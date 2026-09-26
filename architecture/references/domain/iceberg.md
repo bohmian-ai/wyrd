@@ -121,7 +121,9 @@ separate selection, commit, retention, and audit evidence.
 - Orphan cleanup protects every live snapshot, staged or prepared operation,
   publication attempt, committed Scribe `file_list` object without exact
   promotion evidence, pinned Oracle cut, and configured age window.
-  A v1 live-tail lease retains Scribe-local Arrow batches and staged resources for its lifetime but names no Forge-collectable object, so it contributes no independent Forge GC root.
+  An open Scribe fragment retains local Arrow batches and staged resources
+  until its stream completes or drops; it names no Forge-collectable object
+  and contributes no independent Forge GC root.
   A storage listing alone can never prove an orphan.
 
 ## Rejected shapes

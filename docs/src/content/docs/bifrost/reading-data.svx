@@ -17,12 +17,14 @@ terminal state that describes the complete result.
 
 <WyrdSequenceDiagram dense
   title="Synchronous Bifrost query"
-  participants={['Client', 'Gate', 'Oracle', 'Storage']}
+  participants={['Client', 'Gate', 'Oracle', 'Storage', 'Scribe']}
   messages={[
     { from: 'Client', to: 'Gate', label: 'POST /v1/query' },
     { from: 'Gate', to: 'Oracle', label: 'authorize tenant + permission' },
-    { from: 'Oracle', to: 'Storage', label: 'read the immutable visibility cut' },
-    { from: 'Storage', to: 'Oracle', label: 'Arrow batches', dashed: true },
+    { from: 'Oracle', to: 'Storage', label: 'scan the pinned published cut' },
+    { from: 'Storage', to: 'Oracle', label: 'published Arrow batches', dashed: true },
+    { from: 'Oracle', to: 'Scribe', label: 'scan selected live partitions' },
+    { from: 'Scribe', to: 'Oracle', label: 'live Arrow batches', dashed: true },
     { from: 'Oracle', to: 'Client', label: 'Schema → Batch* → Terminal', dashed: true }
   ]}
 />
@@ -32,7 +34,7 @@ length-delimited sequence of `QueryStreamFrame` protobuf messages:
 
 1. `Schema` appears exactly once and identifies the Arrow schema.
 2. Zero or more `Batch` frames carry Arrow IPC record batches.
-3. One `Terminal` frame closes the stream. It contains `outcome`, `freshness`,
+3. One `Terminal` frame closes the stream. It contains `outcome`,
    `row_count`, bounded `warnings`, `source_completion`, and an optional stable
    `error`.
 
@@ -41,23 +43,20 @@ result. A terminal with `outcome: failed` is also a failure even when batches
 precede it. Clients should retain the terminal and release the stream on every
 error path.
 
-## Defaults and explicit opt-ins
+## One query behavior
 
-Omitting policy fields uses the safest shared defaults:
-
-```json
-{
-  "visibility": "published_only",
-  "freshness": "strict"
-}
-```
-
-`published_only` reads the durable published and sealed sources. `strict`
-returns a stable failure when a required source cannot complete. Choose
-`visibility: "fused"` to include the fenced live-tail interval. Pair it with
-`freshness: "allow_degraded"` only when a bounded result without an unavailable
-live source is acceptable. These are explicit opt-ins; clients must serialize
-both enum values rather than relying on language-specific defaults.
+Every query reads a pinned published cut and live data on relevant online
+Scribes. The request has no visibility, freshness, or execution-class setting.
+Oracle selects Interactive or Analytical automatically from the DataFusion
+physical plan. A successful result includes the published cut and the live
+rows the completed plan needed from selected online Scribes. A `LIMIT` query
+can stop an unneeded live scan without draining it. Success does not promise
+every acknowledged write: an offline Scribe may be absent
+from discovery, and publication between planning and opening a live scan can
+briefly omit or duplicate rows. A known unavailable live source before rows
+produces a `degraded` terminal; a published-source or late live-stream failure
+fails the query. Verifiers use this same query service and behavior, so the same
+best-effort limit can affect a judgment.
 
 ## HTTP
 
@@ -66,9 +65,7 @@ curl --fail-with-body -X POST "$WYRD_SERVER_URL/v1/query" \
   -H "x-wyrd-access-token: Bearer $WYRD_ACCESS_TOKEN" \
   -H "content-type: application/json" \
   -d '{
-    "sql": "SELECT metric_name, time, value, service_name FROM vala.metrics.points WHERE wyrd_event_time >= now() - interval '\''7 days'\''",
-    "visibility": "published_only",
-    "freshness": "strict"
+    "sql": "SELECT metric_name, time, value, service_name FROM vala.metrics.points WHERE wyrd_event_time >= now() - interval '\''7 days'\''"
   }'
 ```
 
@@ -79,8 +76,7 @@ Wyrd errors before rows are released.
 
 ## Client examples
 
-The first-class clients expose the same frame and terminal contract. They use
-published-only/strict defaults when the options are omitted.
+The first-class clients expose the same query and terminal contract.
 
 ### Python
 
@@ -90,8 +86,6 @@ from wyrd.bifrost import AsyncBifrost
 client = AsyncBifrost(server_url="https://wyrd.example", credential=token)
 stream = await client.stream(
     'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
-    visibility="published_only",
-    freshness="strict",
 )
 rows = []
 async for batch in stream:
@@ -99,11 +93,11 @@ async for batch in stream:
 terminal = stream.terminal
 if terminal is None:
     raise RuntimeError("query completed without terminal metadata")
-required = ("outcome", "freshness", "row_count", "warnings", "source_completion", "error")
+required = ("outcome", "row_count", "warnings", "source_completion", "error")
 missing = [field for field in required if field not in terminal]
 if missing:
     raise RuntimeError(f"query terminal is missing fields: {missing}")
-if terminal["outcome"] != "success" or terminal["freshness"] != "complete":
+if terminal["outcome"] != "success":
     raise RuntimeError(terminal["error"])
 ```
 
@@ -115,8 +109,6 @@ import { Bifrost } from "@wyrd/sdk";
 const client = await Bifrost.connect({ serverUrl, credential: accessToken });
 const stream = await client.stream({
   sql: 'SELECT metric_name, time, value, service_name FROM "vala.metrics.points" WHERE wyrd_event_time >= now() - interval \'7 days\'',
-  visibility: "published_only",
-  freshness: "strict",
 });
 const rows = [];
 for await (const batch of stream) rows.push(...batch.toArray());
@@ -124,10 +116,10 @@ const terminal = stream.terminal;
 if (terminal === null || terminal === undefined) {
   throw new Error("query completed without terminal metadata");
 }
-for (const field of ["outcome", "freshness", "row_count", "warnings", "source_completion", "error"]) {
+for (const field of ["outcome", "row_count", "warnings", "source_completion", "error"]) {
   if (!(field in terminal)) throw new Error(`query terminal is missing ${field}`);
 }
-if (terminal.outcome !== "success" || terminal.freshness !== "complete" || terminal.error !== null) {
+if (terminal.outcome !== "success" || terminal.error !== null) {
   throw new Error(`query failed: ${JSON.stringify(terminal.error)}`);
 }
 ```
@@ -145,8 +137,7 @@ wyrd query \
 ```
 
 Rows are written to stdout. The validated terminal is written as JSON to
-stderr. `--visibility fused` and `--freshness allow-degraded` are explicit
-alternatives when their semantics are wanted.
+stderr. The CLI uses the same query behavior as HTTP and the SDKs.
 
 ### MCP
 
@@ -168,11 +159,11 @@ once. It preserves a supplied request ID and leaves the application's
 
 After discovery, use `tools/list` to find `bifrost.list_tables`,
 `bifrost.describe_table`, and `bifrost.query`, then invoke them with `tools/call`.
-The `bifrost.query` read tool accepts the same SQL and policy fields and returns
+The `bifrost.query` read tool accepts the same SQL and returns
 one bounded structured result: `{columns, rows, terminal}`. `columns` is an
 ordered array of descriptors with `name`, `data_type`, and `nullable`; each row
 is a positional array in that same order, preserving duplicate column names.
-The terminal contains `outcome`, `freshness`, `execution_path`, `row_count`,
+The terminal contains `outcome`, `execution_path`, `row_count`,
 `warnings`, and `source_completion`.
 
 A query failure or result-ceiling refusal returns a structured Wyrd error with

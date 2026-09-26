@@ -46,7 +46,7 @@ Bifrost runs as four internal components:
 
 - **Gate.** Stateless entry point. Authenticates every request, resolves Principal + DataTenantId + TableRef, dispatches writes to Scribe or reads to Oracle.
 - **Scribe.** Durable write tier. Appends to local WAL (Arrow IPC, fsync), accumulates in memtables keyed by (tenant, table, event_day), seals to Parquet, registers in `vala.file_list`, writes audit rows atomically.
-- **Oracle.** Stateless query tier. Builds DataFusion session with fused scan across Iceberg snapshots, un-compacted Parquet files (from `vala.file_list`), and live Scribe data (Phase 2).
+- **Oracle.** Stateless query tier. Every query scans a pinned Iceberg and committed hot-file cut plus live data from relevant online Scribes. Oracle automatically selects Interactive or Analytical execution from the DataFusion plan.
 - **Forge.** Stateless compaction. Postgres-leased bin-packing of small Parquet files into large ones, Iceberg snapshot commits via Mitari REPLACE, snapshot expiration, orphan garbage collection.
 
 ## Process roles

@@ -22,8 +22,8 @@ engine and its three cohesive subsystems:
 - **Scribe** owns pod-local ingestion, WAL durability, active and immutable
   rows, durable local staging, hot-object publication, and bounded live-tail
   service behavior.
-- **Oracle** owns immutable query cuts, admission, interactive and distributed
-  execution, live-tail fusion, terminal-safe streaming, and read-audit
+- **Oracle** owns pinned published query cuts, admission, interactive and distributed
+  execution, live Scribe routing, terminal-safe streaming, and read-audit
   acceptance.
 - **Forge** owns Scribe-hot promotion, Iceberg maintenance scheduling,
   resource and lease fencing, compaction publication, reconciliation,
@@ -114,13 +114,27 @@ An append acknowledgement means the WAL append and batch fence are durable and
 the exact rows are authoritative in Scribe. It does not wait for local Parquet,
 object publication, Iceberg promotion, or compaction.
 
-Oracle binds every query to one immutable cut. The cut combines its pinned
-Iceberg snapshot, committed Scribe hot objects not represented by that
-snapshot, and a versioned Scribe live-tail lease. When the same row identity is
-visible through more than one source, the most advanced authority in the list
-above wins. A source is suppressed only when the cut contains exact publication
-evidence for the complete corresponding WAL range or object identity. No query
-uses mutable catalog state after pinning.
+Every query pins one published cut: an Iceberg snapshot and committed Scribe
+hot objects not represented by that snapshot. Oracle also discovers active
+streams on ready Scribes and sends live work only to owners of relevant table
+partitions. Scribe scans its own memtable or staged authority and streams
+bounded Arrow results to Oracle. An unavailable Scribe missing before
+discovery is outside the known live set. A known live source lost before rows
+degrades the result; loss after rows fails the query. Published-source,
+security, tenant, schema, resource, cancellation, and deadline failures fail.
+
+All callers, including Verifiers, use this same query service and source
+behavior. The request has no visibility, freshness, or query-class selector.
+Oracle alone classifies the one DataFusion plan as Interactive or Analytical
+from its physical root. A successful terminal means the published cut completed
+and each selected online Scribe supplied the rows required by the completed
+DataFusion plan. A plan that stops consuming a live child (for example, at
+`LIMIT`) cancels and drops it without draining to a footer; unexpected EOF of
+a still-needed stream fails. Success does not prove every acknowledged write
+was included. Publication between cut pinning and live scan opening can omit
+or duplicate rows. This best-effort tradeoff also applies to verification
+judgments. The terminal distinguishes success, known live-source degradation,
+and failure; clients accept rows only after a valid terminal.
 
 ## Ingest: Scribe
 
@@ -256,10 +270,12 @@ existing staged-reader leases finish before local deletion.
 Every local path a node owns derives from its one exclusively locked
 `WYRD_BIFROST_DATA_DIR` root, so no two live processes share a WAL identity.
 Oracle never opens another node's local path and does not use WAL as its normal
-query source. `FetchLiveTailService` serves a leased versioned cut of active,
-immutable, or staged rows through bounded internal RPC. Projection, signed
-predicate, physical partition, retained bytes, batch count, deadline, and
-cancellation are enforced before returning Arrow batches.
+query source. Scribe executes authenticated local DataFusion scan fragments
+over active, immutable, or staged rows and streams Arrow batches through the
+existing peer protocol. Projection, signed predicate, physical partition,
+retained bytes, batch count, deadline, and cancellation are enforced. Open
+fragment streams own their source references until completion or drop; no
+independent tail timeout can end an otherwise active query.
 
 Startup replays WAL using the recorded shard ID, validates staged files and
 manifests, rebuilds source and claim indexes, and reconciles publishing
@@ -276,11 +292,12 @@ never deletes WAL or staged files merely to meet a deadline.
 ### Immutable planning and source authority
 
 Oracle authenticates and authorizes the request, validates read-only SQL,
-acquires the read-audit durability boundary, pins one source cut, builds an
-optimized logical plan, selects an execution path, admits resources, and
-streams one terminal-safe result. DataFusion providers receive only the pinned
-files and leased live-tail sources. Tenant authority is installed before plan
-decode or source IO.
+acquires the read-audit durability boundary, pins the published cut, discovers
+relevant online Scribe routes, builds one optimized logical and physical plan,
+admits resources, and streams one terminal-safe result. DataFusion providers
+receive the pinned files and selected Scribe live sources. Tenant authority is
+installed before plan decode or source IO. There is no caller-selected source
+mode, freshness policy, or query class.
 
 Oracle plans every query once through the pinned `datafusion-distributed`
 planner and derives its admission and terminal path from the returned physical
@@ -336,8 +353,9 @@ the remaining graph stays observable to the owning supervisor, the node does
 not claim a clean terminal state, and readiness or shutdown evidence surfaces
 the failure.
 
-One immutable cut, deadline, cancellation tree, and execution attempt bound
-the complete stage graph. Head cancellation stops and joins every descendant.
+One pinned published cut, one discovered live route set, one deadline,
+cancellation tree, and execution attempt bound the complete stage graph. Head
+cancellation stops and joins every descendant.
 Analytical selection binds the logical query to exactly one distributed
 attempt: after selection, peer transport close, reset, availability timeout,
 authentication, authorization, tenant, digest, protocol, resource, corruption,
@@ -349,12 +367,13 @@ unrelated Scribe, catalog, and Forge protocols, not of a selected Analytical
 query.
 
 Result frames carry query and attempt identity and are followed by one explicit
-success or failure terminal. Bounded transport buffers provide backpressure but
-never spool the complete result. A caller may process frames incrementally, but
-the result is successful only after the success terminal; frames preceding a
-failure terminal are invalid as a complete query result. Frames that do not
-match the owning attempt identity are rejected before egress, so a successful
-stream cannot contain partial or duplicated rows.
+success, degraded, or failure terminal. Bounded transport buffers provide
+backpressure but never spool the complete result. A caller may process frames
+incrementally, but the result is usable only after a valid terminal; frames
+preceding a failure terminal are invalid as a complete query result. Frames
+that do not match the owning attempt identity are rejected before egress.
+Protocol duplication is forbidden; publication overlap may still duplicate a
+row across published and live sources under the accepted best-effort contract.
 
 ### Admission and memory
 
@@ -679,7 +698,9 @@ objects proven unreferenced and outside every active or uncertain attempt.
 Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
 and objects retained by a pinned Oracle cut, are hard GC roots even when no
 Iceberg snapshot references them.
-A v1 live-tail lease retains Scribe-local Arrow batches and staged resources for its lifetime but names no Forge-collectable object, so it contributes no independent Forge GC root.
+An open Scribe fragment retains its local Arrow batches and staged resources
+until its stream completes or drops. It names no Forge-collectable object and
+contributes no independent Forge GC root.
 No cleanup infers safety from age or path shape alone.
 
 ## Resource and failure invariants

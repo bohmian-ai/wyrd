@@ -85,8 +85,8 @@ audit chain, cross-tenant evidence, or ambiguous publication is a no-go.
 ### Classify
 
 Identify the stable node ID, all sixteen shard generations, last valid WAL
-frame and batch fence, immutable cohorts, staged manifests, live-tail leases,
-publication claims, `file_list` rows, and object operations. Classify each
+frame and batch fence, immutable cohorts, staged manifests, active Scribe query
+streams, publication claims, `file_list` rows, and object operations. Classify each
 claim as definitely unpublished, committed, or uncertain. A missing volume is
 node loss, not an empty restart.
 

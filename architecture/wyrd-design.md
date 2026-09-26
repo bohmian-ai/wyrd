@@ -1303,6 +1303,13 @@ authentication, HTTP, and gRPC. `QueryClient` and
 clients. Gate is the server dispatcher; it is neither a client type nor a
 deployment target.
 
+Every Bifrost query, including a Verifier's query, uses the same query service
+and published-plus-live source behavior. The request exposes no visibility,
+freshness, or query-class choice. Oracle selects Interactive or Analytical
+automatically from the one DataFusion physical plan. Live coverage is best
+effort; a successful query is not proof that every acknowledged write was
+included. `bifrost-design.md` owns the failure and publication-overlap details.
+
 ### Coordination clock
 
 The system evaluating a time predicate owns the timestamp used by that

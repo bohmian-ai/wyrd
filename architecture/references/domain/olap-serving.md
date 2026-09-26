@@ -55,9 +55,14 @@ peers; distributed reads do not imply distributed ingest or catalog writes.
 
 ## Oracle read paths
 
-Oracle pins one consistent cut across the selected Iceberg snapshot, published
-hot objects, and Scribe live-tail authority. It never opens another node's
-local staged files and does not query WAL in normal operation.
+Every Oracle query, including a Verifier's, pins one published cut across the
+selected Iceberg snapshot and committed hot objects, then discovers relevant
+online Scribes for live rows. It never opens another node's local staged files
+and does not query WAL in normal operation. The request has no source or
+freshness selector. A successful result includes the selected online live
+sources but may omit or duplicate rows during publication overlap; known live
+loss before rows yields a degraded result. The same tradeoff applies to
+verification judgments.
 
 Oracle runs the pinned `datafusion-distributed` planner once. A normal
 DataFusion physical root selects the interactive admission and terminal path;
@@ -82,8 +87,9 @@ runtime, memory pool, spill allocation, deadline, and cancellation tree, all
 drawn from one aggregate query memory pool shared by operators and exchanges.
 Head cancellation joins all descendants. A selected analytical query owns one
 execution attempt; peer or transport loss after selection fails the stream
-terminally with no successor attempt and no interactive rerun. Success can
-never contain partial or duplicate rows.
+terminally with no successor attempt and no interactive rerun. Transport and
+stage execution must not duplicate rows; the accepted publication overlap can
+still duplicate a row across published and live sources.
 
 Interactive and analytical work use separate queues and counters. Analytical
 work cannot borrow the protected interactive slot floor. Both remain beneath

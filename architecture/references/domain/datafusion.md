@@ -25,7 +25,10 @@ map fields by name or stable field identity.
 
 ## Oracle execution paths
 
-Run every query through the pinned `datafusion-distributed` planner once. A
+Run every query, including a Verifier's query, through the pinned
+`datafusion-distributed` planner once. The public request has no visibility,
+freshness, or query-class choice. Oracle includes the pinned published cut and
+selected online Scribe live sources in that one plan. A
 normal DataFusion physical root selects Interactive; a
 `datafusion_distributed::DistributedExec` root selects Analytical. Retain and
 execute that exact returned root after path-specific admission. Do not add a

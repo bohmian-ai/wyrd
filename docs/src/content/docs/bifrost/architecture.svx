@@ -26,7 +26,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
 |-----------|------|--------------|---------|
 | **Gate** | Auth, tenant/table resolution, dispatch | Stateless | Add pods, any pod handles any request |
 | **Scribe** | WAL append, memtable buffer, seal to Parquet, file_list registration | Per-pod stateful (WAL, memtables) | Add pods, symmetric (any Scribe handles any write) |
-| **Oracle** | Query execution, fused scan | Stateless (local caches only) | Add pods, any pod handles any query |
+| **Oracle** | One published-plus-live query flow; automatic Interactive or Analytical execution | Stateless (local caches only) | Add pods, any pod handles any query |
 | **Forge** | Bin-pack Parquet, Iceberg snapshot commits, GC | Stateless (Postgres-leased) | Multiple pods race for table leases |
 
 ## End-to-end write flow
@@ -75,8 +75,8 @@ orphan GC protect live data, and how leases fence concurrent workers.
     { from: 'Postgres', to: 'Oracle', label: 'un-compacted Parquet refs', dashed: true },
     { from: 'Oracle', to: 'Object store', label: 'scan Iceberg + sealed Parquet' },
     { from: 'Object store', to: 'Oracle', label: 'Arrow batches', dashed: true },
-    { from: 'Oracle', to: 'Scribe', label: 'live-tail RPC (Phase 2)' },
-    { from: 'Scribe', to: 'Oracle', label: 'in-memory rows', dashed: true },
+    { from: 'Oracle', to: 'Scribe', label: 'live scan on selected owners' },
+    { from: 'Scribe', to: 'Oracle', label: 'bounded Arrow batches', dashed: true },
     { from: 'Oracle', to: 'Oracle', label: 'union · FilterExec(tenant_id) · execute' },
     { from: 'Oracle', to: 'Gate', label: 'Arrow IPC stream', dashed: true },
     { from: 'Gate', to: 'Client', label: 'result', dashed: true }
@@ -85,16 +85,20 @@ orphan GC protect live data, and how leases fence concurrent workers.
 
 1. **Client** issues canonical SQL (`POST /v1/query`).
 2. **Gate** authenticates, resolves tenant + permissions, routes to any Oracle.
-3. **Oracle** builds DataFusion session with fused scan:
+3. **Oracle** builds one DataFusion plan for every query:
    - **IcebergTableScan** (compacted data, tenant-qualified and partition-pruned by `Day(event_time)`)
    - **FileListScan** (`SELECT vala.file_list WHERE NOT compacted`, un-compacted Parquet files)
-   - **ScribeLiveTailScan** (gRPC to live Scribe pods for recent WAL data; Phase 2, partially implemented)
+   - **Scribe live scans** on relevant online owners of active or staged rows
 4. Union, then `FilterExec(data_tenant_id = $tenant)` applied (non-removable via `TenantPredicateRule`).
 5. Execute plan, return Arrow IPC stream.
 
-**Query freshness:** Fresh data visible within seal latency (~1-5s typical) even before Forge compacts it.
-
-**Availability note:** Iceberg scan and FileListScan are planned. Live-tail RPC is partially implemented.
+Oracle chooses Interactive or Analytical automatically from the physical plan;
+the request does not select a source mode or execution class. Live coverage is
+best effort: an offline Scribe can be absent from discovery, and publication
+between planning and opening a live scan can briefly omit or duplicate rows.
+The same query behavior applies when a Verifier reads observations, so this
+tradeoff can affect a judgment. A known live-source loss is reported in the
+query terminal; failed queries do not supply usable partial evidence.
 
 ## Storage model
 
@@ -337,7 +341,7 @@ Write-path redaction (when enabled) zeros sensitive columns before seal. Columns
 Bifrost uses three Postgres connection pools with distinct privilege levels:
 
 - **TenantConn** (RLS-enforced, `wyrd_app` role). Tenant-scoped queries and writes. Row-level security enforced on `data_tenant_id`.
-- **OperatorPool** (BYPASSRLS, `wyrd_platform_admin` role). Cross-tenant reads/writes for Forge compaction, Oracle fused scans, and maintenance tasks.
+- **OperatorPool** (BYPASSRLS, `wyrd_platform_admin` role). Cross-tenant reads/writes for Forge compaction, Oracle query coordination, and maintenance tasks.
 - **RecoveryConn** (`wyrd_recovery` role). Disaster recovery and migration tasks only.
 
 Scribe uses TenantConn for its tenant lineage writes (RLS-bound). Forge and Oracle use OperatorPool for cross-tenant operations with explicit admin roles.

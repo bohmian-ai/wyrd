@@ -23,7 +23,7 @@
       "format": "date-time"
     },
     "refresh_token": {
-      "description": "Refresh token. Present only for grants that issue one: human OIDC login (`authorization_code`), API-key exchange (`wyrd_api_key`), and refresh rotation (`refresh_token`). Absent for the workload `jwt-bearer` and `token-exchange` (delegation) grants, whose clients re-present their durable credential to obtain a fresh access token instead of holding a long-lived refresh secret.",
+      "description": "Refresh token. Present only for credentials that issue one: a human OIDC login completed through the common callback, API-key exchange (`wyrd_api_key`), and refresh rotation (`refresh_token`). Absent for the workload `jwt-bearer` and `token-exchange` (delegation) grants, whose clients re-present their durable credential to obtain a fresh access token instead of holding a long-lived refresh secret.",
       "anyOf": [
         {
           "$ref": "#/definitions/SecretBearer"

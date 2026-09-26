@@ -19,8 +19,8 @@ mod pg_tests {
     use wyrd_sql::queries::auth::{
         TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
         delete_workload_bindings_for_issuer, insert_user, trusted_issuer_by_url,
-        trusted_issuers_for_tenant, upsert_user_identity, user_by_id,
-        user_id_by_identity, workload_binding_by_key, workload_binding_by_subject,
+        trusted_issuers_for_tenant, upsert_user_identity, user_by_id, user_id_by_identity,
+        workload_binding_by_key, workload_binding_by_subject,
     };
     // `insert_trusted_issuer`/`insert_workload_binding` are referenced by full path
     // in `cloud_issuer_crud_write_path_conflict_and_cascade` because this test module
@@ -469,7 +469,8 @@ mod pg_tests {
             assert_preflight_refuses(pool, tenant, secret, "2 Human trusted issuers").await;
         }
 
-        // (d) Legacy refresh rows stay live and unbound.
+        // (d) A legacy user refresh row has no login-connection provenance, so
+        // the login-binding migration revokes it; a machine row stays live.
         {
             let database = pre_human_connection_database().await;
             let pool = database.migrator_pool();
@@ -507,9 +508,8 @@ mod pg_tests {
 
             wyrd_sql::migrate(pool).await.expect("upgrade applies");
 
-            let rows: Vec<(Uuid, Option<Uuid>, Option<i64>, bool)> = sqlx::query_as(
-                "SELECT id, human_connection_id, human_connection_revision,
-                        revoked_at IS NULL
+            let rows: Vec<(Uuid, Option<Uuid>, Option<String>)> = sqlx::query_as(
+                "SELECT id, human_connection_id, revoked_reason
                    FROM wyrd.auth_refresh_tokens ORDER BY principal_kind DESC",
             )
             .fetch_all(pool)
@@ -518,10 +518,14 @@ mod pg_tests {
             assert_eq!(
                 rows,
                 vec![
-                    (legacy_row, None, None, true),
-                    (machine_row, None, None, true)
+                    (
+                        legacy_row,
+                        None,
+                        Some("login_connection_unbound".to_owned())
+                    ),
+                    (machine_row, None, None)
                 ],
-                "legacy user and machine rows stay live and unbound"
+                "the unbound user row is revoked and the machine row stays live"
             );
         }
     }

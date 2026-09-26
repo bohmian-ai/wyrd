@@ -18,7 +18,7 @@ A person logs in through the tenant's IdP with the OIDC authorization-code flow,
 
 ### Deployment setup
 
-Set `WYRD_PUBLIC_ORIGIN` to the origin browsers and IdPs reach Wyrd on, for example `https://wyrd.example.com`. The one callback URL every tenant registers at its IdP is `{WYRD_PUBLIC_ORIGIN}/auth/callback`; it is derived from this setting, never from request headers, and is returned read-only as `callback_url`. Without it, connections cannot be staged or tested. If a connection uses a client secret, the server also needs a [sealing key](/self-hosting/authentication/#sealing-key).
+Set `WYRD_PUBLIC_ORIGIN` to the origin browsers and IdPs reach Wyrd on, for example `https://wyrd.example.com`. The one callback URL every tenant registers at its IdP is `{WYRD_PUBLIC_ORIGIN}/auth/callback`; it is derived from this setting, never from request headers, and is returned read-only as `callback_url`. Without it, connections cannot be staged or tested. Human login also needs a [sealing key](/self-hosting/authentication/#sealing-key), which protects each completed session until the web app redeems it, and which also seals any connection client secret.
 
 ### Connection lifecycle
 
@@ -50,7 +50,7 @@ PUT /v1/identity/oidc/candidate
 
 Activation is guarded twice. The Candidate must carry an unexpired test for exactly that revision, so a stale or failed test, or a provider outage, fails closed with `WYRD_AUTH_409_CONNECTION_NOT_TESTED`. And `recovery_api_key` must be a live API key of a headless principal in the same tenant that holds `identity_connections:write`. That proves a way back in exists that does not depend on the new IdP. The key is checked and discarded: it is never stored, logged, or audited. A stale revision, an invalid recovery key, or a competing change returns `WYRD_AUTH_409_CONNECTION_CONFLICT`.
 
-Every replica reads the Active connection from Postgres on each login, so activation, rotation, and deactivation take effect on all replicas without a restart.
+Every replica reads the Active connection from Postgres on each login, so activation, rotation, and deactivation take effect on all replicas without a restart. Replacing or deactivating a connection stops its users' refresh immediately; access tokens already issued stay valid until they expire, at most five minutes. A user from a replacement provider is a new User even when the email matches, and group-map changes apply at the user's next token issuance.
 
 ### Upgrading from Human trusted issuers
 

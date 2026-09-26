@@ -1049,7 +1049,11 @@ async fn authorization_code_for(
     .await;
     assert_eq!(status, StatusCode::OK, "login begins: {body}");
     let fields: Vec<&String> = body.as_object().expect("begin body").keys().collect();
-    assert_eq!(fields, vec!["authorization_url"], "begin returns only the URL");
+    assert_eq!(
+        fields,
+        vec!["authorization_url"],
+        "begin returns only the URL"
+    );
     let authz_url: Url = body["authorization_url"]
         .as_str()
         .expect("authorization_url present")
@@ -1077,7 +1081,10 @@ async fn authorization_code_for(
             &nonce,
         )
         .await;
-    assert!(!login.code.is_empty(), "Keycloak returned an authorization code");
+    assert!(
+        !login.code.is_empty(),
+        "Keycloak returned an authorization code"
+    );
     assert_eq!(login.state, state, "state echoed back correctly");
     ProviderReturn {
         code: login.code,
@@ -1127,7 +1134,12 @@ impl CallbackReply {
 ///
 /// # Panics
 /// Panics when the request cannot be built or the router fails.
-async fn callback_reply(srv: &WyrdTestServer, code: &str, state: &str, host: &str) -> CallbackReply {
+async fn callback_reply(
+    srv: &WyrdTestServer,
+    code: &str,
+    state: &str,
+    host: &str,
+) -> CallbackReply {
     let code_encoded: String = url::form_urlencoded::byte_serialize(code.as_bytes()).collect();
     let state_encoded: String = url::form_urlencoded::byte_serialize(state.as_bytes()).collect();
     let response = srv
@@ -1212,7 +1224,7 @@ async fn redeem(
         .expect("the server owns human connections")
         .completions()
         .expect("the test server has a sealing keyring")
-        .redeem(tenant, LoginInitiation::Browser(flow.clone()))
+        .redeem(tenant, LoginInitiation::Browser(*flow))
         .await
 }
 
@@ -2893,7 +2905,10 @@ async fn tenant_human_login_journey() {
     .await;
     let session = complete_login(&srv, tenant, &provider).await;
     let access = session["access_token"].as_str().expect("access token");
-    assert!(session["refresh_token"].is_string(), "a human session renews");
+    assert!(
+        session["refresh_token"].is_string(),
+        "a human session renews"
+    );
     let alice = principal_id_of(access);
 
     // 2. One user, keyed by the verified (issuer, subject).
@@ -2962,7 +2977,10 @@ const MOCK_CLIENT_ID: &str = "wyrd-fixture";
 
 /// Serve discovery and JWKS for the mock provider, and answer the token
 /// endpoint with `token_response`.
-async fn mount_mock_provider(server: &wiremock::MockServer, token_response: wiremock::ResponseTemplate) {
+async fn mount_mock_provider(
+    server: &wiremock::MockServer,
+    token_response: wiremock::ResponseTemplate,
+) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
     server.reset().await;
@@ -3012,7 +3030,10 @@ fn id_token_reply(id_token: &str) -> wiremock::ResponseTemplate {
 /// # Panics
 /// Panics when seeding fails.
 async fn seed_mock_connection(srv: &WyrdTestServer, tenant: DataTenantId, issuer: &str) {
-    let mut conn = srv.tenant_conn_for(tenant).await.expect("tenant conn opens");
+    let mut conn = srv
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant conn opens");
     let binding = wyrd_dev_fixtures::pg::seed_active_human_connection(&mut conn)
         .await
         .expect("connection seeds");
@@ -3091,19 +3112,42 @@ async fn tenant_callback_refusal_journey() {
         .superuser_pool()
         .await
         .expect("superuser pool opens");
-    let sign_in = || authorization_code(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password");
+    let sign_in = || {
+        authorization_code(
+            &srv,
+            &keycloak,
+            PUBLIC_HUMAN_CLIENT,
+            "alice",
+            "alice-password",
+        )
+    };
 
     // 1. Wrong, unknown, replayed, and expired state.
     let provider = sign_in().await;
     let (status, body) =
         finish_callback(&srv, &provider.code, &format!("{}x", provider.state)).await;
-    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "WYRD_AUTH_400_INVALID_STATE",
+    );
     let (status, body) = finish_callback(&srv, &provider.code, "never-issued").await;
-    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "WYRD_AUTH_400_INVALID_STATE",
+    );
     let session = complete_login(&srv, tenant_a, &provider).await;
     let alice = principal_id_of(session["access_token"].as_str().expect("access token"));
     let (status, body) = finish_callback(&srv, &provider.code, &provider.state).await;
-    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "WYRD_AUTH_400_INVALID_STATE",
+    );
     let expiring = sign_in().await;
     sqlx::query(
         "UPDATE wyrd.auth_login_state SET expires_at = now() - interval '1 second' \
@@ -3114,7 +3158,12 @@ async fn tenant_callback_refusal_journey() {
     .await
     .expect("state expires");
     let (status, body) = finish_callback(&srv, &expiring.code, &expiring.state).await;
-    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+    assert_refused(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "WYRD_AUTH_400_INVALID_STATE",
+    );
 
     // 2. Binding shape and unknown handoff.
     for body in [
@@ -3126,7 +3175,12 @@ async fn tenant_callback_refusal_journey() {
         serde_json::json!({ "tenant_route_key": FIXTURE_TENANT_SLUG }),
     ] {
         let (status, refusal) = begin_login(&srv, "test-tenant-1.wyrd.test", body).await;
-        assert_refused(status, &refusal, StatusCode::BAD_REQUEST, "WYRD_SPEC_400_VALIDATION");
+        assert_refused(
+            status,
+            &refusal,
+            StatusCode::BAD_REQUEST,
+            "WYRD_SPEC_400_VALIDATION",
+        );
     }
     let (status, refusal) = begin_login(
         &srv,
@@ -3137,7 +3191,12 @@ async fn tenant_callback_refusal_journey() {
         }),
     )
     .await;
-    assert_refused(status, &refusal, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+    assert_refused(
+        status,
+        &refusal,
+        StatusCode::BAD_REQUEST,
+        "WYRD_AUTH_400_INVALID_STATE",
+    );
 
     // 3. The retired token grant is refused and consumes nothing.
     let retired = sign_in().await;
@@ -3164,7 +3223,9 @@ async fn tenant_callback_refusal_journey() {
         "the authorization_code grant is refused: {}",
         response.status()
     );
-    let bytes = to_bytes(response.into_body(), 65_536).await.expect("body reads");
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("body reads");
     assert!(
         !String::from_utf8_lossy(&bytes).contains("access_token"),
         "the refused grant serves no token"
@@ -3172,7 +3233,10 @@ async fn tenant_callback_refusal_journey() {
     complete_login(&srv, tenant_a, &retired).await;
 
     // 4. Same issuer, another tenant: the state alone decides the tenant.
-    let tenant_b = srv.seed_tenant("test-tenant-2").await.expect("tenant B seeds");
+    let tenant_b = srv
+        .seed_tenant("test-tenant-2")
+        .await
+        .expect("tenant B seeds");
     let admin_b = tenant_admin(&srv, tenant_b, "refusal-admin-b").await;
     activate_keycloak_connection(&srv, &admin_b, PUBLIC_HUMAN_CLIENT, "Public", None).await;
     let in_b = authorization_code_for(
@@ -3204,7 +3268,10 @@ async fn tenant_callback_refusal_journey() {
     // 5. Token verification refusals against a mock provider.
     let mock = wiremock::MockServer::start().await;
     let issuer = mock.uri();
-    let tenant_c = srv.seed_tenant("test-tenant-3").await.expect("tenant C seeds");
+    let tenant_c = srv
+        .seed_tenant("test-tenant-3")
+        .await
+        .expect("tenant C seeds");
     seed_mock_connection(&srv, tenant_c, &issuer).await;
     let now = chrono::Utc::now();
     let claims = |nonce: &str| {
@@ -3225,7 +3292,13 @@ async fn tenant_callback_refusal_journey() {
     let cases: Vec<(&str, Mutation, StatusCode, &str)> = vec![
         (
             "nonce",
-            Box::new(|_| id_token_reply(&sign_id_token(&eddsa, &claims("other-nonce"), MOCK_SIGNING_KEY))),
+            Box::new(|_| {
+                id_token_reply(&sign_id_token(
+                    &eddsa,
+                    &claims("other-nonce"),
+                    MOCK_SIGNING_KEY,
+                ))
+            }),
             StatusCode::BAD_REQUEST,
             "WYRD_AUTH_400_INVALID_NONCE",
         ),
@@ -3251,7 +3324,9 @@ async fn tenant_callback_refusal_journey() {
         ),
         (
             "signature",
-            Box::new(|nonce| id_token_reply(&sign_id_token(&eddsa, &claims(nonce), FOREIGN_SIGNING_KEY))),
+            Box::new(|nonce| {
+                id_token_reply(&sign_id_token(&eddsa, &claims(nonce), FOREIGN_SIGNING_KEY))
+            }),
             StatusCode::UNAUTHORIZED,
             "WYRD_AUTH_401_INVALID_TOKEN",
         ),
@@ -3375,7 +3450,10 @@ async fn tenant_provider_switch_journey() {
     let before_access = before["access_token"].as_str().expect("access token");
     let claims = jwt_claims(before_access);
     let lifetime = claims["exp"].as_i64().expect("exp") - claims["iat"].as_i64().expect("iat");
-    assert!(lifetime <= 300, "access tokens live at most five minutes: {lifetime}");
+    assert!(
+        lifetime <= 300,
+        "access tokens live at most five minutes: {lifetime}"
+    );
     let first_alice = principal_id_of(before_access);
 
     // 2. Switch providers; the old refresh token is refused.
@@ -3383,7 +3461,14 @@ async fn tenant_provider_switch_journey() {
     assert_refresh_cut_off(&srv, &before, "provider switch").await;
 
     // 3. Same email, separate user, no inherited grants.
-    let switched = human_login(&srv, &second, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let switched = human_login(
+        &srv,
+        &second,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     let switched_access = switched["access_token"].as_str().expect("access token");
     let second_alice = principal_id_of(switched_access);
     assert_ne!(second_alice, first_alice, "a new issuer is a new user");
@@ -3398,17 +3483,23 @@ async fn tenant_provider_switch_journey() {
         .superuser_pool()
         .await
         .expect("superuser pool opens");
-    let same_email: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.auth_users WHERE email = 'alice@wyrd.test'",
-    )
-    .fetch_one(&superuser)
-    .await
-    .expect("users read");
+    let same_email: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_users WHERE email = 'alice@wyrd.test'")
+            .fetch_one(&superuser)
+            .await
+            .expect("users read");
     assert_eq!(same_email, 2, "both providers' alice exist separately");
 
     // 4. A mapping change applies at the next issuance.
     activate_connection(&srv, &admin, second_provider_input(&admins_write())).await;
-    let remapped = human_login(&srv, &second, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let remapped = human_login(
+        &srv,
+        &second,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     let remapped_access = remapped["access_token"].as_str().expect("access token");
     assert_eq!(principal_id_of(remapped_access), second_alice);
     assert_v1_authz_check_ok(&srv, remapped_access, "switch-remapped").await;
@@ -3421,7 +3512,9 @@ async fn tenant_provider_switch_journey() {
     let (status, listed) = call_json(&srv, &recovered, Method::GET, CONNECTIONS, None).await;
     assert_eq!(status, StatusCode::OK, "the owner administers: {listed}");
     assert_eq!(
-        listed["active"]["issuer"].as_str().map(|issuer| issuer.trim_end_matches('/')),
+        listed["active"]["issuer"]
+            .as_str()
+            .map(|issuer| issuer.trim_end_matches('/')),
         Some(keycloak_second_issuer().as_str())
     );
 
@@ -3446,11 +3539,20 @@ fn machine_binding(subject: &str, audience: Option<&str>, name: &str) -> Workloa
 ///
 /// # Panics
 /// Panics when the exchange is accepted or refused differently.
-async fn assert_jwt_bearer_refused(response: axum::http::Response<Body>, code: Option<&str>, label: &str) {
+async fn assert_jwt_bearer_refused(
+    response: axum::http::Response<Body>,
+    code: Option<&str>,
+    label: &str,
+) {
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 65_536).await.expect("body reads");
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("body reads");
     let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    assert!(status.is_client_error(), "{label}: refused, got {status} {body}");
+    assert!(
+        status.is_client_error(),
+        "{label}: refused, got {status} {body}"
+    );
     match code {
         Some(code) => assert_eq!(response_code(&body), code, "{label}: {body}"),
         None => assert!(
@@ -3481,10 +3583,18 @@ async fn tenant_machine_independence_journey() {
         .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
         .await;
     let peer = keycloak
-        .workload_token("wyrd-workload-peer", "wyrd-workload-peer-secret", "wyrd-workload")
+        .workload_token(
+            "wyrd-workload-peer",
+            "wyrd-workload-peer-secret",
+            "wyrd-workload",
+        )
         .await;
     let foreign_audience = keycloak
-        .workload_token("wyrd-workload-foreign", "wyrd-workload-foreign-secret", "wyrd-foreign")
+        .workload_token(
+            "wyrd-workload-foreign",
+            "wyrd-workload-foreign-secret",
+            "wyrd-foreign",
+        )
         .await;
     let wrong_issuer = other_issuer
         .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
@@ -3517,7 +3627,14 @@ async fn tenant_machine_independence_journey() {
     activate_keycloak_connection(&srv, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
 
     // 1. SSO is live.
-    let human = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let human = human_login(
+        &srv,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
     assert!(human["access_token"].is_string());
 
     // 2. An API key is unaffected.
@@ -3533,8 +3650,14 @@ async fn tenant_machine_independence_journey() {
 
     // 3. The exact workload binding is unaffected.
     let response = post_jwt_bearer(&srv, &bound).await;
-    assert_eq!(response.status(), StatusCode::OK, "bound workload exchanges");
-    let bytes = to_bytes(response.into_body(), 65_536).await.expect("body reads");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "bound workload exchanges"
+    );
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("body reads");
     let body: Value = serde_json::from_slice(&bytes).expect("token JSON");
     assert_v1_authz_check_ok(
         &srv,
@@ -3544,7 +3667,12 @@ async fn tenant_machine_independence_journey() {
     .await;
 
     // 4. Every inexact assertion is refused.
-    assert_jwt_bearer_refused(post_jwt_bearer(&srv, &wrong_issuer).await, None, "wrong issuer").await;
+    assert_jwt_bearer_refused(
+        post_jwt_bearer(&srv, &wrong_issuer).await,
+        None,
+        "wrong issuer",
+    )
+    .await;
     assert_jwt_bearer_refused(
         post_jwt_bearer(&srv, &peer).await,
         Some("WYRD_AUTH_404_PRINCIPAL_NOT_FOUND"),
@@ -3557,7 +3685,9 @@ async fn tenant_machine_independence_journey() {
         "wrong audience",
     )
     .await;
-    srv.seed_tenant("test-tenant-2").await.expect("tenant B seeds");
+    srv.seed_tenant("test-tenant-2")
+        .await
+        .expect("tenant B seeds");
     assert_jwt_bearer_refused(
         post_jwt_bearer_for_tenant(&srv, &bound, "test-tenant-2").await,
         None,

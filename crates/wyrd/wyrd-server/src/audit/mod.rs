@@ -88,7 +88,8 @@ fn delegation_detail(caller: &Caller) -> Option<AuditDetail> {
 
 /// Build an [`AuditEvent`] for a pre-authentication attempt, attributed to
 /// [`PLATFORM_AUDIT_PRINCIPAL`] (a reserved well-known service actor). Used
-/// when no `Caller` is available — e.g. `GET /auth/login` before OIDC resolve.
+/// when no `Caller` is available — e.g. an Oracle peer or tail request refused
+/// before a principal resolves.
 ///
 /// The outcome states whether the attempt was admitted or refused.
 #[must_use]

@@ -59,7 +59,7 @@ single thing to revoke to end its access.
   rows={[
     ['wyrd_api_key', 'POST /auth/token', 'No — re-exchange the key'],
     ['jwt-bearer (workload)', 'POST /auth/token', 'No — re-assert the platform JWT'],
-    ['authorization_code (OIDC)', 'POST /auth/token', 'Yes'],
+    ['Human OIDC login', 'POST /auth/login → GET /auth/callback', 'Yes'],
     ['token-exchange (delegation)', 'POST /auth/token', 'No'],
     ['refresh_token', 'POST /auth/token', 'Yes (rotated) · human sessions only']
   ]}
@@ -67,46 +67,58 @@ single thing to revoke to end its access.
 
 ## Human OIDC login flow
 
-The user flow uses PKCE S256 to prevent authorization-code interception. The
-login state is stored server-side for at most 5 minutes.
+A person signs in through their tenant's **Active** OIDC connection. The tenant
+comes from the request body's tenant route key, never from `Host` or forwarded
+headers, and only that connection can authenticate the login. The flow uses
+PKCE S256, and the login state lives server-side for at most 5 minutes.
 
 <WyrdSequenceDiagram
   title="Human OIDC login"
-  participants={['Browser', 'Wyrd server', 'IdP']}
+  participants={['Wyrd web app', 'Wyrd server', 'IdP']}
   messages={[
-    { from: 'Browser', to: 'Wyrd server', label: 'GET /auth/login?issuer=…' },
+    { from: 'Wyrd web app', to: 'Wyrd server', label: 'POST /auth/login · route key + flow binding' },
     { from: 'Wyrd server', to: 'IdP', label: 'OIDC discovery' },
     { from: 'IdP', to: 'Wyrd server', label: 'authorization_endpoint', dashed: true },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'store PKCE + nonce + state (300s)' },
-    { from: 'Wyrd server', to: 'Browser', label: '302 redirect · S256 challenge', dashed: true },
-    { from: 'Browser', to: 'IdP', label: 'authorize' },
-    { from: 'IdP', to: 'Browser', label: 'redirect ?code&state', dashed: true },
-    { from: 'Browser', to: 'Wyrd server', label: 'GET /auth/callback?code&state' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'store PKCE + nonce + hashed state (300s)' },
+    { from: 'Wyrd server', to: 'Wyrd web app', label: 'authorization_url', dashed: true },
+    { from: 'Wyrd web app', to: 'IdP', label: 'browser authorizes' },
+    { from: 'IdP', to: 'Wyrd server', label: 'GET /auth/callback?code&state' },
     { from: 'Wyrd server', to: 'Wyrd server', label: 'consume login state once' },
     { from: 'Wyrd server', to: 'IdP', label: 'exchange code' },
     { from: 'IdP', to: 'Wyrd server', label: 'id_token', dashed: true },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify id_token · nonce · map roles · upsert user' },
-    { from: 'Wyrd server', to: 'Browser', label: 'access + refresh', dashed: true }
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'verify · map groups · issue + seal session' },
+    { from: 'Wyrd server', to: 'Wyrd web app', label: '303 /login/complete', dashed: true }
   ]}
 />
 
-1. Client sends `GET /auth/login?issuer=<issuer-url>`.
-2. Server resolves the trusted issuer for the request tenant, runs OIDC
-   discovery to fetch the `authorization_endpoint`, and generates a PKCE
-   verifier (48-byte CSPRNG, base64url), S256 challenge, nonce, and opaque CSRF
-   state (32-byte CSPRNG, base64url).
-3. Server stores `(state → verifier, nonce, issuer, redirect_uri)` in Postgres
-   with a 300 s TTL and returns a `302` redirect (or JSON `authorization_url`
-   for API callers).
-4. Browser visits the IdP authorization URL with `response_type=code`,
-   `client_id`, `redirect_uri`, `scope=openid profile email`,
-   `code_challenge` (S256), `state`, and `nonce`.
-5. IdP redirects to `GET /auth/callback?code=…&state=…`.
-6. Server consumes the login-state row exactly once (single-use). Missing or
-   expired state → `400` (`WYRD_AUTH_400_INVALID_STATE`).
-7. Server exchanges the code at the IdP token endpoint, verifies the ID token
-   (JWKS, audience, expiry, nonce), and maps groups → roles.
-8. User identity upserted; server issues **access + refresh** tokens.
+1. The web app sends `POST /auth/login` with `tenant_route_key` and exactly one
+   binding: `browser_flow_hash` (the SHA-256 of a secret the web app keeps for
+   this browser flow) or `cli_handoff_id` (reserved for the CLI handoff). An
+   unknown tenant and a tenant without an Active connection get the same
+   `401` refusal. The response carries only `authorization_url`.
+2. The server stores the hashed state, PKCE verifier, nonce, connection, and
+   binding in Postgres with a 300 s TTL. The raw state exists only in the
+   authorization URL.
+3. The IdP returns the browser to the deployment's single
+   `GET /auth/callback?code=…&state=…`.
+4. The server consumes the login state exactly once, and commits that before
+   contacting the IdP. Missing, expired, or reused state → `400`
+   (`WYRD_AUTH_400_INVALID_STATE`).
+5. It exchanges the code, verifies the ID token (JWKS, issuer, audience,
+   expiry, nonce) against the connection the login began with, and confirms
+   that connection is still Active.
+6. It resolves the user by the provider's issuer and subject — never by email —
+   maps the connection's group rules to roles, and issues **access + refresh**
+   tokens. The tokens are sealed into the login row in the same transaction as
+   the canonical audit event; if the audit write fails, nothing is issued.
+7. The browser is redirected (`303`) to `/login/complete`, where the web app
+   redeems the sealed session once with its flow secret. No token ever appears
+   in a URL.
+
+Human sessions require a configured sealing key; without one, login is refused
+before any state is stored. An access token is a five-minute snapshot:
+deactivating or replacing the connection stops refresh immediately, while an
+access token already issued remains valid until it expires.
 
 ## API-key principal flow
 

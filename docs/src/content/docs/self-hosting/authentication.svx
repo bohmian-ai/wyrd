@@ -12,7 +12,7 @@ Wyrd authenticates every request with a signed token. There is no session cookie
 
 ## Principals
 
-Every token belongs to a principal, and there are five kinds across two planes. On the **platform plane**, a **GlobalAdmin** operates the deployment itself — creating tenants and recovering tenant administration — and holds no tenant. Inside a tenant, a **TenantAdmin** is the tenant's headless root of trust, a **User** is a human who logged in through an IdP (identified by email), a **Service** is a machine principal that may be bound to a ServiceCard, and an **Agent** is a machine principal that is always bound to an AgentCard. Services and Agents authenticate the same way. Neither plane's credential or token is accepted by the other. See [Authentication](/concepts/authentication/) in Concepts for the full principal and token model.
+Every token belongs to a principal, and there are five kinds across two planes. On the **platform plane**, a **GlobalAdmin** operates the deployment itself — creating tenants and recovering tenant administration — and holds no tenant. Inside a tenant, a **TenantAdmin** is the tenant's headless root of trust, a **User** is a human who logged in through the tenant's IdP (identified by that IdP's issuer and subject, never by email), a **Service** is a machine principal that may be bound to a ServiceCard, and an **Agent** is a machine principal that is always bound to an AgentCard. Services and Agents authenticate the same way. Neither plane's credential or token is accepted by the other. See [Authentication](/concepts/authentication/) in Concepts for the full principal and token model.
 
 ## Tokens
 
@@ -20,11 +20,11 @@ Wyrd mints EdDSA (Ed25519) JWTs signed with its own key, presented on every requ
 
 ## Grants
 
-A **grant** is how a caller proves its identity at `POST /auth/token` to get a Wyrd access token. Which one you use depends on who is calling.
+A **grant** is how a caller proves its identity to get a Wyrd access token. Machines use `POST /auth/token`; a person signs in through the login flow instead. Which one you use depends on who is calling.
 
 | Caller | Grant | Set up in |
 | --- | --- | --- |
-| A person logging in through your IdP | `authorization_code` (with PKCE) | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
+| A person logging in through your IdP | OIDC login (`POST /auth/login`, PKCE) | [SSO and OIDC](/self-hosting/sso-and-oidc/#human-single-sign-on) |
 | A machine workload (CI job, Kubernetes pod) | `jwt-bearer` | [SSO and OIDC](/self-hosting/sso-and-oidc/#workload-federation) |
 | A service or script holding an API key | API-key exchange | [Running the server](/self-hosting/running-the-server/#init) |
 | A person renewing an expiring session | `refresh_token` | Automatic once a login issues one |
@@ -62,7 +62,7 @@ Rotating the signing key invalidates every token signed with the old key. Plan a
 
 ## Sealing key
 
-The sealing key encrypts IdP client secrets at rest with AES-256-GCM: tenant OIDC connection secrets, workload issuer secrets, and the platform connection secret. You only need it if one of them uses `SecretBasic` or `SecretPost`. A deployment that uses only public PKCE clients and workload federation without secrets does not need one.
+The sealing key encrypts secrets at rest with AES-256-GCM: IdP client secrets (tenant OIDC connection secrets, workload issuer secrets, and the platform connection secret) and each completed human login's session, held until the web app redeems it. You need it for tenant human SSO login, and for any IdP client that uses `SecretBasic` or `SecretPost`. A deployment that uses only API keys and workload federation without secrets does not need one; without it, human login is refused with `WYRD_SPEC_400_VALIDATION` before any login state is stored.
 
 Generate a 32-byte key, base64-encoded, and put it in a file:
 

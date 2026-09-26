@@ -248,6 +248,64 @@ async fn identity_connection_operations_publish_their_contract() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// Tenant human login publishes its header-free contract.
+///
+/// Login begins only with an anonymous `POST /auth/login` whose typed body
+/// carries the tenant route key and binding and whose response is the
+/// authorization URL alone; the retired `GET` form is not served. The common
+/// callback publishes the browser's `303` to the completion page (with its
+/// `Location`) and the CLI's `text/html` page, never a token body, and the
+/// token grant no longer offers `authorization_code`.
+#[tokio::test]
+async fn tenant_login_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let login = &document["paths"]["/auth/login"];
+
+    assert!(login.get("get").is_none(), "GET /auth/login is retired");
+    let begin = &login["post"];
+    assert_eq!(begin["security"], serde_json::json!([{}]));
+    assert_eq!(
+        begin["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/BeginLogin"
+    );
+    assert_eq!(
+        begin["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/BeginLoginResponse"
+    );
+    let response_fields = document["components"]["schemas"]["BeginLoginResponse"]["properties"]
+        .as_object()
+        .expect("BeginLoginResponse publishes its properties");
+    assert_eq!(
+        response_fields.keys().collect::<Vec<_>>(),
+        vec!["authorization_url"]
+    );
+
+    let callback = &document["paths"]["/auth/callback"]["get"]["responses"];
+    assert!(
+        callback["303"]["headers"]["Location"].is_object(),
+        "the browser completion redirect publishes its Location: {callback}"
+    );
+    assert!(
+        callback["200"]["content"]["text/html"].is_object(),
+        "the CLI completion page is HTML: {callback}"
+    );
+    assert!(
+        callback["200"]["content"]["application/json"].is_null(),
+        "the callback never returns a token body: {callback}"
+    );
+    assert!(
+        !document["components"]["schemas"]["TokenRequest"]
+            .to_string()
+            .contains("authorization_code"),
+        "the authorization-code grant is retired"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// The local backend's byte-transfer operations are public Wyrd operations and
 /// are published with their real contract.
 ///

@@ -40,7 +40,7 @@ use crate::error::{screen_error, store_error};
 /// redirected to: `{public_origin}/login/complete`, with no query string.
 ///
 /// The redirect carries no capability. The BFF redeems the completion with
-/// its HttpOnly flow cookie through [`LoginCompletions::redeem`].
+/// its `HttpOnly` flow cookie through [`LoginCompletions::redeem`].
 pub const LOGIN_COMPLETE_PATH: &str = "/login/complete";
 
 /// Lifetime of a persisted login-state row: the browser must complete the `IdP`
@@ -148,7 +148,7 @@ impl HumanConnections {
 /// The callback stores each issued session sealed under the deployment keyring
 /// against the login's initiation binding. This owner hands it out exactly
 /// once: the BFF redeems a browser login with the flow id hash from its
-/// HttpOnly cookie, and the CLI redeems its handoff. It is the primitive the
+/// `HttpOnly` cookie, and the CLI redeems its handoff. It is the primitive the
 /// BFF completion route and the CLI handoff claim wrap; it has no HTTP route
 /// of its own.
 #[derive(Clone)]
@@ -594,7 +594,7 @@ mod pg_tests {
             .expect_err("another binding redeems nothing");
         assert!(matches!(wrong, WyrdError::InvalidState { .. }));
         let redeemed = completions
-            .redeem(tenant, LoginInitiation::Browser(flow.clone()))
+            .redeem(tenant, LoginInitiation::Browser(flow))
             .await
             .expect("the binding redeems its completion");
         assert_eq!(redeemed.token_type, TokenType::Bearer);

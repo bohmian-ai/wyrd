@@ -876,3 +876,147 @@ async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journey
     }
     Ok(ids)
 }
+
+/// Appends one journey row carrying a caller-chosen managed event time.
+///
+/// The write door refuses to declare `wyrd_event_time`, but public IPC ingest
+/// accepts a supplied value and Scribe lifts it verbatim into the managed
+/// slot, which is how a live row is placed in a chosen time partition.
+///
+/// # Errors
+///
+/// Returns an error when the client cannot connect or ingest refuses the row.
+async fn append_event_time_row(
+    client: &WyrdClient,
+    table: &str,
+    id: i64,
+    event_time_micros: i64,
+) -> Result<(), JourneyError> {
+    let mut fields = journey_schema().fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ),
+        false,
+    )));
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+        vec![
+            std::sync::Arc::new(arrow::array::Int64Array::from(vec![id])),
+            std::sync::Arc::new(arrow::array::StringArray::from(vec!["live"])),
+            std::sync::Arc::new(arrow::array::StringArray::from(vec![unused_payload(id)])),
+            std::sync::Arc::new(
+                arrow::array::TimestampMicrosecondArray::from(vec![event_time_micros])
+                    .with_timezone("UTC"),
+            ),
+        ],
+    )?;
+    let mut ipc = Vec::new();
+    let mut ipc_writer =
+        arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())?;
+    ipc_writer.write(&batch)?;
+    ipc_writer.finish()?;
+    drop(ipc_writer);
+    wyrd_testing::bifrost::write::RawIngest::connect(client)
+        .await?
+        .insert(table, uuid::Uuid::now_v7(), ipc)
+        .await?;
+    Ok(())
+}
+
+/// Returns each node's cumulative Scribe fragment executions, in node order.
+///
+/// # Errors
+///
+/// Returns an error when a node in the topology carries no Scribe runtime.
+fn scribe_fragment_executions(cluster: &WyrdTestCluster) -> Result<Vec<u64>, JourneyError> {
+    cluster
+        .servers()
+        .map(|server| {
+            server
+                .state()
+                .bifrost_ingest()
+                .map(|scribe| scribe.fragment_inspection().0)
+                .ok_or_else(|| JourneyError::from("topology node has no Scribe runtime"))
+        })
+        .collect()
+}
+
+/// Subtracts one per-node execution snapshot from a later one.
+fn execution_delta(before: &[u64], after: &[u64]) -> Vec<u64> {
+    after
+        .iter()
+        .zip(before)
+        .map(|(after, before)| after.saturating_sub(*before))
+        .collect()
+}
+
+/// Live rows on two relevant Scribes are read by live fragments sent to
+/// exactly those two owners, while a third Scribe whose only live partition an
+/// event-time predicate excludes executes nothing. A predicate that cannot
+/// prune by event time keeps every reported route.
+///
+/// Nothing is flushed, so every returned row can only have come from a live
+/// Scribe fragment: the query is live-only and still plans, admits, and
+/// succeeds.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_live_routes");
+    let table_fqn = format!("vala.bifrost.{table}");
+    let first = cluster.server(0).ok_or("missing node 0")?;
+    register_table(first, tenant, &table).await?;
+    let now = chrono::Utc::now();
+    // A week back is inside ingest's accepted window yet in a live partition
+    // the one-hour event-time floor below provably excludes.
+    let stale = (now - chrono::Duration::days(7)).timestamp_micros();
+    let now = now.timestamp_micros();
+    for (index, id, event_time) in [(0_usize, 1_i64, now), (1, 2, now), (2, 3, stale)] {
+        let server = cluster.server(index).ok_or("missing writer node")?;
+        let writer = client(server, &format!("live-writer-{index}")).await?;
+        append_event_time_row(&writer, &table_fqn, id, event_time).await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(first, "live-route-reader").await?;
+    let floor = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .format("%Y-%m-%d %H:%M:%S%.6f");
+
+    let before = scribe_fragment_executions(&cluster)?;
+    let pruned = query_ids(
+        &reader,
+        format!("SELECT id FROM {table_fqn} WHERE wyrd_event_time >= TIMESTAMP '{floor}' ORDER BY id"),
+    )
+    .await?;
+    let pruned_delta = execution_delta(&before, &scribe_fragment_executions(&cluster)?);
+    if pruned != vec![1, 2] {
+        return Err(format!("event-time floor expected live ids [1, 2], saw {pruned:?}").into());
+    }
+    if pruned_delta != vec![1, 1, 0] {
+        return Err(format!(
+            "only the two relevant Scribes may execute one live fragment each, saw {pruned_delta:?}"
+        )
+        .into());
+    }
+
+    let before = scribe_fragment_executions(&cluster)?;
+    let unpruned = query_ids(
+        &reader,
+        format!("SELECT id FROM {table_fqn} WHERE id > 0 ORDER BY id"),
+    )
+    .await?;
+    let unpruned_delta = execution_delta(&before, &scribe_fragment_executions(&cluster)?);
+    if unpruned != vec![1, 2, 3] {
+        return Err(format!("unprunable predicate expected ids [1, 2, 3], saw {unpruned:?}").into());
+    }
+    if unpruned_delta != vec![1, 1, 1] {
+        return Err(format!(
+            "an unprunable predicate keeps every reported live route, saw {unpruned_delta:?}"
+        )
+        .into());
+    }
+    Ok(())
+}

@@ -188,7 +188,7 @@ jobs:
     needs: [changes, matrix-plan]
     if: needs.changes.outputs.full_gate == 'true' || needs.changes.outputs.rust_client == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

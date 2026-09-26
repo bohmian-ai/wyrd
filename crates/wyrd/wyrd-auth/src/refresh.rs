@@ -285,8 +285,12 @@ mod pg_tests {
 
     use wyrd_dev_fixtures::cards::seed_backing_card;
 
+    use wyrd_auth_oidc::ScreenedHttp;
+    use wyrd_spec::vala::api::AuditOutcome;
+
     use super::{RefreshError, RefreshTokens};
-    use crate::audit::REFRESH_FAMILY_REVOKE_OPERATION;
+    use crate::audit::{REFRESH_FAMILY_REVOKE_OPERATION, principal_event};
+    use crate::connections::HumanConnections;
     use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -1085,6 +1089,125 @@ mod pg_tests {
             matches!(successor_rotation, Err(RefreshError::Reused)),
             "C cannot rotate: {successor_rotation:?}"
         );
+    }
+
+    /// Poll until some backend is blocked on this tenant's human-connection
+    /// slot lock.
+    ///
+    /// The lock key is derived in SQL from the same expression the slot lock
+    /// uses, so a waiter on another tenant's slot cannot satisfy the poll.
+    /// This is a synchronization point for an owner that opens its own
+    /// transaction, whose backend pid the test cannot learn in advance.
+    ///
+    /// # Panics
+    /// Panics when the key or lock state cannot be read or no wait is seen
+    /// within 30s.
+    async fn wait_for_connection_slot_waiter(fixture: &PgFixture) {
+        let mut probe = fixture.tenant_conn().await.expect("probe conn opens");
+        let key: i64 = sqlx::query_scalar(
+            "SELECT hashtextextended('wyrd.auth_human_connections:' || wyrd.current_tenant()::text, 0)",
+        )
+        .fetch_one(&mut **probe.transaction())
+        .await
+        .expect("slot key derives");
+        drop(probe);
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks
+                      WHERE locktype = 'advisory' AND NOT granted
+                        AND ((classid::bigint << 32) | objid::bigint) = $1)",
+                )
+                .bind(key)
+                .fetch_one(fixture.app_pool())
+                .await
+                .expect("slot lock state reads");
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("deactivation waits on the open rotation's connection slot");
+    }
+
+    /// Connection deactivation overlapping a rotation of `B` leaves the
+    /// successor `C` unrenewable.
+    ///
+    /// Deactivation retires no refresh rows; the cutoff is enforced at the
+    /// next rotation, which requires the bound connection revision to be
+    /// Active under the connection slot lock. This holds the rotation of `B`
+    /// open with `C` written and that lock held, observes the production
+    /// deactivation blocked on the same lock, commits both, and proves from a
+    /// fresh transaction that `C` cannot rotate and mints nothing. It is the
+    /// audit evidence that connection lifecycle paths need no family lock.
+    ///
+    /// # Panics
+    /// Panics when deactivation does not wait on the slot lock, when either
+    /// transaction fails, or when `C` rotates after the connection retires.
+    #[tokio::test]
+    async fn connection_deactivation_overlapping_rotation_ends_successor() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = test_issuing_key();
+        let service = refresh_service();
+        let connections = HumanConnections::new(
+            fixture.wyrd_postgres().clone(),
+            None,
+            ScreenedHttp::allowing_internal(),
+            None,
+        );
+
+        let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
+        let user_id = insert_test_user(&mut setup, tenant).await;
+        let current = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
+        seed_active_refresh(&mut setup, "user", user_id, &hash_of(&current)).await;
+        setup.commit().await.expect("setup commits");
+
+        // The legitimate rotation of B, held open with C written.
+        let mut rotating = fixture.tenant_conn().await.expect("rotating conn opens");
+        let successor = service
+            .execute(&mut rotating, current, "req-rotate-b")
+            .await
+            .expect("B rotates to C")
+            .refresh_token
+            .expect("rotation issues C");
+
+        let decision = principal_event(
+            "req-deactivate",
+            "identity.oidc.active.deactivate",
+            PrincipalId::new(Uuid::new_v4()),
+            PrincipalKindTag::User,
+            None,
+            AuditOutcome::Allowed,
+        );
+        let (deactivated, ()) = tokio::join!(connections.deactivate(tenant, &decision), async {
+            wait_for_connection_slot_waiter(&fixture).await;
+            rotating.commit().await.expect("rotation commits");
+        });
+        deactivated.expect("deactivation commits");
+
+        let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
+        let successor_rotation = service.execute(&mut fresh, successor, "req-rotate-c").await;
+        assert!(
+            matches!(
+                successor_rotation,
+                Err(RefreshError::Issuance(IssuanceError::ConnectionInactive))
+            ),
+            "C cannot renew once its connection is retired: {successor_rotation:?}"
+        );
+        drop(fresh);
+        let mut after = fixture.tenant_conn().await.expect("after conn opens");
+        let family: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.auth_refresh_tokens
+              WHERE principal_kind = 'user' AND principal_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&mut **after.transaction())
+        .await
+        .expect("family count reads");
+        assert_eq!(family, 2, "no successor of C was minted");
     }
 
     /// A machine principal's refresh row cannot rotate.

@@ -31,6 +31,7 @@ use wyrd_auth_oidc::{
 };
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::HUMAN_SUBJECT_CLAIM;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::reference::CardRef;
@@ -296,6 +297,10 @@ pub(crate) enum IssuerDecodeError {
     /// The opened secret is not UTF-8; its bytes are discarded, not echoed.
     #[error("decrypted client secret is not valid utf-8")]
     SecretEncoding,
+    /// A stored human connection maps a subject claim other than `sub`;
+    /// carries the stored path. Human identity is `(issuer, sub)` only.
+    #[error("human connection subject claim {0:?} is not \"sub\"")]
+    HumanSubject(String),
     /// A JSONB column does not match its expected shape.
     #[error("json column decode failed: {0}")]
     Json(#[from] serde_json::Error),
@@ -505,15 +510,26 @@ fn trusted_issuer_from_row(
 /// token audience is always the client id and no default roles exist, since a
 /// human's roles come only from the connection's group map.
 ///
+/// A stored connection whose subject claim is not exactly `sub` — written
+/// before authoring required it — fails closed here, so it never reaches
+/// login or the callback's identity lookup.
+///
 /// # Errors
 /// Returns [`IssuerDecodeError`] when the issuer or JWKS URI is malformed or
-/// absent, a JSON column does not decode, or the client authentication cannot
+/// absent, a JSON column does not decode, the subject claim is not `sub`
+/// ([`IssuerDecodeError::HumanSubject`]), or the client authentication cannot
 /// be reconstructed — including a sealed secret this process holds no key for.
 pub(crate) fn human_connection_trusted_issuer(
     tenant: DataTenantId,
     row: HumanConnectionRow,
     sealing_key: Option<&SealingKeyring>,
 ) -> Result<TrustedIssuer, IssuerDecodeError> {
+    let claim_mapping = claim_mapping_from_value(row.claim_mapping)?;
+    if claim_mapping.subject.as_str() != HUMAN_SUBJECT_CLAIM {
+        return Err(IssuerDecodeError::HumanSubject(
+            claim_mapping.subject.as_str().to_owned(),
+        ));
+    }
     let issuer = IssuerUrl::new(row.issuer_url)
         .map_err(|error| IssuerDecodeError::IssuerUrl(error.to_string()))?;
     let jwks_uri = row
@@ -534,7 +550,7 @@ pub(crate) fn human_connection_trusted_issuer(
         expected_audience: row.client_id.clone(),
         client_id: row.client_id,
         client_auth,
-        claim_mapping: claim_mapping_from_value(row.claim_mapping)?,
+        claim_mapping,
         group_role_map: serde_json::from_value(row.group_role_map)?,
         default_roles: Vec::new(),
         principal_kind: IssuerTokenPolicy::Human,
@@ -714,8 +730,9 @@ mod pg_tests {
     use wyrd_sql::queries::auth::{upsert_trusted_issuer, upsert_workload_binding};
 
     use super::{
-        IssuerSealError, PgIssuerResolver, PgWorkloadBindingResolver, binding_write_from_binding,
-        issuer_write_from_trusted, trusted_issuer_from_row,
+        IssuerDecodeError, IssuerSealError, PgIssuerResolver, PgWorkloadBindingResolver,
+        binding_write_from_binding, human_connection_trusted_issuer, issuer_write_from_trusted,
+        trusted_issuer_from_row,
     };
 
     const ISSUER_URL: &str = "https://idp.example.com/realms/wyrd";
@@ -804,6 +821,49 @@ mod pg_tests {
             ClientAuth::SecretPost(secret) => assert_eq!(secret.expose_secret(), "super-secret"),
             other => panic!("expected SecretPost, got {other:?}"),
         }
+    }
+
+    /// A stored human connection row mapping `subject` as `email` fails closed
+    /// at decode, while the same row mapping `sub` decodes with its email and
+    /// group paths intact.
+    #[test]
+    fn stored_human_connection_requires_the_sub_subject_claim() {
+        let tenant: DataTenantId = "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
+            .parse()
+            .expect("tenant id is valid");
+        let row = |subject: &str| wyrd_sql::row_types::auth::HumanConnectionRow {
+            connection_id: uuid::Uuid::new_v4(),
+            data_tenant_id: tenant.as_uuid(),
+            revision: 1,
+            state: "Active".to_owned(),
+            issuer_url: ISSUER_URL.to_owned(),
+            client_id: "wyrd".to_owned(),
+            client_auth: "Public".to_owned(),
+            client_secret_enc: None,
+            claim_mapping: serde_json::json!({
+                "subject": subject, "email": "email", "groups": "groups"
+            }),
+            group_role_map: serde_json::json!({}),
+            jwks_ttl_secs: 300,
+            jwks_uri: Some(format!("{ISSUER_URL}/jwks")),
+            tested_revision: None,
+            tested_until: None,
+            removed_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let error = human_connection_trusted_issuer(tenant, row("email"), None)
+            .expect_err("a stored non-sub subject fails closed");
+        assert!(matches!(error, IssuerDecodeError::HumanSubject(path) if path == "email"));
+
+        let trusted = human_connection_trusted_issuer(tenant, row("sub"), None)
+            .expect("a sub mapping decodes");
+        assert_eq!(trusted.claim_mapping.subject.as_str(), "sub");
+        assert_eq!(
+            trusted.claim_mapping.email.as_ref().map(ClaimPath::as_str),
+            Some("email")
+        );
     }
 
     #[test]

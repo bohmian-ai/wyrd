@@ -1512,7 +1512,8 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
 /// session still works, then remove the group at Keycloak and log in once more.
 /// The changed login persists the reduced role set and issues a successor that
 /// yields a delegated token that can no longer write; the earlier token is not
-/// introspected.
+/// introspected. The granting and withdrawing logins each stage one
+/// `auth.user.roles.sync` event for alice; the unchanged login stages none.
 ///
 /// The membership is restored before the journey returns, because the realm is
 /// shared with every other Keycloak journey in this target.
@@ -1520,7 +1521,7 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
 /// # Panics
 /// Panics when the server or actor bootstrap fails, a login yields no access
 /// token, the granted session stops reaching `200` after an unchanged
-/// re-login, delegation from the reduced session fails, or the reduced
+/// re-login, the role-sync event count differs, delegation from the reduced session fails, or the reduced
 /// session's delegated `card_write` check is not `Deny`. A panic skips the
 /// membership restore and leaves the shared realm altered.
 #[tokio::test]
@@ -1549,6 +1550,12 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .expect("access_token present")
         .to_owned();
     assert_v1_authz_check_ok(&srv, &granted_token, "roles-granted").await;
+    let alice = principal_id_of(&granted_token);
+    assert_eq!(
+        roles_sync_events(&srv, &alice).await,
+        1,
+        "the granting login records one role change"
+    );
 
     // A second login asserting the same groups changes nothing, so the first
     // session keeps working: re-authenticating must not log a user out.
@@ -1561,6 +1568,11 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
     )
     .await;
     assert_v1_authz_check_ok(&srv, &granted_token, "roles-unchanged").await;
+    assert_eq!(
+        roles_sync_events(&srv, &alice).await,
+        1,
+        "an unchanged login records no role change"
+    );
 
     // The provider withdraws the group; the next login persists the reduced set.
     keycloak
@@ -1578,6 +1590,11 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .as_str()
         .expect("access_token present")
         .to_owned();
+    assert_eq!(
+        roles_sync_events(&srv, &alice).await,
+        2,
+        "the withdrawing login records its role change"
+    );
 
     let actor = srv
         .bootstrap_service("roles-withdrawn-actor", &["writer"])
@@ -1607,6 +1624,30 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
     keycloak
         .set_group_membership("alice", "wyrd-admins", true)
         .await;
+}
+
+/// Staged allowed `auth.user.roles.sync` events for User `principal_id`.
+///
+/// In-process test servers run no audit publisher, so every committed event
+/// is still in staging.
+///
+/// # Panics
+/// Panics when the query fails.
+async fn roles_sync_events(srv: &WyrdTestServer, principal_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging \
+          WHERE operation = 'auth.user.roles.sync' AND outcome = 'allowed' \
+            AND principal_id = $1::uuid AND resource = 'principal:' || $1",
+    )
+    .bind(principal_id)
+    .fetch_one(
+        &srv.pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens"),
+    )
+    .await
+    .expect("role sync audit reads")
 }
 
 // ─── Tenant human connection administration ─────────────────────────────────
@@ -1646,8 +1687,10 @@ async fn login_status(srv: &WyrdTestServer) -> (StatusCode, Value) {
 ///      deployment callback URL, and no response carries B's secret;
 ///   3. B's administrator cannot remove A's connection (RLS answers not
 ///      found), and A's login keeps working afterwards;
-///   4. the old Human trusted-issuer HTTP and CLI writers are refused with
-///      `HUMAN_CONNECTION_REQUIRED` while a Workload CLI write still succeeds;
+///   4. a candidate mapping any subject claim but `sub` is refused with
+///      `VALIDATION`, and the old Human trusted-issuer HTTP and CLI writers
+///      are refused with `HUMAN_CONNECTION_REQUIRED` while a Workload CLI
+///      write still succeeds;
 ///   5. the served OpenAPI document publishes all six operations;
 ///   6. deactivation stops A's login immediately, removal tombstones the
 ///      connection, and the retained audit history records every decision.
@@ -1782,7 +1825,24 @@ async fn tenant_connection_admin_journey() {
     let access = session["access_token"].as_str().expect("access token");
     assert_v1_authz_check_ok(&srv, access, "tenant-a-connection").await;
 
-    // 4. The old Human writers are refused; Workload writes remain.
+    // 4. A human connection keyed by anything but the OIDC `sub` is refused,
+    //    and the old Human writers are refused; Workload writes remain.
+    let mut email_subject = connection_input(PUBLIC_HUMAN_CLIENT, "Public", None, None);
+    email_subject["claim_mapping"]["subject"] = Value::from("email");
+    let (status, body) = call_json(
+        &srv,
+        &admin_a.token,
+        Method::PUT,
+        CANDIDATE,
+        Some(email_subject),
+    )
+    .await;
+    assert_refused(
+        status,
+        &body,
+        StatusCode::BAD_REQUEST,
+        "WYRD_SPEC_400_VALIDATION",
+    );
     let (status, body) = call_json(
         &srv,
         &admin_a.token,
@@ -2979,6 +3039,16 @@ async fn mount_mock_provider(
     server: &wiremock::MockServer,
     token_response: wiremock::ResponseTemplate,
 ) {
+    mount_mock_provider_advertising(server, token_response, &["EdDSA"]).await;
+}
+
+/// [`mount_mock_provider`] whose discovery advertises `algorithms` as its
+/// ID-token signing algorithms.
+async fn mount_mock_provider_advertising(
+    server: &wiremock::MockServer,
+    token_response: wiremock::ResponseTemplate,
+    algorithms: &[&str],
+) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
     server.reset().await;
@@ -2990,7 +3060,7 @@ async fn mount_mock_provider(
             "authorization_endpoint": format!("{issuer}/authorize"),
             "token_endpoint": format!("{issuer}/token"),
             "jwks_uri": format!("{issuer}/jwks"),
-            "id_token_signing_alg_values_supported": ["EdDSA"],
+            "id_token_signing_alg_values_supported": algorithms,
         })))
         .mount(server)
         .await;
@@ -3085,8 +3155,11 @@ async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, Strin
 ///   4. a login begun for tenant B under the same issuer completes into B
 ///      only, whatever `Host` the callback carried: A cannot redeem it;
 ///   5. against a mock provider: a nonce, issuer, audience, signature, or
-///      algorithm mismatch and a provider outage are refused, leaving no
-///      completion, while an otherwise identical valid token completes;
+///      algorithm mismatch, a multi-audience token without `azp`, an `azp`
+///      naming another client, a validly signed token whose algorithm
+///      discovery did not advertise, and a provider outage are refused,
+///      leaving no completion, while a valid multi-audience token whose `azp`
+///      names the client completes;
 ///   6. an injected audit-staging failure issues nothing: no completion and
 ///      no refresh row.
 ///
@@ -3338,6 +3411,26 @@ async fn tenant_callback_refusal_journey() {
             "WYRD_AUTH_401_INVALID_TOKEN",
         ),
         (
+            "multi-audience token without azp",
+            Box::new(|nonce| {
+                let mut wrong = claims(nonce);
+                wrong["aud"] = serde_json::json!([MOCK_CLIENT_ID, "another-client"]);
+                id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
+            }),
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        ),
+        (
+            "azp naming another client",
+            Box::new(|nonce| {
+                let mut wrong = claims(nonce);
+                wrong["azp"] = Value::from("another-client");
+                id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
+            }),
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        ),
+        (
             "outage",
             Box::new(|_| wiremock::ResponseTemplate::new(503)),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3358,9 +3451,27 @@ async fn tenant_callback_refusal_journey() {
     }
     mount_mock_provider(&mock, id_token_reply("unused")).await;
     let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
-    mount_mock_provider(
+    mount_mock_provider_advertising(
         &mock,
         id_token_reply(&sign_id_token(&eddsa, &claims(&nonce), MOCK_SIGNING_KEY)),
+        &["RS256"],
+    )
+    .await;
+    let (status, body) = finish_callback(&srv, "mock-code", &state).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "unadvertised alg: {body}");
+    assert_eq!(response_code(&body), "WYRD_AUTH_401_INVALID_TOKEN");
+    assert!(
+        redeem(&srv, tenant_c, &flow).await.is_err(),
+        "an unadvertised algorithm stores no completion"
+    );
+    mount_mock_provider(&mock, id_token_reply("unused")).await;
+    let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
+    let mut with_azp = claims(&nonce);
+    with_azp["aud"] = serde_json::json!([MOCK_CLIENT_ID, "another-client"]);
+    with_azp["azp"] = Value::from(MOCK_CLIENT_ID);
+    mount_mock_provider(
+        &mock,
+        id_token_reply(&sign_id_token(&eddsa, &with_azp, MOCK_SIGNING_KEY)),
     )
     .await;
     let reply = callback_reply(&srv, "mock-code", &state, "test-tenant-1.wyrd.test").await;

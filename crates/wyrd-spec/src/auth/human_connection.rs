@@ -188,7 +188,9 @@ pub struct ConnectionInput {
     /// `Public`. Sealed before storage and never returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<SecretBearer>,
-    /// Claim mapping.
+    /// Claim mapping. `subject` must be exactly `sub`: a human is identified
+    /// by the provider's immutable OIDC subject, never a mutable claim such as
+    /// email. `email` and `groups` stay configurable.
     pub claim_mapping: ClaimMappingPayload,
     /// Provider group to tenant role names.
     #[serde(default)]
@@ -198,6 +200,10 @@ pub struct ConnectionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_revision: Option<u64>,
 }
+
+/// The only subject claim a tenant human connection may map: the provider's
+/// immutable OIDC `sub`. Durable User identity is `(issuer, sub)`.
+pub const HUMAN_SUBJECT_CLAIM: &str = "sub";
 
 impl ConnectionInput {
     /// Decode a raw request body, refusing unsupported client authentication
@@ -226,16 +232,18 @@ impl ConnectionInput {
     /// Check the cross-field rules the type cannot express.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when `client_id` or the subject claim
-    /// path is empty, a secret method omits its secret or supplies an empty
-    /// one, or `Public` supplies any secret value, including an empty one.
+    /// Returns [`WyrdError::Validation`] when `client_id` is empty, the
+    /// subject claim path is not exactly [`HUMAN_SUBJECT_CLAIM`], a secret
+    /// method omits its secret or supplies an empty one, or `Public` supplies
+    /// any secret value, including an empty one.
     fn validate(&self) -> Result<(), WyrdError> {
         if self.client_id.trim().is_empty() {
             return Err(validation("client_id must not be empty", "client_id"));
         }
-        if self.claim_mapping.subject.trim().is_empty() {
+        if self.claim_mapping.subject != HUMAN_SUBJECT_CLAIM {
             return Err(validation(
-                "claim_mapping.subject must not be empty",
+                "claim_mapping.subject must be \"sub\": a human connection identifies people by \
+                 the provider's OIDC subject",
                 "claim_mapping",
             ));
         }
@@ -425,6 +433,29 @@ mod tests {
             let input =
                 ConnectionInput::from_slice(&bytes(&valid)).expect("a nonempty secret decodes");
             assert!(input.client_auth.requires_secret());
+        }
+    }
+
+    /// A human connection maps exactly `sub` as its subject; any other path,
+    /// including email or an empty one, is refused, while email and groups
+    /// remain configurable.
+    #[test]
+    fn human_subject_must_be_exactly_sub() {
+        let mut valid = body();
+        valid["claim_mapping"] =
+            serde_json::json!({ "subject": "sub", "email": "email", "groups": "roles" });
+        ConnectionInput::from_slice(&bytes(&valid)).expect("sub with email and groups decodes");
+
+        for subject in ["email", "preferred_username", "sub.id", " sub", ""] {
+            let mut other = body();
+            other["claim_mapping"] = serde_json::json!({ "subject": subject });
+            assert!(
+                matches!(
+                    ConnectionInput::from_slice(&bytes(&other)),
+                    Err(WyrdError::Validation { .. })
+                ),
+                "subject {subject:?} is refused"
+            );
         }
     }
 

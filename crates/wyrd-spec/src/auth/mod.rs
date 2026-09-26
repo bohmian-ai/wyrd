@@ -22,8 +22,8 @@ pub use admin::{
 pub use card_scope::CardScope;
 pub use human_connection::{
     ConnectionActivate, ConnectionInput, ConnectionTestRequest, ConnectionTestResponse,
-    HumanClientAuth, HumanConnectionState, HumanConnectionView, HumanConnectionsResponse,
-    refuse_human_trusted_issuer,
+    HUMAN_SUBJECT_CLAIM, HumanClientAuth, HumanConnectionState, HumanConnectionView,
+    HumanConnectionsResponse, refuse_human_trusted_issuer,
 };
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
 pub use oidc::{

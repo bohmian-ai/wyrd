@@ -9,8 +9,8 @@ use crate::exchange_api_key::principal_kind_wire;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    revoke_refresh_family, service_account_by_id, suspend_service_account_principal,
-    suspend_user_principal, user_by_id,
+    lock_refresh_family, revoke_refresh_family, service_account_by_id,
+    suspend_service_account_principal, suspend_user_principal, user_by_id,
 };
 
 /// Revoke `target_id` in the table the caller's declared `kind` names.
@@ -20,6 +20,12 @@ use wyrd_sql::queries::auth::{
 /// tokens it already holds lapse at their five-minute expiry. A User also
 /// carries refresh authority, so the User branch retires the refresh family on
 /// the same [`TenantConn`] and the caller's commit retires both or neither.
+/// Before either write it takes [`lock_refresh_family`] for that User, the
+/// same tenant-qualified lock refresh rotation holds through its commit, so a
+/// rotation already in flight commits its successor first and the family
+/// revocation's snapshot includes it. The lock is transaction-scoped and is
+/// released only by the caller's commit or rollback. No connection lock is
+/// taken, so the family-before-connection order rotation uses is preserved.
 ///
 /// The kind is a selector, not a hint: principal ids are unique only within
 /// their table, so revoking on the caller's claim rather than on whichever
@@ -30,8 +36,9 @@ use wyrd_sql::queries::auth::{
 ///
 /// # Errors
 /// Returns [`WyrdError::PrincipalNotFound`] when no principal of that kind
-/// exists in the tenant, and [`WyrdError::Internal`] when the lookup or the
-/// revocation write fails or the stored kind is unrecognized.
+/// exists in the tenant, and [`WyrdError::Internal`] when the lookup, the
+/// family lock, or the revocation write fails or the stored kind is
+/// unrecognized.
 pub async fn revoke_principal_in_conn(
     conn: &mut TenantConn<'_>,
     target_id: PrincipalId,
@@ -48,6 +55,9 @@ pub async fn revoke_principal_in_conn(
         {
             return Err(not_found(target_id, tenant));
         }
+        lock_refresh_family(conn, "user", id_uuid)
+            .await
+            .map_err(internal_error)?;
         suspend_user_principal(conn, id_uuid)
             .await
             .map_err(internal_error)?;
@@ -101,10 +111,15 @@ fn internal_error(cause: impl Display) -> WyrdError {
 
 #[cfg(test)]
 mod pg_tests {
+    use std::sync::Arc;
+
     use chrono::{Duration, Utc};
+    use secrecy::{ExposeSecret, SecretString};
     use uuid::Uuid;
+    use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_verify::Kid;
     use wyrd_dev_fixtures::cards::seed_backing_card;
-    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::PrincipalId;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::auth::PrincipalKindTag;
@@ -113,11 +128,14 @@ mod pg_tests {
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_sql::queries::auth::{
-        insert_refresh_token, insert_service_account, insert_user, refresh_by_hash,
-        service_account_by_id, user_by_id,
+        insert_human_refresh_token, insert_refresh_token, insert_service_account, insert_user,
+        refresh_by_hash, service_account_by_id, user_by_id,
     };
 
     use super::revoke_principal_in_conn;
+    use crate::exchange_api_key::token_hash;
+    use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
+    use crate::refresh::RefreshTokens;
 
     fn make_service_card_ref(name: &str) -> CardRef {
         CardRef {
@@ -470,6 +488,139 @@ mod pg_tests {
         assert!(
             matches!(result, Err(WyrdError::PrincipalNotFound { .. })),
             "unknown principal should return PrincipalNotFound, got: {result:?}"
+        );
+    }
+
+    /// Ed25519 test key the overlapping rotation signs its successor with.
+    const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+
+    /// Administrative User revocation overlapping a rotation of current row
+    /// `B` still retires the successor `C` that rotation inserts.
+    ///
+    /// The rotation of `B` is held open with `C` written and the family lock
+    /// held. Revocation must then block on that advisory family lock, not pass
+    /// it and snapshot the family without `C`. Once the rotation commits and
+    /// the revocation commits, a fresh transaction sees `C` revoked as
+    /// `principal_revoked`, no active family row, and a suspended User.
+    ///
+    /// # Panics
+    /// Panics when revocation does not wait on the family lock, when either
+    /// transaction fails, or when any family row remains active.
+    #[tokio::test]
+    async fn refresh_rotation_overlapping_user_revocation_retires_successor() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let key = Arc::new(
+            IssuingKey::from_ed_pem(
+                SecretString::from(PRIVATE_KEY_PEM),
+                Kid::new("k1").expect("kid is valid"),
+                "wyrd",
+            )
+            .expect("test private key loads"),
+        );
+        let service = RefreshTokens {
+            issuer: TenantTokenIssuer::new(key, TokenExchangeSettings::default()),
+        };
+
+        let user_id = Uuid::new_v4();
+        let current = SecretString::from(format!("refresh-b-{user_id}"));
+        {
+            let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
+            insert_user(&mut setup, user_id, Some("overlap@test.com"), "oidc", None)
+                .await
+                .expect("user inserts");
+            let binding = seed_active_human_connection(&mut setup)
+                .await
+                .expect("connection seeds");
+            insert_human_refresh_token(
+                &mut setup,
+                Uuid::new_v4(),
+                user_id,
+                &token_hash(current.expose_secret()),
+                Utc::now() + Duration::days(30),
+                None,
+                binding,
+            )
+            .await
+            .expect("B inserts");
+            setup.commit().await.expect("setup commits");
+        }
+
+        // The legitimate rotation of B, held open with C written.
+        let mut rotating = fixture.tenant_conn().await.expect("rotating conn opens");
+        let successor = service
+            .execute(&mut rotating, current, "req-rotate-b")
+            .await
+            .expect("B rotates to C")
+            .refresh_token
+            .expect("rotation issues C");
+
+        let mut revoking = fixture.tenant_conn().await.expect("revoking conn opens");
+        let revoke_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **revoking.transaction())
+            .await
+            .expect("revoke pid reads");
+        let (revoked, ()) = tokio::join!(
+            revoke_principal_in_conn(
+                &mut revoking,
+                PrincipalId::new(user_id),
+                PrincipalKindTag::User,
+                tenant,
+            ),
+            async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    loop {
+                        let waiting: bool = sqlx::query_scalar(
+                            "SELECT EXISTS (SELECT 1 FROM pg_locks
+                              WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
+                        )
+                        .bind(revoke_pid)
+                        .fetch_one(fixture.app_pool())
+                        .await
+                        .expect("revoke lock state reads");
+                        if waiting {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("revocation waits on the open rotation's family lock");
+                rotating.commit().await.expect("rotation commits");
+            }
+        );
+        revoked.expect("revocation succeeds");
+        revoking
+            .commit()
+            .await
+            .expect("the route commits the revocation");
+
+        let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
+        let successor_row = refresh_by_hash(&mut fresh, &token_hash(successor.expose_secret()))
+            .await
+            .expect("lookup")
+            .expect("C exists");
+        assert_eq!(
+            successor_row.revoked_reason.as_deref(),
+            Some("principal_revoked"),
+            "C is retired by the revocation in committed state"
+        );
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM wyrd.auth_refresh_tokens
+              WHERE principal_kind = 'user' AND principal_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&mut **fresh.transaction())
+        .await
+        .expect("active count reads");
+        assert_eq!(active, 0, "no renewable family row survives");
+        let user = user_by_id(&mut fresh, user_id)
+            .await
+            .expect("user lookup runs")
+            .expect("the user still exists");
+        assert_eq!(
+            user.status, "suspended",
+            "the revocation suspended the user"
         );
     }
 }

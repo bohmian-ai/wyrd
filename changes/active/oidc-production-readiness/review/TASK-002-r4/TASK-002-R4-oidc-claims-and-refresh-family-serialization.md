@@ -229,6 +229,6 @@ API, table, trait, lease, retry, isolation change, or process-local lock.
 
 Limit: the refusal journey carries only the missing-`iat` claim case
 end to end. Adding missing-`iss` and future-`iat` there pushed the journey past
-the auth route's per-peer governor burst (20), so all in-process requests got
+the auth route's per-peer governor burst (20), and a later callback got
 `429`. The verifier unit test covers those cases on the shared owner that both
 OIDC paths use.

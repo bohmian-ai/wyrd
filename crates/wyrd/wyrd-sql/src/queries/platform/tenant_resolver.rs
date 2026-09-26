@@ -34,6 +34,39 @@ pub async fn resolve_by_slug_for_app(
         .map_err(SqlError::InvalidDataTenantId)
 }
 
+/// Resolve the tenant owning an unconsumed, unexpired login state.
+///
+/// The common OIDC callback carries only the provider's `state`; it has no
+/// tenant selector and never trusts `Host` or forwarded headers. The
+/// SECURITY DEFINER function `wyrd.auth_login_state_tenant` answers this one
+/// question across tenant RLS for the runtime `wyrd_app` role: the tenant id
+/// of the row whose SHA-256 state hash is `state_hash`, or `None` when the
+/// state is unknown, consumed, or expired. It exposes no other column, so the
+/// caller learns only which tenant transaction to open.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when Postgres rejects the lookup and
+/// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
+/// Wyrd tenant-id contract.
+pub async fn resolve_by_login_state_for_app(
+    pool: &PgPool,
+    state_hash: &[u8; 32],
+) -> Result<Option<DataTenantId>, SqlError> {
+    // Dynamic query is intentional: the definer function post-dates the SQLx
+    // offline bundle, like the slug resolver above.
+    let tenant_uuid =
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT wyrd.auth_login_state_tenant($1)")
+            .bind(state_hash.as_slice())
+            .fetch_one(pool)
+            .await
+            .map_err(SqlError::from)?;
+
+    tenant_uuid
+        .map(DataTenantId::new)
+        .transpose()
+        .map_err(SqlError::InvalidDataTenantId)
+}
+
 /// Report whether a tenant's lifecycle state admits its credentials.
 ///
 /// The authentication path's one question about the tenant directory, answered

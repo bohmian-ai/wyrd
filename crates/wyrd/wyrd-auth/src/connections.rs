@@ -2,7 +2,7 @@
 //!
 //! [`HumanConnections`] is the one owner of a tenant's human login trust. The
 //! admin lifecycle (stage, test, activate, deactivate, remove) and the login
-//! and callback read ([`HumanConnections::active_connection_for`]) all go
+//! and callback read ([`HumanConnections::active_connection`]) all go
 //! through it, and it reads only `wyrd.auth_human_connections`: workload trust
 //! in `wyrd.auth_trusted_issuers` never authorizes a human login.
 //!
@@ -55,7 +55,10 @@ use crate::callback::{DiscoveryFailure, authorization_code_request, discover_pro
 use crate::error::{provider_unreachable, screen_error, store_error};
 use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
 use crate::issuance::resolve_permissions;
-use crate::login::{auth_nonce, auth_state_key, build_authorization_url, pkce_verifier};
+use crate::login::{
+    LOGIN_COMPLETE_PATH, LoginCompletions, auth_nonce, auth_state_key, build_authorization_url,
+    pkce_verifier,
+};
 use crate::pg_resolvers::{client_auth_from_row, human_connection_trusted_issuer, seal_secret};
 
 /// How long a successful candidate test authorizes activation.
@@ -117,6 +120,8 @@ pub struct HumanConnections {
     http: ScreenedHttp,
     /// `{public_origin}/auth/callback`, or `None` without a public origin.
     callback_url: Option<Url>,
+    /// `{public_origin}/login/complete`, or `None` without a public origin.
+    completion_url: Option<Url>,
 }
 
 impl Debug for HumanConnections {
@@ -182,9 +187,10 @@ impl HumanConnections {
     /// Build the owner over the runtime store, keyring, screened HTTP, and
     /// public origin.
     ///
-    /// The callback URL is `{public_origin}/auth/callback`; `None` when the
-    /// deployment configures no public origin, in which case staging, testing,
-    /// and login refuse.
+    /// The callback URL is `{public_origin}/auth/callback` and the browser
+    /// completion URL `{public_origin}/login/complete`; both are `None` when
+    /// the deployment configures no public origin, in which case staging,
+    /// testing, and login refuse.
     #[must_use]
     pub fn new(
         postgres: WyrdPostgres,
@@ -197,6 +203,7 @@ impl HumanConnections {
             keyring,
             http,
             callback_url: public_origin.and_then(|origin| origin.join(CALLBACK_PATH).ok()),
+            completion_url: public_origin.and_then(|origin| origin.join(LOGIN_COMPLETE_PATH).ok()),
         }
     }
 
@@ -556,36 +563,29 @@ impl HumanConnections {
         conn.commit().await.map_err(store_error)
     }
 
-    /// Resolve the tenant's Active connection, requiring it to be `issuer`.
+    /// Resolve the tenant's Active connection, or `None` when it has none.
     ///
     /// Read durably on every call, so every replica sees activation,
-    /// replacement, and deactivation at once. Login state records the issuer
-    /// the flow began against; if the tenant has since activated a different
-    /// provider or deactivated login, the flow fails closed rather than
-    /// trusting whichever provider is active now. The returned binding names
-    /// the exact revision read, which session issuance re-checks under the
-    /// slot lock.
+    /// replacement, and deactivation at once. The returned binding names the
+    /// exact revision read; login state records it, the callback requires it to
+    /// be unchanged, and session issuance re-checks it under the slot lock.
     ///
     /// # Errors
-    /// Returns [`WyrdError::InvalidToken`] when no Active connection exists or
-    /// it names a different issuer, and [`WyrdError::AuthVerifyUnavailable`]
-    /// when the store fails or the Active row cannot be opened (for example,
-    /// its secret was sealed under a key this process does not hold).
-    pub async fn active_connection_for(
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails or the
+    /// Active row cannot be opened (for example, its secret was sealed under a
+    /// key this process does not hold).
+    pub async fn active_connection(
         &self,
         tenant: DataTenantId,
-        issuer: &IssuerUrl,
-    ) -> Result<ActiveHumanConnection, WyrdError> {
+    ) -> Result<Option<ActiveHumanConnection>, WyrdError> {
         let mut conn = self.begin(tenant).await?;
         let row = human_connection_in_state(&mut conn, HumanConnectionState::Active.as_str())
             .await
             .map_err(store_error)?;
         conn.commit().await.map_err(store_error)?;
-        let not_active = || WyrdError::InvalidToken {
-            message: "issuer is not the active login connection for the tenant".to_owned(),
-            details: json!({}),
+        let Some(row) = row else {
+            return Ok(None);
         };
-        let row = row.ok_or_else(not_active)?;
         let binding = HumanConnectionBinding {
             connection_id: row.connection_id,
             connection_revision: row.revision,
@@ -598,10 +598,53 @@ impl HumanConnections {
                     details: json!({ "retry_after_seconds": 1 }),
                 }
             })?;
-        if trusted.issuer != *issuer {
-            return Err(not_active());
-        }
-        Ok(ActiveHumanConnection { trusted, binding })
+        Ok(Some(ActiveHumanConnection { trusted, binding }))
+    }
+
+    /// The fixed same-origin BFF route a completed browser login is sent to.
+    ///
+    /// `{public_origin}/login/complete` (see [`LOGIN_COMPLETE_PATH`]): no query
+    /// string and no capability, so the redirect carries nothing a browser,
+    /// log, or referrer could replay.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] naming the missing public origin.
+    pub fn completion_url(&self) -> Result<&Url, WyrdError> {
+        self.completion_url
+            .as_ref()
+            .ok_or_else(public_origin_missing)
+    }
+
+    /// The deployment keyring login completions are sealed under.
+    ///
+    /// A completed human login is stored until the BFF or CLI redeems it, so
+    /// it is sealed at rest; a keyless deployment cannot complete a human
+    /// login and refuses to begin one.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
+    /// when no sealing keyring is configured.
+    pub(crate) fn completion_keyring(&self) -> Result<&Arc<SealingKeyring>, WyrdError> {
+        self.keyring.as_ref().ok_or_else(|| WyrdError::Validation {
+            message:
+                "human SSO login requires a deployment sealing key (WYRD_SEALING_KEY_FILE) to \
+                      protect completed logins at rest"
+                    .to_owned(),
+            details: json!({ "reason": "sealing_key_missing" }),
+        })
+    }
+
+    /// The login-completion redemption owner over this deployment's store and
+    /// sealing keyring.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
+    /// when no sealing keyring is configured.
+    pub fn completions(&self) -> Result<LoginCompletions, WyrdError> {
+        Ok(LoginCompletions::new(
+            self.postgres.clone(),
+            Arc::clone(self.completion_keyring()?),
+        ))
     }
 
     /// Refuse when no public origin is configured.
@@ -609,15 +652,7 @@ impl HumanConnections {
     /// # Errors
     /// Returns [`WyrdError::Validation`] naming the missing public origin.
     pub fn require_callback(&self) -> Result<&Url, WyrdError> {
-        self.callback_url
-            .as_ref()
-            .ok_or_else(|| WyrdError::Validation {
-                message:
-                    "the deployment has no public origin configured (WYRD_PUBLIC_ORIGIN), so no \
-                      callback URL can be registered"
-                        .to_owned(),
-                details: json!({ "reason": "public_origin_missing" }),
-            })
+        self.callback_url.as_ref().ok_or_else(public_origin_missing)
     }
 
     /// Open one RLS tenant transaction through the runtime store.
@@ -1013,6 +1048,17 @@ fn conflict(message: &str) -> WyrdError {
     WyrdError::ConnectionConflict {
         message: message.to_owned(),
         details: json!({}),
+    }
+}
+
+/// The deployment configures no public origin, so it has no callback or
+/// completion URL.
+fn public_origin_missing() -> WyrdError {
+    WyrdError::Validation {
+        message: "the deployment has no public origin configured (WYRD_PUBLIC_ORIGIN), so no \
+                  callback URL can be registered"
+            .to_owned(),
+        details: json!({ "reason": "public_origin_missing" }),
     }
 }
 

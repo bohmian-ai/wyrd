@@ -5,7 +5,7 @@ use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 use wyrd_client::auth::TokenExchange;
 use wyrd_client::transport::HttpConfig;
-use wyrd_spec::auth::{SecretBearer, TokenRequest};
+use wyrd_spec::auth::{SecretBearer, TokenRequest, TokenResponse};
 
 use crate::error::WyrdCliError;
 
@@ -47,11 +47,23 @@ pub async fn dispatch(args: RefreshArgs) -> Result<ExitCode, WyrdCliError> {
             source: error.into_wyrd(),
         })?;
 
-    super::login::print_tokens(&token);
+    print_tokens(&token);
     Ok(ExitCode::SUCCESS)
 }
 
 /// Argument parsing for `wyrd auth refresh`.
+/// Print an issued token pair to the operator terminal.
+///
+/// The one place either token exists outside the server; neither is written to a
+/// file or a log by the CLI.
+fn print_tokens(token: &TokenResponse) {
+    println!("access_token:  {}", token.access_token.expose());
+    if let Some(refresh_token) = &token.refresh_token {
+        println!("refresh_token: {}", refresh_token.expose());
+    }
+    println!("expires_at:    {}", token.expires_at);
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;

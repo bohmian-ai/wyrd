@@ -1,58 +1,28 @@
-//! Human OIDC callback and authorization-code exchange.
+//! Human OIDC callback adapter: the common `GET /auth/callback` exchange.
 
-use axum::Json;
-use axum::extract::{Extension, Query, State};
-use axum::http::HeaderMap;
 use secrecy::SecretString;
-use uuid::Uuid;
-use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{CallbackQuery, TokenResponse};
-use wyrd_spec::error::WyrdError;
-use wyrd_spec::request_id::RequestId;
-use wyrd_sql::SqlError;
+use wyrd_auth::callback::CompletedLogin;
 
-use crate::auth::{auth_not_configured, invalid_token, tenant_slug_from_host};
+use crate::auth::auth_not_configured;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Handler for `GET /auth/callback`.
-#[tracing::instrument(level = "debug", skip(state, headers), fields(state = %query.state))]
-pub async fn callback(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    request_id: Option<Extension<RequestId>>,
-    Query(query): Query<CallbackQuery>,
-) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
-    let request_id = request_id
-        .as_ref()
-        .map(|Extension(id)| id.as_str().to_owned())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let token = exchange_authorization_code(
-        &state,
-        &headers,
-        query.code.into_secret_string(),
-        &query.state,
-        &request_id,
-    )
-    .await?;
-    Ok(Json(token))
-}
-
-/// Execute the authorization-code grant for `POST /auth/token`.
+/// Complete a login from the provider callback's `code` and `state`.
+///
+/// Builds the authorization-code exchange from the server's auth
+/// configuration and runs it. The tenant is recovered from the state alone;
+/// no request header is consulted. The issued session is stored sealed for
+/// redemption and never returned here.
 ///
 /// # Errors
-/// Returns [`WyrdErrorResponse`] when the callback tenant cannot be resolved
-/// from the request, or when the grant itself is refused — unknown, consumed,
-/// or expired login state, a refused code or unverifiable id token, an
-/// inactive user, or a failed role, issuance, or audit write.
+/// Returns [`WyrdErrorResponse`] when auth is not configured, and every
+/// refusal of [`wyrd_auth::callback::AuthorizationCodeExchange::execute`].
 pub async fn exchange_authorization_code(
     state: &AppState,
-    headers: &HeaderMap,
     code: SecretString,
     state_key: &str,
     request_id: &str,
-) -> Result<TokenResponse, WyrdErrorResponse> {
-    let tenant_id = resolve_callback_tenant(state, headers).await?;
+) -> Result<CompletedLogin, WyrdErrorResponse> {
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
         issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
         verifier: state
@@ -67,37 +37,9 @@ pub async fn exchange_authorization_code(
             .ok_or_else(auth_not_configured)?,
     };
     service
-        .execute(tenant_id, code, state_key, request_id)
+        .execute(code, state_key, request_id)
         .await
         .map_err(WyrdErrorResponse::from)
-}
-
-async fn resolve_callback_tenant(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<DataTenantId, WyrdErrorResponse> {
-    let Some(slug) = tenant_slug_from_host(headers) else {
-        return Err(invalid_token("request host does not encode a tenant"));
-    };
-    match wyrd_sql::queries::platform::tenant_resolver::resolve_by_slug_for_app(
-        state.postgres.app_pool(),
-        &slug,
-    )
-    .await
-    .map_err(sql_error)?
-    {
-        Some(tenant) => Ok(tenant),
-        None => Err(invalid_token("request tenant could not be resolved")),
-    }
-}
-
-fn sql_error(error: impl Into<SqlError>) -> WyrdErrorResponse {
-    let error = error.into();
-    tracing::warn!(error = %error, "OIDC callback SQL unavailable");
-    WyrdErrorResponse::from(WyrdError::AuthVerifyUnavailable {
-        message: "auth backend unavailable".to_owned(),
-        details: serde_json::json!({ "retry_after_seconds": 1 }),
-    })
 }
 
 #[cfg(test)]
@@ -109,7 +51,6 @@ mod pg_tests {
     use crate::auth::pg_resolvers::PgIssuerResolver;
     use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
-    use axum::http::{HeaderMap, HeaderValue, header};
     use chrono::{Duration as ChronoDuration, Utc};
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use secrecy::SecretString;
@@ -117,11 +58,10 @@ mod pg_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth::callback::{
-        AuthorizationCodeExchange, audit_authorization_code_failure, ensure_user_identity,
-        role_names_to_refs, verify_nonce,
+        AuthorizationCodeExchange, CompletedLogin, audit_authorization_code_failure,
+        ensure_user_identity, role_names_to_refs, verify_nonce,
     };
     use wyrd_auth::connections::HumanConnections;
-    use wyrd_auth::login::{LoginStateEntry, PgLoginStateStore};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::{
         ClaimMapping, ClaimPath, ClientAuth, JwksCache, ScreenedHttp, TrustedIssuer,
@@ -133,11 +73,13 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::IssuerTokenPolicy;
-    use wyrd_spec::auth::{IssuerUrl, TokenResponse, TokenType};
+    use wyrd_spec::auth::{IssuerUrl, LoginInitiation, Sha256Hex, TokenType};
+    use wyrd_sql::queries::auth::{
+        ConsumedLoginState, LoginStateBinding, NewLoginState, consume_login_state,
+        insert_login_state,
+    };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
-
-    use crate::auth::tenant_slug_from_host;
 
     use super::exchange_authorization_code;
 
@@ -148,8 +90,10 @@ mod pg_tests {
     const EXTERNAL_KID: &str = "ext-key-1";
     const ED_X: &str = "WhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ-DZ8Vw";
 
+    /// Only mapped groups grant roles; connection default roles never apply
+    /// to a human login.
     #[test]
-    fn role_names_to_refs_maps_defaults_and_known_groups_only() {
+    fn role_names_to_refs_maps_known_groups_only_and_never_defaults() {
         let trusted = trusted_issuer(
             DataTenantId::new_v7(),
             HashMap::from([("data-science".to_owned(), vec!["data_science".to_owned()])]),
@@ -164,25 +108,25 @@ mod pg_tests {
             .expect("roles map"),
         );
 
-        assert_eq!(
-            roles,
-            BTreeSet::from(["data_science".to_owned(), "viewer".to_owned()])
-        );
+        assert_eq!(roles, BTreeSet::from(["data_science".to_owned()]));
     }
 
+    /// A person in no group gets no roles, even when the connection lists
+    /// default roles.
     #[test]
-    fn role_names_to_refs_uses_defaults_when_groups_empty() {
+    fn role_names_to_refs_grants_nothing_without_groups() {
         let trusted = trusted_issuer(
             DataTenantId::new_v7(),
             HashMap::from([("data-science".to_owned(), vec!["data_science".to_owned()])]),
             vec!["viewer".to_owned()],
         );
 
-        let roles = role_set(role_names_to_refs(&trusted, &[]).expect("roles map"));
+        let roles = role_names_to_refs(&trusted, &[]).expect("roles map");
 
-        assert_eq!(roles, BTreeSet::from(["viewer".to_owned()]));
+        assert!(roles.is_empty());
     }
 
+    /// An unmapped group grants nothing.
     #[test]
     fn role_names_to_refs_default_denies_unmapped_groups() {
         let trusted = trusted_issuer(DataTenantId::new_v7(), HashMap::new(), Vec::new());
@@ -192,67 +136,50 @@ mod pg_tests {
         assert!(roles.is_empty());
     }
 
+    /// Two groups mapping to the same role yield it once.
     #[test]
-    fn role_names_to_refs_deduplicates_default_and_group_roles() {
+    fn role_names_to_refs_deduplicates_group_roles() {
         let trusted = trusted_issuer(
             DataTenantId::new_v7(),
-            HashMap::from([("data-science".to_owned(), vec!["viewer".to_owned()])]),
-            vec!["viewer".to_owned()],
+            HashMap::from([
+                ("data-science".to_owned(), vec!["viewer".to_owned()]),
+                ("analysts".to_owned(), vec!["viewer".to_owned()]),
+            ]),
+            Vec::new(),
         );
 
         let roles = role_set(
-            role_names_to_refs(&trusted, &["data-science".to_owned()]).expect("roles map"),
+            role_names_to_refs(
+                &trusted,
+                &["data-science".to_owned(), "analysts".to_owned()],
+            )
+            .expect("roles map"),
         );
 
         assert_eq!(roles, BTreeSet::from(["viewer".to_owned()]));
     }
 
+    /// A token echoing another login's nonce is refused.
     #[test]
     fn verify_nonce_rejects_mismatched_id_token_nonce() {
-        let state = LoginStateEntry {
-            code_verifier: SecretString::from("verifier".to_owned()),
-            nonce: "nonce-a".to_owned(),
-            issuer: "https://idp.example.com/realms/acme".to_owned(),
-            redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
-            connection: unseeded_binding(),
-        };
-
-        let error = verify_nonce(&state, &serde_json::json!({ "nonce": "nonce-b" }))
+        let error = verify_nonce("nonce-a", &serde_json::json!({ "nonce": "nonce-b" }))
             .expect_err("nonce mismatch rejects");
 
         assert_eq!(error.code(), "WYRD_AUTH_400_INVALID_NONCE");
     }
 
-    #[test]
-    fn callback_tenant_slug_rejects_localhost_hosts() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::HOST,
-            HeaderValue::from_static("acme.localhost:8080"),
-        );
-
-        assert!(tenant_slug_from_host(&headers).is_none());
-
-        headers.insert(
-            header::HOST,
-            HeaderValue::from_static("acme.example.com:8080"),
-        );
-
-        assert_eq!(
-            tenant_slug_from_host(&headers).map(|slug| slug.as_str().to_owned()),
-            Some("acme".to_owned())
-        );
-    }
-
+    /// A state naming no pending login is refused before any tenant is known,
+    /// so no tenant audit event is written for it.
+    ///
+    /// # Panics
+    /// Panics when the state is accepted or an audit event is staged.
     #[tokio::test]
-    async fn missing_state_writes_failure_audit_with_nil_principal() {
+    async fn unknown_state_is_refused_without_a_tenant_audit() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let state = test_state_with_external(&fixture).await;
-        let headers = tenant_headers(fixture.tenant_slug());
 
         let error = exchange_authorization_code(
             &state,
-            &headers,
             SecretString::from("code".to_owned()),
             "missing-state",
             "req-missing-state",
@@ -261,55 +188,48 @@ mod pg_tests {
         .expect_err("missing state fails");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_STATE");
-        let audit = audit_rows(&fixture).await;
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].0, Uuid::nil());
-        assert_eq!(audit[0].1, "denied");
-        assert_eq!(audit[0].2, auth_failure_detail("INVALID_TOKEN"));
+        assert!(audit_rows(&fixture).await.is_empty());
     }
 
+    /// A state that was already consumed names no pending login, so its
+    /// replay is refused before any provider IO.
+    ///
+    /// # Panics
+    /// Panics when the replay is accepted.
     #[tokio::test]
-    async fn stored_invalid_issuer_writes_failure_audit_with_nil_principal() {
+    async fn a_consumed_state_is_refused() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
         let state = test_state_with_external(&fixture).await;
-        let headers = tenant_headers(fixture.tenant_slug());
-        PgLoginStateStore::new(fixture.wyrd_postgres().clone())
-            .put(
-                tenant,
-                "bad-issuer-state",
-                LoginStateEntry {
-                    code_verifier: SecretString::from("verifier".to_owned()),
-                    nonce: "nonce".to_owned(),
-                    issuer: "not a url".to_owned(),
-                    redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
-                    connection: unseeded_binding(),
-                },
-                StdDuration::from_secs(300),
-            )
-            .await
-            .expect("state inserts");
+        let binding = committed_active_binding(&fixture).await;
+        let raw = "consumed-state";
+        pending_login(
+            &fixture,
+            *Sha256Hex::digest(raw.as_bytes()).as_bytes(),
+            binding,
+            "nonce",
+        )
+        .await;
 
         let error = exchange_authorization_code(
             &state,
-            &headers,
             SecretString::from("code".to_owned()),
-            "bad-issuer-state",
-            "req-bad-issuer",
+            raw,
+            "req-consumed",
         )
         .await
-        .expect_err("stored issuer rejects");
+        .expect_err("a consumed state is refused");
 
-        assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
-        let audit = audit_rows(&fixture).await;
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].0, Uuid::nil());
-        assert_eq!(audit[0].1, "denied");
-        assert_eq!(audit[0].2, auth_failure_detail("INVALID_TOKEN"));
+        assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_STATE");
     }
 
+    /// A verified token for a consumed login issues the session, stores it
+    /// sealed on the state row for its browser binding, and audits success;
+    /// the completion redeems once to a usable session.
+    ///
+    /// # Panics
+    /// Panics when completion, redemption, or the audit differ.
     #[tokio::test]
-    async fn finish_authorization_code_exchange_mints_tokens_and_success_audit() {
+    async fn finish_issues_seals_and_audits_the_session() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let server = MockServer::start().await;
@@ -318,52 +238,61 @@ mod pg_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
             .mount(&server)
             .await;
-        let jwks_uri = jwks_uri(&server);
         let state = test_state_with_external(&fixture).await;
-        let trusted = trusted_issuer_with_jwks(tenant, jwks_uri, HashMap::new(), Vec::new());
-        let login_state =
-            login_state_with_nonce("nonce-ok", committed_active_binding(&fixture).await);
+        let trusted =
+            trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
+        let binding = committed_active_binding(&fixture).await;
+        let (hash, login) = pending_login(&fixture, [1_u8; 32], binding, "nonce-ok").await;
         let id_token = encode_external_token(&external_claims(
             EXTERNAL_AUDIENCE,
             "nonce-ok",
             Some("ext@example.com"),
             &[],
         ));
-        let (response, audit_principal_id) = finish_id_token_exchange(
-            &state,
-            tenant,
-            &trusted,
-            &login_state,
-            &id_token,
-            "req-success",
-        )
-        .await
-        .expect("callback completion succeeds");
 
-        assert_eq!(response.token_type, TokenType::Bearer);
-        assert!(!response.access_token.expose().is_empty());
-        assert!(
-            !response
-                .refresh_token
-                .as_ref()
-                .expect("human OIDC login issues a refresh token")
-                .expose()
-                .is_empty()
-        );
-        assert_ne!(audit_principal_id, Uuid::nil());
-        assert_eq!(refresh_token_count(&fixture, audit_principal_id).await, 1);
+        let (completed, principal_id) = authorization_exchange_service(&state)
+            .finish_id_token_exchange(tenant, &hash, &trusted, &login, &id_token, "req-success")
+            .await
+            .expect("callback completion succeeds");
+
+        assert_eq!(completed, CompletedLogin::Browser);
+        assert_ne!(principal_id, Uuid::nil());
+        assert_eq!(refresh_token_count(&fixture, principal_id).await, 1);
         let audit = audit_rows(&fixture).await;
         assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].0, audit_principal_id);
+        assert_eq!(audit[0].0, principal_id);
         assert_eq!(audit[0].1, "allowed");
-        let user = audit_principal_id.to_string();
+        let user = principal_id.to_string();
         assert_eq!(audit[0].2["subject_principal_id"], user.as_str());
         assert_eq!(audit[0].2["actor_principal_id"], user.as_str());
         assert_eq!(audit[0].2["delegation_chain"], serde_json::json!([]));
+        let completions = state
+            .auth
+            .human_connections
+            .as_ref()
+            .expect("connection owner")
+            .completions()
+            .expect("keyring configured");
+        let redeemed = completions
+            .redeem(tenant, LoginInitiation::Browser(flow_hash()))
+            .await
+            .expect("the completion redeems");
+        assert_eq!(redeemed.token_type, TokenType::Bearer);
+        assert!(!redeemed.access_token.expose().is_empty());
+        assert!(redeemed.refresh_token.is_some());
+        completions
+            .redeem(tenant, LoginInitiation::Browser(flow_hash()))
+            .await
+            .expect_err("a completion redeems once");
     }
 
+    /// A token for another audience is refused, audited with no principal,
+    /// and leaves no completion or session behind.
+    ///
+    /// # Panics
+    /// Panics when the token is accepted or a completion is stored.
     #[tokio::test]
-    async fn finish_authorization_code_exchange_wrong_audience_writes_failure_audit() {
+    async fn a_wrong_audience_is_refused_and_leaves_no_completion() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let server = MockServer::start().await;
@@ -372,10 +301,11 @@ mod pg_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(ed_jwks_json(EXTERNAL_KID)))
             .mount(&server)
             .await;
-        let jwks_uri = jwks_uri(&server);
         let state = test_state_with_external(&fixture).await;
-        let trusted = trusted_issuer_with_jwks(tenant, jwks_uri, HashMap::new(), Vec::new());
-        let login_state = login_state_with_nonce("nonce-ok", unseeded_binding());
+        let trusted =
+            trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
+        let binding = committed_active_binding(&fixture).await;
+        let (hash, login) = pending_login(&fixture, [2_u8; 32], binding, "nonce-ok").await;
         let id_token = encode_external_token(&external_claims(
             "wrong-audience",
             "nonce-ok",
@@ -383,16 +313,9 @@ mod pg_tests {
             &[],
         ));
 
-        let error = finish_with_failure_audit(
-            &state,
-            tenant,
-            &trusted,
-            &login_state,
-            &id_token,
-            "req-wrong-audience",
-        )
-        .await
-        .expect_err("wrong audience rejects");
+        let error = finish_with_failure_audit(&state, tenant, &hash, &trusted, &login, &id_token)
+            .await
+            .expect_err("wrong audience rejects");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
         let audit = audit_rows(&fixture).await;
@@ -400,6 +323,16 @@ mod pg_tests {
         assert_eq!(audit[0].0, Uuid::nil());
         assert_eq!(audit[0].1, "denied");
         assert_eq!(audit[0].2, auth_failure_detail("INVALID_TOKEN"));
+        state
+            .auth
+            .human_connections
+            .as_ref()
+            .expect("connection owner")
+            .completions()
+            .expect("keyring configured")
+            .redeem(tenant, LoginInitiation::Browser(flow_hash()))
+            .await
+            .expect_err("no completion was stored");
     }
 
     #[tokio::test]
@@ -509,24 +442,49 @@ mod pg_tests {
         }
     }
 
-    /// Login state for `nonce`, bound to `connection`.
-    fn login_state_with_nonce(nonce: &str, connection: HumanConnectionBinding) -> LoginStateEntry {
-        LoginStateEntry {
-            code_verifier: SecretString::from("verifier".to_owned()),
-            nonce: nonce.to_owned(),
-            issuer: EXTERNAL_ISSUER.to_owned(),
-            redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
-            connection,
-        }
+    /// The browser flow binding every pending login in these tests records.
+    fn flow_hash() -> Sha256Hex {
+        Sha256Hex::digest(b"callback-flow")
     }
 
-    /// A binding naming no stored connection, for paths refused before
-    /// issuance ever checks it.
-    fn unseeded_binding() -> HumanConnectionBinding {
-        HumanConnectionBinding {
-            connection_id: Uuid::now_v7(),
-            connection_revision: 1,
-        }
+    /// Record and consume a browser login bound to the fixture's seeded Active
+    /// connection, as the callback does before provider IO, and return its
+    /// state hash and consumed row.
+    ///
+    /// # Panics
+    /// Panics when the row cannot be written or consumed.
+    async fn pending_login(
+        fixture: &PgFixture,
+        state_hash: [u8; 32],
+        connection: HumanConnectionBinding,
+        nonce: &str,
+    ) -> ([u8; 32], ConsumedLoginState) {
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let inserted = insert_login_state(
+            &mut conn,
+            &NewLoginState {
+                state_hash,
+                connection,
+                issuer: "https://idp.fixture.test".to_owned(),
+                client_id: "wyrd-fixture".to_owned(),
+                redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
+                code_verifier: "verifier".to_owned(),
+                nonce: nonce.to_owned(),
+                binding: LoginStateBinding::Browser {
+                    flow_hash: *flow_hash().as_bytes(),
+                },
+            },
+            StdDuration::from_mins(5),
+        )
+        .await
+        .expect("state inserts");
+        assert!(inserted, "the state is recorded");
+        let consumed = consume_login_state(&mut conn, &state_hash)
+            .await
+            .expect("state consumes")
+            .expect("state is pending");
+        conn.commit().await.expect("state commits");
+        (state_hash, consumed)
     }
 
     /// Seed and commit the tenant's Active human connection, returning the
@@ -540,36 +498,30 @@ mod pg_tests {
         binding
     }
 
+    /// Run the post-exchange half of the callback and, on refusal, stage the
+    /// denied audit exactly as `execute` does.
+    ///
+    /// # Errors
+    /// Returns the refusal of `finish_id_token_exchange`.
     async fn finish_with_failure_audit(
         state: &AppState,
         tenant_id: DataTenantId,
+        state_hash: &[u8; 32],
         trusted: &TrustedIssuer,
-        login_state: &LoginStateEntry,
+        login: &ConsumedLoginState,
         id_token: &str,
-        request_id: &str,
-    ) -> Result<TokenResponse, WyrdErrorResponse> {
-        let mut audit_principal_id = Uuid::nil();
+    ) -> Result<CompletedLogin, WyrdErrorResponse> {
         let result = authorization_exchange_service(state)
-            .finish_id_token_exchange(
-                state.postgres.wyrd(),
-                tenant_id,
-                trusted,
-                login_state,
-                id_token,
-                request_id,
-            )
+            .finish_id_token_exchange(tenant_id, state_hash, trusted, login, id_token, "req")
             .await
-            .map(|(token, principal_id)| {
-                audit_principal_id = principal_id;
-                token
-            })
+            .map(|(completed, _)| completed)
             .map_err(WyrdErrorResponse::from);
         if let Err(error) = &result {
             audit_authorization_code_failure(
                 state.postgres.wyrd(),
                 tenant_id,
-                audit_principal_id,
-                request_id,
+                Uuid::nil(),
+                "req",
                 &error.0,
             )
             .await;
@@ -577,27 +529,10 @@ mod pg_tests {
         result
     }
 
-    async fn finish_id_token_exchange(
-        state: &AppState,
-        tenant_id: DataTenantId,
-        trusted: &TrustedIssuer,
-        login_state: &LoginStateEntry,
-        id_token: &str,
-        request_id: &str,
-    ) -> Result<(TokenResponse, Uuid), WyrdErrorResponse> {
-        authorization_exchange_service(state)
-            .finish_id_token_exchange(
-                state.postgres.wyrd(),
-                tenant_id,
-                trusted,
-                login_state,
-                id_token,
-                request_id,
-            )
-            .await
-            .map_err(WyrdErrorResponse::from)
-    }
-
+    /// The exchange service over the test state's auth configuration.
+    ///
+    /// # Panics
+    /// Panics when the test state lacks issuing, verification, or connections.
     fn authorization_exchange_service(state: &AppState) -> AuthorizationCodeExchange {
         AuthorizationCodeExchange {
             issuer: state
@@ -740,15 +675,6 @@ mod pg_tests {
                 sealing_key: Some(sealing_key),
                 ..crate::components::auth::ServerAuth::default()
             })
-    }
-
-    fn tenant_headers(slug: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::HOST,
-            HeaderValue::from_str(&format!("{slug}.example.com")).expect("host is valid"),
-        );
-        headers
     }
 
     /// Staged `auth.token.exchange` events as `(principal_id, outcome, detail)`,

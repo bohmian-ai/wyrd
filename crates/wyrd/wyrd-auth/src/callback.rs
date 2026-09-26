@@ -1,4 +1,9 @@
-//! Domain logic for the human OIDC callback flow.
+//! Domain logic for the common human OIDC callback.
+//!
+//! The callback carries only the provider's `code` and `state`. The state's
+//! SHA-256 names one login-state row across tenants; that row alone decides
+//! the tenant, connection revision, issuer, client, redirect, PKCE verifier,
+//! nonce, and initiation binding. No request header takes part.
 
 use std::sync::Arc;
 
@@ -14,13 +19,15 @@ use wyrd_auth_oidc::{
 use wyrd_auth_verify::ExternalVerifier;
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_spec::auth::{IssuerUrl, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
-    delete_user, insert_user, replace_user_roles, upsert_user_identity, user_id_by_identity,
+    ConsumedLoginState, LoginStateBinding, complete_login_state, consume_login_state, delete_user,
+    insert_user, replace_user_roles, upsert_user_identity, user_id_by_identity,
 };
+use wyrd_sql::queries::platform::tenant_resolver::resolve_by_login_state_for_app;
 use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
 
 use crate::audit::{
@@ -30,7 +37,7 @@ use crate::connections::HumanConnections;
 use crate::error::{auth_error_to_wyrd, provider_unreachable, screen_error, store_error};
 use crate::exchange_api_key::role_refs;
 use crate::issuance::TenantTokenIssuer;
-use crate::login::{LoginStateEntry, PgLoginStateStore};
+use crate::login::{LOGIN_COMPLETION_TTL, seal_completion, state_hash};
 use crate::pg_resolvers::PgIssuerResolver;
 
 #[derive(Debug, Deserialize)]
@@ -38,25 +45,37 @@ struct TokenEndpointResponse {
     id_token: String,
 }
 
-struct FinishAuthorizationCodeInput<'a> {
-    postgres: &'a WyrdPostgres,
-    tenant_id: DataTenantId,
-    trusted: &'a TrustedIssuer,
-    login_state: &'a LoginStateEntry,
-    id_token: &'a str,
-    request_id: &'a str,
-    audit_principal_id: &'a mut Uuid,
+/// How a completed login was initiated, which decides the callback's
+/// response: a browser login is redirected to the BFF completion route, a CLI
+/// login gets a static page telling the person to return to the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletedLogin {
+    /// Initiated by the BFF with a browser flow binding.
+    Browser,
+    /// Initiated by a CLI handoff.
+    Cli,
 }
 
-/// Human OIDC authorization-code exchange service.
+impl From<&LoginStateBinding> for CompletedLogin {
+    /// The response kind of a login recorded with `binding`.
+    fn from(binding: &LoginStateBinding) -> Self {
+        match binding {
+            LoginStateBinding::Browser { .. } => Self::Browser,
+            LoginStateBinding::Cli { .. } => Self::Cli,
+        }
+    }
+}
+
+/// Human OIDC authorization-code exchange service behind the common callback.
 #[derive(Clone)]
 pub struct AuthorizationCodeExchange {
     /// The shared tenant issuance workflow.
     pub issuer: TenantTokenIssuer,
     /// External OIDC id-token verifier.
     pub verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
-    /// The tenant human-connection owner; the only source of human trust and
-    /// of the screened HTTP capability every provider request is made through.
+    /// The tenant human-connection owner; the only source of human trust, of
+    /// the completion keyring, and of the screened HTTP capability every
+    /// provider request is made through.
     pub connections: HumanConnections,
 }
 
@@ -68,160 +87,152 @@ impl std::fmt::Debug for AuthorizationCodeExchange {
 }
 
 impl AuthorizationCodeExchange {
-    /// Execute the authorization-code grant.
+    /// Complete a login from the provider callback's `code` and `state`.
     ///
-    /// The login must still be on the exact connection revision its state was
-    /// bound to when it began, and issuance re-checks that revision under the
-    /// connection slot lock, so a replacement, deactivation, or removal that
-    /// commits while the provider round-trip is in flight refuses the session.
+    /// The SHA-256 of `state_key` resolves the login's tenant through the
+    /// narrow definer lookup; an unknown, expired, or already consumed state
+    /// names no tenant and is refused without any tenant audit. Within the
+    /// tenant the state row is consumed and committed before any provider IO,
+    /// so a replayed state never reaches the provider. The bound connection
+    /// revision must still be the tenant's Active connection with the recorded
+    /// issuer and client; the code is exchanged with the recorded redirect URI
+    /// and PKCE verifier; and [`Self::finish_id_token_exchange`] verifies the
+    /// token and issues and seals the session.
     ///
     /// # Errors
-    /// Returns [`WyrdError`] when the login state is unknown, already consumed,
-    /// or expired, when the login's connection is no longer the tenant's Active
-    /// revision, when the issuer refuses the code or its id token fails
-    /// verification, when role persistence or successor issuance fails, or when
-    /// the decision cannot be audited. Every refusal is audited before it is
-    /// returned, and the grant transaction commits or rolls back whole.
+    /// Returns [`WyrdError::InvalidState`] when the state is unknown, expired,
+    /// or replayed; [`WyrdError::Validation`] when no sealing keyring is
+    /// configured; [`WyrdError::InvalidToken`] when the bound connection is no
+    /// longer Active or the provider refuses the code;
+    /// [`WyrdError::DiscoveryUnavailable`] or
+    /// [`WyrdError::AuthVerifyUnavailable`] when the provider or store is
+    /// unavailable; and the errors of [`Self::finish_id_token_exchange`].
+    /// Every refusal after the tenant is known is audited best-effort before
+    /// it is returned. A failure after the consume commit leaves the state
+    /// spent: the person starts a new login.
     pub async fn execute(
         &self,
-        tenant_id: DataTenantId,
         code: SecretString,
         state_key: &str,
         request_id: &str,
-    ) -> Result<TokenResponse, WyrdError> {
+    ) -> Result<CompletedLogin, WyrdError> {
         let postgres = self.connections.postgres();
-        let store = PgLoginStateStore::new(postgres.clone());
-        let mut audit_principal_id = Uuid::nil();
-        let result = async {
-            let Some(login_state) = store
-                .take(tenant_id, state_key)
-                .await
-                .map_err(store_error)?
-            else {
-                return Err(invalid_state(
-                    "login state is missing, expired, or already consumed",
-                ));
-            };
-            let issuer = IssuerUrl::new(login_state.issuer.clone())
-                .map_err(|_| invalid_token("stored issuer URL is invalid"))?;
-            let active = self
-                .connections
-                .active_connection_for(tenant_id, &issuer)
-                .await?;
-            if active.binding != login_state.connection {
-                return Err(invalid_token(
-                    "the login connection changed while the login was in progress",
-                ));
-            }
-            let trusted = active.trusted;
-            let http = self.connections.http();
-            let provider = discover_provider(&trusted.issuer, http).await?;
-            let id_token = exchange_code_for_id_token(
-                &provider,
-                &trusted.client_id,
-                &trusted.client_auth,
-                &login_state.redirect_uri,
-                &login_state.code_verifier,
-                code,
-                http,
+        let state_hash = state_hash(state_key);
+        let Some(tenant_id) = resolve_by_login_state_for_app(postgres.app_pool(), &state_hash)
+            .await
+            .map_err(store_error)?
+        else {
+            tracing::info!("login callback state names no pending login");
+            return Err(invalid_state(
+                "login state is missing, expired, or already consumed",
+            ));
+        };
+        let result = self
+            .complete(tenant_id, &state_hash, code, request_id)
+            .await;
+        if let Err(error) = &result {
+            // A refusal rolls back any user it resolved, so the denied event
+            // names no principal.
+            audit_authorization_code_failure(postgres, tenant_id, Uuid::nil(), request_id, error)
+                .await;
+        }
+        result
+    }
+
+    /// Consume the state, exchange the code, and finish the login for
+    /// [`Self::execute`] once the tenant is known.
+    ///
+    /// # Errors
+    /// Returns the errors [`Self::execute`] documents after tenant resolution.
+    async fn complete(
+        &self,
+        tenant_id: DataTenantId,
+        state_hash: &[u8; 32],
+        code: SecretString,
+        request_id: &str,
+    ) -> Result<CompletedLogin, WyrdError> {
+        self.connections.completion_keyring()?;
+        let postgres = self.connections.postgres();
+        let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
+        let login_state = consume_login_state(&mut conn, state_hash)
+            .await
+            .map_err(store_error)?;
+        conn.commit().await.map_err(store_error)?;
+        let login_state = login_state
+            .ok_or_else(|| invalid_state("login state is missing, expired, or already consumed"))?;
+        let trusted = self.bound_connection(tenant_id, &login_state).await?;
+        let http = self.connections.http();
+        let provider = discover_provider(&trusted.issuer, http).await?;
+        let id_token = exchange_code_for_id_token(
+            &provider,
+            &trusted.client_id,
+            &trusted.client_auth,
+            &login_state.redirect_uri,
+            &SecretString::from(login_state.code_verifier.clone()),
+            code,
+            http,
+        )
+        .await?;
+        let (completed, _) = self
+            .finish_id_token_exchange(
+                tenant_id,
+                state_hash,
+                &trusted,
+                &login_state,
+                &id_token,
+                request_id,
             )
             .await?;
-            let token = self
-                .finish_authorization_code_exchange(FinishAuthorizationCodeInput {
-                    postgres,
-                    tenant_id,
-                    trusted: &trusted,
-                    login_state: &login_state,
-                    id_token: &id_token,
-                    request_id,
-                    audit_principal_id: &mut audit_principal_id,
-                })
-                .await?;
-            Ok(token)
-        }
-        .await;
-
-        match result {
-            Ok(token) => Ok(token),
-            Err(error) => {
-                audit_authorization_code_failure(
-                    postgres,
-                    tenant_id,
-                    audit_principal_id,
-                    request_id,
-                    &error,
-                )
-                .await;
-                Err(error)
-            }
-        }
+        Ok(completed)
     }
 
-    /// Complete a human OIDC login after the provider has returned an ID token.
+    /// Finish a consumed login once the provider has returned an ID token.
     ///
-    /// The session is bound to `login_state.connection` and issued only while
-    /// that exact revision is still Active. Returns the token and the resolved
-    /// user id.
+    /// Verifies the token against `trusted` and the nonce recorded in
+    /// `login_state`, then re-reads the tenant's Active connection and
+    /// requires it to still be the exact revision, issuer, and client the
+    /// login bound. One tenant transaction then resolves the user by
+    /// (issuer, subject) only, replaces the user's roles with those the
+    /// verified groups map to (unmapped groups and unknown role names grant
+    /// nothing; connection default roles are never applied to human login),
+    /// issues the session under the connection slot lock, and stores it sealed
+    /// on the consumed state row with a fresh redemption expiry. The session
+    /// never leaves this method except sealed. Returns the completion kind and
+    /// the resolved user id.
     ///
     /// # Errors
-    /// Returns the errors of the verification, persistence, and issuance steps
-    /// of [`Self::execute`]; nothing commits unless every step succeeds.
+    /// Returns [`WyrdError::InvalidToken`] when the token fails verification or
+    /// the bound connection is no longer Active,
+    /// [`WyrdError::InvalidNonce`] on a missing or mismatched nonce,
+    /// [`WyrdError::InvalidState`] when the state row is no longer consumed
+    /// and awaiting completion, [`WyrdError::Validation`] when no sealing
+    /// keyring is configured, and the store, issuance, audit, and sealing
+    /// errors; nothing commits unless every step succeeds, so a failed audit
+    /// append leaves no session, refresh row, or completion.
     pub async fn finish_id_token_exchange(
         &self,
-        postgres: &WyrdPostgres,
         tenant_id: DataTenantId,
+        state_hash: &[u8; 32],
         trusted: &TrustedIssuer,
-        login_state: &LoginStateEntry,
+        login_state: &ConsumedLoginState,
         id_token: &str,
         request_id: &str,
-    ) -> Result<(TokenResponse, Uuid), WyrdError> {
-        let mut audit_principal_id = Uuid::nil();
-        let token = self
-            .finish_authorization_code_exchange(FinishAuthorizationCodeInput {
-                postgres,
-                tenant_id,
-                trusted,
-                login_state,
-                id_token,
-                request_id,
-                audit_principal_id: &mut audit_principal_id,
-            })
-            .await?;
-        Ok((token, audit_principal_id))
-    }
-
-    /// Complete the grant once the id token has been verified: persist the
-    /// asserted roles, then issue the session through the shared issuance
-    /// workflow inside the same transaction, so the access token carries the
-    /// permissions of the roles just recorded. Issuance takes the connection
-    /// slot lock and requires the login's bound revision to still be Active.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::InvalidToken`] when the bound connection revision
-    /// is no longer Active, and [`WyrdError`] when identity or role
-    /// persistence, issuance, the canonical audit append, or the commit fails;
-    /// no session is returned unless all of them committed together.
-    async fn finish_authorization_code_exchange(
-        &self,
-        input: FinishAuthorizationCodeInput<'_>,
-    ) -> Result<TokenResponse, WyrdError> {
-        let FinishAuthorizationCodeInput {
-            postgres,
-            tenant_id,
-            trusted,
-            login_state,
-            id_token,
-            request_id,
-            audit_principal_id,
-        } = input;
+    ) -> Result<(CompletedLogin, Uuid), WyrdError> {
+        let keyring = self.connections.completion_keyring()?;
         let verified = self
             .verifier
             .verify_external_against(&trusted.verification(), id_token)
             .await
             .map_err(auth_error_to_wyrd)?;
-        verify_nonce(login_state, &verified.raw_claims)?;
+        verify_nonce(&login_state.nonce, &verified.raw_claims)?;
+        self.bound_connection(tenant_id, login_state).await?;
 
-        let mut conn = postgres.tenant_conn(tenant_id).await.map_err(store_error)?;
+        let mut conn = self
+            .connections
+            .postgres()
+            .tenant_conn(tenant_id)
+            .await
+            .map_err(store_error)?;
         let principal_id = ensure_user_identity(
             &mut conn,
             trusted,
@@ -230,12 +241,10 @@ impl AuthorizationCodeExchange {
         )
         .await
         .map_err(store_error)?;
-        *audit_principal_id = principal_id;
         let roles = role_names_to_refs(trusted, &verified.groups)?;
         // The provider just asserted this human's authority, and nothing else
         // in Wyrd grants a user a role. Recording it here is what makes the
-        // grant table the truth a later refresh rotation can re-read; without
-        // it, renewal would mint an authority-free successor.
+        // grant table the truth a later refresh rotation can re-read.
         let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
         replace_user_roles(&mut conn, principal_id, &role_names)
             .await
@@ -250,9 +259,45 @@ impl AuthorizationCodeExchange {
                 request_id,
             )
             .await?;
+        let sealed = seal_completion(keyring, &exchanged.into_response())?;
+        if !complete_login_state(&mut conn, state_hash, &sealed, LOGIN_COMPLETION_TTL)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(invalid_state(
+                "login state is missing, expired, or already consumed",
+            ));
+        }
         conn.commit().await.map_err(store_error)?;
+        Ok((CompletedLogin::from(&login_state.binding), principal_id))
+    }
 
-        Ok(exchanged.into_response())
+    /// Require the tenant's Active connection to be exactly the one the login
+    /// bound — same connection id and revision, issuer, and client id — and
+    /// return its trust.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::InvalidToken`] when the tenant has no Active
+    /// connection or it differs from the login's binding, and the store
+    /// errors of [`HumanConnections::active_connection`].
+    async fn bound_connection(
+        &self,
+        tenant_id: DataTenantId,
+        login_state: &ConsumedLoginState,
+    ) -> Result<TrustedIssuer, WyrdError> {
+        let active = self.connections.active_connection(tenant_id).await?;
+        match active {
+            Some(active)
+                if active.binding == login_state.connection
+                    && active.trusted.issuer.as_str() == login_state.issuer
+                    && active.trusted.client_id == login_state.client_id =>
+            {
+                Ok(active.trusted)
+            }
+            _ => Err(invalid_token(
+                "the login connection changed while the login was in progress",
+            )),
+        }
     }
 }
 
@@ -442,6 +487,12 @@ pub(crate) fn authorization_code_request(
 }
 
 /// Resolve the local user for a trusted external identity or create it once.
+///
+/// Keyed by (issuer, subject) only: the same email under another issuer is a
+/// different user with no inherited grants.
+///
+/// # Errors
+/// Returns a [`SqlError`] when a lookup, insert, or identity upsert fails.
 pub async fn ensure_user_identity(
     conn: &mut TenantConn<'_>,
     trusted: &TrustedIssuer,
@@ -489,23 +540,36 @@ pub async fn audit_authorization_code_failure(
     record_auth_audit_best_effort(postgres.app_pool(), tenant_id, &event).await;
 }
 
-/// Verify the OIDC nonce bound to the login state.
-pub fn verify_nonce(state: &LoginStateEntry, claims: &Value) -> Result<(), WyrdError> {
+/// Require the verified ID token's `nonce` claim to equal the nonce the login
+/// state recorded.
+///
+/// # Errors
+/// Returns [`WyrdError::InvalidNonce`] when the claim is missing or differs.
+pub fn verify_nonce(expected: &str, claims: &Value) -> Result<(), WyrdError> {
     let Some(nonce) = claims.get("nonce").and_then(Value::as_str) else {
         return Err(invalid_nonce("id token nonce is missing"));
     };
-    if nonce != state.nonce {
+    if nonce != expected {
         return Err(invalid_nonce("id token nonce mismatch"));
     }
     Ok(())
 }
 
-/// Map trusted external groups plus issuer defaults to local Wyrd role refs.
+/// Map the verified groups of a human login to local Wyrd role refs.
+///
+/// Only groups present in the connection's group-to-role map grant anything;
+/// connection `default_roles` are never applied to a human login, so a person
+/// in no mapped group has no authority. A mapped role name that names no
+/// tenant role is dropped when roles are recorded.
+///
+/// # Errors
+/// Returns [`WyrdError::Internal`] when a mapped role name is not a valid
+/// role reference.
 pub fn role_names_to_refs(
     trusted: &TrustedIssuer,
     groups: &[String],
 ) -> Result<Vec<RoleRef>, WyrdError> {
-    let mut names = trusted.default_roles.clone();
+    let mut names = Vec::new();
     for group in groups {
         if let Some(mapped) = trusted.group_role_map.get(group) {
             names.extend(mapped.iter().cloned());

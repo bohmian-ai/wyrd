@@ -30,7 +30,10 @@ pub use human_connections::{
     promote_tested_human_candidate, remove_human_connection, replace_human_candidate,
     sealed_tenant_secrets, stamp_human_candidate_tested, swap_sealed_tenant_secret,
 };
-pub use login_state::{LoginStateRow, insert_login_state, take_login_state};
+pub use login_state::{
+    ConsumedLoginState, LoginStateBinding, NewLoginState, complete_login_state,
+    consume_login_state, insert_login_state, redeem_login_completion,
+};
 pub use refresh_tokens::{
     consume_active_refresh, insert_human_refresh_token, refresh_by_hash, refresh_issuance_instant,
     revoke_refresh, revoke_refresh_family,

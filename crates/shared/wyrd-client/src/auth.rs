@@ -31,8 +31,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    ExchangeTokenType, LoginInitResponse, PlatformTokenRequest, PlatformTokenResponse,
-    SecretBearer, TokenAudience, TokenRequest, TokenResponse,
+    ExchangeTokenType, PlatformTokenRequest, PlatformTokenResponse, SecretBearer, TokenAudience,
+    TokenRequest, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
@@ -202,28 +202,6 @@ impl TokenExchange {
         request: &PlatformTokenRequest,
     ) -> Result<PlatformTokenResponse, AuthError> {
         self.post("/auth/platform/token", request).await
-    }
-
-    /// Begin an interactive login against one trusted issuer.
-    ///
-    /// Returns the provider authorization URL and the state the callback must
-    /// echo. Nothing is authenticated yet: this is the call that produces the
-    /// code a later [`Self::exchange`] trades for a token.
-    ///
-    /// # Errors
-    /// Returns [`AuthError::Server`] when the issuer is not trusted by this
-    /// deployment, and [`AuthError::Client`] for a transport or decode failure.
-    pub async fn begin_login(&self, issuer: &str) -> Result<LoginInitResponse, AuthError> {
-        let url = format!("{}/auth/login", self.base_url);
-        let response = self
-            .http
-            .get(&url)
-            .query(&[("issuer", issuer)])
-            .header(reqwest::header::ACCEPT, "application/json")
-            .send()
-            .await
-            .map_err(transport_down)?;
-        Self::decode(response).await
     }
 
     /// POST a JSON body to one unauthenticated `/auth` path and decode the reply.

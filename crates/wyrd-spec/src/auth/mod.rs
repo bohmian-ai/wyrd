@@ -26,7 +26,10 @@ pub use human_connection::{
     refuse_human_trusted_issuer,
 };
 pub use issue_key::{IssueKeyRequest, IssueKeyResponse};
-pub use oidc::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};
+pub use oidc::{
+    AbsoluteUrl, BeginLogin, BeginLoginResponse, CallbackQuery, IssuerUrl, LoginInitResponse,
+    LoginInitiation, Sha256Hex, Sha256HexError, UrlParseError,
+};
 pub use permission_scope::{
     BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,
     PermissionScopeError,

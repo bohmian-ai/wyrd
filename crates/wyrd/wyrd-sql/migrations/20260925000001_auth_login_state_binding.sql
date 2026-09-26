@@ -84,3 +84,9 @@ UPDATE wyrd.auth_refresh_tokens
  WHERE principal_kind = 'user'
    AND human_connection_id IS NULL
    AND revoked_at IS NULL;
+
+-- A human is identified by the provider that authenticated them (issuer and
+-- subject), never by email. A replacement provider's user who shares an email
+-- with an existing user is a different User until an authorized link, so email
+-- cannot be unique within a tenant. The non-unique lookup index remains.
+ALTER TABLE wyrd.auth_users DROP CONSTRAINT auth_users_data_tenant_id_email_key;

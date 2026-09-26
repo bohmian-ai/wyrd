@@ -593,8 +593,8 @@ def get_admin_token():
     resp = json.loads(urllib.request.urlopen(req).read())
     return resp["access_token"]
 
-def api(method, path, body=None, token=None):
-    url = f"{BASE}/admin/realms/{REALM}{path}"
+def api(method, path, body=None, token=None, realm=REALM):
+    url = f"{BASE}/admin/realms/{realm}{path}"
     data = json.dumps(body).encode() if body else None
     headers = {"Content-Type": "application/json"}
     if token:
@@ -619,7 +619,7 @@ for attempt in range(30):
 else:
     sys.exit("Keycloak admin API not ready after 60s")
 
-def create_user(username, email, password, group_path):
+def create_user(username, email, password, group_path, realm=REALM):
     api("POST", "/users", {
         "username": username,
         "email": email,
@@ -628,8 +628,8 @@ def create_user(username, email, password, group_path):
         "emailVerified": True,
         "enabled": True,
         "requiredActions": [],
-    }, token)
-    users = api("GET", f"/users?username={username}", token=token) or []
+    }, token, realm)
+    users = api("GET", f"/users?username={username}", token=token, realm=realm) or []
     if not users:
         sys.exit(f"user {username} not found after creation")
     uid = users[0]["id"]
@@ -637,13 +637,16 @@ def create_user(username, email, password, group_path):
         "type": "password",
         "temporary": False,
         "value": password,
-    }, token)
-    groups = api("GET", f"/groups?search={group_path.lstrip('/')}", token=token) or []
+    }, token, realm)
+    groups = api("GET", f"/groups?search={group_path.lstrip('/')}", token=token, realm=realm) or []
     if groups:
-        api("PUT", f"/users/{uid}/groups/{groups[0]['id']}", token=token)
+        api("PUT", f"/users/{uid}/groups/{groups[0]['id']}", token=token, realm=realm)
 
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins")
 create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
+# The second provider's alice shares the first's email: a provider switch must
+# still make her a separate Wyrd user.
+create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="wyrd-test-2")
 print("Keycloak users seeded")
 PYEOF
 
@@ -669,7 +672,7 @@ if [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
   fi
   cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1 -E "$expr"
 else
-  for required in tenant_connection_admin_journey tenant_connection_rotation_journey tenant_connection_session_cutoff_journey; do
+  for required in tenant_connection_admin_journey tenant_connection_rotation_journey tenant_connection_session_cutoff_journey tenant_human_login_journey tenant_callback_refusal_journey tenant_provider_switch_journey tenant_machine_independence_journey; do
     count="$(selected_count "test(=$required)")"
     if [ "$count" != 1 ]; then
       echo "identity journey $required selects $count tests; expected exactly 1" >&2

@@ -59,7 +59,7 @@ pub use trusted_issuers::{
     trusted_issuer_exists, trusted_issuers_for_tenant, upsert_trusted_issuer,
 };
 pub use user_identities::{upsert_user_identity, user_id_by_identity};
-pub use users::{UserRow, delete_user, insert_user, user_by_email, user_by_id};
+pub use users::{UserRow, delete_user, insert_user, user_by_id};
 pub use workload_bindings::{
     WorkloadBindingWrite, delete_workload_binding, delete_workload_bindings_for_issuer,
     insert_workload_binding, upsert_workload_binding, workload_binding_by_key,

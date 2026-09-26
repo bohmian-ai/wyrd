@@ -19,7 +19,7 @@ mod pg_tests {
     use wyrd_sql::queries::auth::{
         TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
         delete_workload_bindings_for_issuer, insert_user, trusted_issuer_by_url,
-        trusted_issuers_for_tenant, upsert_user_identity, user_by_email, user_by_id,
+        trusted_issuers_for_tenant, upsert_user_identity, user_by_id,
         user_id_by_identity, workload_binding_by_key, workload_binding_by_subject,
     };
     // `insert_trusted_issuer`/`insert_workload_binding` are referenced by full path
@@ -737,9 +737,9 @@ mod pg_tests {
         let mut conn = TenantConn::acquire(&app_pool, tenant)
             .await
             .expect("tenant conn acquired");
-        let row = user_by_email(&mut conn, "present@example.com")
+        let row = user_by_id(&mut conn, user_id)
             .await
-            .expect("email lookup succeeds")
+            .expect("user lookup succeeds")
             .expect("row exists");
         assert_eq!(row.id, user_id);
         assert_eq!(row.email.as_deref(), Some("present@example.com"));

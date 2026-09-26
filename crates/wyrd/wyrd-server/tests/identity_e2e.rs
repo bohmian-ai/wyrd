@@ -28,7 +28,8 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
-    IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, TokenAudience,
+    IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, LoginInitiation, Sha256Hex,
+    TokenAudience, TokenResponse,
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
@@ -886,21 +887,24 @@ async fn activate_keycloak_connection(
     client_auth: &str,
     client_secret: Option<&str>,
 ) -> Value {
-    let (_, listed) = call_json(srv, &admin.token, Method::GET, CONNECTIONS, None).await;
-    let current = listed["candidate"]["revision"].as_u64();
-    let (status, candidate) = call_json(
+    activate_connection(
         srv,
-        &admin.token,
-        Method::PUT,
-        CANDIDATE,
-        Some(connection_input(
-            client_id,
-            client_auth,
-            client_secret,
-            current,
-        )),
+        admin,
+        connection_input(client_id, client_auth, client_secret, None),
     )
-    .await;
+    .await
+}
+
+/// Stage `input` as the candidate (at the current candidate revision, if
+/// any), test it, and activate it, returning the Active view.
+///
+/// # Panics
+/// Panics when any step does not return `200`.
+async fn activate_connection(srv: &WyrdTestServer, admin: &TenantAdmin, mut input: Value) -> Value {
+    let (_, listed) = call_json(srv, &admin.token, Method::GET, CONNECTIONS, None).await;
+    input["expected_revision"] = listed["candidate"]["revision"].clone();
+    let (status, candidate) =
+        call_json(srv, &admin.token, Method::PUT, CANDIDATE, Some(input)).await;
     assert_eq!(status, StatusCode::OK, "candidate stages: {candidate}");
     let revision = candidate["revision"].as_u64().expect("candidate revision");
     let (status, tested) = call_json(
@@ -959,16 +963,292 @@ async fn human_server() -> WyrdTestServer {
     srv
 }
 
-/// Drive one complete browser login and return the token response body.
-///
-/// This is the served human path end to end: [`authorization_code`] mints the
-/// login and authenticates the user at Keycloak, and [`finish_callback`]
-/// exchanges the code for a Wyrd session. Every human journey starts here,
-/// and the role-change journey runs it several times against the same user,
-/// so the flow is one helper rather than three copies.
+/// Path of the BFF route a completed browser login is redirected to.
+const LOGIN_COMPLETE: &str = "/login/complete";
+
+/// A fresh browser flow binding: the SHA-256 of a random flow id, as the BFF
+/// derives it from the HttpOnly flow cookie it set before beginning login.
+fn new_flow() -> Sha256Hex {
+    Sha256Hex::digest(uuid::Uuid::new_v4().as_bytes())
+}
+
+/// `POST /auth/login` with `body` and hostile `Host` and forwarded headers
+/// that must play no part; returns the status and JSON body.
 ///
 /// # Panics
-/// Panics when any leg of the flow does not return `200`.
+/// Panics when the request cannot be built or the router fails.
+async fn begin_login(srv: &WyrdTestServer, host: &str, body: Value) -> (StatusCode, Value) {
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/login")
+                .header(header::HOST, host)
+                .header("x-forwarded-host", "attacker.example.net")
+                .header("x-forwarded-proto", "https")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("login request builds"),
+        )
+        .await
+        .expect("login call completes");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("login body reads");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// The begin body for a browser login of `tenant_slug` bound to `flow`.
+fn browser_begin(tenant_slug: &str, flow: &Sha256Hex) -> Value {
+    serde_json::json!({
+        "tenant_route_key": tenant_slug,
+        "browser_flow_hash": flow.to_string(),
+    })
+}
+
+/// A provider's redirect back to Wyrd for one begun browser login.
+struct ProviderReturn {
+    /// The authorization code the provider issued.
+    code: String,
+    /// The state the provider echoed; it names the login-state row.
+    state: String,
+    /// The browser flow binding the login was begun with.
+    flow: Sha256Hex,
+}
+
+/// Begin a browser login for `tenant_slug` and authenticate `username` at
+/// `keycloak`, returning the provider's redirect back to Wyrd.
+///
+/// `POST /auth/login` returns only the authorization URL — carrying the PKCE
+/// challenge, nonce, and state — and the Keycloak fixture submits the real
+/// HTML login form. Nothing is exchanged yet, so a journey can change the
+/// tenant's connection between provider authentication and the callback.
+///
+/// # Panics
+/// Panics when login initiation does not return `200` with only the URL,
+/// when the URL omits the PKCE challenge, nonce, or state, or when the IdP
+/// echoes a different `state`.
+async fn authorization_code_for(
+    srv: &WyrdTestServer,
+    tenant_slug: &str,
+    keycloak: &OidcIssuerFixture,
+    client_id: &str,
+    username: &str,
+    password: &str,
+) -> ProviderReturn {
+    let flow = new_flow();
+    let (status, body) = begin_login(
+        srv,
+        "attacker.example.net",
+        browser_begin(tenant_slug, &flow),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "login begins: {body}");
+    let fields: Vec<&String> = body.as_object().expect("begin body").keys().collect();
+    assert_eq!(fields, vec!["authorization_url"], "begin returns only the URL");
+    let authz_url: Url = body["authorization_url"]
+        .as_str()
+        .expect("authorization_url present")
+        .parse()
+        .expect("authorization_url parses");
+    let query = |name: &str| {
+        authz_url
+            .query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_else(|| panic!("authorization_url carries {name}"))
+    };
+    let (code_challenge, nonce, state) = (query("code_challenge"), query("nonce"), query("state"));
+    let redirect_uri: Url = format!("{PUBLIC_ORIGIN}/auth/callback")
+        .parse()
+        .expect("redirect URI parses");
+    let login = keycloak
+        .human_login(
+            client_id,
+            username,
+            password,
+            &redirect_uri,
+            &state,
+            &code_challenge,
+            &nonce,
+        )
+        .await;
+    assert!(!login.code.is_empty(), "Keycloak returned an authorization code");
+    assert_eq!(login.state, state, "state echoed back correctly");
+    ProviderReturn {
+        code: login.code,
+        state: login.state,
+        flow,
+    }
+}
+
+/// [`authorization_code_for`] the fixture tenant.
+async fn authorization_code(
+    srv: &WyrdTestServer,
+    keycloak: &OidcIssuerFixture,
+    client_id: &str,
+    username: &str,
+    password: &str,
+) -> ProviderReturn {
+    authorization_code_for(
+        srv,
+        FIXTURE_TENANT_SLUG,
+        keycloak,
+        client_id,
+        username,
+        password,
+    )
+    .await
+}
+
+/// The raw reply of the common callback.
+struct CallbackReply {
+    /// Response status.
+    status: StatusCode,
+    /// `Location` header, when present.
+    location: Option<String>,
+    /// Response body as text.
+    body: String,
+}
+
+impl CallbackReply {
+    /// The body as problem JSON (`Null` when it is not JSON).
+    fn problem(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or(Value::Null)
+    }
+}
+
+/// Present `code` and `state` to `GET /auth/callback` with `host` as the
+/// request `Host`, and read the raw reply.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn callback_reply(srv: &WyrdTestServer, code: &str, state: &str, host: &str) -> CallbackReply {
+    let code_encoded: String = url::form_urlencoded::byte_serialize(code.as_bytes()).collect();
+    let state_encoded: String = url::form_urlencoded::byte_serialize(state.as_bytes()).collect();
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/auth/callback?code={code_encoded}&state={state_encoded}"
+                ))
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .expect("callback request builds"),
+        )
+        .await
+        .expect("callback call completes");
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("callback body reads");
+    CallbackReply {
+        status,
+        location,
+        body: String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+/// Present `code` and `state` to the callback and return the status and
+/// problem body, for journeys asserting a refusal.
+async fn finish_callback(srv: &WyrdTestServer, code: &str, state: &str) -> (StatusCode, Value) {
+    let reply = callback_reply(srv, code, state, "test-tenant-1.wyrd.test").await;
+    (reply.status, reply.problem())
+}
+
+/// Assert a browser callback completed: `303` to exactly the fixed
+/// `{PUBLIC_ORIGIN}/login/complete` with no query string, and a body that
+/// carries neither a token nor the provider code.
+///
+/// # Panics
+/// Panics when any of those differ.
+fn assert_browser_completion(reply: &CallbackReply, code: &str) {
+    assert_eq!(
+        reply.status,
+        StatusCode::SEE_OTHER,
+        "a browser login completes with a redirect: {}",
+        reply.body
+    );
+    assert_eq!(
+        reply.location.as_deref(),
+        Some(format!("{PUBLIC_ORIGIN}{LOGIN_COMPLETE}").as_str()),
+        "the redirect is the fixed completion route with no query"
+    );
+    for leaked in ["access_token", "refresh_token", code] {
+        assert!(
+            !reply.body.contains(leaked),
+            "the callback response carries no {leaked}"
+        );
+    }
+}
+
+/// Redeem the completed login bound to `flow` in `tenant` through the owner
+/// primitive the BFF completion route wraps.
+///
+/// # Errors
+/// Returns the redemption refusal.
+///
+/// # Panics
+/// Panics when the server has no connection owner or keyring.
+async fn redeem(
+    srv: &WyrdTestServer,
+    tenant: DataTenantId,
+    flow: &Sha256Hex,
+) -> Result<TokenResponse, WyrdError> {
+    srv.state()
+        .auth
+        .human_connections
+        .as_ref()
+        .expect("the server owns human connections")
+        .completions()
+        .expect("the test server has a sealing keyring")
+        .redeem(tenant, LoginInitiation::Browser(flow.clone()))
+        .await
+}
+
+/// Complete one provider return through the callback and the owner's
+/// redemption, returning the session as JSON.
+///
+/// # Panics
+/// Panics when the callback is not a clean browser completion or the
+/// completion does not redeem exactly once.
+async fn complete_login(
+    srv: &WyrdTestServer,
+    tenant: DataTenantId,
+    provider: &ProviderReturn,
+) -> Value {
+    let reply = callback_reply(srv, &provider.code, &provider.state, "attacker.example.net").await;
+    assert_browser_completion(&reply, &provider.code);
+    let session = redeem(srv, tenant, &provider.flow)
+        .await
+        .expect("the completion redeems");
+    assert!(
+        redeem(srv, tenant, &provider.flow).await.is_err(),
+        "a completion redeems once"
+    );
+    serde_json::to_value(session).expect("session serializes")
+}
+
+/// Drive one complete browser login for the fixture tenant and return the
+/// session JSON.
+///
+/// This is the served human path end to end: begin with a random flow
+/// binding, authenticate at Keycloak, receive the `303` from the common
+/// callback, and redeem the sealed completion once. Every human journey
+/// starts here.
+///
+/// # Panics
+/// Panics when any leg of the flow fails.
 async fn human_login(
     srv: &WyrdTestServer,
     keycloak: &OidcIssuerFixture,
@@ -976,129 +1256,8 @@ async fn human_login(
     username: &str,
     password: &str,
 ) -> Value {
-    let (code, state) = authorization_code(srv, keycloak, client_id, username, password).await;
-    let (status, session) = finish_callback(srv, &code, &state).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "authorization code exchange returns 200: {session}"
-    );
-    session
-}
-
-/// Start a login on `srv` and authenticate `username` at Keycloak, returning
-/// the authorization code and echoed state the callback will present.
-///
-/// `GET /auth/login` mints the authorization URL, PKCE challenge, nonce, and
-/// state; the Keycloak fixture submits the real HTML login form. Nothing is
-/// exchanged yet, so a journey can change the tenant's connection between
-/// provider authentication and the callback.
-///
-/// # Panics
-/// Panics when login initiation does not return `200`, when the
-/// authorization URL omits the PKCE challenge or nonce, or when the IdP echoes
-/// a different `state` than the one Wyrd issued.
-async fn authorization_code(
-    srv: &WyrdTestServer,
-    keycloak: &OidcIssuerFixture,
-    client_id: &str,
-    username: &str,
-    password: &str,
-) -> (String, String) {
-    let issuer_encoded: String =
-        url::form_urlencoded::byte_serialize(keycloak_issuer().as_bytes()).collect();
-    let login_resp = srv
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!("/auth/login?issuer={issuer_encoded}"))
-                .header(header::HOST, "test-tenant-1.wyrd.test")
-                .header(header::ACCEPT, "application/json")
-                .body(Body::empty())
-                .expect("login request builds"),
-        )
-        .await
-        .expect("login call completes");
-    assert_eq!(
-        login_resp.status(),
-        StatusCode::OK,
-        "login initiation returns 200: {}",
-        login_resp.status()
-    );
-    let login_bytes = to_bytes(login_resp.into_body(), 65_536)
-        .await
-        .expect("login body reads");
-    let login_body: Value = serde_json::from_slice(&login_bytes).expect("login response is JSON");
-    let authorization_url_str = login_body["authorization_url"]
-        .as_str()
-        .expect("authorization_url present");
-    let state_key = login_body["state"].as_str().expect("state present");
-
-    let authz_url: Url = authorization_url_str
-        .parse()
-        .expect("authorization_url parses");
-    let code_challenge = authz_url
-        .query_pairs()
-        .find(|(k, _)| k == "code_challenge")
-        .map(|(_, v)| v.into_owned())
-        .expect("authorization_url carries code_challenge");
-    let nonce = authz_url
-        .query_pairs()
-        .find(|(k, _)| k == "nonce")
-        .map(|(_, v)| v.into_owned())
-        .expect("authorization_url carries nonce");
-
-    let redirect_uri: Url = "http://test-tenant-1.wyrd.test/auth/callback"
-        .parse()
-        .expect("redirect URI parses");
-    let login_result = keycloak
-        .human_login(
-            client_id,
-            username,
-            password,
-            &redirect_uri,
-            state_key,
-            &code_challenge,
-            &nonce,
-        )
-        .await;
-    assert!(
-        !login_result.code.is_empty(),
-        "Keycloak returned authorization code"
-    );
-    assert_eq!(login_result.state, state_key, "state echoed back correctly");
-    (login_result.code, login_result.state)
-}
-
-/// Present `code` and `state` to `GET /auth/callback` and return the status
-/// and JSON body (`Null` when the body is not JSON).
-///
-/// # Panics
-/// Panics when the request cannot be built or the router fails.
-async fn finish_callback(srv: &WyrdTestServer, code: &str, state: &str) -> (StatusCode, Value) {
-    let code_encoded: String = url::form_urlencoded::byte_serialize(code.as_bytes()).collect();
-    let state_encoded: String = url::form_urlencoded::byte_serialize(state.as_bytes()).collect();
-    let callback_resp = srv
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!(
-                    "/auth/callback?code={code_encoded}&state={state_encoded}"
-                ))
-                .header(header::HOST, "test-tenant-1.wyrd.test")
-                .body(Body::empty())
-                .expect("callback request builds"),
-        )
-        .await
-        .expect("callback call completes");
-    let status = callback_resp.status();
-    let token_bytes = to_bytes(callback_resp.into_body(), 65_536)
-        .await
-        .expect("token body reads");
-    (
-        status,
-        serde_json::from_slice(&token_bytes).unwrap_or(Value::Null),
-    )
+    let provider = authorization_code(srv, keycloak, client_id, username, password).await;
+    complete_login(srv, srv.data_tenant_id(), &provider).await
 }
 
 /// Read the Wyrd principal id a session's access token was minted for.
@@ -1122,9 +1281,10 @@ fn principal_id_of(access_token: &str) -> String {
 ///   1. a tenant admin stages, tests, and activates the Keycloak connection
 ///      through `/v1/identity/oidc/*`, granting `writer` through the
 ///      `wyrd-admins` group so the federated human can be a subject,
-///   2. `GET /auth/login` → authorization URL + state,
+///   2. `POST /auth/login` with a browser flow binding → authorization URL,
 ///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
-///   4. `GET /auth/callback` → Wyrd access token,
+///   4. `GET /auth/callback` → `303` to `/login/complete`, and the sealed
+///      session redeems once by the flow binding,
 ///   5. the human token reaches a real `/v1/authz/check` `200` via delegation.
 ///
 /// It then rotates the refresh token, proves the successor still authorizes,
@@ -1450,34 +1610,18 @@ fn assert_refused(status: StatusCode, body: &Value, expected: StatusCode, code: 
     assert_eq!(response_code(body), code, "stable code: {body}");
 }
 
-/// Start a login at the fixture tenant's host for `issuer` and return the
-/// status: `200` while the tenant's Active connection trusts the issuer.
+/// Begin a browser login for the fixture tenant and return the status: `200`
+/// while the tenant has an Active connection.
 ///
 /// # Panics
 /// Panics when the request cannot be built or the router fails.
 async fn login_status(srv: &WyrdTestServer) -> (StatusCode, Value) {
-    let issuer: String =
-        url::form_urlencoded::byte_serialize(keycloak_issuer().as_bytes()).collect();
-    let response = srv
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!("/auth/login?issuer={issuer}"))
-                .header(header::HOST, "test-tenant-1.wyrd.test")
-                .header(header::ACCEPT, "application/json")
-                .body(Body::empty())
-                .expect("login request builds"),
-        )
-        .await
-        .expect("login responds");
-    let status = response.status();
-    let bytes = to_bytes(response.into_body(), 65_536)
-        .await
-        .expect("login body reads");
-    (
-        status,
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    begin_login(
+        srv,
+        "test-tenant-1.wyrd.test",
+        browser_begin(FIXTURE_TENANT_SLUG, &new_flow()),
     )
+    .await
 }
 
 /// Tenant human connection administration across two tenants, one issuer.
@@ -2577,7 +2721,7 @@ async fn tenant_connection_session_cutoff_journey() {
             .expect("access token"),
     );
     let before = refresh_rows(&replica_a, &principal).await;
-    let (code, state) = authorization_code(
+    let provider = authorization_code(
         &replica_a,
         &keycloak,
         PUBLIC_HUMAN_CLIENT,
@@ -2623,7 +2767,10 @@ async fn tenant_connection_session_cutoff_journey() {
         );
         hold.commit().await.expect("hold releases");
     };
-    let ((status, body), ()) = tokio::join!(finish_callback(&replica_a, &code, &state), release);
+    let ((status, body), ()) = tokio::join!(
+        finish_callback(&replica_a, &provider.code, &provider.state),
+        release
+    );
     assert_refused(
         status,
         &body,
@@ -2635,9 +2782,790 @@ async fn tenant_connection_session_cutoff_journey() {
         before,
         "the in-flight callback issued no session"
     );
+    assert!(
+        redeem(&replica_a, tenant, &provider.flow).await.is_err(),
+        "the in-flight callback stored no completion"
+    );
 
     replica_b.shutdown().await.expect("replica B shuts down");
     replica_a.shutdown().await.expect("replica A shuts down");
+}
+
+// ─── Tenant human login and Wyrd authority ───────────────────────────────────
+
+/// The second Keycloak realm: a distinct issuer whose `alice` shares the
+/// first realm's email, used to switch a tenant's provider.
+fn keycloak_second_issuer() -> String {
+    format!("{}-2", keycloak_issuer().trim_end_matches('/'))
+}
+
+/// A connection input for the second realm's public `wyrd-human` client with
+/// `group_role_map`.
+fn second_provider_input(group_role_map: &HashMap<String, Vec<String>>) -> Value {
+    serde_json::json!({
+        "issuer": keycloak_second_issuer(),
+        "client_id": PUBLIC_HUMAN_CLIENT,
+        "client_auth": "Public",
+        "client_secret": null,
+        "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
+        "group_role_map": group_role_map,
+        "expected_revision": null,
+    })
+}
+
+/// The `/v1/authz/check` decision for a `card_write` through a fresh `writer`
+/// actor delegated by `subject_jwt`: `Allow` only when the subject itself
+/// holds a role granting `card_write`.
+///
+/// # Panics
+/// Panics when bootstrap, exchange, delegation, or the check fails.
+async fn delegated_write_decision(
+    srv: &WyrdTestServer,
+    subject_jwt: &str,
+    label: &str,
+) -> Option<AuthzCheckDecision> {
+    let actor = srv
+        .bootstrap_service(&format!("{label}-actor"), &["writer"])
+        .await
+        .expect("actor bootstraps");
+    let actor_jwt = srv
+        .exchange_api_key(actor.api_key().expect("actor has key"))
+        .await
+        .expect("actor key exchanges");
+    let delegated = srv
+        .delegate(subject_jwt, &actor_jwt, TokenAudience::Wyrd)
+        .await
+        .expect("a human session is a valid delegation subject");
+    srv.authz_check(&delegated, authz_check_request(&actor, "card_write"))
+        .await
+        .expect("authz-check completes")
+        .response
+        .map(|response| response.decision)
+}
+
+/// Number of role grants recorded for the user `principal_id`.
+///
+/// # Panics
+/// Panics when the query fails.
+async fn user_role_count(srv: &WyrdTestServer, principal_id: &str) -> i64 {
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid")
+        .bind(principal_id)
+        .fetch_one(&superuser)
+        .await
+        .expect("user roles read")
+}
+
+/// Tenant human login end to end through the header-free begin, the common
+/// callback, and one-use redemption:
+///   1. alice signs in: begin returns only the authorization URL, the
+///      callback answers `303` to exactly `/login/complete` with no query and
+///      no token or code, and the sealed session redeems once;
+///   2. the login created one user keyed by the Keycloak (issuer, subject);
+///   3. alice's mapped group (`wyrd-admins` → `writer`) allows a delegated
+///      write, while a call outside that grant (connection administration) is
+///      refused;
+///   4. bob, in no mapped group, signs in with zero role grants and his
+///      delegated write is denied;
+///   5. the successful issuance is retained on the canonical audit path.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_human_login_journey() {
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let srv = human_server().await;
+    let tenant = srv.data_tenant_id();
+
+    // 1. Begin, provider, 303, redeem once (asserted by `complete_login`).
+    let provider = authorization_code(
+        &srv,
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let session = complete_login(&srv, tenant, &provider).await;
+    let access = session["access_token"].as_str().expect("access token");
+    assert!(session["refresh_token"].is_string(), "a human session renews");
+    let alice = principal_id_of(access);
+
+    // 2. One user, keyed by the verified (issuer, subject).
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let identities: Vec<(String, String)> = sqlx::query_as(
+        "SELECT issuer, subject FROM wyrd.auth_user_identities WHERE user_id = $1::uuid",
+    )
+    .bind(&alice)
+    .fetch_all(&superuser)
+    .await
+    .expect("identities read");
+    assert_eq!(identities.len(), 1, "one identity: {identities:?}");
+    assert_eq!(
+        identities[0].0.trim_end_matches('/'),
+        keycloak_issuer().trim_end_matches('/')
+    );
+
+    // 3. The mapped group allows; outside the grant is refused.
+    assert_v1_authz_check_ok(&srv, access, "tenant-login-alice").await;
+    let (status, body) = call_json(&srv, access, Method::GET, CONNECTIONS, None).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "writer cannot administer connections: {body}"
+    );
+
+    // 4. An unmapped subject has no authority.
+    let bob = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "bob", "wyrd-test").await;
+    let bob_access = bob["access_token"].as_str().expect("bob access token");
+    let bob_id = principal_id_of(bob_access);
+    assert_ne!(bob_id, alice, "bob is a separate user");
+    assert_eq!(user_role_count(&srv, &bob_id).await, 0, "bob has no grants");
+    assert_eq!(
+        delegated_write_decision(&srv, bob_access, "tenant-login-bob").await,
+        Some(AuthzCheckDecision::Deny),
+        "an unmapped subject cannot write"
+    );
+
+    // 5. The issuance decision is on the canonical audit path.
+    let allowed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging \
+          WHERE operation = 'auth.token.exchange' AND outcome = 'allowed' \
+            AND principal_id = $1::uuid",
+    )
+    .bind(&alice)
+    .fetch_one(&superuser)
+    .await
+    .expect("audit reads");
+    assert!(allowed >= 1, "alice's issuance is audited");
+
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// Ed25519 key the mock provider signs ID tokens with, and its JWKS `x`.
+const MOCK_SIGNING_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+/// Public half of [`MOCK_SIGNING_KEY`] as a JWK `x`.
+const MOCK_SIGNING_X: &str = "WhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ-DZ8Vw";
+/// An Ed25519 key the mock provider does not publish.
+const FOREIGN_SIGNING_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIPNZb/xl9U5jhHGkOTPVsxugPf3cN1/NZDDcvMG8Vczw\n-----END PRIVATE KEY-----\n";
+/// Client id the seeded mock connection records.
+const MOCK_CLIENT_ID: &str = "wyrd-fixture";
+
+/// Serve discovery and JWKS for the mock provider, and answer the token
+/// endpoint with `token_response`.
+async fn mount_mock_provider(server: &wiremock::MockServer, token_response: wiremock::ResponseTemplate) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    server.reset().await;
+    let issuer = server.uri();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "id_token_signing_alg_values_supported": ["EdDSA"],
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "keys": [{ "kty": "OKP", "crv": "Ed25519", "kid": "mock-1", "x": MOCK_SIGNING_X }]
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(token_response)
+        .mount(server)
+        .await;
+}
+
+/// Sign `claims` as an ID token with `header` and the Ed25519 `pem`.
+fn sign_id_token(header: &jsonwebtoken::Header, claims: &Value, pem: &str) -> String {
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(pem.as_bytes()).expect("key parses");
+    jsonwebtoken::encode(header, claims, &key).expect("token signs")
+}
+
+/// A token endpoint reply carrying `id_token`.
+fn id_token_reply(id_token: &str) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "access_token": "provider-access",
+        "token_type": "Bearer",
+        "id_token": id_token,
+    }))
+}
+
+/// Give `tenant` an Active connection to the mock provider at `issuer`.
+///
+/// # Panics
+/// Panics when seeding fails.
+async fn seed_mock_connection(srv: &WyrdTestServer, tenant: DataTenantId, issuer: &str) {
+    let mut conn = srv.tenant_conn_for(tenant).await.expect("tenant conn opens");
+    let binding = wyrd_dev_fixtures::pg::seed_active_human_connection(&mut conn)
+        .await
+        .expect("connection seeds");
+    conn.commit().await.expect("seed commits");
+    sqlx::query(
+        "UPDATE wyrd.auth_human_connections SET issuer_url = $1, jwks_uri = $2 \
+          WHERE connection_id = $3",
+    )
+    .bind(issuer)
+    .bind(format!("{issuer}/jwks"))
+    .bind(binding.connection_id)
+    .execute(
+        &srv.pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens"),
+    )
+    .await
+    .expect("connection points at the mock provider");
+}
+
+/// Begin a browser login for `slug` and return its flow, state, and nonce.
+///
+/// # Panics
+/// Panics when begin is refused or the URL lacks state or nonce.
+async fn begin_mock_login(srv: &WyrdTestServer, slug: &str) -> (Sha256Hex, String, String) {
+    let flow = new_flow();
+    let (status, body) = begin_login(srv, "attacker.example.net", browser_begin(slug, &flow)).await;
+    assert_eq!(status, StatusCode::OK, "mock login begins: {body}");
+    let url: Url = body["authorization_url"]
+        .as_str()
+        .expect("authorization url")
+        .parse()
+        .expect("authorization url parses");
+    let query = |name: &str| {
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_else(|| panic!("authorization url carries {name}"))
+    };
+    (flow, query("state"), query("nonce"))
+}
+
+/// The common callback refuses every unusable login and stores nothing:
+///   1. a wrong (tampered), unknown, replayed, or expired state is
+///      `400 INVALID_STATE`;
+///   2. both or neither initiation binding is `400 VALIDATION`, and an
+///      unknown CLI handoff is `400 INVALID_STATE`;
+///   3. the retired `authorization_code` token grant is refused and consumes
+///      nothing — the same code and state still complete through the callback;
+///   4. a login begun for tenant B under the same issuer completes into B
+///      only, whatever `Host` the callback carried: A cannot redeem it;
+///   5. against a mock provider: a nonce, issuer, audience, signature, or
+///      algorithm mismatch and a provider outage are refused, leaving no
+///      completion, while an otherwise identical valid token completes;
+///   6. an injected audit-staging failure issues nothing: no completion and
+///      no refresh row.
+///
+/// A discovered unsafe (cleartext or internal) provider URL and a deployment
+/// without a sealing key are proven by the `wyrd-auth` unit and Postgres
+/// tests (`login::destination_tests`, `callback::screening_tests`,
+/// `login::pg_tests::begin_without_a_sealing_key_is_refused_before_any_state`):
+/// the journey server is permissive toward local providers so Keycloak is
+/// reachable, and it always configures a sealing keyring.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_callback_refusal_journey() {
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let srv = human_server().await;
+    let tenant_a = srv.data_tenant_id();
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let sign_in = || authorization_code(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password");
+
+    // 1. Wrong, unknown, replayed, and expired state.
+    let provider = sign_in().await;
+    let (status, body) =
+        finish_callback(&srv, &provider.code, &format!("{}x", provider.state)).await;
+    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+    let (status, body) = finish_callback(&srv, &provider.code, "never-issued").await;
+    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+    let session = complete_login(&srv, tenant_a, &provider).await;
+    let alice = principal_id_of(session["access_token"].as_str().expect("access token"));
+    let (status, body) = finish_callback(&srv, &provider.code, &provider.state).await;
+    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+    let expiring = sign_in().await;
+    sqlx::query(
+        "UPDATE wyrd.auth_login_state SET expires_at = now() - interval '1 second' \
+          WHERE browser_flow_hash = $1",
+    )
+    .bind(expiring.flow.as_bytes().as_slice())
+    .execute(&superuser)
+    .await
+    .expect("state expires");
+    let (status, body) = finish_callback(&srv, &expiring.code, &expiring.state).await;
+    assert_refused(status, &body, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+
+    // 2. Binding shape and unknown handoff.
+    for body in [
+        serde_json::json!({
+            "tenant_route_key": FIXTURE_TENANT_SLUG,
+            "browser_flow_hash": new_flow().to_string(),
+            "cli_handoff_id": uuid::Uuid::new_v4(),
+        }),
+        serde_json::json!({ "tenant_route_key": FIXTURE_TENANT_SLUG }),
+    ] {
+        let (status, refusal) = begin_login(&srv, "test-tenant-1.wyrd.test", body).await;
+        assert_refused(status, &refusal, StatusCode::BAD_REQUEST, "WYRD_SPEC_400_VALIDATION");
+    }
+    let (status, refusal) = begin_login(
+        &srv,
+        "test-tenant-1.wyrd.test",
+        serde_json::json!({
+            "tenant_route_key": FIXTURE_TENANT_SLUG,
+            "cli_handoff_id": uuid::Uuid::new_v4(),
+        }),
+    )
+    .await;
+    assert_refused(status, &refusal, StatusCode::BAD_REQUEST, "WYRD_AUTH_400_INVALID_STATE");
+
+    // 3. The retired token grant is refused and consumes nothing.
+    let retired = sign_in().await;
+    let response = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "grant_type": "authorization_code",
+                        "code": retired.code,
+                        "state": retired.state,
+                    })
+                    .to_string(),
+                ))
+                .expect("token request builds"),
+        )
+        .await
+        .expect("token call completes");
+    assert!(
+        response.status().is_client_error(),
+        "the authorization_code grant is refused: {}",
+        response.status()
+    );
+    let bytes = to_bytes(response.into_body(), 65_536).await.expect("body reads");
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("access_token"),
+        "the refused grant serves no token"
+    );
+    complete_login(&srv, tenant_a, &retired).await;
+
+    // 4. Same issuer, another tenant: the state alone decides the tenant.
+    let tenant_b = srv.seed_tenant("test-tenant-2").await.expect("tenant B seeds");
+    let admin_b = tenant_admin(&srv, tenant_b, "refusal-admin-b").await;
+    activate_keycloak_connection(&srv, &admin_b, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+    let in_b = authorization_code_for(
+        &srv,
+        "test-tenant-2",
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let reply = callback_reply(&srv, &in_b.code, &in_b.state, "test-tenant-1.wyrd.test").await;
+    assert_browser_completion(&reply, &in_b.code);
+    assert!(
+        redeem(&srv, tenant_a, &in_b.flow).await.is_err(),
+        "tenant A cannot redeem tenant B's login"
+    );
+    let b_session = redeem(&srv, tenant_b, &in_b.flow)
+        .await
+        .expect("tenant B redeems its login");
+    let b_claims = jwt_claims(b_session.access_token.expose());
+    assert_eq!(
+        b_claims["principal"]["tenant_id"],
+        tenant_b.to_string(),
+        "the session belongs to tenant B"
+    );
+    assert_ne!(principal_id_of(b_session.access_token.expose()), alice);
+
+    // 5. Token verification refusals against a mock provider.
+    let mock = wiremock::MockServer::start().await;
+    let issuer = mock.uri();
+    let tenant_c = srv.seed_tenant("test-tenant-3").await.expect("tenant C seeds");
+    seed_mock_connection(&srv, tenant_c, &issuer).await;
+    let now = chrono::Utc::now();
+    let claims = |nonce: &str| {
+        serde_json::json!({
+            "sub": "mock-user",
+            "iss": issuer,
+            "aud": MOCK_CLIENT_ID,
+            "exp": (now + ChronoDuration::hours(1)).timestamp(),
+            "iat": now.timestamp(),
+            "nonce": nonce,
+        })
+    };
+    let mut eddsa = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+    eddsa.kid = Some("mock-1".to_owned());
+    let mut hs256 = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+    hs256.kid = Some("mock-1".to_owned());
+    type Mutation<'a> = Box<dyn Fn(&str) -> wiremock::ResponseTemplate + 'a>;
+    let cases: Vec<(&str, Mutation, StatusCode, &str)> = vec![
+        (
+            "nonce",
+            Box::new(|_| id_token_reply(&sign_id_token(&eddsa, &claims("other-nonce"), MOCK_SIGNING_KEY))),
+            StatusCode::BAD_REQUEST,
+            "WYRD_AUTH_400_INVALID_NONCE",
+        ),
+        (
+            "issuer",
+            Box::new(|nonce| {
+                let mut wrong = claims(nonce);
+                wrong["iss"] = Value::from("https://evil.example.com");
+                id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
+            }),
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        ),
+        (
+            "audience",
+            Box::new(|nonce| {
+                let mut wrong = claims(nonce);
+                wrong["aud"] = Value::from("another-client");
+                id_token_reply(&sign_id_token(&eddsa, &wrong, MOCK_SIGNING_KEY))
+            }),
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        ),
+        (
+            "signature",
+            Box::new(|nonce| id_token_reply(&sign_id_token(&eddsa, &claims(nonce), FOREIGN_SIGNING_KEY))),
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        ),
+        (
+            "algorithm",
+            Box::new(|nonce| {
+                let key = jsonwebtoken::EncodingKey::from_secret(MOCK_SIGNING_X.as_bytes());
+                id_token_reply(&jsonwebtoken::encode(&hs256, &claims(nonce), &key).expect("signs"))
+            }),
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        ),
+        (
+            "outage",
+            Box::new(|_| wiremock::ResponseTemplate::new(503)),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "WYRD_AUTH_503_VERIFY_UNAVAILABLE",
+        ),
+    ];
+    for (label, reply_for, expected, code) in &cases {
+        mount_mock_provider(&mock, id_token_reply("unused")).await;
+        let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
+        mount_mock_provider(&mock, reply_for(&nonce)).await;
+        let (status, body) = finish_callback(&srv, "mock-code", &state).await;
+        assert_eq!(status, *expected, "{label}: {body}");
+        assert_eq!(response_code(&body), *code, "{label}: {body}");
+        assert!(
+            redeem(&srv, tenant_c, &flow).await.is_err(),
+            "{label}: no completion is stored"
+        );
+    }
+    mount_mock_provider(&mock, id_token_reply("unused")).await;
+    let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
+    mount_mock_provider(
+        &mock,
+        id_token_reply(&sign_id_token(&eddsa, &claims(&nonce), MOCK_SIGNING_KEY)),
+    )
+    .await;
+    let reply = callback_reply(&srv, "mock-code", &state, "test-tenant-1.wyrd.test").await;
+    assert_browser_completion(&reply, "mock-code");
+    redeem(&srv, tenant_c, &flow)
+        .await
+        .expect("the unmodified mock token completes");
+
+    // 6. An audit failure issues nothing.
+    let before = refresh_rows(&srv, &alice).await;
+    let failing = sign_in().await;
+    sqlx::query(
+        r#"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'auth.token.exchange' THEN
+               RAISE EXCEPTION 'injected login audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure function installs");
+    sqlx::query(
+        r#"CREATE TRIGGER test_fail_login_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_login_audit()"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure trigger installs");
+    let (status, body) = finish_callback(&srv, &failing.code, &failing.state).await;
+    sqlx::query("DROP TRIGGER test_fail_login_audit ON vala.audit_staging")
+        .execute(&superuser)
+        .await
+        .expect("failure trigger drops");
+    assert!(
+        status.is_server_error(),
+        "a login without a durable decision fails closed: {status} {body}"
+    );
+    assert!(
+        redeem(&srv, tenant_a, &failing.flow).await.is_err(),
+        "the failed login stored no completion"
+    );
+    assert_eq!(
+        refresh_rows(&srv, &alice).await,
+        before,
+        "the failed login inserted no refresh row"
+    );
+
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// Switching a tenant's provider ends the old provider's sessions and grants
+/// nothing across providers:
+///   1. alice signs in through the first realm; her access token lives at
+///      most five minutes (`exp - iat <= 300`), which bounds how long a
+///      pre-switch access token outlives the switch;
+///   2. the administrator tests and activates the second realm with no group
+///      mapping, and the pre-switch refresh token is refused;
+///   3. the second realm's alice — same email — becomes a separate user with
+///      no grants, and her delegated write is denied;
+///   4. a mapping change applies at her next issuance;
+///   5. the owner's recovery API key still authenticates and administers.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_provider_switch_journey() {
+    let first = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let second = OidcIssuerFixture::connect(&keycloak_second_issuer()).await;
+    let srv = human_server_builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = srv.data_tenant_id();
+    let admin = tenant_admin(&srv, tenant, "switch-admin").await;
+    activate_keycloak_connection(&srv, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+
+    // 1. A first-provider session with a bounded access token.
+    let before = human_login(&srv, &first, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let before_access = before["access_token"].as_str().expect("access token");
+    let claims = jwt_claims(before_access);
+    let lifetime = claims["exp"].as_i64().expect("exp") - claims["iat"].as_i64().expect("iat");
+    assert!(lifetime <= 300, "access tokens live at most five minutes: {lifetime}");
+    let first_alice = principal_id_of(before_access);
+
+    // 2. Switch providers; the old refresh token is refused.
+    activate_connection(&srv, &admin, second_provider_input(&HashMap::new())).await;
+    assert_refresh_cut_off(&srv, &before, "provider switch").await;
+
+    // 3. Same email, separate user, no inherited grants.
+    let switched = human_login(&srv, &second, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let switched_access = switched["access_token"].as_str().expect("access token");
+    let second_alice = principal_id_of(switched_access);
+    assert_ne!(second_alice, first_alice, "a new issuer is a new user");
+    assert_eq!(user_role_count(&srv, &second_alice).await, 0);
+    assert_eq!(
+        delegated_write_decision(&srv, switched_access, "switch-unmapped").await,
+        Some(AuthzCheckDecision::Deny),
+        "the second provider's alice inherits nothing"
+    );
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let same_email: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.auth_users WHERE email = 'alice@wyrd.test'",
+    )
+    .fetch_one(&superuser)
+    .await
+    .expect("users read");
+    assert_eq!(same_email, 2, "both providers' alice exist separately");
+
+    // 4. A mapping change applies at the next issuance.
+    activate_connection(&srv, &admin, second_provider_input(&admins_write())).await;
+    let remapped = human_login(&srv, &second, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    let remapped_access = remapped["access_token"].as_str().expect("access token");
+    assert_eq!(principal_id_of(remapped_access), second_alice);
+    assert_v1_authz_check_ok(&srv, remapped_access, "switch-remapped").await;
+
+    // 5. The owner's API key still recovers administration.
+    let recovered = srv
+        .exchange_api_key(&admin.api_key)
+        .await
+        .expect("the owner's key still exchanges");
+    let (status, listed) = call_json(&srv, &recovered, Method::GET, CONNECTIONS, None).await;
+    assert_eq!(status, StatusCode::OK, "the owner administers: {listed}");
+    assert_eq!(
+        listed["active"]["issuer"].as_str().map(|issuer| issuer.trim_end_matches('/')),
+        Some(keycloak_second_issuer().as_str())
+    );
+
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// A workload binding entry for `subject` bound to the Service card `name`.
+fn machine_binding(subject: &str, audience: Option<&str>, name: &str) -> WorkloadBindingEntry {
+    WorkloadBindingEntry {
+        issuer: keycloak_issuer(),
+        subject: subject.to_owned(),
+        audience: audience.map(ToOwned::to_owned),
+        kind: "service".to_owned(),
+        name: name.to_owned(),
+        space: "prod".to_owned(),
+        version: "1.0.0".to_owned(),
+    }
+}
+
+/// Assert a jwt-bearer refusal: a `4xx` whose code is in the `WYRD_AUTH_4`
+/// family (or exactly `code` when given) and no token.
+///
+/// # Panics
+/// Panics when the exchange is accepted or refused differently.
+async fn assert_jwt_bearer_refused(response: axum::http::Response<Body>, code: Option<&str>, label: &str) {
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 65_536).await.expect("body reads");
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    assert!(status.is_client_error(), "{label}: refused, got {status} {body}");
+    match code {
+        Some(code) => assert_eq!(response_code(&body), code, "{label}: {body}"),
+        None => assert!(
+            response_code(&body).starts_with("WYRD_AUTH_4"),
+            "{label}: {body}"
+        ),
+    }
+    assert!(body.get("access_token").is_none(), "{label}: no token");
+}
+
+/// Machine credentials are independent of tenant SSO: while the tenant's
+/// human connection is Active,
+///   1. a human still signs in (SSO is live);
+///   2. a tenant API key exchanges and authorizes;
+///   3. an exactly bound workload assertion exchanges and authorizes;
+///   4. an assertion from another issuer, an unbound subject of the trusted
+///      issuer, a bound subject whose token carries another audience, and the
+///      exact assertion presented to another tenant are all refused.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_machine_independence_journey() {
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let other_issuer = OidcIssuerFixture::connect(&keycloak_second_issuer()).await;
+    let bound = keycloak
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let peer = keycloak
+        .workload_token("wyrd-workload-peer", "wyrd-workload-peer-secret", "wyrd-workload")
+        .await;
+    let foreign_audience = keycloak
+        .workload_token("wyrd-workload-foreign", "wyrd-workload-foreign-secret", "wyrd-foreign")
+        .await;
+    let wrong_issuer = other_issuer
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let subject_of = |jwt: &str| {
+        jwt_claims(jwt)["sub"]
+            .as_str()
+            .expect("workload token carries a subject")
+            .to_owned()
+    };
+    let srv = human_server_builder()
+        .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
+        .with_workload_binding_configs(vec![
+            machine_binding(&subject_of(&bound), Some("wyrd-workload"), "machine-sa"),
+            machine_binding(&subject_of(&foreign_audience), None, "foreign-sa"),
+        ])
+        .start_in_process()
+        .await
+        .expect("server boots");
+    let tenant = srv.data_tenant_id();
+    // The foreign-audience token is refused at the audience check before any
+    // principal resolution, so only the accepted workload needs a principal.
+    srv.seed_card_principal(
+        &binding_card_ref(CardKind::Service, "machine-sa", "prod"),
+        &["writer"],
+    )
+    .await
+    .expect("workload principal seeds");
+    let admin = tenant_admin(&srv, tenant, "machine-admin").await;
+    activate_keycloak_connection(&srv, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+
+    // 1. SSO is live.
+    let human = human_login(&srv, &keycloak, PUBLIC_HUMAN_CLIENT, "alice", "alice-password").await;
+    assert!(human["access_token"].is_string());
+
+    // 2. An API key is unaffected.
+    let keyed = srv
+        .bootstrap_service("machine-key", &["writer"])
+        .await
+        .expect("keyed service bootstraps");
+    let keyed_token = srv
+        .exchange_api_key(keyed.api_key().expect("service has a key"))
+        .await
+        .expect("api key exchanges");
+    assert_v1_authz_check_ok(&srv, &keyed_token, "machine-api-key").await;
+
+    // 3. The exact workload binding is unaffected.
+    let response = post_jwt_bearer(&srv, &bound).await;
+    assert_eq!(response.status(), StatusCode::OK, "bound workload exchanges");
+    let bytes = to_bytes(response.into_body(), 65_536).await.expect("body reads");
+    let body: Value = serde_json::from_slice(&bytes).expect("token JSON");
+    assert_v1_authz_check_ok(
+        &srv,
+        body["access_token"].as_str().expect("access token"),
+        "machine-workload",
+    )
+    .await;
+
+    // 4. Every inexact assertion is refused.
+    assert_jwt_bearer_refused(post_jwt_bearer(&srv, &wrong_issuer).await, None, "wrong issuer").await;
+    assert_jwt_bearer_refused(
+        post_jwt_bearer(&srv, &peer).await,
+        Some("WYRD_AUTH_404_PRINCIPAL_NOT_FOUND"),
+        "wrong subject",
+    )
+    .await;
+    assert_jwt_bearer_refused(
+        post_jwt_bearer(&srv, &foreign_audience).await,
+        None,
+        "wrong audience",
+    )
+    .await;
+    srv.seed_tenant("test-tenant-2").await.expect("tenant B seeds");
+    assert_jwt_bearer_refused(
+        post_jwt_bearer_for_tenant(&srv, &bound, "test-tenant-2").await,
+        None,
+        "wrong tenant",
+    )
+    .await;
+
+    srv.shutdown().await.expect("server shuts down");
 }
 
 // ─── Federated cloud journey: CLI-authored issuer + binding ───────────────────
@@ -3049,42 +3977,29 @@ async fn conformance_untrusted_issuer_rejected() {
     );
 }
 
-/// `GET /auth/login` without a valid Host header returns 401 INVALID_TOKEN.
+/// `POST /auth/login` for a route key naming no tenant returns the generic
+/// `401 INVALID_TOKEN`, whatever tenant the `Host` header names.
+///
+/// # Panics
+/// Panics when the server fails to start or the refusal differs.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn conformance_login_rejects_bare_localhost_host() {
-    let srv = WyrdTestServerBuilder::default()
+    let srv = human_server_builder()
         .start_in_process()
         .await
         .expect("test server starts");
 
-    let resp = srv
-        .oneshot(
-            Request::builder()
-                .method(Method::GET)
-                .uri("/auth/login?issuer=http%3A%2F%2Flocalhost%3A8080%2Frealms%2Fwyrd-test")
-                .header(header::HOST, "localhost")
-                .header(header::ACCEPT, "application/json")
-                .body(Body::empty())
-                .expect("request builds"),
-        )
-        .await
-        .expect("call completes");
-    assert_eq!(
-        resp.status(),
-        StatusCode::UNAUTHORIZED,
-        "bare localhost host rejected for login: {}",
-        resp.status()
-    );
-    let bytes = to_bytes(resp.into_body(), 65_536)
-        .await
-        .expect("body reads");
-    let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-    assert_eq!(
-        response_code(&body),
-        "WYRD_AUTH_401_INVALID_TOKEN",
-        "error code is INVALID_TOKEN; body={body}"
-    );
+    for host in ["localhost", "test-tenant-1.wyrd.test"] {
+        let (status, body) =
+            begin_login(&srv, host, browser_begin("no-such-tenant", &new_flow())).await;
+        assert_refused(
+            status,
+            &body,
+            StatusCode::UNAUTHORIZED,
+            "WYRD_AUTH_401_INVALID_TOKEN",
+        );
+    }
 }
 
 // ─── Key rotation (Keycloak admin API) ────────────────────────────────────────

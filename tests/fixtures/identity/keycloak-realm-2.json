@@ -1,8 +1,8 @@
 {
-  "id": "wyrd-test",
-  "realm": "wyrd-test",
+  "id": "wyrd-test-2",
+  "realm": "wyrd-test-2",
   "enabled": true,
-  "displayName": "Wyrd Test",
+  "displayName": "Wyrd Test (second provider)",
   "sslRequired": "none",
   "registrationAllowed": false,
   "loginWithEmailAllowed": true,
@@ -10,24 +10,21 @@
   "resetPasswordAllowed": false,
   "editUsernameAllowed": false,
   "bruteForceProtected": false,
-  "defaultRoles": ["offline_access", "uma_authorization"],
+  "defaultRoles": [
+    "offline_access",
+    "uma_authorization"
+  ],
   "groups": [
     {
-      "id": "grp-wyrd-admins",
+      "id": "r2-grp-wyrd-admins",
       "name": "wyrd-admins",
       "path": "/wyrd-admins",
-      "subGroups": []
-    },
-    {
-      "id": "grp-wyrd-viewers",
-      "name": "wyrd-viewers",
-      "path": "/wyrd-viewers",
       "subGroups": []
     }
   ],
   "clients": [
     {
-      "id": "wyrd-human-client",
+      "id": "r2-wyrd-human-client",
       "clientId": "wyrd-human",
       "name": "Wyrd Human Login",
       "enabled": true,
@@ -37,18 +34,18 @@
       "serviceAccountsEnabled": false,
       "authorizationServicesEnabled": false,
       "redirectUris": [
-        "http://localhost:*",
-        "http://127.0.0.1:*",
         "http://test-tenant-1.wyrd.test/auth/callback"
       ],
-      "webOrigins": ["*"],
+      "webOrigins": [
+        "*"
+      ],
       "protocol": "openid-connect",
       "attributes": {
         "pkce.code.challenge.method": "S256"
       },
       "protocolMappers": [
         {
-          "id": "wyrd-human-audience-mapper",
+          "id": "r2-wyrd-human-audience-mapper",
           "name": "wyrd-audience",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-audience-mapper",
@@ -60,7 +57,7 @@
           }
         },
         {
-          "id": "wyrd-human-groups-mapper",
+          "id": "r2-wyrd-human-groups-mapper",
           "name": "groups",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-group-membership-mapper",
@@ -76,46 +73,9 @@
       ]
     },
     {
-      "id": "wyrd-human-conf-client",
-      "clientId": "wyrd-human-confidential",
-      "name": "Wyrd Human Login (confidential)",
-      "enabled": true,
-      "publicClient": false,
-      "clientAuthenticatorType": "client-secret",
-      "secret": "wyrd-human-confidential-secret",
-      "standardFlowEnabled": true,
-      "directAccessGrantsEnabled": false,
-      "serviceAccountsEnabled": false,
-      "authorizationServicesEnabled": false,
-      "redirectUris": [
-        "http://test-tenant-1.wyrd.test/auth/callback"
-      ],
-      "webOrigins": ["*"],
-      "protocol": "openid-connect",
-      "attributes": {
-        "pkce.code.challenge.method": "S256"
-      },
-      "protocolMappers": [
-        {
-          "id": "wyrd-human-conf-groups-mapper",
-          "name": "groups",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-group-membership-mapper",
-          "consentRequired": false,
-          "config": {
-            "full.path": "false",
-            "id.token.claim": "true",
-            "access.token.claim": "true",
-            "userinfo.token.claim": "true",
-            "claim.name": "groups"
-          }
-        }
-      ]
-    },
-    {
-      "id": "wyrd-workload-client",
+      "id": "r2-wyrd-workload-client",
       "clientId": "wyrd-workload",
-      "name": "Wyrd Workload",
+      "name": "Wyrd Workload (second provider)",
       "enabled": true,
       "publicClient": false,
       "secret": "wyrd-workload-secret",
@@ -126,67 +86,13 @@
       "protocol": "openid-connect",
       "protocolMappers": [
         {
-          "id": "wyrd-workload-audience-mapper",
+          "id": "r2-wyrd-workload-aud-mapper",
           "name": "wyrd-audience",
           "protocol": "openid-connect",
           "protocolMapper": "oidc-audience-mapper",
           "consentRequired": false,
           "config": {
             "included.client.audience": "wyrd-workload",
-            "id.token.claim": "false",
-            "access.token.claim": "true"
-          }
-        }
-      ]
-    },
-    {
-      "id": "wyrd-workload-peer-client",
-      "clientId": "wyrd-workload-peer",
-      "name": "Wyrd Workload (unbound peer)",
-      "enabled": true,
-      "publicClient": false,
-      "secret": "wyrd-workload-peer-secret",
-      "standardFlowEnabled": false,
-      "directAccessGrantsEnabled": false,
-      "serviceAccountsEnabled": true,
-      "authorizationServicesEnabled": false,
-      "protocol": "openid-connect",
-      "protocolMappers": [
-        {
-          "id": "wyrd-workload-peer-aud-mapper",
-          "name": "wyrd-audience",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-audience-mapper",
-          "consentRequired": false,
-          "config": {
-            "included.client.audience": "wyrd-workload",
-            "id.token.claim": "false",
-            "access.token.claim": "true"
-          }
-        }
-      ]
-    },
-    {
-      "id": "wyrd-workload-foreign-client",
-      "clientId": "wyrd-workload-foreign",
-      "name": "Wyrd Workload (foreign audience)",
-      "enabled": true,
-      "publicClient": false,
-      "secret": "wyrd-workload-foreign-secret",
-      "standardFlowEnabled": false,
-      "directAccessGrantsEnabled": false,
-      "serviceAccountsEnabled": true,
-      "authorizationServicesEnabled": false,
-      "protocol": "openid-connect",
-      "protocolMappers": [
-        {
-          "id": "wyrd-workload-foreign-aud-mapper",
-          "name": "wyrd-audience",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-audience-mapper",
-          "consentRequired": false,
-          "config": {
-            "included.client.audience": "wyrd-foreign",
             "id.token.claim": "false",
             "access.token.claim": "true"
           }
@@ -248,6 +154,12 @@
       }
     }
   ],
-  "defaultDefaultClientScopes": ["openid", "profile", "email"],
-  "defaultOptionalClientScopes": ["offline_access"]
+  "defaultDefaultClientScopes": [
+    "openid",
+    "profile",
+    "email"
+  ],
+  "defaultOptionalClientScopes": [
+    "offline_access"
+  ]
 }

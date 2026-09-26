@@ -42,6 +42,7 @@ services:
       KC_LOG_LEVEL: WARN
     volumes:
       - ./tests/fixtures/identity/keycloak-realm.json:/opt/keycloak/data/import/keycloak-realm.json:ro
+      - ./tests/fixtures/identity/keycloak-realm-2.json:/opt/keycloak/data/import/keycloak-realm-2.json:ro
     ports:
       - "8080:8080"
     # The Keycloak 24 image (UBI-micro) ships no curl or wget, so the old

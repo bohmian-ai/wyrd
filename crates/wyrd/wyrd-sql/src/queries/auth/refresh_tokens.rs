@@ -24,6 +24,11 @@ const CONSUME_ACTIVE_REFRESH_SQL: &str = r#"
               human_connection_id, human_connection_revision
 "#;
 
+/// Serializes every refresh operation for one stored principal family in the
+/// bound tenant; see [`lock_refresh_family`].
+const LOCK_REFRESH_FAMILY_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended(\
+     'wyrd.auth_refresh_tokens:' || wyrd.current_tenant()::text || ':' || $1 || ':' || $2::text, 0))";
+
 const REFRESH_ISSUANCE_INSTANT_SQL: &str = r#"
     SELECT date_trunc('second', statement_timestamp())
 "#;
@@ -86,6 +91,32 @@ pub async fn consume_active_refresh(
         .bind(tenant_id)
         .fetch_optional(&mut **conn.transaction())
         .await
+}
+
+/// Serialize every refresh operation for one principal family in the bound
+/// tenant.
+///
+/// Takes a transaction-scoped advisory lock keyed by tenant, principal kind,
+/// and principal id, so it is released only when the caller commits or rolls
+/// back. Row locks alone cannot serialize a replay of an ancestor row against
+/// rotation of the current one: the family revocation's snapshot would miss a
+/// successor inserted by the concurrent rotation. Callers take this before
+/// classifying the presented row and before [`crate::queries::auth::lock_human_connection_slot`],
+/// keeping one fixed order: family first, connection second.
+///
+/// # Errors
+/// Returns a SQLx error when the lock statement fails.
+pub async fn lock_refresh_family(
+    conn: &mut TenantConn<'_>,
+    principal_kind: &str,
+    principal_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(LOCK_REFRESH_FAMILY_SQL)
+        .bind(principal_kind)
+        .bind(principal_id)
+        .execute(&mut **conn.transaction())
+        .await
+        .map(|_| ())
 }
 
 /// Look up any row by hash regardless of its lifecycle state.

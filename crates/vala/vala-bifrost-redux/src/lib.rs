@@ -80,7 +80,7 @@ pub mod partition_fixtures {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    pub(crate) use crate::partition_fixtures::{day_partition, hour_partition};
+    pub(crate) use crate::partition_fixtures::day_partition;
     use std::collections::HashMap;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};

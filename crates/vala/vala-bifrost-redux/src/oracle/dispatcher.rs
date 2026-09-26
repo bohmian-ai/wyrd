@@ -3226,6 +3226,37 @@ pub struct PhysicalDispatchFragment {
     pub deadline_unix_ms: i64,
 }
 
+/// Builds the execute request one minted ticket authorizes for one candidate.
+///
+/// The leader and target fences, assignments, plan bytes, and fingerprint are
+/// the exact values the ticket claims were minted over, so the worker's
+/// recomputation of the claim binding matches.
+fn fragment_request(
+    ticket: wyrd_spec::vala::api::SignedPeerTicket,
+    candidate: &DispatchCandidate,
+    context: &DispatchContext,
+    fragment: &PhysicalDispatchFragment,
+    pending: &PendingNodeReservation,
+) -> ExecuteFragmentRequest {
+    ExecuteFragmentRequest {
+        ticket,
+        physical_plan_bytes: fragment.physical_plan_bytes.clone(),
+        reservation_id: pending.reservation_id,
+        leader_fence: OracleRoleFence {
+            node_id: context.leader_node_id,
+            role: wyrd_spec::vala::api::ClusterRole::Oracle,
+            fencing_token: context.leader_fence,
+        },
+        target_fence: OracleRoleFence {
+            node_id: candidate.node_id,
+            role: fragment.target_role,
+            fencing_token: candidate.worker_fence,
+        },
+        assignments: fragment.assignments.clone(),
+        plan_fingerprint: fragment.plan_fingerprint.clone(),
+    }
+}
+
 /// Owns claims construction and one ambiguity-terminal reserve/execute/release cut.
 pub struct FragmentDispatcher {
     /// Narrow server-owned authority used to mint a fresh ticket per attempt.
@@ -3353,23 +3384,7 @@ impl FragmentDispatcher {
                     reason: DispatchPartialReason::Setup,
                 });
             };
-            let request = ExecuteFragmentRequest {
-                ticket,
-                physical_plan_bytes: fragment.physical_plan_bytes.clone(),
-                reservation_id: pending.reservation_id,
-                leader_fence: OracleRoleFence {
-                    node_id: context.leader_node_id,
-                    role: wyrd_spec::vala::api::ClusterRole::Oracle,
-                    fencing_token: context.leader_fence,
-                },
-                target_fence: OracleRoleFence {
-                    node_id: candidate.node_id,
-                    role: fragment.target_role,
-                    fencing_token: candidate.worker_fence,
-                },
-                assignments: fragment.assignments.clone(),
-                plan_fingerprint: fragment.plan_fingerprint.clone(),
-            };
+            let request = fragment_request(ticket, candidate, context, &fragment, &pending);
             let result = self
                 .execute_attempt(candidate, request, context, &fragment)
                 .await;
@@ -3454,6 +3469,25 @@ impl FragmentDispatcher {
         request: ExecuteFragmentRequest,
         context: &DispatchContext,
     ) -> Result<WorkerAttemptStream, DispatchError> {
+        self.open_frames(candidate, request, context)
+            .await
+            .map_err(open_failure)
+    }
+
+    /// Opens one authenticated peer stream under the query deadline and
+    /// cancellation, returning the unclassified failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Unavailable`] when the deadline has passed, the
+    /// query was cancelled, or the open timed out, and otherwise the
+    /// transport's own failure unchanged.
+    async fn open_frames(
+        &self,
+        candidate: &DispatchCandidate,
+        request: ExecuteFragmentRequest,
+        context: &DispatchContext,
+    ) -> Result<WorkerAttemptStream, DispatchError> {
         let remaining = context
             .deadline
             .checked_duration_since(Instant::now())
@@ -3484,9 +3518,47 @@ impl FragmentDispatcher {
                     "oracle peer remote execute open failed"
                 );
                 record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(&error));
-                Err(open_failure(error))
+                Err(error)
             }
         }
+    }
+
+    /// Opens one Scribe live fragment and hands back its unbuffered frames.
+    ///
+    /// Unlike [`Self::execute`], nothing is buffered or retried: the caller
+    /// validates frames as they arrive and owns the stream's lifetime, so
+    /// dropping it cancels the fragment on the Scribe. The ticket is minted for
+    /// exactly this candidate's node and writer epoch; a Scribe that restarted
+    /// or advanced its epoch refuses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when this node is not the local
+    /// leader, the candidate is not the fragment's Scribe target, or the ticket
+    /// cannot be minted, and otherwise the unclassified open failure.
+    pub async fn open_stream(
+        &self,
+        context: &DispatchContext,
+        fragment: &PhysicalDispatchFragment,
+        candidate: &DispatchCandidate,
+    ) -> Result<WorkerAttemptStream, DispatchError> {
+        if !self.transports.is_local(context.leader_node_id)
+            || candidate.role != wyrd_spec::vala::api::ClusterRole::Scribe
+            || fragment.target_role != candidate.role
+        {
+            return Err(DispatchError::Terminal);
+        }
+        let pending = PendingNodeReservation {
+            reservation_id: ReservationId::new(uuid::Uuid::nil()),
+            expires_at: Utc::now() + PENDING_TTL,
+        };
+        let claims = peer_ticket_claims(candidate, context, fragment, &pending)?;
+        let ticket = self.ticket_minter.mint_peer_ticket(&claims).map_err(|_| {
+            tracing::error!("Oracle live Scribe ticket mint failed");
+            DispatchError::Terminal
+        })?;
+        let request = fragment_request(ticket, candidate, context, fragment, &pending);
+        self.open_frames(candidate, request, context).await
     }
 
     async fn execute_attempt(

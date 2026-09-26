@@ -1318,6 +1318,8 @@ pub(crate) struct OracleTableInputs {
     /// Frozen remote owner of this cut's persisted sources, when the cut chose
     /// one. `None` keeps every persisted leaf leader-local.
     pub(crate) remote: Option<OracleRemoteSource>,
+    /// Scribe live routes discovered for this table before planning.
+    pub(crate) live: Option<super::live::LiveTableRoutes>,
 }
 
 /// Complete physical provider for one authenticated table visibility cut.
@@ -1346,6 +1348,8 @@ pub(crate) struct OracleTableProvider {
     /// Frozen remote owner of this cut's persisted sources, when the cut chose
     /// one. `None` keeps every persisted leaf leader-local.
     remote: Option<OracleRemoteSource>,
+    /// Scribe live routes discovered for this table before planning.
+    live: Option<super::live::LiveTableRoutes>,
     /// Request-local ordinal handed to the next physical scan of this table.
     ///
     /// `DataFusion` calls [`TableProvider::scan`] once per physical occurrence,
@@ -1435,7 +1439,7 @@ impl OracleTableProvider {
         )?)
     }
 
-    /// Builds one provider from an already pinned sealed cut and drained live rows.
+    /// Builds one provider from an already pinned sealed cut and its discovered live routes.
     ///
     /// # Errors
     ///
@@ -1451,6 +1455,7 @@ impl OracleTableProvider {
             table_name,
             audit,
             remote,
+            live,
         } = inputs;
         let file_io = table.file_io().clone();
         let iceberg = IcebergStaticTableProvider::try_new_from_table(table)
@@ -1470,6 +1475,7 @@ impl OracleTableProvider {
             table: table_name,
             audit,
             remote,
+            live,
             scan_occurrences: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1782,18 +1788,24 @@ impl TableProvider for OracleTableProvider {
                 occurrence,
             )
             .await?;
-        // Planned unconditionally: the Fused drain runs after admission, so
-        // planning cannot know whether this table has live rows. The leaf
-        // resolves its one bound batch set — possibly empty — from the
-        // execution `TaskContext` instead of capturing rows here.
-        inputs.push(Arc::new(
-            super::analytical_scan::AnalyticalScanExec::local_drained(
-                super::bindings::OracleSourceKey::LocalDrained {
-                    table: self.table.clone(),
-                },
-                Arc::clone(&required_schema),
-            ),
-        ));
+        // One live leaf over the routes safe event-time pruning keeps. It
+        // captures routes and the signed closure only; fragments open at
+        // execution, after admission and the audited read decision.
+        if let Some(live) = self.live.as_ref() {
+            let routes = live.select(&supported_predicates);
+            if !routes.is_empty() {
+                inputs.push(Arc::new(super::live::LiveScribeExec::new(
+                    super::live::LiveTableRoutes {
+                        routes,
+                        ..live.clone()
+                    },
+                    super::assignment_schema_fingerprint(&self.physical_schema),
+                    scan_projection.required_columns.clone(),
+                    supported_predicates.clone(),
+                    Arc::clone(&required_schema),
+                )));
+            }
+        }
         let union = UnionExec::try_new(inputs)?;
         let tripwire = Arc::new(TenantTripwireExec::new(
             union,
@@ -3570,7 +3582,10 @@ pub(super) fn select_row_groups_for_predicates(
 ///
 /// Returns a `DataFusion` error when a required field is missing, a cast fails,
 /// or Arrow rejects the projected batch.
-fn project_batch(batch: &RecordBatch, schema: SchemaRef) -> DataFusionResult<RecordBatch> {
+pub(super) fn project_batch(
+    batch: &RecordBatch,
+    schema: SchemaRef,
+) -> DataFusionResult<RecordBatch> {
     let columns = schema
         .fields()
         .iter()
@@ -3681,7 +3696,7 @@ mod tests {
     use super::*;
     use crate::oracle::BifrostQueryReadDecision;
     use crate::oracle::bindings::{
-        FollowerSourceKey, OracleExecutionBindingInputs, OracleExecutionBindings, OracleSourceKey,
+        FollowerSourceKey, OracleExecutionBindingInputs, OracleExecutionBindings,
     };
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
@@ -5503,7 +5518,6 @@ mod tests {
                 memory,
                 Arc::clone(telemetry),
             ),
-            std::collections::HashMap::new(),
         )
     }
 
@@ -5545,56 +5559,7 @@ mod tests {
                 memory,
                 Arc::clone(telemetry),
             ),
-            std::collections::HashMap::new(),
         )
-    }
-
-    /// Builds the one valid binding set, proving the two refusals on the way.
-    ///
-    /// A planned key with no binding and a binding no leaf planned are both
-    /// mismatches between the retained plan and the admitted sources, and both
-    /// must be refused before any task exists to read rows with.
-    ///
-    /// # Panics
-    ///
-    /// Panics when either mismatch is accepted, or when the exact planned key
-    /// set is refused.
-    fn validated_bindings(
-        governor: &crate::resources::BifrostRoleResources,
-        telemetry: &Arc<OracleTelemetry>,
-        table: &str,
-        live: &RecordBatch,
-        planned_keys: &[crate::oracle::bindings::OracleSourceKey],
-    ) -> crate::oracle::bindings::OracleExecutionBindings {
-        let inputs = |batches: std::collections::HashMap<String, Vec<RecordBatch>>| {
-            crate::oracle::bindings::OracleExecutionBindingInputs {
-                grant: crate::oracle::bindings::OracleExecutionGrant::for_test(
-                    QueryClass::Interactive,
-                    oracle_memory_resources(governor, 1024 * 1024),
-                    Arc::clone(telemetry),
-                ),
-                local_batches: batches,
-                follower_assignments: std::collections::HashMap::new(),
-                reservations: Vec::new(),
-                degraded: false,
-            }
-        };
-        let bound = || std::collections::HashMap::from([(table.to_owned(), vec![live.clone()])]);
-        assert!(
-            crate::oracle::bindings::OracleExecutionBindings::try_new(
-                inputs(std::collections::HashMap::new()),
-                planned_keys,
-            )
-            .is_err(),
-            "a planned key with no binding is refused"
-        );
-        assert!(
-            crate::oracle::bindings::OracleExecutionBindings::try_new(inputs(bound()), &[])
-                .is_err(),
-            "a binding no leaf planned is refused"
-        );
-        crate::oracle::bindings::OracleExecutionBindings::try_new(inputs(bound()), planned_keys)
-            .expect("the exact planned key set binds")
     }
 
     /// Builds the one frozen participant a delegated fixture cut names.
@@ -5687,10 +5652,7 @@ mod tests {
             .source_key()
             .expect("a delegated leaf names a key");
         assert_ne!(left_key, right_key, "two occurrences are two keys");
-        let (Some(left_source), Some(right_source)) = (left_key.follower(), right_key.follower())
-        else {
-            panic!("both occurrences are remote");
-        };
+        let (left_source, right_source) = (&left_key, &right_key);
         assert_ne!(
             left_source.required_columns, right_source.required_columns,
             "each occurrence keeps its own projection closure"
@@ -5711,17 +5673,16 @@ mod tests {
         let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
         let telemetry = Arc::new(OracleTelemetry::new());
         let pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
-        let inputs = |assignments: HashMap<OracleSourceKey, FollowerScanAssignment>| {
+        let inputs = |assignments: HashMap<FollowerSourceKey, FollowerScanAssignment>| {
             OracleExecutionBindingInputs {
                 grant: crate::oracle::bindings::OracleExecutionGrant::for_test(
                     QueryClass::Interactive,
                     oracle_memory_resources(&governor, 1024 * 1024),
                     Arc::clone(&telemetry),
                 ),
-                local_batches: HashMap::new(),
                 follower_assignments: assignments,
-                reservations: Vec::new(),
-                degraded: false,
+                live: None,
+                degraded: Arc::default(),
             }
         };
 
@@ -5775,6 +5736,7 @@ mod tests {
                 destination: fixture_destination(),
                 iceberg: true,
             }),
+            None,
         )
         .await;
         let session = datafusion::execution::context::SessionContext::new();
@@ -5809,7 +5771,7 @@ mod tests {
     /// Panics when a variant derives a different key or two variants overlap.
     fn assert_task_variants_share_one_occurrence(
         leaf: &RemoteSourcePlaceholderExec,
-        key: &OracleSourceKey,
+        key: &FollowerSourceKey,
         assignment: &FollowerScanAssignment,
     ) {
         let first_task = leaf.clone().with_task_share(0, 2);
@@ -5840,9 +5802,9 @@ mod tests {
         /// The second occurrence's complete planned authority.
         right: &'a FollowerSourceKey,
         /// The first occurrence's key, as the retained plan carries it.
-        left_key: &'a OracleSourceKey,
+        left_key: &'a FollowerSourceKey,
         /// The second occurrence's key, as the retained plan carries it.
-        right_key: &'a OracleSourceKey,
+        right_key: &'a FollowerSourceKey,
     }
 
     /// Refuses every single-fact disagreement between a plan and its bindings.
@@ -5857,8 +5819,8 @@ mod tests {
     /// assignment value is accepted.
     fn assert_exact_binding_refusals<I, A>(case: &BindingRefusalCase<'_, I, A>)
     where
-        I: Fn(HashMap<OracleSourceKey, FollowerScanAssignment>) -> OracleExecutionBindingInputs,
-        A: Fn() -> HashMap<OracleSourceKey, FollowerScanAssignment>,
+        I: Fn(HashMap<FollowerSourceKey, FollowerScanAssignment>) -> OracleExecutionBindingInputs,
+        A: Fn() -> HashMap<FollowerSourceKey, FollowerScanAssignment>,
     {
         let BindingRefusalCase {
             inputs,
@@ -5903,7 +5865,6 @@ mod tests {
             other_columns,
             other_predicates,
         ] {
-            let mutated = OracleSourceKey::Follower(Box::new(mutated));
             assert!(
                 OracleExecutionBindings::try_new(
                     inputs(assignments()),
@@ -5965,8 +5926,8 @@ mod tests {
     /// A whole retained root binds once and reads only its admitted task.
     ///
     /// Split out of [`retained_plan_uses_admitted_task_context_only`] to keep
-    /// each half readable; it owns the sentinel planning runtime, the binding
-    /// validation refusals, and the planning-versus-execution config equality.
+    /// each half readable; it owns the sentinel planning runtime, the empty binding
+    /// set, and the planning-versus-execution config equality.
     ///
     /// # Panics
     ///
@@ -5979,14 +5940,9 @@ mod tests {
     ) {
         // A whole retained root is planned on a sentinel planning runtime and
         // executed on a distinct admitted one. Planning must reach no row
-        // source, and the bound Fused rows must arrive through the admitted
-        // pool alone.
+        // source, and execution must charge the admitted pool alone.
         let tenant = wyrd_spec::DataTenantId::new_v7();
-        let (provider, live) = projection_closure_provider(tenant, None).await;
-        let table = "vala.traces.spans".to_owned();
-        let planned_keys = [crate::oracle::bindings::OracleSourceKey::LocalDrained {
-            table: table.clone(),
-        }];
+        let (provider, _live) = projection_closure_provider(tenant, None, None).await;
 
         let shape = crate::resources::OracleSessionShape::for_grant(
             crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
@@ -6020,7 +5976,20 @@ mod tests {
             "planning opens no row source and reserves nothing"
         );
 
-        let bindings = validated_bindings(governor, telemetry, &table, &live, &planned_keys);
+        let bindings = OracleExecutionBindings::try_new(
+            OracleExecutionBindingInputs {
+                grant: crate::oracle::bindings::OracleExecutionGrant::for_test(
+                    QueryClass::Interactive,
+                    oracle_memory_resources(governor, 1024 * 1024),
+                    Arc::clone(telemetry),
+                ),
+                follower_assignments: HashMap::new(),
+                live: None,
+                degraded: Arc::default(),
+            },
+            &[],
+        )
+        .expect("a root that planned no delegated source binds nothing");
         assert!(lock.set(bindings).is_ok(), "a fresh lock binds once");
 
         let admitted_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
@@ -6048,17 +6017,19 @@ mod tests {
                 .iter()
                 .map(arrow::array::RecordBatch::num_rows)
                 .sum::<usize>(),
-            2,
-            "the bound Fused rows are the retained root's only rows"
+            0,
+            "the unpublished fixture table has no rows"
         );
         assert_eq!(planning_pool.reserved(), 0, "row IO never touches planning");
         assert_eq!(admitted_pool.reserved(), 0, "settlement returns every byte");
 
-        // A freshly planned root executed on a session carrying no lock refuses
-        // at the leaf rather than reading rows from anywhere else.
+        // A freshly planned root with a governed live leaf, executed on a
+        // session carrying no lock, refuses at the leaf rather than dialing.
+        let (live_provider, _live) =
+            projection_closure_provider(tenant, None, Some(one_live_route(tenant))).await;
         let unbound_session =
             datafusion::execution::context::SessionContext::new_with_config(shape.session_config());
-        let unbound_root = provider
+        let unbound_root = live_provider
             .scan(&unbound_session.state(), None, &[], None)
             .await
             .expect("a second root plans");
@@ -6395,6 +6366,7 @@ mod tests {
             table_name: "vala.traces.spans".to_owned(),
             audit: Arc::new(NoopAudit),
             remote: None,
+            live: None,
         })
         .await
         .expect("pruning fixture provider")
@@ -6646,6 +6618,7 @@ mod tests {
     async fn projection_closure_provider(
         tenant: wyrd_spec::DataTenantId,
         remote: Option<OracleRemoteSource>,
+        live_routes: Option<crate::oracle::live::LiveTableRoutes>,
     ) -> (OracleTableProvider, RecordBatch) {
         let principal = Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
@@ -6695,10 +6668,40 @@ mod tests {
             table_name: "vala.traces.spans".to_owned(),
             audit: Arc::new(NoopAudit),
             remote,
+            live: live_routes,
         })
         .await
         .expect("pinned fixture provider");
         (provider, live)
+    }
+
+    /// Builds one live Scribe route over the closure fixture's table.
+    ///
+    /// The route is only planned, never dialed: the closure owner substitutes
+    /// the live leaf with the fixture rows before execution.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed hour boundary is rejected, which is a fixture bug.
+    fn one_live_route(tenant: wyrd_spec::DataTenantId) -> crate::oracle::live::LiveTableRoutes {
+        crate::oracle::live::LiveTableRoutes {
+            binding: wyrd_spec::vala::api::TenantTableBinding {
+                tenant_id: tenant,
+                namespace: "traces".to_owned(),
+                table: "spans".to_owned(),
+            },
+            table_uid: uuid::Uuid::nil(),
+            routes: vec![crate::oracle::live::LiveScribeRoute {
+                node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
+                writer_epoch: 1,
+                time_partition: wyrd_spec::vala::api::TimePartitionWire::new(
+                    wyrd_spec::vala::api::TimeGranularityWire::Hour,
+                    chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
+                        .expect("instant"),
+                )
+                .expect("hour boundary"),
+            }],
+        }
     }
 
     /// One leader-owned closure governs every leaf, the placeholder, the
@@ -6717,13 +6720,15 @@ mod tests {
     /// the closure contract this owner pins.
     #[tokio::test]
     async fn projected_leaf_union_preserves_predicate_and_tenant_columns() {
+        use datafusion::common::tree_node::TreeNode;
         use datafusion::execution::context::SessionContext;
         use datafusion::logical_expr::{col, lit};
         use datafusion::physical_plan::collect;
         use datafusion::physical_plan::filter::FilterExec;
 
         let tenant = wyrd_spec::DataTenantId::new_v7();
-        let (provider, live) = projection_closure_provider(tenant, None).await;
+        let (provider, live) =
+            projection_closure_provider(tenant, None, Some(one_live_route(tenant))).await;
 
         let public = provider.schema();
         let projection = vec![public.index_of("duration_ms").expect("public duration_ms")];
@@ -6759,7 +6764,7 @@ mod tests {
             vec!["duration_ms".to_string(), "status_code".to_string()]
         );
 
-        // Every union child — the published Iceberg leaf and the bound live
+        // Every union child — the published Iceberg leaf and the live Scribe
         // leaf alike — exposes exactly the closure, in closure order.
         let children = union_child_column_names(&union);
         assert_eq!(children.len(), 2, "published and live leaves both planned");
@@ -6776,7 +6781,25 @@ mod tests {
                 .collect::<Vec<_>>();
         assert_eq!(predicate_columns, vec![("status_code".to_string(), 1)]);
 
-        // One ERROR row and one OK row in; only the ERROR duration out.
+        // One ERROR row and one OK row in; only the ERROR duration out. The
+        // live leaf's peer stream is substituted by its rows, projected onto
+        // the same closure the leaf planned.
+        let plan = plan
+            .transform_up(|node| {
+                if node
+                    .downcast_ref::<super::super::live::LiveScribeExec>()
+                    .is_none()
+                {
+                    return Ok(datafusion::common::tree_node::Transformed::no(node));
+                }
+                OracleTableProvider::projected_memory_source(
+                    std::slice::from_ref(&live),
+                    &node.schema(),
+                )
+                .map(datafusion::common::tree_node::Transformed::yes)
+            })
+            .expect("live leaf substitutes")
+            .data;
         let rows = collect(
             plan,
             crate::oracle::bindings::bind_test_session(
@@ -6787,7 +6810,6 @@ mod tests {
                     oracle_memory_resources(&oracle_test_roles(1024 * 1024 * 1024), 1024 * 1024),
                     Arc::new(OracleTelemetry::new()),
                 ),
-                std::collections::HashMap::from([("vala.traces.spans".to_owned(), vec![live])]),
             ),
         )
         .await

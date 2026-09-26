@@ -23,14 +23,6 @@ pub const ORACLE_PHYSICAL_CODEC_VERSION: u32 = 1;
 pub const ORACLE_REMOTE_SCAN_TAG: &str = "wyrd.oracle.remote_scan";
 /// Extension type for the authenticated tenant tripwire surrounding follower sources.
 pub const ORACLE_TENANT_TRIPWIRE_TAG: &str = "wyrd.oracle.tenant_tripwire";
-/// Wire tag for a leader-owned leaf that bound no rows for this attempt.
-///
-/// The leader's drained live tail is planned unconditionally, because the drain
-/// runs after admission and planning cannot know whether a table has live rows.
-/// When the bound tail is empty the leaf contributes nothing, so a stage
-/// carrying it can still be dispatched by encoding it as an empty leaf of the
-/// same schema. A tail that bound rows has no wire form and refuses instead.
-pub const ORACLE_EMPTY_LEAF_TAG: &str = "wyrd.oracle.empty_leaf";
 
 /// Fingerprints the exact versioned physical-plan bytes shared by all followers.
 #[must_use]
@@ -271,21 +263,19 @@ impl RemoteSourcePlaceholderExec {
     /// Task variants of one occurrence derive an identical key, because a share
     /// divides work rather than authority.
     #[must_use]
-    pub(super) fn source_key(&self) -> Option<super::bindings::OracleSourceKey> {
-        self.source.as_ref().map(|source| {
-            super::bindings::OracleSourceKey::Follower(Box::new(
-                super::bindings::FollowerSourceKey {
-                    scan_id: self.scan_id.clone(),
-                    destination: source.destination.clone(),
-                    tenant: source.tenant,
-                    table: source.table.clone(),
-                    tier: source.tier,
-                    schema_fingerprint: self.schema_fingerprint.clone(),
-                    required_columns: self.required_columns.clone(),
-                    predicates: self.predicates.clone(),
-                },
-            ))
-        })
+    pub(super) fn source_key(&self) -> Option<super::bindings::FollowerSourceKey> {
+        self.source
+            .as_ref()
+            .map(|source| super::bindings::FollowerSourceKey {
+                scan_id: self.scan_id.clone(),
+                destination: source.destination.clone(),
+                tenant: source.tenant,
+                table: source.table.clone(),
+                tier: source.tier,
+                schema_fingerprint: self.schema_fingerprint.clone(),
+                required_columns: self.required_columns.clone(),
+                predicates: self.predicates.clone(),
+            })
     }
 
     /// Narrows this leaf to one task's share of its stage.
@@ -914,28 +904,6 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let envelope = Self::decode_envelope(buf)?;
         match envelope.type_tag.as_str() {
-            ORACLE_EMPTY_LEAF_TAG => {
-                if !inputs.is_empty() {
-                    return Err(DataFusionError::Plan(
-                        "empty leaf extension must be a leaf".to_owned(),
-                    ));
-                }
-                let payload =
-                    RemoteScanPayload::decode(envelope.payload.as_slice()).map_err(|error| {
-                        DataFusionError::Plan(format!("invalid empty leaf payload: {error}"))
-                    })?;
-                let schema =
-                    datafusion_proto::protobuf::Schema::decode(payload.closure_schema.as_slice())
-                        .map_err(|error| {
-                        DataFusionError::Plan(format!("invalid empty leaf schema: {error}"))
-                    })?;
-                let schema = arrow::datatypes::Schema::try_from(&schema).map_err(|error| {
-                    DataFusionError::Plan(format!("invalid empty leaf schema: {error}"))
-                })?;
-                Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
-                    Arc::new(schema),
-                )))
-            }
             ORACLE_REMOTE_SCAN_TAG => {
                 if !inputs.is_empty() {
                     return Err(DataFusionError::Plan(
@@ -1021,39 +989,10 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                 ORACLE_REMOTE_SCAN_TAG,
                 remote_scan_payload(scan, self.bindings.as_deref())?.encode_to_vec(),
             )
-        } else if let Some(drained) = node
-            .downcast_ref::<super::analytical_scan::AnalyticalScanExec>()
-            .and_then(super::analytical_scan::AnalyticalScanExec::local_drained_key)
-        {
-            let bound = self
-                .bindings
-                .as_deref()
-                .and_then(std::sync::OnceLock::get)
-                .map(|bindings| bindings.local_batches(drained));
-            // An unbound tail carries nothing either: the refusal is reserved
-            // for a tail that actually resolved rows on this node.
-            if bound.is_some_and(|batches| {
-                batches.is_ok_and(|batches| batches.iter().any(|batch| batch.num_rows() > 0))
-            }) {
-                return Err(DataFusionError::Plan(
-                    "leader drained tail holds rows and cannot cross the wire".to_owned(),
-                ));
-            }
-            let schema = datafusion_proto::protobuf::Schema::try_from(node.schema().as_ref())
-                .map_err(|error| {
-                    DataFusionError::Plan(format!("empty leaf schema encoding failed: {error}"))
-                })?;
-            (
-                ORACLE_EMPTY_LEAF_TAG,
-                RemoteScanPayload {
-                    scan_id: String::new(),
-                    schema_fingerprint: String::new(),
-                    assignment_json: Vec::new(),
-                    closure_schema: schema.encode_to_vec(),
-                    partitions: 0,
-                }
-                .encode_to_vec(),
-            )
+        } else if node.downcast_ref::<super::live::LiveScribeExec>().is_some() {
+            return Err(DataFusionError::Plan(
+                "leader-owned live Scribe source cannot cross the wire".to_owned(),
+            ));
         } else if let Some(tripwire) = node.downcast_ref::<super::exec::TenantTripwireExec>() {
             (
                 ORACLE_TENANT_TRIPWIRE_TAG,

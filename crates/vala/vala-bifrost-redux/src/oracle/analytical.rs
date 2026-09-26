@@ -7845,10 +7845,23 @@ impl datafusion_distributed::DesiredTaskCountHandler for AnalyticalCutTaskCount 
                     )
                 });
         }
+        // The live Scribe leaf is leader-owned and has no wire encoding, so its
+        // stage is capped at one task and stays on the leader.
+        // ponytail: an aggregate over live rows then runs on the leader; a
+        // coalesce boundary under the union lets published work distribute.
+        if ev
+            .plan
+            .downcast_ref::<super::live::LiveScribeExec>()
+            .is_some()
+        {
+            return Some(Ok(
+                datafusion_distributed::DesiredTaskCountEventResponse::maximum(1),
+            ));
+        }
         // Only a substituted source may occupy more than one task. Every other
-        // leaf — the drained local live tail above all — is leader-owned and
-        // carries no wire encoding, so distributing its stage would ask the
-        // codec to serialize a plan that exists only on this node.
+        // leaf is leader-owned and carries no wire encoding, so distributing
+        // its stage would ask the codec to serialize a plan that exists only
+        // on this node.
         //
         // A substituted leaf gets the cut's own budget and nothing more. It is
         // deliberately not forced past one task: the placeholder can read its

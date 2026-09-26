@@ -1,12 +1,11 @@
 //! Post-admission execution bindings shared by one query's planned leaves.
 //!
 //! A physical root is built before the query is admitted, so nothing a leaf
-//! captures at planning time may name a runtime, a memory pool, a drained
-//! batch, or a follower assignment. Each planning leaf instead retains one
-//! closed [`OracleSourceKey`], and the single
-//! `OnceLock<OracleExecutionBindings>` installed in the session configuration
-//! before planning receives every concrete value exactly once after admission
-//! and the audited source drain.
+//! captures at planning time may name a runtime, a memory pool, a dispatcher,
+//! or a follower assignment. Each remote planning leaf instead retains one
+//! [`FollowerSourceKey`], and the single `OnceLock<OracleExecutionBindings>`
+//! installed in the session configuration before planning receives every
+//! concrete value exactly once after admission and the audited read decision.
 //!
 //! The lock travels with the retained plan and with every `TaskContext` derived
 //! from the same configuration, which is what lets planning observe an unbound
@@ -15,13 +14,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::vala::api::QueryClass;
 use wyrd_spec::vala::error::BifrostError;
 
-use super::{OracleMemoryResources, OracleTelemetry};
+use super::live::LiveDispatch;
+use super::{DegradedSourceAccumulator, OracleMemoryResources, OracleTelemetry};
 
 /// Complete planned authority of one physical remote-scan occurrence.
 ///
@@ -74,64 +73,15 @@ impl FollowerSourceKey {
     }
 }
 
-/// Closed identity of the one source a planning leaf reads.
-///
-/// This is everything a leaf may retain about its data before admission: which
-/// per-table drained batch set it reads, or which remote scan occurrence it
-/// reads from which frozen destination. It deliberately carries no batches,
-/// assignment, pool, runtime, or class.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum OracleSourceKey {
-    /// The single Fused batch set drained for one canonical table.
-    LocalDrained {
-        /// Canonical fully-qualified table name whose batches this leaf reads.
-        table: String,
-    },
-    /// One remote scan occurrence answered by exactly one frozen participant.
+impl std::hash::Hash for FollowerSourceKey {
+    /// Hashes only the request-local scan identity every equal key shares.
     ///
-    /// The destination is fixed when the roster is frozen, before the class
-    /// exists, so a stage carrying this leaf can never be routed to a peer the
-    /// cut did not authorize. The assignment itself is bound after admission.
-    /// Boxed because this variant dwarfs its sibling.
-    Follower(Box<FollowerSourceKey>),
-}
-
-impl OracleSourceKey {
-    /// Returns the canonical table name of a local-drained key, if it is one.
-    pub(super) fn local_table(&self) -> Option<&str> {
-        match self {
-            Self::LocalDrained { table } => Some(table.as_str()),
-            Self::Follower(_) => None,
-        }
-    }
-
-    /// Returns the full planned remote authority, if this key is remote.
-    pub(super) fn follower(&self) -> Option<&FollowerSourceKey> {
-        match self {
-            Self::LocalDrained { .. } => None,
-            Self::Follower(source) => Some(source),
-        }
-    }
-}
-
-impl std::hash::Hash for OracleSourceKey {
-    /// Hashes only the identity every equal key necessarily shares.
-    ///
-    /// A canonical table name and a request-local scan identity each already
-    /// separate every distinct key in one query, so hashing the remaining
-    /// authority would cost a full closure walk per lookup without removing a
-    /// collision. Equal keys still hash equally, which is the contract.
+    /// A scan identity already separates every distinct occurrence in one
+    /// query, so hashing the remaining authority would cost a full closure walk
+    /// per lookup without removing a collision. Equal keys still hash equally,
+    /// which is the contract.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            Self::LocalDrained { table } => {
-                state.write_u8(0);
-                table.hash(state);
-            }
-            Self::Follower(source) => {
-                state.write_u8(1);
-                source.scan_id.hash(state);
-            }
-        }
+        self.scan_id.hash(state);
     }
 }
 
@@ -194,22 +144,18 @@ impl OracleExecutionGrant {
 
 /// Every concrete value the retained plan's leaves need, bound exactly once.
 ///
-/// Built after admission and the audited drain, validated against the exact set
-/// of keys the planned leaves retained, and then published through the
-/// session's `OnceLock`. It also owns the drained tails' reservations for the
-/// lifetime of the query, so the shallow batches a memory source projects are
-/// charged once rather than twice.
+/// Built after admission and the audited read decision, validated against the
+/// exact set of keys the planned leaves retained, and then published through
+/// the session's `OnceLock`.
 pub(super) struct OracleExecutionBindings {
     /// Admitted governance shared by every governed leaf.
     grant: OracleExecutionGrant,
-    /// Drained Fused batches keyed by canonical table name.
-    local_batches: HashMap<String, Vec<RecordBatch>>,
     /// Completed follower assignments keyed by their full planned occurrence.
-    follower_assignments: HashMap<OracleSourceKey, wyrd_spec::vala::api::FollowerScanAssignment>,
-    /// Reservations retaining those batches until the query settles.
-    _reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
-    /// Whether one requested live source was unavailable at drain time.
-    degraded: bool,
+    follower_assignments: HashMap<FollowerSourceKey, wyrd_spec::vala::api::FollowerScanAssignment>,
+    /// Admitted dispatch capability live Scribe leaves open fragments through.
+    live: Option<LiveDispatch>,
+    /// Known live sources lost before their first row, read at the terminal.
+    degraded: DegradedSourceAccumulator,
 }
 
 impl std::fmt::Debug for OracleExecutionBindings {
@@ -217,8 +163,8 @@ impl std::fmt::Debug for OracleExecutionBindings {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OracleExecutionBindings")
-            .field("local_tables", &self.local_batches.len())
-            .field("degraded", &self.degraded)
+            .field("follower_assignments", &self.follower_assignments.len())
+            .field("live", &self.live)
             .finish_non_exhaustive()
     }
 }
@@ -227,15 +173,13 @@ impl std::fmt::Debug for OracleExecutionBindings {
 pub(super) struct OracleExecutionBindingInputs {
     /// Admitted governance derived from the root's class and the query owner.
     pub(super) grant: OracleExecutionGrant,
-    /// Drained Fused batches keyed by canonical table name.
-    pub(super) local_batches: HashMap<String, Vec<RecordBatch>>,
     /// Completed follower assignments keyed by their full planned occurrence.
     pub(super) follower_assignments:
-        HashMap<OracleSourceKey, wyrd_spec::vala::api::FollowerScanAssignment>,
-    /// Reservations retaining those batches until the query settles.
-    pub(super) reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
-    /// Whether one requested live source was unavailable at drain time.
-    pub(super) degraded: bool,
+        HashMap<FollowerSourceKey, wyrd_spec::vala::api::FollowerScanAssignment>,
+    /// Admitted dispatch capability, present when live routes were planned.
+    pub(super) live: Option<LiveDispatch>,
+    /// Accumulator the terminal reads, already holding any listing loss.
+    pub(super) degraded: DegradedSourceAccumulator,
 }
 
 impl OracleExecutionBindings {
@@ -256,48 +200,31 @@ impl OracleExecutionBindings {
     /// or predicates differ from the occurrence that planned it.
     pub(super) fn try_new(
         inputs: OracleExecutionBindingInputs,
-        planned: &[OracleSourceKey],
+        planned: &[FollowerSourceKey],
     ) -> Result<Self, BifrostError> {
         let OracleExecutionBindingInputs {
             grant,
-            local_batches,
             follower_assignments,
-            reservations,
+            live,
             degraded,
         } = inputs;
-        let mut planned_followers = 0_usize;
-        for key in planned {
-            let bound = match key {
-                OracleSourceKey::LocalDrained { table } => local_batches.contains_key(table),
-                OracleSourceKey::Follower(source) => {
-                    planned_followers += 1;
-                    follower_assignments
-                        .get(key)
-                        .is_some_and(|assignment| source.matches(assignment))
-                }
-            };
-            if !bound {
-                return Err(BifrostError::QueryExecutionFailed);
-            }
+        if planned.iter().any(|key| {
+            !follower_assignments
+                .get(key)
+                .is_some_and(|assignment| key.matches(assignment))
+        }) {
+            return Err(BifrostError::QueryExecutionFailed);
         }
         // Exact cardinality both ways. Every planned occurrence resolved above,
         // so equal counts leave no unplanned binding and no repeated canonical
         // occurrence — a duplicate would be counted twice against one entry.
-        if planned_followers != follower_assignments.len() {
-            return Err(BifrostError::QueryExecutionFailed);
-        }
-        if local_batches.keys().any(|table| {
-            !planned
-                .iter()
-                .any(|key| key.local_table() == Some(table.as_str()))
-        }) {
+        if planned.len() != follower_assignments.len() {
             return Err(BifrostError::QueryExecutionFailed);
         }
         Ok(Self {
             grant,
-            local_batches,
             follower_assignments,
-            _reservations: reservations,
+            live,
             degraded,
         })
     }
@@ -307,29 +234,23 @@ impl OracleExecutionBindings {
         &self.grant
     }
 
-    /// Returns whether one requested live source was unavailable at drain time.
-    pub(super) const fn degraded(&self) -> bool {
-        self.degraded
+    /// Returns the accumulator a live leaf records a pre-row source loss on.
+    pub(super) const fn degraded(&self) -> &DegradedSourceAccumulator {
+        &self.degraded
     }
 
-    /// Resolves the drained batches one local leaf reads.
+    /// Returns the admitted dispatch capability a live leaf opens fragments through.
     ///
     /// # Errors
     ///
-    /// Returns a `DataFusion` execution error when the key was never bound,
-    /// which is the same refusal a mismatched binding produces.
-    pub(super) fn local_batches(
-        &self,
-        key: &OracleSourceKey,
-    ) -> datafusion::error::Result<&[RecordBatch]> {
-        key.local_table()
-            .and_then(|table| self.local_batches.get(table))
-            .map(Vec::as_slice)
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
-                    "Oracle plan leaf has no bound local source".to_owned(),
-                )
-            })
+    /// Returns a `DataFusion` execution error when the query planned a live
+    /// leaf but bound no dispatcher, which means plan and bindings disagree.
+    pub(super) fn live(&self) -> datafusion::error::Result<&LiveDispatch> {
+        self.live.as_ref().ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "Oracle plan leaf has no bound live dispatch".to_owned(),
+            )
+        })
     }
 
     /// Resolves the one completed assignment a remote leaf reads.
@@ -341,17 +262,12 @@ impl OracleExecutionBindings {
     ///
     /// # Errors
     ///
-    /// Returns a `DataFusion` execution error when the key names no follower
-    /// scan or when nothing was bound under it.
+    /// Returns a `DataFusion` execution error when nothing was bound under the
+    /// key.
     pub(super) fn follower_assignment(
         &self,
-        key: &OracleSourceKey,
+        key: &FollowerSourceKey,
     ) -> datafusion::error::Result<&wyrd_spec::vala::api::FollowerScanAssignment> {
-        if key.follower().is_none() {
-            return Err(datafusion::error::DataFusionError::Execution(
-                "Oracle plan leaf is not a remote source".to_owned(),
-            ));
-        }
         self.follower_assignments.get(key).ok_or_else(|| {
             datafusion::error::DataFusionError::Execution(
                 "Oracle plan leaf has no bound follower assignment".to_owned(),
@@ -404,16 +320,14 @@ pub(super) fn bind_test_session(
     config: datafusion::prelude::SessionConfig,
     memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     grant: OracleExecutionGrant,
-    local_batches: HashMap<String, Vec<RecordBatch>>,
 ) -> Arc<datafusion::execution::TaskContext> {
     let lock = Arc::new(OracleExecutionLock::new());
     assert!(
         lock.set(OracleExecutionBindings {
             grant,
-            local_batches,
             follower_assignments: HashMap::new(),
-            _reservations: Vec::new(),
-            degraded: false,
+            live: None,
+            degraded: DegradedSourceAccumulator::default(),
         })
         .is_ok(),
         "a fresh execution lock binds exactly once"

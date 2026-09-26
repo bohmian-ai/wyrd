@@ -28,43 +28,31 @@ use futures_util::TryStreamExt as _;
 use wyrd_spec::vala::api::ClusterRole;
 use wyrd_spec::vala::api::FollowerScanAssignment;
 
-use super::bindings::OracleSourceKey;
 use super::follower::{FollowerSourceResolver, signed_closure_schema};
 
-/// The one source a lazily resolved Oracle leaf reads.
+/// The worker-side assignment a lazily resolved Oracle leaf reads.
 ///
-/// Both variants defer every byte of IO to `execute`, which is the only point
-/// at which the admitted task — and therefore the query's runtime, pool,
-/// deadline, cancellation, and bound sources — exists.
+/// Every byte of IO is deferred to `execute`, which is the only point at which
+/// the admitted task — and therefore the query's runtime, pool, deadline, and
+/// cancellation — exists.
 #[derive(Clone)]
-enum AnalyticalScanSource {
-    /// Leader-side leaf projecting the one Fused batch set bound for its table.
-    LocalDrained {
-        /// Exact planned key this leaf resolves its batches through.
-        key: OracleSourceKey,
-    },
-    /// Worker-side leaf resolving the assignment authenticated on the wire.
-    Assigned {
-        /// Signed assignment naming this task's tenant binding, files, and closure.
-        assignment: Arc<FollowerScanAssignment>,
-        /// Role this node executes as, selecting the resolver's source family.
-        role: ClusterRole,
-        /// Process resolver that turns an assignment into a role-local provider.
-        resolver: Arc<dyn FollowerSourceResolver>,
-        /// This node's reader epoch, which the assignment's cut is protected under.
-        reader_authority: Option<Arc<super::reader_pins::OracleReaderAuthority>>,
-        /// Graph that owns the guard this leaf's protection produces.
-        guard_sink: Option<Arc<GraphReaderGuardSink>>,
-    },
+struct AnalyticalScanSource {
+    /// Signed assignment naming this task's tenant binding, files, and closure.
+    assignment: Arc<FollowerScanAssignment>,
+    /// Role this node executes as, selecting the resolver's source family.
+    role: ClusterRole,
+    /// Process resolver that turns an assignment into a role-local provider.
+    resolver: Arc<dyn FollowerSourceResolver>,
+    /// This node's reader epoch, which the assignment's cut is protected under.
+    reader_authority: Option<Arc<super::reader_pins::OracleReaderAuthority>>,
+    /// Graph that owns the guard this leaf's protection produces.
+    guard_sink: Option<Arc<GraphReaderGuardSink>>,
 }
 
 impl AnalyticalScanSource {
     /// Returns the stable non-secret identity rendered in plan diagnostics.
     fn label(&self) -> &str {
-        match self {
-            Self::LocalDrained { key } => key.local_table().unwrap_or("local"),
-            Self::Assigned { assignment, .. } => assignment.scan_id.as_str(),
-        }
+        self.assignment.scan_id.as_str()
     }
 }
 
@@ -148,7 +136,7 @@ impl AnalyticalScanExec {
         partitions: usize,
     ) -> Self {
         Self::with_source(
-            AnalyticalScanSource::Assigned {
+            AnalyticalScanSource {
                 assignment: Arc::new(assignment),
                 role,
                 resolver,
@@ -158,30 +146,6 @@ impl AnalyticalScanExec {
             schema,
             partitions,
         )
-    }
-
-    /// Creates the leader-side leaf that reads one table's bound Fused batches.
-    ///
-    /// The batch set is bound after admission and the audited drain, so this
-    /// leaf retains only its key and the closure schema the plan was built
-    /// against. A single partition is advertised because one drained batch set
-    /// is projected as one memory source.
-    #[must_use]
-    pub(super) fn local_drained(key: OracleSourceKey, schema: SchemaRef) -> Self {
-        Self::with_source(AnalyticalScanSource::LocalDrained { key }, schema, 1)
-    }
-
-    /// Returns the planned key when this leaf is the leader's drained tail.
-    ///
-    /// Encoding consults this to decide whether the leaf can cross the wire at
-    /// all: a drained tail exists only on the node that drained it, so a stage
-    /// carrying one may be dispatched only when the tail bound no rows.
-    #[must_use]
-    pub(super) fn local_drained_key(&self) -> Option<&OracleSourceKey> {
-        match &self.source {
-            AnalyticalScanSource::LocalDrained { key } => Some(key),
-            AnalyticalScanSource::Assigned { .. } => None,
-        }
     }
 
     /// Builds one leaf around an already-chosen source and advertised shape.
@@ -201,11 +165,11 @@ impl AnalyticalScanExec {
 
     /// Resolves, validates, and reshapes the provider backing this leaf.
     ///
-    /// Both variants resolve against the executing task rather than a fresh
+    /// Resolution runs against the executing task rather than a fresh
     /// process default, so the resolved subtree inherits the admitted runtime,
     /// memory pool, session configuration, and registered functions.
     ///
-    /// The assigned variant's two schema checks mirror
+    /// The two schema checks mirror
     /// `PhysicalPlanFollower::decode` exactly: the fingerprint identifies the
     /// table's complete canonical schema, and the leaf must then expose
     /// precisely the closure derived from that schema and the signed column
@@ -218,74 +182,51 @@ impl AnalyticalScanExec {
     /// # Errors
     ///
     /// Returns [`DataFusionError::Plan`] when resolution fails, when either
-    /// schema check fails, or when the provider cannot be repartitioned, and a
-    /// [`DataFusionError::Execution`] when a local-drained leaf has no bound
-    /// source in the executing task.
+    /// schema check fails, or when the provider cannot be repartitioned.
     async fn resolve(&self, task: &Arc<TaskContext>) -> Result<ResolvedAnalyticalSource> {
-        let resolved = match &self.source {
-            AnalyticalScanSource::LocalDrained { key } => {
-                let lock = super::bindings::bindings_for_task(task.as_ref())?;
-                let bindings = lock.get().ok_or_else(|| {
-                    DataFusionError::Execution("Oracle execution bindings are not bound".to_owned())
-                })?;
-                bindings.grant().ensure_live()?;
-                let batches = bindings.local_batches(key)?;
-                return Ok(ResolvedAnalyticalSource {
-                    plan: super::exec::OracleTableProvider::projected_memory_source(
-                        batches,
-                        &self.schema(),
-                    )?,
-                });
-            }
-            AnalyticalScanSource::Assigned {
+        let resolved = {
+            let AnalyticalScanSource {
                 assignment,
                 role,
                 resolver,
                 reader_authority,
                 guard_sink,
-            } => {
-                let session = SessionStateBuilder::new()
-                    .with_config(task.session_config().clone())
-                    .with_runtime_env(task.runtime_env())
-                    .with_scalar_functions(task.scalar_functions().values().cloned().collect())
-                    .with_aggregate_functions(
-                        task.aggregate_functions().values().cloned().collect(),
-                    )
-                    .with_window_functions(task.window_functions().values().cloned().collect())
-                    .build();
-                let permit = graph_owned_permit(
-                    reader_authority.as_ref(),
-                    guard_sink.as_ref(),
-                    assignment.as_ref(),
-                )
-                .await?;
-                let resolved = resolver
-                    .resolve(*role, assignment.as_ref(), &session, permit.as_ref())
-                    .await
-                    .map_err(|error| {
-                        DataFusionError::Plan(format!(
-                            "analytical source resolution failed: {error}"
-                        ))
-                    })?;
-                let actual = super::assignment_schema_fingerprint(resolved.full_schema.as_ref());
-                if actual != assignment.schema_fingerprint {
-                    return Err(DataFusionError::Plan(
-                        "resolved provider schema fingerprint differs from assignment".to_owned(),
-                    ));
-                }
-                let expected = signed_closure_schema(
-                    resolved.full_schema.as_ref(),
-                    &assignment.required_columns,
-                )
-                .map_err(DataFusionError::Plan)?;
-                if resolved.plan.schema() != expected {
-                    return Err(DataFusionError::Plan(
-                        "resolved provider schema differs from the signed projection closure"
-                            .to_owned(),
-                    ));
-                }
-                resolved.plan
+            } = &self.source;
+            let session = SessionStateBuilder::new()
+                .with_config(task.session_config().clone())
+                .with_runtime_env(task.runtime_env())
+                .with_scalar_functions(task.scalar_functions().values().cloned().collect())
+                .with_aggregate_functions(task.aggregate_functions().values().cloned().collect())
+                .with_window_functions(task.window_functions().values().cloned().collect())
+                .build();
+            let permit = graph_owned_permit(
+                reader_authority.as_ref(),
+                guard_sink.as_ref(),
+                assignment.as_ref(),
+            )
+            .await?;
+            let resolved = resolver
+                .resolve(*role, assignment.as_ref(), &session, permit.as_ref())
+                .await
+                .map_err(|error| {
+                    DataFusionError::Plan(format!("analytical source resolution failed: {error}"))
+                })?;
+            let actual = super::assignment_schema_fingerprint(resolved.full_schema.as_ref());
+            if actual != assignment.schema_fingerprint {
+                return Err(DataFusionError::Plan(
+                    "resolved provider schema fingerprint differs from assignment".to_owned(),
+                ));
             }
+            let expected =
+                signed_closure_schema(resolved.full_schema.as_ref(), &assignment.required_columns)
+                    .map_err(DataFusionError::Plan)?;
+            if resolved.plan.schema() != expected {
+                return Err(DataFusionError::Plan(
+                    "resolved provider schema differs from the signed projection closure"
+                        .to_owned(),
+                ));
+            }
+            resolved.plan
         };
         if resolved.schema() != self.schema() {
             return Err(DataFusionError::Plan(

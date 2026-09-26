@@ -27,7 +27,7 @@ use vala_bifrost_redux::oracle::dispatcher::{
 use vala_bifrost_redux::oracle::peer::ReservationTicketMinter;
 use vala_bifrost_redux::oracle::{
     Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
-    OracleSlotManager, OracleSpillRuntime, TailTransportDirectory,
+    OracleSlotManager, OracleSpillRuntime,
 };
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,
@@ -1898,14 +1898,12 @@ impl<'a> OracleRoleBuilder<'a> {
                 reconciliation_limit_bytes,
             },
             spill_runtime: Arc::new(spill_runtime),
-            tails: Arc::new(TailTransportDirectory::default()),
             audit: audit.clone(),
             peer_ticket_minter,
             reservations,
             stage_authority: Some(stage_authority),
             peer_tls,
             peer_credentials: Some(Arc::clone(&peer_credentials)),
-            tail_ticket_minter: Some(tail_authority),
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
             config: oracle_config,

@@ -738,6 +738,7 @@ impl OracleAdmission {
     /// # Errors
     /// Returns admission rejection when the queue is full, closed, cancelled, or the absolute
     /// deadline expires before a grant.
+    #[cfg(test)]
     #[tracing::instrument(name = "bifrost.oracle.admission", skip_all)]
     pub(super) async fn admit(
         self: &Arc<Self>,

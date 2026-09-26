@@ -892,7 +892,11 @@ async fn append_event_time_row(
     id: i64,
     event_time_micros: i64,
 ) -> Result<(), JourneyError> {
-    let mut fields = journey_schema().fields().iter().cloned().collect::<Vec<_>>();
+    let mut fields = journey_schema()
+        .fields()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
         wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
         arrow::datatypes::DataType::Timestamp(
@@ -982,13 +986,14 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     }
     cluster.refresh_oracle_snapshots().await?;
     let reader = client(first, "live-route-reader").await?;
-    let floor = (chrono::Utc::now() - chrono::Duration::hours(1))
-        .format("%Y-%m-%d %H:%M:%S%.6f");
+    let floor = (chrono::Utc::now() - chrono::Duration::hours(1)).format("%Y-%m-%d %H:%M:%S%.6f");
 
     let before = scribe_fragment_executions(&cluster)?;
     let pruned = query_ids(
         &reader,
-        format!("SELECT id FROM {table_fqn} WHERE wyrd_event_time >= TIMESTAMP '{floor}' ORDER BY id"),
+        format!(
+            "SELECT id FROM {table_fqn} WHERE wyrd_event_time >= TIMESTAMP '{floor}' ORDER BY id"
+        ),
     )
     .await?;
     let pruned_delta = execution_delta(&before, &scribe_fragment_executions(&cluster)?);
@@ -1010,7 +1015,9 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     .await?;
     let unpruned_delta = execution_delta(&before, &scribe_fragment_executions(&cluster)?);
     if unpruned != vec![1, 2, 3] {
-        return Err(format!("unprunable predicate expected ids [1, 2, 3], saw {unpruned:?}").into());
+        return Err(
+            format!("unprunable predicate expected ids [1, 2, 3], saw {unpruned:?}").into(),
+        );
     }
     if unpruned_delta != vec![1, 1, 1] {
         return Err(format!(

@@ -119,3 +119,19 @@ git diff --check
 No behavioral test is warranted for this rustdoc-only correction. If the diff
 changes executable behavior, a public/generated contract, SQL, a test, a
 dependency, or a feature, remove that drift rather than broadening this task.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `refresh_by_hash` no longer claims it follows a failed `consume_active_refresh`; describes lookup-before-family-lock/classification and revocation use | `crates/wyrd/wyrd-sql/src/queries/auth/refresh_tokens.rs` `refresh_by_hash` rustdoc (plus required `# Errors`) | Direct inspection | PASS |
+| `RefreshTokens::execute` and every `refresh_by_hash` caller agree with the rustdoc | `wyrd-auth/src/refresh.rs:121-128` (lookup → `lock_refresh_family` → `consume_active_refresh`); `wyrd-auth/src/revoke.rs:213` | `git grep -n refresh_by_hash` | PASS |
+| Only the cited rustdoc changed | Diff touches one doc comment | `mise run fmt`, `mise run lints`, `git diff --check` (all exit 0) | PASS |
+
+Correction to the task premise: `git grep` finds exactly one production
+caller, refresh rotation. The revocation owner (`revoke.rs`) calls
+`refresh_by_hash` only inside `#[cfg(test)]` to observe a revoked row's
+lifecycle state, so the rustdoc describes it as a test lookup rather than a
+production revocation caller. Non-goals held: executable code, SQL, tests,
+dependencies, features, and generated artifacts are unchanged. No behavioral
+test was added (documentation-only change).

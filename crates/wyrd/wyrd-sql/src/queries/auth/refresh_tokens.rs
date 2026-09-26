@@ -121,9 +121,17 @@ pub async fn lock_refresh_family(
 
 /// Look up any row by hash regardless of its lifecycle state.
 ///
-/// Used in the reuse-detection path: if `consume_active_refresh` returns
-/// `None`, this query determines whether the presented token was ever valid
-/// (rotated or explicitly revoked) or is entirely unknown.
+/// Active, rotated, revoked, and expired rows are all returned; `None` means
+/// the hash was never issued in this tenant. Refresh rotation calls this
+/// first, before any classification: it derives the row's immutable
+/// principal kind and id, takes [`lock_refresh_family`] for that family, and
+/// only then classifies the row with [`consume_active_refresh`]. Classifying
+/// before the family lock would let an ancestor replay miss a successor
+/// inserted by a concurrent rotation. Revocation tests use the same lookup to
+/// observe a row's lifecycle state after revocation, whatever that state is.
+///
+/// # Errors
+/// Returns a SQLx error when the lookup statement fails.
 pub async fn refresh_by_hash(
     conn: &mut TenantConn<'_>,
     token_hash: &str,

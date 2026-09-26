@@ -20,7 +20,7 @@ use wyrd_sql::queries::auth::{
 /// tokens it already holds lapse at their five-minute expiry. A User also
 /// carries refresh authority, so the User branch retires the refresh family on
 /// the same [`TenantConn`] and the caller's commit retires both or neither.
-/// Before either write it takes [`lock_refresh_family`] for that User, the
+/// Before reading the User or writing it takes [`lock_refresh_family`], the
 /// same tenant-qualified lock refresh rotation holds through its commit, so a
 /// rotation already in flight commits its successor first and the family
 /// revocation's snapshot includes it. The lock is transaction-scoped and is
@@ -48,6 +48,11 @@ pub async fn revoke_principal_in_conn(
     let id_uuid = target_id.as_uuid();
 
     if kind == PrincipalKindTag::User {
+        // The family lock precedes every read of the User, as in rotation,
+        // issuance, and callback role sync; locking an absent id is harmless.
+        lock_refresh_family(conn, "user", id_uuid)
+            .await
+            .map_err(internal_error)?;
         if user_by_id(conn, id_uuid)
             .await
             .map_err(internal_error)?
@@ -55,9 +60,6 @@ pub async fn revoke_principal_in_conn(
         {
             return Err(not_found(target_id, tenant));
         }
-        lock_refresh_family(conn, "user", id_uuid)
-            .await
-            .map_err(internal_error)?;
         suspend_user_principal(conn, id_uuid)
             .await
             .map_err(internal_error)?;
@@ -531,8 +533,8 @@ pub(crate) mod pg_tests {
 
     /// Poll until backend `pid` is observed blocked on an advisory lock.
     ///
-    /// Revocation and human-session issuance both take the refresh-family
-    /// lock as their first advisory lock, so a wait seen before anything else
+    /// Revocation, rotation, and human-session issuance all take the
+    /// refresh-family lock as their first advisory lock, so a wait seen before anything else
     /// is granted proves the backend is parked on the family lock rather than
     /// having passed it; it is a synchronization point, not a sleep.
     ///

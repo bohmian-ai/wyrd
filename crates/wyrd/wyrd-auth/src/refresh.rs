@@ -292,6 +292,7 @@ mod pg_tests {
     use crate::audit::{REFRESH_FAMILY_REVOKE_OPERATION, principal_event};
     use crate::connections::HumanConnections;
     use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
+    use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -1033,23 +1034,7 @@ mod pg_tests {
         let (replay, ()) = tokio::join!(
             service.execute(&mut replaying, ancestor, "req-replay-a"),
             async {
-                tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                    loop {
-                        let waiting: bool = sqlx::query_scalar(
-                            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND NOT granted)",
-                        )
-                        .bind(replay_pid)
-                        .fetch_one(fixture.app_pool())
-                        .await
-                        .expect("replay lock state reads");
-                        if waiting {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                })
-                .await
-                .expect("the replay waits on the open rotation");
+                wait_for_advisory_lock_wait(&fixture, replay_pid).await;
                 rotating.commit().await.expect("rotation commits");
             }
         );

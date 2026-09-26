@@ -118,3 +118,21 @@ No new runtime test is warranted because executable behavior must not change
 and the existing advertised-algorithm refusal tests already prove the composed
 security boundary. If implementation or generated output changes, remove that
 drift rather than expanding this remediation.
+
+## Implementation evidence
+
+Remediation commit `176905ddc` (rustdoc only). Lead-directed items are
+separate commits: `3b3c0a6b7` (item 2) and `97f2c8e24` (item 3).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `verify_id_token_algorithm` documents advertised-set membership rather than claiming it independently enforces asymmetry. | `crates/wyrd/wyrd-auth/src/callback.rs` `verify_id_token_algorithm` summary; the caller `finish_id_token_exchange` summary no longer says "asymmetric" either | Static comparison with the unchanged bodies of the helper, `finish_id_token_exchange`, and `wyrd-auth-verify` `verify_external_against` (HS256/384/512 refused before `kid`/JWKS) | PASS |
+| Its `# Errors` section names the actual malformed-header, invalid advertised-value, and absent-from-advertised-set failures. | `# Errors` names a malformed/undecodable header and an absent-from-set algorithm, and states that an unparseable advertised value is skipped, not raised, so it can only contribute to the absent-from-set failure (matches the `filter_map` body) | Static inspection | PASS |
+| The rustdoc identifies `ExternalVerifier::verify_external_against` as the subsequent symmetric-algorithm rejection owner without changing either body or caller. | Intra-doc link ``[`ExternalVerifier::verify_external_against`]`` plus a link to the sole caller | `cargo doc -p wyrd-auth --no-deps`: both new links resolve with no warnings; `git show 176905ddc` touches only `///` lines | PASS |
+| The remediation diff contains no executable, contract, test, generated-artifact, dependency, or unrelated documentation change. | `git show --stat 176905ddc`: one file, rustdoc lines only | `mise run fmt`, `mise run lints`, `git diff --check HEAD~3 HEAD` all exit 0 | PASS |
+| Lead item 2: `terminal_json` uses `let … else` instead of `map_or_else(panic)`. | `crates/wyrd/wyrd-gateway/src/adapter/tests.rs` `terminal_json` (`3b3c0a6b7`) | `cargo nextest run --locked -p wyrd-gateway --lib -E 'test(/^adapter::tests::/)'`: 39 passed; `mise run lints` exit 0 | PASS |
+| Lead item 3: an identity journey case where the provider advertises HS256 proves that the shared verifier's rejection is the guard. | `tenant_callback_refusal_journey` step 5 (`97f2c8e24`): discovery advertises `["EdDSA", "HS256"]` and an HS256 token passes the advertised-set check, then gets `401 WYRD_AUTH_401_INVALID_TOKEN` with no completion. An HS256-only advertisement is refused earlier at discovery (`503`, no asymmetric algorithm), so the mixed set is the only reachable case. It shares one loop with the existing unadvertised case. | `WYRD_IDENTITY_FILTER=tenant_callback_refusal_journey mise run test:identity:journey` exit 0; full `mise run test:identity:journey` exit 0 (27 passed) | PASS |
+
+Non-goals held: no executable, caller, error, schema, generated, or dependency
+change in the remediation commit; no HMAC filter restored; no TASK-003/004
+work; the human-connection claim-type follow-up was not done.

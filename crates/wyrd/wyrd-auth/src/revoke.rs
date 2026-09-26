@@ -494,6 +494,68 @@ mod pg_tests {
     /// Ed25519 test key the overlapping rotation signs its successor with.
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
+    /// Seed an active User with one committed human refresh row `B` bound to
+    /// the tenant's Active connection, returning the User id and `B`'s token.
+    ///
+    /// The token is an opaque string: rotation resolves rows by hash only, so
+    /// it needs no signature to be presented.
+    ///
+    /// # Panics
+    /// Panics when any seed write or the commit fails.
+    async fn seed_user_with_current_refresh(fixture: &PgFixture) -> (Uuid, SecretString) {
+        let user_id = Uuid::new_v4();
+        let current = SecretString::from(format!("refresh-b-{user_id}"));
+        let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
+        insert_user(&mut setup, user_id, Some("overlap@test.com"), "oidc", None)
+            .await
+            .expect("user inserts");
+        let binding = seed_active_human_connection(&mut setup)
+            .await
+            .expect("connection seeds");
+        insert_human_refresh_token(
+            &mut setup,
+            Uuid::new_v4(),
+            user_id,
+            &token_hash(current.expose_secret()),
+            Utc::now() + Duration::days(30),
+            None,
+            binding,
+        )
+        .await
+        .expect("B inserts");
+        setup.commit().await.expect("setup commits");
+        (user_id, current)
+    }
+
+    /// Poll until backend `pid` is observed blocked on an advisory lock.
+    ///
+    /// The refresh-family lock is the only advisory lock revocation takes, so
+    /// this proves the revocation is parked on the family lock rather than
+    /// having passed it; it is a synchronization point, not a sleep.
+    ///
+    /// # Panics
+    /// Panics when the lock state cannot be read or no wait is seen in 30s.
+    async fn wait_for_advisory_lock_wait(fixture: &PgFixture, pid: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks
+                      WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
+                )
+                .bind(pid)
+                .fetch_one(fixture.app_pool())
+                .await
+                .expect("lock state reads");
+                if waiting {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("revocation waits on the open rotation's family lock");
+    }
+
     /// Administrative User revocation overlapping a rotation of current row
     /// `B` still retires the successor `C` that rotation inserts.
     ///
@@ -522,29 +584,7 @@ mod pg_tests {
             issuer: TenantTokenIssuer::new(key, TokenExchangeSettings::default()),
         };
 
-        let user_id = Uuid::new_v4();
-        let current = SecretString::from(format!("refresh-b-{user_id}"));
-        {
-            let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
-            insert_user(&mut setup, user_id, Some("overlap@test.com"), "oidc", None)
-                .await
-                .expect("user inserts");
-            let binding = seed_active_human_connection(&mut setup)
-                .await
-                .expect("connection seeds");
-            insert_human_refresh_token(
-                &mut setup,
-                Uuid::new_v4(),
-                user_id,
-                &token_hash(current.expose_secret()),
-                Utc::now() + Duration::days(30),
-                None,
-                binding,
-            )
-            .await
-            .expect("B inserts");
-            setup.commit().await.expect("setup commits");
-        }
+        let (user_id, current) = seed_user_with_current_refresh(&fixture).await;
 
         // The legitimate rotation of B, held open with C written.
         let mut rotating = fixture.tenant_conn().await.expect("rotating conn opens");
@@ -568,24 +608,7 @@ mod pg_tests {
                 tenant,
             ),
             async {
-                tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                    loop {
-                        let waiting: bool = sqlx::query_scalar(
-                            "SELECT EXISTS (SELECT 1 FROM pg_locks
-                              WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
-                        )
-                        .bind(revoke_pid)
-                        .fetch_one(fixture.app_pool())
-                        .await
-                        .expect("revoke lock state reads");
-                        if waiting {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                })
-                .await
-                .expect("revocation waits on the open rotation's family lock");
+                wait_for_advisory_lock_wait(&fixture, revoke_pid).await;
                 rotating.commit().await.expect("rotation commits");
             }
         );

@@ -1,4 +1,4 @@
-# Trigger Card - evaluates drift observations on a schedule.
+# Trigger Card - activates a bound Drift Verifier on a schedule.
 
 apiVersion: wyrd/v1
 kind: Trigger
@@ -8,19 +8,6 @@ metadata:
   version: 1.0.0
 
 spec:
-  schedule:
-    cron: "*/5 * * * *"
-    tz: UTC
-  source:
-    kind: drift_observation
-    drift_ref:
-      kind: Drift
-      name: churn-input-drift
-      space: retention
-      version: 1.0.0
-
-  operator_ref:
-    kind: Operator
-    name: churn-retrain-on-drift
-    space: retention
-    version: 1.0.0
+  kind: schedule
+  cron: "*/5 * * * *"
+  tz: UTC

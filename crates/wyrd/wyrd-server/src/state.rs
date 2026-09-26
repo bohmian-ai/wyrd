@@ -34,7 +34,6 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 use crate::bifrost::gate_audit::PostgresGateAudit;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
-use crate::components::eval::{EvalRuns, new_run_map};
 use crate::components::health::ReadinessSnapshot;
 use crate::config::{
     BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig, GatewayConfig,
@@ -42,6 +41,7 @@ use crate::config::{
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
+use crate::verification::health::VerificationHealth;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
@@ -2078,6 +2078,14 @@ pub struct AppState {
     /// merely compiling `test-support` never adds a capability to the catalog.
     #[cfg(feature = "test-support")]
     pub mcp_context_probe: bool,
+    /// Keep this process's audit publisher from starting.
+    ///
+    /// Default `false`. A journey that asserts on `vala.audit_staging` sets it
+    /// through `WyrdTestServerBuilder::without_audit_publication_for_test`,
+    /// because the publisher otherwise retires staged rows on its own cadence
+    /// and races the assertion. Production never sets it.
+    #[cfg(feature = "test-support")]
+    pub audit_publication_disabled: bool,
     /// Telemetry guard (holds the tracer provider).
     pub telemetry: Arc<TelemetryGuard>,
     /// Request-shaping limits for the router middleware stack.
@@ -2101,8 +2109,11 @@ pub struct AppState {
     pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
     /// Retained status of this process's private Bifrost peer listener.
     pub peer_plane: Arc<crate::app::peer_plane::PeerPlaneStatus>,
-    /// Tenant-keyed in-memory eval run/lease/session map. Ephemeral, single-replica.
-    pub eval_runs: EvalRuns,
+    /// Liveness of this process's verification runtime capabilities.
+    ///
+    /// The runtime marks each capability it composes required and up or down;
+    /// the readiness loop reports the server unready while one is absent.
+    pub verification: Arc<VerificationHealth>,
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
@@ -2133,6 +2144,8 @@ impl AppState {
             gateway_tasks: tokio_util::task::TaskTracker::new(),
             #[cfg(feature = "test-support")]
             mcp_context_probe: false,
+            #[cfg(feature = "test-support")]
+            audit_publication_disabled: false,
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
                 wyrd_telemetry::TelemetryConfig::default(),
             )),
@@ -2144,7 +2157,7 @@ impl AppState {
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
-            eval_runs: new_run_map(),
+            verification: Arc::default(),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
             #[cfg(feature = "test-support")]
@@ -2161,6 +2174,18 @@ impl AppState {
     #[must_use]
     pub fn with_mcp_context_probe(mut self, enabled: bool) -> Self {
         self.mcp_context_probe = enabled;
+        self
+    }
+
+    /// Keep the audit publisher from starting when `disabled` is set.
+    ///
+    /// Test servers call this through
+    /// `WyrdTestServerBuilder::without_audit_publication_for_test`; staged
+    /// audit rows then remain in `vala.audit_staging` for the test to read.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_audit_publication_disabled(mut self, disabled: bool) -> Self {
+        self.audit_publication_disabled = disabled;
         self
     }
 

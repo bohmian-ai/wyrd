@@ -169,9 +169,15 @@ optional `space`, and optional `uid`. The server derives relationships from
 these references; users do not author a parallel lineage graph.
 
 A Verifier is a reusable, subject-less peer with one typed Drift or Eval
-implementation. Deployment composition binds it through versioned
-`verified_by`; runtime observations carry the subject identity used for
-evaluation and filtering.
+implementation; `Drift` and `Eval` are not Card kinds. Deployment composition
+binds it through versioned `verified_by` on a Service component, Service, or
+standalone Agent; runtime observations carry the subject identity used for
+evaluation and filtering. Each binding names one Verifier, one Trigger
+activation (`runs_on`), and zero or more `on_failure` Operators. The runtime
+direction is `binding activation -> Verifier run -> Verification Result ->
+zero or more on_failure dispatches`: Trigger decides when, the Verifier
+decides the verdict, and only a `failed` verdict dispatches Operators. There
+is no Alert resource and no standalone Trigger or monitor firing.
 
 ## Service boundaries
 

@@ -82,6 +82,59 @@ spec:
   return service;
 }
 
+/**
+ * Write an eval Verifier and a standalone Agent bound to it.
+ *
+ * The Agent is the smallest binding owner: one Agent-level binding running the
+ * Verifier on an inline `observations_ready` Trigger. It reuses the shared
+ * Prompt, so it registers after the Prompt. Returns the Verifier and Agent
+ * paths in registration order.
+ */
+function writeBoundAgent(root: string): [string, string] {
+  const verifier = join(root, "verifier.yaml");
+  writeFileSync(
+    verifier,
+    `apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: ts-eval
+  version: 1.0.0
+  space: default
+spec:
+  implementation:
+    kind: eval
+    spec:
+      tasks: {}
+`,
+  );
+  const agent = join(root, "bound-agent.yaml");
+  writeFileSync(
+    agent,
+    `apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: ts-bound-agent
+  version: 1.0.0
+  space: default
+spec:
+  prompt:
+    kind: Prompt
+    name: ts-shared-prompt
+    version: 1.0.0
+    space: default
+  verified_by:
+    - verifier:
+        kind: Verifier
+        name: ts-eval
+        version: 1.0.0
+        space: default
+      runs_on:
+        kind: observations_ready
+`,
+  );
+  return [verifier, agent];
+}
+
 /** Await a promise expected to reject with a structured catalog error. */
 async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
   const error = await promise.then(
@@ -136,6 +189,16 @@ describe("Card and WyrdState journey", () => {
 
       const invalidRef = await rejection(cards.get("not-a-card-ref"));
       expect(invalidRef.code).toBe("WYRD_SPEC_400_VALIDATION");
+
+      const [verifier, boundAgent] = writeBoundAgent(root);
+      await cards.registerFromPath(verifier);
+      const bound = await cards.registerFromPath(boundAgent);
+      const bindingIds = (await cards.get(bound.root)).status?.verification?.binding_ids;
+      expect(bindingIds).toEqual([expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-7/)]);
+      const rebound = await cards.registerFromPath(boundAgent);
+      expect((await cards.get(rebound.root)).status?.verification?.binding_ids).toEqual(
+        bindingIds,
+      );
 
       const denied = Cards.connect({
         serverUrl: server.baseUrl,

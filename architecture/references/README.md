@@ -54,7 +54,7 @@ references/
 | `languages/errors.md` | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
 | `domain/vala-architecture.md` | Broad Vala architecture, ownership, Bifrost orientation, or cross-domain advice |
 | `domain/telemetry-observations.md` | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
-| `domain/evaluation.md` | Eval Cards, scenarios, judge quality, scoring, or evidence |
+| `domain/evaluation.md` | Eval-backed Verifiers, scenarios, judge quality, scoring, or evidence |
 | `domain/drift-monitoring.md` | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
 | `domain/olap-serving.md` | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
 | `domain/iceberg.md` | Iceberg snapshots, catalogs, schemas, partitions, object storage, or compaction |

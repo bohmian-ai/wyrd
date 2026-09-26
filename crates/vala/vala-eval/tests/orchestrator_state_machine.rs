@@ -194,6 +194,7 @@ fn turn_cursor_is_monotonic() {
     ));
 }
 
+/// Records captured in one scenario never leak into a sibling scenario.
 #[test]
 fn cross_scenario_record_isolation() {
     let mut state = RunState::open(
@@ -204,10 +205,9 @@ fn cross_scenario_record_isolation() {
             scenario("two", Vec::new(), None, 1),
         ],
     );
-    let run_id = state.run_id.clone();
     state.next().expect("first directive");
     let mut sub = agent_submission("one", 0, "First");
-    sub.records.push(record(&run_id, true));
+    sub.records.push(record(true));
     state.submit_agent_turn(sub).expect("submit first");
     let TurnDirective::ScenarioComplete { scenario_id } = state.next().expect("complete").0 else {
         panic!("scenario one complete");

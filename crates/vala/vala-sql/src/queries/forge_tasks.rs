@@ -829,7 +829,11 @@ impl ForgeTasks {
         exact_one(changed, "heartbeat")
     }
 
-    /// Returns an exact Claimed or Running attempt to Retryable with a new eligibility time.
+    /// Returns an exact Claimed or Running attempt to Retryable, eligible immediately.
+    ///
+    /// Eligibility is stamped from PostgreSQL's `statement_timestamp()`, the
+    /// same clock the fair claim compares against; a host-supplied instant
+    /// would hide the task for the duration of any host/database skew.
     ///
     /// `ready_at` is `None` for an immediate release, which Postgres stamps
     /// from its own clock inside this statement so the released task is

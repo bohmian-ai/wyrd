@@ -15,23 +15,24 @@ pub mod cards;
 pub mod client;
 pub mod config;
 pub mod error;
-pub mod eval;
 pub mod gateway;
 pub mod gateway_credential;
 pub mod global_config;
+pub mod observe;
 pub mod platform;
 pub mod principals;
 pub mod state;
 pub mod storage;
 pub mod transport;
+pub mod verification;
 
-pub use bifrost::Bifrost;
+pub use bifrost::{Bifrost, QueueConfig};
 pub use client::WyrdClient;
-pub use eval::EvalProtocol;
 pub use gateway::Gateway;
 pub use global_config::GlobalConfig;
 pub use platform::Platform;
 pub use principals::Principals;
+pub use verification::Verification;
 
 /// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`
 /// environment variables. `ClientConfig::from_env` and

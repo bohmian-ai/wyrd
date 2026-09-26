@@ -17,8 +17,6 @@ export const CARD_KINDS = [
   'Mcp',
   'Policy',
   'Audit',
-  'Drift',
-  'Eval',
   'Source',
   'Trigger',
   'Operator',

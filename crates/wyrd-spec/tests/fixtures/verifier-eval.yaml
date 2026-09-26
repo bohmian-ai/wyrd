@@ -1,0 +1,22 @@
+# Verifier Card - assertion Eval over committed observations.
+
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: retention
+  name: churn-triage-quality
+  version: 1.0.0
+
+spec:
+  implementation:
+    kind: eval
+    spec:
+      pass_gate:
+        kind: all_pass
+      tasks:
+        lookup_called:
+          kind: assertion
+          id: lookup_called
+          context_path: $.tool_call_names
+          operator: contains
+          expected: customer_lookup

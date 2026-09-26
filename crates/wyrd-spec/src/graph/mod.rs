@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::envelope::Spec;
 use crate::reference::{CardRef, CardRefIdentity};
-use crate::refs::{ReferenceSlotVisitor, SlotValue};
+use crate::refs::ReferenceSlotVisitor;
 use crate::registry::CardSubmission;
 use wyrd_semver::{VersionBlock, VersionSpec};
 
@@ -18,7 +18,9 @@ mod root;
 mod topo;
 
 pub use canonical::{canonical_order, relationships_from_spec};
-pub use composition::{publication_validation_errors, validate_composition};
+pub use composition::{
+    BindingSite, binding_validation_errors, spec_binding_errors, validate_composition,
+};
 pub use root::{pick_root, root_last};
 pub use topo::{GraphError, topo_sort};
 
@@ -159,16 +161,8 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
         )?;
         let mut spec = spec;
         let mut references = Vec::new();
-        ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
-            SlotValue::Durable(reference) => {
-                references.extend(reference.as_sibling().cloned());
-            }
-            SlotValue::InlineablePrompt(reference) => {
-                references.extend(reference.as_sibling().cloned());
-            }
-            SlotValue::InlineableAgent(reference) => {
-                references.extend(reference.as_sibling().cloned());
-            }
+        ReferenceSlotVisitor::visit(&mut spec, |slot| {
+            references.extend(slot.value.as_sibling().cloned());
         });
         for child in references {
             let Some(target) = siblings.get(&identity_key(&child)) else {

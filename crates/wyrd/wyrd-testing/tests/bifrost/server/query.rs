@@ -123,7 +123,7 @@ const READINESS_CEILING: std::time::Duration = std::time::Duration::from_secs(30
 /// # Errors
 ///
 /// Returns the publication-barrier timeout or the retained-history query error.
-async fn audit_rows(
+pub(super) async fn audit_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     operation: &str,

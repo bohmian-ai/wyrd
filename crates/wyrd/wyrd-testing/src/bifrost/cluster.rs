@@ -2710,6 +2710,19 @@ mod tests {
     }
 
     /// A stopped node retains raw observations and re-derives the same clean plan.
+    ///
+    /// The replacement process is proved usable by querying its application and
+    /// Vala pools, not by comparing allocator addresses, which the allocator may
+    /// legally reuse once the stopped server has been dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cluster fails to start, stop, restart, or shut down,
+    /// when either replacement pool fails a trivial query, when the retained WAL
+    /// root, re-derived resource plan, or reset resource counters diverge, or
+    /// when the Oracle peer role, its stored permissions, or its exchanged
+    /// bearer's effective permissions do not match the expected single
+    /// `bifrost_peer` grant.
     #[tokio::test]
     async fn cluster_restart_rederives_same_plan_from_retained_snapshot() {
         let observation = SystemResourceSnapshot {
@@ -2727,7 +2740,6 @@ mod tests {
         .expect("cluster starts");
         let node_id = cluster.ready_query_nodes()[0];
         let original = cluster.server_by_node(node_id).expect("running node");
-        let original_identity = original.postgres_pool_identity();
         let original_resources = original
             .state()
             .bifrost_resources()
@@ -2739,7 +2751,14 @@ mod tests {
         assert!(cluster.server_by_node(node_id).is_none());
         cluster.restart_node(node_id).await.expect("node restarts");
         let server = cluster.server_by_node(node_id).expect("node is running");
-        assert_ne!(server.postgres_pool_identity(), original_identity);
+        sqlx::query("SELECT 1")
+            .execute(server.state().postgres.app_pool())
+            .await
+            .expect("replacement application pool is usable");
+        sqlx::query("SELECT 1")
+            .execute(server.state().postgres.vala().pool())
+            .await
+            .expect("replacement Vala pool is usable");
         assert_eq!(cluster.wal_dirs().next(), Some(wal_root.as_path()));
         let restarted_resources = server
             .state()
@@ -2786,41 +2805,47 @@ mod tests {
         cluster.shutdown().await.expect("cluster shuts down");
     }
 
-    /// Stopping one process closes only its fresh pools while another process
-    /// remains queryable, and restart allocates a new pool graph.
+    /// Stopping one process leaves every surviving process queryable, and the
+    /// restarted node comes back with a usable pool graph of its own.
+    ///
+    /// Replacement is proved by exercising each process's application and Vala
+    /// pools rather than by comparing allocator addresses: the stopped server
+    /// is dropped before its replacement allocates, so the allocator may
+    /// legally reuse the same address, and an unequal address would not show
+    /// that the new pools work.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cluster fails to start, stop, restart, or shut down,
+    /// when the stopped node is still present, or when any process's
+    /// application or Vala pool fails to answer a trivial query.
     #[tokio::test]
     async fn process_pool_lifecycle_isolated_across_restart() {
         let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
             .await
             .expect("cluster starts");
         let ids = cluster.configured_node_ids();
-        let before = ids
-            .iter()
-            .map(|id| {
-                cluster
-                    .server_by_node(*id)
-                    .expect("running node")
-                    .postgres_pool_identity()
-            })
-            .collect::<Vec<_>>();
         cluster.stop_node(ids[0]).await.expect("node stops");
+        assert!(cluster.server_by_node(ids[0]).is_none());
         let survivor = cluster.server_by_node(ids[1]).expect("survivor remains");
         sqlx::query("SELECT 1")
             .execute(survivor.state().postgres.app_pool())
             .await
             .expect("survivor pool remains usable");
         cluster.restart_node(ids[0]).await.expect("node restarts");
-        let after = ids
-            .iter()
-            .map(|id| {
-                cluster
-                    .server_by_node(*id)
-                    .expect("running replacement")
-                    .postgres_pool_identity()
-            })
-            .collect::<Vec<_>>();
-        assert_ne!(after[0], before[0]);
-        assert_eq!(after[1..], before[1..]);
+        for id in &ids {
+            let server = cluster
+                .server_by_node(*id)
+                .expect("every configured node is running");
+            sqlx::query("SELECT 1")
+                .execute(server.state().postgres.app_pool())
+                .await
+                .expect("application pool is usable after the restart");
+            sqlx::query("SELECT 1")
+                .execute(server.state().postgres.vala().pool())
+                .await
+                .expect("Vala pool is usable after the restart");
+        }
         cluster.shutdown().await.expect("cluster shuts down");
     }
 

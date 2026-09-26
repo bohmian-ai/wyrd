@@ -1,21 +1,21 @@
 //! Top-level baseline fit and score dispatch.
 
+use serde::{Deserialize, Serialize};
 use wyrd_spec::card::drift::{DriftMethod, DriftProfile, DriftSignal, DriftSpec};
-use wyrd_spec::ids::FeatureName;
 
 use crate::custom::score_custom;
 use crate::error::{DriftFitError, DriftScoreError};
 use crate::psi::PsiBaseline;
-use crate::psi::{fit_psi_baseline, score_psi};
+use crate::psi::{fit_psi_baseline_until, score_psi};
 use crate::report::DriftReport;
 use crate::spc::SpcBaseline;
-use crate::spc::{fit_spc_baseline, score_spc};
+use crate::spc::{fit_spc_baseline_until, score_spc};
 
 /// Fitted baseline state produced by `fit_baseline`.
 ///
-/// Serialization and persistence are out of phase; store baselines via the
-/// server-side baseline store.
-#[derive(Debug, Clone)]
+/// Serializable so the server's baseline store persists it as the fitted
+/// profile of one Verifier version and the Drift engine reads it back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FittedBaseline {
     /// PSI fitted baseline state.
     Psi(PsiBaseline),
@@ -25,7 +25,36 @@ pub enum FittedBaseline {
     Custom,
 }
 
+/// Format of every PSI and SPC fitted profile this crate writes.
+///
+/// Format 2 is the exhaustive-bin PSI and NIST X-bar/S SPC fit. Profiles
+/// fitted earlier carry no format and are refused rather than rescored under
+/// different math; their Verifier needs a new version and a new fit.
+pub const FITTED_FORMAT: u32 = 2;
+
+/// Rows a fit loop processes between two cancellation checks.
+///
+/// Bounds how long a cancelled fit keeps computing inside one large feature.
+pub(crate) const CANCEL_CHECK_ROWS: usize = 65_536;
+
+/// Fail with [`DriftFitError::Cancelled`] once `cancelled` reports true.
+///
+/// Fit loops call this before each feature, between a feature's phases, and
+/// every [`CANCEL_CHECK_ROWS`] rows, so a caller's stop signal ends the fit
+/// without waiting for the whole batch.
+///
+/// # Errors
+/// Returns [`DriftFitError::Cancelled`] when `cancelled()` is true.
+pub(crate) fn ensure_live(cancelled: &dyn Fn() -> bool) -> Result<(), DriftFitError> {
+    if cancelled() {
+        return Err(DriftFitError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Fit a method-specific baseline from an Arrow `RecordBatch`.
+///
+/// Runs to completion; see [`fit_baseline_until`] for a cancellable fit.
 ///
 /// # Errors
 /// Returns a [`DriftFitError`] when the `DriftSpec` does not carry the signal
@@ -34,6 +63,25 @@ pub enum FittedBaseline {
 pub fn fit_baseline(
     batch: &arrow::record_batch::RecordBatch,
     spec: &DriftSpec,
+) -> Result<FittedBaseline, crate::DriftFitError> {
+    fit_baseline_until(batch, spec, &|| false)
+}
+
+/// Fit a method-specific baseline, stopping once `cancelled` reports true.
+///
+/// Produces exactly what [`fit_baseline`] produces while `cancelled` stays
+/// false. PSI and SPC poll `cancelled` before each feature, between a
+/// feature's collect, edge, and binning phases, and every
+/// [`CANCEL_CHECK_ROWS`] rows, so a blocking caller can stop a long fit
+/// promptly. A single quantile sort is not interrupted.
+///
+/// # Errors
+/// Returns [`DriftFitError::Cancelled`] once `cancelled` reports true, and
+/// otherwise the errors of [`fit_baseline`].
+pub fn fit_baseline_until(
+    batch: &arrow::record_batch::RecordBatch,
+    spec: &DriftSpec,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<FittedBaseline, crate::DriftFitError> {
     match spec.method {
         DriftMethod::Psi => {
@@ -53,7 +101,7 @@ pub fn fit_baseline(
                     });
                 }
             };
-            fit_psi_baseline(batch, profile, features).map(FittedBaseline::Psi)
+            fit_psi_baseline_until(batch, profile, features, cancelled).map(FittedBaseline::Psi)
         }
         DriftMethod::Spc => {
             let profile = match spec.profile.as_ref() {
@@ -64,27 +112,17 @@ pub fn fit_baseline(
                     });
                 }
             };
-            let metric_feature;
             let features = match &spec.signal {
                 DriftSignal::Distribution { features, .. } => features.as_slice(),
-                DriftSignal::Metric { name } => {
-                    metric_feature = FeatureName::new(name.as_str()).map_err(|_| {
-                        DriftFitError::SpcInternal {
-                            message: format!("metric name {name} is not a valid FeatureName"),
-                        }
-                    })?;
-                    std::slice::from_ref(&metric_feature)
-                }
-                other => {
+                other @ DriftSignal::Metric { .. } => {
                     return Err(DriftFitError::SignalShapeMismatch {
                         got: signal_variant(other),
                     });
                 }
             };
-            fit_spc_baseline(batch, profile, features).map(FittedBaseline::Spc)
+            fit_spc_baseline_until(batch, profile, features, cancelled).map(FittedBaseline::Spc)
         }
         DriftMethod::Custom => Ok(FittedBaseline::Custom),
-        DriftMethod::External => Err(DriftFitError::ExternalMethodHasNoBaseline),
     }
 }
 
@@ -92,8 +130,8 @@ pub fn fit_baseline(
 ///
 /// # Errors
 /// Returns a [`DriftScoreError`] when the fitted baseline does not match the
-/// selected method, the method profile is missing or mismatched, scoring fails,
-/// or the spec selects the out-of-phase External method.
+/// selected method, the method profile is missing or mismatched, or scoring
+/// fails.
 pub fn score_drift(
     baseline: &FittedBaseline,
     target: &arrow::record_batch::RecordBatch,
@@ -122,15 +160,7 @@ pub fn score_drift(
                     message: "SPC method requires FittedBaseline::Spc".to_string(),
                 });
             };
-            let profile = match spec.profile.as_ref() {
-                Some(DriftProfile::Spc(profile)) => profile,
-                _ => {
-                    return Err(DriftScoreError::SpcInternal {
-                        message: "SPC method requires DriftProfile::Spc".to_string(),
-                    });
-                }
-            };
-            score_spc(baseline, target, profile)
+            score_spc(baseline, target)
         }
         DriftMethod::Custom => {
             if !matches!(baseline, FittedBaseline::Custom) {
@@ -148,7 +178,6 @@ pub fn score_drift(
             };
             score_custom(target, profile)
         }
-        DriftMethod::External => Err(DriftScoreError::ExternalMethodNotInPhase),
     }
 }
 
@@ -156,8 +185,6 @@ fn signal_variant(signal: &DriftSignal) -> &'static str {
     match signal {
         DriftSignal::Distribution { .. } => "Distribution",
         DriftSignal::Metric { .. } => "Metric",
-        DriftSignal::EvalScore { .. } => "EvalScore",
-        DriftSignal::External { .. } => "External",
     }
 }
 
@@ -176,7 +203,7 @@ mod dispatch_errors {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::card::drift::{
         DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec, PsiBinningStrategy,
-        PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
+        PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
@@ -200,46 +227,20 @@ mod dispatch_errors {
         .expect("record batch")
     }
 
-    fn external_spec() -> DriftSpec {
-        DriftSpec::new(
-            DriftMethod::External,
-            DriftSignal::External {
-                source_ref: data_ref("source").into(),
+    /// Build an SPC + Metric spec without validation.
+    ///
+    /// Registration rejects this pair; the literal bypasses `DriftSpec::new`
+    /// to prove the fitter also refuses it rather than reinterpreting it.
+    fn spc_metric_unvalidated_spec() -> DriftSpec {
+        DriftSpec {
+            description: None,
+            method: DriftMethod::Spc,
+            signal: DriftSignal::Metric {
+                name: "latency".to_owned(),
             },
-            DriftCondition::Above { limit: 1.0 },
-            None,
-            None,
-            BTreeMap::new(),
-        )
-        .expect("valid external spec")
-    }
-
-    fn spc_eval_score_spec() -> DriftSpec {
-        // SPC + EvalScore passes spec-level validation (EvalScore is in the allowed
-        // set for SPC) but hits the SignalShapeMismatch arm in fit_baseline because
-        // fit_spc_baseline only handles Distribution and Metric signals.
-        DriftSpec::new(
-            DriftMethod::Spc,
-            DriftSignal::EvalScore {
-                eval_ref: CardRef {
-                    kind: CardKind::Eval,
-                    name: CardName::new("eval-card").expect("valid name"),
-                    version: VersionBlock::parse("1.0.0").expect("valid version"),
-                    space: Some(SpaceName::new("default").expect("valid space")),
-                    uid: None,
-                }
-                .into(),
-            },
-            DriftCondition::Statistical,
-            Some(DriftProfile::Spc(SpcProfile {
-                sample_size: 0,
-                weco_rule: SpcWecoRule::default(),
-                alert_threshold: SpcAlertThreshold::Zone4,
-            })),
-            None,
-            BTreeMap::new(),
-        )
-        .expect("valid spc+evalscore spec")
+            condition: DriftCondition::Statistical,
+            profile: Some(DriftProfile::Spc(SpcProfile { sample_size: 5 })),
+        }
     }
 
     fn psi_spec() -> DriftSpec {
@@ -257,46 +258,26 @@ mod dispatch_errors {
                 threshold: PsiThreshold::Fixed { value: 0.25 },
             })),
             None,
-            BTreeMap::new(),
         )
         .expect("valid psi spec")
     }
 
+    /// An SPC baseline with no features, used where only its method matters
+    /// for dispatch.
     fn spc_baseline_stub() -> FittedBaseline {
         use wyrd_version::WyrdVersion;
         FittedBaseline::Spc(SpcBaseline {
             features: BTreeMap::new(),
-            chunk_size: 25,
+            subgroup_size: 25,
+            format: super::FITTED_FORMAT,
             wyrd_version: WyrdVersion::current(),
         })
     }
 
     #[test]
-    fn fit_baseline_external_errors() {
-        let spec = external_spec();
-        let batch = empty_batch();
-        let err = fit_baseline(&batch, &spec).expect_err("should error");
-        assert!(
-            matches!(err, DriftFitError::ExternalMethodHasNoBaseline),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn score_drift_external_errors() {
-        let spec = external_spec();
-        let baseline = FittedBaseline::Custom;
-        let batch = empty_batch();
-        let err = score_drift(&baseline, &batch, &spec).expect_err("should error");
-        assert!(
-            matches!(err, DriftScoreError::ExternalMethodNotInPhase),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
+    /// SPC fitting refuses a Metric signal instead of fitting it as Custom.
     fn fit_baseline_signal_shape_mismatch() {
-        let spec = spc_eval_score_spec();
+        let spec = spc_metric_unvalidated_spec();
         let batch = empty_batch();
         let err = fit_baseline(&batch, &spec).expect_err("should error");
         assert!(
@@ -322,7 +303,6 @@ mod dispatch_errors {
 mod end_to_end {
     //! In-memory end-to-end tests for top-level drift dispatch.
 
-    use std::collections::BTreeMap;
     use std::error::Error;
     use std::sync::Arc;
 
@@ -333,7 +313,7 @@ mod end_to_end {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::card::drift::{
         CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
-        PsiBinningStrategy, PsiProfile, PsiThreshold, SpcAlertThreshold, SpcProfile, SpcWecoRule,
+        PsiBinningStrategy, PsiProfile, PsiThreshold, SpcProfile,
     };
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
@@ -376,7 +356,6 @@ mod end_to_end {
                 threshold: PsiThreshold::Fixed { value: 0.25 },
             })),
             None,
-            BTreeMap::new(),
         )?)
     }
 
@@ -390,20 +369,6 @@ mod end_to_end {
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(spc_profile())),
             None,
-            BTreeMap::new(),
-        )?)
-    }
-
-    fn spc_metric_spec(name: &str) -> Result<DriftSpec, Box<dyn Error>> {
-        Ok(DriftSpec::new(
-            DriftMethod::Spc,
-            DriftSignal::Metric {
-                name: name.to_string(),
-            },
-            DriftCondition::Statistical,
-            Some(DriftProfile::Spc(spc_profile())),
-            None,
-            BTreeMap::new(),
         )?)
     }
 
@@ -420,18 +385,20 @@ mod end_to_end {
                 alert_threshold: 5.0,
             })),
             None,
-            BTreeMap::new(),
         )?)
     }
 
+    /// The SPC profile of the dispatch fixtures: subgroups of five rows.
     fn spc_profile() -> SpcProfile {
-        SpcProfile {
-            sample_size: 0,
-            weco_rule: SpcWecoRule::default(),
-            alert_threshold: SpcAlertThreshold::Zone4,
-        }
+        SpcProfile { sample_size: 5 }
     }
 
+    /// Assert `report` is a finite, scored `method` report with exactly one
+    /// row, for `feature`, whose verdict and the report's are `verdict`.
+    ///
+    /// # Panics
+    /// Panics when the method, verdict, feature row, or finite score and
+    /// threshold differ.
     fn assert_report_shape(
         report: &DriftReport,
         method: DriftMethod,
@@ -448,11 +415,7 @@ mod end_to_end {
         assert_eq!(feature_report.feature, *feature);
         assert_eq!(feature_report.verdict, verdict);
         assert!(feature_report.score.is_finite());
-        if method == DriftMethod::Spc {
-            assert!(feature_report.threshold.is_nan());
-        } else {
-            assert!(feature_report.threshold.is_finite());
-        }
+        assert!(feature_report.threshold.is_finite());
     }
 
     #[test]
@@ -487,22 +450,6 @@ mod end_to_end {
     }
 
     #[test]
-    fn spc_metric_dispatch_scores_single_feature_report() -> Result<(), Box<dyn Error>> {
-        let feature = FeatureName::new("latency_ms")?;
-        let spec = spc_metric_spec(feature.as_str())?;
-        let baseline_values = (0..500).map(|idx| (f64::from(idx) * 0.01).sin()).collect();
-        let baseline_batch = numeric_batch(feature.as_str(), baseline_values)?;
-        let baseline = fit_baseline(&baseline_batch, &spec)?;
-        assert!(matches!(baseline, FittedBaseline::Spc(_)));
-
-        let target = numeric_batch(feature.as_str(), vec![100.0; 200])?;
-        let report = score_drift(&baseline, &target, &spec)?;
-
-        assert_report_shape(&report, DriftMethod::Spc, &feature, DriftVerdict::Drift);
-        Ok(())
-    }
-
-    #[test]
     fn custom_dispatch_scores_report_shape() -> Result<(), Box<dyn Error>> {
         let feature = FeatureName::new("latency_ms")?;
         let spec = custom_spec(feature.as_str())?;
@@ -515,5 +462,344 @@ mod end_to_end {
 
         assert_report_shape(&report, DriftMethod::Custom, &feature, DriftVerdict::Drift);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod aggregate_inputs {
+    //! Aggregate-input scoring matches raw-batch scoring, keeps insufficient
+    //! input inconclusive, and fitted baselines round-trip through JSON.
+
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use wyrd_spec::card::drift::{
+        CustomProfile, DriftMethod, PsiBinningStrategy, PsiProfile, PsiThreshold, SpcProfile,
+    };
+    use wyrd_spec::ids::FeatureName;
+
+    use crate::{
+        DriftReport, DriftVerdict, FittedBaseline, SpcScorer, fit_psi_baseline, fit_spc_baseline,
+        score_custom_mean, score_psi, score_psi_counts, score_spc,
+    };
+
+    /// Parse a fixture feature name.
+    ///
+    /// # Panics
+    /// Panics when `name` is not a valid feature name.
+    fn feature(name: &str) -> FeatureName {
+        FeatureName::new(name).expect("valid feature name")
+    }
+
+    /// One-column batch named `name` holding `array`.
+    ///
+    /// # Panics
+    /// Panics when the batch cannot be built.
+    fn batch(name: &str, data_type: DataType, array: ArrayRef) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, data_type, true)])),
+            vec![array],
+        )
+        .expect("record batch")
+    }
+
+    /// A numeric PSI profile with four equal-width bins and a fixed threshold.
+    fn psi_profile(categorical: Vec<FeatureName>) -> PsiProfile {
+        PsiProfile {
+            binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 4 },
+            categorical_features: categorical,
+            threshold: PsiThreshold::Fixed { value: 0.1 },
+        }
+    }
+
+    /// Server-side numeric bin counts equal raw-batch scoring, and a window
+    /// under the minimum sample is unscored rather than a pass.
+    ///
+    /// # Panics
+    /// Panics when the two paths disagree or small input is not inconclusive.
+    #[test]
+    fn psi_counts_match_raw_scoring_and_small_windows_are_inconclusive() {
+        let x = feature("x");
+        let profile = psi_profile(Vec::new());
+        let base: Vec<f64> = (0..400).map(|value| f64::from(value % 100)).collect();
+        let baseline = fit_psi_baseline(
+            &batch("x", DataType::Float64, Arc::new(Float64Array::from(base))),
+            &profile,
+            std::slice::from_ref(&x),
+        )
+        .expect("baseline fits");
+        let target: Vec<f64> = (0..200).map(|value| f64::from(value % 30)).collect();
+        let edges = baseline.features[&x].numeric_edges().expect("edges");
+        let mut bins = vec![0_u64; edges.len() - 1];
+        for value in &target {
+            bins[crate::psi::binning::assign_bin(*value, &edges)] += 1;
+        }
+        let counts = BTreeMap::from([(x.clone(), bins)]);
+        let raw = score_psi(
+            &baseline,
+            &batch("x", DataType::Float64, Arc::new(Float64Array::from(target))),
+            &profile,
+        )
+        .expect("raw scores");
+        let aggregate = score_psi_counts(&baseline, &counts, &profile).expect("counts score");
+        assert_eq!(raw, aggregate);
+        assert_eq!(aggregate.verdict, DriftVerdict::Drift);
+
+        let small = BTreeMap::from([(x.clone(), vec![99, 0, 0, 0])]);
+        let report = score_psi_counts(&baseline, &small, &profile).expect("small scores");
+        assert_eq!(report, DriftReport::unscored(DriftMethod::Psi));
+    }
+
+    /// Unseen categories land in the reserved `other` bin on both paths.
+    ///
+    /// # Panics
+    /// Panics when raw scoring and `other`-bin counts disagree.
+    #[test]
+    fn psi_categorical_unknowns_land_in_the_other_bin() {
+        let c = feature("c");
+        let profile = psi_profile(vec![c.clone()]);
+        let base: Vec<&str> = (0..200)
+            .map(|i| if i % 2 == 0 { "a" } else { "b" })
+            .collect();
+        let baseline = fit_psi_baseline(
+            &batch("c", DataType::Utf8, Arc::new(StringArray::from(base))),
+            &profile,
+            std::slice::from_ref(&c),
+        )
+        .expect("baseline fits");
+        let target: Vec<&str> = (0..200)
+            .map(|i| match i % 4 {
+                0 | 1 => "a",
+                2 => "b",
+                _ => "unseen",
+            })
+            .collect();
+        let raw = score_psi(
+            &baseline,
+            &batch("c", DataType::Utf8, Arc::new(StringArray::from(target))),
+            &profile,
+        )
+        .expect("raw scores");
+        let counts = BTreeMap::from([(c.clone(), vec![100, 50, 50])]);
+        assert_eq!(
+            raw,
+            score_psi_counts(&baseline, &counts, &profile).expect("counts score")
+        );
+    }
+
+    /// Server subgroup aggregates equal raw-batch SPC scoring, and a target
+    /// ending in a partial subgroup is wholly unscored.
+    ///
+    /// # Panics
+    /// Panics when the two paths disagree or a partial target scores.
+    #[test]
+    fn spc_subgroups_match_raw_scoring_and_partial_targets_are_inconclusive() {
+        let x = feature("x");
+        let profile = SpcProfile { sample_size: 5 };
+        let base: Vec<f64> = (0..100).map(|value| f64::from(value % 10)).collect();
+        let baseline = fit_spc_baseline(
+            &batch("x", DataType::Float64, Arc::new(Float64Array::from(base))),
+            &profile,
+            std::slice::from_ref(&x),
+        )
+        .expect("baseline fits");
+        let target: Vec<f64> = (0..20).map(|value| 40.0 + f64::from(value)).collect();
+        let mut scorer = SpcScorer::new(&baseline);
+        for subgroup in target.chunks(5) {
+            let (mean, sd) = crate::spc::control_limits::subgroup_stats(subgroup);
+            scorer.push(&x, 5, mean, sd).expect("subgroup pushes");
+        }
+        let aggregate = scorer.finish();
+        let raw = score_spc(
+            &baseline,
+            &batch("x", DataType::Float64, Arc::new(Float64Array::from(target))),
+        )
+        .expect("raw scores");
+        assert_eq!(raw, aggregate);
+        assert_eq!(aggregate.verdict, DriftVerdict::Drift);
+
+        let mut partial = SpcScorer::new(&baseline);
+        partial.push(&x, 5, 4.5, 2.0).expect("subgroup pushes");
+        partial
+            .push(&x, 4, f64::NAN, f64::NAN)
+            .expect("partial pushes");
+        assert_eq!(partial.finish(), DriftReport::unscored(DriftMethod::Spc));
+    }
+
+    /// The Custom window mean drifts only strictly above the threshold.
+    ///
+    /// # Panics
+    /// Panics when equality drifts, excess does not, or a non-finite mean scores.
+    #[test]
+    fn custom_mean_equality_is_no_drift() {
+        let profile = CustomProfile {
+            metric_name: "latency".to_owned(),
+            baseline_value: 10.0,
+            alert_threshold: 2.0,
+        };
+        let equal = score_custom_mean(12.0, &profile).expect("equal scores");
+        assert_eq!(equal.verdict, DriftVerdict::NoDrift);
+        assert_eq!(equal.features[&feature("latency")].score, 2.0);
+        assert_eq!(
+            score_custom_mean(12.5, &profile)
+                .expect("above scores")
+                .verdict,
+            DriftVerdict::Drift
+        );
+        assert!(score_custom_mean(f64::NAN, &profile).is_err());
+    }
+
+    /// Fitted baselines, including infinite numeric edges, round-trip through JSON.
+    ///
+    /// # Panics
+    /// Panics when a baseline does not survive serialization unchanged.
+    #[test]
+    fn fitted_baselines_round_trip_through_json() {
+        let x = feature("x");
+        let values: Vec<f64> = (0..100).map(f64::from).collect();
+        let fitted = FittedBaseline::Psi(
+            fit_psi_baseline(
+                &batch("x", DataType::Float64, Arc::new(Float64Array::from(values))),
+                &psi_profile(Vec::new()),
+                std::slice::from_ref(&x),
+            )
+            .expect("baseline fits"),
+        );
+        let json = serde_json::to_value(&fitted).expect("baseline serializes");
+        assert_eq!(json["Psi"]["features"]["x"]["bins"][0]["lower"], "-inf");
+        let restored: FittedBaseline = serde_json::from_value(json).expect("baseline restores");
+        assert_eq!(restored, fitted);
+    }
+}
+
+#[cfg(test)]
+mod cancellation {
+    //! Cancellation reaching a fit after it starts stops inside a feature.
+
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use crate::baseline::CANCEL_CHECK_ROWS;
+    use crate::{DriftFitError, fit_baseline, fit_baseline_until};
+    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::card::drift::{
+        DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec, PsiBinningStrategy,
+        PsiProfile, PsiThreshold, SpcProfile,
+    };
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, FeatureName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+
+    /// Rows per fixture: three cancellation chunks, so a mid-loop stop leaves work undone.
+    const ROWS: usize = CANCEL_CHECK_ROWS * 3;
+
+    /// One-column batch holding `ROWS` numeric values under `num` and labels under `cat`.
+    ///
+    /// # Panics
+    /// Panics when Arrow rejects the fixed two-column schema.
+    fn batch() -> RecordBatch {
+        let numbers: ArrayRef = Arc::new(Float64Array::from_iter_values(
+            (0..ROWS).map(|row| (row % 997) as f64),
+        ));
+        let labels: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..ROWS).map(|row| ["a", "b", "c"][row % 3]),
+        ));
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("num", DataType::Float64, false),
+                Field::new("cat", DataType::Utf8, false),
+            ])),
+            vec![numbers, labels],
+        )
+        .expect("fixture batch")
+    }
+
+    /// A Distribution Drift spec over one feature with `profile`.
+    ///
+    /// # Panics
+    /// Panics when the fixed spec fails validation.
+    fn spec(method: DriftMethod, feature: &str, profile: DriftProfile) -> DriftSpec {
+        let baseline = CardRef {
+            kind: CardKind::Data,
+            name: CardName::new("baseline").expect("valid name"),
+            version: VersionBlock::parse("1.0.0").expect("valid version"),
+            space: Some(SpaceName::new("default").expect("valid space")),
+            uid: None,
+        };
+        DriftSpec::new(
+            method,
+            DriftSignal::Distribution {
+                baseline_ref: baseline.into(),
+                features: vec![FeatureName::new(feature).expect("valid feature")],
+            },
+            DriftCondition::Statistical,
+            Some(profile),
+            None,
+        )
+        .expect("valid drift spec")
+    }
+
+    /// PSI profile using quantile bins, with `categorical` as its categorical features.
+    ///
+    /// # Panics
+    /// Panics when a name is not a valid feature name.
+    fn psi(categorical: &[&str]) -> DriftProfile {
+        DriftProfile::Psi(PsiProfile {
+            binning_strategy: PsiBinningStrategy::Quantile { n_bins: 10 },
+            categorical_features: categorical
+                .iter()
+                .map(|name| FeatureName::new(*name).expect("valid feature"))
+                .collect(),
+            threshold: PsiThreshold::Fixed { value: 0.25 },
+        })
+    }
+
+    /// SPC profile whose subgroup size divides `ROWS`.
+    fn spc() -> DriftProfile {
+        DriftProfile::Spc(SpcProfile { sample_size: 3 })
+    }
+
+    /// Each method stops at the first check after cancellation flips mid-feature,
+    /// and a never-cancelled fit equals the ordinary fit.
+    ///
+    /// The probe reports cancelled from its `stop_at`-th call. Earlier calls
+    /// include the per-feature check, so the stop lands inside the feature:
+    /// PSI numeric mid-binning, PSI categorical mid-count, SPC before limits.
+    ///
+    /// # Panics
+    /// Panics when a fit ignores cancellation, polls past the stop, or an
+    /// uncancelled fit differs from [`fit_baseline`].
+    #[test]
+    fn cancellation_after_fit_starts_stops_inside_the_feature() {
+        let batch = batch();
+        let cases = [
+            (spec(DriftMethod::Psi, "num", psi(&[])), 3),
+            (spec(DriftMethod::Psi, "cat", psi(&["cat"])), 2),
+            (spec(DriftMethod::Spc, "num", spc()), 2),
+        ];
+        for (spec, stop_at) in cases {
+            let calls = Cell::new(0_u32);
+            let probe = || {
+                calls.set(calls.get() + 1);
+                calls.get() >= stop_at
+            };
+            let error = fit_baseline_until(&batch, &spec, &probe).expect_err("cancelled fit");
+            assert!(matches!(error, DriftFitError::Cancelled), "{error:?}");
+            assert_eq!(
+                calls.get(),
+                stop_at,
+                "{:?} polled past the stop",
+                spec.method
+            );
+
+            let uncancelled = fit_baseline_until(&batch, &spec, &|| false).expect("fit");
+            assert_eq!(uncancelled, fit_baseline(&batch, &spec).expect("fit"));
+        }
     }
 }

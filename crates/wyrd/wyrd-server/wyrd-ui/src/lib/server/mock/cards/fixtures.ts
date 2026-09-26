@@ -9,7 +9,7 @@ import { serviceDetail } from './service';
  */
 export const cardRows: CardRow[] = [
   { uid: 'card_service_01', name: 'checkout-api', kind: 'Service', version: 'v12', space: 'prod', status: { label: 'Needs attention', tone: 'warn' }, owner: 'j.reyes', updated: '3m ago', updatedAt: '2026-09-08T14:57:00Z', labels: ['plane=serving'] },
-  { uid: 'card_drift_01', name: 'model-drift', kind: 'Drift', version: 'v3', space: 'prod', status: { label: 'Breaching', tone: 'warn' }, owner: 'm.linden', updated: '12m ago', updatedAt: '2026-09-08T14:48:00Z', labels: ['plane=eval'] },
+  { uid: 'card_drift_01', name: 'model-drift', kind: 'Verifier', version: 'v3', space: 'prod', status: { label: 'Breaching', tone: 'warn' }, owner: 'm.linden', updated: '12m ago', updatedAt: '2026-09-08T14:48:00Z', labels: ['plane=eval'] },
   { uid: 'card_trigger_01', name: 'ranking-drift-response', kind: 'Trigger', version: 'v1', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '12m ago', updatedAt: '2026-09-08T14:48:00Z', labels: ['plane=eval'] },
   { uid: 'card_operator_01', name: 'investigate-ranking-drift', kind: 'Operator', version: 'v1', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '12m ago', updatedAt: '2026-09-08T14:48:00Z', labels: ['plane=eval'] },
   { uid: 'card_service_02', name: 'ledger-api', kind: 'Service', version: 'v4', space: 'prod', status: { label: 'Healthy', tone: 'ok' }, owner: 'j.reyes', updated: '18m ago', updatedAt: '2026-09-08T14:42:00Z', labels: ['plane=serving'] },
@@ -24,7 +24,7 @@ export const cardRows: CardRow[] = [
   { uid: 'card_prompt_01', name: 'checkout-triage', kind: 'Prompt', version: 'v8', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'r.okafor', updated: '4h ago', updatedAt: '2026-09-08T11:00:00Z', labels: ['plane=agents'] },
   { uid: 'card_service_06', name: 'settlement-api', kind: 'Service', version: 'v7', space: 'prod', status: { label: 'Healthy', tone: 'ok' }, owner: 'j.reyes', updated: '5h ago', updatedAt: '2026-09-08T10:00:00Z', labels: ['plane=serving'] },
   { uid: 'card_artifact_01', name: 'ranker-weights', kind: 'Artifact', version: 'v2', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '1d ago', updatedAt: '2026-09-07T15:00:00Z', labels: ['plane=serving'] },
-  { uid: 'card_eval_01', name: 'checkout-quality', kind: 'Eval', version: 'v5', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '1d ago', updatedAt: '2026-09-07T14:00:00Z', labels: ['plane=eval'] },
+  { uid: 'card_eval_01', name: 'checkout-quality', kind: 'Verifier', version: 'v5', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '1d ago', updatedAt: '2026-09-07T14:00:00Z', labels: ['plane=eval'] },
   { uid: 'card_data_02', name: 'checkout-quality-dataset', kind: 'Data', version: 'v1', space: 'staging', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '2d ago', updatedAt: '2026-09-06T15:00:00Z', labels: ['plane=eval'] },
   { uid: 'card_source_01', name: 'warehouse-telemetry', kind: 'Source', version: 'v2', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'j.reyes', updated: '3d ago', updatedAt: '2026-09-05T15:00:00Z', labels: ['plane=data'] },
   { uid: 'card_workflow_01', name: 'checkout-quality', kind: 'Workflow', version: 'v7', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '4d ago', updatedAt: '2026-09-04T15:00:00Z', labels: ['plane=eval'] },
@@ -38,7 +38,7 @@ export const cardRows: CardRow[] = [
   { uid: 'card_workflow_02', name: 'runtime', kind: 'Workflow', version: 'v1', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'j.reyes', updated: '3d ago', updatedAt: '2026-09-05T12:00:00Z', labels: ['plane=serving'] },
   { uid: 'card_prompt_02', name: 'capture-review', kind: 'Prompt', version: 'v3', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'r.okafor', updated: '4d ago', updatedAt: '2026-09-04T12:00:00Z', labels: ['plane=agents'] },
   { uid: 'card_policy_01', name: 'checkout-guardrails', kind: 'Policy', version: 'v2', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'j.reyes', updated: '1w ago', updatedAt: '2026-09-01T12:00:00Z', labels: ['plane=governance'] },
-  { uid: 'card_eval_02', name: 'checkout-agent-eval', kind: 'Eval', version: 'v4', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '1w ago', updatedAt: '2026-09-01T11:00:00Z', labels: ['plane=eval'] }
+  { uid: 'card_eval_02', name: 'checkout-agent-eval', kind: 'Verifier', version: 'v4', space: 'prod', status: { label: 'Active', tone: 'ok' }, owner: 'm.linden', updated: '1w ago', updatedAt: '2026-09-01T11:00:00Z', labels: ['plane=eval'] }
 ];
 
 /** The recently-viewed rail for this principal; presentation-only fixture. */

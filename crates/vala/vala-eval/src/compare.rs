@@ -549,7 +549,7 @@ mod comparison_four_quadrant {
     }
 
     fn eval_ref() -> CardRef {
-        card_ref(CardKind::Eval, "rubric")
+        card_ref(CardKind::Verifier, "rubric")
     }
 
     fn assertion(task: &str, passed: bool) -> AssertionResult {

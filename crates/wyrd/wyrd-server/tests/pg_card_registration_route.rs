@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{Method, Request, Response, StatusCode, header};
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -22,17 +23,50 @@ use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, DataTenantId, SpaceName};
-use wyrd_spec::reference::InlineableRef;
+use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Seed a dependency row directly so the journey can exercise non-Active states.
+///
+/// # Panics
+/// Panics when the fixture superuser pool cannot open or the dependency row
+/// fails to insert.
 async fn seed_dependency(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     name: &str,
+    status: &str,
+) -> CardUid {
+    seed_card(
+        server,
+        tenant,
+        "Prompt",
+        name,
+        json!({ "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }),
+        status,
+    )
+    .await
+}
+
+/// Seed one already-registered Card of any kind for a reference to resolve to.
+///
+/// Registration reads a referenced binding target's effective spec out of the
+/// registry, so the server-only refusals need real rows rather than siblings in
+/// the same request.
+///
+/// # Panics
+/// Panics when the generated UID is invalid, the fixture superuser pool
+/// cannot open, or the Card row fails to insert.
+async fn seed_card(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    kind: &str,
+    name: &str,
+    spec: Value,
     status: &str,
 ) -> CardUid {
     let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test dependency UID is valid");
@@ -45,12 +79,13 @@ async fn seed_dependency(
     sqlx::query(
         "INSERT INTO wyrd.cards \
             (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
-         VALUES ($1, $2, 'Prompt', 'default', $3, '1.0.0', $4, $5, $6)",
+         VALUES ($1, $2, $3, 'default', $4, '1.0.0', $5, $6, $7)",
     )
     .bind(uid.as_uuid())
     .bind(tenant.as_uuid())
+    .bind(kind)
     .bind(name)
-    .bind(json!({ "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }))
+    .bind(spec)
     .bind(spec_hash)
     .bind(status)
     .execute(&pool)
@@ -803,7 +838,329 @@ async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Build an Agent submission whose `verified_by` binds already-registered peers.
+fn bound_agent_request(
+    name: &str,
+    prompt_name: &str,
+    verifier_name: &str,
+    trigger_name: &str,
+    on_failure: Value,
+    idempotency_key: &str,
+) -> Request<Body> {
+    request_with_body(
+        idempotency_key,
+        json!({ "submissions": [{
+            "apiVersion": "wyrd/v1",
+            "kind": "Agent",
+            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "spec": {
+                "prompt": {
+                    "kind": "Prompt", "name": prompt_name,
+                    "version": "1.0.0", "space": "default"
+                },
+                "verified_by": [{
+                    "verifier": {
+                        "kind": "Verifier", "name": verifier_name,
+                        "version": "1.0.0", "space": "default"
+                    },
+                    "runs_on": {
+                        "kind": "Trigger", "name": trigger_name,
+                        "version": "1.0.0", "space": "default"
+                    },
+                    "on_failure": on_failure,
+                }],
+            },
+            "artifacts": []
+        }] }),
+    )
+}
+
+/// Reject every binding refusal at the authenticated route before any write.
+///
+/// Four branches are only reachable with a real registry behind them: the
+/// effective Operator and Trigger bodies come from previously registered
+/// Cards, the cross-tenant case depends on RLS, and the under-privileged case
+/// depends on the route's own scope check. The fifth, a binding nested under
+/// an inline Agent, is decidable from the request alone, but it is proved here
+/// so the seam from HTTP decoding through shared spec validation, stable error
+/// mapping, and the no-write transaction boundary cannot regress silently.
+///
+/// # Panics
+/// Panics when the test server fails to start or shut down, when either
+/// bootstrap returns a non-user principal, when any fixture row fails to
+/// insert, when the route fails to respond, or when any refusal does not
+/// produce its exact status, stable error code, and absence of durable
+/// registration state.
+#[tokio::test(flavor = "current_thread")]
+async fn referenced_binding_refusals_leave_no_writes() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-binding-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let Bootstrap::User {
+        jwt: denied_jwt, ..
+    } = server
+        .bootstrap_user("registry-binding-denied", &[])
+        .await
+        .expect("denied user bootstraps")
+    else {
+        panic!("denied bootstrap returned a non-user principal");
+    };
+
+    let tenant = server.data_tenant_id();
+    seed_dependency(&server, tenant, "binding-prompt", "active").await;
+    seed_card(
+        &server,
+        tenant,
+        "Verifier",
+        "binding-eval-verifier",
+        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
+        "active",
+    )
+    .await;
+    seed_card(
+        &server,
+        tenant,
+        "Trigger",
+        "binding-observations-trigger",
+        json!({ "kind": "observations_ready" }),
+        "active",
+    )
+    .await;
+    seed_card(
+        &server,
+        tenant,
+        "Trigger",
+        "binding-schedule-trigger",
+        json!({ "kind": "schedule", "cron": "0 * * * *" }),
+        "active",
+    )
+    .await;
+    seed_card(
+        &server,
+        tenant,
+        "Workflow",
+        "binding-rollback-workflow",
+        json!({ "steps": [] }),
+        "active",
+    )
+    .await;
+    seed_card(
+        &server,
+        tenant,
+        "Operator",
+        "binding-workflow-operator",
+        json!({
+            "kind": "workflow",
+            "workflow_ref": {
+                "kind": "Workflow", "name": "binding-rollback-workflow",
+                "version": "1.0.0", "space": "default"
+            }
+        }),
+        "active",
+    )
+    .await;
+
+    let workflow_operator = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_agent_request(
+                "binding-workflow-operator-agent",
+                "binding-prompt",
+                "binding-eval-verifier",
+                "binding-observations-trigger",
+                json!([{
+                    "kind": "Operator", "name": "binding-workflow-operator",
+                    "version": "1.0.0", "space": "default"
+                }]),
+                "binding-workflow-operator-operation",
+            ),
+        )
+        .await
+        .expect("workflow-Operator registration responds");
+    assert_eq!(workflow_operator.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(workflow_operator).await["code"],
+        "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION"
+    );
+    assert_no_registration_writes(
+        &server,
+        "binding-workflow-operator-operation",
+        "binding-workflow-operator-agent",
+    )
+    .await;
+
+    let mismatch = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_agent_request(
+                "binding-mismatch-agent",
+                "binding-prompt",
+                "binding-eval-verifier",
+                "binding-schedule-trigger",
+                json!([]),
+                "binding-mismatch-operation",
+            ),
+        )
+        .await
+        .expect("activation-mismatch registration responds");
+    assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(mismatch).await["code"],
+        "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH"
+    );
+    assert_no_registration_writes(
+        &server,
+        "binding-mismatch-operation",
+        "binding-mismatch-agent",
+    )
+    .await;
+
+    let other_tenant = DataTenantId::new_v7();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query(
+        "INSERT INTO platform.tenants \
+            (data_tenant_id, slug, display_name, status) VALUES ($1, $2, $3, 'active')",
+    )
+    .bind(other_tenant.as_uuid())
+    .bind(format!("binding-{}", other_tenant.as_uuid()))
+    .bind("Cross-tenant binding fixture")
+    .execute(&pool)
+    .await
+    .expect("cross-tenant fixture inserts");
+    seed_card(
+        &server,
+        other_tenant,
+        "Verifier",
+        "binding-foreign-verifier",
+        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
+        "active",
+    )
+    .await;
+
+    let cross_tenant = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_agent_request(
+                "binding-cross-tenant-agent",
+                "binding-prompt",
+                "binding-foreign-verifier",
+                "binding-observations-trigger",
+                json!([]),
+                "binding-cross-tenant-operation",
+            ),
+        )
+        .await
+        .expect("cross-tenant binding registration responds");
+    assert_eq!(cross_tenant.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(cross_tenant).await["code"],
+        "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY"
+    );
+    assert_no_registration_writes(
+        &server,
+        "binding-cross-tenant-operation",
+        "binding-cross-tenant-agent",
+    )
+    .await;
+
+    let denied = server
+        .oneshot_authenticated(
+            &denied_jwt,
+            bound_agent_request(
+                "binding-denied-agent",
+                "binding-prompt",
+                "binding-eval-verifier",
+                "binding-observations-trigger",
+                json!([]),
+                "binding-denied-operation",
+            ),
+        )
+        .await
+        .expect("under-privileged binding registration responds");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response_json(denied).await["code"],
+        "WYRD_PERMISSION_403_DENIED_RBAC"
+    );
+    assert_no_registration_writes(&server, "binding-denied-operation", "binding-denied-agent")
+        .await;
+
+    let nested = server
+        .oneshot_authenticated(
+            &jwt,
+            request_with_body(
+                "binding-nested-operation",
+                json!({ "submissions": [{
+                    "apiVersion": "wyrd/v1",
+                    "kind": "Workflow",
+                    "metadata": {
+                        "name": "binding-nested-workflow",
+                        "version": "1.0.0",
+                        "space": "default"
+                    },
+                    "spec": {
+                        "steps": [{
+                            "id": "judge",
+                            "action": {
+                                "type": "agent",
+                                "target": {
+                                    "prompt": {
+                                        "kind": "Prompt", "name": "binding-prompt",
+                                        "version": "1.0.0", "space": "default"
+                                    },
+                                    "verified_by": [{
+                                        "verifier": {
+                                            "kind": "Verifier",
+                                            "name": "binding-eval-verifier",
+                                            "version": "1.0.0",
+                                            "space": "default"
+                                        },
+                                        "runs_on": { "kind": "observations_ready" },
+                                    }],
+                                },
+                            },
+                        }],
+                    },
+                    "artifacts": []
+                }] }),
+            ),
+        )
+        .await
+        .expect("nested inline-Agent binding registration responds");
+    assert_eq!(nested.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(nested).await["code"],
+        "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
+    );
+    assert_no_registration_writes(
+        &server,
+        "binding-nested-operation",
+        "binding-nested-workflow",
+    )
+    .await;
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Confirm a rejected dependency did not append any durable registration state.
+///
+/// Counts the registration operation under `operation_key` and, for Cards
+/// named `name`, the Card rows, their relationships, Card-bound principals of
+/// the same name, and verification bindings they own.
+///
+/// # Panics
+/// Panics when a count cannot be read or any count is non-zero.
 async fn assert_no_registration_writes(server: &WyrdTestServer, operation_key: &str, name: &str) {
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
@@ -829,9 +1186,25 @@ async fn assert_no_registration_writes(server: &WyrdTestServer, operation_key: &
     .fetch_one(&mut **conn.transaction())
     .await
     .expect("relationship count reads");
+    let principal_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_service_accounts WHERE name = $1")
+            .bind(name)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("principal count reads");
+    let binding_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.verification_bindings WHERE owner_card_uid IN \
+         (SELECT card_uid FROM wyrd.cards WHERE name = $1)",
+    )
+    .bind(name)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("binding count reads");
     assert_eq!(operation_count, 0);
     assert_eq!(card_count, 0);
     assert_eq!(relationship_count, 0);
+    assert_eq!(principal_count, 0);
+    assert_eq!(binding_count, 0);
     conn.commit().await.expect("assertion transaction commits");
 }
 
@@ -1883,7 +2256,7 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
                     "spec": { "components": [{
                         "alias": "quality",
                         "ref": {
-                            "kind": "Eval",
+                            "kind": "Verifier",
                             "name": "quality",
                             "version": "1.0.0",
                             "space": "default"
@@ -1920,13 +2293,13 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
                     },
                     {
                         "apiVersion": "wyrd/v1",
-                        "kind": "Eval",
+                        "kind": "Verifier",
                         "metadata": {
                             "name": "orphan-quality",
                             "version": "1.0.0",
                             "space": "default"
                         },
-                        "spec": { "tasks": {} },
+                        "spec": { "implementation": { "kind": "eval", "spec": { "tasks": {} } } },
                         "artifacts": []
                     }
                 ] }),
@@ -1937,7 +2310,7 @@ async fn service_peer_composition_rejects_before_registry_resolution() {
     assert_eq!(orphan_peer.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         response_json(orphan_peer).await["code"],
-        "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER"
+        "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER"
     );
 
     server.shutdown().await.expect("test server shuts down");
@@ -2194,6 +2567,1158 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
         .await
         .expect("deleted read responds");
     assert_eq!(deleted_read.status(), StatusCode::NOT_FOUND);
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Seed the active dependencies every bound-Service registration names.
+///
+/// Inserts the `vb-prompt` Prompt, the `vb-eval` eval Verifier, the
+/// `vb-drift` drift Verifier, and the daily `vb-schedule` Trigger, returning
+/// the Trigger's UID so a test can prove it is frozen by identity.
+///
+/// # Panics
+/// Panics when a fixture row cannot be inserted.
+async fn seed_binding_dependencies(server: &WyrdTestServer) -> CardUid {
+    let tenant = server.data_tenant_id();
+    seed_dependency(server, tenant, "vb-prompt", "active").await;
+    seed_card(
+        server,
+        tenant,
+        "Verifier",
+        "vb-eval",
+        json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
+        "active",
+    )
+    .await;
+    seed_card(
+        server,
+        tenant,
+        "Verifier",
+        "vb-drift",
+        json!({ "implementation": { "kind": "drift", "spec": {
+            "method": "Psi",
+            "signal": {
+                "kind": "Distribution",
+                "baseline_ref": {
+                    "kind": "Data", "name": "vb-baseline", "space": "default", "version": "1.0.0"
+                },
+                "features": ["tenure_months"]
+            },
+            "condition": { "kind": "Statistical" },
+            "profile": {
+                "kind": "Psi",
+                "binning_strategy": { "kind": "Quantile", "n_bins": 10 },
+                "threshold": { "kind": "Fixed", "value": 0.25 }
+            }
+        } } }),
+        "active",
+    )
+    .await;
+
+    seed_card(
+        server,
+        tenant,
+        "Trigger",
+        "vb-schedule",
+        json!({ "kind": "schedule", "cron": "0 2 * * *" }),
+        "active",
+    )
+    .await
+}
+
+/// The reference to the seeded `vb-schedule` Trigger.
+fn schedule_trigger_ref() -> Value {
+    json!({ "kind": "Trigger", "name": "vb-schedule", "version": "1.0.0", "space": "default" })
+}
+
+/// Build a Service-root registration whose Service and component both own a binding.
+///
+/// The Service-level binding runs the drift Verifier on `runs_on` (a
+/// referenced or inline `schedule` Trigger) and dispatches one inline HTTP
+/// Operator on failure; the `assistant` component binding runs the eval
+/// Verifier on an inline `observations_ready` Trigger. `second_alias` adds a second component occurrence
+/// under that alias so the alias-uniqueness refusal can reuse the builder.
+fn bound_service_request(
+    service_name: &str,
+    runs_on: Value,
+    second_alias: Option<&str>,
+    idempotency_key: &str,
+) -> Request<Body> {
+    request_with_body(
+        idempotency_key,
+        bound_service_body(service_name, runs_on, second_alias),
+    )
+}
+
+/// The JSON registration body [`bound_service_request`] posts.
+///
+/// Returned separately so a test can rewrite one binding, such as its
+/// `on_failure` list, before posting it with [`request_with_body`].
+fn bound_service_body(service_name: &str, runs_on: Value, second_alias: Option<&str>) -> Value {
+    let agent_ref = json!({ "sibling": {
+        "kind": "Agent", "name": "vb-agent", "version": "1.0.0", "space": "default"
+    } });
+    let mut components = vec![json!({
+        "alias": "assistant",
+        "ref": agent_ref,
+        "verified_by": [{
+            "verifier": {
+                "kind": "Verifier", "name": "vb-eval", "version": "1.0.0", "space": "default"
+            },
+            "runs_on": { "kind": "observations_ready" }
+        }]
+    })];
+    if let Some(alias) = second_alias {
+        components.push(json!({ "alias": alias, "ref": agent_ref }));
+    }
+    json!({ "submissions": [
+            {
+                "apiVersion": "wyrd/v1", "kind": "Service",
+                "metadata": { "name": service_name, "version": "1.0.0", "space": "default" },
+                "spec": {
+                    "components": components,
+                    "verified_by": [{
+                        "verifier": {
+                            "kind": "Verifier", "name": "vb-drift",
+                            "version": "1.0.0", "space": "default"
+                        },
+                        "runs_on": runs_on,
+                        "on_failure": [{
+                            "kind": "http", "method": "post",
+                            "url": "https://hooks.example.test/verification-failed"
+                        }]
+                    }]
+                },
+                "artifacts": []
+            },
+            {
+                "apiVersion": "wyrd/v1", "kind": "Agent",
+                "metadata": { "name": "vb-agent", "version": "1.0.0", "space": "default" },
+                "spec": { "prompt": {
+                    "kind": "Prompt", "name": "vb-prompt", "version": "1.0.0", "space": "default"
+                } },
+                "artifacts": []
+            }
+        ] })
+}
+
+/// Read one Card by UID through the public route as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn read_card(server: &WyrdTestServer, jwt: &str, kind: &str, uid: &str) -> Response<Body> {
+    server
+        .oneshot_authenticated(
+            jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/cards/by-uid/{kind}/{uid}"))
+                .body(Body::empty())
+                .expect("UID read request builds"),
+        )
+        .await
+        .expect("UID read responds")
+}
+
+/// One projected binding's owner activity, activation, and schedule cursor.
+type BindingActivityRow = (Option<DateTime<Utc>>, String, Option<DateTime<Utc>>);
+
+/// Read every binding of `owner` with its principal's activity, ordered by activation.
+///
+/// # Panics
+/// Panics when the tenant connection or the read fails.
+async fn owner_activity(server: &WyrdTestServer, owner: Uuid) -> Vec<BindingActivityRow> {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let rows = sqlx::query_as(
+        "SELECT p.last_authenticated_at, b.activation, b.next_run_at \
+           FROM wyrd.verification_bindings b \
+           JOIN wyrd.auth_service_accounts p ON p.card_uid = b.owner_card_uid \
+          WHERE b.owner_card_uid = $1 \
+          ORDER BY b.activation",
+    )
+    .bind(owner)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("activity reads");
+    conn.commit().await.expect("assertion transaction commits");
+    rows
+}
+
+/// Served binding IDs are stable, authorized, tenant-isolated, and activate
+/// only through the owner's real API-key exchange.
+///
+/// Registers a Service owning a Service-level binding on a referenced
+/// schedule Trigger with an inline Operator, plus a component
+/// observations-ready binding; checks the referenced Trigger is frozen by UID
+/// and the inline Operator by digest; then reads `status.verification.binding_ids`
+/// through the public route, re-applies the identical graph, and checks the
+/// under-privileged and cross-tenant reads. Finally it exchanges an API key
+/// for the Service's own projected principal through `/auth/token` and proves
+/// that exchange stamped the owner's activity and armed only the schedule
+/// cursor. An unarmable schedule and a repeated component alias are refused
+/// before any write.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, a bootstrap or fixture
+/// write fails, a route fails to respond, or any status, error code, binding
+/// identity, or activity assertion does not hold.
+#[tokio::test(flavor = "current_thread")]
+async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("binding-status-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let Bootstrap::User {
+        jwt: denied_jwt, ..
+    } = server
+        .bootstrap_user("binding-status-denied", &[])
+        .await
+        .expect("denied user bootstraps")
+    else {
+        panic!("denied bootstrap returned a non-user principal");
+    };
+    let tenant = server.data_tenant_id();
+    let trigger_uid = seed_binding_dependencies(&server).await;
+    let schedule_trigger = schedule_trigger_ref();
+
+    let bad_cron = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_service_request(
+                "vb-bad-cron",
+                json!({ "kind": "schedule", "cron": "not a cron" }),
+                None,
+                "vb-bad-cron-operation",
+            ),
+        )
+        .await
+        .expect("bad-cron registration responds");
+    assert_eq!(bad_cron.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(bad_cron).await["code"],
+        "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
+    );
+    assert_no_registration_writes(&server, "vb-bad-cron-operation", "vb-bad-cron").await;
+
+    let never = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_service_request(
+                "vb-never-cron",
+                json!({ "kind": "schedule", "cron": "0 0 30 2 *" }),
+                None,
+                "vb-never-cron-operation",
+            ),
+        )
+        .await
+        .expect("never-firing registration responds");
+    assert_eq!(never.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(never).await["code"],
+        "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
+    );
+    assert_no_registration_writes(&server, "vb-never-cron-operation", "vb-never-cron").await;
+
+    let reserved = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_service_request(
+                "vb-reserved-alias",
+                schedule_trigger.clone(),
+                Some(wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY),
+                "vb-reserved-alias-operation",
+            ),
+        )
+        .await
+        .expect("reserved-alias registration responds");
+    assert_eq!(reserved.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(reserved).await["code"],
+        "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
+    );
+    assert_no_registration_writes(&server, "vb-reserved-alias-operation", "vb-reserved-alias")
+        .await;
+
+    let duplicate = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_service_request(
+                "vb-dup-alias",
+                schedule_trigger.clone(),
+                Some("assistant"),
+                "vb-dup-alias-operation",
+            ),
+        )
+        .await
+        .expect("duplicate-alias registration responds");
+    assert_eq!(duplicate.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(duplicate).await["code"],
+        "WYRD_REGISTRY_400_INVALID_CARD_SPEC"
+    );
+    assert_no_registration_writes(&server, "vb-dup-alias-operation", "vb-dup-alias").await;
+
+    let registered = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_service_request(
+                "vb-service",
+                schedule_trigger.clone(),
+                None,
+                "vb-first-operation",
+            ),
+        )
+        .await
+        .expect("bound registration responds");
+    let registered_status = registered.status();
+    let registered_body = response_json(registered).await;
+    assert_eq!(registered_status, StatusCode::CREATED, "{registered_body}");
+    let outcome_uid = |kind: &str| {
+        registered_body["outcomes"]
+            .as_array()
+            .expect("registration outcomes are an array")
+            .iter()
+            .find(|outcome| outcome["card_ref"]["kind"] == kind)
+            .and_then(|outcome| outcome["card_ref"]["uid"].as_str())
+            .expect("outcome UID exists")
+            .to_owned()
+    };
+    let service_uid = outcome_uid("Service");
+    let agent_uid = outcome_uid("Agent");
+
+    let service = response_json(read_card(&server, &jwt, "Service", &service_uid).await).await;
+    let binding_ids = service["card"]["status"]["verification"]["binding_ids"].clone();
+    let ids = binding_ids
+        .as_array()
+        .expect("Service status lists binding IDs");
+    assert_eq!(ids.len(), 2, "Service-level and component bindings");
+    for id in ids {
+        let id = Uuid::parse_str(id.as_str().expect("binding ID is a string"))
+            .expect("binding ID is a UUID");
+        assert_eq!(id.get_version_num(), 7);
+    }
+    assert!(
+        service["card"]["spec"]["verified_by"][0]
+            .get("binding_id")
+            .is_none(),
+        "authored spec is not rewritten"
+    );
+    let mut conn = server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection opens");
+    let (frozen_trigger, operators): (Option<Uuid>, Value) = sqlx::query_as(
+        "SELECT trigger_uid, operators FROM wyrd.verification_bindings \
+          WHERE owner_card_uid = $1 AND activation = 'schedule'",
+    )
+    .bind(Uuid::parse_str(&service_uid).expect("service UID parses"))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("frozen targets read");
+    conn.commit().await.expect("assertion transaction commits");
+    assert_eq!(frozen_trigger, Some(trigger_uid.as_uuid()));
+    assert!(
+        operators[0]["digest"].is_string(),
+        "an inline Operator is frozen as its canonical digest: {operators}"
+    );
+    let agent = response_json(read_card(&server, &jwt, "Agent", &agent_uid).await).await;
+    assert!(
+        agent["card"]["status"].get("verification").is_none(),
+        "a subject that owns no binding serves no verification status"
+    );
+
+    let reapplied = server
+        .oneshot_authenticated(
+            &jwt,
+            bound_service_request(
+                "vb-service",
+                schedule_trigger.clone(),
+                None,
+                "vb-reapply-operation",
+            ),
+        )
+        .await
+        .expect("re-applied registration responds");
+    assert!(reapplied.status().is_success());
+    let service = response_json(read_card(&server, &jwt, "Service", &service_uid).await).await;
+    assert_eq!(
+        service["card"]["status"]["verification"]["binding_ids"], binding_ids,
+        "re-apply preserves binding identity"
+    );
+
+    let denied = read_card(&server, &denied_jwt, "Service", &service_uid).await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let other_tenant = server
+        .seed_tenant("binding-status-other")
+        .await
+        .expect("second tenant seeds");
+    let Bootstrap::Machine {
+        api_key: other_key, ..
+    } = server
+        .bootstrap_service_in_tenant(other_tenant, "binding-status-foreign", &["writer"])
+        .await
+        .expect("foreign reader bootstraps")
+    else {
+        panic!("service bootstrap returned a non-machine principal");
+    };
+    let other_jwt = server
+        .exchange_api_key(&other_key)
+        .await
+        .expect("foreign key exchanges");
+    let foreign = read_card(&server, &other_jwt, "Service", &service_uid).await;
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+
+    let service_ref: wyrd_spec::reference::CardRef = serde_json::from_value(json!({
+        "kind": "Service", "name": "vb-service", "version": "1.0.0", "space": "default"
+    }))
+    .expect("service ref decodes");
+    let Bootstrap::Machine { api_key, .. } = server
+        .credential_registered_service(&service_ref, &[])
+        .await
+        .expect("registered Service is credentialed")
+    else {
+        panic!("credentialed Service returned a non-machine principal");
+    };
+    let service_uid = Uuid::parse_str(&service_uid).expect("service UID parses");
+    assert!(
+        owner_activity(&server, service_uid)
+            .await
+            .iter()
+            .all(|(seen, _, cursor)| seen.is_none() && cursor.is_none()),
+        "registration alone never activates the owner"
+    );
+
+    server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("owner API key exchanges");
+    let rows = owner_activity(&server, service_uid).await;
+    assert_eq!(rows.len(), 2);
+    let (seen, _, eval_cursor) = &rows[0];
+    let seen = seen.expect("API-key exchange records owner activity");
+    assert_eq!(rows[0].1, "observations_ready");
+    assert_eq!(*eval_cursor, None, "an eval binding never has a cursor");
+    assert_eq!(rows[1].1, "schedule");
+    assert!(
+        rows[1].2.expect("first exchange arms the schedule") > seen,
+        "the armed cursor is the next future boundary"
+    );
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// List `principal`'s registration audit rows as (permission, outcome), sorted.
+///
+/// # Panics
+/// Panics when the tenant connection or the read fails.
+async fn registration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let rows = sqlx::query_as(
+        "SELECT permission, outcome FROM vala.audit_staging \
+          WHERE operation = 'card.registration.create' AND principal_id = $1 \
+          ORDER BY permission, outcome",
+    )
+    .bind(principal)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("audit rows read");
+    conn.commit().await.expect("assertion transaction commits");
+    rows
+}
+
+/// Operator-bearing registration also needs `operators:invoke`, audited once.
+///
+/// A caller holding only `cards:write` registers an Operator-free bound
+/// Service with one allowed `cards:write` row, but an inline or referenced
+/// `on_failure` Operator is refused with the stable 403, writes no Card,
+/// principal, binding, or operation, and audits the allowed `cards:write` and
+/// the denied `operators:invoke`. A caller holding both commits the
+/// registration with exactly one allowed row per permission.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, a fixture write fails, a
+/// route fails to respond, or any status, write, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn operator_bearing_registration_requires_operator_invoke() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    seed_binding_dependencies(&server).await;
+    seed_card(
+        &server,
+        tenant,
+        "Operator",
+        "vb-hook",
+        json!({
+            "kind": "http", "method": "post",
+            "url": "https://hooks.example.test/verification-failed"
+        }),
+        "active",
+    )
+    .await;
+    let card_write = wyrd_runtime::Permission::card_write();
+    let operator_invoke = wyrd_runtime::Permission::operator_invoke();
+    server
+        .seed_role("vb_cards_only", std::slice::from_ref(&card_write))
+        .await
+        .expect("cards-only role seeds");
+    server
+        .seed_role("vb_cards_and_operators", &[card_write, operator_invoke])
+        .await
+        .expect("cards-and-operators role seeds");
+    let Bootstrap::User {
+        jwt: cards_only,
+        id: cards_only_id,
+        ..
+    } = server
+        .bootstrap_user("vb-cards-only-user", &["vb_cards_only"])
+        .await
+        .expect("cards-only user bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let Bootstrap::User {
+        jwt: both,
+        id: both_id,
+        ..
+    } = server
+        .bootstrap_user("vb-both-user", &["vb_cards_and_operators"])
+        .await
+        .expect("cards-and-operators user bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let with_on_failure = |name: &str, on_failure: Value| {
+        let mut body = bound_service_body(name, schedule_trigger_ref(), None);
+        body["submissions"][0]["spec"]["verified_by"][0]["on_failure"] = on_failure;
+        body
+    };
+    let allowed = |permission: &str| (permission.to_owned(), "allowed".to_owned());
+    let denied = |permission: &str| (permission.to_owned(), "denied".to_owned());
+
+    let free = server
+        .oneshot_authenticated(
+            &cards_only,
+            request_with_body("vb-free-operation", with_on_failure("vb-free", json!([]))),
+        )
+        .await
+        .expect("operator-free registration responds");
+    let free_status = free.status();
+    assert_eq!(
+        free_status,
+        StatusCode::CREATED,
+        "{}",
+        response_json(free).await
+    );
+    assert_eq!(
+        registration_audits(&server, cards_only_id.as_uuid()).await,
+        vec![allowed("cards:write")],
+        "operator-free registration spends only cards:write"
+    );
+
+    let refused = [
+        (
+            "vb-inline-op",
+            json!([{
+                "kind": "http", "method": "post",
+                "url": "https://hooks.example.test/verification-failed"
+            }]),
+        ),
+        (
+            "vb-referenced-op",
+            json!([{
+                "kind": "Operator", "name": "vb-hook", "version": "1.0.0", "space": "default"
+            }]),
+        ),
+    ];
+    for (name, on_failure) in refused {
+        let operation = format!("{name}-operation");
+        let response = server
+            .oneshot_authenticated(
+                &cards_only,
+                request_with_body(&operation, with_on_failure(name, on_failure)),
+            )
+            .await
+            .expect("operator-bearing registration responds");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(
+            response_json(response).await["code"],
+            "WYRD_PERMISSION_403_DENIED_RBAC"
+        );
+        assert_no_registration_writes(&server, &operation, name).await;
+    }
+    assert_eq!(
+        registration_audits(&server, cards_only_id.as_uuid()).await,
+        vec![
+            allowed("cards:write"),
+            allowed("cards:write"),
+            allowed("cards:write"),
+            denied("operators:invoke"),
+            denied("operators:invoke"),
+        ],
+        "each refusal records the evaluated cards:write and the operators:invoke denial"
+    );
+
+    let accepted = server
+        .oneshot_authenticated(
+            &both,
+            request_with_body(
+                "vb-both-operation",
+                with_on_failure(
+                    "vb-both",
+                    json!([{
+                        "kind": "Operator", "name": "vb-hook", "version": "1.0.0",
+                        "space": "default"
+                    }]),
+                ),
+            ),
+        )
+        .await
+        .expect("authorized operator-bearing registration responds");
+    let accepted_status = accepted.status();
+    assert_eq!(
+        accepted_status,
+        StatusCode::CREATED,
+        "{}",
+        response_json(accepted).await
+    );
+    assert_eq!(
+        registration_audits(&server, both_id.as_uuid()).await,
+        vec![allowed("cards:write"), allowed("operators:invoke")],
+        "one allowed row per evaluated permission commits with the registration"
+    );
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Register the bound `vb-twin` Service in `space` and return its Service UID.
+///
+/// # Panics
+/// Panics when the registration route fails to respond, refuses the graph, or
+/// returns no Service outcome UID.
+async fn register_twin(server: &WyrdTestServer, jwt: &str, space: &str) -> Uuid {
+    let mut body = bound_service_body("vb-twin", schedule_trigger_ref(), None);
+    body["submissions"][0]["metadata"]["space"] = json!(space);
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            request_with_body(&format!("vb-twin-{space}-operation"), body),
+        )
+        .await
+        .expect("twin registration responds");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let uid = body["outcomes"]
+        .as_array()
+        .expect("registration outcomes are an array")
+        .iter()
+        .find(|outcome| outcome["card_ref"]["kind"] == "Service")
+        .and_then(|outcome| outcome["card_ref"]["uid"].as_str())
+        .expect("Service outcome UID exists");
+    Uuid::parse_str(uid).expect("Service UID parses")
+}
+
+/// POST `/auth/issue-key` for `card_ref` as `jwt` and return status and body.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn issue_key(server: &WyrdTestServer, jwt: &str, card_ref: Value) -> (StatusCode, Value) {
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/auth/issue-key")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "card_ref": card_ref }).to_string()))
+                .expect("issue-key request builds"),
+        )
+        .await
+        .expect("issue-key responds");
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+/// Whether every binding row of `owner` still has no recorded activity.
+///
+/// # Panics
+/// Panics when the activity read fails.
+async fn never_activated(server: &WyrdTestServer, owner: Uuid) -> bool {
+    owner_activity(server, owner)
+        .await
+        .iter()
+        .all(|(seen, _, cursor)| seen.is_none() && cursor.is_none())
+}
+
+/// One Card identity in two spaces resolves only through an exact reference.
+///
+/// Registers the same bound Service kind, name, and version in the `default`
+/// and `blue` spaces, which projects two distinct Card-bound principals. An
+/// explicit-space `card_ref` issues a key for and — through the real API-key
+/// exchange — activates only its own space's owner; the same ref with its
+/// space omitted matches both principals and fails closed with the stable
+/// principal-not-found refusal, leaving both owners' activity untouched.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, a bootstrap or fixture write
+/// fails, a route fails to respond, or any status, code, or activity
+/// expectation does not hold.
+#[tokio::test(flavor = "current_thread")]
+async fn same_card_in_two_spaces_resolves_only_exact_refs() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    seed_binding_dependencies(&server).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("vb-twin-admin", &["writer", "runtime_admin"])
+        .await
+        .expect("admin bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let default_owner = register_twin(&server, &jwt, "default").await;
+    let blue_owner = register_twin(&server, &jwt, "blue").await;
+    let twin_ref = |space: Option<&str>| {
+        let mut card_ref = json!({ "kind": "Service", "name": "vb-twin", "version": "1.0.0" });
+        if let Some(space) = space {
+            card_ref["space"] = json!(space);
+        }
+        card_ref
+    };
+
+    let (status, ambiguous) = issue_key(&server, &jwt, twin_ref(None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{ambiguous}");
+    assert_eq!(ambiguous["code"], "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND");
+    assert!(never_activated(&server, default_owner).await);
+    assert!(never_activated(&server, blue_owner).await);
+
+    let (status, issued) = issue_key(&server, &jwt, twin_ref(Some("blue"))).await;
+    assert_eq!(status, StatusCode::OK, "{issued}");
+    let key = SecretString::from(issued["key"].as_str().expect("issued key").to_owned());
+    assert!(
+        never_activated(&server, blue_owner).await,
+        "issuance never activates the owner"
+    );
+    server
+        .exchange_api_key(&key)
+        .await
+        .expect("exact owner key exchanges");
+    assert!(
+        owner_activity(&server, blue_owner)
+            .await
+            .iter()
+            .all(|(seen, _, _)| seen.is_some()),
+        "the exchange activates the exact owner"
+    );
+    assert!(
+        never_activated(&server, default_owner).await,
+        "the same-named owner in another space is untouched"
+    );
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Register the bound `vb-live` Service at `version` and return its Service UID.
+///
+/// # Panics
+/// Panics when the registration route fails to respond, refuses the graph, or
+/// returns no Service outcome UID.
+async fn register_live(server: &WyrdTestServer, jwt: &str, version: &str) -> Uuid {
+    let mut body = bound_service_body("vb-live", schedule_trigger_ref(), None);
+    body["submissions"][0]["metadata"]["version"] = json!(version);
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            request_with_body(&format!("vb-live-{version}-operation"), body),
+        )
+        .await
+        .expect("live registration responds");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let uid = body["outcomes"]
+        .as_array()
+        .expect("registration outcomes are an array")
+        .iter()
+        .find(|outcome| outcome["card_ref"]["kind"] == "Service")
+        .and_then(|outcome| outcome["card_ref"]["uid"].as_str())
+        .expect("Service outcome UID exists");
+    Uuid::parse_str(uid).expect("Service UID parses")
+}
+
+/// The `vb-live` Service reference at `version` in the default space.
+///
+/// # Panics
+/// Panics when the reference does not decode.
+fn live_ref(version: &str) -> CardRef {
+    serde_json::from_value(json!({
+        "kind": "Service", "name": "vb-live", "version": version, "space": "default"
+    }))
+    .expect("live ref decodes")
+}
+
+/// Read the machine principals whose id or bound Card UID is `value`.
+///
+/// Returns each match's id and last qualifying exchange, so a caller can read
+/// one principal by id or every principal an owner Card projects and assert
+/// how many exist; principal ids and Card UIDs never collide.
+///
+/// # Panics
+/// Panics when the tenant connection or the read fails.
+async fn principal_activity(
+    server: &WyrdTestServer,
+    value: Uuid,
+) -> Vec<(Uuid, Option<DateTime<Utc>>)> {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let rows = sqlx::query_as(
+        "SELECT id, last_authenticated_at FROM wyrd.auth_service_accounts \
+          WHERE id = $1 OR card_uid = $1",
+    )
+    .bind(value)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("principal activity reads");
+    conn.commit().await.expect("assertion transaction commits");
+    rows
+}
+
+/// The one principal `owner` projects and its last qualifying exchange.
+///
+/// # Panics
+/// Panics when the read fails or the owner does not project exactly one
+/// principal.
+async fn owner_principal(server: &WyrdTestServer, owner: Uuid) -> (Uuid, Option<DateTime<Utc>>) {
+    let rows = principal_activity(server, owner).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "one exact owner version projects one principal"
+    );
+    rows[0]
+}
+
+/// The schedule cursor of `owner`'s Service-level binding.
+///
+/// # Panics
+/// Panics when the owner has no schedule binding.
+async fn schedule_cursor(server: &WyrdTestServer, owner: Uuid) -> Option<DateTime<Utc>> {
+    owner_activity(server, owner)
+        .await
+        .into_iter()
+        .find(|(_, activation, _)| activation == "schedule")
+        .expect("owner has a schedule binding")
+        .2
+}
+
+/// Move `principal`'s recorded activity past the default inactivity window,
+/// so the gate lapses on the database's own clock, and return the stamp it
+/// now carries.
+///
+/// # Panics
+/// Panics when the tenant connection or the update fails.
+async fn lapse_activity(server: &WyrdTestServer, principal: Uuid) -> DateTime<Utc> {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let lapsed = sqlx::query_scalar(
+        "UPDATE wyrd.auth_service_accounts \
+            SET last_authenticated_at = statement_timestamp() - INTERVAL '25 hours' \
+          WHERE id = $1 RETURNING last_authenticated_at",
+    )
+    .bind(principal)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("activity ages");
+    conn.commit().await.expect("assertion transaction commits");
+    lapsed
+}
+
+/// Evaluate every binding admission gate of `owner` on the database clock.
+///
+/// # Panics
+/// Panics when the tenant connection, the binding list, or an activity read
+/// fails, or a listed binding has no activity row.
+async fn owner_gates(server: &WyrdTestServer, owner: Uuid) -> Vec<bool> {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT binding_id FROM wyrd.verification_bindings WHERE owner_card_uid = $1",
+    )
+    .bind(owner)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("owner bindings list");
+    let mut gates = Vec::with_capacity(ids.len());
+    for id in ids {
+        let id = wyrd_spec::ids::BindingId::new(id).expect("stored binding ID is UUIDv7");
+        let activity = binding_activity(&mut conn, id, InactivityTimeout::default())
+            .await
+            .expect("binding activity reads")
+            .expect("listed binding has activity");
+        gates.push(activity.active);
+    }
+    conn.commit().await.expect("assertion transaction commits");
+    gates
+}
+
+/// Build a real client over the bound server that authenticates with `key`.
+///
+/// # Panics
+/// Panics when the server is not bound or the client auth cannot build.
+fn machine_auth(server: &WyrdTestServer, key: &SecretString) -> Arc<AuthMiddleware> {
+    let config = ClientConfig {
+        http: HttpConfig {
+            base_url: server
+                .base_url()
+                .expect("bound server has a URL")
+                .to_owned(),
+            ..HttpConfig::default()
+        },
+        ..ClientConfig::default()
+    };
+    AuthMiddleware::new(
+        &config,
+        ResolvedCredential::ApiKey(SecretString::clone(key)),
+    )
+    .expect("client auth builds")
+}
+
+/// Runtime activity follows only qualifying exchanges of the exact owner.
+///
+/// Registers two A/B versions of one bound Service and drives a real client
+/// through `/auth/token`. The first API-key exchange activates only the exact
+/// version, arms its schedule cursor, and — through the component binding —
+/// activates every binding of that Service. A cached-token request, an idle
+/// client whose token went stale, delegation to the other version, and a
+/// Card-free automation principal's exchange write no activity. A second
+/// replica sharing the principal and a request-driven stale-token re-exchange
+/// renew the one shared timestamp without moving the armed cursor. The other
+/// version stays independently gated until its own exchange. Idle expiry after
+/// the default window, suspension, and Card deletion each close the gate.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, a fixture or route call
+/// fails, or any activity, cursor, or gate expectation does not hold.
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_activity_follows_only_qualifying_exchanges() {
+    // 33s access tokens go stale (within the client's 30s skew) after ~3s.
+    let server = wyrd_testing::WyrdTestServerBuilder::default()
+        .with_access_ttl(chrono::Duration::seconds(33))
+        .start_bound()
+        .await
+        .expect("test server starts");
+    seed_binding_dependencies(&server).await;
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("vb-live-admin", &["writer", "runtime_admin"])
+        .await
+        .expect("admin bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let a_owner = register_live(&server, &jwt, "1.0.0").await;
+    let b_owner = register_live(&server, &jwt, "2.0.0").await;
+    let credential = |version: &'static str| {
+        let server = &server;
+        async move {
+            let Bootstrap::Machine { api_key, .. } = server
+                .credential_registered_service(&live_ref(version), &["writer"])
+                .await
+                .expect("registered Service is credentialed")
+            else {
+                panic!("credentialed Service returned a non-machine principal");
+            };
+            api_key
+        }
+    };
+    let replica_one = credential("1.0.0").await;
+    let replica_two = credential("1.0.0").await;
+    let b_key = credential("2.0.0").await;
+    let (a_principal, seen) = owner_principal(&server, a_owner).await;
+    assert_eq!(seen, None, "registration and credentialing never activate");
+
+    let client = machine_auth(&server, &replica_one);
+    let token = client.bearer().await.expect("first exchange succeeds");
+    let (_, first) = owner_principal(&server, a_owner).await;
+    let first = first.expect("the exact owner's first exchange records activity");
+    let cursor = schedule_cursor(&server, a_owner)
+        .await
+        .expect("the first exchange arms the schedule");
+    assert!(cursor > first, "the cursor is the next future boundary");
+    assert!(
+        owner_activity(&server, a_owner)
+            .await
+            .iter()
+            .all(|(stamp, _, _)| *stamp == Some(first)),
+        "component bindings inherit the Service activity"
+    );
+    assert_eq!(owner_principal(&server, b_owner).await.1, None);
+    assert!(owner_gates(&server, b_owner).await.iter().all(|g| !g));
+
+    let cached = client.bearer().await.expect("cached token returns");
+    assert_eq!(cached.expose(), token.expose(), "a fresh token is reused");
+    let read = read_card(&server, token.expose(), "Service", &a_owner.to_string()).await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let automation = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/principals")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "name": "vb-automation", "roles": ["writer"] }).to_string(),
+                ))
+                .expect("automation request builds"),
+        )
+        .await
+        .expect("automation creation responds");
+    assert_eq!(automation.status(), StatusCode::OK);
+    let automation = response_json(automation).await;
+    let automation_id = Uuid::parse_str(
+        automation["principal_id"]
+            .as_str()
+            .expect("automation principal id"),
+    )
+    .expect("automation principal id parses");
+    server
+        .exchange_api_key(&SecretString::from(
+            automation["credential"]
+                .as_str()
+                .expect("automation credential")
+                .to_owned(),
+        ))
+        .await
+        .expect("Card-free automation exchanges");
+    assert_eq!(
+        principal_activity(&server, automation_id).await,
+        vec![(automation_id, None)],
+        "a Card-free automation exchange records no activity"
+    );
+    assert_eq!(owner_principal(&server, a_owner).await.1, Some(first));
+    assert_eq!(
+        owner_principal(&server, b_owner).await.1,
+        None,
+        "cached requests never activate an owner"
+    );
+
+    let replica = machine_auth(&server, &replica_two);
+    replica.bearer().await.expect("replica exchange succeeds");
+    assert_eq!(
+        principal_activity(&server, a_owner).await.len(),
+        1,
+        "replicas share the one exact principal"
+    );
+    let (principal, renewed) = owner_principal(&server, a_owner).await;
+    assert_eq!(principal, a_principal);
+    let renewed = renewed.expect("replica exchange renews activity");
+    assert!(renewed >= first);
+    assert_eq!(schedule_cursor(&server, a_owner).await, Some(cursor));
+
+    sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        owner_principal(&server, a_owner).await.1,
+        Some(renewed),
+        "an idle client does not re-exchange on staleness alone"
+    );
+    let refreshed = client.bearer().await.expect("stale token re-exchanges");
+    assert_ne!(
+        refreshed.expose(),
+        token.expose(),
+        "a stale token is replaced"
+    );
+    let restamped = owner_principal(&server, a_owner)
+        .await
+        .1
+        .expect("re-exchange keeps activity");
+    assert!(
+        restamped > renewed,
+        "request-driven re-exchange renews activity"
+    );
+    assert_eq!(
+        schedule_cursor(&server, a_owner).await,
+        Some(cursor),
+        "renewal never moves an armed cursor"
+    );
+
+    machine_auth(&server, &b_key)
+        .bearer()
+        .await
+        .expect("the other version exchanges");
+    let b_seen = owner_principal(&server, b_owner)
+        .await
+        .1
+        .expect("the other version activates on its own exchange");
+    assert_eq!(owner_principal(&server, a_owner).await.1, Some(restamped));
+    assert!(b_seen >= restamped);
+
+    assert!(owner_gates(&server, a_owner).await.iter().all(|g| *g));
+    assert!(owner_gates(&server, b_owner).await.iter().all(|g| *g));
+    let lapsed = lapse_activity(&server, a_principal).await;
+    assert!(
+        owner_gates(&server, a_owner).await.iter().all(|g| !g),
+        "the default inactivity window closes the gate"
+    );
+
+    let revoke = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/v1/principals/{a_principal}/revoke"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "principal_kind": "service", "reason": "suspend owner" }).to_string(),
+                ))
+                .expect("revoke request builds"),
+        )
+        .await
+        .expect("revoke responds");
+    assert!(revoke.status().is_success(), "{}", revoke.status());
+    assert!(
+        owner_gates(&server, a_owner).await.iter().all(|g| !g),
+        "suspension closes the gate on the next read"
+    );
+    assert!(server.exchange_api_key(&replica_one).await.is_err());
+    assert_eq!(owner_principal(&server, a_owner).await.1, Some(lapsed));
+
+    let delete = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/cards/by-ref?kind=Service&space=default&name=vb-live&version=2.0.0")
+                .body(Body::empty())
+                .expect("delete request builds"),
+        )
+        .await
+        .expect("delete responds");
+    assert!(delete.status().is_success(), "{}", delete.status());
+    assert!(
+        owner_gates(&server, b_owner).await.iter().all(|g| !g),
+        "deleting the owner Card closes the gate"
+    );
 
     server.shutdown().await.expect("test server shuts down");
 }

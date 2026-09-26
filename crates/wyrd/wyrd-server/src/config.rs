@@ -1744,6 +1744,40 @@ impl Default for MetricsConfig {
     }
 }
 
+/// Verification runtime configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationConfig {
+    /// Whether an API-serving process runs the verification runtime.
+    ///
+    /// Defaults to true; the scheduler and runner coordinate through the
+    /// durable queue, so every replica may run them.
+    #[serde(default = "default_verification_enabled")]
+    pub enabled: bool,
+    /// Scribe-bearing gRPC endpoint Verifier results are published through.
+    ///
+    /// When unset, a process that hosts a Scribe and serves plaintext gRPC
+    /// publishes through its own listener; any other process runs no Verifier
+    /// runner until this is set.
+    #[serde(default)]
+    pub ingest_endpoint: Option<String>,
+}
+
+/// Serde default for [`VerificationConfig::enabled`].
+fn default_verification_enabled() -> bool {
+    true
+}
+
+impl Default for VerificationConfig {
+    /// The runtime is enabled and publishes through the local Scribe.
+    fn default() -> Self {
+        Self {
+            enabled: default_verification_enabled(),
+            ingest_endpoint: None,
+        }
+    }
+}
+
 impl MetricsConfig {
     /// Resolve the concrete metrics bind. When `bind` is unset, use
     /// **loopback** (`127.0.0.1`) on `http_bind`'s port + 1 — NOT `http_bind`'s
@@ -1829,6 +1863,9 @@ pub struct WyrdServerConfig {
     /// Workload identity bindings for this deployment.
     #[serde(default)]
     pub workload_bindings: Vec<WorkloadBindingEntry>,
+    /// Verification runtime configuration.
+    #[serde(default)]
+    pub verification: VerificationConfig,
     /// Operator-owned gateway credential sources.
     #[serde(default)]
     pub gateway: GatewayConfig,
@@ -1930,6 +1967,10 @@ impl LimitsConfig {
 #[serde(deny_unknown_fields)]
 pub struct ShutdownConfig {
     /// Time in milliseconds to wait for in-flight requests to drain.
+    ///
+    /// The verification runtime drains inside this budget, one second short
+    /// of it, so a value below 31 seconds shortens its 30-second in-flight
+    /// drain.
     #[serde(default = "default_shutdown_drain_ms")]
     pub drain_ms: u64,
 }
@@ -2431,8 +2472,13 @@ fn default_concurrency() -> usize {
     1_024
 }
 
+/// Serde default for [`ShutdownConfig::drain_ms`].
+///
+/// Thirty-five seconds: the verification runtime's full 30-second in-flight
+/// drain plus the second it reserves for releasing leases, with headroom for
+/// the rest of teardown.
 fn default_shutdown_drain_ms() -> u64 {
-    15_000
+    35_000
 }
 
 fn default_readiness_tick_ms() -> u64 {
@@ -2845,6 +2891,16 @@ impl WyrdServerConfig {
                             message: e.to_string(),
                         })?,
                 );
+        }
+
+        // verification.enabled
+        if let Some(val) = env_opt("WYRD_VERIFICATION_ENABLED")? {
+            self.verification.enabled = parse_flag(&val, "WYRD_VERIFICATION_ENABLED")?;
+        }
+
+        // verification.ingest_endpoint
+        if let Some(val) = env_opt("WYRD_VERIFICATION_INGEST_ENDPOINT")? {
+            self.verification.ingest_endpoint = Some(val);
         }
 
         // readiness.tick_ms

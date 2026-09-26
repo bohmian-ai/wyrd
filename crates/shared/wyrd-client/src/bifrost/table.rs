@@ -306,6 +306,49 @@ impl TryFrom<TableConfigWire> for TableConfig {
     }
 }
 
+/// One table this connected writer has described, with its cached user schema.
+///
+/// Holding this value is the proof that the table was described once for this
+/// writer's lifetime, which is what lets [`crate::bifrost::Bifrost::insert_into`]
+/// stay a synchronous, IO-free enqueue: there is no way to name a destination
+/// the writer has not already resolved, so no insert path can smuggle in a
+/// per-observation describe or a caller-supplied schema.
+///
+/// One schema is authoritative per table name for that lifetime. A server-side
+/// schema change therefore requires a new writer after shutdown; the existing
+/// fingerprint fence refuses a stale batch rather than silently replacing a
+/// live producer's schema.
+#[derive(Debug, Clone)]
+pub struct WriterTable {
+    /// Fully-qualified `<namespace>.<name>` destination.
+    fqn: Arc<str>,
+    /// The user schema the server described for this table.
+    schema: SchemaRef,
+}
+
+impl WriterTable {
+    /// Build a described destination from its resolved config.
+    #[must_use]
+    pub(crate) fn new(fqn: &str, schema: SchemaRef) -> Self {
+        Self {
+            fqn: Arc::from(fqn),
+            schema,
+        }
+    }
+
+    /// The fully-qualified table name rows are routed to.
+    #[must_use]
+    pub fn fqn(&self) -> &str {
+        &self.fqn
+    }
+
+    /// The described user schema rows are parsed against when a batch seals.
+    #[must_use]
+    pub fn user_schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+}
+
 /// Optional per-row correlation.
 ///
 /// Both fields are optional on the wire: the server stores an uncorrelated row

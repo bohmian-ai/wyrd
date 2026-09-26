@@ -5,14 +5,12 @@ metadata:
   name: slack-ops-alerts
   version: "1.0.0"
 spec:
-  # NO pre_invoke. NO post_invoke. Operator is a pure side-effect template.
-  # Every Trigger that wants this side effect names it as its `operator_ref`.
-  # One Operator card serves N Triggers across the whole org.
-
-  action:
-    kind: notify
-    channel:
-      kind: slack
-      text: |
-        [{{ severity }}] {{ trigger.name }} fired on {{ subject.name }}@{{ subject.version }}
-        → {{ observation.summary }}
+  # Operator is a pure side-effect template. Every verification binding that
+  # wants this reaction lists it under `on_failure`; one Operator card serves
+  # N bindings across the whole org.
+  kind: notify
+  channel:
+    kind: slack
+    text: |
+      [{{ severity }}] {{ trigger.name }} fired on {{ subject.name }}@{{ subject.version }}
+      → {{ observation.summary }}

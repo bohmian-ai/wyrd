@@ -228,7 +228,7 @@ impl<'a> QueryAuthority<'a> {
 ///
 /// Returns the tenant invariant error if the principal and extractor tenant
 /// disagree.
-fn oracle_context(caller: &Caller) -> Result<AuthorizedQueryContext, WyrdError> {
+pub(crate) fn oracle_context(caller: &Caller) -> Result<AuthorizedQueryContext, WyrdError> {
     AuthorizedQueryContext::try_new(
         caller.principal.clone(),
         caller.data_tenant_id,

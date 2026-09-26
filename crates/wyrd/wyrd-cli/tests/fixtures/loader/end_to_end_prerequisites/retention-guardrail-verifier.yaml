@@ -1,0 +1,22 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: wyrd-team
+  name: retention-guardrail
+  version: "1.0.0"
+spec:
+  description: |
+    Org-wide guardrail registered on its own. Subjects in other bundles bind it
+    by exact `ref:`, which is why it is a prerequisite rather than a sibling.
+  implementation:
+    kind: eval
+    spec:
+      pass_gate:
+        kind: all_pass
+      tasks:
+        no_refund_promise:
+          kind: assertion
+          id: no_refund_promise
+          context_path: $.response_text
+          operator: not_contains
+          expected: guaranteed refund

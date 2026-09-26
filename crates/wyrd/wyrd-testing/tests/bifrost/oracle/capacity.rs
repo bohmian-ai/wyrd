@@ -294,7 +294,18 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
     }
 
     await_clean_nodes(&cluster).await?;
-    let settled = ownership_baseline(&cluster).await?;
+    // Query-owned leases, including each query runtime's empty spill
+    // directory, live until coordinator end-of-stream and cache invalidation
+    // (bifrost-design.md), which can trail graph release. The exact baseline
+    // is therefore observed under the clean-node bound rather than sampled once.
+    let mut settled = ownership_baseline(&cluster).await?;
+    for _ in 0..CLEAN_NODE_POLLS {
+        if settled == baseline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        settled = ownership_baseline(&cluster).await?;
+    }
     if settled != baseline {
         return Err(format!(
             "Oracle ownership did not return to baseline: {baseline:?} then {settled:?}"

@@ -3357,11 +3357,17 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
             );
         }
 
-        let counts: (i64, i64, i64) = sqlx::query_as(
-            "SELECT (SELECT count(*) FROM wyrd.auth_service_accounts WHERE data_tenant_id = $1),
+        // The administrative principal is counted apart from the internal
+        // SYSTEM verification writer: provisioning creates exactly one of
+        // each, and a resumed attempt must duplicate neither.
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM wyrd.auth_service_accounts
+                      WHERE data_tenant_id = $1 AND principal_kind <> 'system'),
                     (SELECT count(*) FROM wyrd.auth_service_account_roles WHERE data_tenant_id = $1),
                     (SELECT count(*) FROM wyrd.auth_api_keys
-                      WHERE data_tenant_id = $1 AND revoked_at IS NULL)",
+                      WHERE data_tenant_id = $1 AND revoked_at IS NULL),
+                    (SELECT count(*) FROM wyrd.auth_service_accounts
+                      WHERE data_tenant_id = $1 AND principal_kind = 'system')",
         )
         .bind(uuid::Uuid::parse_str(tenant_id).expect("the tenant id is a uuid"))
         .fetch_one(&superuser)
@@ -3369,8 +3375,9 @@ async fn every_durable_provisioning_stage_fails_closed_and_retries_clean() {
         .expect("the tenant's durable rows are counted");
         assert_eq!(
             counts,
-            (1, 1, 1),
-            "the retry after a {stage} failure leaves one principal, grant, and live credential"
+            (1, 1, 1, 1),
+            "the retry after a {stage} failure leaves one administrative principal, grant, \
+             live credential, and SYSTEM writer"
         );
         assert!(
             tenant_token(
@@ -3579,8 +3586,11 @@ async fn interrupted_and_racing_provisioning_converge_on_one_tenant() {
     } else {
         second.1
     };
+    // Only the administrative principal is counted; every provisioned tenant
+    // also carries the internal credentialless SYSTEM verification writer.
     let principals: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.auth_service_accounts WHERE data_tenant_id = $1::uuid",
+        "SELECT count(*) FROM wyrd.auth_service_accounts
+          WHERE data_tenant_id = $1::uuid AND principal_kind <> 'system'",
     )
     .bind(
         winner["tenant"]["id"]

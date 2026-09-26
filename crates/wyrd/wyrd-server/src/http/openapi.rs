@@ -3,6 +3,8 @@
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme};
 use utoipa::openapi::{Content, OpenApi as OpenApiDocument};
 use utoipa::{Modify, OpenApi};
+use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, CancelRunningQueryResponse, FreshnessPolicy, ListRunningQueriesResponse,
     QueryClass, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
@@ -129,6 +131,11 @@ fn is_problem(content: Option<&Content>) -> bool {
         RunningQueryLifecycleState,
         RunningQueryProgress,
         RunningQuerySummary,
+        TriggerActivation,
+        TriggerSpec,
+        VerificationBinding,
+        VerifierImplementation,
+        VerifierSpec,
         VisibilityMode
     )),
     tags(
@@ -154,6 +161,10 @@ fn is_problem(content: Option<&Content>) -> bool {
             description = "Card artifact upload and download plans"
         ),
         (
+            name = "Verification",
+            description = "Verification binding status, manual Verifier runs, and run status"
+        ),
+        (
             name = "Authz",
             description = "Delegated invoke authorization checks"
         ),
@@ -176,3 +187,65 @@ fn is_problem(content: Option<&Content>) -> bool {
     )
 )]
 pub struct WyrdApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::WyrdApiDoc;
+    use utoipa::OpenApi;
+
+    /// Collect component references nested under one schema.
+    fn collect_refs(value: &serde_json::Value, found: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(serde_json::Value::String(target)) = object.get("$ref")
+                    && let Some(name) = target.strip_prefix("#/components/schemas/")
+                {
+                    found.insert(name.to_owned());
+                }
+                for nested in object.values() {
+                    collect_refs(nested, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for nested in items {
+                    collect_refs(nested, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every component reachable from the Verifier contract resolves.
+    #[test]
+    fn verifier_contract_component_references_all_resolve() {
+        let document = serde_json::to_value(WyrdApiDoc::openapi()).expect("OpenAPI is JSON");
+        let schemas = document["components"]["schemas"]
+            .as_object()
+            .expect("the document defines components.schemas");
+        let mut pending: Vec<String> = [
+            "VerifierSpec",
+            "VerificationBinding",
+            "VerifierImplementation",
+            "TriggerSpec",
+            "TriggerActivation",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut visited = BTreeSet::new();
+
+        while let Some(name) = pending.pop() {
+            if !visited.insert(name.clone()) {
+                continue;
+            }
+            let schema = schemas.get(&name).unwrap_or_else(|| {
+                panic!("{name} is reachable from the Verifier contract but is undefined")
+            });
+            let mut referenced = BTreeSet::new();
+            collect_refs(schema, &mut referenced);
+            pending.extend(referenced);
+        }
+    }
+}

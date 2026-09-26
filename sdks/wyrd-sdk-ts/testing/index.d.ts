@@ -60,6 +60,35 @@ export declare class NativeWyrdTestServer {
    */
   flushBifrost(): void
   /**
+   * Bring binding `binding_id`'s schedule cursor to database time, so the
+   * verification runtime schedules its next occurrence now.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, `binding_id` is not a
+   * binding ID, or the update fails.
+   */
+  makeBindingDue(bindingId: string): void
+  /**
+   * Every verification run ID of the fixture tenant, oldest first.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the runs cannot be
+   * read.
+   */
+  verificationRuns(): Array<string>
+  /**
+   * Strip the fitted-profile format from Verifier `verifier_uid`'s ready
+   * baseline, as a baseline fitted under earlier semantics is stored.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, `verifier_uid` is not
+   * a Card UID, or no ready baseline exists.
+   */
+  retireFittedFormat(verifierUid: string): void
+  /**
    * Provision one canonical built-in table for the fixture tenant.
    *
    * A canonical signal ledger is server-owned, so a journey cannot register
@@ -86,6 +115,22 @@ export declare class NativeWyrdTestServer {
    */
   scopedApiKey(role: string, permissions: Array<string>): string
   /**
+   * Issue an API key for the principal a registered Service Card projects.
+   *
+   * `card_ref` is the canonical `space/Kind/name@version` identity a
+   * registration receipt returns. The Card must already be registered: this
+   * credentials the service account registration projected for it rather
+   * than minting a new one, so the key carries the registered Service's real
+   * card-ref scope and a run may observe the component Cards its spec
+   * references.
+   *
+   * # Errors
+   *
+   * Returns a napi error for a malformed identity string, or when the
+   * harness is closed or the Card has no projected principal.
+   */
+  credentialRegisteredService(cardRef: string, roles: Array<string>): string
+  /**
    * Mint an authenticated token without `bifrost_query:read`.
    *
    * # Errors
@@ -101,6 +146,39 @@ export declare class NativeWyrdTestServer {
    * Returns a napi error when the harness is closed or the audit query fails.
    */
   bifrostReadDecisionCount(): number
+  /**
+   * Return the staged allowed describe decisions for one table FQN.
+   *
+   * Every server describe stages exactly one decision, so a journey started
+   * with audit publication disabled reads how many schema describes a table
+   * has received.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the audit query fails.
+   */
+  tableDescribeCount(fqn: string): number
+  /**
+   * Make every describe of one table FQN fail until restored.
+   *
+   * The server answers the failed describe with
+   * `WYRD_VALA_500_AUDIT_UNAVAILABLE`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed, the FQN is not a
+   * dotted identifier, or installing the fault fails.
+   */
+  failTableDescribe(fqn: string): void
+  /**
+   * Remove the describe fault installed by `fail_table_describe`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or removing the fault
+   * fails.
+   */
+  restoreTableDescribe(): void
   /**
    * Truncate the next query after its schema frame.
    *
@@ -132,15 +210,12 @@ export declare class NativeWyrdTestServer {
 /**
  * Starts a real bound Wyrd test server and mints an admin access token.
  *
- * `providerBaseUrl` roots every built-in gateway adapter at one local mock
- * upstream (`OpenAI` under `/v1`), so a TypeScript gateway journey dispatches
- * over HTTP with the harness's operator credential bindings; without it the
- * gateway admits and accounts calls but reaches no provider.
+ * `auditPublication: false` keeps staged audit rows for assertions.
+ * `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
+ * `providerBaseUrl` roots built-in gateway adapters at a local mock upstream.
  *
  * # Errors
  *
- * Returns a napi error when `providerBaseUrl` is not an absolute URL, or when
- * server startup, service bootstrap, API-key exchange, or URL discovery
- * fails.
+ * Returns a napi error for an invalid provider URL or server setup failure.
  */
-export declare function startTestServer(providerBaseUrl?: string | undefined | null): NativeWyrdTestServer
+export declare function startTestServer(providerBaseUrl?: string | undefined | null, auditPublication?: boolean | undefined | null, verificationRuntime?: boolean | undefined | null): NativeWyrdTestServer

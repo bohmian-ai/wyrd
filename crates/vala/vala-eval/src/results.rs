@@ -76,7 +76,7 @@ pub struct EvalResults {
 pub struct RunIdentity {
     /// Typed run identifier.
     pub run_id: RunId,
-    /// Eval card whose execution produced this run.
+    /// Eval-backed Verifier Card whose execution produced this run.
     pub eval_ref: CardRef,
     /// Wall-clock UTC start.
     pub started_at: DateTime<Utc>,
@@ -701,7 +701,7 @@ mod results_aggregation {
 
     fn eval_card_ref() -> CardRef {
         CardRef {
-            kind: CardKind::Eval,
+            kind: CardKind::Verifier,
             name: CardName::new("rubric").expect("static card name is valid"),
             version: VersionBlock::parse("0.1.0").expect("static version is valid"),
             space: Some(SpaceName::new("tests").expect("static space is valid")),

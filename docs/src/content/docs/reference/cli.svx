@@ -97,19 +97,13 @@ wyrd auth issue-key \
 
 ## wyrd eval run
 
-Execute an Eval card. There are two source modes, and exactly one is required:
-
-- **Live** — drive a running server against an agent endpoint: `--server` with
-  `--agent-url`.
-- **Local records** — score pre-collected observations: `--records`.
+Score pre-collected observations locally against an Eval-backed Verifier card
+(`kind: Verifier` with `implementation.kind: eval`). The command reads a local
+card file and a JSONL of records; it does not contact a server.
 
 ```bash
-# Live run against an agent
-wyrd eval run --eval ./eval.yaml \
-  --server https://acme.wyrd.cloud --agent-url http://localhost:8080
-
-# Offline scoring of recorded rows
-wyrd eval run --eval ./eval.yaml --records ./observations.jsonl
+wyrd eval run --eval ./verifier.yaml --records ./observations.jsonl \
+  --subject support/Agent/triage@1.0.0
 ```
 
 <DataTable
@@ -119,16 +113,12 @@ wyrd eval run --eval ./eval.yaml --records ./observations.jsonl
     { header: 'Meaning' }
   ]}
   rows={[
-    ['--eval', '(required)', 'Eval card filesystem path (JSON or YAML).'],
-    ['--server', '—', 'Drive a remote server protocol router. Requires --agent-url.'],
-    ['--agent-url', '—', 'Agent endpoint URL. Conflicts with --records.'],
-    ['--records', '—', 'JSONL of pre-collected EvalRecordObservation rows. Conflicts with --server/--agent-url.'],
+    ['--eval', '(required)', 'Eval-backed Verifier card filesystem path (JSON or YAML).'],
+    ['--records', '(required)', 'JSONL of pre-collected EvalRecordObservation rows.'],
+    ['--subject', '(required)', 'CardRef of the Card that emitted the records.'],
     ['--judge-mock', 'false', 'Deterministic judge — all LLM judge tasks return passed: true. Required if the spec has LLM judges and no provider is configured.'],
-    ['--simulated-user', 'server', 'Who supplies unscripted user turns: server or client.'],
-    ['--simulated-user-script', '—', 'JSONL of client-supplied user turns. Required when --simulated-user client.'],
     ['--baseline', '—', 'Baseline EvalResults JSON for comparison.'],
     ['--out', '—', 'Directory for local output artifacts (env WYRD_EVAL_OUT).'],
-    ['--agent-timeout-secs', '60', 'Agent HTTP timeout in seconds.'],
     ['--fail-on-gate', 'true', 'Exit non-zero when the local pass gate fails.']
   ]}
 />

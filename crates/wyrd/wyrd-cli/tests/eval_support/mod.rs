@@ -8,6 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 use wyrd_semver::VersionBlock;
 use wyrd_spec::api_version::ApiVersion;
+use wyrd_spec::card::verifier::{VerifierImplementation, VerifierSpec};
 use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::metadata::{Annotations, Labels};
@@ -17,7 +18,6 @@ use wyrd_spec::vala::eval::{
     AssertionTask, ComparisonOperator, EvalPassGate, EvalScenario, EvalSpec, EvalTask, JsonPath,
     LlmJudgeTask, RecordId, ScenarioId, ScenarioTask, TaskId,
 };
-use wyrd_spec::vala::ids::RunId;
 
 pub fn tid(value: &str) -> TaskId {
     TaskId::new(value).expect("static task id is valid")
@@ -38,7 +38,7 @@ pub fn card_ref(kind: CardKind, name: &str) -> CardRef {
 }
 
 pub fn eval_ref() -> CardRef {
-    card_ref(CardKind::Eval, "cli-eval")
+    card_ref(CardKind::Verifier, "cli-eval")
 }
 
 pub fn subject_ref() -> CardRef {
@@ -48,7 +48,7 @@ pub fn subject_ref() -> CardRef {
 pub fn eval_card(spec: EvalSpec) -> Card {
     Card {
         api_version: ApiVersion::default(),
-        kind: CardKind::Eval,
+        kind: CardKind::Verifier,
         metadata: Metadata {
             name: CardName::new("cli-eval").expect("static card name is valid"),
             version: Some(
@@ -65,7 +65,10 @@ pub fn eval_card(spec: EvalSpec) -> Card {
             artifact_hash: None,
             origin: None,
         },
-        spec: Spec::Eval(spec),
+        spec: Spec::Verifier(VerifierSpec {
+            description: None,
+            implementation: VerifierImplementation::Eval(spec),
+        }),
         relationships: Relationships::default(),
         status: None,
     }
@@ -133,12 +136,12 @@ pub fn scenario_with(id: &str, max_turns: u32) -> EvalScenario {
     }
 }
 
+/// A canonical Eval record whose context is `{"ok": ok}`; the record id is
+/// fixed per `ok` value and it carries no session, trace, or media.
 pub fn record(ok: bool) -> EvalRecordObservation {
     EvalRecordObservation {
         record_id: RecordId(Uuid::from_u128(if ok { 1 } else { 2 })),
-        run_id: RunId::from_string("run-records".to_owned()),
         session_id: None,
-        eval_ref: Some(eval_ref()),
         context: json!({ "ok": ok }),
         trace_id: None,
         span_id: None,

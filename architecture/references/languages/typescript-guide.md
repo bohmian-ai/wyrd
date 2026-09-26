@@ -56,8 +56,8 @@ Prefer APIs that make invalid states unrepresentable:
 export type CardKind =
   | 'Model' | 'Data' | 'Artifact' | 'Experiment'
   | 'Prompt' | 'Agent' | 'Workflow' | 'Mcp'
-  | 'Service' | 'Policy' | 'Audit' | 'Drift'
-  | 'Eval' | 'Source' | 'Trigger' | 'Operator'
+  | 'Service' | 'Policy' | 'Audit' | 'Verifier'
+  | 'Source' | 'Trigger' | 'Operator'
   | 'External';
 
 // Discriminated union for outcomes

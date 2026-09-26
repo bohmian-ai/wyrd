@@ -23,15 +23,18 @@ pub mod managed_columns;
 pub mod metrics;
 pub mod signal;
 pub mod traces;
+pub mod verification;
 
 pub use audit::AuditLogTable;
 pub use dev::AgentTracesTable;
 pub use drift::ObservationsTable;
-pub use eval::{AssertionsTable, RunsTable};
+pub use drift::{ObservationsTable as DriftObservationsTable, ResultFeaturesTable};
+pub use eval::{ObservationsTable as EvalObservationsTable, ResultItemsTable};
 pub use gateway::CallsTable;
 pub use logs::RecordsTable;
 pub use metrics::PointsTable;
 pub use traces::SpansTable;
+pub use verification::ResultsTable;
 
 /// Errors from pure table schema and projection operations.
 #[derive(Debug, Error)]
@@ -107,6 +110,25 @@ pub fn sort_desc(column: &str) -> SortKeyWire {
         column: column.to_owned(),
         direction: SortDirectionWire::Desc,
         null_order: NullOrderWire::Last,
+    }
+}
+
+/// Builds one built-in physical-layout declaration on daily
+/// `wyrd_event_time`.
+///
+/// The five verification tables partition by UTC day rather than by hour: one
+/// Verification Result and every one of its detail rows share one
+/// server-chosen event time, and a Drift analysis window is chosen by a
+/// schedule rather than by ingest rate, so an hourly partition would only
+/// fragment the objects a windowed scan reads. Like [`hourly_layout`], the
+/// declaration names only what is specific to the table; the catalog unions
+/// the managed Bloom floor when it resolves.
+#[must_use]
+pub fn daily_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> PhysicalLayoutWire {
+    PhysicalLayoutWire {
+        partition_granularity: TimeGranularityWire::Day,
+        sort_keys,
+        bloom_columns: bloom_columns.iter().map(|c| (*c).to_owned()).collect(),
     }
 }
 
@@ -728,14 +750,16 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     }
 }
 
-/// The single canonical list of nine server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 9] = [
+/// The single canonical list of eleven server-owned built-in tables.
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 11] = [
     definition::<SpansTable>(),
     definition::<PointsTable>(),
     definition::<RecordsTable>(),
-    definition::<RunsTable>(),
-    definition::<AssertionsTable>(),
-    definition::<ObservationsTable>(),
+    definition::<DriftObservationsTable>(),
+    definition::<EvalObservationsTable>(),
+    definition::<ResultsTable>(),
+    definition::<ResultFeaturesTable>(),
+    definition::<ResultItemsTable>(),
     definition::<AgentTracesTable>(),
     definition::<AuditLogTable>(),
     definition::<CallsTable>(),
@@ -743,7 +767,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 9] = [
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 9] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 11] {
     &BUILTIN_TABLES
 }
 
@@ -755,7 +779,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
         .find(|definition| definition.namespace == namespace && definition.name == name)
 }
 
-/// Return the nine built-in logical FQNs in canonical order.
+/// Return the eleven built-in logical FQNs in canonical order.
 #[must_use]
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
@@ -774,6 +798,7 @@ mod tests {
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
 
     use super::*;
+    use fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID};
 
     /// The registry owns three `OTel` signal tables and no removed physical name.
@@ -807,6 +832,8 @@ mod tests {
             ("genai", "embeddings"),
             ("genai", "tool_calls"),
             ("genai", "memory"),
+            ("eval", "runs"),
+            ("eval", "assertions"),
         ] {
             assert!(
                 builtin_table(namespace, name).is_none(),
@@ -831,6 +858,12 @@ mod tests {
         assert_eq!((spans.schema)(), SpansTable::schema());
     }
 
+    /// Every built-in keeps its managed columns, a stable fingerprint, and the
+    /// partition granularity pinned for its namespace and name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a built-in declares no pinned granularity or drifts from it.
     #[test]
     fn every_builtin_has_stable_schema_fingerprint_and_physical_columns() {
         for definition in builtin_tables() {
@@ -845,12 +878,24 @@ mod tests {
             let schema = (definition.schema)();
             assert!(schema.field_with_name(WYRD_EVENT_TIME).is_ok());
             assert!(schema.field_with_name(DATA_TENANT_ID).is_ok());
-            // Signal tables partition hourly; retained audit history is a
-            // low-volume decision ledger and declares a daily partition.
-            let expected = if definition.correlation_policy == CorrelationPolicy::None {
-                TimeGranularityWire::Day
-            } else {
-                TimeGranularityWire::Hour
+            // Continuous high-rate OTel signals and gateway calls partition hourly. Retained
+            // audit history and the five verification tables partition daily:
+            // both are low-rate, both are read over date ranges rather than a
+            // recent window, and a Verification Result plus all of its detail
+            // rows share one event time and must never split across partitions.
+            let expected = match (definition.namespace, definition.name) {
+                ("traces", "spans")
+                | ("metrics", "points")
+                | ("logs", "records")
+                | ("dev", "agent_traces")
+                | ("gateway", "calls") => TimeGranularityWire::Hour,
+                ("system", "audit_log")
+                | ("drift", "observations" | "result_features")
+                | ("eval", "observations" | "result_items")
+                | ("verification", "results") => TimeGranularityWire::Day,
+                (namespace, name) => {
+                    panic!("vala.{namespace}.{name} declares no pinned partition granularity")
+                }
             };
             assert_eq!(
                 (definition.physical_layout)().partition_granularity,
@@ -862,8 +907,212 @@ mod tests {
         }
     }
 
+    /// One verification table's complete approved physical contract.
+    struct VerificationContract {
+        /// The Bifrost namespace, e.g. `drift`.
+        namespace: &'static str,
+        /// The table name within `namespace`.
+        name: &'static str,
+        /// Authored columns in their exact declared order.
+        columns: Vec<Field>,
+        /// Table-specific Bloom columns, excluding the catalog's managed floor.
+        blooms: &'static [&'static str],
+    }
+
+    /// The approved contract for all five verification tables.
+    fn verification_contracts() -> Vec<VerificationContract> {
+        vec![
+            VerificationContract {
+                namespace: "drift",
+                name: "observations",
+                columns: vec![
+                    utf8("record_id", false),
+                    utf8("series", false),
+                    float64("num_value", true),
+                    utf8("str_value", true),
+                    utf8("session_id", true),
+                    ts_us_utc("created_at", false),
+                ],
+                blooms: &["series"],
+            },
+            VerificationContract {
+                namespace: "eval",
+                name: "observations",
+                columns: vec![
+                    utf8("record_id", false),
+                    utf8("session_id", true),
+                    utf8("context", false),
+                    fields::fixed_binary("trace_id", 16, true),
+                    fields::fixed_binary("span_id", 8, true),
+                    ts_us_utc("created_at", false),
+                    utf8("media", true),
+                ],
+                blooms: &[],
+            },
+            VerificationContract {
+                namespace: "verification",
+                name: "results",
+                columns: vec![
+                    utf8("result_id", false),
+                    utf8("implementation", false),
+                    utf8("execution_status", false),
+                    utf8("verdict", false),
+                    utf8("verifier_version", false),
+                    utf8("owner_card_uid", true),
+                    utf8("subject_card_uid", false),
+                    utf8("binding_id", true),
+                    utf8("trigger_identity", true),
+                    utf8("source_record_id", true),
+                    ts_us_utc("window_start", true),
+                    ts_us_utc("window_end", true),
+                    ts_us_utc("started_at", false),
+                    ts_us_utc("ended_at", false),
+                    utf8("details", true),
+                ],
+                blooms: &["result_id", "subject_card_uid", "binding_id"],
+            },
+            VerificationContract {
+                namespace: "drift",
+                name: "result_features",
+                columns: vec![
+                    utf8("result_id", false),
+                    utf8("owner_card_uid", true),
+                    utf8("subject_card_uid", false),
+                    utf8("binding_id", true),
+                    ts_us_utc("window_start", false),
+                    ts_us_utc("window_end", false),
+                    utf8("method", false),
+                    utf8("feature", false),
+                    float64("score", true),
+                    float64("threshold", true),
+                    utf8("verdict", false),
+                ],
+                blooms: &["result_id"],
+            },
+            VerificationContract {
+                namespace: "eval",
+                name: "result_items",
+                columns: vec![
+                    utf8("result_id", false),
+                    utf8("owner_card_uid", true),
+                    utf8("subject_card_uid", false),
+                    utf8("binding_id", true),
+                    utf8("source_record_id", false),
+                    utf8("task_id", false),
+                    utf8("outcome_kind", false),
+                    boolean("passed", true),
+                    utf8("actual", true),
+                    utf8("expected", true),
+                    utf8("operator", true),
+                    utf8("message", true),
+                    int32("stage", true),
+                    ts_us_utc("started_at", true),
+                    int64("duration_ms", true),
+                    utf8("skip_reason", true),
+                    utf8("upstream_task_id", true),
+                ],
+                blooms: &["result_id"],
+            },
+        ]
+    }
+
+    /// The five verification tables carry exactly their approved physical
+    /// contract: authored columns, order, types, nullability, daily partition,
+    /// Observation correlation, and Bloom intent.
+    ///
+    /// These schemas are a published contract — three SDKs project rows into
+    /// them and dashboards query them — so a reordered, retyped, renamed, or
+    /// newly nullable column is a breaking change rather than an
+    /// implementation detail. Pinning the whole authored list here is what
+    /// makes that break fail in this crate instead of at a caller's insert.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any verification table drifts from that contract.
+    #[test]
+    fn verification_tables_match_their_approved_schemas() {
+        for contract in verification_contracts() {
+            let VerificationContract {
+                namespace,
+                name,
+                columns,
+                blooms,
+            } = contract;
+            let definition = builtin_table(namespace, name)
+                .unwrap_or_else(|| panic!("vala.{namespace}.{name} is a registered built-in"));
+            assert_eq!(
+                (definition.arrow_fields)(),
+                columns,
+                "vala.{namespace}.{name} authored columns, order, types, and nullability"
+            );
+            assert_eq!(
+                definition.correlation_policy,
+                CorrelationPolicy::Observation,
+                "vala.{namespace}.{name} appends run_id, card_uid, and principal_id"
+            );
+
+            let layout = (definition.physical_layout)();
+            assert_eq!(
+                layout.partition_granularity,
+                TimeGranularityWire::Day,
+                "vala.{namespace}.{name} partitions by UTC day"
+            );
+            assert_eq!(
+                layout.bloom_columns,
+                blooms.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>(),
+                "vala.{namespace}.{name} declares only its table-specific Bloom columns"
+            );
+
+            // The managed Bloom floor is unioned by the catalog, not declared.
+            let canonical = crate::catalog::layout::PhysicalLayout::resolve(
+                &format!("vala.{namespace}.{name}"),
+                &(definition.schema)(),
+                Some(&layout),
+            )
+            .expect("verification layout resolves");
+            for column in crate::catalog::layout::MANAGED_BLOOM_FLOOR {
+                assert!(
+                    canonical.bloom_columns().contains(&(*column).to_owned()),
+                    "vala.{namespace}.{name} Bloom union omits {column}"
+                );
+            }
+        }
+    }
+
+    /// A raw observation names its subject Card and never a Verifier, a
+    /// binding, or a user-authored correlation column.
+    ///
+    /// `drift_ref` and `eval_ref` are the retired Verifier pointers, and
+    /// `run_id`/`card_uid` are managed correlation the queue appends. Any of
+    /// them reappearing as an authored payload column would let one raw input
+    /// be attributed to, or duplicated per, a Verifier binding.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either observation table authors a forbidden column.
+    #[test]
+    fn observation_tables_author_no_verifier_or_correlation_columns() {
+        for (namespace, forbidden) in [
+            ("drift", ["drift_ref", "run_id", "card_uid"]),
+            ("eval", ["eval_ref", "run_id", "card_uid"]),
+        ] {
+            let authored: Vec<String> = (builtin_table(namespace, "observations")
+                .expect("observation table")
+                .arrow_fields)()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+            for column in forbidden {
+                assert!(
+                    !authored.iter().any(|name| name == column),
+                    "vala.{namespace}.observations authors no {column}: {authored:?}"
+                );
+            }
+        }
+    }
+
     /// The one authoritative physical-layout contract for every registration
-    /// path: all eight built-ins plus each dynamic declaration class.
+    /// path: every built-in plus each dynamic declaration class.
     ///
     /// Built-ins and dynamic tables run the same single resolution entry point,
     /// so this proves in one place that the system injects no sort key, that
@@ -896,7 +1145,7 @@ mod tests {
     /// Proves every built-in table declares a layout that resolves and is a
     /// fixed point of resolution.
     ///
-    /// Each built-in must partition hourly, resolve through the same
+    /// Each built-in must resolve through the same
     /// [`crate::catalog::layout::PhysicalLayout::resolve`] entry point a caller
     /// uses, carry the managed Bloom floor for every column its schema actually
     /// has, name only columns that exist, and name `data_tenant_id` in neither
@@ -916,10 +1165,9 @@ mod tests {
                 crate::catalog::layout::PhysicalLayout::resolve(&fqn, &schema, Some(&declared))
                     .unwrap_or_else(|error| panic!("{fqn} declares a canonical layout: {error}"));
 
-            let expected = if definition.correlation_policy == CorrelationPolicy::None {
-                crate::catalog::layout::TimeGranularity::Day
-            } else {
-                crate::catalog::layout::TimeGranularity::Hour
+            let expected = match declared.partition_granularity {
+                TimeGranularityWire::Day => crate::catalog::layout::TimeGranularity::Day,
+                TimeGranularityWire::Hour => crate::catalog::layout::TimeGranularity::Hour,
             };
             assert_eq!(
                 canonical.granularity(),
@@ -1609,8 +1857,8 @@ mod tests {
         );
 
         assert!(
-            builtin_table("eval", "runs")
-                .expect("runs definition")
+            builtin_table("drift", "observations")
+                .expect("drift observations definition")
                 .canonical_validator
                 .is_none(),
             "a pre-declared built-in owns no canonical value validation"

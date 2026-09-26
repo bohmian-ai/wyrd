@@ -1,6 +1,6 @@
 # Run API for continuous verification
 
-**Status:** Approved client interface through specification revision 32.
+**Status:** Approved client interface through specification revision 34.
 
 ## User contract
 
@@ -12,9 +12,12 @@ describes the fixed Drift and Eval system tables. The state owns that one
 `wyrd_client::Bifrost` facade and shuts down all of its table producers; it
 does not construct a second queue or transport. A caller opens one run for an
 application invocation without passing a Bifrost client or table to `run()`.
-The run initially targets the root Service Card.
-`for_card` / `forCard` selects a registered alias in that same hydrated graph
-and returns an immutable Card-scoped view; it does not mutate the parent view.
+With no Card argument, the run initially targets the root Service Card. Python
+`state.run(card="alias")`, TypeScript `state.run("alias")`, and Rust
+`state.run_for_card("alias")` select an initial registered alias without first
+constructing a root view. `for_card` / `forCard` remains the multi-component
+operation: it selects a registered alias in that same hydrated graph and
+returns an immutable Card-scoped view without mutating the parent view.
 The views share the invocation's `run_id`. Every observation carries its
 view's exact subject `card_ref` and that `run_id` as Bifrost row correlation.
 The caller never supplies a Verifier reference, Card UID, record ID, or
@@ -25,10 +28,43 @@ Card scope and resolves its managed `card_uid`.
 Opening a run and selecting a Card do not perform network IO, register a
 server-side Run resource, or execute a Verifier. Drift and Eval observations
 only project and enqueue. The first `observe.record(table, value)` for a
-dynamic table may describe that table before enqueue. An Eval observation can later activate
+dynamic table may describe that table before enqueue. `table` names a
+registered table in `vala.datasets`, the one caller-owned namespace; every
+other `vala.*` namespace is server-owned and is refused before admission. An Eval observation can later activate
 each matching `observations_ready` binding; Drift observations become input
 for scheduled or manual, windowed analysis. The two observation calls do not
 return a score or alert.
+
+In Python, `Run` is also a synchronous context manager. Entering a run installs
+best-effort, execution-local OpenTelemetry span correlation for the selected
+Card and invocation; exiting restores the previous correlation. It does not
+start or end a span, flush Bifrost, close the run, or call the server. The run
+remains usable as an ordinary value without `with`.
+
+### Public Run surface
+
+```text
+Python
+  WyrdState.run(*, card: str | None = None) -> Run
+  Run.for_card(alias: str) -> Run
+  Run.__enter__() -> Run
+  Run.__exit__(exc_type, exc_value, traceback) -> False
+  wyrd.otel.install_run_correlation(provider=None) -> bool
+
+TypeScript
+  WyrdState.run(card?: string): Run
+  Run.forCard(alias: string): Run
+
+Rust
+  WyrdState::run(&self) -> Run
+  WyrdState::run_for_card(&self, alias: &str) -> Result<Run, WyrdError>
+  Run::for_card(&self, alias: &str) -> Result<Run, WyrdError>
+```
+
+Python's `__exit__` always returns false so a user exception continues out of
+the block. `install_run_correlation` returns true only when the supplied or
+global provider accepts the processor; false means optional enrichment is not
+available. Callers never need to branch on that result to use a Run.
 
 ### Python
 
@@ -53,22 +89,25 @@ state.start_bifrost()
 # Or, with the same arguments as Bifrost(...):
 # state.start_bifrost(table=None, server_url=server_url,
 #                     credential=credential, grpc_url=grpc_url)
-run = state.run()
+with state.run() as run:
+    with run.for_card("churn_model") as model:
+        model.observe.drift(ChurnFeatures(age=42, plan="premium", score=0.82))
+        model.observe.drift({"age": 43, "plan": "basic", "score": 0.37})
 
-model = run.for_card("churn_model")
-model.observe.drift(ChurnFeatures(age=42, plan="premium", score=0.82))
-model.observe.drift({"age": 43, "plan": "basic", "score": 0.37})
+    with run.for_card("support_agent") as agent:
+        agent.observe.eval(
+            SupportExchange(question=question, answer=answer),
+            session_id=session_id,
+            media=[EvalMediaRef(id="screenshot", kind="image",
+                                uri=media_uri, media_type="image/png")],
+        )
+        agent.observe.record("vala.datasets.app_agent_events", {"step": "answered"})
 
-agent = run.for_card("support_agent")
-agent.observe.eval(
-    SupportExchange(question=question, answer=answer),
-    session_id=session_id,
-    media=[EvalMediaRef(id="screenshot", kind="image",
-                        uri=media_uri, media_type="image/png")],
-)
+    run.observe.record("vala.datasets.app_events", {"event": "request_completed"})
 
-run.observe.record("app.events", {"event": "request_completed"})
-agent.observe.record("app.agent_events", {"step": "answered"})
+# The common single-component form selects the Card before entering the scope.
+with state.run(card="support_agent") as agent_run:
+    framework_agent.invoke(question)
 
 # At graceful application shutdown, not after each observation:
 state.shutdown()
@@ -88,6 +127,118 @@ conversion from that JSON payload to the existing typed record and fixed
 table rows before inserting them through the Bifrost facade owned by
 `WyrdState`.
 
+#### Python OpenTelemetry run scope
+
+The Python context manager correlates spans emitted by application and agent
+framework code inside its lexical scope. Bifrost recognizes the exact
+record-level string attributes `wyrd.card_ref` and `wyrd.run_id`; the context
+manager supplies both. The client never injects tenant, principal, Card UID,
+or request identity. Gate and Scribe continue to derive those values from
+authenticated authority, authorize the asserted CardRef against the signed
+Card scope, and resolve the authoritative Card UID.
+
+Entering a Python run performs three best-effort local operations:
+
+1. Attach the run's exact CardRef and `run_id` to Python OpenTelemetry's
+   execution-local context.
+2. Set both attributes on the recording span already active at entry, when one
+   exists.
+3. Ensure the current global tracer provider has one idempotently registered
+   Wyrd span processor. On every later span start, that processor reads the
+   parent context and copies the two values onto the new span. Scoped values
+   replace conflicting initial values for those two Wyrd keys.
+
+Setting attributes only on the span active at entry is insufficient because
+OpenTelemetry span attributes are not inherited by child spans. The processor
+is therefore required for spans created by an agent framework inside the run
+scope. It is stateless apart from provider-registration bookkeeping and wraps
+its complete `on_start` path so an import, context lookup, provider, or span
+error never escapes into application code. Registration is thread-safe and
+idempotent per provider. The scope uses a local OpenTelemetry context value,
+not baggage or resource attributes: baggage is not projected automatically and
+may cross process boundaries, while Bifrost extracts these keys from each
+record.
+
+OpenTelemetry integration is optional and fail-open:
+
+- `state.run(...)`, Card selection, `run_id`, and explicit
+  `run.observe.*` calls work when no OpenTelemetry package is installed.
+- A missing `opentelemetry-api`, a provider without span-processor support, no
+  recording active span, an invalid context, or any enrichment failure turns
+  ambient span enrichment into a no-op. It never fails run entry, run exit,
+  application code, or explicit Wyrd observation emission.
+- Unknown or out-of-graph Card aliases still fail normally before a context is
+  entered. Fail-open applies only to optional telemetry enrichment, never to
+  Card identity, authorization, validation, or Wyrd writes.
+- Exiting always attempts to detach the exact token installed by that entry
+  and never masks an exception raised by the user's block. Detach failure is
+  swallowed because telemetry enrichment cannot take down the application.
+
+The Python boundary owns attach/detach because Python OpenTelemetry context is
+not Rust OpenTelemetry context. Shared Rust continues to own `Run`, UUIDv7
+`RunId`, hydrated Card lookup, and immutable Card-scoped views. The PyO3
+`Run.__enter__` / `Run.__exit__` methods delegate the optional runtime work to
+the Python SDK's `wyrd.otel` module. That module uses execution-local context
+tokens rather than storing a token on `Run`, so the same immutable run may be
+nested or used concurrently by different asyncio tasks without one task
+detaching another task's scope.
+
+Normal `contextvars` propagation carries the scope across `await` and into
+asyncio tasks created inside it. Nested Card views restore the outer Card when
+they exit:
+
+```python
+with state.run() as run:
+    service_call()  # root Service Card
+    with run.for_card("retriever"):
+        retrieve()  # same run_id, retriever Card
+    generate()      # root Service Card restored
+```
+
+A task created inside the block receives a copy of that context and may retain
+it after the creating block exits. Raw threads or framework-private execution
+contexts are not implicitly covered. A framework that uses the global tracer
+provider needs no setup beyond the context manager. A framework using a
+private provider must pass it once to
+`wyrd.otel.install_run_correlation(provider)`; registration is idempotent and
+fail-open. No OpenTelemetry SDK dependency becomes mandatory: the helper uses
+the optional API when present and duck-types provider registration. The
+existing `otel` extra remains optional.
+
+This contract covers spans. Logs and metrics also use record-level
+`wyrd.card_ref` and `wyrd.run_id` when supplied to Bifrost, but their runtime
+enrichment requires signal-specific processors and is not implied by the Run
+context manager.
+
+#### Required end-to-end exercise
+
+The Python SDK journey uses a real registered Service and its Card-bound
+credential. It configures the stock Python OpenTelemetry SDK and OTLP/HTTP
+exporter to send traces to Wyrd's authenticated `POST /v1/traces` endpoint,
+then enters a component scope with `state.run(card="alias")`. Framework-style
+code inside that block creates spans without setting Wyrd attributes. The same
+scope writes one caller-owned `vala.datasets.*` row and one Eval observation;
+the Eval call relies on its existing active-span capture rather than explicit
+trace or span IDs.
+
+Leaving the `with` block restores ambient correlation but is not a durability
+barrier. The journey explicitly flushes the tracer provider, shuts down the
+state-owned Bifrost writer, and waits for the test server's publication barrier
+before querying. It then proves:
+
+- `vala.traces.spans` contains the exported spans with the scope's exact
+  `run_id`, asserted CardRef, authenticated publisher, and server-resolved
+  Card UID;
+- the custom row joins to those spans by `run_id` and resolves to the same
+  invocation and subject Card; and
+- the Eval row joins to its active span by exact `trace_id` and `span_id`, while
+  its `run_id` and Card UID match the same Run scope.
+
+The assertions use persisted Bifrost rows, not an in-memory exporter or SDK
+objects. This extends the existing Python scoped-observation journey and reuses
+its Service graph, custom table, Eval emission, public Bifrost query client,
+and real server/Postgres harness.
+
 ### TypeScript
 
 ```ts
@@ -100,6 +251,7 @@ const state = WyrdState.fromPath("./service-bundle");
 await state.startBifrost();
 // Or: await state.startBifrost({ table, serverUrl, credential, grpcUrl });
 const run = state.run();
+// Single-component equivalent: const run = state.run("support_agent");
 
 const model = run.forCard("churn_model");
 const features: ChurnFeatures = { age: 42, plan: "premium", score: 0.82 };
@@ -112,8 +264,8 @@ const media: EvalMediaRef[] = [
 ];
 agent.observe.eval(context, { sessionId, media });
 
-await run.observe.record("app.events", { event: "request_completed" });
-await agent.observe.record("app.agent_events", { step: "answered" });
+await run.observe.record("vala.datasets.app_events", { event: "request_completed" });
+await agent.observe.record("vala.datasets.app_agent_events", { step: "answered" });
 
 // At graceful application shutdown, not after each observation:
 await state.shutdown();
@@ -158,6 +310,7 @@ state.start_bifrost().await?;
 //     &client, Some(table), queue_config,
 // ).await?; // mirrors Bifrost::connect_with_config
 let run = state.run();
+// Single-component equivalent: let run = state.run_for_card("support_agent")?;
 
 let model = run.for_card("churn_model")?;
 model.observe().drift(
@@ -181,7 +334,7 @@ agent.observe().eval(
 )?;
 
 run.observe()
-    .record("app.events", &Event { event: "request_completed" })
+    .record("vala.datasets.app_events", &Event { event: "request_completed" })
     .await?;
 
 // At graceful application shutdown, not after each observation:

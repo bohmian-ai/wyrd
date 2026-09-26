@@ -42,7 +42,6 @@ skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
 vala-bifrost-redux = { path = "crates/vala/vala-bifrost-redux", version = "0.0.1" }
 vala-sql = { path = "crates/vala/vala-sql", version = "0.0.1" }
-vala-core = { path = "crates/vala/vala-core", version = "0.0.1" }
 vala-ingest = { path = "crates/vala/vala-ingest", version = "0.0.1" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
 vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
@@ -121,6 +120,8 @@ wiremock = "0.6"
 temp-env = "0.3"
 tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+chrono-tz = "0.10"
+croner = { version = "4", default-features = false, features = ["chrono"] }
 dashmap = "6.1"
 crossbeam-queue = "0.3"
 flate2 = "1.*"

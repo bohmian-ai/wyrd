@@ -22,7 +22,6 @@ use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
 use crate::components::authz::authz_router;
 use crate::components::cards::cards_router;
-use crate::components::eval::eval_router;
 use crate::components::gateway::{gateway_ingress_router, gateway_router};
 use crate::components::health::health_router;
 use crate::components::platform::{
@@ -31,6 +30,7 @@ use crate::components::platform::{
 };
 use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
+use crate::components::verification::verification_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::{require_authenticated, require_bifrost_authenticated};
 use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
@@ -66,10 +66,10 @@ pub fn build_router(state: AppState) -> Router {
         ));
     let v1_group = OpenApiRouter::new()
         .merge(storage_router(&state))
-        .merge(eval_router())
         .merge(authz_router())
         .merge(cards_router())
         .merge(principals_router())
+        .merge(verification_router())
         .merge(admin_router())
         .merge(gateway_router())
         .merge(otlp_router())

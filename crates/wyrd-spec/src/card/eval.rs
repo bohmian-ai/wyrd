@@ -1,6 +1,8 @@
-//! `Eval` card spec. The body type is owned by `vala::eval` -- this file
-//! re-exports it under the `card::` path so `Spec::Eval` keeps its stable
-//! import surface.
+//! Eval spec body. The type is owned by `vala::eval` -- this file re-exports
+//! it under the `card::` path so the eval-backed `Verifier` implementation
+//! keeps its stable import surface. Authors declare it as a `kind: Verifier`
+//! card with `implementation.kind: eval`; there is no registrable `Eval` card
+//! kind.
 //!
 //! The legacy `EvalProfile` / `EvalAssertion` / `EvalPassGate` /
 //! `EvalRubricItem` / `EvalScenario` / `EvalType` types previously defined

@@ -90,7 +90,8 @@ cargo test --locked -p wyrd-server --lib components::cards
 """
 
 [tasks."test:cards:integration"]
-description = "Run the durable card registration Postgres suite"
+description = "Run the durable card registration and manual verification Postgres suite"
+env = { WYRD_REG_E2E = "1" }
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:cards:integration:inner'"
 
 [tasks."test:cards:integration:inner"]
@@ -99,6 +100,8 @@ description = "Run the durable card registration Postgres suite with its lifecyc
 run = """
 cargo test --locked -p wyrd-sql --test pg_cards_register -- --nocapture --test-threads=1
 cargo test --locked -p wyrd-server --test pg_card_registration_route -- --nocapture --test-threads=1
+cargo test --locked -p wyrd-server --test pg_verification_routes -- --nocapture --test-threads=1
+cargo nextest run --locked -p wyrd-sdk-rust --test verification_run --run-ignored all -E 'test(=starts_a_keyed_manual_run_and_reads_its_status)'
 """
 
 [tasks."test:principals:unit"]
@@ -107,6 +110,7 @@ run = """
 cargo nextest run --locked -p wyrd-spec --lib -E 'test(/^auth::principal_kind::/)'
 cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/^principal::/)'
 cargo nextest run --locked -p wyrd-auth-verify --lib -E 'test(/^tests::(into_verified_|token_verifier_)/)'
+cargo nextest run --locked -p wyrd-auth-issue --lib -E 'test(/^tests::issue_access_token_/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_credentials::tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^issuance::tests::/)'
 """
@@ -303,7 +307,8 @@ cargo nextest run --locked \
   -p wyrd-mcp --test mcp \
   -p vala-bifrost-redux --test integration \
   --features wyrd-client/test-support \
-  -P journey --run-ignored=only
+  -P journey --run-ignored=only \
+  -E "not test(=qualification::scribe_512_mib_physical_object_qualifies)"
 mise run test:bifrost:unit:python:inner'
 """
 
@@ -354,7 +359,7 @@ run = "scripts/postgres/with-test-postgres.sh -- mise run test:bifrost:integrati
 [tasks."test:bifrost:integration:server:inner"]
 hide = true
 description = "Run explicit wyrd-server integration targets that exercise Bifrost serving seams."
-run = "cargo nextest run --locked -p wyrd-server --features test-support --test pg_eval_v1_protocol --test pg_grpc_ingest_smoke --test pg_grpc_smoke --test pg_merge_http_protected --test pg_router_smoke --test-threads=1"
+run = "cargo nextest run --locked -p wyrd-server --features test-support --test pg_grpc_ingest_smoke --test pg_grpc_smoke --test pg_merge_http_protected --test pg_router_smoke --test pg_verification_runtime --test-threads=1"
 
 [tasks."test:bifrost:integration:server"]
 description = "Run wyrd-server integration targets that exercise Bifrost serving seams."
@@ -422,6 +427,22 @@ hide = true
 description = "wyrd-client pg_bifrost_e2e binary, whole"
 run = "cargo nextest run --locked -p wyrd-client --test pg_bifrost_e2e -P journey --run-ignored=all"
 
+[tasks."test:bifrost:journey:observe"]
+description = "Tier-1 journeys: the scoped observation surface over one WyrdState Bifrost lifetime"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:observe:inner'"
+[tasks."test:bifrost:journey:observe:inner"]
+hide = true
+description = "wyrd-sdk-rust observe_run binary, whole"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test observe_run -P journey --run-ignored=all"
+
+[tasks."test:bifrost:journey:drift"]
+description = "Tier-1 journeys: PSI, SPC, and Custom Drift Verifiers fitted, scored through Oracle, and dispatched"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:drift:inner'"
+[tasks."test:bifrost:journey:drift:inner"]
+hide = true
+description = "wyrd-sdk-rust drift_verification binary, whole"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test drift_verification -P journey --run-ignored=all"
+
 [tasks."test:bifrost:journey:forge"]
 description = "Tier-1 journeys: compaction, maintenance, publication recovery, lease reclaim"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:forge:inner'"
@@ -445,7 +466,16 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:scribe:inner"]
 hide = true
 description = "wyrd-testing `scribe` binary, whole"
-run = "cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all"
+run = "cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'not test(=qualification::scribe_512_mib_physical_object_qualifies)'"
+
+[tasks."test:bifrost:journey:scribe:production-geometry"]
+description = "The Scribe physical-object qualification at the standard 512 MiB production size"
+run = """
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && \
+  cargo nextest run --locked -p wyrd-testing --test scribe \
+  -P journey --run-ignored=only \
+  -E "test(=qualification::scribe_512_mib_physical_object_qualifies)"'
+"""
 
 [tasks."test:bifrost:journey:oracle"]
 description = "Tier-1 journeys: query execution, distributed dispatch, peer security, tail fencing, spill, telemetry"
@@ -488,7 +518,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py tests/integration/test_drift_journey.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -499,7 +529,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts"
+run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/drift-verification.test.ts"
 
 [tasks."check:bifrost-oracle-deploy"]
 description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
@@ -646,7 +676,7 @@ create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
 print("Keycloak users seeded")
 PYEOF
 
-cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1
+cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
 """
 
 [tasks."build:server"]
@@ -1310,7 +1340,6 @@ description = "Regenerate JSON schemas / MCP tool list / pyi stubs from source"
 run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
 cargo run --locked -p wyrd-client --example gen_schemas
-cargo run --locked -p vala-core --example gen_schemas
 mise run codegen:stubs
 """
 
@@ -1330,7 +1359,6 @@ snapshot_codegen() {
   {
     find crates/wyrd-spec/schemas crates/wyrd-spec/tests/schemas -type f -name '*.json'
     find crates/shared/wyrd-client/schemas crates/shared/wyrd-client/tests/schemas -type f -name '*.json'
-    find crates/vala/vala-core/schemas crates/vala/vala-core/tests/schemas -type f -name '*.json'
     printf '%s\n' sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts
     find sdks/wyrd-sdk-python/python/wyrd -type f -name '*.pyi' \
       ! -path 'sdks/wyrd-sdk-python/python/wyrd/stubs/*'
@@ -1579,11 +1607,6 @@ run = "cargo nextest run --locked -p wyrd-spec --no-default-features --features 
 hide = true
 description = "wyrd-client::transport goldens match the generator's output"
 run = "cargo nextest run --locked -p wyrd-client --tests transport schema_drift"
-
-[tasks."check:alert-router-schema-drift"]
-hide = true
-description = "vala-core::alert_router goldens match the generator's output"
-run = "cargo nextest run --locked -p vala-core --tests alert_router schema_drift"
 
 [tasks."dev:pg:nuke"]
 hide = true

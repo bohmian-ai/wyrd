@@ -1,0 +1,33 @@
+# Verifier Card - PSI drift over a version-pinned baseline Data Card.
+
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: retention
+  name: churn-input-drift
+  version: 1.0.0
+
+spec:
+  description: Churn model input distribution drift.
+  implementation:
+    kind: drift
+    spec:
+      method: Psi
+      signal:
+        kind: Distribution
+        baseline_ref:
+          kind: Data
+          name: churn-training
+          space: retention
+          version: 1.0.0
+        features: [tenure_months, monthly_spend]
+      condition:
+        kind: Statistical
+      profile:
+        kind: Psi
+        binning_strategy:
+          kind: Quantile
+          n_bins: 10
+        threshold:
+          kind: Fixed
+          value: 0.25

@@ -75,6 +75,17 @@ pub enum PrincipalKind {
         /// Transitive card authorization set; always contains `card_ref`.
         card_ref_scope: CardRefScope,
     },
+    /// Internal credentialless verification-result writer.
+    ///
+    /// Exactly one exists per tenant. It binds no root Card, holds no roles or
+    /// credential, and has no public lifecycle; the server mints it a
+    /// short-lived token scoped to the single Verifier whose results it
+    /// writes, so ingest authorizes and stamps each result row against that
+    /// signed Verifier reference.
+    System {
+        /// Signed authorization set naming exactly one UID-bearing Verifier.
+        card_ref_scope: CardRefScope,
+    },
 }
 
 impl PrincipalKind {
@@ -86,6 +97,7 @@ impl PrincipalKind {
             Self::User => PrincipalKindTag::User,
             Self::Service { .. } => PrincipalKindTag::Service,
             Self::Agent { .. } => PrincipalKindTag::Agent,
+            Self::System { .. } => PrincipalKindTag::System,
         }
     }
 }
@@ -174,25 +186,27 @@ impl Principal {
     ///
     /// An agent always binds a Card. A service binds one only when it is a
     /// deployed workload; Card-free tenant automation, tenant administrators,
-    /// and humans return `None`.
+    /// humans, and the internal SYSTEM writer return `None`.
     #[must_use]
     pub fn card_ref(&self) -> Option<&CardRef> {
         match &self.kind {
             PrincipalKind::Service { card_ref, .. } => card_ref.as_ref(),
             PrincipalKind::Agent { card_ref, .. } => Some(card_ref),
-            PrincipalKind::TenantAdmin | PrincipalKind::User => None,
+            PrincipalKind::TenantAdmin | PrincipalKind::User | PrincipalKind::System { .. } => None,
         }
     }
 
     /// Returns the card scope for card-carrying machine principals.
     ///
     /// A Card-free service still reports its (empty) scope, so callers can
-    /// distinguish "no emit authority" from "not a machine principal".
+    /// distinguish "no emit authority" from "not a machine principal". The
+    /// internal SYSTEM writer reports its single signed Verifier scope.
     #[must_use]
     pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
         match &self.kind {
             PrincipalKind::Service { card_ref_scope, .. }
-            | PrincipalKind::Agent { card_ref_scope, .. } => Some(card_ref_scope),
+            | PrincipalKind::Agent { card_ref_scope, .. }
+            | PrincipalKind::System { card_ref_scope } => Some(card_ref_scope),
             PrincipalKind::TenantAdmin | PrincipalKind::User => None,
         }
     }
@@ -233,7 +247,7 @@ impl PrincipalRef {
         match &self.kind {
             PrincipalKind::Service { card_ref, .. } => card_ref.as_ref(),
             PrincipalKind::Agent { card_ref, .. } => Some(card_ref),
-            PrincipalKind::TenantAdmin | PrincipalKind::User => None,
+            PrincipalKind::TenantAdmin | PrincipalKind::User | PrincipalKind::System { .. } => None,
         }
     }
 
@@ -245,7 +259,8 @@ impl PrincipalRef {
     pub fn card_ref_scope(&self) -> Option<&CardRefScope> {
         match &self.kind {
             PrincipalKind::Service { card_ref_scope, .. }
-            | PrincipalKind::Agent { card_ref_scope, .. } => Some(card_ref_scope),
+            | PrincipalKind::Agent { card_ref_scope, .. }
+            | PrincipalKind::System { card_ref_scope } => Some(card_ref_scope),
             PrincipalKind::TenantAdmin | PrincipalKind::User => None,
         }
     }
@@ -359,6 +374,66 @@ mod tests {
         let mut unrelated = service_card_ref();
         unrelated.name = CardName::new("unrelated").expect("static card name is valid");
         assert!(!principal.authorizes_card(&unrelated));
+    }
+
+    /// Build the UID-bearing Verifier reference a SYSTEM token is scoped to.
+    ///
+    /// # Panics
+    /// Panics when a static identity component is invalid.
+    fn verifier_card_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Verifier,
+            name: CardName::new("drift").expect("static card name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
+            uid: Some(
+                wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7())
+                    .expect("UUIDv7 is a valid card UID"),
+            ),
+        }
+    }
+
+    /// The internal SYSTEM writer binds no root Card, yet exposes its one
+    /// signed Verifier scope so ingest can authorize and stamp result rows.
+    ///
+    /// # Panics
+    /// Panics when the kind projects a root Card, loses its scope, authorizes
+    /// a Card outside that scope, or does not round-trip as `system`.
+    #[test]
+    fn system_kind_exposes_its_verifier_scope_without_a_root_card() {
+        let verifier = verifier_card_ref();
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::System {
+                card_ref_scope: CardRefScope::own(&verifier),
+            },
+            wyrd_spec::DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::from_iter([Permission::bifrost_record_write()]),
+        );
+
+        assert_eq!(
+            principal.kind.tag(),
+            wyrd_spec::auth::PrincipalKindTag::System
+        );
+        assert_eq!(principal.card_ref(), None);
+        assert_eq!(
+            principal.card_ref_scope(),
+            Some(&CardRefScope::own(&verifier))
+        );
+        assert!(principal.authorizes_card(&verifier));
+        assert!(!principal.authorizes_card(&service_card_ref()));
+
+        let principal_ref = PrincipalRef::from_principal(&principal);
+        assert_eq!(principal_ref.card_ref(), None);
+        assert_eq!(principal_ref.card_ref_scope(), principal.card_ref_scope());
+
+        let wire = serde_json::to_value(&principal.kind).expect("kind serializes");
+        assert_eq!(wire["kind"], "system");
+        assert_eq!(
+            serde_json::from_value::<PrincipalKind>(wire).expect("kind deserializes"),
+            principal.kind
+        );
     }
 
     #[test]

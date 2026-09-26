@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 32
+revision: 38
 status: approved
 ---
 
@@ -85,9 +85,10 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   Agent declaration that names the Verifier, when it runs, and zero or more
   Operators performed independently after a failed verdict.
 - **Runtime-active binding owner**: the exact Service or standalone Agent Card
-  version whose existing card-bound service principal successfully authenticated
-  or refreshed within the configured verification inactivity timeout. Service
-  component bindings inherit the activity of their containing Service version.
+  version whose existing Card-bound machine principal successfully completed
+  an API-key exchange or workload `jwt-bearer` authentication within the
+  configured verification inactivity timeout. Service component bindings
+  inherit the activity of their containing Service version.
 - **Verification Result**: one Verifier run's immutable Bifrost summary and
   verdict, identified by exact tenant, run, binding, subject, Verifier Card
   version, and input identity.
@@ -107,9 +108,12 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   `AssertionResult`. A false assertion is attesting evidence; a skipped task or
   an executor/input failure is not.
 - **Internal SYSTEM result writer**: one server-only tenant principal, persisted
-  with a server-minted UUIDv7 and used only to publish Verification Result
-  batches. It has no public credential, Card, role grant, refresh path, or
-  delegation path.
+  in the existing tenant machine-principal store with `kind: system`, a
+  server-minted UUIDv7, and the fixed name `verification-results-writer`. It is
+  used only for two server-minted purposes, each in its own token: publishing
+  Verification Result batches and the fixed Drift observation read. It has no
+  public credential, Card, role grant, refresh, workload, delegation, or
+  principal-management path.
 - **Operator connection**: one tenant-owned, provider-specific Postgres record
   containing nonsecret delivery coordinates and an encrypted credential. Cards
   carry only its provider-scoped name; connection reads never return secret
@@ -143,9 +147,9 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
 - **REQ-047**: The initial registrable `VerifierImplementation` variants MUST
   be `Drift(DriftSpec)` and `Eval(EvalSpec)`. They MUST incorporate the current
   Drift and Eval contracts rather than replace them.
-- **REQ-110**: The Drift payload MUST retain the existing `method`, `signal`,
-  `condition`, `profile`, and nested PSI/SPC/Custom configuration and
-  validation, with the agreed removals of `DriftMethod::External`,
+- **REQ-110**: The Drift payload MUST retain `method`, `signal`, `condition`,
+  `profile`, and the nested PSI/Custom configuration and validation, with the
+  agreed removals of `DriftMethod::External`,
   `DriftSignal::External`, `DriftSignal::EvalScore`, and `DriftSpec.details`.
   The only valid method/signal pairs are `Psi` + `Distribution`, `Spc` +
   `Distribution`, and `Custom` + `Metric`, each with its matching profile.
@@ -157,18 +161,73 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   fitted distributions. `condition` MUST be `Statistical` for all three
   executable pairs; `Above`, `Below`, and `Outside` remain typed vocabulary
   but registration rejects them in this delivery because the three profiles
-  already own their thresholds. The SPC public contract remains exactly
-  `SpcProfile { sample_size, weco_rule, alert_threshold }`: `sample_size = 0`
-  uses the existing row-count adaptive chunk size and any authored value MUST
-  be at least 2; the eight-positive-integer `weco_rule.rule_string`, existing
-  zone assignment, trend rule, and `alert_threshold` filtering retain their
-  current `vala-drift` semantics. Runtime observations are ordered by
-  `created_at`, then `record_id`, before the same consecutive chunk-mean
-  scorer is applied; incomplete trailing chunks retain the scorer's current
-  behavior. This change MUST NOT replace that contract with a fixed four-rule
-  WECO policy, an X-bar/S dual-chart result, a 25-subgroup readiness gate, or
-  a new SPC result shape. No client-side binning or subgroup aggregation is
-  added.
+  already own their thresholds or control limits. Revision 37 replaces the
+  previous SPC profile and scoring decisions with REQ-153–REQ-155. No
+  client-side binning or subgroup aggregation is added.
+- **REQ-153**: PSI MUST compare baseline and target over the same exhaustive,
+  frozen bins. Numeric bins retain their fitted edges and cover values outside
+  the baseline range. A categorical fit MUST include one reserved `other` bin
+  with zero baseline count; every target category absent from the fitted
+  labels contributes to that bin. Baseline and target proportions MUST each
+  sum to one before the existing zero-bin smoothing and PSI formula. The
+  `other` bin participates in the score, threshold bin count, and reported
+  sample/bin evidence. Existing numeric bin strategies, the minimum target
+  sample of 100, and authored PSI threshold choices remain; PSI and its
+  threshold strategies MUST NOT be presented as a significance test or proof
+  of model degradation.
+- **REQ-154**: SPC MUST be a two-sided, three-sigma Shewhart X-bar/S chart over
+  consecutive rational subgroups of an explicitly authored, fixed
+  `SpcProfile.sample_size >= 2`. The public SPC profile contains only
+  `sample_size`; registration rejects zero, the old `weco_rule` and
+  `alert_threshold` fields, and unknown fields. Authors are responsible for
+  supplying baseline rows in process order and a size whose consecutive rows
+  form meaningful subgroups; Wyrd does not infer process context or subgroup
+  boundaries. Runtime rows are ordered by `created_at`, then `record_id`.
+  Baseline fitting requires at least 20 complete subgroups from an
+  author-identified stable process; extra trailing rows make fitting fail
+  visibly rather than joining a smaller subgroup. A target window requires
+  at least one complete subgroup; a trailing partial subgroup makes that run
+  inconclusive. Neither path may shift or silently discard rows to make groups
+  fit.
+- **REQ-155**: For subgroup size `n`, fit the grand mean `x_bar_bar`, mean
+  sample standard deviation `s_bar` (each subgroup uses `n - 1`), and NIST's
+  `c4(n)`. Freeze X-bar limits at `x_bar_bar ± 3*s_bar/(c4(n)*sqrt(n))` and S
+  limits at `max(0, s_bar*(1 - 3*sqrt(1 - c4(n)^2)/c4(n)))` and
+  `s_bar*(1 + 3*sqrt(1 - c4(n)^2)/c4(n))`; the chart centers are `x_bar_bar`
+  and `s_bar`. A subgroup mean or sample standard deviation strictly outside
+  its respective limits signals drift; equality does not. Either chart's
+  signal fails the feature and thus the run. The existing scalar feature
+  `score` becomes the total count of signaled subgroups across both charts
+  and its threshold is zero. Persist typed SPC report evidence containing
+  subgroup size/count and, for each X-bar and S chart, center, lower/upper
+  limits, and signal count. PSI and Custom reports omit this SPC evidence.
+  The shared `vala-drift` scorer owns both direct and server scoring; the
+  server only supplies ordered complete subgroup aggregates.
+- **REQ-156**: Baseline fitting MUST reject any null or non-finite value in a
+  required PSI or SPC feature. The server selects target observations for the
+  subject and window by configured series presence, even when a selected
+  series has a null value; unrelated observations do not enter the comparison.
+  Direct PSI/SPC scoring receives an already selected target batch: every row
+  is one relevant observation, and its caller excludes unrelated observations
+  before scoring. The direct scorer MUST NOT infer row membership from whether
+  configured values are non-null. In either path, a missing configured feature
+  in a selected observation, or a null or non-finite value, MUST make the
+  affected Drift run inconclusive, with no scored details or feature rows;
+  values are not dropped or imputed. A target with no observations or
+  insufficient complete samples is likewise inconclusive. Direct and server
+  scoring MUST agree after the same observation selection. This is Wyrd's
+  explicit data-completeness policy, not a PSI or SPC formula. Client
+  `observe:drift` continues to reject explicit null and non-finite values;
+  server checks also cover omitted features and historical or externally
+  ingested rows. Custom retains its existing null, non-finite, and
+  empty-window inconclusive behavior.
+- **REQ-157**: Corrected PSI/SPC semantics begin with newly registered,
+  immutable Verifier Card versions and newly fitted baselines. The service
+  MUST NOT silently rescore existing Verifier versions or stored results
+  under revision 37 math. Previously persisted reports remain readable;
+  legacy versions without a revision-37 fitted profile cannot start new
+  scoring and fail visibly until replaced by a new version. No dual legacy
+  scorer or automatic migration is required.
 - **REQ-111**: The Eval payload MUST retain the existing `EvalSpec` fields
   `dataset`, `tasks`, `workflow`, `sampling`, `pass_gate`, and
   `context_capture`, and the existing nested task/DAG/result semantics.
@@ -181,7 +240,7 @@ The initial Verifier implementations and input/output boundaries are:
 
 | Implementation kind | Typed spec | Verification input | Typed engine output | Delivery |
 |---|---|---|---|---|
-| `drift` | existing `DriftSpec` with REQ-110 removals | Exact subject and fixed window of existing `DriftRecordObservation` rows; PSI/SPC also load exact `FittedBaseline` | Existing `DriftReport` mapped to one common verdict plus feature details | Production in this change |
+| `drift` | `DriftSpec` with REQ-110 and REQ-153–REQ-157 decisions | Exact subject and fixed window of existing `DriftRecordObservation` rows; PSI/SPC also load exact `FittedBaseline` | `DriftReport` with SPC chart evidence, mapped to one common verdict plus feature details | Production in this change |
 | `eval` | existing `EvalSpec` | Exact subject and committed existing `EvalRecordObservation`, with declared trace context when needed | Existing `EvalReport` task outcomes and `EvalWorkflowSummary` mapped to one common verdict plus task details | Production in this change |
 
 Future code-review, CI-test, Python, MCP, API, standalone LLM-judge, and
@@ -211,12 +270,14 @@ The three exact `observe.eval`, `observe.drift`, and `observe.record` insertion
 flows are listed in its "Input and queue boundary" section.
 
 - **REQ-123**: All three SDKs MUST expose the run API shown in `run_api.md`:
-  Python `state.start_bifrost(...)`, `state.run()`, `run.for_card(alias)`, and
+  Python `state.start_bifrost(...)`, `state.run(card=None)`,
+  `run.for_card(alias)`, and
   `scope.observe.drift(...)` / `scope.observe.eval(...)` /
   `scope.observe.record(table, value)`; TypeScript `await
-  state.startBifrost(options)`, `state.run()`, `run.forCard(alias)`, and the
-  corresponding `scope.observe` methods (with async `record`); Rust
-  `state.start_bifrost().await?`, `state.run()`, `run.for_card(alias)?`, and
+  state.startBifrost(options)`, `state.run(card?)`, `run.forCard(alias)`, and
+  the corresponding `scope.observe` methods (with async `record`); Rust
+  `state.start_bifrost().await?`, `state.run()`,
+  `state.run_for_card(alias)?`, `run.for_card(alias)?`, and
   `scope.observe().drift(...)` / `scope.observe().eval(...)` /
   `scope.observe().record(table, value).await?`. Python and TypeScript expose
   `observe` as a member; Rust uses an `observe()` accessor. Python startup and
@@ -229,12 +290,39 @@ flows are listed in its "Input and queue boundary" section.
   `wyrd_client::Bifrost` facade, which owns the existing bounded queue and
   transport. Callers MUST NOT pass a separate Bifrost client or table to
   `run()`.
-  A run generates one client-side invocation `run_id` and initially scopes the root Service
-  Card. Selecting a hydrated Card alias returns an immutable view of that
-  invocation that automatically supplies its exact subject `card_ref` on
-  every observation; sibling views cannot retarget each other. Unknown or
-  out-of-graph aliases fail. Run creation and scope selection MUST NOT
-  register a server Run, authenticate by themselves, or execute a Verifier.
+  A run generates one client-side invocation `run_id` and defaults to the root
+  Service Card. The language-idiomatic initial-Card argument and later
+  `for_card` / `forCard` selection both resolve a hydrated Card alias and
+  return an immutable view of that invocation that automatically supplies its
+  exact subject `card_ref` on every observation; sibling views cannot retarget
+  each other. Unknown or out-of-graph aliases fail. Run creation and scope
+  selection MUST NOT register a server Run, authenticate by themselves, or
+  execute a Verifier.
+- **REQ-151**: Python `Run` MUST be a synchronous context manager. Entering it
+  MUST best-effort attach the selected CardRef and invocation ID to Python's
+  execution-local OpenTelemetry context under the exact Bifrost attributes
+  `wyrd.card_ref` and `wyrd.run_id`, set both attributes on an already-active
+  recording span, and ensure one idempotently registered span processor copies
+  both values from the parent context to every span started inside the scope.
+  Exiting MUST restore the prior context, including nested Card scopes, and
+  MUST NOT suppress a user exception. Normal context propagation MUST work
+  across `await` and asyncio task creation without storing one shared attach
+  token on the immutable Run. A framework using the global provider MUST need
+  no setup beyond `with state.run(...)`; the Python SDK MUST expose an
+  idempotent `wyrd.otel.install_run_correlation(provider)` escape hatch for a
+  framework-owned private provider. Missing OpenTelemetry packages, an
+  unsupported or absent provider, no active recording span, invalid runtime
+  context, processor failure, and attach/detach failure MUST all fail open as
+  no enrichment: they MUST NOT fail Run construction or entry/exit, application
+  execution, or explicit Wyrd observation emission. Unknown Card aliases,
+  authorization, validation, and Wyrd writes remain fail-closed. The client
+  MUST inject only CardRef and run ID; tenant, principal, Card UID, and request
+  identity remain server-derived. The context manager MUST NOT start or end a
+  span, flush or close Bifrost, perform network IO, or create a server Run.
+  This requirement covers spans only; it does not promise ambient log or
+  metric enrichment. Shared Rust owns Run identity and Card selection, while
+  the Python SDK owns its foreign-runtime OpenTelemetry context and provider
+  integration. OpenTelemetry remains an optional dependency.
 - **REQ-124**: `observe.drift` MUST accept a Python mapping, dataclass, or
   Pydantic model; a TypeScript plain serializable object; or a Rust `Serialize`
   map/struct. The value represents one event's feature-name-to-scalar
@@ -440,13 +528,15 @@ flows are listed in its "Input and queue boundary" section.
   separate binding name or identifier.
 - **REQ-105**: Registering a Service, standalone Agent, or verification binding
   MUST NOT make its bindings runtime-active. A successful existing card-bound
-  service-principal authentication MUST activate the exact owning Card version.
-  A successful refresh of that same principal MUST renew its activity. User
-  authentication, another Card version, and authorization scope over a
-  component MUST NOT activate the owner.
-- **REQ-106**: Runtime activity MUST extend the existing service-principal
+  Service or Agent API-key exchange or workload `jwt-bearer` authentication
+  MUST activate the exact owning Card version. A later successful exchange of
+  either durable machine credential MUST renew its activity. Delegation, OIDC
+  login, human refresh, Card-free automation, SYSTEM issuance, cached bearer
+  use, user authentication, another Card version, and authorization scope over
+  a component MUST NOT activate the owner.
+- **REQ-106**: Runtime activity MUST extend the existing machine-principal
   authentication lifecycle. The server MUST persist the principal's last
-  successful token exchange time on its existing service-principal state,
+  successful qualifying exchange time on its existing machine-principal state,
   using the server clock and the same transaction that issues the token.
   `wyrd-client` MUST continue to re-exchange a stale access token automatically
   when an authenticated request needs one; token expiry or an otherwise idle
@@ -455,7 +545,7 @@ flows are listed in its "Input and queue boundary" section.
   add an activation endpoint, heartbeat protocol, activity table, background
   refresh timer, per-request touch, or per-observation activity write.
 - **REQ-107**: A binding owner is runtime-active only while its service
-  principal is enabled and its last successful authentication or refresh is
+  principal is enabled and its last successful qualifying machine exchange is
   within `WYRD_VERIFICATION_INACTIVITY_TIMEOUT_SECONDS`, which MUST default to
   `86400`. A process remaining open without another successful token exchange
   does not extend activity; once the timeout passes, the owner becomes
@@ -465,10 +555,10 @@ flows are listed in its "Input and queue boundary" section.
   or Eval post-commit enqueue MUST restrict new work to runtime-active exact
   owners. An inactive occurrence MUST create no activation or run and MUST NOT
   be backfilled after later authentication. Reauthentication starts eligibility
-  with the next schedule occurrence after that authentication. A refresh while
-  the owner remains active MUST NOT reset or postpone its existing schedule
-  cursor. Multiple exact
-  Card versions used for A/B operation remain independently active through
+  with the next schedule occurrence after that authentication. A later
+  qualifying exchange while the owner remains active MUST NOT reset or postpone
+  its existing schedule cursor. Multiple exact Card versions used for A/B
+  operation remain independently active through
   their distinct service principals; replicas sharing one exact principal
   share its activity. Service-level and component-occurrence bindings inherit
   their exact containing Service principal's activity, while a standalone
@@ -679,7 +769,7 @@ The locked storage split is:
 
 | Store | Existing/reused | Added by this change |
 |---|---|---|
-| Postgres control state | `wyrd.cards`, `wyrd.auth_service_accounts`, Scribe's `vala.scribe_batch_commits` fence | `verification_bindings`, `drift_baselines`, `verifier_runs`, `operator_dispatches`, encrypted tenant Operator connections, and one credentialless UUIDv7 SYSTEM principal per tenant; `last_authenticated_at` on the existing service-principal row |
+| Postgres control state | `wyrd.cards`, tenant machine principals in `wyrd.auth_service_accounts`, Scribe's `vala.scribe_batch_commits` fence | `verification_bindings`, `drift_baselines`, `verifier_runs`, `operator_dispatches`, encrypted tenant Operator connections, and one credentialless UUIDv7 SYSTEM principal per tenant; `last_authenticated_at` on the existing machine-principal row |
 | Bifrost analytical state | `vala.drift.observations`; existing Scribe/Oracle table lifecycle | `vala.eval.observations`, `vala.verification.results`, `vala.drift.result_features`, `vala.eval.result_items` |
 | Object storage | Registered Data Card Parquet artifact | No new baseline artifact format; the fitted profile is Postgres control state |
 
@@ -718,7 +808,7 @@ table on `(data_tenant_id, result_id)`.
   due binding row, create a unique verifier_runs row, and advance its cron
   cursor in the same transaction; the transaction releases the row lock
   before verification executes. It MUST filter on the existing service
-  principal's last successful token exchange and generic Verifier readiness
+  principal's last successful qualifying machine exchange and generic Verifier readiness
   before creating work. Inactive or unready due occurrences create no run and
   are not backfilled. After an outage, missed schedule occurrences are skipped
   rather than materialized in a catch-up batch; the next future cron boundary
@@ -726,8 +816,9 @@ table on `(data_tenant_id, result_id)`.
 - **REQ-112**: Composite owner registration MUST persist its resolved
   `verification_bindings` projection in the same registration transaction as
   the containing Card and its existing card-bound principal. A new binding's
-  scheduled cursor is null until the first successful exact-principal token
-  exchange; that exchange sets the next future cron boundary. Eval bindings
+  scheduled cursor is null until the first successful qualifying exchange by
+  that exact Card-bound machine principal; that exchange sets the next future
+  cron boundary. Eval bindings
   have no schedule cursor. Runtime activity is the existing
   `wyrd.auth_service_accounts.last_authenticated_at` value, not a new
   heartbeat or activity table. Existing principal uniqueness MUST permit two
@@ -874,14 +965,22 @@ table on `(data_tenant_id, result_id)`.
   MUST idempotently create exactly one internal `system` principal row named
   `verification-results-writer` for each tenant in the existing tenant machine
   principal store. Its server-minted `PrincipalId` MUST be UUIDv7 and remain
-  stable after provisioning. It is not a Card, API key, refresh token, role
-  grant, workload binding, or user-manageable principal.
+  stable after provisioning. `system` is the sixth `PrincipalKindTag` wire
+  value and a tenant-plane `PrincipalKind`, not a second identity hierarchy.
+  The row has no bound Card or user-managed lifecycle. It is not a Card, API
+  key, refresh token, role grant, workload binding, or user-manageable
+  principal. Public create, list, get, update, suspend/delete, credential,
+  refresh, workload, delegation, and token-exchange operations MUST reject or
+  omit it as appropriate; it remains representable in token and audit wire
+  contracts so internal writes are attributable.
 
   Immediately before each result-publication attempt, the runner MUST mint a
-  normal short-lived Wyrd access token using that tenant's persisted SYSTEM
+  normal five-minute-or-shorter Wyrd access token through the existing tenant
+  token issuer using that tenant's persisted SYSTEM
   principal. The token MUST contain the run tenant, `kind=system`, no roles or
-  bound root Card, and signed Card scope containing exactly one UID-bearing
-  `Verifier` CardRef: the run's exact Verifier version. Verification MUST reject
+  credential attribution, delegation chain, or bound root Card, and signed Card
+  scope containing exactly one UID-bearing `Verifier` CardRef: the run's exact
+  Verifier version. Verification MUST reject
   a missing or non-UUIDv7 persisted principal, a mismatched tenant, a bound root
   Card, any role, an empty or multi-Card scope, a non-Verifier scope member, or
   a scope member without managed Card UID. Public API-key, refresh, JWT-bearer,
@@ -889,6 +988,12 @@ table on `(data_tenant_id, result_id)`.
   MUST reject creation, credentialing, impersonation, delegation, or refresh
   of `system`. Expiry or retry mints a new short-lived token; no credential is
   persisted.
+
+  SYSTEM minting evaluates no end-user permission and emits no authorization
+  audit row. Gate's result-table admission is the one
+  `bifrost_record:write` authorization decision and uses the canonical audit
+  path. No second issuer, token format, credential table, or identity store is
+  introduced.
 
   A valid SYSTEM result token receives only the existing
   `bifrost_record:write` permission. Gate MUST reserve exactly
@@ -904,6 +1009,42 @@ table on `(data_tenant_id, result_id)`.
   `Verifier` is therefore an eligible scoped Bifrost target only for this
   internal path. The global `SYSTEM_OWNER` tenant, platform audit principal,
   and audit-publisher identity MUST NOT be reused.
+
+  Drift observation reads use a second, mutually exclusive SYSTEM token
+  purpose. Immediately before each Drift aggregate query the runner mints,
+  through the same tenant issuer and persisted SYSTEM principal, a
+  five-minute-or-shorter token with no roles, credential attribution,
+  delegation chain, or bound root Card, whose only permission is
+  `bifrost_query:read` scoped to the table object
+  `{ catalog: vala, schema: drift, table_uid }` of the tenant's registered
+  `vala.drift.observations` table. The issuer resolves that existing table UID
+  in the caller's tenant transaction and MUST NOT create or register a table;
+  when the tenant has no such table no token is minted and the run scores an
+  empty window (Custom completes `inconclusive` with no report). The token's
+  Card scope is the run's exact UID-bearing Verifier CardRef and serves
+  attribution only; it does not limit what Oracle reads. No SYSTEM token
+  carries both the result-write and read permission. Verification MUST accept
+  a `kind=system` claim set only when its permissions are exactly
+  `bifrost_record:write` or exactly one table-scoped `bifrost_query:read` on
+  catalog `vala`, schema `drift`, and MUST refuse every other set, scope, or
+  combination as forged.
+
+  The runner verifies the minted read token with the server's ordinary token
+  verifier, derives the query caller from the verified principal, and
+  dispatches through the ordinary server query service: coarse capability
+  admission, Gate, and a local or peer-forwarded Oracle. It MUST NOT assume an
+  Oracle is active in its own process, construct a principal or query context
+  by hand, or add an Oracle endpoint, client query route, or plan
+  serialization. Oracle's table authorization is the enforcement point; each
+  read records the canonical Oracle read decision and each denial the
+  canonical audited denial. Minting records no audit. The token does not
+  enforce subject, series, or window limits: the server-built fixed SQL
+  supplies those filters from the frozen run and fitted baseline, rendering
+  the subject UID, feature name, fitted edges and labels, and window bounds as
+  escaped typed literals. A Verifier contributes no SQL text. Registration
+  authorization is not standing query authorization. A read token is refused
+  by every record-write admission, and a result-write token is refused by
+  query admission.
 
   Every non-empty required detail batch is written before the canonical
   summary batch, and each is separately acknowledged. A result with zero
@@ -1188,7 +1329,7 @@ table on `(data_tenant_id, result_id)`.
   this initial journey.
 - **REQ-113**: Implementation MUST reuse the existing Card envelope,
   composite registration, UID-pinned `Ref`/`InlineableRef` resolution,
-  card-bound principal/token exchange, `WyrdState` request-driven refresh,
+  card-bound principal/token exchange, `WyrdState` request-driven re-exchange,
   `DriftRecordObservation` and `EvalRecordObservation` with their obsolete
   implementation-ref fields removed and the existing Eval `MediaRef` extended
   only for named native media binding, bounded
@@ -1244,6 +1385,23 @@ table on `(data_tenant_id, result_id)`.
   absent. Existing tracing and metrics MUST expose queue depth, active work,
   attempts, failures, and latency; this change adds no new telemetry service or
   process-local work registry.
+- **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
+  PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
+  run and dispatch availability, claim and lease expiry, retry/backoff
+  availability, worker deadlines, and coordination-relevant creation/update
+  times with `statement_timestamp()`. Immediate timestamps are assigned in the
+  owning SQL statement; relative deadlines are computed there from a bound
+  duration; and expiry or eligibility is compared there. When Rust needs a
+  database deadline decision, the same statement MUST return the verdict or
+  remaining interval rather than exposing a timestamp for comparison with a
+  process wall clock. An explicitly authored or cron-derived future schedule
+  remains an allowed bound instant, but its "next future" anchor MUST be a
+  PostgreSQL timestamp returned by the owning statement. Rust `Instant` remains
+  the clock for process-local timeouts, sleeps, and latency, while producer
+  clocks remain authoritative for event facts such as observation time,
+  verification execution start/end, and JWT `iat`/`exp`. Verification MUST NOT
+  add a clock abstraction, skew tolerance, synchronization setting, safety
+  margin, or permanent source checker.
 - **REQ-114**: Before this change is complete, the owning Card and runtime
   architecture authorities, generated schemas, and public documentation MUST
   describe the new Verifier-only verification model. In particular, the
@@ -1306,13 +1464,18 @@ table on `(data_tenant_id, result_id)`.
 - **INV-012**: This change reuses existing Drift, Eval, observation, execution,
   and Bifrost contracts inside the new Verifier Card. It MUST NOT replace
   their working algorithms or record semantics merely to implement the missing
-  server machinery and plumbing; removing obsolete implementation refs is
-  the only intentional logical input-record subtraction. The existing Eval
+  server machinery and plumbing; REQ-153–REQ-157 are the explicit exception
+  correcting PSI/SPC behavior. Removing obsolete implementation refs is the
+  only other intentional logical input-record subtraction. The existing Eval
   media item gains binding identity/kind so its already-authored media can
   reach the existing multimodal judge path.
 - **INV-014**: `Verifier` is the only registrable Card kind for verification.
   `Drift` and `Eval` are typed implementations, not parallel Cards, hidden
   resources, or alternate registration paths.
+- **INV-015**: The system evaluating a verification time predicate owns the
+  timestamp used by that predicate. A PostgreSQL coordination column is never
+  written from a Rust wall-clock instant and later compared by PostgreSQL, and
+  Rust never evaluates a PostgreSQL-owned deadline against its wall clock.
 - **INV-013**: Inline and referenced Trigger or Operator definitions have the
   same semantics. Inline definitions remain part of the containing Card version
   and MUST NOT create hidden Cards. Referenced definitions retain their own Card
@@ -1343,6 +1506,22 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   report and produced feature rows.
   Invalid/non-Parquet baselines, failed fitting, insufficient data,
   unauthorized access, and cross-tenant reads fail visibly.
+- **AC-034**: Published NIST X-bar/S examples or independently calculated
+  fixtures MUST prove both chart limits, subgroup mean/standard-deviation
+  signals, equality at the limit, and the missing `sqrt(n)` regression. PSI
+  fixtures MUST prove exhaustive numeric/category bins, including unseen
+  target categories and zero-count smoothing. Baseline and target fixtures
+  MUST prove null, non-finite, omitted feature, insufficient sample, and
+  incomplete subgroup outcomes without silent row removal. Direct PSI/SPC
+  fixtures MUST pass only preselected relevant rows, prove that a selected
+  null-only row makes an otherwise sufficient target wholly unscored, and
+  prove that unrelated observations are excluded before direct scoring and by
+  the server. Real Rust,
+  Python, and TypeScript SDK-to-server Drift journeys MUST prove the new
+  report evidence, a failed scheduled run's Operator dispatch, and the
+  visible refusal of legacy versions; direct scoring and server scoring must
+  agree for the same valid data. Existing tenancy, fixed-window, audit,
+  capacity, timeout, and result-publication obligations remain.
 - **AC-013**: A real Service binding journey registers a Drift Verifier,
   Trigger, and one or more Operators; emits existing DriftRecordObservation
   through observe:drift and the same wyrd-client/wyrd-queue path used by
@@ -1457,6 +1636,43 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   MUST omit `run_id` and `card_ref` user fields; both are supplied only as
   per-row correlation. Two concurrent scoped runs writing different tables
   MUST retain their own table and correlation without active-table switching.
+- **AC-032**: A Python real-SDK-to-real-server journey MUST enter
+  `state.run(card="...")` for a registered Service component, invoke
+  framework-style code that creates spans without setting Wyrd attributes,
+  and export those spans through the stock Python OpenTelemetry SDK and
+  OTLP/HTTP exporter to Wyrd's authenticated `POST /v1/traces` endpoint. The
+  same Run scope MUST write one caller-owned `vala.datasets.*` row and one Eval
+  observation whose trace/span IDs come from the active span rather than
+  explicit arguments. After context exit, explicit tracer flush, state
+  shutdown, and server publication, persisted Bifrost queries MUST prove every
+  span carries the exact shared `wyrd.run_id`, asserted `wyrd.card_ref`,
+  authenticated publisher, and server-resolved Card UID; the custom row joins
+  to those spans by `run_id`; and the Eval row joins to its exact span by
+  `trace_id` and `span_id` while retaining the same run and Card identity. The
+  proof MUST extend the existing Python scoped-observation journey rather than
+  introduce a second Service fixture. An already-active recording span MUST
+  receive the same attributes. Nested root and component scopes MUST share one
+  run ID, select their own exact CardRefs, and restore the outer Card after
+  exit. Async evidence MUST cover an `await`, concurrent tasks using the same
+  immutable Run, and a task created inside the scope. Focused Python tests MUST
+  prove that missing `opentelemetry-api`, an API-only/no-SDK provider,
+  processor registration failure, span enrichment failure, and detach failure
+  do not escape or block explicit observations; a user exception from the
+  block MUST propagate unchanged. Unknown aliases MUST still fail before
+  entry. Provider registration MUST be idempotent, and an explicitly installed
+  private provider MUST receive the same attributes. Context exit MUST NOT be
+  treated as a telemetry or Bifrost durability barrier. No test may infer
+  automatic log or metric enrichment from this span contract.
+- **AC-033**: Postgres integration evidence MUST prove the shared machine-
+  activity/schedule path and the shared verifier-run/dispatch path assign
+  immediate timestamps, relative deadlines, and due/expiry verdicts from
+  `statement_timestamp()`. Lease reclaim, retry availability, inactivity, and
+  no-backfill scheduling tests MUST control database coordination state rather
+  than advance a process wall clock or backdate a fixture merely to make an
+  unrelated predicate pass. Existing runtime journeys MUST continue to prove
+  restart reclaim, stale-token fencing, scheduling, activity renewal, and
+  dispatch creation. No skew workaround, clock abstraction, or permanent grep
+  check is acceptable evidence.
 - **AC-025**: Rust, Python, and TypeScript SDK journeys MUST start Bifrost
   through their specified pass-through options, fail startup when either
   fixed system table cannot be described, and emit Drift and Eval without
@@ -1492,10 +1708,13 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   unauthorized, or cross-tenant refs. Registration alone does not activate
   a binding or start a run; PSI/SPC bindings remain unrunnable until ready.
 - **AC-019**: A real client/server journey proves that initial
-  service-principal authentication activates only the exact Service or
-  Agent Card version, request-driven stale-token re-exchange renews activity
-  without resetting an active schedule cursor, and an idle client does not
-  refresh solely on token expiry. Inactivity, suspension, and deletion
+  API-key exchange or workload `jwt-bearer` authentication activates only the
+  exact Card-bound Service or Agent Card version, request-driven stale-token
+  re-exchange renews activity without resetting an active schedule cursor, and
+  an idle client does not
+  re-exchange solely on token expiry. Delegation, human refresh, Card-free
+  automation, SYSTEM minting, cached-token requests, and ordinary observations
+  do not activate or renew an owner. Inactivity, suspension, and deletion
   prevent scheduled work; later reauthentication starts at the next future
   occurrence without backfill. Two A/B versions remain independently
   active, replicas of one exact principal do not duplicate runs, component
@@ -1564,10 +1783,17 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   `card_ref` MUST be rejected; no global `SYSTEM_OWNER` token may write a
   customer-tenant result. Provisioning MUST create one stable UUIDv7 SYSTEM
   principal per tenant without a public credential. Tests MUST reject public
-  issuance, refresh, and delegation for SYSTEM, non-SYSTEM writes to any result
-  table, and SYSTEM writes to every other table. Two bindings for one subject MUST remain
-  independently filterable through runs/results while sharing the one raw
-  subject observation without Verifier/binding columns or per-binding copies.
+  create, list, get, update, suspend/delete, credential, refresh, workload,
+  delegation, impersonation, and token-exchange operations for SYSTEM,
+  non-SYSTEM writes to any result table, and SYSTEM writes to every other
+  table. They MUST prove that a SYSTEM read token is refused against another
+  table and another tenant and cannot write results, and that a verification
+  process without a local Oracle completes a Drift run through peer-forwarded
+  Oracle with an audited read decision. They MUST also prove the existing tenant issuer/JWT format and the
+  single canonical Gate authorization audit. Two bindings for one subject MUST
+  remain independently filterable through runs/results while sharing the one
+  raw subject observation without Verifier/binding columns or per-binding
+  copies.
 - **AC-024**: Bifrost catalog/schema tests MUST assert the exact column names,
   order, Arrow types, and nullability in `architecture/logic/table_schema.md`,
   daily `wyrd_event_time` partitioning for all five verification tables, and the
@@ -1602,8 +1828,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 
 ## Open material decisions
 
-None. Revision 32 was explicitly approved by the user's delegated
-Ponytail blocker resolver on 2026-09-19.
+None. Revision 36 was directed by the user on 2026-09-24 in the TASK-005 r1
+remediation plan.
 
 ## Material authority links
 
@@ -1633,6 +1859,26 @@ Ponytail blocker resolver on 2026-09-19.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 38 direct Drift input boundary (2026-09-24):** Approved by the
+  user after the TASK-011 review. Direct PSI/SPC batches contain only selected
+  observations; every row participates in completeness checks. Server
+  selection continues to use series identity, including present-null values.
+  The revision removes the impossible requirement to infer selected-row
+  membership from a wide batch's null values. It retains revision 37's
+  statistical formulas, fixed subgrouping, and explicit null-to-inconclusive
+  policy; no missing PSI bin, new observation format, or statistical method is
+  introduced. The remaining TASK-011 review findings still require remediation.
+
+- **Revision 37 conventional PSI/SPC (2026-09-24):** Approved complete
+  categorical PSI bins, strict missing-data handling, fixed rational
+  subgroups, NIST three-sigma X-bar/S limits, chart-specific result evidence,
+  and an explicit new-version/refit boundary. This reverses revision 32's
+  SPC preservation decision and was explicitly approved by the user on
+  2026-09-24. Statistical
+  grounding: [NIST X-bar/S chart](https://itl.nist.gov/div898/handbook/pmc/section3/pmc321.htm),
+  [NIST rational subgroups](https://www.itl.nist.gov/div898/handbook/glossary.htm),
+  and [ASQ control-chart setup](https://asq.org/quality-resources/control-chart).
 
 - **Revisions 1–10 (2026-09-03 through 2026-09-16):** Earlier draft
   iterations established the Verifier Card, Change Request model,
@@ -1797,3 +2043,42 @@ Ponytail blocker resolver on 2026-09-19.
   post-ack Eval enqueue, and no-Alert flow. This revision was explicitly
   approved through the user's delegated blocker-resolution authority on
   2026-09-19.
+- **Revision 33 identity integration (2026-09-21):** Integrated Verification
+  with the current tenant-principal and five-minute permission-snapshot model.
+  Added one internal-only tenant `system` principal kind for canonical result
+  publication while reusing the existing identity store, token issuer, JWT
+  format, Gate, and audit path. Fixed binding activity to successful API-key or
+  workload-`jwt-bearer` exchange by the exact Card-bound Service or Agent and
+  explicitly excluded delegation, human refresh, Card-free automation, SYSTEM
+  minting, cached bearer use, and idle expiry. This revision was explicitly
+  approved by the user on 2026-09-21.
+- **Revision 34 Run context and Python span correlation (2026-09-22):** Added
+  language-idiomatic initial Card selection when opening a Run and retained
+  immutable `for_card` views for multi-component invocations. Made Python Run
+  a synchronous context manager that injects `wyrd.card_ref` and
+  `wyrd.run_id` into the active span and framework-created child spans through
+  optional execution-local OpenTelemetry context plus an idempotent span
+  processor. Fixed nested and asyncio propagation, private-provider escape
+  hatch, server-owned identity boundaries, and fail-open behavior when Python
+  OpenTelemetry is absent or fails. Required the existing Python Service journey
+  to export through authenticated `/v1/traces` and prove persisted joins from
+  traces to custom rows by Run ID and Eval rows by trace/span identity. This
+  revision was explicitly approved by the user on 2026-09-22.
+- **Revision 35 PostgreSQL coordination clock (2026-09-22):** Made the
+  evaluator own every verification timestamp: PostgreSQL now owns activity,
+  scheduling, claims, leases, retries, worker deadlines, and their predicates;
+  Rust retains monotonic in-process timing and producer-owned event facts.
+  Prohibited process-clock/database-clock mixing, clock abstractions, skew
+  tolerances, and checker-based enforcement, and required behavioral Postgres
+  regression evidence for each corrected shared write path. This revision was
+  explicitly approved by the user on 2026-09-22.
+- **Revision 36 SYSTEM Drift read (2026-09-24):** Resolved TASK-005 r1
+  `FIND-TASK-005-6`. Added a second, mutually exclusive SYSTEM token purpose:
+  a short-lived `bifrost_query:read` token scoped to the tenant's registered
+  `vala.drift.observations` table UID, resolved without creating the table.
+  Drift verifies it through the ordinary verifier and dispatches server-built
+  fixed SQL through the ordinary query service, Gate, and local or
+  peer-forwarded Oracle, replacing the local typed `query_plan` seam and the
+  hand-built SYSTEM principal. Stated that the token does not enforce
+  subject, series, or window limits. This revision was directed by the user
+  on 2026-09-24.

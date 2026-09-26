@@ -1,4 +1,4 @@
-//! In-memory drift baseline fit and scoring for Wyrd's DriftCard primitive.
+//! In-memory drift baseline fit and scoring for Wyrd's drift Verifier implementation.
 //!
 //! This crate consumes Arrow `RecordBatch`es directly. Parquet I/O, DataCard
 //! resolution, persistence, scheduling, and HTTP wiring live in other crates.
@@ -6,7 +6,7 @@
 //! ## Public surface
 //!
 //! - `fit_psi_baseline` / `score_psi` - Population Stability Index over a feature distribution.
-//! - `fit_spc_baseline` / `score_spc` - Statistical Process Control with WECO rule evaluation.
+//! - `fit_spc_baseline` / `score_spc` - Shewhart X-bar/S control charts over fixed rational subgroups.
 //! - `score_custom` - User-defined scalar drift against an author-supplied baseline value.
 //! - `fit_baseline` / `score` - Method-dispatching helpers that read a `DriftSpec`.
 //!
@@ -24,12 +24,18 @@ pub mod psi;
 pub mod report;
 pub mod spc;
 
-pub use baseline::{FittedBaseline, fit_baseline, score_drift};
-pub use custom::score_custom;
+pub use baseline::{FITTED_FORMAT, FittedBaseline, fit_baseline, fit_baseline_until, score_drift};
+pub use custom::{score_custom, score_custom_mean};
 pub use error::{DriftFitError, DriftScoreError};
-pub use psi::{FittedPsiFeature, PsiBaseline, fit_psi_baseline, score_psi};
-pub use report::{DriftReport, DriftVerdict, FeatureDriftReport};
-pub use spc::{FittedSpcFeature, SpcBaseline, fit_spc_baseline, score_spc};
+pub use psi::{
+    FittedPsiFeature, PSI_MIN_TARGET_SAMPLE, PsiBaseline, PsiBinEvidence, PsiEvidence,
+    fit_psi_baseline, score_psi, score_psi_counts,
+};
+pub use report::{DriftReport, DriftVerdict, FeatureDriftReport, FeatureEvidence};
+pub use spc::{
+    ChartLimits, FittedSpcFeature, MIN_BASELINE_SUBGROUPS, SpcBaseline, SpcChartEvidence,
+    SpcEvidence, SpcScorer, fit_spc_baseline, score_spc,
+};
 
 #[cfg(test)]
 mod smoke {
@@ -44,6 +50,7 @@ mod smoke {
     use wyrd_spec::card::drift::{CustomProfile, DriftSpec, PsiProfile, SpcProfile};
     use wyrd_spec::ids::FeatureName;
 
+    /// Every public re-export stays nameable from the crate root.
     #[test]
     fn public_surface_is_visible() {
         // No-op: this test exists to force a link of every public re-export. If
@@ -73,11 +80,8 @@ mod smoke {
             &SpcProfile,
             &[FeatureName],
         ) -> Result<SpcBaseline, DriftFitError> = fit_spc_baseline;
-        let _score_spc: fn(
-            &SpcBaseline,
-            &RecordBatch,
-            &SpcProfile,
-        ) -> Result<DriftReport, DriftScoreError> = score_spc;
+        let _score_spc: fn(&SpcBaseline, &RecordBatch) -> Result<DriftReport, DriftScoreError> =
+            score_spc;
         let _score_custom_fn: fn(
             &RecordBatch,
             &CustomProfile,

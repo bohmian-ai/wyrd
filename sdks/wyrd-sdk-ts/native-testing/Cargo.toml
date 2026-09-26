@@ -19,6 +19,7 @@ secrecy = { workspace = true }
 url = { workspace = true }
 vala-bifrost-redux = { workspace = true }
 wyrd-runtime = { workspace = true }
+wyrd-spec = { workspace = true }
 wyrd-testing = { workspace = true }
 
 [build-dependencies]

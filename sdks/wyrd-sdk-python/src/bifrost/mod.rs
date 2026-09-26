@@ -98,6 +98,17 @@ pub struct PyTableConfig {
     inner: TableConfig,
 }
 
+impl PyTableConfig {
+    /// Hand the native config to another boundary in this crate.
+    ///
+    /// `WyrdState.start_bifrost` passes the caller's optional `table` straight
+    /// through to the same native constructor `Bifrost(...)` uses, so the inner
+    /// config has to leave this wrapper without a second conversion.
+    pub(crate) fn into_native(self) -> TableConfig {
+        self.inner
+    }
+}
+
 #[pymethods]
 impl PyTableConfig {
     /// Builds one config from a JSON Schema document.

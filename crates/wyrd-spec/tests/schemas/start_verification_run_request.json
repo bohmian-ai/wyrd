@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StartVerificationRunRequest",
+  "description": "`POST /v1/verification/runs` request body.",
+  "type": "object",
+  "required": [
+    "input",
+    "target"
+  ],
+  "properties": {
+    "input": {
+      "description": "Input to analyze.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerificationRunInput"
+        }
+      ]
+    },
+    "target": {
+      "description": "Binding or direct Verifier target.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerificationRunTarget"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "VerificationRunInput": {
+      "description": "The input a manual run analyzes.",
+      "oneOf": [
+        {
+          "description": "A bounded half-open UTC Drift window `[start, end)`.",
+          "type": "object",
+          "required": [
+            "end",
+            "kind",
+            "start"
+          ],
+          "properties": {
+            "end": {
+              "description": "Exclusive window end.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "drift_window"
+              ]
+            },
+            "start": {
+              "description": "Inclusive window start.",
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "VerificationRunTarget": {
+      "description": "What a manual run verifies.",
+      "oneOf": [
+        {
+          "description": "One projected binding; its frozen owner, Trigger, and `on_failure` Operators apply, so a failed verdict dispatches them.",
+          "type": "object",
+          "required": [
+            "binding_id",
+            "kind"
+          ],
+          "properties": {
+            "binding_id": {
+              "description": "The binding to run.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "binding"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A direct, analysis-only run of one exact Verifier over one subject. It has no owner, binding, Trigger, or Operator and never dispatches.",
+          "type": "object",
+          "required": [
+            "kind",
+            "subject_card_uid",
+            "verifier_uid"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "verifier"
+              ]
+            },
+            "subject_card_uid": {
+              "description": "Exact subject Card whose observations are analyzed.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardUid"
+                }
+              ]
+            },
+            "verifier_uid": {
+              "description": "Exact Verifier Card version.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardUid"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

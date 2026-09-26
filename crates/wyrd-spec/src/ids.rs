@@ -1,9 +1,10 @@
 //! Newtype identifiers used across Wyrd specs.
 
-use std::fmt;
+use std::fmt::{self, Display, Formatter, Result as FmtResult};
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use uuid::Uuid;
 
 macro_rules! id_type {
     ($name:ident, $doc:literal, $validator:ident) => {
@@ -114,7 +115,12 @@ id_type!(RoleName, "RBAC role identifier.", validate_token);
 id_type!(ColumnName, "DataCard column name.", validate_card_token);
 id_type!(
     FeatureName,
-    "Feature column name referenced by a DriftCard signal.",
+    "Feature column name referenced by a drift Verifier signal.",
+    validate_card_token
+);
+id_type!(
+    MediaBindingId,
+    "Name of a `${media:id}` binding slot in a resolved judge Prompt.",
     validate_card_token
 );
 id_type!(SplitName, "DataCard split label.", validate_card_token);
@@ -241,6 +247,130 @@ impl<'de> Deserialize<'de> for DataTenantId {
         Self::new(value).map_err(serde::de::Error::custom)
     }
 }
+
+/// Define a server-minted `UUIDv7` identity newtype.
+///
+/// Every generated type serializes as the canonical hyphenated UUID, mints
+/// fresh values with [`Uuid::now_v7`], and refuses any non-v7 UUID on
+/// construction, parsing, and deserialization, so a stored or submitted
+/// identity of another version never becomes a typed value.
+macro_rules! uuid7_id_type {
+    ($(#[$meta:meta])* $name:ident) => {
+        $(#[$meta])*
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize,
+            schemars::JsonSchema,
+        )]
+        #[serde(transparent)]
+        #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+        pub struct $name(Uuid);
+
+        impl $name {
+            /// Mint a fresh identity.
+            #[must_use]
+            pub fn new_v7() -> Self {
+                Self(uuid::Uuid::now_v7())
+            }
+
+            /// Build an identity from a stored or decoded UUID.
+            ///
+            /// # Errors
+            /// Returns [`IdError::InvalidUuid7`] when the UUID is not version 7.
+            pub fn new(value: Uuid) -> Result<Self, IdError> {
+                if value.get_version_num() == 7 {
+                    Ok(Self(value))
+                } else {
+                    Err(IdError::InvalidUuid7)
+                }
+            }
+
+            /// Return the underlying UUID.
+            #[must_use]
+            pub fn as_uuid(&self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl Display for $name {
+            /// Render the canonical hyphenated UUID form used on the wire.
+            fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+                Display::fmt(&self.0, f)
+            }
+        }
+
+        impl FromStr for $name {
+            /// The identifier refusal a malformed or non-v7 identity produces.
+            type Err = IdError;
+
+            /// Parse a path or query value, refusing a malformed or non-v7 UUID.
+            ///
+            /// # Errors
+            /// Returns [`IdError::InvalidUuid7`] when `value` is not a UUID or
+            /// is a UUID of any version other than 7.
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                let uuid = uuid::Uuid::parse_str(value).map_err(|_| IdError::InvalidUuid7)?;
+                Self::new(uuid)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            /// Decode a UUID and refuse any version other than 7.
+            ///
+            /// # Errors
+            /// Returns the deserializer's error when the value is not a UUID,
+            /// or a custom error carrying [`IdError::InvalidUuid7`] for a
+            /// non-v7 UUID.
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = uuid::Uuid::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+uuid7_id_type!(
+    /// Durable identity of one projected verification binding.
+    ///
+    /// A binding is an inline `verified_by` entry on a Service, one of its
+    /// component occurrences, or a standalone Agent; it is never authored with
+    /// its own name or identifier. Registration mints this `UUIDv7` on the
+    /// first projection of the binding's natural key — tenant, exact owner
+    /// Card UID, subject occurrence, and exact Verifier UID — and every later
+    /// projection of that same key keeps it, so status, runs, and results
+    /// address the binding stably.
+    BindingId
+);
+
+uuid7_id_type!(
+    /// Durable identity of one Verifier run in `wyrd.verifier_runs`.
+    ///
+    /// The server mints it when scheduled, manual, or observation work is
+    /// enqueued. It is the managed `run_id` of every result and detail row the
+    /// run publishes and addresses the run's status and Operator dispatches.
+    /// Retries and lease reclaims keep it.
+    VerificationRunId
+);
+
+uuid7_id_type!(
+    /// Durable identity of one canonical Verification Result.
+    ///
+    /// The runner mints it for a completed run's result batches: the summary
+    /// row in `vala.verification.results` and every detail row join on
+    /// (`data_tenant_id`, `result_id`), and the settled run points at it.
+    VerificationResultId
+);
+
+uuid7_id_type!(
+    /// Durable identity of one Operator dispatch in `wyrd.operator_dispatches`.
+    ///
+    /// Settlement of a failed binding-created run mints one per distinct
+    /// configured Operator. Every delivery retry keeps it, so it is also the
+    /// idempotency key an external destination may honor.
+    OperatorDispatchId
+);
 
 /// Generate a UUIDv7 string for Wyrd-owned identifiers.
 #[must_use]

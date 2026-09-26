@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 
 use super::error::Diagnostic;
@@ -98,42 +98,25 @@ fn resolve_card_references(
 }
 
 /// Rewrite one path-bearing slot and retain diagnostics for failed imports.
+///
+/// Space inheritance and path resolution are identical for every slot shape,
+/// so both go through the canonical [`SlotValue`] accessors rather than one
+/// arm per reference type.
 fn resolve_reference_slot(
     resolver: &mut PathResolver<'_>,
-    value: SlotValue<'_>,
+    mut value: SlotValue<'_>,
     source_path: &Path,
     parent_space: Option<&wyrd_spec::ids::SpaceName>,
     discovered: &mut Vec<AuthoredCard>,
     source_depth: usize,
 ) {
-    match value {
-        SlotValue::Durable(ref_slot) => {
-            inherit_space(ref_slot.as_card_ref_mut(), parent_space);
-            if let Ref::Path(path) = ref_slot {
-                match resolver.resolve(source_path, path, discovered, source_depth) {
-                    Ok(card_ref) => *ref_slot = Ref::Sibling { sibling: card_ref },
-                    Err(diagnostic) => resolver.diagnostics.push(diagnostic),
-                }
-            }
-        }
-        SlotValue::InlineablePrompt(ref_slot) => {
-            inherit_space(ref_slot.as_card_ref_mut(), parent_space);
-            if let InlineableRef::Path(path) = ref_slot {
-                match resolver.resolve(source_path, path, discovered, source_depth) {
-                    Ok(card_ref) => *ref_slot = InlineableRef::Sibling { sibling: card_ref },
-                    Err(diagnostic) => resolver.diagnostics.push(diagnostic),
-                }
-            }
-        }
-        SlotValue::InlineableAgent(ref_slot) => {
-            inherit_space(ref_slot.as_card_ref_mut(), parent_space);
-            if let InlineableRef::Path(path) = ref_slot {
-                match resolver.resolve(source_path, path, discovered, source_depth) {
-                    Ok(card_ref) => *ref_slot = InlineableRef::Sibling { sibling: card_ref },
-                    Err(diagnostic) => resolver.diagnostics.push(diagnostic),
-                }
-            }
-        }
+    inherit_space(value.as_card_ref_mut(), parent_space);
+    let Some(path) = value.as_path().map(Path::to_path_buf) else {
+        return;
+    };
+    match resolver.resolve(source_path, &path, discovered, source_depth) {
+        Ok(card_ref) => value.resolve_path_to_sibling(card_ref),
+        Err(diagnostic) => resolver.diagnostics.push(diagnostic),
     }
 }
 

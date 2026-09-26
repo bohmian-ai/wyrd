@@ -2258,6 +2258,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "croner"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a59ed87528b2ee2b6d2b14d6767f6dbe41867dfc581433fc23a7c0fae847467a"
+dependencies = [
+ "chrono",
+ "derive_builder",
+ "strum",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10462,24 +10473,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "vala-core"
-version = "0.0.1"
-dependencies = [
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "workspace-hack",
- "wyrd-spec",
-]
-
-[[package]]
 name = "vala-drift"
 version = "0.0.1"
 dependencies = [
  "arrow",
  "arrow-schema",
  "serde",
+ "serde_json",
  "statrs",
  "thiserror 2.0.18",
  "workspace-hack",
@@ -11214,6 +11214,8 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
  "twox-hash",
  "typenum",
  "url",
@@ -11476,6 +11478,7 @@ dependencies = [
  "futures-util",
  "hex",
  "indicatif",
+ "opentelemetry",
  "reqwest 0.13.4",
  "schemars 0.8.22",
  "secrecy",
@@ -11494,6 +11497,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-opentelemetry",
  "urlencoding",
  "uuid",
  "vala-bifrost-redux",
@@ -11760,11 +11764,17 @@ dependencies = [
 name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "base64 0.22.1",
+ "chrono",
+ "parquet",
  "secrecy",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "uuid",
  "workspace-hack",
  "wyrd-client",
  "wyrd-testing",
@@ -11800,6 +11810,7 @@ dependencies = [
  "url",
  "vala-bifrost-redux",
  "wyrd-runtime",
+ "wyrd-spec",
  "wyrd-testing",
 ]
 
@@ -11873,6 +11884,7 @@ dependencies = [
  "utoipa-axum",
  "uuid",
  "vala-bifrost-redux",
+ "vala-drift",
  "vala-eval",
  "vala-sql",
  "wiremock",
@@ -11938,6 +11950,8 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "chrono",
+ "chrono-tz",
+ "croner",
  "metrics",
  "paste",
  "pg-embed",

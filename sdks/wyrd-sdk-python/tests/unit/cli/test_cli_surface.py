@@ -25,7 +25,7 @@ def test_packaged_cli_preserves_runtime_codes(tmp_path, monkeypatch) -> None:
         json.dumps(
             {
                 "apiVersion": "wyrd/v1",
-                "kind": "Eval",
+                "kind": "Verifier",
                 "metadata": {
                     "name": "cli-exit",
                     "version": "1.0.0",
@@ -34,16 +34,21 @@ def test_packaged_cli_preserves_runtime_codes(tmp_path, monkeypatch) -> None:
                     "annotations": {},
                 },
                 "spec": {
-                    "tasks": {
-                        "ok_check": {
-                            "kind": "assertion",
-                            "id": "ok_check",
-                            "context_path": "$.ok",
-                            "operator": "equals",
-                            "expected": True,
-                        }
-                    },
-                    "pass_gate": {"kind": "all_pass"},
+                    "implementation": {
+                        "kind": "eval",
+                        "spec": {
+                            "tasks": {
+                                "ok_check": {
+                                    "kind": "assertion",
+                                    "id": "ok_check",
+                                    "context_path": "$.ok",
+                                    "operator": "equals",
+                                    "expected": True,
+                                }
+                            },
+                            "pass_gate": {"kind": "all_pass"},
+                        },
+                    }
                 },
                 "relationships": {
                     "outbound": [],
@@ -79,13 +84,6 @@ def test_packaged_cli_preserves_runtime_codes(tmp_path, monkeypatch) -> None:
         json.dumps(
             {
                 "record_id": "00000000-0000-0000-0000-000000000002",
-                "run_id": "run-records",
-                "eval_ref": {
-                    "kind": "Eval",
-                    "name": "cli-exit",
-                    "version": "1.0.0",
-                    "space": "tests",
-                },
                 "context": {"ok": False},
                 "created_at": "2026-01-01T00:00:00Z",
             }

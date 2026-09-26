@@ -100,61 +100,37 @@ mod pg_tests {
             );
         }
 
-        /// The staging constraint admits exactly the five principal kinds.
+        /// The internal verification-result writer's admission decisions stage
+        /// under the `system` principal kind.
         ///
-        /// Every approved kind appends through the canonical path, and a row
-        /// copied from a staged decision but relabelled `system` is refused by
-        /// `audit_staging_principal_kind_check`, so no reserved internal kind
-        /// can enter the chain.
+        /// Audit is fail-closed, so a kind the staging CHECK refuses would make
+        /// every Gate admission by the SYSTEM writer an audit-unavailable
+        /// refusal. The row must stage and keep the kind as written.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the append is refused or the staged kind differs.
         #[tokio::test]
-        async fn principal_kind_check_admits_exactly_the_five_kinds() {
+        async fn system_principal_decisions_stage() {
             let (fixture, superuser, tenant) = setup().await;
-            for kind in [
-                PrincipalKindTag::GlobalAdmin,
-                PrincipalKindTag::TenantAdmin,
-                PrincipalKindTag::User,
-                PrincipalKindTag::Service,
-                PrincipalKindTag::Agent,
-            ] {
-                let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
-                    .await
-                    .unwrap();
-                vala_sql::queries::audit_staging::append_audit(
-                    &mut conn,
-                    &AuditEvent {
-                        principal_kind: kind,
-                        ..event(kind.as_str())
-                    },
-                )
-                .await
-                .unwrap_or_else(|error| panic!("{} must be admitted: {error}", kind.as_str()));
-                conn.commit().await.unwrap();
-            }
-
-            let mut tx = superuser.begin().await.unwrap();
-            sqlx::query(
-                "CREATE TEMP TABLE relabelled ON COMMIT DROP AS
-                 SELECT * FROM vala.audit_staging WHERE data_tenant_id = $1 AND seq = 5",
-            )
-            .bind(tenant.as_uuid())
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-            sqlx::query("UPDATE relabelled SET principal_kind = 'system', seq = 6")
-                .execute(&mut *tx)
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .unwrap();
-            let refused = sqlx::query("INSERT INTO vala.audit_staging SELECT * FROM relabelled")
-                .execute(&mut *tx)
+            let mut system_event = event("bifrost.insert");
+            system_event.principal_kind = PrincipalKindTag::System;
+            vala_sql::queries::audit_staging::append_audit(&mut conn, &system_event)
                 .await
-                .expect_err("the system kind must be refused");
-            assert_eq!(
-                refused
-                    .as_database_error()
-                    .and_then(|error| error.constraint()),
-                Some("audit_staging_principal_kind_check"),
-                "{refused}"
-            );
+                .expect("a system-writer decision stages");
+            conn.commit().await.unwrap();
+
+            let kind: String = sqlx::query_scalar(
+                "SELECT principal_kind FROM vala.audit_staging WHERE data_tenant_id = $1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(&superuser)
+            .await
+            .unwrap();
+            assert_eq!(kind, "system");
         }
 
         /// A written audit row can be retired, but never rewritten.
@@ -329,6 +305,66 @@ mod pg_tests {
                 Some(4),
                 "a stale settlement must not clear the newer in-flight bound"
             );
+        }
+
+        /// A held chain head fails the freeze immediately, never as an idle
+        /// tenant.
+        ///
+        /// Postgres aborts the waiter's transaction on `55P03`, so reporting
+        /// `None` would hand the publisher a transaction that can only fail at
+        /// commit. The waiter must see the error, its rollback must leave the
+        /// range unfrozen, and a fresh freeze after the holder releases must
+        /// establish the owed range.
+        #[tokio::test]
+        async fn held_chain_head_fails_immediately_and_retries_unchanged() {
+            let (fixture, superuser, tenant) = setup().await;
+            append(fixture.app_pool(), tenant, "op.a").await;
+
+            let mut holder = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            sqlx::query("SELECT 1 FROM vala.audit_chain_head FOR UPDATE")
+                .execute(&mut **holder.transaction())
+                .await
+                .unwrap();
+
+            let mut waiter = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let lock_error =
+                vala_sql::queries::audit_staging::freeze_publication_range(&mut waiter, 512)
+                    .await
+                    .expect_err("a held chain head is an immediate, explicit error");
+            let vala_sql::SqlError::Query(sqlx::Error::Database(database_error)) = &lock_error
+            else {
+                panic!("the freeze returns the database lock error: {lock_error}");
+            };
+            assert_eq!(
+                database_error.code().as_deref(),
+                Some("55P03"),
+                "the refusal is PostgreSQL lock_not_available"
+            );
+            drop(waiter);
+
+            let in_flight: Option<i64> = sqlx::query_scalar(
+                "SELECT publishing_seq_hi FROM vala.audit_chain_head WHERE data_tenant_id = $1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(&superuser)
+            .await
+            .unwrap();
+            assert_eq!(in_flight, None, "the aborted freeze left no bound behind");
+
+            holder.commit().await.unwrap();
+            let mut retry = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let range = vala_sql::queries::audit_staging::freeze_publication_range(&mut retry, 512)
+                .await
+                .unwrap()
+                .expect("the owed range survives the contended cycle");
+            retry.commit().await.unwrap();
+            assert_eq!((range.seq_lo, range.seq_hi), (1, 1));
         }
 
         /// An idle tenant owes nothing and its staging table drains to zero.

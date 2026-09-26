@@ -223,8 +223,20 @@ fn message_details_fields(fields: &Fields) -> Option<(&syn::Type, &syn::Type)> {
     Some((message_ty?, details_ty?))
 }
 
-/// Compare two types by their token representation.
+/// Compare two field types for `from_code` eligibility.
+///
+/// A path type is compared by its final segment, so a variant written against
+/// an imported alias (`details: Value`) qualifies alongside one written in
+/// full (`details: serde_json::Value`). They name the same type, and a
+/// mismatch that slipped through would fail to compile in the generated
+/// constructor rather than pass silently. Any other type shape falls back to
+/// token equality.
 fn types_equal(left: &syn::Type, right: &syn::Type) -> bool {
+    if let (syn::Type::Path(left), syn::Type::Path(right)) = (left, right)
+        && let (Some(left), Some(right)) = (left.path.segments.last(), right.path.segments.last())
+    {
+        return quote!(#left).to_string() == quote!(#right).to_string();
+    }
     quote!(#left).to_string() == quote!(#right).to_string()
 }
 

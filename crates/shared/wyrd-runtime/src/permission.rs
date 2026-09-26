@@ -76,9 +76,9 @@ pub enum Resource {
     Services,
     /// Operator cards and invocations.
     Operators,
-    /// Eval cards and eval runs.
+    /// Eval-backed Verifier Cards and eval runs.
     Evals,
-    /// Drift cards and drift observations.
+    /// Drift-backed Verifier Cards and drift observations.
     Drift,
     /// Artifact bytes and metadata.
     Artifacts,
@@ -620,6 +620,37 @@ impl Permission {
             action: Action::Read,
             scope: PermissionScope::All,
         }
+    }
+
+    /// Read exactly one table of the `vala.drift` schema, identified by UID.
+    ///
+    /// The tenant SYSTEM Drift reader's only permission: the issuer passes the
+    /// UID of the tenant's registered `vala.drift.observations` table, and
+    /// Oracle's table authorization refuses every other table.
+    #[must_use]
+    pub fn drift_table_read(table_uid: uuid::Uuid) -> Self {
+        Self {
+            resource: Resource::BifrostQuery,
+            action: Action::Read,
+            scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "drift".to_owned(),
+                table_uid,
+            })),
+        }
+    }
+
+    /// Whether this is a [`Self::drift_table_read`] permission for some table.
+    ///
+    /// Token verification uses it to accept the SYSTEM Drift reader's closed
+    /// claim shape without knowing the tenant's table UID.
+    #[must_use]
+    pub fn is_drift_table_read(&self) -> bool {
+        matches!(
+            &self.scope,
+            PermissionScope::Bifrost(BifrostPermissionScope::Table(table))
+                if *self == Self::drift_table_read(table.table_uid)
+        )
     }
 
     /// Read gateway deployments, redacted credential metadata, and policies.

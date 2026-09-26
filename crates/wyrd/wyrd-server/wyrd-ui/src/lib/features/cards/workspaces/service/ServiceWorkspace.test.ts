@@ -155,7 +155,7 @@ test('a failed projection is a named load error with a Retry that clears only th
   expect(html).toContain('Retry');
   expect(html).toContain('?view=overview&amp;version=v12&amp;range=1h"');
   // Independently sourced intelligence stays rendered.
-  expect(html).toContain('MODEL-DRIFT (Drift v3)');
+  expect(html).toContain('MODEL-DRIFT (Verifier v3)');
   expect(html).toContain('unaffected by the failed projection');
 });
 
@@ -168,14 +168,14 @@ test('the saved custom chart and the restrained Add-chart slot render as opt-in 
 
 test('drift/eval intelligence keeps subject, version, threshold and scope-preserving Observe links', async () => {
   const html = await get(CARD);
-  expect(html).toContain('MODEL-DRIFT (Drift v3)');
+  expect(html).toContain('MODEL-DRIFT (Verifier v3)');
   expect(html).toContain('✕ BREACHED');
   expect(html).toContain('subject ranker (model_primary · Model v12)');
   expect(html).toContain('PSI 0.27');
   expect(html).toContain('threshold 0.20');
   expect(html).toContain('baseline txns-2026q3 (Data v3)');
   expect(html).toContain('/t/acme/observe/drift?service=checkout-api&amp;driftCard=card_drift_01');
-  expect(html).toContain('CHECKOUT-AGENT-EVAL (Eval v4)');
+  expect(html).toContain('CHECKOUT-AGENT-EVAL (Verifier v4)');
   expect(html).toContain('subject checkout-agent (agent_triage · Agent v6)');
   expect(html).toContain('pass ≥ 95%');
   expect(html).toContain('96.4%');
@@ -213,7 +213,7 @@ test('Composition preserves lanes, aliases, identities and selection without cla
   expect(html).toContain('mock-only continuation');
   // Selecting a node opens the drawer and keeps direct Card routes.
   const selected = await get(`${CARD}?view=composition&version=v12&sel=card_drift_01`);
-  expect(selected).toContain('SELECTED — MODEL-DRIFT (DRIFT · V3)');
+  expect(selected).toContain('SELECTED — MODEL-DRIFT (VERIFIER · V3)');
   expect(selected).toContain('✕ close · graph stays in view');
   expect(selected).toContain('/t/acme/cards/card_drift_01');
   expect(selected).toContain('/t/acme/observe/drift?driftCard=card_drift_01');

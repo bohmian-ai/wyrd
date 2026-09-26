@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
@@ -231,6 +231,19 @@ fn collect<T>(
     Ok(out)
 }
 
+/// Build one Arrow column for `field` from the buffered JSON rows.
+///
+/// Dispatches on the field's data type and converts every row's value for
+/// that column; a missing value becomes null only when the field is nullable.
+/// `FixedSizeBinary` columns take canonical lowercase hex text and decode it to
+/// exactly the declared width, so trace and span ids land as the same bytes
+/// `vala.traces.spans` stores.
+///
+/// # Errors
+///
+/// Returns [`WyrdQueueError::SchemaParse`] when a value does not convert to
+/// the column type (including malformed or wrong-width hex), when a required
+/// value is null or missing, or when the data type is unsupported.
 fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueError> {
     let name = field.name();
     let nullable = field.is_nullable();
@@ -294,6 +307,20 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
             })?;
             Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(tz.clone()))
         }
+        DataType::FixedSizeBinary(width) => {
+            let width = *width;
+            let values = collect(name, rows, nullable, |v| {
+                v.as_str().and_then(|text| decode_lower_hex(text, width))
+            })?;
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.into_iter(), width)
+                    .map_err(|err| {
+                        WyrdQueueError::SchemaParse(format!(
+                            "field `{name}`: fixed-size binary column: {err}"
+                        ))
+                    })?,
+            )
+        }
         other => {
             return Err(WyrdQueueError::SchemaParse(format!(
                 "batch builder does not support column type {other:?} for field `{name}`"
@@ -301,6 +328,37 @@ fn build_column(field: &Field, rows: &[BuiltRow]) -> Result<ArrayRef, WyrdQueueE
         }
     };
     Ok(array)
+}
+
+/// Decode exactly `width` bytes from canonical lowercase hex.
+///
+/// Trace and span identities travel as the lowercase hex text every OpenTelemetry
+/// surface prints, and land in Arrow as the same fixed-width bytes
+/// `vala.traces.spans` stores. Uppercase hex, a `0x` prefix, non-hex characters,
+/// and any text whose length is not `2 * width` return `None`, which the caller
+/// reports as a column type mismatch rather than silently truncating or padding.
+fn decode_lower_hex(text: &str, width: i32) -> Option<Vec<u8>> {
+    let width = usize::try_from(width).ok()?;
+    if text.len() != width * 2 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(width);
+    for pair in bytes.chunks_exact(2) {
+        let hi = lower_hex_digit(pair[0])?;
+        let lo = lower_hex_digit(pair[1])?;
+        out.push(hi << 4 | lo);
+    }
+    Some(out)
+}
+
+/// Value of one canonical lowercase hex digit, or `None` for any other byte.
+fn lower_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
 }
 
 /// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
@@ -412,7 +470,7 @@ mod batch_builder_tests {
     use std::sync::Arc;
 
     use crate::BatchBuilder;
-    use arrow::array::{Array, Int64Array, StringArray};
+    use arrow::array::{Array, FixedSizeBinaryArray, Int64Array, StringArray};
     use arrow::ipc::reader::StreamReader;
     use arrow_schema::{DataType, Field, Schema};
     use wyrd_spec::reference::CardRef;
@@ -558,5 +616,81 @@ mod batch_builder_tests {
             .expect("int64");
         assert_eq!(ids.value(0), 7);
         assert!(reader.next().is_none(), "single batch stream");
+    }
+
+    /// Trace/span identity columns as `vala.eval.observations` and
+    /// `vala.traces.spans` describe them: nullable fixed-width binary keyed by
+    /// canonical lowercase hex text.
+    fn trace_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::FixedSizeBinary(16), true),
+            Field::new("span_id", DataType::FixedSizeBinary(8), true),
+        ]))
+    }
+
+    /// Lowercase hex trace and span ids become the exact 16- and 8-byte values
+    /// the Arrow IPC reader returns, and a missing id stays null.
+    #[test]
+    fn fixed_size_binary_round_trips_hex_trace_and_span_ids() {
+        let mut builder = BatchBuilder::new(trace_schema());
+        builder
+            .append_json_row(
+                r#"{"trace_id": "0af7651916cd43dd8448eb211c80319c", "span_id": "b7ad6b7169203331"}"#,
+                None,
+                None,
+            )
+            .expect("appends");
+        builder
+            .append_json_row(r#"{"trace_id": null, "span_id": null}"#, None, None)
+            .expect("absent identity appends");
+
+        let batch = builder.finish().expect("finish");
+        let traces = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("fixed-size binary");
+        assert_eq!(traces.value_length(), 16);
+        assert_eq!(
+            traces.value(0),
+            [
+                0x0a, 0xf7, 0x65, 0x19, 0x16, 0xcd, 0x43, 0xdd, 0x84, 0x48, 0xeb, 0x21, 0x1c, 0x80,
+                0x31, 0x9c
+            ]
+        );
+        assert!(traces.is_null(1), "absent trace identity stays null");
+
+        let spans = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("fixed-size binary");
+        assert_eq!(spans.value_length(), 8);
+        assert_eq!(
+            spans.value(0),
+            [0xb7, 0xad, 0x6b, 0x71, 0x69, 0x20, 0x33, 0x31]
+        );
+    }
+
+    /// Short, long, uppercase, prefixed, and non-hex ids are refused rather
+    /// than truncated or padded into a wrong identity.
+    #[test]
+    fn fixed_size_binary_rejects_malformed_and_wrong_width_hex() {
+        for row in [
+            r#"{"trace_id": "0af7651916cd43dd8448eb211c8031"}"#,
+            r#"{"trace_id": "0af7651916cd43dd8448eb211c80319c00"}"#,
+            r#"{"trace_id": "0AF7651916CD43DD8448EB211C80319C"}"#,
+            r#"{"trace_id": "0af7651916cd43dd8448eb211c80319z"}"#,
+            r#"{"trace_id": 12}"#,
+        ] {
+            let mut builder = BatchBuilder::new(trace_schema());
+            builder
+                .append_json_row(row, None, None)
+                .expect("appends deferred");
+            let err = builder
+                .finish()
+                .expect_err("malformed fixed-size binary input is refused before admission");
+            assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE", "row {row}");
+        }
     }
 }

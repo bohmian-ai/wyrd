@@ -2,7 +2,7 @@
 //!
 //! A Source is a read-side reference to an external data system. Wyrd reads,
 //! never writes (Doctrine #7). The `source` field is a *read-shape bucket* —
-//! the shape of data a consuming Drift/Eval Card sees — not a vendor. Vendors
+//! the shape of data a consuming Verifier Card sees — not a vendor. Vendors
 //! (BigQuery vs Snowflake, Prometheus vs Datadog) are a connection detail
 //! nested below the bucket, so a consumer binds to "row set" or "time series",
 //! never to a specific vendor. Adding a vendor is a new `*Connection` variant

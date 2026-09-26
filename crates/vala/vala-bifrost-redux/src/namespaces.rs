@@ -5,14 +5,25 @@ use iceberg::NamespaceIdent;
 /// Closed set of Bifrost logical namespaces a table may belong to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BifrostNamespace {
+    /// `vala.system` — retained audit history.
     Audit,
+    /// `vala.bifrost` — Bifrost's own operational tables.
     Bifrost,
+    /// `vala.traces` — OpenTelemetry spans.
     Traces,
+    /// `vala.metrics` — OpenTelemetry metric points.
     Metrics,
+    /// `vala.logs` — OpenTelemetry log records.
     Logs,
+    /// `vala.eval` — Eval observations and per-task result items.
     Eval,
+    /// `vala.drift` — Drift observations and per-feature result details.
     Drift,
+    /// `vala.verification` — the shared per-run Verifier verdict table.
+    Verification,
+    /// `vala.dev` — development-time agent traces.
     Dev,
+    /// `vala.datasets` — caller-owned dynamic tables.
     Datasets, // Redux-only variant for dynamic table namespace
     /// Gateway capture tables such as `vala.gateway.calls`.
     Gateway,
@@ -21,7 +32,7 @@ pub enum BifrostNamespace {
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Audit,
         Self::Bifrost,
         Self::Traces,
@@ -29,11 +40,13 @@ impl BifrostNamespace {
         Self::Logs,
         Self::Eval,
         Self::Drift,
+        Self::Verification,
         Self::Dev,
         Self::Datasets,
         Self::Gateway,
     ];
 
+    /// The wire namespace string (e.g. `"vala.eval"`) every FQN is built from.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Audit => "vala.system",
@@ -43,6 +56,7 @@ impl BifrostNamespace {
             Self::Logs => "vala.logs",
             Self::Eval => "vala.eval",
             Self::Drift => "vala.drift",
+            Self::Verification => "vala.verification",
             Self::Dev => "vala.dev",
             Self::Datasets => "vala.datasets",
             Self::Gateway => "vala.gateway",
@@ -66,6 +80,7 @@ impl BifrostNamespace {
             "logs" => Some(Self::Logs),
             "eval" => Some(Self::Eval),
             "drift" => Some(Self::Drift),
+            "verification" => Some(Self::Verification),
             "dev" => Some(Self::Dev),
             "datasets" => Some(Self::Datasets),
             "gateway" => Some(Self::Gateway),
@@ -145,6 +160,27 @@ mod tests {
     #[test]
     fn from_domain_namespace_unknown_returns_none() {
         assert!(BifrostNamespace::from_domain_namespace("unknown_namespace").is_none());
+    }
+
+    /// Forge keeps its own namespace allowlist (in Rust and in the Postgres
+    /// CHECKs on its task tables); a Bifrost namespace missing from it has
+    /// every planning hint refused and is never maintained.
+    ///
+    /// # Panics
+    /// Panics when Forge refuses a known Bifrost namespace.
+    #[test]
+    fn forge_accepts_every_bifrost_namespace() {
+        for ns in BifrostNamespace::ALL {
+            assert!(
+                vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+                    crate::catalog::BIFROST_CATALOG_NAME,
+                    ns.as_str(),
+                    "events",
+                )
+                .is_ok(),
+                "Forge refuses {ns:?}"
+            );
+        }
     }
 
     #[test]

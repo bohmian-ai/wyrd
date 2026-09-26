@@ -6,18 +6,22 @@ metadata:
   space: default
 spec:
   interface:
-    kind: Custom
+    kind: Parquet
     meta:
-      loader_module: fixture
-      loader_class: Data
-      extra: {}
+      compression: Snappy
   schema:
-    columns: []
+    columns:
+      - name: feature
+        dtype: float64
+      - name: label
+        dtype: int64
   stats:
-    byte_count: 14
-    sha256: db622818c69fb90f249d5d1b35b8a76a75555fc9114b4cb36d41a05fd0526aa8
+    row_count: 100
+    col_count: 2
+    byte_count: 1302
+    sha256: c4bdf033832c747f6b16b257d7174d06493d9cece1d752adc714b840254ab600
 artifacts:
-  - relative_path: training.bin
-    sha256: 22IoGMafuQ8knV0bNbinanVVX8kRS0yzbUGgX9BSaqg=
-    size_bytes: 14
-    content_type: application/octet-stream
+  - relative_path: data/data.parquet
+    sha256: xL3wM4MsdH9rFrJX1xdNBkk9nOzh11KtxxS4QCVKtgA=
+    size_bytes: 1302
+    content_type: application/vnd.apache.parquet

@@ -21,6 +21,7 @@ const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
   connectBifrost,
   connectCards,
+  connectVerification,
   connectGateway,
   connectWyrdClient,
   describeTableConfig,
@@ -29,9 +30,12 @@ const {
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
+type NativeVerification = import("../index.cjs").NativeVerification;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
 type NativeWyrdState = import("../index.cjs").NativeWyrdState;
+type NativeRun = import("../index.cjs").NativeRun;
+type NativeRunOpen = import("../index.cjs").NativeRunOpen;
 type NativeTableConfig = import("../index.cjs").NativeTableConfig;
 
 export type VisibilityMode = "published_only" | "fused";
@@ -924,7 +928,28 @@ export interface Card {
     readonly [key: string]: unknown;
   };
   readonly spec: Readonly<Record<string, unknown>>;
+  readonly status?: CardStatus | null;
   readonly [key: string]: unknown;
+}
+
+/** Server-derived Card status; a registration request's own status is ignored. */
+export interface CardStatus {
+  readonly phase: string;
+  readonly message?: string | null;
+  readonly updated_at?: string | null;
+  readonly verification?: VerificationStatus | null;
+}
+
+/** Server-derived verification state of one Card version. */
+export interface VerificationStatus {
+  /** Stable UUIDv7 binding identities, ordered by identity; omitted when empty. */
+  readonly binding_ids?: readonly string[];
+  /** Fitted Drift baseline lifecycle of a Drift Verifier; omitted otherwise. */
+  readonly baseline?: {
+    readonly state: "pending" | "building" | "ready" | "failed";
+    readonly data: CardRef;
+    readonly error?: VerificationError;
+  };
 }
 
 /** Server outcome for one Card in a composite registration. */
@@ -1128,6 +1153,432 @@ export class Cards {
   }
 }
 
+/** What a manual run verifies: one projected binding, or one exact Verifier over one subject. */
+export type VerificationRunTarget =
+  | { readonly kind: "binding"; readonly binding_id: string }
+  | {
+      readonly kind: "verifier";
+      readonly verifier_uid: string;
+      readonly subject_card_uid: string;
+    };
+
+/** A manual Drift run request: its target and an RFC 3339 `[start, end)` window. */
+export interface StartVerificationRunRequest {
+  readonly target: VerificationRunTarget;
+  readonly input: {
+    readonly kind: "drift_window";
+    readonly start: string;
+    readonly end: string;
+  };
+}
+
+/** A structured run or dispatch failure. */
+export interface VerificationError {
+  readonly code: string;
+  readonly message: string;
+}
+
+/** One binding's exact identities, activity gate, readiness, and cursor. */
+export interface VerificationBindingStatus {
+  readonly binding_id: string;
+  readonly owner_card_uid: string;
+  readonly subject_card_uid: string;
+  readonly verifier_uid: string;
+  readonly active: boolean;
+  readonly readiness: "ready" | "baseline_not_ready" | "verifier_unavailable";
+  readonly next_run_at: string | null;
+  readonly last_activated_at: string | null;
+  readonly last_run_id: string | null;
+}
+
+/** One Operator dispatch a failed binding run produced. */
+export interface OperatorDispatchState {
+  readonly dispatch_id: string;
+  readonly operator: { readonly uid: string } | { readonly digest: string };
+  readonly status: "pending" | "running" | "retrying" | "delivered" | "failed";
+  readonly error: VerificationError | null;
+}
+
+/** One run's execution status, requester, result pointer, and dispatches. */
+export interface VerificationRunStatus {
+  readonly run_id: string;
+  readonly status:
+    | "pending"
+    | "running"
+    | "retrying"
+    | "completed"
+    | "cancelled"
+    | "timed_out"
+    | "errored";
+  readonly requested_by_principal_id: string | null;
+  readonly result_id: string | null;
+  readonly error: VerificationError | null;
+  readonly dispatches: readonly OperatorDispatchState[];
+}
+
+/**
+ * Tenant-scoped Verification control-plane client over the shared Rust handle.
+ *
+ * The server decides readiness, authorizes and audits each request, and
+ * enqueues runs; failures throw a structured {@link WyrdError}. Binding IDs
+ * come from a Card's `status.verification.binding_ids`; verdicts are read from
+ * Bifrost by the run's `result_id`.
+ */
+export class Verification {
+  readonly #native: NativeVerification;
+
+  private constructor(native: NativeVerification) {
+    this.#native = native;
+  }
+
+  /**
+   * Build a Verification client without performing IO.
+   *
+   * Omitted options resolve through the same chain as {@link Cards.connect}.
+   */
+  static connect(
+    options: { readonly serverUrl?: string; readonly credential?: string } = {},
+  ): Verification {
+    const connection = connectVerification(
+      options.serverUrl,
+      options.credential,
+    );
+    return new Verification(
+      nativeHandle(connection.verification, connection.error),
+    );
+  }
+
+  /** Read one binding's identities, activity, readiness, and cursor. */
+  async getBinding(bindingId: string): Promise<VerificationBindingStatus> {
+    return lifecycleValue<VerificationBindingStatus>(
+      await this.#native.getBinding(bindingId),
+    );
+  }
+
+  /**
+   * Durably enqueue one manual Drift run and return its run ID.
+   *
+   * Resolves once the run is enqueued, not finished; poll {@link getRun}. A
+   * retry with the same `idempotencyKey` and request returns the same run ID.
+   */
+  async startRun(
+    request: StartVerificationRunRequest,
+    options: { readonly idempotencyKey?: string } = {},
+  ): Promise<string> {
+    return lifecycleValue<{ readonly run_id: string }>(
+      await this.#native.startRun(
+        JSON.stringify(request),
+        options.idempotencyKey,
+      ),
+    ).run_id;
+  }
+
+  /** Read one run's execution status, requester, result pointer, and dispatches. */
+  async getRun(runId: string): Promise<VerificationRunStatus> {
+    return lifecycleValue<VerificationRunStatus>(
+      await this.#native.getRun(runId),
+    );
+  }
+}
+
+/** One media item an Eval observation names for its judge Prompt. */
+export type EvalMediaRef = {
+  /** The `${media:id}` binding slot this artifact fills in the judge Prompt. */
+  readonly id: string;
+  /** The supported media kind, chosen explicitly rather than from the URI. */
+  readonly kind: "image" | "document";
+  /** Durable object-storage locator; the server reads the bytes at judge time. */
+  readonly uri: string;
+  /** IANA media type, such as `image/png`. */
+  readonly mediaType?: string;
+};
+
+/** The optional per-emission data an Eval observation may carry. */
+export type EvalOptions = {
+  /** The observed interaction's session; runs and sessions are many-to-many. */
+  readonly sessionId?: string;
+  /** Media descriptors the judge Prompt binds by `id`. */
+  readonly media?: readonly EvalMediaRef[];
+  /** Explicit lower-case hex trace identity, which wins over the active span. */
+  readonly traceId?: string;
+  /** Explicit lower-case hex span identity within `traceId`. */
+  readonly spanId?: string;
+};
+
+/** Refuse one observation input the strict serializer cannot carry exactly. */
+function invalidObservationInput(field: string, path: string, reason: string): WyrdError {
+  return new WyrdError(
+    "WYRD_SPEC_400_VALIDATION",
+    400,
+    "Validation failed",
+    `${field} is invalid: ${path} ${reason}`,
+    "Check the submitted Wyrd request fields against the published schema and retry.",
+    { field, path, reason },
+  );
+}
+
+/** Whether `key` is a canonical element index below `length`, which JSON keeps. */
+function isArrayIndex(key: string, length: number): boolean {
+  return String(Number(key)) === key && Number.isInteger(Number(key)) && Number(key) >= 0 && Number(key) < length;
+}
+
+/**
+ * Serialize one observation input as JSON text, refusing what `JSON.stringify`
+ * would silently drop or coerce.
+ *
+ * `JSON.stringify` omits `undefined`, functions, symbols, symbol keys,
+ * non-enumerable properties, and non-element array properties, turns non-finite
+ * numbers into `null`, cannot keep an unsafe integer exact, throws on bigint
+ * and cycles, and flattens a `Map` or `Date` through its own rules. Rust only
+ * ever sees the resulting text, so the one place such a change is detectable
+ * is here, before it happens. Only plain objects, arrays, strings, booleans,
+ * `null`, and finite safe numbers pass; durable validation stays in Rust.
+ * Traversal reads every property and element exactly once into a plain
+ * snapshot, and that snapshot is what gets stringified, so a getter cannot
+ * return one value to validation and another to serialization.
+ *
+ * @throws a `WYRD_SPEC_400_VALIDATION` {@link WyrdError} naming the offending
+ * path.
+ */
+function strictJson(field: string, value: unknown): string {
+  const ancestors = new Set<object>();
+  const check = (node: unknown, path: string): unknown => {
+    if (node === null || typeof node === "string" || typeof node === "boolean") {
+      return node;
+    }
+    if (typeof node === "number") {
+      if (!Number.isFinite(node)) {
+        throw invalidObservationInput(field, path, "is not a finite number");
+      }
+      if (Number.isInteger(node) && !Number.isSafeInteger(node)) {
+        throw invalidObservationInput(field, path, "is an integer beyond the safe range");
+      }
+      return node;
+    }
+    if (typeof node !== "object") {
+      throw invalidObservationInput(field, path, `is an unsupported ${typeof node} value`);
+    }
+    if (ancestors.has(node)) {
+      throw invalidObservationInput(field, path, "is a cycle");
+    }
+    ancestors.add(node);
+    let snapshot: unknown;
+    if (Array.isArray(node)) {
+      for (const key of Reflect.ownKeys(node)) {
+        if (key !== "length" && !(typeof key === "string" && isArrayIndex(key, node.length))) {
+          throw invalidObservationInput(field, path, "has a non-element array property");
+        }
+      }
+      const items: unknown[] = [];
+      for (let index = 0; index < node.length; index += 1) {
+        items.push(check(node[index], `${path}[${index}]`));
+      }
+      snapshot = items;
+    } else {
+      const prototype = Object.getPrototypeOf(node) as unknown;
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw invalidObservationInput(field, path, "is not a plain object");
+      }
+      const keys = Reflect.ownKeys(node);
+      for (const key of keys) {
+        if (typeof key === "symbol") {
+          throw invalidObservationInput(field, path, "has a symbol key");
+        }
+        if (!Object.prototype.propertyIsEnumerable.call(node, key)) {
+          throw invalidObservationInput(field, path, `has a non-enumerable property ${key}`);
+        }
+      }
+      snapshot = Object.fromEntries(
+        (keys as string[]).map((key) => [key, check((node as Record<string, unknown>)[key], `${path}.${key}`)]),
+      );
+    }
+    ancestors.delete(node);
+    return snapshot;
+  };
+  return JSON.stringify(check(value, "$"));
+}
+
+/**
+ * The application's `@opentelemetry/api`, resolved once on first use; `null`
+ * when it is not installed. Loaded lazily rather than imported so the SDK does
+ * not make OpenTelemetry a required dependency.
+ */
+let otelApi: typeof import("@opentelemetry/api") | null | undefined;
+
+/**
+ * Trace and span identity of Node's active OpenTelemetry span.
+ *
+ * Node's OTel context never becomes Rust's current `tracing` span across
+ * N-API, so the shared Rust fallback cannot see it; this boundary reads it and
+ * passes the IDs down the ordinary explicit-options path. Both IDs or neither:
+ * no installed API, no active span, or an invalid context supplies nothing.
+ */
+function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string } {
+  if (otelApi === undefined) {
+    try {
+      otelApi = require("@opentelemetry/api") as typeof import("@opentelemetry/api");
+    } catch {
+      otelApi = null;
+    }
+  }
+  const spanContext = otelApi?.trace.getActiveSpan()?.spanContext();
+  if (spanContext === undefined || !otelApi?.isSpanContextValid(spanContext)) {
+    return {};
+  }
+  return { traceId: spanContext.traceId, spanId: spanContext.spanId };
+}
+
+/** The closed own-key set of one {@link EvalMediaRef}. */
+const MEDIA_KEYS: ReadonlySet<string | symbol> = new Set(["id", "kind", "uri", "mediaType"]);
+
+/**
+ * Project Eval media descriptors to their wire names and serialize them.
+ *
+ * The projection would silently drop any key outside the closed descriptor
+ * shape, so each original descriptor's own keys are checked first; declared
+ * fields are then read once each and the snapshot goes through
+ * {@link strictJson}.
+ *
+ * @throws a `WYRD_SPEC_400_VALIDATION` {@link WyrdError} naming the offending
+ * descriptor.
+ */
+function mediaJson(media?: readonly EvalMediaRef[]): string | undefined {
+  if (media === undefined) {
+    return undefined;
+  }
+  return strictJson(
+    "media",
+    media.map((item, index) => {
+      for (const key of Reflect.ownKeys(item)) {
+        if (!MEDIA_KEYS.has(key) || !Object.prototype.propertyIsEnumerable.call(item, key)) {
+          throw invalidObservationInput("media", `$[${index}]`, `has a symbol, hidden, or undeclared key ${String(key)}`);
+        }
+      }
+      const { id, kind, uri, mediaType } = item;
+      return { id, kind, uri, ...(mediaType === undefined ? {} : { media_type: mediaType }) };
+    }),
+  );
+}
+
+/**
+ * The three observation emits available on one scoped {@link Run}.
+ *
+ * `drift` and `eval` are synchronous: their fixed tables were described at
+ * {@link WyrdState.startBifrost}, so an emit only projects and enqueues.
+ * Returning is queue admission, never a durable acknowledgement —
+ * {@link WyrdState.shutdown} is the barrier.
+ */
+export class Observe {
+  readonly #native: NativeRun;
+
+  /** @internal Wrap the native run this surface emits through. */
+  constructor(native: NativeRun) {
+    this.#native = native;
+  }
+
+  /**
+   * Emit one Drift observation as one row per feature.
+   *
+   * @throws a {@link WyrdError} for a payload that is not a flat object of
+   * strings, finite numbers, or booleans, before startup, after shutdown, or
+   * when the producer is saturated.
+   */
+  drift(
+    features: Readonly<Record<string, string | number | boolean>>,
+    options: { readonly sessionId?: string } = {},
+  ): void {
+    lifecycleValue<null>(
+      this.#native.drift(strictJson("features", features), options.sessionId),
+    );
+  }
+
+  /**
+   * Emit one Eval observation carrying its context and identity.
+   *
+   * With neither `traceId` nor `spanId` the active OpenTelemetry span supplies
+   * both; a `spanId` without its `traceId` is refused.
+   *
+   * @throws a {@link WyrdError} for a context or media descriptor the strict
+   * serializer refuses, a malformed identifier,
+   * before startup, after shutdown, or when the producer is saturated.
+   */
+  eval(context: unknown, options: EvalOptions = {}): void {
+    const contextJson = strictJson("context", context);
+    const media = mediaJson(options.media);
+    const identity = options.traceId === undefined && options.spanId === undefined
+      ? activeSpanIds()
+      : options;
+    lifecycleValue<null>(
+      this.#native.eval(
+        contextJson,
+        options.sessionId,
+        media,
+        identity.traceId,
+        identity.spanId,
+      ),
+    );
+  }
+
+  /**
+   * Emit one row into a registered `vala.datasets.<name>` table.
+   *
+   * The first call for a table describes it; later calls reuse the cached
+   * schema and producer, so only the first awaits a lookup.
+   *
+   * @throws a {@link WyrdError} for a table outside `vala.datasets`, an unknown
+   * or unauthorized table, before startup, or after shutdown.
+   */
+  async record(table: string, row: unknown): Promise<void> {
+    lifecycleValue<null>(await this.#native.record(table, strictJson("row", row)));
+  }
+}
+
+/**
+ * One invocation, and one Card-scoped view of it.
+ *
+ * Reached through {@link WyrdState.run}. Opening a run is local: no network IO
+ * and no server-side Run resource. Views are immutable — {@link Run.forCard}
+ * returns a sibling instead of retargeting this one — so concurrent emits
+ * cannot observe a moved subject.
+ */
+export class Run {
+  readonly #native: NativeRun;
+
+  private constructor(native: NativeRun) {
+    this.#native = native;
+  }
+
+  /** @internal Unwrap one closed native open result. */
+  static fromOpen(open: NativeRunOpen): Run {
+    return new Run(nativeHandle(open.run, open.error));
+  }
+
+  /** The UUIDv7 invocation identity this run and every view of it share. */
+  get runId(): string {
+    return this.#native.runId;
+  }
+
+  /** The exact `space/Kind/name@version` this view observes. */
+  get cardRef(): string {
+    return this.#native.cardRef;
+  }
+
+  /** The emit surface for this view. */
+  get observe(): Observe {
+    return new Observe(this.#native);
+  }
+
+  /**
+   * An immutable sibling view scoped to a registered alias.
+   *
+   * @throws a {@link WyrdError} when the bundle does not register `alias`. No
+   * network IO occurs.
+   */
+  forCard(alias: string): Run {
+    return Run.fromOpen(this.#native.forCard(alias));
+  }
+}
+
 /**
  * Offline view of a hydrated Card bundle over the shared Rust `WyrdState`.
  *
@@ -1171,6 +1622,69 @@ export class WyrdState {
   /** The verified local artifacts for an alias. */
   artifacts(alias: string): readonly HydratedArtifact[] {
     return lifecycleValue<HydratedArtifact[]>(this.#native.artifacts(alias));
+  }
+
+  /**
+   * Connect this state's one Bifrost writer and describe the fixed tables.
+   *
+   * The options are {@link Bifrost.connect}'s and resolve through the same
+   * chain when omitted. Startup describes `vala.drift.observations` and
+   * `vala.eval.observations` before resolving, so a run can never enqueue
+   * against a missing, unauthorized, or incompatible system table. `table`
+   * keeps its existing Bifrost meaning and does not choose a run's destination.
+   *
+   * @throws a {@link WyrdError} for a second start, a closed state, a missing
+   * credential, an undialable ingest channel, or a fixed table that is absent,
+   * unauthorized, or incompatible.
+   */
+  async startBifrost(
+    options: {
+      readonly table?: TableConfig;
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly grpcUrl?: string;
+    } = {},
+  ): Promise<void> {
+    lifecycleValue<null>(
+      await this.#native.startBifrost(
+        options.table?.native,
+        options.serverUrl,
+        options.credential,
+        options.grpcUrl,
+      ),
+    );
+  }
+
+  /** Open one invocation over this state, targeting the root Service Card. */
+  run(): Run {
+    return Run.fromOpen(this.#native.run());
+  }
+
+  /**
+   * Drain every producer of this state's writer without closing it.
+   *
+   * The explicit durability barrier for a test or a finite job.
+   *
+   * @throws a {@link WyrdError} before startup, after shutdown, or for the
+   * first producer or sink failure.
+   */
+  async flush(): Promise<void> {
+    lifecycleValue<null>(await this.#native.flush());
+  }
+
+  /**
+   * Drain every producer of this state's writer and close it to writes.
+   *
+   * Call this once at graceful shutdown, not after each observation: queue
+   * admission is not a durable acknowledgement, so an abrupt exit before it
+   * resolves can lose pending rows. After an ambiguous failure, retry
+   * `shutdown()` on the same state rather than replacing the writer; a
+   * successfully closed state stays closed.
+   *
+   * @throws a {@link WyrdError} for the first producer or sink failure.
+   */
+  async shutdown(): Promise<void> {
+    lifecycleValue<null>(await this.#native.shutdown());
   }
 }
 

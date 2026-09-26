@@ -59,7 +59,9 @@ pub use query::{
 };
 pub use scope::{ClientScope, SinkKind};
 pub use sink::{BifrostIngestSink, IngestTransport};
-pub use table::{Correlation, ResolvedTable, TableConfig};
+pub use table::{Correlation, ResolvedTable, TableConfig, WriterTable};
+/// The bounded producer-queue configuration a Bifrost writer is connected with.
+pub use wyrd_queue::QueueConfig;
 
 // C4a forward schema helpers, re-exported so SDK users build the user Arrow
 // schema from a `FieldSpec` set or a JSON-Schema value without reaching into

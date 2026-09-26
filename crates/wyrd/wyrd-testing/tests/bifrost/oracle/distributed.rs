@@ -4,6 +4,8 @@
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
 
+use std::time::Duration;
+
 use arrow::array::{Array, Int64Array};
 use vala_bifrost_redux::oracle::iceberg_projection_probe;
 use wyrd_client::WyrdClient;
@@ -17,6 +19,16 @@ use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use crate::support::*;
+
+/// Bound on polls waiting for the Oracle graph to release every reservation.
+///
+/// Terminal delivery precedes asynchronous graph settlement, so the journey
+/// observes the zero-ownership invariant across this bound instead of sampling
+/// it once at the terminal frame.
+const SETTLEMENT_POLLS: usize = 300;
+
+/// Interval between polls for a settled Oracle graph.
+const SETTLEMENT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Which physical pruning signal a topology's follower cut can actually move.
 enum PruningExpectation {
@@ -315,11 +327,11 @@ async fn prove_selective_predicate_pruning(
         .into());
     }
 
-    // A follower settles its cancelled graph, and so its peer permit, on its
-    // own stage-operation path after the leader's terminal frame, so this is a
-    // bounded convergence rather than an instantaneous read.
+    // A terminal response reaches the caller before the graph settles, so the
+    // exact zero-ownership invariant is observed under a bound rather than
+    // sampled once. The final nonzero snapshot is reported on timeout.
     let mut inspection = cluster.oracle_inspection().await?;
-    for _ in 0..CLEAN_NODE_POLLS {
+    for _ in 0..SETTLEMENT_POLLS {
         if inspection.active_queries == 0
             && inspection.queued_queries == 0
             && inspection.reserved_memory_bytes == 0
@@ -330,7 +342,7 @@ async fn prove_selective_predicate_pruning(
             cluster.shutdown().await?;
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
         inspection = cluster.oracle_inspection().await?;
     }
     Err(format!("Oracle runtime did not settle: {inspection:?}").into())

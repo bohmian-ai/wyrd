@@ -1,13 +1,15 @@
 //! Server-owned scheduled query caller.
 
+use arrow::record_batch::RecordBatch;
 use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::oracle::{AuthorizedQueryContext, QueryIpcDecoder};
+use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryIpcDecoder};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome, VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
 
+use crate::components::auth::Caller;
 use crate::state::AppState;
 use futures_util::StreamExt as _;
 
@@ -27,11 +29,18 @@ pub struct ScheduledQueryOutcome {
 /// entry every public caller uses, and settles the returned stream itself. It
 /// deliberately owns no clock, queue, job, loop, path selector, or alternate
 /// operation — whatever decides *when* a statement runs stays outside it.
+///
+/// A caller built by [`Self::authenticated`] instead holds a verified
+/// [`Caller`] and dispatches through the public
+/// [`stream_query`](super::service::stream_query) entry, so capability
+/// admission and the audited object denial apply exactly as for any client.
 pub struct ScheduledQueryCaller {
     /// Shared server state owning Gate, the Oracle, and admission.
     state: AppState,
     /// Context the server authorized for this caller, reused per statement.
     context: AuthorizedQueryContext,
+    /// Verified caller whose statements pass public admission, when present.
+    caller: Option<Caller>,
     /// Token whose cancellation settles the stream before its own deadline.
     cancellation: CancellationToken,
 }
@@ -47,8 +56,32 @@ impl ScheduledQueryCaller {
         Self {
             state,
             context,
+            caller: None,
             cancellation,
         }
+    }
+
+    /// Binds one verified caller, whose statements pass public query admission.
+    ///
+    /// The Oracle context is derived from `caller` exactly as the public query
+    /// service derives it, so the settlement this owner performs names the
+    /// same tenant and request as the admitted stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns the tenant invariant error when the principal and caller tenant
+    /// disagree.
+    pub fn authenticated(
+        state: AppState,
+        caller: Caller,
+        cancellation: CancellationToken,
+    ) -> Result<Self, WyrdError> {
+        Ok(Self {
+            state,
+            context: super::service::oracle_context(&caller)?,
+            caller: Some(caller),
+            cancellation,
+        })
     }
 
     /// Runs and settles one statement through the ordinary query entry.
@@ -74,13 +107,32 @@ impl ScheduledQueryCaller {
         &self,
         request: BifrostQueryRequest,
     ) -> Result<ScheduledQueryOutcome, WyrdError> {
+        self.run_with(request, |_| Ok(())).await
+    }
+
+    /// Runs and settles one statement, handing each decoded batch to `on_batch`.
+    ///
+    /// Batches arrive in stream order and are not retained, so a caller that
+    /// folds them keeps only its own state. A batch `on_batch` refuses ends
+    /// consumption and settles the stream like any other failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::run`], and the error `on_batch` returned.
+    ///
+    /// # Cancellation
+    ///
+    /// Behaves as [`Self::run`].
+    pub async fn run_with<F>(
+        &self,
+        request: BifrostQueryRequest,
+        mut on_batch: F,
+    ) -> Result<ScheduledQueryOutcome, WyrdError>
+    where
+        F: FnMut(RecordBatch) -> Result<(), WyrdError>,
+    {
         let visibility = request.visibility;
-        let mut stream = self
-            .state
-            .bifrost
-            .query_sql(self.context.clone(), request)
-            .await
-            .map_err(WyrdError::from)?;
+        let mut stream = self.dispatch(request).await?;
         // The stream's absolute deadline becomes one fixed instant before any
         // frame is taken, so no leg of consumption — least of all the wait for
         // clean EOF after a terminal — can start a fresh budget.
@@ -92,6 +144,7 @@ impl ScheduledQueryCaller {
             &self.cancellation,
             visibility,
             &mut terminal,
+            &mut on_batch,
         )
         .await
         {
@@ -111,6 +164,26 @@ impl ScheduledQueryCaller {
                     .await?;
                 Err(error)
             }
+        }
+    }
+
+    /// Dispatches one statement through public admission or the bound context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable pre-stream admission or query error.
+    async fn dispatch(&self, request: BifrostQueryRequest) -> Result<OracleQueryStream, WyrdError> {
+        match &self.caller {
+            Some(caller) => {
+                super::service::stream_query(self.state.clone(), caller.clone(), request, None)
+                    .await
+            }
+            None => self
+                .state
+                .bifrost
+                .query_sql(self.context.clone(), request)
+                .await
+                .map_err(WyrdError::from),
         }
     }
 
@@ -137,15 +210,17 @@ impl ScheduledQueryCaller {
     ///
     /// Cancelling the bound token or reaching the fixed deadline abandons the
     /// stream; the caller settles it.
-    async fn consume_to_terminal<S>(
+    async fn consume_to_terminal<S, F>(
         frames: &mut S,
         deadline: tokio::time::Instant,
         cancellation: &CancellationToken,
         visibility: VisibilityMode,
         observed: &mut Option<QueryTerminalFrame>,
+        on_batch: &mut F,
     ) -> Result<ScheduledQueryOutcome, WyrdError>
     where
         S: futures_util::Stream<Item = Result<QueryStreamFrame, BifrostError>> + Unpin,
+        F: FnMut(RecordBatch) -> Result<(), WyrdError>,
     {
         let mut decoder = QueryIpcDecoder::new();
         let mut rows = 0_u64;
@@ -187,11 +262,12 @@ impl ScheduledQueryCaller {
                     let decoded = decoder
                         .accept_batch(&batch.arrow_ipc_batch)
                         .map_err(|_| WyrdError::from(BifrostError::QueryExecutionFailed))?;
-                    let decoded = u64::try_from(decoded.num_rows())
+                    let decoded_rows = u64::try_from(decoded.num_rows())
                         .map_err(|_| WyrdError::from(BifrostError::QueryStreamProtocol))?;
                     rows = rows
-                        .checked_add(decoded)
+                        .checked_add(decoded_rows)
                         .ok_or_else(|| WyrdError::from(BifrostError::QueryStreamProtocol))?;
+                    on_batch(decoded)?;
                 }
                 QueryStreamFrame::Terminal(terminal) => {
                     terminal
@@ -397,6 +473,7 @@ mod tests {
                 &CancellationToken::new(),
                 VisibilityMode::PublishedOnly,
                 &mut None,
+                &mut |_| Ok(()),
             )
             .await
             .expect_err(label);
@@ -424,6 +501,7 @@ mod tests {
             &CancellationToken::new(),
             VisibilityMode::PublishedOnly,
             &mut None,
+            &mut |_| Ok(()),
         )
         .await
         .expect_err("a malformed end-of-stream is refused");
@@ -445,6 +523,7 @@ mod tests {
             &CancellationToken::new(),
             VisibilityMode::PublishedOnly,
             &mut None,
+            &mut |_| Ok(()),
         )
         .await
         .expect("a valid terminal followed by clean EOF settles");
@@ -459,9 +538,93 @@ mod tests {
             &CancellationToken::new(),
             VisibilityMode::PublishedOnly,
             &mut None,
+            &mut |_| Ok(()),
         )
         .await
         .expect_err("an elapsed deadline is incomplete");
+        assert_eq!(
+            error.code(),
+            WyrdError::from(BifrostError::QueryStreamIncomplete).code()
+        );
+    }
+
+    /// Decoded batches reach the caller's sink in stream order, a sink refusal
+    /// ends consumption with the sink's error and no outcome, and a cancelled
+    /// token settles as incomplete even with frames ready.
+    ///
+    /// # Panics
+    /// Panics if a batch is lost, reordered, or retained after refusal, or if
+    /// cancellation yields an outcome.
+    #[tokio::test]
+    async fn scheduled_sink_folds_batches_and_refusal_ends_the_stream() {
+        let (prefix, fragments, eos) = split_ipc_stream(&[&[1, 2], &[3]]);
+        let frames = || {
+            let mut frames = vec![QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "test".to_owned(),
+                arrow_ipc_schema: prefix.clone(),
+            })];
+            frames.extend(fragments.iter().map(|fragment| {
+                QueryStreamFrame::Batch(QueryBatchFrame {
+                    arrow_ipc_batch: fragment.clone(),
+                })
+            }));
+            frames.push(QueryStreamFrame::Terminal(success_terminal(3, eos.clone())));
+            futures_util::stream::iter(frames.into_iter().map(Ok::<_, BifrostError>))
+        };
+        /// Consumes `stream` into `sink` under `cancellation` and a live deadline.
+        async fn consume<S, F>(
+            mut stream: S,
+            cancellation: CancellationToken,
+            mut sink: F,
+        ) -> Result<ScheduledQueryOutcome, WyrdError>
+        where
+            S: futures_util::Stream<Item = Result<QueryStreamFrame, BifrostError>> + Unpin,
+            F: FnMut(RecordBatch) -> Result<(), WyrdError>,
+        {
+            ScheduledQueryCaller::consume_to_terminal(
+                &mut stream,
+                deadline_instant(deadline_in(30_000)),
+                &cancellation,
+                VisibilityMode::PublishedOnly,
+                &mut None,
+                &mut sink,
+            )
+            .await
+        }
+
+        let mut seen = Vec::new();
+        let outcome = consume(frames(), CancellationToken::new(), |batch: RecordBatch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("fixture column is Int64");
+            seen.extend(ids.values().iter().copied());
+            Ok(())
+        })
+        .await
+        .expect("a valid stream settles");
+        assert_eq!(outcome.rows, 3);
+        assert_eq!(seen, vec![1, 2, 3]);
+
+        let mut calls = 0;
+        let error = consume(frames(), CancellationToken::new(), |_| {
+            calls += 1;
+            Err(BifrostError::QueryStreamProtocol.into())
+        })
+        .await
+        .expect_err("a refused batch ends consumption");
+        assert_eq!(calls, 1, "no batch is handed over after a refusal");
+        assert_eq!(
+            error.code(),
+            WyrdError::from(BifrostError::QueryStreamProtocol).code()
+        );
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let error = consume(frames(), cancelled, |_| Ok(()))
+            .await
+            .expect_err("a cancelled caller never settles an outcome");
         assert_eq!(
             error.code(),
             WyrdError::from(BifrostError::QueryStreamIncomplete).code()

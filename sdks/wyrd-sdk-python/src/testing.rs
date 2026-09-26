@@ -95,11 +95,17 @@ fn publish_env(py: Python<'_>, key: &str, value: Option<&str>) -> WyrdPyResult<(
 
 /// Python context manager for the Wyrd in-process test server.
 #[pyclass(module = "wyrd._wyrd.testing")]
+// justification: preserve the established Python test-harness constructor flags
+#[allow(clippy::struct_excessive_bools)]
 pub struct WyrdTestServer {
     /// Retained from the Python constructor signature; teardown always runs.
     cleanup: bool,
     /// Whether entering publishes the `WYRD_*` endpoint variables.
     mutate_env: bool,
+    /// Whether the audit publisher runs during the fixture.
+    audit_publication: bool,
+    /// Whether the verification runtime is composed during the fixture.
+    verification_runtime: bool,
     /// Root every built-in gateway adapter targets; `None` keeps a gateway
     /// that dispatches nothing unless `live_providers` is set.
     provider_base_url: Option<Url>,
@@ -136,10 +142,14 @@ impl WyrdTestServer {
     /// Raises the harness error when `provider_base_url` is not an absolute
     /// URL, or when it is combined with `live_providers`.
     #[new]
-    #[pyo3(signature = (cleanup = true, mutate_env = true, provider_base_url = None, live_providers = false))]
+    #[pyo3(signature = (cleanup = true, mutate_env = true, audit_publication = true, verification_runtime = false, provider_base_url = None, live_providers = false))]
+    // justification: PyO3 projects the existing Python test-harness flags directly
+    #[allow(clippy::fn_params_excessive_bools)]
     fn __new__(
         cleanup: bool,
         mutate_env: bool,
+        audit_publication: bool,
+        verification_runtime: bool,
         provider_base_url: Option<&str>,
         live_providers: bool,
     ) -> WyrdPyResult<Self> {
@@ -157,6 +167,8 @@ impl WyrdTestServer {
         Ok(Self {
             cleanup,
             mutate_env,
+            audit_publication,
+            verification_runtime,
             provider_base_url,
             live_providers,
             base_url: None,
@@ -177,9 +189,17 @@ impl WyrdTestServer {
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
         let root = slf.provider_base_url.clone();
         let live_providers = slf.live_providers;
+        let audit_publication = slf.audit_publication;
+        let verification_runtime = slf.verification_runtime;
         let (server, api_key) = wyrd_runtime::runtime()
             .block_on(async {
                 let mut builder = TestServer::builder();
+                if !audit_publication {
+                    builder = builder.without_audit_publication_for_test();
+                }
+                if verification_runtime {
+                    builder = builder.with_verification_runtime_for_test();
+                }
                 if let Some(root) = root {
                     builder = builder.with_gateway_provider_root_for_test(root);
                 } else if live_providers {
@@ -320,6 +340,28 @@ impl WyrdTestServer {
             bootstrap,
             "expected Machine bootstrap from bootstrap_service",
         )
+    }
+
+    /// Issue an API key for the principal projected by a registered Service Card.
+    ///
+    /// # Errors
+    /// Raises a harness error for an invalid Card identity or a missing principal.
+    // justification: PyO3 extracts the Python list into an owned Vec at the boundary
+    #[allow(clippy::needless_pass_by_value)]
+    fn credential_registered_service(
+        &self,
+        card_ref: &str,
+        roles: Vec<String>,
+    ) -> WyrdPyResult<String> {
+        let server = self.started()?;
+        let card_ref = card_ref
+            .parse::<wyrd_spec::reference::CardRef>()
+            .map_err(|error| harness_error(format!("invalid card identity: {error}")))?;
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+        let bootstrap = wyrd_runtime::runtime()
+            .block_on(server.credential_registered_service(&card_ref, &roles))
+            .map_err(py_error)?;
+        machine_key(bootstrap, "expected a machine bootstrap")
     }
 
     /// Materialize one canonical built-in table for the fixture tenant.
@@ -512,6 +554,54 @@ impl WyrdTestServer {
             .map_err(py_error)
     }
 
+    /// Bring a binding's schedule cursor to database time.
+    ///
+    /// # Errors
+    /// Raises a harness error for an invalid binding or failed fixture update.
+    fn make_binding_due(&self, binding_id: &str) -> WyrdPyResult<()> {
+        let server = self.started()?;
+        let binding = binding_id.parse().map_err(harness_error)?;
+        wyrd_runtime::runtime()
+            .block_on(async {
+                server
+                    .verification_fixture()
+                    .await?
+                    .make_binding_due(binding)
+                    .await
+            })
+            .map_err(harness_error)
+    }
+
+    /// Return every verification run ID for the fixture tenant.
+    ///
+    /// # Errors
+    /// Raises a harness error if the run query fails.
+    fn verification_runs(&self) -> WyrdPyResult<Vec<String>> {
+        let server = self.started()?;
+        let runs = wyrd_runtime::runtime()
+            .block_on(async { server.verification_fixture().await?.runs().await })
+            .map_err(harness_error)?;
+        Ok(runs.iter().map(ToString::to_string).collect())
+    }
+
+    /// Remove the fitted format from a ready Drift baseline for compatibility tests.
+    ///
+    /// # Errors
+    /// Raises a harness error for an invalid Verifier UID or failed update.
+    fn retire_fitted_format(&self, verifier_uid: &str) -> WyrdPyResult<()> {
+        let server = self.started()?;
+        let verifier = verifier_uid.parse().map_err(harness_error)?;
+        wyrd_runtime::runtime()
+            .block_on(async {
+                server
+                    .verification_fixture()
+                    .await?
+                    .retire_fitted_format(&verifier)
+                    .await
+            })
+            .map_err(harness_error)
+    }
+
     /// Truncate the next query after its schema frame in the real server.
     ///
     /// # Errors
@@ -606,6 +696,39 @@ impl WyrdTestServer {
         let server = self.started()?;
         wyrd_runtime::runtime()
             .block_on(server.query_denied_token())
+            .map_err(py_error)
+    }
+
+    /// Return the server-observed describe count for a fixture table.
+    ///
+    /// # Errors
+    /// Raises a harness error when the audit query fails.
+    fn table_describe_count(&self, fqn: &str) -> WyrdPyResult<i64> {
+        let server = self.started()?;
+        wyrd_runtime::runtime()
+            .block_on(server.table_describe_count(fqn))
+            .map_err(py_error)
+    }
+
+    /// Make describes of a fixture table fail until restored.
+    ///
+    /// # Errors
+    /// Raises a harness error when the fault cannot be installed.
+    fn fail_table_describe(&self, fqn: &str) -> WyrdPyResult<()> {
+        let server = self.started()?;
+        wyrd_runtime::runtime()
+            .block_on(server.fail_table_describe(fqn))
+            .map_err(py_error)
+    }
+
+    /// Remove the active table-describe fault.
+    ///
+    /// # Errors
+    /// Raises a harness error when the fault cannot be removed.
+    fn restore_table_describe(&self) -> WyrdPyResult<()> {
+        let server = self.started()?;
+        wyrd_runtime::runtime()
+            .block_on(server.restore_table_describe())
             .map_err(py_error)
     }
 

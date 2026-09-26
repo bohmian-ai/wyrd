@@ -140,7 +140,14 @@ fn validate_range(
             index,
             "principal_kind",
             &row.principal_kind,
-            ["global_admin", "tenant_admin", "user", "service", "agent"],
+            [
+                "global_admin",
+                "tenant_admin",
+                "user",
+                "service",
+                "agent",
+                "system",
+            ],
         )?;
         validate_enum(index, "outcome", &row.outcome, ["allowed", "denied"])?;
 
@@ -408,6 +415,21 @@ mod tests {
         let projection = project_audit_rows(system, &[row(system, 1)])
             .expect("system-owner decisions project into retained history");
         assert_eq!(projection.tenant, system);
+    }
+
+    /// Decisions made about the internal verification-result writer carry the
+    /// `system` principal kind and must project into retained history.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a `system`-kind row is refused.
+    #[test]
+    fn projects_system_principal_kind_rows() {
+        let authenticated = tenant(1);
+        let mut system_row = row(authenticated, 1);
+        system_row.principal_kind = "system".to_owned();
+        project_audit_rows(authenticated, &[system_row])
+            .expect("system-writer decisions project into retained history");
     }
 
     #[test]

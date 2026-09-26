@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VerificationRunStatus",
+  "description": "`GET /v1/verification/runs/{run_id}` response.\n\nExecution state and pointers only: the verdict and Drift/Eval details are read from Bifrost by `result_id`. A run may point at an acknowledged result before it is visible to analytical queries.",
+  "type": "object",
+  "required": [
+    "dispatches",
+    "run_id",
+    "status"
+  ],
+  "properties": {
+    "dispatches": {
+      "description": "Every Operator dispatch of a failed binding-created run, in identity order; empty otherwise.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/OperatorDispatchState"
+      }
+    },
+    "error": {
+      "description": "Last execution error of a retrying or terminal run.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/VerificationError"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "requested_by_principal_id": {
+      "description": "Authenticated caller of a manual run; null for scheduled and observation-created runs.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "result_id": {
+      "description": "Canonical result of a completed run.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "run_id": {
+      "description": "The run.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "status": {
+      "description": "Execution state.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerificationExecutionStatus"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "FrozenTarget": {
+      "description": "A frozen reference to one effective Trigger or Operator.\n\nA referenced Card is frozen by its exact UID; an inline body, which has no Card, by the canonical digest of its typed spec. Binding projection, runs, and dispatches store this identity so later Card changes never retarget admitted work.",
+      "oneOf": [
+        {
+          "description": "A registered Card version.",
+          "type": "object",
+          "required": [
+            "uid"
+          ],
+          "properties": {
+            "uid": {
+              "$ref": "#/definitions/CardUid"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "The canonical spec digest of an inline body.",
+          "type": "object",
+          "required": [
+            "digest"
+          ],
+          "properties": {
+            "digest": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OperatorDispatchState": {
+      "description": "Current state of one Operator dispatch in a Run GET response.",
+      "type": "object",
+      "required": [
+        "dispatch_id",
+        "operator",
+        "status"
+      ],
+      "properties": {
+        "dispatch_id": {
+          "description": "The dispatch.",
+          "type": "string",
+          "format": "uuid"
+        },
+        "error": {
+          "description": "Last delivery error, when one occurred.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VerificationError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operator": {
+          "description": "The frozen Operator Card UID or inline-spec digest.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FrozenTarget"
+            }
+          ]
+        },
+        "status": {
+          "description": "Independent delivery status.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OperatorDispatchStatus"
+            }
+          ]
+        }
+      }
+    },
+    "OperatorDispatchStatus": {
+      "description": "Delivery state of one Operator dispatch.",
+      "oneOf": [
+        {
+          "description": "Created by settlement and waiting for its first claim.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "Claimed by the Operator worker under an unexpired lease.",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "A transient delivery failure is waiting for its next attempt.",
+          "type": "string",
+          "enum": [
+            "retrying"
+          ]
+        },
+        {
+          "description": "The provider accepted the action.",
+          "type": "string",
+          "enum": [
+            "delivered"
+          ]
+        },
+        {
+          "description": "Failed terminally or exhausted its attempts.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        }
+      ]
+    },
+    "VerificationError": {
+      "description": "Structured, secret-free execution or delivery error.",
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "description": "Stable machine-readable error code.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Bounded human-readable description.",
+          "type": "string"
+        }
+      }
+    },
+    "VerificationExecutionStatus": {
+      "description": "Execution state of one Verifier run.\n\nIndependent of the verdict: only `completed` has one, and it lives in the Bifrost result the run points at. `cancelled`, `timed_out`, and `errored` never carry a verdict or dispatch an Operator.",
+      "oneOf": [
+        {
+          "description": "Enqueued and waiting for its first claim.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "Claimed by a runner under an unexpired lease.",
+          "type": "string",
+          "enum": [
+            "running"
+          ]
+        },
+        {
+          "description": "A retryable failure is waiting for its next attempt.",
+          "type": "string",
+          "enum": [
+            "retrying"
+          ]
+        },
+        {
+          "description": "Executed and produced an acknowledged result.",
+          "type": "string",
+          "enum": [
+            "completed"
+          ]
+        },
+        {
+          "description": "Stopped before producing a result.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        },
+        {
+          "description": "Exceeded its execution deadline.",
+          "type": "string",
+          "enum": [
+            "timed_out"
+          ]
+        },
+        {
+          "description": "Failed terminally or exhausted its attempts.",
+          "type": "string",
+          "enum": [
+            "errored"
+          ]
+        }
+      ]
+    }
+  }
+}

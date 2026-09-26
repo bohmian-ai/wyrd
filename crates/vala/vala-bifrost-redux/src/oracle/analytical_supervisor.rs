@@ -974,23 +974,39 @@ impl AnalyticalSupervisor {
         })
     }
 
-    /// Aborts one graph's lifecycle task in place, leaving it joinable.
+    /// Aborts one graph's lifecycle task in place and waits until it has ended.
     ///
     /// The one caller is the test that proves an exceptional lifecycle end is
     /// treated as cleanup failure. The handle stays in the entry so shutdown
     /// still takes and joins it, which is exactly the path production takes
     /// when a task panics.
+    ///
+    /// An abort cannot preempt a poll already running on another worker: a
+    /// signal sent before that poll parks would let the task run its whole
+    /// cleanup to completion instead of being cancelled. Waiting here until the
+    /// task has finished makes the abort, not a later signal, the task's end.
+    /// The graph lock is released before every yield.
     #[cfg(test)]
-    pub(super) fn abort_lifecycle_task_for_test(&self, graph: AnalyticalGraphKey) {
-        let Ok(graphs) = self.graphs.lock() else {
-            return;
-        };
-        if let Some(handle) = graphs
-            .get(&graph)
-            .and_then(|entry| entry.state().lifecycle.as_ref())
-            .and_then(|lifecycle| lifecycle.handle.as_ref())
-        {
-            handle.abort();
+    pub(super) async fn abort_lifecycle_task_for_test(&self, graph: AnalyticalGraphKey) {
+        loop {
+            let finished = {
+                let Ok(graphs) = self.graphs.lock() else {
+                    return;
+                };
+                let Some(handle) = graphs
+                    .get(&graph)
+                    .and_then(|entry| entry.state().lifecycle.as_ref())
+                    .and_then(|lifecycle| lifecycle.handle.as_ref())
+                else {
+                    return;
+                };
+                handle.abort();
+                handle.is_finished()
+            };
+            if finished {
+                return;
+            }
+            tokio::task::yield_now().await;
         }
     }
 

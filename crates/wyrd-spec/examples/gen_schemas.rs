@@ -38,7 +38,8 @@ use wyrd_spec::card::source::{
     LogConnection, MetricsConnection, SourceAuth, SourceKind, SourceSpec, SqlConnection,
     TraceConnection,
 };
-use wyrd_spec::card::trigger::{TriggerSchedule, TriggerSource, TriggerSpec};
+use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
@@ -73,14 +74,17 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
-    EvalPassGate, EvalRecordObservation, EvalRunOpenRequest, EvalRunOpenResponse, EvalSampling,
-    EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan, SimulatedUserMode,
-    SimulatedUserTurn, TurnDirective, UserTurnSubmission,
+    EvalPassGate, EvalRecordObservation, EvalSampling, EvalScenarioCollection, EvalSpec, EvalTask,
+    ExecutionPlan, SimulatedUserMode, SimulatedUserTurn, TurnDirective, UserTurnSubmission,
 };
 use wyrd_spec::vala::observation::{ObservationEnvelope, ObservationKind, RecordObservation};
 use wyrd_spec::vala::trace::{
     AttributeValue, GenAiEvalResult, GenAiSpanRecord, InstrumentationScope, Resource, SpanEvent,
     SpanKind, SpanLink, SpanRecord, SpanStatus, TraceSummaryRecord,
+};
+use wyrd_spec::verification::{
+    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
+    VerificationRunStatus,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -123,8 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<CardEvalSpec>(out, golden, "eval_spec")?;
     write::<DriftSpec>(out, golden, "drift_spec")?;
     write::<TriggerSpec>(out, golden, "trigger_spec")?;
-    write::<TriggerSchedule>(out, golden, "trigger_schedule")?;
-    write::<TriggerSource>(out, golden, "trigger_source")?;
+    write::<TriggerActivation>(out, golden, "trigger_activation")?;
+    write::<VerifierSpec>(out, golden, "verifier_spec")?;
+    write::<VerifierImplementation>(out, golden, "verifier_implementation")?;
+    write::<VerificationBinding>(out, golden, "verification_binding")?;
     write::<OperatorSpec>(out, golden, "operator_spec")?;
     write::<OperatorAction>(out, golden, "operator_action")?;
     write::<NotifyChannel>(out, golden, "notify_channel")?;
@@ -242,6 +248,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
     write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
     write::<AuditOutcome>(out, golden, "bifrost_audit_outcome")?;
+    write::<StartVerificationRunRequest>(out, golden, "start_verification_run_request")?;
+    write::<StartVerificationRunResponse>(out, golden, "start_verification_run_response")?;
+    write::<VerificationBindingStatus>(out, golden, "verification_binding_status")?;
+    write::<VerificationRunStatus>(out, golden, "verification_run_status")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;
@@ -254,8 +264,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_fixture::<EvalScenarioCollection>(eval_fixtures, "eval_scenario_collection")?;
     write_fixture::<EvalPassGate>(eval_fixtures, "eval_pass_gate")?;
     write_fixture::<EvalSampling>(eval_fixtures, "eval_sampling")?;
-    write_fixture::<EvalRunOpenRequest>(eval_fixtures, "eval_run_open_request")?;
-    write_fixture::<EvalRunOpenResponse>(eval_fixtures, "eval_run_open_response")?;
     write_fixture::<SimulatedUserMode>(eval_fixtures, "simulated_user_mode")?;
     write_fixture::<TurnDirective>(eval_fixtures, "turn_directive")?;
     write_fixture::<ConversationTurn>(eval_fixtures, "conversation_turn")?;

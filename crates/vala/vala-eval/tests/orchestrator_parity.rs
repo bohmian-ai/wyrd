@@ -123,19 +123,18 @@ async fn drive(
     }
 }
 
+/// A scripted LLM-judge walk reaches the fixture's expected pass rate.
 #[tokio::test(flavor = "multi_thread")]
 async fn scripted_walk_llm_judge_parity() {
     let fixture = fixture_value(include_str!("fixtures/parity/scripted_judge.json"));
     assert_eq!(fixture["expected_pass_rate"], json!(1.0));
-    let run_id = wyrd_spec::vala::ids::RunId::from_string("scripted-parity-run".to_owned());
-
     let outcome = drive(
         vec![judge_task("judge_passes")],
         vec![Ok(json!({"passed": true})), Ok(json!({"passed": true}))],
         scenario("scripted_judge", vec!["Continue"], None, 2),
         vec![
-            reply("First answer", vec![record(&run_id, true)]),
-            reply("DONE", vec![record(&run_id, true)]),
+            reply("First answer", vec![record(true)]),
+            reply("DONE", vec![record(true)]),
         ],
     )
     .await;
@@ -152,17 +151,16 @@ async fn scripted_walk_llm_judge_parity() {
     assert!((outcome.run.metrics.pass_rate - 1.0).abs() < f64::EPSILON);
 }
 
+/// A termination signal ends every scenario with the fixture's expected outcome.
 #[tokio::test(flavor = "multi_thread")]
 async fn termination_signal_parity() {
     let fixture = fixture_value(include_str!("fixtures/parity/termination_signal.json"));
     assert_eq!(fixture["expected_scenario_passed"], json!(true));
-    let run_id = wyrd_spec::vala::ids::RunId::from_string("signal-parity-run".to_owned());
-
     let outcome = drive(
         vec![assertion_task("context_ok")],
         Vec::new(),
         scenario("termination_signal", Vec::new(), Some("DONE"), 8),
-        vec![reply("DONE", vec![record(&run_id, true)])],
+        vec![reply("DONE", vec![record(true)])],
     )
     .await;
 
@@ -177,17 +175,16 @@ async fn termination_signal_parity() {
     );
 }
 
+/// Per-subject outcomes roll up exactly as the fixture expects.
 #[tokio::test(flavor = "multi_thread")]
 async fn subject_aggregation_parity() {
     let fixture = fixture_value(include_str!("fixtures/parity/subject_rollup.json"));
     assert_eq!(fixture["expected_subject_pass_rate"], json!(1.0));
-    let run_id = wyrd_spec::vala::ids::RunId::from_string("subject-parity-run".to_owned());
-
     let outcome = drive(
         vec![assertion_task("subject_context_ok")],
         Vec::new(),
         scenario("subject_rollup", Vec::new(), Some("DONE"), 1),
-        vec![reply("DONE", vec![record(&run_id, true)])],
+        vec![reply("DONE", vec![record(true)])],
     )
     .await;
 

@@ -234,6 +234,9 @@ mod pg_tests {
                 "bifrost.describe_table",
                 "bifrost.query",
                 "principals.list_credentials",
+                "cards.get",
+                "verification.get_binding",
+                "verification.get_run",
                 "gateway.list_provider_credentials",
                 "gateway.list_provider_deployments",
                 "gateway.get_fallback_policy",
@@ -252,6 +255,7 @@ mod pg_tests {
                 "gateway.delete_fallback_policy",
                 "gateway.delete_governance_policy",
                 "principals.revoke_credential",
+                "verification.start_run",
                 probe::TOOL_NAME,
             ],
             "an opted-in fixture advertises the context probe after the ordinary catalog"

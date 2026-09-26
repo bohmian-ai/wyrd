@@ -676,7 +676,7 @@ create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
 print("Keycloak users seeded")
 PYEOF
 
-cargo nextest run --locked -p wyrd-server --all-features --test identity_e2e --run-ignored=all --test-threads=1
+cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
 """
 
 [tasks."build:server"]

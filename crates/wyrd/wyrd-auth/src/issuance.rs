@@ -25,8 +25,8 @@ use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
     RoleRow, human_connection_is_active, insert_human_refresh_token, list_service_account_roles,
-    list_user_roles, lock_human_connection_slot, refresh_issuance_instant, roles_by_name,
-    service_account_by_id, user_by_id,
+    list_user_roles, lock_human_connection_slot, lock_refresh_family, refresh_issuance_instant,
+    roles_by_name, service_account_by_id, user_by_id,
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::row_types::auth::HumanConnectionBinding;
@@ -457,8 +457,15 @@ impl TenantTokenIssuer {
     /// row on renewal; it is both the family back-link that makes reuse
     /// detectable and the credential attribution of the renewed access token.
     /// `connection` is the exact human-connection id and revision the session
-    /// belongs to. Before anything is minted this takes the tenant's connection
-    /// slot lock — the lock every lifecycle mutation takes — and requires that
+    /// belongs to. Before anything is read or minted this takes the User's
+    /// tenant-qualified refresh-family lock — the lock rotation and
+    /// administrative User revocation hold through their commits — so first
+    /// login and renewal alike either commit before a revocation, whose family
+    /// snapshot then retires the new row, or wait for it and re-read the User
+    /// as suspended. The lock is transaction-scoped and held until the
+    /// caller's commit or rollback; rotation already holds it, and the owning
+    /// transaction reacquires it without waiting. It then takes the tenant's
+    /// connection slot lock — the lock every lifecycle mutation takes — and requires that
     /// exact revision to still be Active, so replacement, deactivation, or
     /// removal committed on any replica cuts the session off: once the mutation
     /// commits no successor can be written, and a mutation waiting on the lock
@@ -470,8 +477,8 @@ impl TenantTokenIssuer {
     /// Returns [`IssuanceError::ConnectionInactive`] when the bound connection
     /// revision is no longer Active, every [`Self::issue`] error,
     /// [`IssuanceError::Issue`] when the refresh token cannot be signed, and
-    /// [`IssuanceError::Database`] or [`IssuanceError::Wyrd`] when a store step
-    /// fails. Nothing is committed here.
+    /// [`IssuanceError::Database`] or [`IssuanceError::Wyrd`] when a lock or
+    /// store step fails. Nothing is committed here.
     pub async fn issue_human_session(
         &self,
         conn: &mut TenantConn<'_>,
@@ -480,6 +487,9 @@ impl TenantTokenIssuer {
         connection: HumanConnectionBinding,
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
+        lock_refresh_family(conn, "user", principal_id)
+            .await
+            .map_err(store_error)?;
         lock_human_connection_slot(conn)
             .await
             .map_err(store_error)?;
@@ -812,6 +822,8 @@ mod pg_tests {
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
     use super::{IssuanceError, TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
+    use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
+    use crate::revoke::revoke_principal_in_conn;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -1044,6 +1056,118 @@ mod pg_tests {
         assert!(
             matches!(result, Err(IssuanceError::ConnectionInactive)),
             "a stale binding must refuse, got {result:?}"
+        );
+    }
+
+    /// Read backend `conn`'s process id so a peer can observe its lock waits.
+    ///
+    /// # Panics
+    /// Panics when the statement fails.
+    async fn backend_pid(conn: &mut TenantConn<'_>) -> i32 {
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("backend pid reads")
+    }
+
+    /// Count `user`'s refresh rows in committed state, all and still active.
+    ///
+    /// # Panics
+    /// Panics when the connection or the count fails.
+    async fn committed_family(fixture: &PgFixture, user: Uuid) -> (i64, i64) {
+        let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
+        sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE revoked_at IS NULL)
+               FROM wyrd.auth_refresh_tokens
+              WHERE principal_kind = 'user' AND principal_id = $1",
+        )
+        .bind(user)
+        .fetch_one(&mut **fresh.transaction())
+        .await
+        .expect("family counts read")
+    }
+
+    /// First-login issuance and administrative User revocation serialize on
+    /// the User's refresh-family lock in both orders.
+    ///
+    /// Issuance first: with the session's row inserted and its transaction
+    /// open, revocation parks on the family lock, then retires the new row
+    /// once issuance commits, so no active family row survives. Revocation
+    /// first: with the User suspended and its transaction open, issuance parks
+    /// on the family lock before reading the User, then re-reads it as
+    /// suspended once revocation commits and refuses without writing a row.
+    ///
+    /// # Panics
+    /// Panics when either side fails to wait on the family lock, a transaction
+    /// fails, issuance is not refused after revocation, or any row is left
+    /// renewable.
+    #[tokio::test]
+    async fn initial_session_issuance_and_user_revocation_serialize() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
+        let early = seed_user(&mut setup).await;
+        let late = seed_user(&mut setup).await;
+        let binding = seed_active_human_connection(&mut setup)
+            .await
+            .expect("connection seeds");
+        setup.commit().await.expect("setup commits");
+
+        let mut issuing = fixture.tenant_conn().await.expect("issuing conn opens");
+        issuer()
+            .issue_human_session(&mut issuing, early, None, binding, "req-first-login")
+            .await
+            .expect("first login issues");
+        let mut revoking = fixture.tenant_conn().await.expect("revoking conn opens");
+        let revoke_pid = backend_pid(&mut revoking).await;
+        let (revoked, ()) = tokio::join!(
+            revoke_principal_in_conn(
+                &mut revoking,
+                PrincipalId::new(early),
+                PrincipalKindTag::User,
+                tenant,
+            ),
+            async {
+                wait_for_advisory_lock_wait(&fixture, revoke_pid).await;
+                issuing.commit().await.expect("issuance commits");
+            }
+        );
+        revoked.expect("revocation succeeds");
+        revoking.commit().await.expect("revocation commits");
+        assert_eq!(
+            committed_family(&fixture, early).await,
+            (1, 0),
+            "the first-login row exists and revocation retired it"
+        );
+
+        let mut revoking = fixture.tenant_conn().await.expect("revoking conn opens");
+        revoke_principal_in_conn(
+            &mut revoking,
+            PrincipalId::new(late),
+            PrincipalKindTag::User,
+            tenant,
+        )
+        .await
+        .expect("revocation succeeds");
+        let mut issuing = fixture.tenant_conn().await.expect("issuing conn opens");
+        let issue_pid = backend_pid(&mut issuing).await;
+        let late_issuer = issuer();
+        let (issued, ()) = tokio::join!(
+            late_issuer.issue_human_session(&mut issuing, late, None, binding, "req-late-login"),
+            async {
+                wait_for_advisory_lock_wait(&fixture, issue_pid).await;
+                revoking.commit().await.expect("revocation commits");
+            }
+        );
+        assert!(
+            matches!(issued, Err(IssuanceError::PrincipalInactive)),
+            "issuance after revocation re-reads the suspended User, got {issued:?}"
+        );
+        drop(issuing);
+        assert_eq!(
+            committed_family(&fixture, late).await,
+            (0, 0),
+            "a refused first login writes no refresh row"
         );
     }
 }

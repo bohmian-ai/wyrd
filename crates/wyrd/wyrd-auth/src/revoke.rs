@@ -109,8 +109,10 @@ fn internal_error(cause: impl Display) -> WyrdError {
     }
 }
 
+/// Postgres proofs of revocation, and the advisory-lock wait probe the
+/// issuance serialization proof shares.
 #[cfg(test)]
-mod pg_tests {
+pub(crate) mod pg_tests {
     use std::sync::Arc;
 
     use chrono::{Duration, Utc};
@@ -529,13 +531,14 @@ mod pg_tests {
 
     /// Poll until backend `pid` is observed blocked on an advisory lock.
     ///
-    /// The refresh-family lock is the only advisory lock revocation takes, so
-    /// this proves the revocation is parked on the family lock rather than
+    /// Revocation and human-session issuance both take the refresh-family
+    /// lock as their first advisory lock, so a wait seen before anything else
+    /// is granted proves the backend is parked on the family lock rather than
     /// having passed it; it is a synchronization point, not a sleep.
     ///
     /// # Panics
     /// Panics when the lock state cannot be read or no wait is seen in 30s.
-    async fn wait_for_advisory_lock_wait(fixture: &PgFixture, pid: i32) {
+    pub(crate) async fn wait_for_advisory_lock_wait(fixture: &PgFixture, pid: i32) {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 let waiting: bool = sqlx::query_scalar(
@@ -553,7 +556,7 @@ mod pg_tests {
             }
         })
         .await
-        .expect("revocation waits on the open rotation's family lock");
+        .expect("the backend waits on the contended family lock");
     }
 
     /// Administrative User revocation overlapping a rotation of current row

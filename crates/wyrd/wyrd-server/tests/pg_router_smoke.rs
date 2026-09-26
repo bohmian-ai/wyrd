@@ -1672,6 +1672,9 @@ async fn coordinator_standby_pass_is_not_ready() {
         .expect("the scheduler composes")
         .expect("the default target selects a coordinator");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(scheduler));
+    // A pass requested while the boot pass runs stays pending; without this,
+    // that standby pass could satisfy the post-release wait below.
+    await_boot_scheduler_pass(&server, "standby boot pass").await;
 
     drive_scheduler_pass(&server, "standby pass").await;
     assert!(

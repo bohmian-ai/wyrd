@@ -170,17 +170,23 @@ impl Bifrost {
 
     /// Dial the ingest channel and assemble both planes over one client.
     ///
+    /// The transport is the single owner of a batch's attempt budget, so the
+    /// producer's send deadline is raised past that whole budget; a shorter
+    /// deadline would cancel the transport and restart its attempts later.
+    ///
     /// # Errors
     ///
     /// Returns a transport error when the ingest channel cannot be dialled.
     async fn assemble(
         client: &WyrdClient,
         table: Option<TableConfig>,
-        config: QueueConfig,
+        mut config: QueueConfig,
     ) -> Result<Self, BifrostClientError> {
         let transport = BifrostGrpcTransport::connect(client)
             .await
             .map_err(BifrostClientError::from)?;
+        let deadline_ms = u64::try_from(transport.send_deadline().as_millis()).unwrap_or(u64::MAX);
+        config.flush_timeout_ms = config.flush_timeout_ms.max(deadline_ms);
         Ok(Self {
             query: QueryClient::new(client),
             writer: Arc::new(WriterPool::new(
@@ -460,6 +466,34 @@ impl Bifrost {
         self.writer
             .write_batch(table, batch)
             .await
+            .map_err(Into::into)
+    }
+
+    /// Enqueue one owned Arrow batch for `table` without waiting for publication.
+    ///
+    /// This is the bounded, fire-and-return counterpart of
+    /// [`Self::write_batch`] for Rust-native callers that must never delay
+    /// their own work on Bifrost, such as the embedded server capture path.
+    /// Admission charges this client's byte budget and one bounded producer
+    /// slot, then returns. The background producer encodes the batch, seals it
+    /// alone under a stable batch identity, and publishes it under `request_id`
+    /// when supplied (so a server call's observations share its request), and retries, flushes,
+    /// and drains it like buffered rows; it is durable only after that owner,
+    /// [`Self::flush`], or [`Self::shutdown`] settles it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostClientError::Queue`] with backpressure or
+    /// `WYRD_CLIENT_429_QUEUE_FULL` when the producer, channel, or byte
+    /// envelope cannot admit the batch, or the client is shutting down.
+    pub fn enqueue_batch(
+        &self,
+        table: &str,
+        batch: RecordBatch,
+        request_id: Option<RequestId>,
+    ) -> Result<(), BifrostClientError> {
+        self.writer
+            .enqueue_batch(table, batch, request_id)
             .map_err(Into::into)
     }
 
@@ -743,6 +777,18 @@ impl Bifrost {
     #[must_use]
     pub fn metrics(&self) -> BifrostMetrics {
         self.writer.metrics()
+    }
+
+    /// Registers `observer` to receive the row count of every accepted row
+    /// this client settles as lost after admission, such as a terminal
+    /// publication refusal or a retry slot it could not retain, as the loss
+    /// settles. The loss's bytes and retry slot are already released, so
+    /// [`Self::metrics`] read from the observer reports settled ownership.
+    ///
+    /// The observer runs on the producer task and must not block. Only the
+    /// first registration takes effect.
+    pub fn observe_losses(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
+        self.writer.observe_losses(observer);
     }
 
     /// The producer pool this client writes through.

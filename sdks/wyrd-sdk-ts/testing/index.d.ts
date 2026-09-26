@@ -210,15 +210,14 @@ export declare class NativeWyrdTestServer {
 /**
  * Starts a real bound Wyrd test server and mints an admin access token.
  *
- * `auditPublication: false` keeps staged audit rows in place so a journey can
- * count describe decisions; omitted, publication runs as in production.
- * `verificationRuntime: true` composes the verification runtime, so Drift
- * Verifier baselines fit and manual runs execute and persist results; omitted,
- * it stays off so queue-driving journeys are not raced.
+ * `providerBaseUrl` roots gateway adapters at a local mock upstream.
+ * `auditPublication: false` retains staged audit rows for assertions.
+ * `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
  *
  * # Errors
  *
- * Returns a napi error when server startup, service bootstrap, API-key
- * exchange, or URL discovery fails.
+ * Returns a napi error when `providerBaseUrl` is not an absolute URL, or when
+ * server startup, service bootstrap, API-key exchange, or URL discovery
+ * fails.
  */
-export declare function startTestServer(auditPublication?: boolean | undefined | null, verificationRuntime?: boolean | undefined | null): NativeWyrdTestServer
+export declare function startTestServer(providerBaseUrl?: string | undefined | null, auditPublication?: boolean | undefined | null, verificationRuntime?: boolean | undefined | null): NativeWyrdTestServer

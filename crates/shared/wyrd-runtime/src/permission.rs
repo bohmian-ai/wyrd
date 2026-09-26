@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 pub use wyrd_spec::auth::{
-    BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, PermissionScope,
+    BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,
     PermissionScopeError,
 };
 
@@ -128,6 +128,11 @@ pub enum Resource {
     /// private services, so a Scribe and an Oracle are authorized by the same
     /// permission rather than by role-specific resources.
     BifrostPeer,
+    /// Gateway administration (provider credentials, deployments, policies)
+    /// and provider/model invocation.
+    Gateway,
+    /// Captured gateway request and response payload fields.
+    GatewayPayload,
     /// One of several resources.
     AnyOf(Vec<Resource>),
     /// All resources.
@@ -190,12 +195,12 @@ impl Resource {
 
     /// True when this resource owns Bifrost objects a grant may be scoped to.
     ///
-    /// Only the Bifrost query surface names a table. `AnyOf` and `Wildcard` are
-    /// deliberately excluded: a multi-resource or wildcard grant reaches
-    /// objects only through [`PermissionScope::All`].
+    /// Bifrost query reads and record writes name a table. `AnyOf` and
+    /// `Wildcard` are deliberately excluded: a multi-resource or wildcard grant
+    /// reaches objects only through [`PermissionScope::All`].
     #[must_use]
     pub const fn accepts_bifrost_scope(&self) -> bool {
-        matches!(self, Self::BifrostQuery)
+        matches!(self, Self::BifrostQuery | Self::BifrostRecord)
     }
 
     /// Stable label for this resource, or `None` for a composite `AnyOf`.
@@ -223,6 +228,8 @@ impl Resource {
             Self::BifrostRecord => "bifrost_record",
             Self::BifrostQuery => "bifrost_query",
             Self::BifrostPeer => "bifrost_peer",
+            Self::Gateway => "gateway",
+            Self::GatewayPayload => "gateway_payload",
             Self::Wildcard => "wildcard",
             Self::AnyOf(_) => return None,
         })
@@ -282,30 +289,41 @@ impl Permission {
 
     /// Rejects a permission whose object scope cannot apply to its operation.
     ///
-    /// Bifrost object scope is meaningful only for Bifrost query reads.
-    /// A wildcard or multi-resource grant on either axis keeps object-wide
-    /// reach only with [`PermissionScope::All`], which is what stops a
-    /// wildcard from inheriting one table's narrow authority.
+    /// Bifrost object scope is meaningful only for Bifrost query reads and
+    /// record writes, and gateway object scope only for gateway invocation. A wildcard or
+    /// multi-resource grant on either axis keeps object-wide reach only with
+    /// [`PermissionScope::All`], which is what stops a wildcard from inheriting
+    /// one object's narrow authority.
     ///
     /// # Errors
     ///
     /// Returns the scope's own identity failure, or
-    /// [`PermissionScopeError::InvalidIdentifier`] with field `resource` when a
-    /// Bifrost scope is attached to a resource that owns no Bifrost object, or
-    /// with field `action` when it is attached to any action other than
-    /// [`Action::Read`].
+    /// [`PermissionScopeError::InvalidIdentifier`] with field `resource` when an
+    /// object scope is attached to a resource that does not own that object, or
+    /// with field `action` when a Bifrost scope is attached to an action other
+    /// than [`Action::Read`] for query or [`Action::Write`] for record, or a
+    /// gateway scope to any action other than [`Action::Invoke`].
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         self.scope.validate()?;
-        if !self.scope.is_bifrost() {
-            return Ok(());
-        }
-        if !self.resource.accepts_bifrost_scope() {
+        let (resource_accepts, required_action) = match &self.scope {
+            PermissionScope::All => return Ok(()),
+            PermissionScope::Bifrost(_) => (
+                self.resource.accepts_bifrost_scope(),
+                if self.resource == Resource::BifrostRecord {
+                    Action::Write
+                } else {
+                    Action::Read
+                },
+            ),
+            PermissionScope::Gateway(_) => (self.resource == Resource::Gateway, Action::Invoke),
+        };
+        if !resource_accepts {
             return Err(PermissionScopeError::InvalidIdentifier {
                 field: "resource",
                 value: self.resource.as_str().unwrap_or("any_of").to_owned(),
             });
         }
-        if self.action != Action::Read {
+        if self.action != required_action {
             return Err(PermissionScopeError::InvalidIdentifier {
                 field: "action",
                 value: self.action.as_str().unwrap_or("any_of").to_owned(),
@@ -635,6 +653,56 @@ impl Permission {
         )
     }
 
+    /// Read gateway deployments, redacted credential metadata, and policies.
+    #[must_use]
+    pub const fn gateway_read() -> Self {
+        Self {
+            resource: Resource::Gateway,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Create, replace, rotate, or revoke gateway configuration and policies.
+    #[must_use]
+    pub const fn gateway_write() -> Self {
+        Self {
+            resource: Resource::Gateway,
+            action: Action::Write,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Delete gateway credentials, deployments, and policies.
+    #[must_use]
+    pub const fn gateway_delete() -> Self {
+        Self {
+            resource: Resource::Gateway,
+            action: Action::Delete,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Invoke the gateway for the provider or model named by `access`.
+    #[must_use]
+    pub const fn gateway_invoke(access: GatewayAccess) -> Self {
+        Self {
+            resource: Resource::Gateway,
+            action: Action::Invoke,
+            scope: PermissionScope::Gateway(access),
+        }
+    }
+
+    /// Read captured gateway payload fields.
+    #[must_use]
+    pub const fn gateway_payload_read() -> Self {
+        Self {
+            resource: Resource::GatewayPayload,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }
+    }
+
     /// All permissions.
     #[must_use]
     pub const fn wildcard() -> Self {
@@ -703,6 +771,8 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "bifrost_record" => Resource::BifrostRecord,
         "bifrost_peer" => Resource::BifrostPeer,
         "bifrost_query" => Resource::BifrostQuery,
+        "gateway" => Resource::Gateway,
+        "gateway_payload" => Resource::GatewayPayload,
         "wildcard" => Resource::Wildcard,
         _ => return Err(PermissionParseError),
     })
@@ -1051,6 +1121,63 @@ mod tests {
         assert_eq!(round_trip, permissions);
     }
 
+    /// Proves gateway grants round-trip their approved wire names, a provider
+    /// invoke grant covers that provider's models only, and a gateway object
+    /// scope is refused anywhere but gateway invoke.
+    #[test]
+    fn gateway_permissions_are_typed_and_scope_checked() {
+        use super::GatewayAccess;
+        use wyrd_spec::ids::{ModelId, ProviderId};
+        let openai = ProviderId::new("openai").expect("valid provider");
+        let provider = GatewayAccess::Provider {
+            provider: openai.clone(),
+        };
+        let model = |name: &str| GatewayAccess::Model {
+            provider: openai.clone(),
+            model: ModelId::new(name).expect("valid model"),
+        };
+
+        assert_eq!(
+            Permission::gateway_payload_read().to_string(),
+            "gateway_payload:read"
+        );
+        assert_eq!(
+            "gateway:write".parse::<Permission>().expect("parses"),
+            Permission::gateway_write()
+        );
+        assert!(
+            Permission::gateway_invoke(provider.clone())
+                .covers(&Permission::gateway_invoke(model("gpt-4o")))
+        );
+        assert!(
+            !Permission::gateway_invoke(model("gpt-4o"))
+                .covers(&Permission::gateway_invoke(model("gpt-4.1")))
+        );
+        assert!(
+            !Permission::gateway_invoke(provider.clone()).covers(&Permission::gateway_read()),
+            "invoke never grants admin metadata reads"
+        );
+        assert_eq!(
+            serde_json::to_value(Permission::gateway_invoke(model("gpt-4o"))).expect("serializes"),
+            json!({
+                "resource": "gateway",
+                "action": "invoke",
+                "scope": {"gateway": {"model": {"provider": "openai", "model": "gpt-4o"}}}
+            })
+        );
+        for (resource, action) in [("gateway", "read"), ("cards", "invoke")] {
+            assert!(
+                serde_json::from_value::<Permission>(json!({
+                    "resource": resource,
+                    "action": action,
+                    "scope": {"gateway": {"provider": {"provider": "openai"}}}
+                }))
+                .is_err(),
+                "{resource}:{action}"
+            );
+        }
+    }
+
     /// Builds the schema-scoped Bifrost query-read grant the journey seeds.
     fn logs_schema_grant() -> Permission {
         Permission {
@@ -1171,6 +1298,51 @@ mod tests {
                 serde_json::from_value::<Permission>(wire).expect("permission deserializes"),
                 permission
             );
+        }
+    }
+
+    /// Proves Bifrost object scope applies to record writes as well as query
+    /// reads, a table-scoped write covers only its own table, and the scope is
+    /// still refused on any other resource or action pairing.
+    #[test]
+    fn bifrost_scope_applies_to_record_write_and_query_read_only() {
+        let calls = uuid::Uuid::from_u128(0xca11);
+        let spans = uuid::Uuid::from_u128(0x5a45);
+        let table_write = |uid| Permission {
+            resource: Resource::BifrostRecord,
+            action: Action::Write,
+            scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "gateway".to_owned(),
+                table_uid: uid,
+            })),
+        };
+        table_write(calls)
+            .validate()
+            .expect("scoped record write is valid");
+        assert!(table_write(calls).covers(&table_write(calls)));
+        assert!(!table_write(calls).covers(&table_write(spans)));
+        assert!(
+            !table_write(calls).covers(&Permission::bifrost_record_write()),
+            "a table-scoped write never covers the unscoped requirement"
+        );
+        assert!(Permission::bifrost_record_write().covers(&table_write(spans)));
+        let wire = serde_json::to_value(table_write(calls)).expect("serializes");
+        assert_eq!(
+            serde_json::from_value::<Permission>(wire).expect("round-trips"),
+            table_write(calls)
+        );
+        for (resource, action) in [
+            (Resource::BifrostRecord, Action::Read),
+            (Resource::BifrostQuery, Action::Write),
+            (Resource::BifrostTable, Action::Write),
+        ] {
+            let permission = Permission {
+                resource,
+                action,
+                ..table_write(calls)
+            };
+            assert!(permission.validate().is_err(), "{permission}");
         }
     }
 

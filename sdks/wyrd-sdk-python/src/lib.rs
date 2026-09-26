@@ -9,9 +9,13 @@ mod bifrost;
 #[cfg(feature = "python")]
 mod client;
 #[cfg(feature = "python")]
+mod gateway;
+#[cfg(feature = "python")]
 mod observe;
 #[cfg(feature = "python")]
 mod state;
+#[cfg(feature = "testing")]
+mod testing;
 #[cfg(feature = "python")]
 mod verification;
 
@@ -106,6 +110,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&bifrost)?;
     register_submodule(py, "wyrd._wyrd.bifrost", &bifrost)?;
 
+    let gateway = PyModule::new(py, "gateway")?;
+    gateway::register_gateway(&gateway)?;
+    m.add_submodule(&gateway)?;
+    register_submodule(py, "wyrd._wyrd.gateway", &gateway)?;
+
     let observe = PyModule::new(py, "observe")?;
     bifrost::register_observe(&observe)?;
     observe::register_run(&observe)?;
@@ -120,7 +129,7 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "testing")]
     {
         let testing = PyModule::new(py, "testing")?;
-        wyrd_testing::python::register(&testing)?;
+        testing::register(&testing)?;
         m.add_submodule(&testing)?;
         register_submodule(py, "wyrd._wyrd.testing", &testing)?;
     }

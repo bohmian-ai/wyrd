@@ -1,4 +1,4 @@
-//! OpenAI bearer-token authentication.
+//! OpenAI and OpenAI-compatible authentication.
 
 use std::fmt;
 
@@ -8,20 +8,47 @@ use url::Url;
 
 use crate::error::{ProviderError, ProviderResult};
 
+/// How an OpenAI-compatible endpoint receives its API key.
+#[derive(Clone)]
+enum Credential {
+    /// The endpoint needs no authentication.
+    None,
+    /// `Authorization: Bearer <key>`, as OpenAI itself expects.
+    Bearer(SecretString),
+    /// The raw key in a provider-named header.
+    Header(HeaderName, SecretString),
+}
+
 /// OpenAI auth material and endpoint configuration.
 #[derive(Clone)]
 pub struct OpenAiAuth {
-    api_key: SecretString,
+    credential: Credential,
     organization: Option<String>,
     project: Option<String>,
     base_url: String,
 }
 
 impl OpenAiAuth {
-    /// Creates OpenAI auth from an API key.
+    /// Creates OpenAI bearer auth from an API key.
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::with_credential(Credential::Bearer(super::secret(api_key)))
+    }
+
+    /// Creates auth for a compatible endpoint that reads the raw key from
+    /// `header`.
+    pub fn with_key_header(header: HeaderName, api_key: impl Into<String>) -> Self {
+        Self::with_credential(Credential::Header(header, super::secret(api_key)))
+    }
+
+    /// Creates auth for a compatible endpoint that needs no credential.
+    pub fn unauthenticated() -> Self {
+        Self::with_credential(Credential::None)
+    }
+
+    /// Auth presenting `credential` to the default OpenAI base URL.
+    fn with_credential(credential: Credential) -> Self {
         Self {
-            api_key: super::secret(api_key),
+            credential,
             organization: None,
             project: None,
             base_url: "https://api.openai.com/v1".to_owned(),
@@ -72,15 +99,34 @@ impl OpenAiAuth {
         &self.base_url
     }
 
-    /// Builds OpenAI request headers with secrets redacted from errors.
+    /// Builds request headers; the credential header is marked sensitive so
+    /// it never appears in debug output. Bearer, provider-named header, and
+    /// unauthenticated credentials each add exactly their own header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Decode`] when the credential, header name value,
+    /// organization, or project is not a valid header value.
     pub fn headers(&self) -> ProviderResult<HeaderMap> {
         let mut headers = HeaderMap::new();
-        let value = format!("Bearer {}", self.api_key.expose_secret());
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&value)
-                .map_err(|error| ProviderError::decode("openai", error))?,
-        );
+        let secret = |value: &str| {
+            let mut value = HeaderValue::from_str(value)
+                .map_err(|error| ProviderError::decode("openai", error))?;
+            value.set_sensitive(true);
+            Ok::<_, ProviderError>(value)
+        };
+        match &self.credential {
+            Credential::None => {}
+            Credential::Bearer(key) => {
+                headers.insert(
+                    AUTHORIZATION,
+                    secret(&format!("Bearer {}", key.expose_secret()))?,
+                );
+            }
+            Credential::Header(name, key) => {
+                headers.insert(name.clone(), secret(key.expose_secret())?);
+            }
+        }
         if let Some(organization) = &self.organization {
             headers.insert(
                 HeaderName::from_static("openai-organization"),
@@ -108,5 +154,35 @@ impl fmt::Debug for OpenAiAuth {
             .field("project", &self.project)
             .field("base_url", &self.base_url)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod openai_auth_headers {
+    use reqwest::header::{AUTHORIZATION, HeaderName};
+
+    use super::OpenAiAuth;
+
+    /// Bearer, named-header, and unauthenticated credentials each produce
+    /// exactly their own sensitive header.
+    #[test]
+    fn credentials_produce_their_own_sensitive_header() {
+        let bearer = OpenAiAuth::new("sk").headers().expect("headers");
+        assert_eq!(bearer[AUTHORIZATION], "Bearer sk");
+        assert!(bearer[AUTHORIZATION].is_sensitive());
+
+        let named = OpenAiAuth::with_key_header(HeaderName::from_static("api-key"), "k")
+            .headers()
+            .expect("headers");
+        assert_eq!(named["api-key"], "k");
+        assert!(named["api-key"].is_sensitive());
+        assert!(!named.contains_key(AUTHORIZATION));
+
+        assert!(
+            OpenAiAuth::unauthenticated()
+                .headers()
+                .expect("headers")
+                .is_empty()
+        );
     }
 }

@@ -454,4 +454,22 @@ pub trait Scribe: Send + Sync {
     /// Returns [`ScribeError`] when validation, resolution, projection,
     /// admission, persistence, or durable acknowledgment fails.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError>;
+
+    /// Resolve the tenant's registered UID of one write destination.
+    ///
+    /// Gate authorizes a record write against this exact table identity. A
+    /// built-in destination that the tenant has never used is provisioned
+    /// first, exactly as ingest would; any other table must already be
+    /// registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::TableNotFound`] for an unregistered caller table,
+    /// and [`ScribeError::Internal`] when no catalog owner exists or
+    /// provisioning or lookup fails.
+    async fn resolve_write_table(
+        &self,
+        tenant: wyrd_spec::ids::DataTenantId,
+        table: &TableRef,
+    ) -> Result<crate::catalog::TableUid, ScribeError>;
 }

@@ -51,6 +51,7 @@ wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
 wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.0.1" }
 wyrd-config = { path = "crates/wyrd/wyrd-config", version = "0.0.1" }
+wyrd-crypt = { path = "crates/shared/wyrd-crypt", version = "0.0.1" }
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
@@ -63,6 +64,7 @@ wyrd-auth = { path = "crates/wyrd/wyrd-auth", version = "0.0.1" }
 wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures", version = "0.0.1" }
 wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.0.1" }
 wyrd-sql = { path = "crates/wyrd/wyrd-sql", version = "0.0.1" }
+wyrd-gateway = { path = "crates/wyrd/wyrd-gateway", version = "0.0.1" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
 wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
 wyrd-testing = { path = "crates/wyrd/wyrd-testing", version = "0.0.1" }
@@ -111,6 +113,7 @@ futures-util = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 hdrhistogram = "7.5"
 num-traits = "0.2"
+bigdecimal = "0.4"
 blake3 = "1"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"

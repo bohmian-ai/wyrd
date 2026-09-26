@@ -811,12 +811,31 @@ impl BoundServer {
         let mcp_drained = tokio::time::timeout_at(deadline, self.state.mcp_tasks.wait())
             .await
             .is_ok();
+        // Gateway calls refuse admission once shutdown begins; accounting of
+        // the calls already accepted, including streams that settle after
+        // their response, drains within the same deadline.
+        self.state.gateway_tasks.close();
+        let gateway_drained = tokio::time::timeout_at(deadline, self.state.gateway_tasks.wait())
+            .await
+            .is_ok();
+        // Drained calls have enqueued their capture; publish it within the
+        // same deadline. Evidence still buffered at the deadline may be lost,
+        // which capture permits before Scribe acknowledgement.
+        if tokio::time::timeout_at(deadline, self.state.gateway_capture.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("gateway capture did not drain before the shutdown deadline");
+        }
         let terminal = match terminal {
             Some(message) => Some(message),
-            None if mcp_drained => None,
-            None => {
+            None if !mcp_drained => {
                 Some("MCP in-flight work did not drain before the shutdown deadline".to_owned())
             }
+            None if !gateway_drained => Some(
+                "gateway call accounting did not drain before the shutdown deadline".to_owned(),
+            ),
+            None => None,
         };
 
         let deadline = deadline.into_std();

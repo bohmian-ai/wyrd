@@ -36,6 +36,7 @@
 ## How-to guides
 
 - [How-to](https://mitari-ai.github.io/wyrd/how-to/): Goal-oriented recipes for declaring, evaluating, observing, and operating Wyrd components.
+- [Administer the gateway](https://mitari-ai.github.io/wyrd/how-to/administer-the-gateway/): Configure tenant provider credentials, deployments, and fallback, governance, and capture policies.
 - [Build an Agent Workflow](https://mitari-ai.github.io/wyrd/how-to/build-a-workflow/): Author a workflow from Python, YAML, or Rust, then run and instrument it.
 - [Build an Agent](https://mitari-ai.github.io/wyrd/how-to/build-an-agent/): Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side.
 - [Declare](https://mitari-ai.github.io/wyrd/how-to/declare/): Author Wyrd cards in Python and save them locally — recipes for the three shipped kinds.
@@ -82,7 +83,7 @@
 ## Reference
 
 - [Reference](https://mitari-ai.github.io/wyrd/reference/): The literal contract — CLI verbs, card schemas, error codes, and the API surface.
-- [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, and principal commands, with every flag and environment variable.
+- [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, principal, and gateway commands, with every flag and environment variable.
 
 ## Self-hosting
 

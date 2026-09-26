@@ -17,8 +17,10 @@ pub(crate) const WYRD_ACCESS_TOKEN_SCHEME: &str = "wyrdAccessToken";
 /// Declares how every Wyrd surface authenticates.
 ///
 /// One scheme, because there is one header: `X-Wyrd-Access-Token` carries the
-/// token on every plane, and the caller's own `Authorization` header is never
-/// read by any Wyrd route. The scheme is applied document-wide, so a route added
+/// token on every plane. The public gateway inference ingress additionally
+/// accepts the same Wyrd access token in the header its provider SDK sends
+/// (`Authorization`, `x-api-key`, or `x-goog-api-key`); no other route reads the
+/// caller's own `Authorization` header. The scheme is applied document-wide, so a route added
 /// tomorrow is documented as authenticated without anyone remembering to say so;
 /// the handful of operations a caller reaches before it has a session clear the
 /// requirement themselves with `security(())`, beside the handler, where the
@@ -177,6 +179,10 @@ fn is_problem(content: Option<&Content>) -> bool {
         (
             name = "Platform",
             description = "Platform control plane: tenant lifecycle, platform identity, and platform credentials"
+        ),
+        (
+            name = "Gateway",
+            description = "Governed model inference and tenant gateway administration"
         )
     )
 )]

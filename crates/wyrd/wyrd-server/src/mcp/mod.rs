@@ -11,7 +11,8 @@
 //! The production catalog exposes three read-only Bifrost tools for table
 //! discovery, schema/layout description, and bounded terminal-safe queries,
 //! the Card read and Verification status tools, and per-caller write tools for
-//! credential revocation and manual Verifier runs.
+//! credential revocation and manual Verifier runs, plus the seventeen tenant
+//! gateway administration tools.
 //! A test-support context probe is available only through explicit fixture opt-in.
 
 use std::borrow::Cow;
@@ -32,6 +33,7 @@ use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::state::AppState;
 
 mod bifrost;
+mod gateway;
 mod principals;
 #[cfg(feature = "test-support")]
 pub mod probe;
@@ -131,13 +133,16 @@ impl WyrdMcpHandler {
     /// The tools this handler advertises to every authenticated caller.
     ///
     /// Ordinary startup — production and an ordinary `WyrdTestServer` alike —
-    /// advertises the three read-only Bifrost tools followed by the read-only
-    /// principal credential listing. Write tools are per caller and the
-    /// test-support probe is opt-in, so neither belongs here.
+    /// advertises the three read-only Bifrost tools, the read-only principal
+    /// credential listing, and the gateway tools, whose replacement and delete
+    /// operations require explicit gateway write or delete scopes at dispatch.
+    /// Principal write tools are per caller and the test-support probe is
+    /// opt-in, so neither belongs here.
     fn catalog(&self) -> Vec<Tool> {
         let mut catalog = bifrost::descriptors();
         catalog.extend(principals::descriptors_unscoped());
         catalog.extend(verification::descriptors_unscoped());
+        catalog.extend(gateway::descriptors());
         catalog
     }
 
@@ -284,6 +289,10 @@ impl ServerHandler for WyrdMcpHandler {
                 self.mcp_start_run(caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
+            }
+            name if gateway::TOOLS.contains(&name) => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.gateway_tool(name, caller, request.arguments).await
             }
             unknown => {
                 return Err(ErrorData::new(

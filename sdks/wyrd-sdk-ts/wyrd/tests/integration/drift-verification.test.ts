@@ -358,7 +358,7 @@ function assertUnscored({ result, features }: Outcome): void {
 describe("drift method edge journey", () => {
   it("scores each method's edge cases through the production runtime", async () => {
     const root = mkdtempSync(join(tmpdir(), "wyrd-ts-drift-"));
-    const server = startTestServer(true, true);
+    const server = startTestServer(undefined, true, true);
     try {
       const cards = Cards.connect({ serverUrl: server.baseUrl, credential: server.apiKey });
       const query = await Bifrost.connect({

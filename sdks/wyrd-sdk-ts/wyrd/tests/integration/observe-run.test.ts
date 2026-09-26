@@ -175,7 +175,7 @@ describe("scoped observation journey", () => {
     const service = writeServiceGraph(root);
     const bundle = join(root, "bundle");
     // Publication would retire the staged describe decisions counted below.
-    const server = startTestServer(false);
+    const server = startTestServer(undefined, false);
     const manager = new StorageContextManager();
     context.setGlobalContextManager(manager);
     try {

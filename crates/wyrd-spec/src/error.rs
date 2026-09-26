@@ -779,6 +779,146 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A gateway administration document violates the gateway contract.
+    #[error("[WYRD_GATEWAY_400_INVALID_CONFIGURATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_400_INVALID_CONFIGURATION",
+        status = 400,
+        title = "Invalid gateway configuration",
+        remediation = "Correct the field named in `details.field`. Path and body names must match, credential bindings and secret backends must be configured on the server, and deployments must reference an active credential for the same provider."
+    )]
+    GatewayInvalidConfiguration {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A named gateway credential or deployment does not exist in the tenant.
+    #[error("[WYRD_GATEWAY_404_RESOURCE_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_404_RESOURCE_NOT_FOUND",
+        status = 404,
+        title = "Gateway resource not found in tenant",
+        remediation = "List provider credentials or deployments to confirm the name exists in the current tenant."
+    )]
+    GatewayResourceNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A gateway write conflicts with lifecycle state or a live reference.
+    #[error("[WYRD_GATEWAY_409_RESOURCE_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_409_RESOURCE_CONFLICT",
+        status = 409,
+        title = "Gateway resource conflicts with its current state",
+        remediation = "A revoked credential cannot be replaced, a credential referenced by a deployment cannot be deleted, a pricing version's content is immutable, and an identical batch creation still pending cannot be repeated. Use a new name or version, remove the referencing deployment first, or vary the batch metadata."
+    )]
+    GatewayResourceConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A gateway invocation request violates the invocation contract.
+    #[error("[WYRD_GATEWAY_400_INVALID_REQUEST] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_400_INVALID_REQUEST",
+        status = 400,
+        title = "Invalid gateway request",
+        remediation = "Correct the field named in `details.field`. Models use the `<provider>/<model>` projection and a fallback override is a non-empty, duplicate-free list that excludes the requested model."
+    )]
+    GatewayInvalidRequest {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// No authorized deployment in the tenant serves the requested operation.
+    #[error("[WYRD_GATEWAY_404_MODEL_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_404_MODEL_UNAVAILABLE",
+        status = 404,
+        title = "Gateway model unavailable",
+        remediation = "Request a model the tenant has deployed for this operation, or ask a tenant administrator to add a deployment or fallback candidate."
+    )]
+    GatewayModelUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The call's cost cannot be bounded where policy requires a bound.
+    #[error("[WYRD_GATEWAY_422_COST_UNBOUNDED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_422_COST_UNBOUNDED",
+        status = 422,
+        title = "Gateway call cost cannot be bounded",
+        remediation = "A budget applies or unknown cost is rejected, so the call needs active pricing for its model and a bounded request such as a maximum output token count."
+    )]
+    GatewayCostUnbounded {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A request, token, or concurrency limit refused the call.
+    #[error("[WYRD_GATEWAY_429_LIMIT_EXCEEDED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_429_LIMIT_EXCEEDED",
+        status = 429,
+        title = "Gateway limit exceeded",
+        remediation = "Retry after `details.retry_after_seconds`, reduce concurrency, or ask a tenant administrator to raise the limit."
+    )]
+    GatewayLimitExceeded {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A spending budget cannot cover the call's reservation.
+    #[error("[WYRD_GATEWAY_429_BUDGET_EXCEEDED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_429_BUDGET_EXCEEDED",
+        status = 429,
+        title = "Gateway budget exceeded",
+        remediation = "Wait for the next budget period, request a smaller bounded call, or ask a tenant administrator to raise the budget."
+    )]
+    GatewayBudgetExceeded {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Every eligible upstream attempt failed.
+    #[error("[WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE",
+        status = 502,
+        title = "Gateway upstream unavailable",
+        remediation = "Retry with backoff. If failures persist, a tenant administrator should check the deployment's provider, credential, and fallback configuration."
+    )]
+    GatewayUpstreamUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The caller deadline elapsed before an attempt completed.
+    #[error("[WYRD_GATEWAY_504_DEADLINE_EXCEEDED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_GATEWAY_504_DEADLINE_EXCEEDED",
+        status = 504,
+        title = "Gateway deadline exceeded",
+        remediation = "Retry with a longer deadline or a smaller request."
+    )]
+    GatewayDeadlineExceeded {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Auth verification backend is transiently unavailable.
     #[error("[WYRD_AUTH_503_VERIFY_UNAVAILABLE] {message}")]
     #[wyrd_error(
@@ -3444,6 +3584,16 @@ impl WyrdError {
             | Self::PrincipalNotFound { message, details }
             | Self::AdminConflict { message, details }
             | Self::AdminNotFound { message, details }
+            | Self::GatewayInvalidConfiguration { message, details }
+            | Self::GatewayResourceNotFound { message, details }
+            | Self::GatewayResourceConflict { message, details }
+            | Self::GatewayInvalidRequest { message, details }
+            | Self::GatewayModelUnavailable { message, details }
+            | Self::GatewayCostUnbounded { message, details }
+            | Self::GatewayLimitExceeded { message, details }
+            | Self::GatewayBudgetExceeded { message, details }
+            | Self::GatewayUpstreamUnavailable { message, details }
+            | Self::GatewayDeadlineExceeded { message, details }
             | Self::AuthVerifyUnavailable { message, details }
             | Self::DiscoveryUnavailable { message, details }
             | Self::AuditUnavailable { message, details }

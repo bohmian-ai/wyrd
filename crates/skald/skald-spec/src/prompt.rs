@@ -21,7 +21,8 @@ use crate::wire::openai_chat::{
     OpenAiMessageContent,
 };
 use crate::wire::openai_responses::{
-    OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesSettings,
+    OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesInput, OpenAiResponsesRequest,
+    OpenAiResponsesSettings,
 };
 
 /// Authored native prompt request plus render metadata.
@@ -521,8 +522,16 @@ fn openai_text_segments(
         .collect()
 }
 
+/// Splits media placeholders out of every Responses text part.
+///
+/// Text shorthand input is expanded into its user message only when it holds a
+/// placeholder, so input without media keeps the form it was authored in.
 fn split_openai_responses(request: &mut OpenAiResponsesRequest, names: &mut Vec<String>) {
-    for item in &mut request.input {
+    if matches!(&request.input, OpenAiResponsesInput::Text(text) if !media_placeholder_regex().is_match(text))
+    {
+        return;
+    }
+    for item in request.input.items_mut() {
         if let OpenAiResponseItem::Message { content, .. } = item {
             let mut out = Vec::new();
             for part in std::mem::take(content) {
@@ -693,6 +702,17 @@ fn bind_media_openai_chat(
     found_or_missing(found, name)
 }
 
+/// Replaces the isolated `name` placeholder part in Responses message items
+/// with `media`.
+///
+/// Text shorthand input has no split-out placeholder part, so it binds
+/// nothing and reports the placeholder missing.
+///
+/// # Errors
+///
+/// Returns [`SkaldError::MediaPlaceholderNotIsolated`] when the placeholder
+/// shares its part with other text, a media build error, or the missing
+/// placeholder error when no part names `name`.
 fn bind_media_openai_responses(
     request: &mut OpenAiResponsesRequest,
     name: &str,
@@ -700,7 +720,11 @@ fn bind_media_openai_responses(
 ) -> SkaldResult<()> {
     let sentinel = placeholder_token(name);
     let mut found = false;
-    for item in &mut request.input {
+    // Text shorthand holds no split-out placeholder part to bind.
+    let OpenAiResponsesInput::Items(items) = &mut request.input else {
+        return found_or_missing(found, name);
+    };
+    for item in items {
         let OpenAiResponseItem::Message { content, .. } = item else {
             continue;
         };

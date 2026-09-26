@@ -15,6 +15,8 @@ pub mod cards;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod gateway;
+pub mod gateway_credential;
 pub mod global_config;
 pub mod observe;
 pub mod platform;
@@ -26,6 +28,7 @@ pub mod verification;
 
 pub use bifrost::{Bifrost, QueueConfig};
 pub use client::WyrdClient;
+pub use gateway::Gateway;
 pub use global_config::GlobalConfig;
 pub use platform::Platform;
 pub use principals::Principals;

@@ -1,7 +1,9 @@
 //! Wyrd-owned request body size limiter.
 //!
 //! Returns `WyrdError::PayloadTooLarge` rendered as `application/problem+json`
-//! when the body exceeds `max_bytes`. Uses bounded buffering: `to_bytes` reads
+//! when the body exceeds `max_bytes`. Audio transcription and translation
+//! uploads pass through unbuffered: their handlers stream them under
+//! `limits.audio_upload_bytes`. Uses bounded buffering: `to_bytes` reads
 //! the full body into memory up to `max_bytes + 1`; the worst-case process
 //! footprint is `max_bytes * concurrency`.
 
@@ -88,6 +90,13 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
+        if matches!(
+            request.uri().path(),
+            "/v1/audio/transcriptions" | "/v1/audio/translations"
+        ) {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move { inner.call(request).await.map_err(Into::into) });
+        }
         let scribe_route = matches!(
             request.uri().path(),
             "/v1/traces" | "/v1/metrics" | "/v1/logs"
@@ -316,5 +325,37 @@ mod tests {
             axum::http::StatusCode::PAYLOAD_TOO_LARGE
         );
         assert!(invoked.load(Ordering::Acquire));
+    }
+
+    /// Audio transcription and translation uploads reach their handler
+    /// unbuffered past the general limit, which still refuses every other
+    /// route, including Audio speech.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a request is refused or admitted differently.
+    #[tokio::test]
+    async fn audio_uploads_pass_the_body_limit_unbuffered() {
+        let service = ServiceBuilder::new()
+            .layer(wyrd_body_limit(16, None, None))
+            .service(service_fn(|_request: Request<Body>| async {
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }));
+        for (path, status) in [
+            ("/v1/audio/transcriptions", axum::http::StatusCode::OK),
+            ("/v1/audio/translations", axum::http::StatusCode::OK),
+            (
+                "/v1/audio/speech",
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let request = Request::builder()
+                .uri(path)
+                .header(axum::http::header::CONTENT_LENGTH, "17")
+                .body(Body::from(vec![0_u8; 17]))
+                .expect("request");
+            let response = service.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), status, "{path}");
+        }
     }
 }

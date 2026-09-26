@@ -776,14 +776,18 @@ The surface includes:
 - agent-facing read and write operations governed by explicit permissions.
 
 Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.eval`, `vala.drift`, `vala.verification`, `vala.dev`, and `vala.system`
-remain tenant-qualified Bifrost tables. Canonical SQL is their only read contract;
+`vala.eval`, `vala.drift`, `vala.verification`, `vala.dev`, `vala.gateway`, and
+`vala.system` remain tenant-qualified Bifrost tables. Canonical SQL is their
+only read contract;
 the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
-`BifrostQuery`. Generic writes cannot target reserved or system-managed tables.
-Sensitive-column metadata remains descriptive; table query permission governs
-every column, including GenAI fields stored on trace spans.
+`BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
+`vala.gateway.calls` accepts writes only from the reserved gateway capture
+principal. Sensitive-column metadata remains descriptive; table query
+permission governs every column, including GenAI fields stored on trace spans,
+except that a projection reaching the `vala.gateway.calls` request or response
+payload columns also requires the tenant-wide gateway payload-read permission.
 
 Bifrost query permissions carry an object axis. A `bifrost_query:read` grant is
 scoped either to every object (`all`) or to a named Bifrost object: a

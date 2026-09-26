@@ -149,10 +149,13 @@ impl Prompt {
                 request.messages.push(message);
             }
             ProviderRequest::OpenAiResponses(request) => {
-                request.input.push(OpenAiResponseItem::FunctionCallOutput {
-                    call_id: tool_use_id,
-                    output: content,
-                });
+                request
+                    .input
+                    .items_mut()
+                    .push(OpenAiResponseItem::FunctionCallOutput {
+                        call_id: tool_use_id,
+                        output: content,
+                    });
             }
             ProviderRequest::AnthropicMessage(request) => {
                 request.messages.push(AnthropicMessage {
@@ -186,7 +189,7 @@ impl Prompt {
                 request.messages.push(openai_message(role, text));
             }
             ProviderRequest::OpenAiResponses(request) => {
-                request.input.push(OpenAiResponseItem::Message {
+                request.input.items_mut().push(OpenAiResponseItem::Message {
                     role: role.to_owned(),
                     content: vec![if role == "assistant" {
                         OpenAiResponseContentPart::OutputText { text }
@@ -1325,7 +1328,7 @@ fn request_messages_value(request: &ProviderRequest) -> serde_json::Value {
         | ProviderRequest::OpenAiChatCompatible { request, .. } => {
             serde_json::to_value(&request.messages)
         }
-        ProviderRequest::OpenAiResponses(request) => serde_json::to_value(&request.input),
+        ProviderRequest::OpenAiResponses(request) => serde_json::to_value(request.input.items()),
         ProviderRequest::AnthropicMessage(request) => serde_json::to_value(&request.messages),
         ProviderRequest::GeminiGenerateContent(request) => serde_json::to_value(&request.contents),
         ProviderRequest::Vertex(request) => serde_json::to_value(&request.0.contents),
@@ -1628,7 +1631,7 @@ fn append_native_json_content(
         }
         ProviderRequest::OpenAiResponses(request) => {
             let parts = json_parts::<OpenAiResponseContentPart>(value)?;
-            request.input.push(OpenAiResponseItem::Message {
+            request.input.items_mut().push(OpenAiResponseItem::Message {
                 role: role.to_owned(),
                 content: parts,
             });

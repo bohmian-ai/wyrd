@@ -195,7 +195,30 @@ mod pg_tests {
 
         assert_platform_resolver_shape(pool).await;
         assert_current_tenant_parallel_restricted(pool).await;
-        assert_auth_rls_metadata(pool).await;
+        assert_rls_metadata(
+            pool,
+            "auth_%",
+            &[
+                "auth_api_keys",
+                "auth_login_state",
+                "auth_refresh_tokens",
+                "auth_roles",
+                "auth_service_account_roles",
+                "auth_service_accounts",
+                "auth_trusted_issuers",
+                "auth_user_identities",
+                "auth_user_roles",
+                "auth_users",
+                "auth_workload_bindings",
+            ],
+        )
+        .await;
+        assert_rls_metadata(
+            pool,
+            "gateway_batch%",
+            &["gateway_batch_files", "gateway_batches"],
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1649,7 +1672,15 @@ mod pg_tests {
         );
     }
 
-    async fn assert_auth_rls_metadata(pool: &PgPool) {
+    /// Asserts that the `wyrd` tables whose names match the SQL `like` pattern
+    /// are exactly `expected_tables`, each enabling and forcing row-level
+    /// security under the canonical `tenant_isolation` policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the catalog query fails, the matching tables differ, or a
+    /// table lacks forced RLS or the policy.
+    async fn assert_rls_metadata(pool: &PgPool, like: &str, expected_tables: &[&str]) {
         let rows: Vec<(String, bool, bool, bool)> = sqlx::query_as(
             "SELECT
              c.relname,
@@ -1668,26 +1699,13 @@ mod pg_tests {
          JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE n.nspname = 'wyrd'
            AND c.relkind = 'r'
-           AND c.relname LIKE 'auth_%'
+           AND c.relname LIKE $1
          ORDER BY c.relname",
         )
+        .bind(like)
         .fetch_all(pool)
         .await
-        .expect("auth RLS metadata query succeeds");
-
-        let expected_tables = [
-            "auth_api_keys",
-            "auth_login_state",
-            "auth_refresh_tokens",
-            "auth_roles",
-            "auth_service_account_roles",
-            "auth_service_accounts",
-            "auth_trusted_issuers",
-            "auth_user_identities",
-            "auth_user_roles",
-            "auth_users",
-            "auth_workload_bindings",
-        ];
+        .expect("RLS metadata query succeeds");
 
         assert_eq!(
             rows.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),

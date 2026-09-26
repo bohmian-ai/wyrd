@@ -11,6 +11,8 @@
 //! [`ResolvedCredential::WorkloadJwt`] — exchange their secret for a short-lived
 //! access token through the *same* cache and single-flight gate. A directly
 //! supplied [`ResolvedCredential::BearerToken`] is passed through as-is. A
+//! [`ResolvedCredential::Renewable`] source mints its token in-process through
+//! that same cache and gate, and its tokens are never written to disk.
 //! [`ResolvedCredential::Delegated`] middleware, built by
 //! [`AuthMiddleware::on_behalf_of`], re-runs its RFC 8693 exchange through the
 //! same cache and gate, drawing the actor token from the acting middleware.
@@ -26,6 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use wyrd_spec::auth::{
     ExchangeTokenType, LoginInitResponse, PlatformTokenRequest, PlatformTokenResponse,
@@ -36,7 +39,7 @@ use wyrd_spec::ids::TenantSlug;
 
 use crate::config::{ClientConfig, TokenCacheMode};
 use crate::error::{WyrdClientError, from_problem_json};
-use crate::transport::credential::ResolvedCredential;
+use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
 use reqwest::{Client, Response};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
@@ -94,6 +97,9 @@ impl CachedToken {
         Utc::now() >= self.expires_at - chrono::Duration::seconds(REFRESH_SKEW_SECONDS)
     }
 }
+
+/// A renewable mint running on Tokio's blocking pool.
+type PendingMint = JoinHandle<Result<MintedAccessToken, WyrdClientError>>;
 
 /// On-disk token record. Holds the access token and expiry only — never a
 /// refresh token. `Debug` is redacted via [`SecretBearer`].
@@ -267,7 +273,15 @@ pub struct AuthMiddleware {
     credential: ResolvedCredential,
     /// The unauthenticated `/auth` surface this middleware exchanges against.
     exchange: TokenExchange,
+    /// Total deadline of one `/auth/token` exchange, the same
+    /// `HttpConfig::timeout_ms` that bounds the exchange client.
+    exchange_timeout: Duration,
     cache: Mutex<Option<CachedToken>>,
+    /// The renewable mint started under the `cache` gate and not yet
+    /// consumed. Locked only while `cache` is held. It outlives a cancelled
+    /// waiter, so the next caller awaits that same mint instead of starting a
+    /// concurrent one.
+    pending_mint: Mutex<Option<PendingMint>>,
     cache_mode: TokenCacheMode,
     /// Resolved on-disk token-cache path, computed once at construction in
     /// [`TokenCacheMode::Disk`] mode (`None` otherwise). Resolving here — rather
@@ -328,13 +342,16 @@ impl AuthMiddleware {
         cache_path: Option<PathBuf>,
     ) -> Result<Arc<Self>, WyrdClientError> {
         let exchange = TokenExchange::new(&config.http.base_url, config.http.timeout_ms)?;
+        let exchange_timeout = Duration::from_millis(config.http.timeout_ms);
 
         let initial = cache_path.as_deref().and_then(load_disk_record);
 
         Ok(Arc::new(Self {
             credential,
             exchange,
+            exchange_timeout,
             cache: Mutex::new(initial),
+            pending_mint: Mutex::new(None),
             cache_mode: config.token_cache.clone(),
             cache_path,
             short_ttl_warned: AtomicBool::new(false),
@@ -373,7 +390,9 @@ impl AuthMiddleware {
                 actor: Arc::clone(self),
             },
             exchange: self.exchange.clone(),
+            exchange_timeout: self.exchange_timeout,
             cache: Mutex::new(None),
+            pending_mint: Mutex::new(None),
             cache_mode: TokenCacheMode::InMemory,
             cache_path: None,
             short_ttl_warned: AtomicBool::new(false),
@@ -404,6 +423,16 @@ impl AuthMiddleware {
         self.exchange.base_url()
     }
 
+    /// The longest one token exchange may take.
+    ///
+    /// A caller that bounds an operation including [`Self::bearer`] or
+    /// [`Self::force_refresh`], such as a retrying transport, sizes its budget
+    /// from this value instead of restating the HTTP configuration.
+    #[must_use]
+    pub(crate) fn exchange_timeout(&self) -> Duration {
+        self.exchange_timeout
+    }
+
     /// Return the current access token, exchanging or refreshing as needed.
     ///
     /// For an [`ResolvedCredential::ApiKey`]: reads the cache and returns the
@@ -421,6 +450,15 @@ impl AuthMiddleware {
     /// slug, or [`AuthError::Server`] when the server rejects the credential.
     pub async fn bearer(&self) -> Result<SecretBearer, AuthError> {
         match &self.credential {
+            ResolvedCredential::Renewable(source) => {
+                let mut cache = self.cache.lock().await;
+                if let Some(entry) = cache.as_ref()
+                    && !entry.is_stale()
+                {
+                    return Ok(entry.access_token.clone());
+                }
+                self.mint_into(source, &mut cache).await
+            }
             ResolvedCredential::BearerToken(token) => {
                 Ok(SecretBearer::new(token.expose_secret().to_owned()))
             }
@@ -473,6 +511,10 @@ impl AuthMiddleware {
     /// credential, or [`AuthError::Server`] when the server rejects the key.
     pub async fn force_refresh(&self) -> Result<SecretBearer, AuthError> {
         match &self.credential {
+            ResolvedCredential::Renewable(source) => {
+                let mut cache = self.cache.lock().await;
+                self.mint_into(source, &mut cache).await
+            }
             ResolvedCredential::BearerToken(token) => {
                 Ok(SecretBearer::new(token.expose_secret().to_owned()))
             }
@@ -523,6 +565,55 @@ impl AuthMiddleware {
     ) -> Result<SecretBearer, AuthError> {
         let entry = self.exchange_workload(jwt, tenant).await?;
         Ok(self.store(entry, cache))
+    }
+
+    /// Mint a fresh token from `source` and replace the in-memory cache.
+    ///
+    /// The [`ResolvedCredential::Renewable`] tail of [`AuthMiddleware::bearer`]
+    /// and [`AuthMiddleware::force_refresh`]; the caller holds the exchange gate,
+    /// so racing callers mint once. Unlike an exchanged token, a minted token is
+    /// never persisted: the source mints again after a restart.
+    ///
+    /// The synchronous [`AccessTokenSource::mint`] may block, so it runs on
+    /// Tokio's blocking pool and this future stays pollable: a caller's timeout
+    /// can abandon it while the mint is still running. The running mint is kept
+    /// in `pending_mint` until a caller receives its result, so a caller
+    /// arriving after a cancelled one awaits that mint rather than starting
+    /// another; at most one mint runs per middleware.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Client`] with the source's error when minting fails;
+    /// the cache is left unchanged.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future releases the gate without touching the cache. An
+    /// already started mint keeps running and stays pending; its token is
+    /// installed only by the next caller that awaits it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the source's `mint` panics.
+    async fn mint_into(
+        &self,
+        source: &Arc<dyn AccessTokenSource>,
+        cache: &mut Option<CachedToken>,
+    ) -> Result<SecretBearer, AuthError> {
+        let mut pending = self.pending_mint.lock().await;
+        let mint = pending.get_or_insert_with(|| {
+            let source = Arc::clone(source);
+            tokio::task::spawn_blocking(move || source.mint())
+        });
+        let joined = mint.await;
+        *pending = None;
+        let minted = joined.expect("renewable mint task joins")?;
+        let bearer = minted.access_token.clone();
+        *cache = Some(CachedToken {
+            access_token: minted.access_token,
+            expires_at: minted.expires_at,
+        });
+        Ok(bearer)
     }
 
     /// Persist a freshly exchanged token and replace the in-memory cache,
@@ -729,7 +820,7 @@ mod tests {
     use super::{AuthError, AuthMiddleware, CachedToken};
     use crate::config::{ClientConfig, TokenCacheMode};
     use crate::error::WyrdClientError;
-    use crate::transport::credential::ResolvedCredential;
+    use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
     use wyrd_spec::auth::SecretBearer;
 
     struct MockServer {
@@ -1148,6 +1239,105 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Source double minting sequentially numbered tokens of a fixed lifetime.
+    struct CountingSource {
+        /// Tokens minted so far.
+        minted: AtomicUsize,
+        /// Lifetime of every minted token.
+        ttl_seconds: i64,
+    }
+
+    impl CountingSource {
+        /// Builds one shared source minting tokens valid for `ttl_seconds`.
+        fn new(ttl_seconds: i64) -> Arc<Self> {
+            Arc::new(Self {
+                minted: AtomicUsize::new(0),
+                ttl_seconds,
+            })
+        }
+    }
+
+    impl AccessTokenSource for CountingSource {
+        /// Names the fixed test identity.
+        fn identity(&self) -> &str {
+            "test-system-producer"
+        }
+
+        /// Mints `minted-<n>` expiring after the configured lifetime.
+        ///
+        /// # Errors
+        ///
+        /// This test source never fails.
+        fn mint(&self) -> Result<MintedAccessToken, WyrdClientError> {
+            let ordinal = self.minted.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(MintedAccessToken {
+                access_token: SecretBearer::new(format!("minted-{ordinal}")),
+                expires_at: Utc::now() + chrono::Duration::seconds(self.ttl_seconds),
+            })
+        }
+    }
+
+    /// A renewable source reuses the exchange cache, proactive refresh,
+    /// single-flight, and forced refresh, and never touches the network.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fresh token re-mints, a stale or forced read does not,
+    /// or concurrent readers on an empty cache mint more than once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn renewable_source_uses_the_shared_refresh_lifecycle() {
+        let config = config_for("http://127.0.0.1:9".to_owned(), TokenCacheMode::InMemory);
+        let fresh = CountingSource::new(900);
+        let mw = AuthMiddleware::new(&config, ResolvedCredential::Renewable(fresh.clone()))
+            .expect("middleware builds");
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let mw = Arc::clone(&mw);
+            readers.push(tokio::spawn(async move {
+                mw.bearer().await.expect("mint").expose().to_owned()
+            }));
+        }
+        for reader in readers {
+            assert_eq!(reader.await.expect("reader joins"), "minted-1");
+        }
+        assert_eq!(fresh.minted.load(Ordering::SeqCst), 1, "single-flight mint");
+        assert_eq!(
+            mw.force_refresh().await.expect("forced mint").expose(),
+            "minted-2"
+        );
+        assert_eq!(mw.bearer().await.expect("cached").expose(), "minted-2");
+
+        let stale = CountingSource::new(5);
+        let mw = AuthMiddleware::new(&config, ResolvedCredential::Renewable(stale.clone()))
+            .expect("middleware builds");
+        mw.bearer().await.expect("first mint");
+        assert_eq!(
+            mw.bearer().await.expect("proactive refresh").expose(),
+            "minted-2",
+            "a token inside the refresh skew is replaced before use"
+        );
+    }
+
+    /// A minted token stays in memory even when the client caches on disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the disk-mode middleware writes the token cache file.
+    #[tokio::test]
+    async fn renewable_tokens_are_never_persisted() {
+        let dir = std::env::temp_dir().join(format!("wyrd_auth_renewable_{}", Uuid::now_v7()));
+        let path = dir.join("token_cache.json");
+        let mw = AuthMiddleware::new_with_cache_path(
+            &config_for("http://127.0.0.1:9".to_owned(), TokenCacheMode::Disk),
+            ResolvedCredential::Renewable(CountingSource::new(900)),
+            Some(path.clone()),
+        )
+        .expect("middleware builds");
+        mw.bearer().await.expect("mint");
+        assert!(!path.exists(), "a minted capture token must not reach disk");
+        assert!(format!("{mw:?}").contains("test-system-producer"));
     }
 
     #[test]

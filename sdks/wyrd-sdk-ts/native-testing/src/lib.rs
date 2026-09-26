@@ -565,44 +565,54 @@ impl NativeWyrdTestServer {
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
 ///
-/// `auditPublication: false` keeps staged audit rows in place so a journey can
-/// count describe decisions; omitted, publication runs as in production.
-/// `verificationRuntime: true` composes the verification runtime, so Drift
-/// Verifier baselines fit and manual runs execute and persist results; omitted,
-/// it stays off so queue-driving journeys are not raced.
+/// `auditPublication: false` keeps staged audit rows for assertions.
+/// `verificationRuntime: true` runs Drift baseline fitting and Verifier runs.
+/// `providerBaseUrl` roots built-in gateway adapters at a local mock upstream.
 ///
 /// # Errors
 ///
-/// Returns a napi error when server startup, service bootstrap, API-key
-/// exchange, or URL discovery fails.
+/// Returns a napi error for an invalid provider URL or server setup failure.
 #[napi]
 pub fn start_test_server(
+    provider_base_url: Option<String>,
     audit_publication: Option<bool>,
     verification_runtime: Option<bool>,
-) -> Result<NativeWyrdTestServer> {
+) -> napi::Result<NativeWyrdTestServer> {
+    let provider_root = provider_base_url
+        .as_deref()
+        .map(|base| {
+            url::Url::parse(base).map_err(|error| {
+                napi::Error::from_reason(format!("invalid providerBaseUrl: {error}"))
+            })
+        })
+        .transpose()?;
+    drop(provider_base_url);
     wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async(
+        provider_root,
         audit_publication.unwrap_or(true),
         verification_runtime.unwrap_or(false),
     )))
 }
 
-/// Starts the bound harness inside Wyrd's shared runtime, disabling audit
-/// publication when `audit_publication` is false and composing the
-/// verification runtime when `verification_runtime` is true.
+/// Starts the bound harness with the requested test-only capabilities.
 ///
 /// # Errors
 ///
 /// Returns a napi error when any server setup step fails.
 async fn start_test_server_async(
+    provider_root: Option<url::Url>,
     audit_publication: bool,
     verification_runtime: bool,
-) -> Result<NativeWyrdTestServer> {
+) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
     if !audit_publication {
         builder = builder.without_audit_publication_for_test();
     }
     if verification_runtime {
         builder = builder.with_verification_runtime_for_test();
+    }
+    if let Some(root) = provider_root {
+        builder = builder.with_gateway_provider_root_for_test(root);
     }
     let server = Box::pin(builder.start_bound())
         .await

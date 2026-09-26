@@ -22,6 +22,7 @@ Wyrd?" Skip the explanation; go straight to the code.
 - [Evaluate](/how-to/evaluate/) — score agent runs and models against eval definitions.
 - [Observe](/how-to/observe/) — read metrics, drift, and audit trails from a running system.
 - [Operate](/how-to/operate/) — run, restart, and manage card-governed components.
+- [Administer the gateway](/how-to/administer-the-gateway/) — provider credentials, deployments, and gateway policies.
 
 <Aside title="What ships today" data-variant="wyrd">
 

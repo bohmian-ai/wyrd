@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProviderDeployment",
+  "description": "One tenant-authorized upstream model target.\n\nThe name is an administration identifier only; inference callers select a [`ModelRef`], never a deployment. The same shape is the `PUT` body and the redacted read view because it carries no secret material.",
+  "type": "object",
+  "required": [
+    "adapter",
+    "auth",
+    "capabilities",
+    "model",
+    "name",
+    "routing_weight"
+  ],
+  "properties": {
+    "adapter": {
+      "description": "Upstream protocol family.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProviderAdapter"
+        }
+      ]
+    },
+    "auth": {
+      "description": "Upstream authentication.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProviderAuth"
+        }
+      ]
+    },
+    "capabilities": {
+      "description": "Explicitly declared operations; never inferred by probing.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GatewayOperation"
+      },
+      "uniqueItems": true
+    },
+    "model": {
+      "description": "Exact model this deployment serves.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelRef"
+        }
+      ]
+    },
+    "name": {
+      "description": "Tenant-unique deployment name.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProviderDeploymentName"
+        }
+      ]
+    },
+    "routing_weight": {
+      "description": "Positive weight among deployments serving the same model.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "AbsoluteUrl": {
+      "description": "Absolute URL with a scheme and authority.",
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://"
+    },
+    "GatewayOperation": {
+      "description": "Typed capability a caller requests from the gateway.",
+      "oneOf": [
+        {
+          "description": "Chat Completions.",
+          "type": "string",
+          "enum": [
+            "chat_completions"
+          ]
+        },
+        {
+          "description": "Responses.",
+          "type": "string",
+          "enum": [
+            "responses"
+          ]
+        },
+        {
+          "description": "Embeddings.",
+          "type": "string",
+          "enum": [
+            "embeddings"
+          ]
+        },
+        {
+          "description": "Image generation, editing, and variations.",
+          "type": "string",
+          "enum": [
+            "images"
+          ]
+        },
+        {
+          "description": "Speech, transcription, and translation.",
+          "type": "string",
+          "enum": [
+            "audio"
+          ]
+        },
+        {
+          "description": "Batches, including the file operations batches require.",
+          "type": "string",
+          "enum": [
+            "batches"
+          ]
+        }
+      ]
+    },
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "One exact provider-native model selected by a caller.\n\nTyped surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "description": "Provider-native model identifier.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelId"
+            }
+          ]
+        },
+        "provider": {
+          "description": "Provider that serves the model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderAdapter": {
+      "description": "Upstream protocol family a deployment speaks.\n\nThe four built-in variants use Skald's typed provider protocols and require their reserved provider identity. `OpenAiCompatible` uses the standard OpenAI routes under `base_url` for any non-reserved provider.",
+      "oneOf": [
+        {
+          "description": "OpenAI native protocol.",
+          "type": "string",
+          "enum": [
+            "openai"
+          ]
+        },
+        {
+          "description": "Anthropic Messages protocol.",
+          "type": "string",
+          "enum": [
+            "anthropic"
+          ]
+        },
+        {
+          "description": "Google Gemini GenerateContent protocol.",
+          "type": "string",
+          "enum": [
+            "gemini"
+          ]
+        },
+        {
+          "description": "Google Vertex GenerateContent protocol.",
+          "type": "object",
+          "required": [
+            "vertex"
+          ],
+          "properties": {
+            "vertex": {
+              "type": "object",
+              "required": [
+                "location",
+                "project"
+              ],
+              "properties": {
+                "location": {
+                  "description": "Google Cloud location, such as `us-central1`.",
+                  "type": "string"
+                },
+                "project": {
+                  "description": "Google Cloud project identifier.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Standard OpenAI-compatible routes under a tenant base URL.",
+          "type": "object",
+          "required": [
+            "openai_compatible"
+          ],
+          "properties": {
+            "openai_compatible": {
+              "type": "object",
+              "required": [
+                "base_url"
+              ],
+              "properties": {
+                "base_url": {
+                  "description": "Absolute base URL whose standard OpenAI routes the deployment uses.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/AbsoluteUrl"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ProviderAuth": {
+      "description": "Authentication the gateway presents to an upstream provider.\n\nUnrelated to the caller's Wyrd access token, which is never forwarded. The header value is built from the referenced tenant credential at call time.",
+      "oneOf": [
+        {
+          "description": "No upstream authentication.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        },
+        {
+          "description": "`Authorization: Bearer <credential>`.",
+          "type": "object",
+          "required": [
+            "bearer"
+          ],
+          "properties": {
+            "bearer": {
+              "type": "object",
+              "required": [
+                "credential"
+              ],
+              "properties": {
+                "credential": {
+                  "description": "Tenant credential supplying the bearer value.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ProviderCredentialName"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A named API-key header carrying the credential.",
+          "type": "object",
+          "required": [
+            "api_key_header"
+          ],
+          "properties": {
+            "api_key_header": {
+              "type": "object",
+              "required": [
+                "credential",
+                "header"
+              ],
+              "properties": {
+                "credential": {
+                  "description": "Tenant credential supplying the header value.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ProviderCredentialName"
+                    }
+                  ]
+                },
+                "header": {
+                  "description": "Validated non-reserved HTTP field name.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ProviderCredentialName": {
+      "description": "Tenant-unique gateway provider credential name.",
+      "type": "string"
+    },
+    "ProviderDeploymentName": {
+      "description": "Tenant-unique gateway provider deployment name.",
+      "type": "string"
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
+    }
+  }
+}

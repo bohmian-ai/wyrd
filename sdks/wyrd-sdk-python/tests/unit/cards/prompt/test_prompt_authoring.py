@@ -186,3 +186,16 @@ def test_provider_settings_constructor_smoke() -> None:
             )
         else:
             assert prompt.request.model_dump()[key] == value
+
+
+def test_openai_responses_input_getter_projects_text_and_item_forms() -> None:
+    items_prompt = Prompt.openai_responses("gpt-4.1", messages="Hello")
+    body = json.loads(items_prompt.model_dump_json())
+    body["request"]["input"] = "Hello"
+    text_prompt = Prompt.model_validate_json(json.dumps(body))
+
+    for prompt in (items_prompt, text_prompt):
+        (item,) = prompt.request.openai_responses().input
+        assert item.kind == "message"
+        assert item.as_message_role() == "user"
+    assert text_prompt.request.model_dump()["input"] == "Hello"

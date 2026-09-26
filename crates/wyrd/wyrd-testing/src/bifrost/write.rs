@@ -210,6 +210,7 @@ impl RawIngest {
             batch_id: batch_id.into_bytes(),
             frame: OwnedIpcBytes::new(arrow_ipc, guard),
             rows: 0,
+            request_id: None,
         };
         self.transport
             .insert_batch(&batch)

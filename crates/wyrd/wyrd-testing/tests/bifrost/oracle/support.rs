@@ -517,7 +517,7 @@ pub(crate) fn unused_payload(id: i64) -> String {
 /// failed with nothing compacted and no time elapsed. Generous, because a pass
 /// may claim nothing, retry, or lose a lease race; finite, because a stalled
 /// Forge must fail the journey rather than hang it.
-const COMPACTION_BUDGET: Duration = Duration::from_secs(120);
+const COMPACTION_BUDGET: Duration = Duration::from_secs(180);
 
 /// Longest one requested pass is waited on before the loop re-reads the truth.
 const COMPACTION_PASS_WAIT: Duration = Duration::from_secs(30);

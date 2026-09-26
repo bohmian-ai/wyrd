@@ -36,6 +36,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 ## How-to guides
 
 - [How-to](https://mitari-ai.github.io/wyrd/how-to/): Goal-oriented recipes for declaring, evaluating, observing, and operating Wyrd components.
+- [Administer the gateway](https://mitari-ai.github.io/wyrd/how-to/administer-the-gateway/): Configure tenant provider credentials, deployments, and fallback, governance, and capture policies.
 - [Build an Agent Workflow](https://mitari-ai.github.io/wyrd/how-to/build-a-workflow/): Author a workflow from Python, YAML, or Rust, then run and instrument it.
 - [Build an Agent](https://mitari-ai.github.io/wyrd/how-to/build-an-agent/): Build a Wyrd Agent: prompt, tools, callbacks, session memory, and run config. Python and Rust side-by-side.
 - [Declare](https://mitari-ai.github.io/wyrd/how-to/declare/): Author Wyrd cards in Python and save them locally — recipes for the three shipped kinds.
@@ -82,7 +83,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 ## Reference
 
 - [Reference](https://mitari-ai.github.io/wyrd/reference/): The literal contract — CLI verbs, card schemas, error codes, and the API surface.
-- [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, and principal commands, with every flag and environment variable.
+- [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, principal, and gateway commands, with every flag and environment variable.
 
 ## Self-hosting
 
@@ -1341,9 +1342,11 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "additionalProperties": false,
       "properties": {
         "file_uri": {
+          "description": "File URI; decodes from `file_uri` or `fileUri`.",
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
@@ -1354,7 +1357,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "type": "object"
     },
     "GoogleFunctionCall": {
-      "additionalProperties": false,
+      "description": "Function call the model requested.\n\nDecoding is deliberately permissive (no `deny_unknown_fields`): Gemini and Vertex add members such as call identifiers and thought signatures, which are ignored rather than failing the whole answer.",
       "properties": {
         "args": true,
         "name": {
@@ -1627,6 +1630,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
@@ -1639,66 +1643,14 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
     "GooglePart": {
       "anyOf": [
         {
+          "description": "Model reasoning text.",
           "properties": {
             "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "inline_data": {
-              "$ref": "#/definitions/GoogleInlineData"
-            }
-          },
-          "required": [
-            "inline_data"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "file_data": {
-              "$ref": "#/definitions/GoogleFileData"
-            }
-          },
-          "required": [
-            "file_data"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "function_call": {
-              "$ref": "#/definitions/GoogleFunctionCall"
-            }
-          },
-          "required": [
-            "function_call"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "function_response": {
-              "$ref": "#/definitions/GoogleFunctionResponse"
-            }
-          },
-          "required": [
-            "function_response"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "text": {
+              "description": "Reasoning text.",
               "type": "string"
             },
             "thought": {
+              "description": "Reasoning marker the provider sets on thought parts.",
               "type": "boolean"
             }
           },
@@ -1709,9 +1661,96 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "type": "object"
         },
         {
+          "description": "Visible text.",
+          "properties": {
+            "text": {
+              "description": "Text content.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Inline base64 media.",
+          "properties": {
+            "inline_data": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleInlineData"
+                }
+              ],
+              "description": "Media payload; decodes from `inline_data` or `inlineData`."
+            }
+          },
+          "required": [
+            "inline_data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Media referenced by URI.",
+          "properties": {
+            "file_data": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFileData"
+                }
+              ],
+              "description": "File reference; decodes from `file_data` or `fileData`."
+            }
+          },
+          "required": [
+            "file_data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Function call the model requested.",
+          "properties": {
+            "function_call": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionCall"
+                }
+              ],
+              "description": "Call; decodes from `function_call` or `functionCall`."
+            }
+          },
+          "required": [
+            "function_call"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Function result returned to the model.",
+          "properties": {
+            "function_response": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionResponse"
+                }
+              ],
+              "description": "Result; decodes from `function_response` or `functionResponse`."
+            }
+          },
+          "required": [
+            "function_response"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Code the model generated for execution.",
           "properties": {
             "executable_code": {
-              "$ref": "#/definitions/GoogleExecutableCode"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleExecutableCode"
+                }
+              ],
+              "description": "Code; decodes from `executable_code` or `executableCode`."
             }
           },
           "required": [
@@ -1720,9 +1759,15 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "type": "object"
         },
         {
+          "description": "Result of executing generated code.",
           "properties": {
             "code_execution_result": {
-              "$ref": "#/definitions/GoogleCodeExecutionResult"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleCodeExecutionResult"
+                }
+              ],
+              "description": "Result; decodes from `code_execution_result` or `codeExecutionResult`."
             }
           },
           "required": [
@@ -1730,7 +1775,8 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           ],
           "type": "object"
         }
-      ]
+      ],
+      "description": "One content part.\n\nDecoding is untagged and tries variants in declaration order, so `Thought` precedes `Text`: a part carrying both `thought` and `text` is reasoning, not visible text. Structured variants accept the snake_case names Skald emits and the camelCase names Gemini and Vertex return."
     },
     "GoogleSafetySetting": {
       "additionalProperties": false,
@@ -3638,6 +3684,22 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       ],
       "type": "string"
     },
+    "OpenAiResponsesInput": {
+      "anyOf": [
+        {
+          "description": "Text shorthand for one user message carrying one `input_text` part.",
+          "type": "string"
+        },
+        {
+          "description": "Ordered input items.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseItem"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "OpenAI Responses `input`: the text shorthand for one user message, or an ordered list of input items.\n\nBoth forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for."
+    },
     "OpenAiResponsesMcpToolChoice": {
       "additionalProperties": false,
       "properties": {
@@ -3668,7 +3730,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
     },
     "OpenAiResponsesRequest": {
       "additionalProperties": true,
-      "description": "Native OpenAI Responses generation settings flattened into the request body.",
+      "description": "`OpenAI` Responses API request body carried by a prompt or gateway call.\n\n`input` keeps the form the author or caller sent, either text shorthand or an item list, so the request serializes back without reshaping.",
       "properties": {
         "include": {
           "description": "Additional response fields to include.",
@@ -3681,10 +3743,12 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           ]
         },
         "input": {
-          "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
-          },
-          "type": "array"
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesInput"
+            }
+          ],
+          "description": "Conversation input, in the text or item form the author or caller sent."
         },
         "instructions": {
           "type": [
@@ -10807,9 +10871,11 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
       "additionalProperties": false,
       "properties": {
         "file_uri": {
+          "description": "File URI; decodes from `file_uri` or `fileUri`.",
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
@@ -10820,7 +10886,7 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
       "type": "object"
     },
     "GoogleFunctionCall": {
-      "additionalProperties": false,
+      "description": "Function call the model requested.\n\nDecoding is deliberately permissive (no `deny_unknown_fields`): Gemini and Vertex add members such as call identifiers and thought signatures, which are ignored rather than failing the whole answer.",
       "properties": {
         "args": true,
         "name": {
@@ -11093,6 +11159,7 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
@@ -11105,66 +11172,14 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
     "GooglePart": {
       "anyOf": [
         {
+          "description": "Model reasoning text.",
           "properties": {
             "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "inline_data": {
-              "$ref": "#/definitions/GoogleInlineData"
-            }
-          },
-          "required": [
-            "inline_data"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "file_data": {
-              "$ref": "#/definitions/GoogleFileData"
-            }
-          },
-          "required": [
-            "file_data"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "function_call": {
-              "$ref": "#/definitions/GoogleFunctionCall"
-            }
-          },
-          "required": [
-            "function_call"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "function_response": {
-              "$ref": "#/definitions/GoogleFunctionResponse"
-            }
-          },
-          "required": [
-            "function_response"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "text": {
+              "description": "Reasoning text.",
               "type": "string"
             },
             "thought": {
+              "description": "Reasoning marker the provider sets on thought parts.",
               "type": "boolean"
             }
           },
@@ -11175,9 +11190,96 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
           "type": "object"
         },
         {
+          "description": "Visible text.",
+          "properties": {
+            "text": {
+              "description": "Text content.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Inline base64 media.",
+          "properties": {
+            "inline_data": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleInlineData"
+                }
+              ],
+              "description": "Media payload; decodes from `inline_data` or `inlineData`."
+            }
+          },
+          "required": [
+            "inline_data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Media referenced by URI.",
+          "properties": {
+            "file_data": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFileData"
+                }
+              ],
+              "description": "File reference; decodes from `file_data` or `fileData`."
+            }
+          },
+          "required": [
+            "file_data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Function call the model requested.",
+          "properties": {
+            "function_call": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionCall"
+                }
+              ],
+              "description": "Call; decodes from `function_call` or `functionCall`."
+            }
+          },
+          "required": [
+            "function_call"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Function result returned to the model.",
+          "properties": {
+            "function_response": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionResponse"
+                }
+              ],
+              "description": "Result; decodes from `function_response` or `functionResponse`."
+            }
+          },
+          "required": [
+            "function_response"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Code the model generated for execution.",
           "properties": {
             "executable_code": {
-              "$ref": "#/definitions/GoogleExecutableCode"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleExecutableCode"
+                }
+              ],
+              "description": "Code; decodes from `executable_code` or `executableCode`."
             }
           },
           "required": [
@@ -11186,9 +11288,15 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
           "type": "object"
         },
         {
+          "description": "Result of executing generated code.",
           "properties": {
             "code_execution_result": {
-              "$ref": "#/definitions/GoogleCodeExecutionResult"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleCodeExecutionResult"
+                }
+              ],
+              "description": "Result; decodes from `code_execution_result` or `codeExecutionResult`."
             }
           },
           "required": [
@@ -11196,7 +11304,8 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
           ],
           "type": "object"
         }
-      ]
+      ],
+      "description": "One content part.\n\nDecoding is untagged and tries variants in declaration order, so `Thought` precedes `Text`: a part carrying both `thought` and `text` is reasoning, not visible text. Structured variants accept the snake_case names Skald emits and the camelCase names Gemini and Vertex return."
     },
     "GoogleSafetySetting": {
       "additionalProperties": false,
@@ -12790,6 +12899,22 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
       ],
       "type": "string"
     },
+    "OpenAiResponsesInput": {
+      "anyOf": [
+        {
+          "description": "Text shorthand for one user message carrying one `input_text` part.",
+          "type": "string"
+        },
+        {
+          "description": "Ordered input items.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseItem"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "OpenAI Responses `input`: the text shorthand for one user message, or an ordered list of input items.\n\nBoth forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for."
+    },
     "OpenAiResponsesMcpToolChoice": {
       "additionalProperties": false,
       "properties": {
@@ -12820,7 +12945,7 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
     },
     "OpenAiResponsesRequest": {
       "additionalProperties": true,
-      "description": "Native OpenAI Responses generation settings flattened into the request body.",
+      "description": "`OpenAI` Responses API request body carried by a prompt or gateway call.\n\n`input` keeps the form the author or caller sent, either text shorthand or an item list, so the request serializes back without reshaping.",
       "properties": {
         "include": {
           "description": "Additional response fields to include.",
@@ -12833,10 +12958,12 @@ Schema source: crates/wyrd-spec/schemas/prompt_spec.json
           ]
         },
         "input": {
-          "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
-          },
-          "type": "array"
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesInput"
+            }
+          ],
+          "description": "Conversation input, in the text or item form the author or caller sent."
         },
         "instructions": {
           "type": [
@@ -17155,9 +17282,11 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
       "additionalProperties": false,
       "properties": {
         "file_uri": {
+          "description": "File URI; decodes from `file_uri` or `fileUri`.",
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
@@ -17168,7 +17297,7 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
       "type": "object"
     },
     "GoogleFunctionCall": {
-      "additionalProperties": false,
+      "description": "Function call the model requested.\n\nDecoding is deliberately permissive (no `deny_unknown_fields`): Gemini and Vertex add members such as call identifiers and thought signatures, which are ignored rather than failing the whole answer.",
       "properties": {
         "args": true,
         "name": {
@@ -17441,6 +17570,7 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
@@ -17453,66 +17583,14 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
     "GooglePart": {
       "anyOf": [
         {
+          "description": "Model reasoning text.",
           "properties": {
             "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "inline_data": {
-              "$ref": "#/definitions/GoogleInlineData"
-            }
-          },
-          "required": [
-            "inline_data"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "file_data": {
-              "$ref": "#/definitions/GoogleFileData"
-            }
-          },
-          "required": [
-            "file_data"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "function_call": {
-              "$ref": "#/definitions/GoogleFunctionCall"
-            }
-          },
-          "required": [
-            "function_call"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "function_response": {
-              "$ref": "#/definitions/GoogleFunctionResponse"
-            }
-          },
-          "required": [
-            "function_response"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "text": {
+              "description": "Reasoning text.",
               "type": "string"
             },
             "thought": {
+              "description": "Reasoning marker the provider sets on thought parts.",
               "type": "boolean"
             }
           },
@@ -17523,9 +17601,96 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
           "type": "object"
         },
         {
+          "description": "Visible text.",
+          "properties": {
+            "text": {
+              "description": "Text content.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Inline base64 media.",
+          "properties": {
+            "inline_data": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleInlineData"
+                }
+              ],
+              "description": "Media payload; decodes from `inline_data` or `inlineData`."
+            }
+          },
+          "required": [
+            "inline_data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Media referenced by URI.",
+          "properties": {
+            "file_data": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFileData"
+                }
+              ],
+              "description": "File reference; decodes from `file_data` or `fileData`."
+            }
+          },
+          "required": [
+            "file_data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Function call the model requested.",
+          "properties": {
+            "function_call": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionCall"
+                }
+              ],
+              "description": "Call; decodes from `function_call` or `functionCall`."
+            }
+          },
+          "required": [
+            "function_call"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Function result returned to the model.",
+          "properties": {
+            "function_response": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionResponse"
+                }
+              ],
+              "description": "Result; decodes from `function_response` or `functionResponse`."
+            }
+          },
+          "required": [
+            "function_response"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Code the model generated for execution.",
           "properties": {
             "executable_code": {
-              "$ref": "#/definitions/GoogleExecutableCode"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleExecutableCode"
+                }
+              ],
+              "description": "Code; decodes from `executable_code` or `executableCode`."
             }
           },
           "required": [
@@ -17534,9 +17699,15 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
           "type": "object"
         },
         {
+          "description": "Result of executing generated code.",
           "properties": {
             "code_execution_result": {
-              "$ref": "#/definitions/GoogleCodeExecutionResult"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleCodeExecutionResult"
+                }
+              ],
+              "description": "Result; decodes from `code_execution_result` or `codeExecutionResult`."
             }
           },
           "required": [
@@ -17544,7 +17715,8 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
           ],
           "type": "object"
         }
-      ]
+      ],
+      "description": "One content part.\n\nDecoding is untagged and tries variants in declaration order, so `Thought` precedes `Text`: a part carrying both `thought` and `text` is reasoning, not visible text. Structured variants accept the snake_case names Skald emits and the camelCase names Gemini and Vertex return."
     },
     "GoogleSafetySetting": {
       "additionalProperties": false,
@@ -19547,6 +19719,22 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
       ],
       "type": "string"
     },
+    "OpenAiResponsesInput": {
+      "anyOf": [
+        {
+          "description": "Text shorthand for one user message carrying one `input_text` part.",
+          "type": "string"
+        },
+        {
+          "description": "Ordered input items.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseItem"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "OpenAI Responses `input`: the text shorthand for one user message, or an ordered list of input items.\n\nBoth forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for."
+    },
     "OpenAiResponsesMcpToolChoice": {
       "additionalProperties": false,
       "properties": {
@@ -19577,7 +19765,7 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
     },
     "OpenAiResponsesRequest": {
       "additionalProperties": true,
-      "description": "Native OpenAI Responses generation settings flattened into the request body.",
+      "description": "`OpenAI` Responses API request body carried by a prompt or gateway call.\n\n`input` keeps the form the author or caller sent, either text shorthand or an item list, so the request serializes back without reshaping.",
       "properties": {
         "include": {
           "description": "Additional response fields to include.",
@@ -19590,10 +19778,12 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
           ]
         },
         "input": {
-          "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
-          },
-          "type": "array"
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesInput"
+            }
+          ],
+          "description": "Conversation input, in the text or item form the author or caller sent."
         },
         "instructions": {
           "type": [
@@ -22764,9 +22954,11 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "additionalProperties": false,
       "properties": {
         "file_uri": {
+          "description": "File URI; decodes from `file_uri` or `fileUri`.",
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
@@ -22777,7 +22969,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "type": "object"
     },
     "GoogleFunctionCall": {
-      "additionalProperties": false,
+      "description": "Function call the model requested.\n\nDecoding is deliberately permissive (no `deny_unknown_fields`): Gemini and Vertex add members such as call identifiers and thought signatures, which are ignored rather than failing the whole answer.",
       "properties": {
         "args": true,
         "name": {
@@ -23050,6 +23242,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "type": "string"
         },
         "mime_type": {
+          "description": "Media type; decodes from `mime_type` or `mimeType`.",
           "type": "string"
         }
       },
@@ -23062,66 +23255,14 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
     "GooglePart": {
       "anyOf": [
         {
+          "description": "Model reasoning text.",
           "properties": {
             "text": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "text"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "inline_data": {
-              "$ref": "#/definitions/GoogleInlineData"
-            }
-          },
-          "required": [
-            "inline_data"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "file_data": {
-              "$ref": "#/definitions/GoogleFileData"
-            }
-          },
-          "required": [
-            "file_data"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "function_call": {
-              "$ref": "#/definitions/GoogleFunctionCall"
-            }
-          },
-          "required": [
-            "function_call"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "function_response": {
-              "$ref": "#/definitions/GoogleFunctionResponse"
-            }
-          },
-          "required": [
-            "function_response"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "text": {
+              "description": "Reasoning text.",
               "type": "string"
             },
             "thought": {
+              "description": "Reasoning marker the provider sets on thought parts.",
               "type": "boolean"
             }
           },
@@ -23132,9 +23273,96 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "type": "object"
         },
         {
+          "description": "Visible text.",
+          "properties": {
+            "text": {
+              "description": "Text content.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Inline base64 media.",
+          "properties": {
+            "inline_data": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleInlineData"
+                }
+              ],
+              "description": "Media payload; decodes from `inline_data` or `inlineData`."
+            }
+          },
+          "required": [
+            "inline_data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Media referenced by URI.",
+          "properties": {
+            "file_data": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFileData"
+                }
+              ],
+              "description": "File reference; decodes from `file_data` or `fileData`."
+            }
+          },
+          "required": [
+            "file_data"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Function call the model requested.",
+          "properties": {
+            "function_call": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionCall"
+                }
+              ],
+              "description": "Call; decodes from `function_call` or `functionCall`."
+            }
+          },
+          "required": [
+            "function_call"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Function result returned to the model.",
+          "properties": {
+            "function_response": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleFunctionResponse"
+                }
+              ],
+              "description": "Result; decodes from `function_response` or `functionResponse`."
+            }
+          },
+          "required": [
+            "function_response"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Code the model generated for execution.",
           "properties": {
             "executable_code": {
-              "$ref": "#/definitions/GoogleExecutableCode"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleExecutableCode"
+                }
+              ],
+              "description": "Code; decodes from `executable_code` or `executableCode`."
             }
           },
           "required": [
@@ -23143,9 +23371,15 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "type": "object"
         },
         {
+          "description": "Result of executing generated code.",
           "properties": {
             "code_execution_result": {
-              "$ref": "#/definitions/GoogleCodeExecutionResult"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/GoogleCodeExecutionResult"
+                }
+              ],
+              "description": "Result; decodes from `code_execution_result` or `codeExecutionResult`."
             }
           },
           "required": [
@@ -23153,7 +23387,8 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           ],
           "type": "object"
         }
-      ]
+      ],
+      "description": "One content part.\n\nDecoding is untagged and tries variants in declaration order, so `Thought` precedes `Text`: a part carrying both `thought` and `text` is reasoning, not visible text. Structured variants accept the snake_case names Skald emits and the camelCase names Gemini and Vertex return."
     },
     "GoogleSafetySetting": {
       "additionalProperties": false,
@@ -25268,6 +25503,22 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       ],
       "type": "string"
     },
+    "OpenAiResponsesInput": {
+      "anyOf": [
+        {
+          "description": "Text shorthand for one user message carrying one `input_text` part.",
+          "type": "string"
+        },
+        {
+          "description": "Ordered input items.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseItem"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "OpenAI Responses `input`: the text shorthand for one user message, or an ordered list of input items.\n\nBoth forms decode and re-encode unchanged, so a relayed request keeps the form its caller sent. Editing the conversation first expands the text shorthand into the single user message it stands for."
+    },
     "OpenAiResponsesMcpToolChoice": {
       "additionalProperties": false,
       "properties": {
@@ -25298,7 +25549,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
     },
     "OpenAiResponsesRequest": {
       "additionalProperties": true,
-      "description": "Native OpenAI Responses generation settings flattened into the request body.",
+      "description": "`OpenAI` Responses API request body carried by a prompt or gateway call.\n\n`input` keeps the form the author or caller sent, either text shorthand or an item list, so the request serializes back without reshaping.",
       "properties": {
         "include": {
           "description": "Additional response fields to include.",
@@ -25311,10 +25562,12 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           ]
         },
         "input": {
-          "items": {
-            "$ref": "#/definitions/OpenAiResponseItem"
-          },
-          "type": "array"
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesInput"
+            }
+          ],
+          "description": "Conversation input, in the text or item form the author or caller sent."
         },
         "instructions": {
           "type": [

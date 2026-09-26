@@ -22,6 +22,7 @@ const {
   connectBifrost,
   connectCards,
   connectVerification,
+  connectGateway,
   connectWyrdClient,
   describeTableConfig,
   openWyrdState,
@@ -30,6 +31,7 @@ const {
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
 type NativeVerification = import("../index.cjs").NativeVerification;
+type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
 type NativeWyrdState = import("../index.cjs").NativeWyrdState;
 type NativeRun = import("../index.cjs").NativeRun;
@@ -1683,5 +1685,288 @@ export class WyrdState {
    */
   async shutdown(): Promise<void> {
     lifecycleValue<null>(await this.#native.shutdown());
+  }
+}
+
+/** Provider model identity, `{provider, model}`. */
+export interface ModelRef {
+  readonly provider: string;
+  readonly model: string;
+}
+
+/** Gateway operation a deployment may serve. */
+export type GatewayOperation =
+  | "chat_completions"
+  | "responses"
+  | "embeddings"
+  | "images"
+  | "audio"
+  | "batches";
+
+/**
+ * Redacted credential source. A tenant-submitted managed secret projects to
+ * the bare discriminator. There is no write counterpart to this type: the SDK
+ * reads provider credentials and never mutates one. Submitting, rotating,
+ * revoking, and deleting a credential are CLI and scoped MCP administration
+ * paths, because a name-only revoke or delete cannot be told apart from one
+ * aimed at a managed secret.
+ */
+export type ProviderCredentialSourceView =
+  | { readonly environment: { readonly binding: string } }
+  | {
+      readonly external_secret: {
+        readonly backend: string;
+        readonly reference: string;
+      };
+    }
+  | "managed_secret";
+
+/** Redacted provider credential as returned by every read and write. */
+export interface ProviderCredentialView {
+  readonly name: string;
+  readonly provider: string;
+  readonly source: ProviderCredentialSourceView;
+  readonly state: "active" | "revoked";
+  readonly created_at: string;
+  readonly updated_at: string;
+  readonly rotated_at: string | null;
+  readonly revoked_at: string | null;
+}
+
+/** Provider wire adapter; built-in adapters require their reserved provider. */
+export type ProviderAdapter =
+  | "openai"
+  | "anthropic"
+  | "gemini"
+  | {
+      readonly vertex: { readonly project: string; readonly location: string };
+    }
+  | { readonly openai_compatible: { readonly base_url: string } };
+
+/** How a deployment authenticates to its provider. */
+export type ProviderAuth =
+  | "none"
+  | { readonly bearer: { readonly credential: string } }
+  | {
+      readonly api_key_header: {
+        readonly header: string;
+        readonly credential: string;
+      };
+    };
+
+/** One named provider deployment. */
+export interface ProviderDeployment {
+  readonly name: string;
+  readonly model: ModelRef;
+  readonly adapter: ProviderAdapter;
+  readonly auth: ProviderAuth;
+  readonly capabilities: readonly GatewayOperation[];
+  readonly routing_weight: number;
+}
+
+/** Scope a fallback rule applies to. */
+export type FallbackScope =
+  | "global"
+  | { readonly operation: { readonly operation: GatewayOperation } }
+  | { readonly model: { readonly model: ModelRef } };
+
+/** Ordered fallback candidates for one scope. */
+export interface FallbackRule {
+  readonly scope: FallbackScope;
+  readonly candidates: readonly ModelRef[];
+}
+
+/** Tenant fallback policy; the default has no rules. */
+export interface GatewayFallbackPolicy {
+  readonly rules: readonly FallbackRule[];
+}
+
+/** Subject a budget applies to. */
+export type GatewayPolicySubject =
+  | "tenant"
+  | { readonly principal: { readonly principal_id: string } }
+  | { readonly role: { readonly role_name: string } };
+
+/** Subject a rate limit applies to. */
+export type GatewayLimitSubject =
+  | "tenant"
+  | { readonly principal: { readonly principal_id: string } };
+
+/** Provider or model a limit targets. */
+export type GatewayPolicyTarget =
+  | "all"
+  | { readonly provider: { readonly provider: string } }
+  | { readonly model: { readonly model: ModelRef } };
+
+/** One rate limit; at least one ceiling is set. */
+export interface GatewayLimit {
+  readonly subject: GatewayLimitSubject;
+  readonly target: GatewayPolicyTarget;
+  readonly requests_per_minute: number | null;
+  readonly tokens_per_minute: number | null;
+  readonly concurrent_calls: number | null;
+}
+
+/** One spend budget; `amount` is a non-negative decimal string. */
+export interface GatewayBudget {
+  readonly subject: GatewayPolicySubject;
+  readonly period: "calendar_day_utc" | "calendar_month_utc";
+  readonly amount: string;
+  readonly currency: string;
+}
+
+/** One priced usage dimension; `price` is a decimal string. */
+export interface GatewayPriceRate {
+  readonly dimension: string;
+  readonly unit: string;
+  readonly price: string;
+}
+
+/** One versioned model price list. */
+export interface GatewayModelPricing {
+  readonly model: ModelRef;
+  readonly version: string;
+  readonly currency: string;
+  readonly effective_at: string;
+  readonly active: boolean;
+  readonly rates: readonly GatewayPriceRate[];
+}
+
+/** Tenant governance policy: limits, budgets, pricing, unknown-cost handling. */
+export interface GatewayGovernancePolicy {
+  readonly limits: readonly GatewayLimit[];
+  readonly budgets: readonly GatewayBudget[];
+  readonly pricing: readonly GatewayModelPricing[];
+  readonly unknown_cost: "reject" | "allow_unpriced";
+}
+
+/** Capture mode for gateway calls. */
+export type GatewayCaptureMode = "disabled" | "metadata" | "payload";
+
+/** Capture policy write; payload fields are required only in payload mode. */
+export interface GatewayCapturePolicyWrite {
+  readonly mode: GatewayCaptureMode;
+  readonly payload_fields: readonly ("request" | "response")[];
+}
+
+/** Versioned capture policy as stored by the server. */
+export interface GatewayCapturePolicy extends GatewayCapturePolicyWrite {
+  readonly version: number;
+}
+
+/**
+ * Tenant gateway administration over the shared Rust `Gateway` handle.
+ *
+ * Bodies are validated in Rust and by the server; credential reads are always
+ * redacted, and failures throw a structured {@link WyrdError}. A decode
+ * failure names the argument and its position and quotes none of the body.
+ *
+ * Provider credential mutation is absent here and on the exported native
+ * class beneath it, so no JavaScript value can reach a managed secret write
+ * from this SDK. Use the Wyrd CLI or the scoped MCP tool to submit, rotate,
+ * revoke, or delete a credential.
+ */
+export class Gateway {
+  readonly #native: NativeGateway;
+
+  private constructor(native: NativeGateway) {
+    this.#native = native;
+  }
+
+  /**
+   * Build an administration client without performing IO.
+   *
+   * Omitted options resolve through the same chain as {@link Bifrost.connect}.
+   */
+  static connect(
+    options: { readonly serverUrl?: string; readonly credential?: string } = {},
+  ): Gateway {
+    return new Gateway(connectGateway(options.serverUrl, options.credential));
+  }
+
+  /** Read one redacted provider credential. */
+  async credential(name: string): Promise<ProviderCredentialView> {
+    return lifecycleValue(await this.#native.credential(name));
+  }
+
+  /** List redacted provider credentials ordered by name. */
+  async credentials(): Promise<ProviderCredentialView[]> {
+    return lifecycleValue(await this.#native.credentials());
+  }
+
+  /** Create or replace a provider deployment. */
+  async putDeployment(
+    deployment: ProviderDeployment,
+  ): Promise<ProviderDeployment> {
+    return lifecycleValue(
+      await this.#native.putDeployment(JSON.stringify(deployment)),
+    );
+  }
+
+  /** Read one provider deployment. */
+  async deployment(name: string): Promise<ProviderDeployment> {
+    return lifecycleValue(await this.#native.deployment(name));
+  }
+
+  /** List provider deployments ordered by name. */
+  async deployments(): Promise<ProviderDeployment[]> {
+    return lifecycleValue(await this.#native.deployments());
+  }
+
+  /** Delete a provider deployment; an absent name succeeds. */
+  async deleteDeployment(name: string): Promise<void> {
+    lifecycleValue<null>(await this.#native.deleteDeployment(name));
+  }
+
+  /** Replace the tenant fallback policy. */
+  async putFallbackPolicy(
+    policy: GatewayFallbackPolicy,
+  ): Promise<GatewayFallbackPolicy> {
+    return lifecycleValue(
+      await this.#native.putFallbackPolicy(JSON.stringify(policy)),
+    );
+  }
+
+  /** Read the tenant fallback policy, or the default. */
+  async fallbackPolicy(): Promise<GatewayFallbackPolicy> {
+    return lifecycleValue(await this.#native.fallbackPolicy());
+  }
+
+  /** Restore the default fallback policy. */
+  async deleteFallbackPolicy(): Promise<void> {
+    lifecycleValue<null>(await this.#native.deleteFallbackPolicy());
+  }
+
+  /** Replace the tenant governance policy. */
+  async putGovernancePolicy(
+    policy: GatewayGovernancePolicy,
+  ): Promise<GatewayGovernancePolicy> {
+    return lifecycleValue(
+      await this.#native.putGovernancePolicy(JSON.stringify(policy)),
+    );
+  }
+
+  /** Read the tenant governance policy, or the default. */
+  async governancePolicy(): Promise<GatewayGovernancePolicy> {
+    return lifecycleValue(await this.#native.governancePolicy());
+  }
+
+  /** Restore the default governance policy. */
+  async deleteGovernancePolicy(): Promise<void> {
+    lifecycleValue<null>(await this.#native.deleteGovernancePolicy());
+  }
+
+  /** Replace the tenant capture policy; returns its versioned view. */
+  async putCapturePolicy(
+    policy: GatewayCapturePolicyWrite,
+  ): Promise<GatewayCapturePolicy> {
+    return lifecycleValue(
+      await this.#native.putCapturePolicy(JSON.stringify(policy)),
+    );
+  }
+
+  /** Read the tenant capture policy, or the disabled default. */
+  async capturePolicy(): Promise<GatewayCapturePolicy> {
+    return lifecycleValue(await this.#native.capturePolicy());
   }
 }

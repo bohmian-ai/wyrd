@@ -65,6 +65,16 @@ Card-free machine principal therefore carries no emit scope. `tenant_admin`,
 `global_admin`, and `user` never bind a Card — an administrative or human
 identity is not a registered AI-system component.
 
+Gateway capture runs as the reserved `GATEWAY_CAPTURE_PRINCIPAL`, a
+tenant-bound, card-free `service` principal. Only the server's signing key
+issues it, as a token of at most 900 seconds carrying an empty Card-reference
+scope, only the informational `gateway_capture` Role, and exactly the two
+table-scoped record-write grants for `vala.gateway.calls` and
+`vala.traces.spans`, which the verifier requires. Public credential,
+workload, refresh, delegation, and impersonation flows refuse it; it never
+appears in a delegation chain, holds no persisted credential, and never
+replaces the invocation caller in audit.
+
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
 Credential issuance is a separate privileged operation and is policy-gated.
@@ -323,16 +333,26 @@ is not an SSRF control.
 ## Audit integrity and privacy
 
 Audit cardinality follows authorization decisions, not HTTP requests and not
-engine mechanics. Every decision that evaluates a principal's permission
-appends its audit row in the same transaction that made it. Scribe batch
-commits and Forge maintenance transitions evaluate no permission: they are
-recorded as lineage in `vala.scribe_batch_commits` and `vala.forge_operations`
-and emit no audit event.
+engine mechanics. Except for the explicitly non-blocking Oracle read and
+gateway invocation paths below, every decision that evaluates a principal's
+permission appends its audit row in the same transaction that made it. Scribe
+batch commits and Forge maintenance transitions evaluate no permission: they
+are recorded as lineage in `vala.scribe_batch_commits` and
+`vala.forge_operations` and emit no audit event.
 
-Oracle query admission is the single durability exception: the serving process
-fsyncs a versioned, CRC-framed local acceptance record before returning rows,
-then a bounded at-least-once relay appends the canonical tenant
+Oracle query admission uses a stronger local durability handoff: the serving
+process fsyncs a versioned, CRC-framed local acceptance record before returning
+rows, then a bounded at-least-once relay appends the canonical tenant
 `vala.audit_staging` entry. Relay identity makes replay safe and observable.
+
+Gateway invocation authorization is evaluated synchronously before protected
+work, but its audit event is committed to the same canonical
+`vala.audit_staging` path by tracked non-blocking server work. Slow or failed
+audit persistence does not delay or reverse the authorization verdict; failure
+is metered and logged, and shutdown drains tracked work. Gateway administration
+decisions remain transactional with their mutations. No gateway-specific audit
+WAL, disk spool, durable queue, relay, table, publisher, or sink exists; abrupt
+process loss may therefore lose an invocation event that has not committed.
 
 `vala.audit_staging` is transient transactional write-ahead state with no
 external consumer. Retained audit history lives in the

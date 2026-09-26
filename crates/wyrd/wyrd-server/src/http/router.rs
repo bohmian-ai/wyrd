@@ -11,6 +11,7 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower::load_shed::LoadShedLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
+use tracing::Span;
 use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use wyrd_spec::error::WyrdError;
@@ -21,6 +22,7 @@ use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
 use crate::components::authz::authz_router;
 use crate::components::cards::cards_router;
+use crate::components::gateway::{gateway_ingress_router, gateway_router};
 use crate::components::health::health_router;
 use crate::components::platform::{
     platform_auth_router, platform_credentials_router, platform_identity_router,
@@ -69,6 +71,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(principals_router())
         .merge(verification_router())
         .merge(admin_router())
+        .merge(gateway_router())
         .merge(otlp_router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -95,7 +98,9 @@ pub fn build_router(state: AppState) -> Router {
     // Routing and documentation come out of the same composition: every handler
     // is registered once, through `routes!`, and the served document is
     // whatever that registration produced. There is no second list of paths to
-    // keep in step with this one.
+    // keep in step with this one. Gateway inference sits outside `/v1`'s
+    // default-deny layer because each protocol authenticates its own SDK
+    // credential carrier, but it is documented by the same composition.
     let (routed, mut document) = OpenApiRouter::with_openapi(WyrdApiDoc::openapi())
         .merge(auth_routes)
         .merge(platform_auth_router())
@@ -103,6 +108,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(platform_router())
         .merge(platform_identity_router())
         .merge(platform_credentials_router())
+        .merge(gateway_ingress_router(&state))
         .nest("/v1", v1_group)
         .split_for_parts();
     // The document-wide modifiers run after composition because both of them
@@ -127,7 +133,22 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::http::middleware::metrics::track_metrics,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
+}
+
+/// Opens the root span of one HTTP request.
+///
+/// It records the method, path, and version but never the query: a URL-borne
+/// credential, such as a provider SDK's `?key=` that ingress refuses, is
+/// already in the request when this span opens, before any authentication
+/// runs, and must not reach logs or exported traces.
+fn request_span(request: &Request) -> Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        path = request.uri().path(),
+        version = ?request.version(),
+    )
 }
 
 /// Apply the core protective edge stack to `router`: request-id propagation,

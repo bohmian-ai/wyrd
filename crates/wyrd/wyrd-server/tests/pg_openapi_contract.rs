@@ -134,6 +134,18 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/bifrost/tables/{namespace}/{name}",
         "/auth/token",
         "/platform/tenants",
+        "/v1/admin/gateway/provider-credentials",
+        "/v1/admin/gateway/provider-credentials/{name}",
+        "/v1/admin/gateway/provider-credentials/{name}/revoke",
+        "/v1/admin/gateway/provider-deployments",
+        "/v1/admin/gateway/provider-deployments/{name}",
+        "/v1/admin/gateway/fallback-policy",
+        "/v1/admin/gateway/governance-policy",
+        "/v1/admin/gateway/capture-policy",
+        "/v1/gateway/payload-objects/{digest}",
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1beta/models/{target}",
     ] {
         assert!(paths.contains_key(path), "missing {path}");
     }
@@ -483,6 +495,316 @@ fn resolve_schema<'a>(document: &'a Value, schema: &'a Value) -> &'a Value {
     schema
 }
 
+/// Every gateway administration operation publishes its common and
+/// route-specific refusals as `application/problem+json` `WyrdProblem` bodies,
+/// and only the credential routes that can conflict publish a 409.
+#[tokio::test]
+async fn gateway_operations_publish_problem_json_refusals() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let credential = "/v1/admin/gateway/provider-credentials/{name}";
+    let deployment = "/v1/admin/gateway/provider-deployments/{name}";
+    let operations: [(&str, &str, &[&str]); 17] = [
+        (credential, "put", &["400", "409"]),
+        (credential, "get", &["400", "404"]),
+        ("/v1/admin/gateway/provider-credentials", "get", &[]),
+        (
+            "/v1/admin/gateway/provider-credentials/{name}/revoke",
+            "post",
+            &["400", "404"],
+        ),
+        (credential, "delete", &["400", "409"]),
+        (deployment, "put", &["400"]),
+        (deployment, "get", &["400", "404"]),
+        ("/v1/admin/gateway/provider-deployments", "get", &[]),
+        (deployment, "delete", &["400"]),
+        ("/v1/admin/gateway/fallback-policy", "put", &["400"]),
+        ("/v1/admin/gateway/fallback-policy", "get", &[]),
+        ("/v1/admin/gateway/fallback-policy", "delete", &[]),
+        ("/v1/admin/gateway/governance-policy", "put", &["400"]),
+        ("/v1/admin/gateway/governance-policy", "get", &[]),
+        ("/v1/admin/gateway/governance-policy", "delete", &[]),
+        ("/v1/admin/gateway/capture-policy", "put", &["400"]),
+        ("/v1/admin/gateway/capture-policy", "get", &[]),
+    ];
+    for (path, method, specific) in operations {
+        let responses = &document["paths"][path][method]["responses"];
+        assert_eq!(
+            responses.get("409").is_some(),
+            path == credential && specific.contains(&"409"),
+            "{method} {path} publishes 409 only for reachable credential conflicts"
+        );
+        for status in ["401", "403", "503", "default"].iter().chain(specific) {
+            assert_eq!(
+                responses[*status]["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+                "#/components/schemas/WyrdProblem",
+                "{method} {path} must publish {status} as problem+json"
+            );
+        }
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The public gateway inference ingress publishes typed request, success, and
+/// native error contracts.
+///
+/// Chat completions publishes both JSON and `text/event-stream` success; every
+/// media route publishes its request media type; every `OpenAI`-compatible
+/// route publishes typed bodies and the `OpenAI` error envelope; the batch list
+/// `limit` carries the bounds the runtime enforces; payload retrieval publishes
+/// a binary string; and the Anthropic Messages and Gemini `GenerateContent`
+/// routes publish open, typed native bodies and their own error envelopes.
+#[tokio::test]
+async fn gateway_ingress_publishes_typed_contracts() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let schemas = &document["components"]["schemas"];
+    let reference = |name: &str| format!("#/components/schemas/{name}");
+
+    let content = &document["paths"]["/v1/chat/completions"]["post"]["responses"]["200"]["content"];
+    for media in ["application/json", "text/event-stream"] {
+        assert!(
+            content.get(media).is_some(),
+            "200 must publish {media}: {content}"
+        );
+    }
+
+    for (path, method, media, request, success) in [
+        (
+            "/v1/chat/completions",
+            "post",
+            "application/json",
+            Some("GatewayChatCompletionsRequest"),
+            Some("GatewayChatCompletion"),
+        ),
+        (
+            "/v1/responses",
+            "post",
+            "application/json",
+            Some("GatewayResponsesRequest"),
+            Some("GatewayResponse"),
+        ),
+        (
+            "/v1/embeddings",
+            "post",
+            "application/json",
+            Some("GatewayEmbeddingsRequest"),
+            Some("GatewayEmbeddings"),
+        ),
+        (
+            "/v1/images/generations",
+            "post",
+            "application/json",
+            Some("GatewayImageGenerationRequest"),
+            Some("GatewayImages"),
+        ),
+        (
+            "/v1/images/edits",
+            "post",
+            "multipart/form-data",
+            Some("GatewayImageEditForm"),
+            Some("GatewayImages"),
+        ),
+        (
+            "/v1/images/variations",
+            "post",
+            "multipart/form-data",
+            Some("GatewayImageVariationForm"),
+            Some("GatewayImages"),
+        ),
+        (
+            "/v1/audio/speech",
+            "post",
+            "application/json",
+            Some("GatewaySpeechRequest"),
+            None,
+        ),
+        (
+            "/v1/audio/transcriptions",
+            "post",
+            "multipart/form-data",
+            Some("GatewayTranscriptionForm"),
+            Some("GatewayTranscription"),
+        ),
+        (
+            "/v1/audio/translations",
+            "post",
+            "multipart/form-data",
+            Some("GatewayTranslationForm"),
+            Some("GatewayTranscription"),
+        ),
+        ("/v1/models", "get", "", None, Some("GatewayModelList")),
+        (
+            "/v1/files",
+            "post",
+            "multipart/form-data",
+            Some("GatewayFileUploadForm"),
+            Some("GatewayFile"),
+        ),
+        ("/v1/files/{file_id}", "get", "", None, Some("GatewayFile")),
+        (
+            "/v1/files/{file_id}",
+            "delete",
+            "",
+            None,
+            Some("GatewayFileDeleted"),
+        ),
+        (
+            "/v1/batches",
+            "post",
+            "application/json",
+            Some("GatewayBatchCreateRequest"),
+            Some("GatewayBatch"),
+        ),
+        ("/v1/batches", "get", "", None, Some("GatewayBatchList")),
+        (
+            "/v1/batches/{batch_id}",
+            "get",
+            "",
+            None,
+            Some("GatewayBatch"),
+        ),
+        (
+            "/v1/batches/{batch_id}/cancel",
+            "post",
+            "",
+            None,
+            Some("GatewayBatch"),
+        ),
+    ] {
+        let operation = &document["paths"][path][method];
+        if let Some(request) = request {
+            assert_eq!(
+                operation["requestBody"]["content"][media]["schema"]["$ref"],
+                reference(request),
+                "{method} {path} request"
+            );
+        }
+        if let Some(success) = success {
+            assert_eq!(
+                operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                reference(success),
+                "{method} {path} success"
+            );
+        }
+        assert_eq!(
+            operation["responses"]["default"]["content"]["application/json"]["schema"]["$ref"],
+            reference("OpenAiErrorEnvelope"),
+            "{method} {path} error envelope"
+        );
+    }
+    for (component, fields) in [
+        (
+            "GatewayChatCompletionsRequest",
+            &["model", "messages", "temperature"][..],
+        ),
+        (
+            "GatewayImageEditForm",
+            &["model", "image", "mask", "prompt"],
+        ),
+        ("GatewayTranscriptionForm", &["model", "file", "language"]),
+        (
+            "GatewayBatchCreateRequest",
+            &["input_file_id", "endpoint", "completion_window"],
+        ),
+        (
+            "GatewayBatchList",
+            &["object", "data", "first_id", "last_id", "has_more"],
+        ),
+        ("OpenAiError", &["message", "type", "param", "code"]),
+    ] {
+        for field in fields {
+            assert!(
+                schemas[component]["properties"].get(*field).is_some(),
+                "{component} must publish {field}"
+            );
+        }
+    }
+    assert_eq!(schemas["GatewayFormFile"]["type"], "string");
+    assert_eq!(schemas["GatewayFormFile"]["format"], "binary");
+    assert_eq!(
+        document["paths"]["/v1/gateway/payload-objects/{digest}"]["get"]["responses"]["200"]["content"]
+            ["application/octet-stream"]["schema"]["$ref"],
+        reference("GatewayFormFile"),
+        "payload object retrieval publishes a binary string"
+    );
+    let limit = document["paths"]["/v1/batches"]["get"]["parameters"]
+        .as_array()
+        .expect("batch list parameters")
+        .iter()
+        .find(|parameter| parameter["name"] == "limit")
+        .expect("limit parameter");
+    assert_eq!(
+        (&limit["schema"]["minimum"], &limit["schema"]["maximum"]),
+        (&serde_json::json!(1), &serde_json::json!(100))
+    );
+
+    for (path, request, success, error) in [
+        (
+            "/v1/messages",
+            "GatewayAnthropicMessagesRequest",
+            "GatewayAnthropicMessage",
+            "AnthropicErrorEnvelope",
+        ),
+        (
+            "/v1beta/models/{target}",
+            "GatewayGeminiGenerateContentRequest",
+            "GatewayGeminiGenerateContentResponse",
+            "GoogleErrorEnvelope",
+        ),
+    ] {
+        let operation = &document["paths"][path]["post"];
+        assert_eq!(
+            (
+                &operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                &operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                &operation["responses"]["default"]["content"]["application/json"]["schema"]["$ref"],
+            ),
+            (
+                &serde_json::json!(reference(request)),
+                &serde_json::json!(reference(success)),
+                &serde_json::json!(reference(error)),
+            ),
+            "{path}"
+        );
+    }
+    for (component, fields) in [
+        (
+            "GatewayAnthropicMessagesRequest",
+            &["model", "max_tokens", "messages", "stream"][..],
+        ),
+        (
+            "GatewayAnthropicMessage",
+            &["id", "type", "content", "stop_reason", "usage"],
+        ),
+        ("GatewayGeminiGenerateContentRequest", &["contents"]),
+        (
+            "GatewayGeminiGenerateContentResponse",
+            &["candidates", "usageMetadata"],
+        ),
+    ] {
+        let schema = &schemas[component];
+        for field in fields {
+            assert!(
+                schema["properties"].get(*field).is_some(),
+                "{component} must publish {field}: {schema}"
+            );
+        }
+        assert_ne!(
+            schema["additionalProperties"],
+            serde_json::json!(false),
+            "{component} must accept native extensions"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// The card surface publishes its typed lifecycle, parameter, and problem
 /// shapes.
 ///
@@ -757,10 +1079,7 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
                 .expect("router responds");
             let status = response.status();
             let code = if status == StatusCode::UNAUTHORIZED {
-                problem_json(response).await["code"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned()
+                refusal_code(&problem_json(response).await)
             } else {
                 String::new()
             };
@@ -786,6 +1105,22 @@ async fn unauthenticated_requests_match_each_operation_declared_security() {
     assert!(defects.is_empty(), "{}", defects.join("\n"));
 
     server.shutdown().await.expect("server shuts down");
+}
+
+/// The stable Wyrd code a refusal body carries, whatever envelope it uses.
+///
+/// Wyrd surfaces answer with problem+json, whose `code` names it. The public
+/// gateway inference ingress answers in the calling SDK's own envelope instead:
+/// `OpenAI` and Anthropic carry the code in `error.code`, and Google carries it
+/// as the `reason` of its `ErrorInfo` detail. Returns an empty string when the
+/// body names no code.
+fn refusal_code(body: &Value) -> String {
+    body["code"]
+        .as_str()
+        .or_else(|| body["error"]["code"].as_str())
+        .or_else(|| body["error"]["details"][0]["reason"].as_str())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Replace every `{template}` segment with a probe value so the path routes.

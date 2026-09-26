@@ -778,17 +778,23 @@ pub enum AddressPlan {
 }
 
 impl AddressPlan {
-    /// Detects whether this platform can assign distinct loopback addresses,
-    /// and picks this cluster's random loopback block when it can.
+    /// Detects whether this platform can bind the canonical ports on a distinct
+    /// loopback address, and picks this cluster's random block when it can.
     #[must_use]
     pub fn detect() -> Self {
         let subnet: [u8; 2] = rand::random();
-        match TcpListener::bind((Ipv4Addr::new(127, subnet[0], subnet[1], 2), 0)) {
-            Ok(listener) => {
-                drop(listener);
-                Self::DistinctLoopbackAddresses { subnet }
-            }
-            Err(_) => Self::DistinctPortsOnLocalhost,
+        let host = Ipv4Addr::new(127, subnet[0], subnet[1], 2);
+        let canonical_ports_available = [
+            CANONICAL_PUBLIC_HTTP_PORT,
+            CANONICAL_PUBLIC_GRPC_PORT,
+            CANONICAL_PEER_PORT,
+        ]
+        .into_iter()
+        .all(|port| TcpListener::bind((host, port)).is_ok());
+        if canonical_ports_available {
+            Self::DistinctLoopbackAddresses { subnet }
+        } else {
+            Self::DistinctPortsOnLocalhost
         }
     }
 

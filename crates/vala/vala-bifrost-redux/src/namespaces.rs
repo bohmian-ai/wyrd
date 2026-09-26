@@ -2,11 +2,7 @@
 
 use iceberg::NamespaceIdent;
 
-/// The closed set of `vala.*` namespaces the Bifrost catalog owns.
-///
-/// Every built-in table and every caller-owned dataset lives in exactly one of
-/// these; the catalog, query admission, and FQN parsing all resolve names
-/// through this enum rather than matching namespace strings ad hoc.
+/// Closed set of Bifrost logical namespaces a table may belong to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BifrostNamespace {
     /// `vala.system` — retained audit history.
@@ -29,12 +25,14 @@ pub enum BifrostNamespace {
     Dev,
     /// `vala.datasets` — caller-owned dynamic tables.
     Datasets, // Redux-only variant for dynamic table namespace
+    /// Gateway capture tables such as `vala.gateway.calls`.
+    Gateway,
 }
 
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Audit,
         Self::Bifrost,
         Self::Traces,
@@ -45,6 +43,7 @@ impl BifrostNamespace {
         Self::Verification,
         Self::Dev,
         Self::Datasets,
+        Self::Gateway,
     ];
 
     /// The wire namespace string (e.g. `"vala.eval"`) every FQN is built from.
@@ -60,6 +59,7 @@ impl BifrostNamespace {
             Self::Verification => "vala.verification",
             Self::Dev => "vala.dev",
             Self::Datasets => "vala.datasets",
+            Self::Gateway => "vala.gateway",
         }
     }
 
@@ -83,6 +83,7 @@ impl BifrostNamespace {
             "verification" => Some(Self::Verification),
             "dev" => Some(Self::Dev),
             "datasets" => Some(Self::Datasets),
+            "gateway" => Some(Self::Gateway),
             _ => None,
         }
     }

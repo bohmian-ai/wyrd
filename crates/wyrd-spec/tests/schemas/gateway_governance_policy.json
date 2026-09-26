@@ -1,0 +1,450 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayGovernancePolicy",
+  "description": "The tenant's single gateway governance policy.\n\nThe default is the empty policy: no limits or budgets, no active pricing, and `unknown_cost: allow_unpriced`.",
+  "type": "object",
+  "required": [
+    "budgets",
+    "limits",
+    "pricing",
+    "unknown_cost"
+  ],
+  "properties": {
+    "budgets": {
+      "description": "Spending budgets.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GatewayBudget"
+      }
+    },
+    "limits": {
+      "description": "Rate and concurrency limits.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GatewayLimit"
+      }
+    },
+    "pricing": {
+      "description": "Versioned model pricing.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GatewayModelPricing"
+      }
+    },
+    "unknown_cost": {
+      "description": "Unknown-cost admission.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/UnknownCostPolicy"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "GatewayBudget": {
+      "description": "Spending budget for one subject and period.",
+      "type": "object",
+      "required": [
+        "amount",
+        "currency",
+        "period",
+        "subject"
+      ],
+      "properties": {
+        "amount": {
+          "description": "Positive budget amount.",
+          "type": "string"
+        },
+        "currency": {
+          "description": "Budget currency.",
+          "type": "string"
+        },
+        "period": {
+          "description": "Accounting period.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GatewayBudgetPeriod"
+            }
+          ]
+        },
+        "subject": {
+          "description": "Budgeted principal set.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GatewayPolicySubject"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "GatewayBudgetPeriod": {
+      "description": "UTC calendar accounting period for a budget.",
+      "oneOf": [
+        {
+          "description": "One UTC calendar day.",
+          "type": "string",
+          "enum": [
+            "calendar_day_utc"
+          ]
+        },
+        {
+          "description": "One UTC calendar month.",
+          "type": "string",
+          "enum": [
+            "calendar_month_utc"
+          ]
+        }
+      ]
+    },
+    "GatewayLimit": {
+      "description": "Rate and concurrency limit for one subject and target.",
+      "type": "object",
+      "required": [
+        "subject",
+        "target"
+      ],
+      "properties": {
+        "concurrent_calls": {
+          "description": "Maximum concurrently admitted calls.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1.0
+        },
+        "requests_per_minute": {
+          "description": "Maximum admitted requests per minute.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1.0
+        },
+        "subject": {
+          "description": "Limited principal set.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GatewayLimitSubject"
+            }
+          ]
+        },
+        "target": {
+          "description": "Limited calls.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/GatewayPolicyTarget"
+            }
+          ]
+        },
+        "tokens_per_minute": {
+          "description": "Maximum tokens per minute.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "GatewayLimitSubject": {
+      "description": "Principal set a limit applies to; limits have no role subject.",
+      "oneOf": [
+        {
+          "description": "The whole tenant.",
+          "type": "string",
+          "enum": [
+            "tenant"
+          ]
+        },
+        {
+          "description": "One principal.",
+          "type": "object",
+          "required": [
+            "principal"
+          ],
+          "properties": {
+            "principal": {
+              "type": "object",
+              "required": [
+                "principal_id"
+              ],
+              "properties": {
+                "principal_id": {
+                  "description": "Principal identity.",
+                  "type": "string",
+                  "format": "uuid"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GatewayModelPricing": {
+      "description": "One immutable pricing version for a model.",
+      "type": "object",
+      "required": [
+        "active",
+        "currency",
+        "effective_at",
+        "model",
+        "rates",
+        "version"
+      ],
+      "properties": {
+        "active": {
+          "description": "Whether the entry is eligible for newly admitted calls.",
+          "type": "boolean"
+        },
+        "currency": {
+          "description": "Pricing currency.",
+          "type": "string"
+        },
+        "effective_at": {
+          "description": "Admission time from which this entry applies.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "model": {
+          "description": "Priced model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelRef"
+            }
+          ]
+        },
+        "rates": {
+          "description": "Non-empty rates.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GatewayPriceRate"
+          }
+        },
+        "version": {
+          "description": "Immutable version label.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GatewayPolicySubject": {
+      "description": "Principal set a budget applies to.",
+      "oneOf": [
+        {
+          "description": "The whole tenant.",
+          "type": "string",
+          "enum": [
+            "tenant"
+          ]
+        },
+        {
+          "description": "One principal.",
+          "type": "object",
+          "required": [
+            "principal"
+          ],
+          "properties": {
+            "principal": {
+              "type": "object",
+              "required": [
+                "principal_id"
+              ],
+              "properties": {
+                "principal_id": {
+                  "description": "Principal identity.",
+                  "type": "string",
+                  "format": "uuid"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Every principal holding one role.",
+          "type": "object",
+          "required": [
+            "role"
+          ],
+          "properties": {
+            "role": {
+              "type": "object",
+              "required": [
+                "role_name"
+              ],
+              "properties": {
+                "role_name": {
+                  "description": "Role name.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/RoleName"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GatewayPolicyTarget": {
+      "description": "Calls a limit applies to.",
+      "oneOf": [
+        {
+          "description": "Every provider and model.",
+          "type": "string",
+          "enum": [
+            "all"
+          ]
+        },
+        {
+          "description": "One provider.",
+          "type": "object",
+          "required": [
+            "provider"
+          ],
+          "properties": {
+            "provider": {
+              "type": "object",
+              "required": [
+                "provider"
+              ],
+              "properties": {
+                "provider": {
+                  "description": "Provider identity.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ProviderId"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "One exact model.",
+          "type": "object",
+          "required": [
+            "model"
+          ],
+          "properties": {
+            "model": {
+              "type": "object",
+              "required": [
+                "model"
+              ],
+              "properties": {
+                "model": {
+                  "description": "Model identity.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ModelRef"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GatewayPriceRate": {
+      "description": "Price for one provider billing dimension.",
+      "type": "object",
+      "required": [
+        "dimension",
+        "price",
+        "unit"
+      ],
+      "properties": {
+        "dimension": {
+          "description": "Open provider billing dimension, such as `input_tokens`.",
+          "type": "string"
+        },
+        "price": {
+          "description": "Non-negative price per unit.",
+          "type": "string"
+        },
+        "unit": {
+          "description": "Billing unit, such as `1m_tokens`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "One exact provider-native model selected by a caller.\n\nTyped surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "description": "Provider-native model identifier.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelId"
+            }
+          ]
+        },
+        "provider": {
+          "description": "Provider that serves the model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
+    },
+    "RoleName": {
+      "description": "RBAC role identifier.",
+      "type": "string"
+    },
+    "UnknownCostPolicy": {
+      "description": "Admission of a call whose cost cannot be bounded.",
+      "oneOf": [
+        {
+          "description": "Reject the call.",
+          "type": "string",
+          "enum": [
+            "reject"
+          ]
+        },
+        {
+          "description": "Admit it with an explicit unpriced outcome when no budget applies.",
+          "type": "string",
+          "enum": [
+            "allow_unpriced"
+          ]
+        }
+      ]
+    }
+  }
+}

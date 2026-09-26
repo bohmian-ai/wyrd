@@ -65,6 +65,15 @@ impl TableUid {
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+
+    /// Wraps a stable 16-byte identity already issued by the catalog.
+    ///
+    /// Used where a registered UID crosses a boundary as raw bytes, such as a
+    /// Scribe test double answering Gate's destination resolution.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
 }
 
 /// Inputs for one tenant-qualified physical table registration.
@@ -1200,6 +1209,28 @@ impl BifrostCatalog {
             ))
         })?;
         Ok((SchemaFingerprint(fingerprint), layout_wire_from_row(&row)?))
+    }
+
+    /// Return the registered UID of one tenant/logical table.
+    ///
+    /// This is a single control-row lookup: nothing is provisioned and no
+    /// Iceberg metadata is loaded, so Gate can name a write destination's
+    /// object scope cheaply on every frame.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant does not
+    /// own the registration, or a metadata or SQL error otherwise.
+    pub async fn table_uid(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+    ) -> Result<TableUid, BifrostCatalogError> {
+        let fqn = table.fqn();
+        let row = self
+            .lookup_table_row(&fqn, tenant)
+            .await?
+            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
+        TableUid::from_row(&row.table_uid, &fqn)
     }
 
     /// Return the registered user-schema fingerprint for one tenant/logical table.

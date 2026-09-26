@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayAttemptSpanFieldsV1",
+  "description": "Exact attributes carried by each linked GenAI attempt span.",
+  "type": "object",
+  "required": [
+    "attempt_ordinal",
+    "deployment",
+    "gateway_call_id",
+    "model",
+    "outcome",
+    "started_at",
+    "terminal_at"
+  ],
+  "properties": {
+    "attempt_ordinal": {
+      "description": "One-based attempt ordinal.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1.0
+    },
+    "cost": {
+      "description": "Cost, or null when unknown.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "currency": {
+      "description": "Currency, present exactly when cost is.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "deployment": {
+      "description": "Deployment attempted.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProviderDeploymentName"
+        }
+      ]
+    },
+    "error_code": {
+      "description": "Stable Wyrd error code on failure.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^WYRD_[A-Z0-9_]+$"
+    },
+    "gateway_call_id": {
+      "description": "Logical call.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "model": {
+      "description": "Model attempted.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelRef"
+        }
+      ]
+    },
+    "normalized_usage": {
+      "description": "Normalized usage, or null when unknown.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/definitions/GatewayUsageAmount"
+      }
+    },
+    "outcome": {
+      "description": "Attempt outcome.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GatewayCallOutcome"
+        }
+      ]
+    },
+    "pricing_version": {
+      "description": "Pricing version, present exactly when cost is.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 128,
+      "minLength": 1
+    },
+    "provider_usage_json": {
+      "description": "Canonical provider-native usage JSON. Bounded by the fixed ceiling of 1,048,576 serialized UTF-8 bytes. `maxLength` counts characters, so a multibyte value within it can still exceed the byte ceiling and is rejected.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1048576
+    },
+    "started_at": {
+      "description": "Attempt start.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "terminal_at": {
+      "description": "Attempt end.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "GatewayCallOutcome": {
+      "description": "Terminal outcome of a logical call or attempt.",
+      "oneOf": [
+        {
+          "description": "Completed successfully.",
+          "type": "string",
+          "enum": [
+            "succeeded"
+          ]
+        },
+        {
+          "description": "Failed.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "Cancelled by the caller or shutdown.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        },
+        {
+          "description": "Exceeded its deadline.",
+          "type": "string",
+          "enum": [
+            "timed_out"
+          ]
+        }
+      ]
+    },
+    "GatewayUsageAmount": {
+      "description": "One normalized usage quantity.",
+      "type": "object",
+      "required": [
+        "dimension",
+        "quantity",
+        "unit"
+      ],
+      "properties": {
+        "dimension": {
+          "description": "Open usage dimension, such as `output_tokens`.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "quantity": {
+          "description": "Non-negative quantity.",
+          "type": "string"
+        },
+        "unit": {
+          "description": "Usage unit, such as `tokens`.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "One exact provider-native model selected by a caller.\n\nTyped surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "description": "Provider-native model identifier.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelId"
+            }
+          ]
+        },
+        "provider": {
+          "description": "Provider that serves the model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderDeploymentName": {
+      "description": "Tenant-unique gateway provider deployment name.",
+      "type": "string"
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
+    }
+  }
+}

@@ -10,7 +10,6 @@ autotests = false
 
 [features]
 default = []
-python = ["dep:pyo3", "dep:wyrd-utils"]
 
 # Capability-scoped Bifrost test binaries. Each target is named for the
 # capability it proves and lives in `tests/bifrost/<capability>/`, where
@@ -44,6 +43,10 @@ path = "tests/bifrost/otlp/main.rs"
 name = "server"
 path = "tests/bifrost/server/main.rs"
 
+[[test]]
+name = "gateway"
+path = "tests/gateway/main.rs"
+
 [dependencies]
 async-trait = { workspace = true }
 async-stream = { workspace = true }
@@ -64,7 +67,6 @@ http-body = { workspace = true }
 http-body-util = "0.1"
 opendal = { workspace = true }
 parquet = { workspace = true }
-pyo3 = { workspace = true, optional = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -92,18 +94,18 @@ wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
-wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
+wyrd-crypt = { workspace = true }
 wyrd-client = { workspace = true, features = ["test-support"] }
 wyrd-queue = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
+wyrd-gateway = { workspace = true }
 wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-telemetry = { workspace = true }
-wyrd-utils = { workspace = true, features = ["python"], optional = true }
 wyrd-tls = { workspace = true }
 
 wiremock = { workspace = true }
@@ -111,6 +113,8 @@ wiremock = { workspace = true }
 [dev-dependencies]
 workspace-hack.workspace = true
 metrics = { workspace = true }
+# Local provider upstream of the native gateway ingress journey.
+wiremock = { workspace = true }
 # Stock upstream OpenTelemetry, used only by the OTLP journey target: those
 # tests must configure the exporters an ordinary application configures rather
 # than hand-build protocol requests. The `logs` and `metrics` features are the

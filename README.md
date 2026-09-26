@@ -9,7 +9,7 @@ component versions behind it.
 
 [Getting started](docs/src/content/docs/get-started/index.svx) ·
 [Architecture](architecture/wyrd-design.md) ·
-[Release tracker](https://github.com/orgs/bohmian-ai/projects/1) ·
+[Release tracker](https://github.com/orgs/bohmian-ai/projects/2) ·
 [Contributing](CONTRIBUTING.md)
 
 **Coming this week:** Wyrd `v0.1.0` is targeted for September 25, 2026. The

@@ -339,22 +339,13 @@ async fn prove_selective_predicate_pruning(
             && inspection.peer_pending == 0
             && inspection.peer_running == 0
         {
-            break;
+            cluster.shutdown().await?;
+            return Ok(());
         }
         tokio::time::sleep(SETTLEMENT_INTERVAL).await;
         inspection = cluster.oracle_inspection().await?;
     }
-    if inspection.active_queries != 0
-        || inspection.queued_queries != 0
-        || inspection.reserved_memory_bytes != 0
-        || inspection.reserved_spill_bytes != 0
-        || inspection.peer_pending != 0
-        || inspection.peer_running != 0
-    {
-        return Err(format!("Oracle runtime did not settle: {inspection:?}").into());
-    }
-    cluster.shutdown().await?;
-    Ok(())
+    Err(format!("Oracle runtime did not settle: {inspection:?}").into())
 }
 
 /// Drives one query to a terminal outcome across both of Oracle's refusal

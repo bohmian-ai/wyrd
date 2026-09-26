@@ -12,7 +12,6 @@ cloud = ["wyrd-storage/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
 test-support = [
     "dep:iceberg",
-    "dep:wyrd-queue",
     "vala-bifrost-redux/test-support",
     "wyrd-client/test-support",
     "wyrd-telemetry/test-support",
@@ -37,7 +36,7 @@ clap = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server"] }
 shellexpand = { workspace = true }
 toml = { workspace = true }
-tokio = { workspace = true, features = ["signal", "net"] }
+tokio = { workspace = true, features = ["signal", "net", "fs", "io-util"] }
 tokio-util = { workspace = true }
 url = { workspace = true }
 axum = { workspace = true }
@@ -51,7 +50,7 @@ rmcp = { workspace = true, features = [
 vala-drift = { workspace = true }
 vala-eval = { workspace = true }
 wyrd-telemetry = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
@@ -66,6 +65,7 @@ schemars = { workspace = true }
 serde_json = { workspace = true }
 serde_jcs = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 sqlx = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
@@ -73,13 +73,14 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
 vala-bifrost-redux = { workspace = true }
+wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-auth-check = { workspace = true }
 wyrd-auth = { workspace = true }
-wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
+wyrd-crypt = { workspace = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
@@ -89,8 +90,7 @@ http-body-util = "0.1"
 wyrd-spec = { workspace = true, features = ["server"] }
 wyrd-semver = { workspace = true }
 wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
-# Sealed-batch types the test-support publication fault transport records.
-wyrd-queue = { workspace = true, optional = true }
+wyrd-gateway = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-tls = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -99,14 +99,13 @@ utoipa-axum = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+tracing-subscriber = { workspace = true }
 insta = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
 wyrd-storage = { workspace = true }
 temp-env = { workspace = true }
-tempfile = { workspace = true }
 tokio-stream = "0.1"
-tracing-subscriber = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }

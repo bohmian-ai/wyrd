@@ -29,10 +29,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use vala_sql::ValaPostgres;
-use wyrd_runtime::{
-    BifrostPermissionScope, BifrostTableScope, DelegationStep, Permission, PermissionScope,
-    Principal,
-};
+use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
@@ -2621,7 +2618,7 @@ impl Oracle {
             .to_owned(),
             permission_digest: scoped_permission_digest(
                 &context.permission,
-                &resolved_table_scopes(&planned.cuts)?,
+                &resolved_table_scopes(&planned.cuts),
             )?
             .as_str()
             .to_owned(),
@@ -3365,6 +3362,13 @@ impl Oracle {
             return Err(BifrostError::QueryTimeout);
         }
         validate_read_only_plan(&plan)?;
+        // Typed plans arrive unoptimized, where a scan may still carry every
+        // column; the gate reads the pushed-down projection instead.
+        let optimized = SessionContext::new()
+            .state()
+            .optimize(&plan)
+            .map_err(|error| map_datafusion_error(&error))?;
+        authorize_payload_columns(&context, &optimized)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
@@ -3982,7 +3986,7 @@ impl Oracle {
         if self.take_analytical_plan_failure() {
             return Err(BifrostError::QueryExecutionFailed);
         }
-        let root = Self::plan_physical(&planning, sql)
+        let root = Self::plan_physical(&planning, context, sql)
             .await
             .map_err(|OracleExecutionError::Public(error)| error)?;
         Ok(RetainedPhysicalPlan {
@@ -3998,8 +4002,13 @@ impl Oracle {
     /// Returns a repairable invalid-query refusal for typed SQL, schema, or
     /// unsupported-feature errors. Other planning failures retain their stable
     /// public mapping without exposing dependency diagnostics.
+    ///
+    /// The optimized plan passes the payload-column gate before lowering, so a
+    /// projection or filter reaching `vala.gateway.calls` payload content
+    /// without payload-read authority never becomes executable.
     async fn plan_physical(
         session: &SessionContext,
+        context: &AuthorizedQueryContext,
         sql: &str,
     ) -> Result<Arc<dyn ExecutionPlan>, OracleExecutionError> {
         let frame = session
@@ -4009,6 +4018,7 @@ impl Oracle {
         let plan = frame
             .into_optimized_plan()
             .map_err(|error| map_query_planning_error(&error))?;
+        authorize_payload_columns(context, &plan)?;
         session
             .state()
             .create_physical_plan(&plan)
@@ -4605,7 +4615,7 @@ fn read_decision(
         projection_digest: audit_digest(sql)?,
         permission_digest: scoped_permission_digest(
             &context.permission,
-            &resolved_table_scopes(cuts)?,
+            &resolved_table_scopes(cuts),
         )?,
         execution: QueryExecutionMode::Local,
         selected_node_count: 1,
@@ -4665,7 +4675,7 @@ fn plan_read_decision(
         projection_digest: audit_digest(&plan_text)?,
         permission_digest: scoped_permission_digest(
             &context.permission,
-            &resolved_table_scopes(cuts)?,
+            &resolved_table_scopes(cuts),
         )?,
         execution: QueryExecutionMode::Local,
         selected_node_count: 1,
@@ -4688,29 +4698,11 @@ fn plan_read_decision(
 ///
 /// A prepared identity and the sealed cut it later materializes into carry the
 /// same binding and UID, so both authorization stages name the same object.
-///
-/// # Errors
-///
-/// Returns [`BifrostError::QueryForbidden`] when a resolved namespace does not
-/// split into a logical catalog and schema, which would leave the table with no
-/// nameable object identity and must fail closed.
 pub(super) fn resolved_table_scope(
     binding: &crate::catalog::TenantTableBinding,
     table_uid: &crate::catalog::TableUid,
-) -> Result<PermissionScope, BifrostError> {
-    let (catalog, schema) = binding
-        .table_ref
-        .namespace
-        .as_str()
-        .split_once('.')
-        .ok_or(BifrostError::QueryForbidden)?;
-    Ok(PermissionScope::Bifrost(BifrostPermissionScope::Table(
-        BifrostTableScope {
-            catalog: catalog.to_owned(),
-            schema: schema.to_owned(),
-            table_uid: uuid::Uuid::from_bytes(*table_uid.as_bytes()),
-        },
-    )))
+) -> PermissionScope {
+    binding.table_ref.permission_scope(table_uid)
 }
 
 /// Refuses the whole query unless every resolved table is individually granted.
@@ -4728,8 +4720,7 @@ pub(super) fn resolved_table_scope(
 /// # Errors
 ///
 /// Returns [`BifrostError::QueryForbidden`] for the first resolved table the
-/// principal's effective permissions do not cover, and for any table whose
-/// catalog-resolved identity cannot be named.
+/// principal's effective permissions do not cover.
 pub(super) fn authorize_resolved_tables(
     context: &AuthorizedQueryContext,
     prepared: &[crate::catalog::PreparedReaderIdentity],
@@ -4738,7 +4729,7 @@ pub(super) fn authorize_resolved_tables(
         let required = Permission {
             resource: wyrd_runtime::Resource::BifrostQuery,
             action: wyrd_runtime::Action::Read,
-            scope: resolved_table_scope(&identity.binding, &identity.table_uid)?,
+            scope: resolved_table_scope(&identity.binding, &identity.table_uid),
         };
         if !context.principal.effective_permissions.contains(&required) {
             tracing::warn!(
@@ -4748,6 +4739,72 @@ pub(super) fn authorize_resolved_tables(
             );
             return Err(BifrostError::QueryForbidden);
         }
+    }
+    Ok(())
+}
+
+/// Refuses a plan reaching `vala.gateway.calls` payload content without the
+/// tenant-wide payload-read permission.
+///
+/// Runs on an optimized logical plan, including subqueries, after ordinary
+/// table authorization. A scan reaches payload content when its pushed-down
+/// projection or any pushed-down filter names a payload column; `SELECT *`
+/// therefore reaches it. Metadata-only reads need nothing beyond the scoped
+/// table read, and other tables' sensitive columns are unaffected. Denial
+/// rejects the whole query, so no row is returned.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryForbidden`] when a payload column is reached
+/// without [`Permission::gateway_payload_read`], and the mapped planning error
+/// when the plan cannot be traversed.
+pub(super) fn authorize_payload_columns(
+    context: &AuthorizedQueryContext,
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Result<(), BifrostError> {
+    use crate::tables::{CallsTable, DomainTable};
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::logical_expr::LogicalPlan;
+
+    if context
+        .principal
+        .effective_permissions
+        .contains(&Permission::gateway_payload_read())
+    {
+        return Ok(());
+    }
+    let calls = format!("vala.{}.{}", CallsTable::NAMESPACE, CallsTable::NAME);
+    let payload = CallsTable::SENSITIVE_PAYLOAD_COLUMNS;
+    let mut reached = false;
+    plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::TableScan(scan) = node
+            && scan.table_name.to_string() == calls
+        {
+            reached = scan
+                .projected_schema
+                .fields()
+                .iter()
+                .any(|field| payload.contains(&field.name().as_str()))
+                || scan.filters.iter().any(|filter| {
+                    filter
+                        .column_refs()
+                        .iter()
+                        .any(|column| payload.contains(&column.name.as_str()))
+                });
+        }
+        Ok(if reached {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })
+    .map_err(|error| map_datafusion_error(&error))?;
+    if reached {
+        tracing::warn!(
+            request_id = %context.request_id,
+            "Oracle refused a query reaching gateway payload columns without payload-read authority"
+        );
+        return Err(BifrostError::QueryForbidden);
     }
     Ok(())
 }
@@ -4778,14 +4835,7 @@ pub(super) fn scoped_permission_digest(
 }
 
 /// Projects every pinned table in one cut into its RBAC object identity.
-///
-/// # Errors
-///
-/// Returns [`BifrostError::QueryForbidden`] when a pinned namespace carries no
-/// nameable catalog and schema.
-pub(super) fn resolved_table_scopes(
-    cuts: &[PinnedSealedTable],
-) -> Result<Vec<PermissionScope>, BifrostError> {
+pub(super) fn resolved_table_scopes(cuts: &[PinnedSealedTable]) -> Vec<PermissionScope> {
     cuts.iter()
         .map(|cut| resolved_table_scope(&cut.binding, &cut.table_uid))
         .collect()
@@ -5319,6 +5369,136 @@ where
 mod tests {
     use super::participant_cut::tests::lease;
     use super::*;
+    use wyrd_runtime::{BifrostPermissionScope, BifrostTableScope};
+
+    /// Builds a same-tenant query context holding exactly `permissions`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture principal cannot form a context.
+    fn payload_context(permissions: &[Permission]) -> AuthorizedQueryContext {
+        let tenant = DataTenantId::new_v7();
+        let mut effective_permissions = wyrd_runtime::PermissionSet::default();
+        for permission in permissions {
+            effective_permissions.insert(permission.clone());
+        }
+        AuthorizedQueryContext::try_new(
+            Principal {
+                id: wyrd_runtime::PrincipalId::new(uuid::Uuid::now_v7()),
+                kind: wyrd_runtime::PrincipalKind::User,
+                tenant_id: tenant,
+                roles: Vec::new(),
+                effective_permissions,
+                credential_id: None,
+            },
+            tenant,
+            RequestId::now_v7(),
+            None,
+            AuthMethod::Internal,
+            Permission::bifrost_query_read(),
+        )
+        .expect("the fixture principal forms a query context")
+    }
+
+    /// Registers empty `vala.gateway.calls` and `vala.logs.records` built-ins
+    /// under their canonical names, the way Oracle names cut providers.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a built-in definition or in-memory registration fails.
+    fn payload_session() -> SessionContext {
+        use datafusion::catalog::SchemaProvider;
+
+        let session = SessionContext::new();
+        let catalog = MemoryCatalogProvider::new();
+        for (schema, name) in [("gateway", "calls"), ("logs", "records")] {
+            let definition = crate::tables::builtin_table(schema, name).expect("built-in resolves");
+            let table =
+                datafusion::datasource::MemTable::try_new((definition.schema)(), vec![Vec::new()])
+                    .expect("empty table builds");
+            let provider = MemorySchemaProvider::new();
+            provider
+                .register_table(name.to_owned(), Arc::new(table))
+                .expect("table registers");
+            catalog
+                .register_schema(schema, Arc::new(provider))
+                .expect("schema registers");
+        }
+        session.register_catalog("vala", Arc::new(catalog));
+        session
+    }
+
+    /// Proves metadata reads need only scoped query authority while any SQL or
+    /// typed plan reaching gateway payload columns also needs payload-read
+    /// authority, and other tables' sensitive columns stay ungated.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a metadata read is refused, a payload read plans without
+    /// payload authority, or payload authority fails to admit it.
+    #[tokio::test]
+    async fn gateway_payload_columns_require_payload_read_authority() {
+        let metadata = payload_context(&[Permission::bifrost_query_read()]);
+        let payload = payload_context(&[
+            Permission::bifrost_query_read(),
+            Permission::gateway_payload_read(),
+        ]);
+        let session = payload_session();
+        for sql in [
+            "SELECT call_id, outcome FROM vala.gateway.calls",
+            "SELECT count(*) FROM vala.gateway.calls",
+            "SELECT * FROM vala.logs.records",
+        ] {
+            if let Err(error) = Oracle::plan_physical(&session, &metadata, sql).await {
+                panic!("metadata read {sql} was refused: {error}");
+            }
+        }
+        for sql in [
+            "SELECT request_payload_json FROM vala.gateway.calls",
+            "SELECT * FROM vala.gateway.calls",
+            "SELECT call_id FROM vala.gateway.calls WHERE response_payload_json LIKE '%key%'",
+            "SELECT count(*) FROM vala.logs.records WHERE EXISTS \
+             (SELECT 1 FROM vala.gateway.calls WHERE request_payload_json IS NOT NULL)",
+        ] {
+            assert!(
+                matches!(
+                    Oracle::plan_physical(&session, &metadata, sql).await,
+                    Err(OracleExecutionError::Public(BifrostError::QueryForbidden))
+                ),
+                "{sql} reached payload without authority"
+            );
+            if let Err(error) = Oracle::plan_physical(&session, &payload, sql).await {
+                panic!("payload authority was refused for {sql}: {error}");
+            }
+        }
+
+        let typed = |sql: &'static str| {
+            let session = &session;
+            async move {
+                let plan = session
+                    .sql(sql)
+                    .await
+                    .expect("typed plan lowers")
+                    .into_unoptimized_plan();
+                SessionContext::new()
+                    .state()
+                    .optimize(&plan)
+                    .expect("typed plan optimizes")
+            }
+        };
+        authorize_payload_columns(
+            &metadata,
+            &typed("SELECT call_id FROM vala.gateway.calls").await,
+        )
+        .expect("typed metadata projection is admitted");
+        assert!(matches!(
+            authorize_payload_columns(
+                &metadata,
+                &typed("SELECT response_payload_json FROM vala.gateway.calls").await
+            ),
+            Err(BifrostError::QueryForbidden)
+        ));
+    }
 
     /// Builds one Bifrost table scope for the supplied schema and UID.
     fn table_scope(schema: &str, uid: uuid::Uuid) -> PermissionScope {

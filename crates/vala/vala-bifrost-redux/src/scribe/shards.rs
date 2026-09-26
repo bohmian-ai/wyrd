@@ -1534,6 +1534,7 @@ impl ShardOwner {
                 wal_lsn: batch.meta.wal_lsn_max,
                 origin: crate::scribe::tail_rpc::HotBatchSource::Append {
                     batch_id: batch.meta.batch_id,
+                    generation: batch.generation,
                 },
                 rows: batch.batch,
             })

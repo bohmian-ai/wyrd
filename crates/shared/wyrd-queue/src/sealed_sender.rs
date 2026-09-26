@@ -87,10 +87,7 @@ impl SealedBatchSender {
         table: &str,
         batch: &RecordBatch,
     ) -> Result<DurableBatchAck, WyrdQueueError> {
-        let frame = encode_ipc(batch)?;
-        if frame.len() > self.config.max_message_bytes {
-            return Err(WyrdQueueError::PayloadTooLarge);
-        }
+        let frame = encode_ipc(batch, self.config.max_message_bytes)?;
         let guard = self.budget.reserve_sealed(frame.len())?;
         let rows = batch.num_rows() as u64;
         let sealed = SealedBatch {
@@ -98,6 +95,7 @@ impl SealedBatchSender {
             batch_id: Uuid::now_v7().into_bytes(),
             frame: OwnedIpcBytes::new(frame, guard),
             rows,
+            request_id: None,
         };
         self.settle(&sealed).await
     }
@@ -130,23 +128,77 @@ impl SealedBatchSender {
     }
 }
 
-/// Encodes one Arrow batch as a single-batch IPC stream.
+/// Encodes one Arrow batch as a single-batch IPC stream of at most `limit` bytes.
+///
+/// The output buffer grows exactly and never past `limit`, so a caller that
+/// reserved `limit` bytes before encoding has covered every byte the encoder
+/// can allocate.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdQueueError::SchemaParse`] when the writer cannot be built,
-/// cannot write the batch, or cannot close the stream.
-fn encode_ipc(batch: &RecordBatch) -> Result<Vec<u8>, WyrdQueueError> {
-    let mut buffer = Vec::new();
-    {
+/// Returns [`WyrdQueueError::PayloadTooLarge`] as soon as the stream would
+/// exceed `limit`, and [`WyrdQueueError::SchemaParse`] when the writer cannot
+/// be built, cannot write the batch, or cannot close the stream.
+pub(crate) fn encode_ipc(batch: &RecordBatch, limit: usize) -> Result<Vec<u8>, WyrdQueueError> {
+    let mut buffer = CappedBuffer {
+        bytes: Vec::new(),
+        limit,
+        exceeded: false,
+    };
+    let encoded = (|| {
         let mut writer = StreamWriter::try_new(&mut buffer, batch.schema_ref())
-            .map_err(|e| WyrdQueueError::SchemaParse(format!("IPC writer init failed: {e}")))?;
+            .map_err(|e| format!("IPC writer init failed: {e}"))?;
         writer
             .write(batch)
-            .map_err(|e| WyrdQueueError::SchemaParse(format!("IPC write failed: {e}")))?;
+            .map_err(|e| format!("IPC write failed: {e}"))?;
         writer
             .finish()
-            .map_err(|e| WyrdQueueError::SchemaParse(format!("IPC finish failed: {e}")))?;
+            .map_err(|e| format!("IPC finish failed: {e}"))
+    })();
+    match encoded {
+        Ok(()) => Ok(buffer.bytes),
+        Err(_) if buffer.exceeded => Err(WyrdQueueError::PayloadTooLarge),
+        Err(message) => Err(WyrdQueueError::SchemaParse(message)),
     }
-    Ok(buffer)
+}
+
+/// IPC output buffer that refuses to grow past a byte ceiling.
+struct CappedBuffer {
+    /// Encoded bytes so far.
+    bytes: Vec<u8>,
+    /// Largest stream, and capacity, the buffer may hold.
+    limit: usize,
+    /// Whether a write was refused for exceeding `limit`.
+    exceeded: bool,
+}
+
+impl std::io::Write for CappedBuffer {
+    /// Appends `data`, growing capacity at most to `limit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error, recording the refusal, when `data` would take the
+    /// stream past `limit`.
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let needed = self.bytes.len().saturating_add(data.len());
+        if needed > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "IPC stream exceeds the message ceiling",
+            ));
+        }
+        if needed > self.bytes.capacity() {
+            let target = needed
+                .max(self.bytes.capacity().saturating_mul(2))
+                .min(self.limit);
+            self.bytes.reserve_exact(target - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    /// Nothing is buffered outside `bytes`.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

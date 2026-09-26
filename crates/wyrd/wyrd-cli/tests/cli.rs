@@ -6,6 +6,8 @@ mod card_lifecycle;
 mod eval_local_records;
 #[path = "eval_support/mod.rs"]
 mod eval_support;
+#[path = "gateway_server_journey.rs"]
+mod gateway_server_journey;
 #[path = "loader.rs"]
 mod loader;
 #[path = "operator_journey.rs"]

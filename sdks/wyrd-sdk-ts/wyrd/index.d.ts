@@ -250,6 +250,146 @@ export declare class NativeCards {
   delete(cardRef: string): Promise<NativeLifecycleResult>
 }
 
+/**
+ * Tenant gateway administration handle over the shared `wyrd_client` Gateway.
+ *
+ * Provider credential mutation is absent by construction: submitting,
+ * rotating, revoking, and deleting a credential live on
+ * `wyrd_client::gateway_credential`, which this binding never constructs.
+ * A JavaScript caller reaching this exported class directly therefore has no
+ * method that can write a managed secret, and no runtime source check is
+ * needed. Reads, deployments, policies, and invocation stay.
+ */
+export declare class NativeGateway {
+  /**
+   * Reads one redacted provider credential by name.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the view cannot be serialized; an invalid
+   * name or server failure is returned in the result.
+   */
+  credential(name: string): Promise<NativeLifecycleResult>
+  /**
+   * Lists the tenant's redacted provider credentials ordered by name.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the list cannot be serialized; server
+   * failures are returned in the result.
+   */
+  credentials(): Promise<NativeLifecycleResult>
+  /**
+   * Creates or replaces a provider deployment from its serialized body.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the deployment cannot be serialized; a
+   * malformed body or server failure is returned in the result.
+   */
+  putDeployment(deploymentJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads one provider deployment by name.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the deployment cannot be serialized; an
+   * invalid name or server failure is returned in the result.
+   */
+  deployment(name: string): Promise<NativeLifecycleResult>
+  /**
+   * Lists the tenant's provider deployments ordered by name.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the list cannot be serialized; server
+   * failures are returned in the result.
+   */
+  deployments(): Promise<NativeLifecycleResult>
+  /**
+   * Deletes one provider deployment; an absent name succeeds.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the result cannot be projected; an
+   * invalid name or server failure is returned in the result.
+   */
+  deleteDeployment(name: string): Promise<NativeLifecycleResult>
+  /**
+   * Replaces the tenant fallback policy from its serialized body.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the policy cannot be serialized; a
+   * malformed body or server failure is returned in the result.
+   */
+  putFallbackPolicy(policyJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads the tenant fallback policy, or the default when none is set.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the policy cannot be serialized; server
+   * failures are returned in the result.
+   */
+  fallbackPolicy(): Promise<NativeLifecycleResult>
+  /**
+   * Restores the default fallback policy.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the result cannot be projected; server
+   * failures are returned in the result.
+   */
+  deleteFallbackPolicy(): Promise<NativeLifecycleResult>
+  /**
+   * Replaces the tenant governance policy from its serialized body.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the policy cannot be serialized; a
+   * malformed body or server failure is returned in the result.
+   */
+  putGovernancePolicy(policyJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads the tenant governance policy, or the default when none is set.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the policy cannot be serialized; server
+   * failures are returned in the result.
+   */
+  governancePolicy(): Promise<NativeLifecycleResult>
+  /**
+   * Restores the default governance policy.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the result cannot be projected; server
+   * failures are returned in the result.
+   */
+  deleteGovernancePolicy(): Promise<NativeLifecycleResult>
+  /**
+   * Replaces the tenant capture policy from its serialized write body.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the versioned policy cannot be
+   * serialized; a malformed body or server failure is returned in the
+   * result.
+   */
+  putCapturePolicy(policyJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads the tenant capture policy, or the disabled default.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the policy cannot be serialized; server
+   * failures are returned in the result.
+   */
+  capturePolicy(): Promise<NativeLifecycleResult>
+}
+
 /** Structured result of starting a native terminal-safe query. */
 export declare class NativeQueryStart {
   /** Moves the Rust-owned stream out after a successful startup. */
@@ -508,6 +648,17 @@ export declare function connectCards(serverUrl?: string | undefined | null, cred
  * chain as `connectCards`, so every capability authenticates identically.
  */
 export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeVerificationConnection
+ * Builds one gateway administration handle without performing IO.
+ *
+ * Omitted arguments resolve through the same shared client configuration
+ * chain as `connectCards`, so every capability authenticates identically.
+ *
+ * # Errors
+ *
+ * Returns a napi error when no credential resolves or the HTTP client cannot
+ * be built.
+ */
+export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeGateway
 
 /**
  * Builds one client without performing IO.

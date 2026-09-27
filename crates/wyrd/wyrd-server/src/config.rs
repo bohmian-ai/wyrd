@@ -272,6 +272,12 @@ pub struct ForgeRuntimeConfig {
     /// positive when set. Default 60.
     #[serde(default)]
     pub maintenance_interval_secs: Option<u64>,
+    /// Soft rewrite file target for every table that declares no
+    /// `write.target-file-size-bytes` property. Overridden by
+    /// `WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`. Must be positive when set.
+    /// Default 1073741824 (1 GiB).
+    #[serde(default)]
+    pub target_file_size_bytes: Option<u64>,
 }
 
 impl ForgeRuntimeConfig {
@@ -377,6 +383,8 @@ pub struct ScribeRuntimeConfig {
     ///
     /// Independent of every rotation limit: a generation rotates to bound
     /// memory, while staging assembles across generations toward this size.
+    /// `WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES` overrides the file
+    /// value; the soft target is validated with the rest of Scribe geometry.
     #[serde(default = "default_scribe_staging_target_file_size_bytes")]
     pub staging_target_file_size_bytes: u64,
     /// Maximum field count in one canonical native IPC schema.
@@ -2668,6 +2676,15 @@ impl WyrdServerConfig {
             "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
             self.bifrost.resources.forge_compaction_memory_limit_bytes,
         )?;
+        self.forge.target_file_size_bytes = parse_optional_env(
+            "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
+            self.forge.target_file_size_bytes,
+        )?;
+        self.bifrost.scribe.staging_target_file_size_bytes = parse_optional_env(
+            "WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES",
+            Some(self.bifrost.scribe.staging_target_file_size_bytes),
+        )?
+        .unwrap_or(self.bifrost.scribe.staging_target_file_size_bytes);
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -2949,6 +2966,11 @@ impl WyrdServerConfig {
         if self.forge.per_tenant_active_cap == Some(0) {
             return Err(ConfigError::Invalid {
                 message: "forge.per_tenant_active_cap must be positive".to_owned(),
+            });
+        }
+        if self.forge.target_file_size_bytes == Some(0) {
+            return Err(ConfigError::Invalid {
+                message: "forge.target_file_size_bytes must be positive".to_owned(),
             });
         }
         if serves_api {
@@ -3730,6 +3752,65 @@ maintenance_interval_secs = 45
             ..ForgeRuntimeConfig::default()
         };
         assert_eq!(capped.resolved_per_tenant_active_cap(), 2);
+    }
+
+    /// Both whole-file targets take a positive environment override over the
+    /// file value, and a zero or malformed value is refused at boot.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an override does not win, or a zero or malformed target is
+    /// accepted.
+    #[test]
+    fn file_target_environment_overrides_win_and_refuse_nonpositive_values() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let file = from_toml_str_with_dev_oracle_opt_in(
+            "[forge]\ntarget_file_size_bytes = 268435456\n\n[bifrost.scribe]\nstaging_target_file_size_bytes = 134217728\n",
+        )
+        .expect("file targets parse");
+        assert_eq!(file.forge.target_file_size_bytes, Some(268_435_456));
+        assert_eq!(
+            file.bifrost.scribe.staging_target_file_size_bytes,
+            134_217_728
+        );
+        temp_env::with_vars(
+            [
+                (
+                    "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
+                    Some("2147483648"),
+                ),
+                (
+                    "WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES",
+                    Some("268435456"),
+                ),
+            ],
+            || {
+                let mut config = file.clone();
+                config.apply_env_overrides().expect("overrides apply");
+                assert_eq!(config.forge.target_file_size_bytes, Some(2_147_483_648));
+                assert_eq!(
+                    config.bifrost.scribe.staging_target_file_size_bytes,
+                    268_435_456
+                );
+                config.validate().expect("positive targets validate");
+            },
+        );
+        for key in [
+            "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
+            "WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES",
+        ] {
+            temp_env::with_vars([(key, Some("0"))], || {
+                let mut config = file.clone();
+                config.apply_env_overrides().expect("zero parses as bytes");
+                assert!(config.validate().is_err(), "{key}=0 is refused at boot");
+            });
+            temp_env::with_vars([(key, Some("1GiB"))], || {
+                assert!(
+                    file.clone().apply_env_overrides().is_err(),
+                    "{key} must be a byte count"
+                );
+            });
+        }
     }
 
     /// A zero `forge.per_tenant_active_cap` fails boot validation fail-closed.

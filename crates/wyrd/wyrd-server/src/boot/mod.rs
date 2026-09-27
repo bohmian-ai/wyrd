@@ -390,6 +390,9 @@ fn resolve_forge_config(
             .orphan_gc_run_budget_secs
             .map(std::time::Duration::from_secs)
             .unwrap_or(base.orphan_gc_run_budget),
+        default_target_file_size_bytes: forge_runtime
+            .target_file_size_bytes
+            .unwrap_or(base.default_target_file_size_bytes),
         ..base
     };
     let maintenance_interval = forge_runtime
@@ -2663,6 +2666,11 @@ mod tests {
         let (config, maintenance_interval) =
             resolve_forge_config(&crate::config::ForgeRuntimeConfig::default());
         assert_eq!(config, ForgeConfig::default());
+        assert_eq!(
+            config.default_target_file_size_bytes,
+            1024 * 1024 * 1024,
+            "an unset deployment file target is 1 GiB, not Iceberg's 512 MiB"
+        );
         assert_eq!(maintenance_interval, DEFAULT_MAINTENANCE_INTERVAL);
     }
 
@@ -2679,9 +2687,11 @@ mod tests {
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
+            target_file_size_bytes: Some(2_147_483_648),
             ..crate::config::ForgeRuntimeConfig::default()
         };
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
+        assert_eq!(config.default_target_file_size_bytes, 2_147_483_648);
         assert_eq!(
             config.snapshot_retention,
             std::time::Duration::from_secs(7_200)

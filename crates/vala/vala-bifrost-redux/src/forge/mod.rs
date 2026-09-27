@@ -42,7 +42,7 @@ pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore};
 pub use error::ForgeError;
 pub use managed::{
     ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite, ForgeRewriteEvidence,
-    ForgeRewriteOutcome, ForgeUnsettledOutput, RewriteHandoff,
+    ForgeRewriteOutcome, ForgeTablePolicy, ForgeUnsettledOutput, RewriteHandoff,
 };
 pub use metrics::ForgeTelemetry;
 pub use planner::{ForgePlanCandidate, PlannedForgeTask};

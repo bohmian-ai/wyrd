@@ -520,9 +520,11 @@ impl<'a> RollingArtifactWriter<'a> {
     ///
     /// The encoder buffers rows toward its row-group target and flushes
     /// completed groups itself, so small inputs from many staged runs share
-    /// groups rather than each becoming one. Once the artifact's flushed
-    /// encoded bytes reach the plan's object target it is sealed; the next
-    /// batch opens another.
+    /// groups rather than each becoming one. Once the artifact's flushed bytes
+    /// plus the encoder's estimate for its buffered group reach the plan's
+    /// soft object target it is sealed; the next batch opens another. The
+    /// estimate is a pure function of the rows written, so a retry of the same
+    /// input rolls at the same batches.
     ///
     /// # Errors
     ///
@@ -549,7 +551,11 @@ impl<'a> RollingArtifactWriter<'a> {
                 detail: format!("write Scribe Parquet batch: {error}"),
             })?;
         open.rows = open.rows.saturating_add(ordered_batch.num_rows());
-        let written = u64::try_from(open.writer.bytes_written()).unwrap_or(u64::MAX);
+        let written = open
+            .writer
+            .bytes_written()
+            .saturating_add(open.writer.in_progress_size());
+        let written = u64::try_from(written).unwrap_or(u64::MAX);
         if written >= self.plan.target_object_bytes {
             self.seal_open_artifact()?;
         }

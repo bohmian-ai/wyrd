@@ -23,6 +23,12 @@ const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
 /// Small-file candidacy threshold.
 pub(crate) const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+/// Deployment-wide rewrite file target for tables that declare none: 1 GiB.
+///
+/// Replaces Iceberg's 512 MiB writer default so every Bifrost table, built-in
+/// or registered, compacts toward the same soft target unless its own
+/// `write.target-file-size-bytes` property says otherwise.
+pub const DEFAULT_TARGET_FILE_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Default commit count past `retain_last` that makes snapshot expiry due on
 /// its own. Chosen well above ordinary per-tick compaction commit counts so a
 /// table under steady ingest still accrues history before maintenance fires,
@@ -83,6 +89,13 @@ pub struct ForgeConfig {
     /// Whether periodic fragmented-manifest rewrite is enabled.
     /// Independent small-file candidacy threshold used by live planning.
     pub small_file_threshold_bytes: u64,
+    /// Soft rewrite file target for a table without its own
+    /// `write.target-file-size-bytes` property.
+    ///
+    /// Resolved at planning time rather than written into table metadata, so
+    /// changing the deployment default also moves every table that never
+    /// declared an override.
+    pub default_target_file_size_bytes: u64,
     /// Maximum bytes packed into one selected manifest rewrite bin.
     /// Minimum count required for the newest under-filled manifest bin.
     /// Age after which an unreferenced object may be deleted.
@@ -147,6 +160,7 @@ impl Default for ForgeConfig {
             retain_last: 1,
             snapshot_expiry_enabled: false,
             small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            default_target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE_BYTES,
             orphan_gc_ttl: Duration::from_hours(24),
             max_gc_candidates_per_batch: 256,
             max_maintenance_items_per_tick: DEFAULT_MAX_MAINTENANCE_ITEMS_PER_TICK,
@@ -183,6 +197,7 @@ impl ForgeConfig {
             || self.snapshot_retention.is_zero()
             || self.retain_last == 0
             || self.small_file_threshold_bytes == 0
+            || self.default_target_file_size_bytes == 0
             || self.orphan_gc_ttl.is_zero()
             || self.max_gc_candidates_per_batch == 0
             || self.max_maintenance_items_per_tick == 0
@@ -527,14 +542,16 @@ mod tests {
         );
     }
 
-    /// Forge output encoding uses the shared Bifrost Parquet recipe.
+    /// Forge output encoding uses the shared Bifrost Parquet recipe: the
+    /// parquet-rs row cap and the soft 128 MiB encoded row-group target.
     #[test]
     fn compacted_output_uses_shared_writer_properties() {
+        let properties = crate::parquet::writer_properties::bifrost_writer_properties(10, &[]);
         assert_eq!(
-            crate::parquet::writer_properties::bifrost_writer_properties(10, &[])
-                .max_row_group_row_count(),
-            Some(131_072)
+            properties.max_row_group_row_count(),
+            Some(parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT)
         );
+        assert_eq!(properties.max_row_group_bytes(), Some(128 * 1024 * 1024));
     }
 
     /// Both reconciliation caps default to 256 and reject zero independently.

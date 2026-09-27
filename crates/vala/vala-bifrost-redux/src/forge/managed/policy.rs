@@ -34,17 +34,13 @@ const ROW_GROUP_TARGET_PROPERTY: &str = TableProperties::PROPERTY_PARQUET_ROW_GR
 
 /// Default encoded row-group target when the table declares none.
 ///
-/// Matches the pinned Iceberg default so an undeclared table behaves the same
-/// under Forge as it would under any other Iceberg writer.
+/// The same soft 128 MiB target Scribe's staged writer uses, so a table's row
+/// groups keep one shape from staging through compaction.
 const ROW_GROUP_TARGET_DEFAULT: u64 =
-    TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT as u64;
+    crate::parquet::writer_properties::BIFROST_ROW_GROUP_TARGET_BYTES as u64;
 
 /// Iceberg property naming the target size of a newly written data file.
 const FILE_TARGET_PROPERTY: &str = TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES;
-
-/// Default target file size when the table declares none.
-const FILE_TARGET_DEFAULT: u64 =
-    TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT as u64;
 
 /// Multiplier the managed core applies to derive its oversized ceiling.
 ///
@@ -62,7 +58,7 @@ const OVERSIZED_CEILING_PERCENT: u64 = 180;
 /// is the only place these can disagree, so construction is where they are
 /// checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForgeTablePolicy {
+pub struct ForgeTablePolicy {
     /// Target size of one rewritten data file, passed through unchanged.
     pub(crate) target_file_size_bytes: u64,
     /// Independent encoded row-group target applied to the Parquet writer.
@@ -81,27 +77,13 @@ pub(crate) struct ForgeTablePolicy {
     pub(crate) data_location: String,
 }
 
-/// Reads the target output size one table declares for its data files.
-///
-/// Exposed separately from [`ForgeTablePolicy::extract`] because the audit row
-/// for a publication records the same target the writer used, and reconstructing
-/// the whole policy there would demand an admitted memory grant the publication
-/// no longer holds. Both paths read the one property, so they cannot disagree.
-///
-/// # Errors
-///
-/// Returns [`ForgeError::InvalidConfig`] when the declared value is not a
-/// positive integer byte count.
-pub(crate) fn declared_target_file_size_bytes(metadata: &TableMetadata) -> Result<u64, ForgeError> {
-    declared_bytes(
-        metadata.properties(),
-        FILE_TARGET_PROPERTY,
-        FILE_TARGET_DEFAULT,
-    )
-}
-
 impl ForgeTablePolicy {
     /// Derives one attempt's policy from a loaded table and validated limits.
+    ///
+    /// The file target is the table's `write.target-file-size-bytes` property
+    /// when declared, otherwise the deployment default in
+    /// [`ForgeConfig::default_target_file_size_bytes`]. It is resolved here
+    /// once; execution, publication, and audit all read this policy's value.
     ///
     /// There is no admitted-memory term. Execution is unbounded and admission
     /// happens against a per-plan estimate in the worker's queue, so a
@@ -121,8 +103,11 @@ impl ForgeTablePolicy {
         config: &ForgeConfig,
     ) -> Result<Self, ForgeError> {
         let properties = metadata.properties();
-        let target_file_size_bytes =
-            declared_bytes(properties, FILE_TARGET_PROPERTY, FILE_TARGET_DEFAULT)?;
+        let target_file_size_bytes = declared_bytes(
+            properties,
+            FILE_TARGET_PROPERTY,
+            config.default_target_file_size_bytes,
+        )?;
         let row_group_target_bytes = declared_bytes(
             properties,
             ROW_GROUP_TARGET_PROPERTY,
@@ -437,7 +422,8 @@ mod tests {
     /// being conflated with it. Clamping the target to the admitted memory, or
     /// reusing one term for both, would change the selection boundary and the
     /// file geometry without any operator asking for it. An undeclared table
-    /// falls back to the pinned Iceberg defaults rather than to nothing.
+    /// falls back to the deployment file target — 1 GiB unless the operator
+    /// moved it, never Iceberg's 512 MiB — and the Iceberg row-group default.
     #[test]
     fn forge_table_policy_preserves_declared_target_geometry() {
         let metadata = metadata_with(vec![
@@ -483,9 +469,27 @@ mod tests {
         );
 
         let unset = ForgeTablePolicy::extract(&metadata_with(Vec::new()), &limits())
-            .expect("undeclared geometry falls back to the pinned Iceberg defaults");
-        assert_eq!(unset.target_file_size_bytes, FILE_TARGET_DEFAULT);
-        assert_eq!(unset.row_group_target_bytes, ROW_GROUP_TARGET_DEFAULT);
+            .expect("undeclared geometry falls back to the deployment defaults");
+        assert_eq!(unset.target_file_size_bytes, 1024 * 1024 * 1024);
+        assert_eq!(unset.row_group_target_bytes, 128 * 1024 * 1024);
+        let moved = ForgeConfig {
+            default_target_file_size_bytes: 256 * 1024 * 1024,
+            ..limits()
+        };
+        assert_eq!(
+            ForgeTablePolicy::extract(&metadata_with(Vec::new()), &moved)
+                .expect("a moved deployment default is admissible")
+                .target_file_size_bytes,
+            256 * 1024 * 1024,
+            "an undeclared table follows the configured deployment default"
+        );
+        assert_eq!(
+            ForgeTablePolicy::extract(&metadata, &moved)
+                .expect("declared geometry is admissible")
+                .target_file_size_bytes,
+            268_435_456,
+            "a declared table property wins over the deployment default"
+        );
     }
 
     /// Every impossible geometry is refused before any planning happens.

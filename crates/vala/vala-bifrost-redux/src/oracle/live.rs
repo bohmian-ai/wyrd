@@ -254,7 +254,7 @@ impl LiveScribeExec {
                 writer_epoch: route.writer_epoch,
                 start_partition: route.time_partition,
                 end_partition: route.time_partition,
-                maximum_batch_count: LIVE_FRAGMENT_MAX_BATCHES,
+                maximum_batch_count: live_fragment_max_batches(),
                 maximum_retained_bytes: LIVE_FRAGMENT_MAX_RETAINED_BYTES,
             }),
             schema_fingerprint: self.schema_fingerprint.clone(),
@@ -570,6 +570,33 @@ static LIVE_SOURCE_BATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::
 #[must_use]
 pub fn live_source_batches_for_test() -> usize {
     LIVE_SOURCE_BATCHES.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Test override of [`LIVE_FRAGMENT_MAX_BATCHES`]; zero means no override.
+///
+/// A journey lowers the signed per-fragment batch ceiling below the live
+/// batches a Scribe holds so the real bounded snapshot refuses the read for
+/// capacity, which must fail the query rather than degrade it.
+#[cfg(feature = "test-support")]
+static LIVE_FRAGMENT_BATCH_BOUND: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Sets or clears the per-fragment live batch ceiling signed into new cuts.
+#[cfg(feature = "test-support")]
+pub fn set_live_fragment_batch_bound_for_test(bound: Option<u32>) {
+    LIVE_FRAGMENT_BATCH_BOUND.store(bound.unwrap_or(0), std::sync::atomic::Ordering::Release);
+}
+
+/// Returns the batch ceiling one live fragment's cut signs.
+fn live_fragment_max_batches() -> u32 {
+    #[cfg(feature = "test-support")]
+    {
+        let bound = LIVE_FRAGMENT_BATCH_BOUND.load(std::sync::atomic::Ordering::Acquire);
+        if bound != 0 {
+            return bound;
+        }
+    }
+    LIVE_FRAGMENT_MAX_BATCHES
 }
 
 /// Returns the time left before `deadline`, zero once it has passed.

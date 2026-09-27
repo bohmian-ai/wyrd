@@ -12,6 +12,21 @@ use vala_bifrost_redux::scribe::tail_rpc::{
 };
 use wyrd_spec::vala::api::TenantTableBinding;
 
+/// One-shot switch that sends the next listing without its tail ticket.
+///
+/// A journey needs a listing the ready Scribe itself refuses for a credential
+/// reason, through its real verifier and status mapping, to prove Oracle fails
+/// rather than degrades on a trust-boundary refusal.
+#[cfg(feature = "test-support")]
+static REJECT_NEXT_LISTING_TICKET: AtomicBool = AtomicBool::new(false);
+
+/// Arms the next private listing in this process to carry an empty ticket,
+/// which the receiving Scribe refuses as unauthorized.
+#[cfg(feature = "test-support")]
+pub fn arm_tail_listing_ticket_rejection_for_test() {
+    REJECT_NEXT_LISTING_TICKET.store(true, Ordering::Release);
+}
+
 /// Production resolver that owns no persistent route registry.
 pub struct RegistryTailStreamDiscovery {
     /// Authoritative role membership owner.
@@ -166,6 +181,12 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
                 .map_err(|_| TailReadError::State {
                     detail: "tail ticket mint failed".to_owned(),
                 })?;
+            #[cfg(feature = "test-support")]
+            let ticket = if REJECT_NEXT_LISTING_TICKET.swap(false, Ordering::AcqRel) {
+                Vec::new()
+            } else {
+                ticket
+            };
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(TailReadError::DeadlineElapsed)?;

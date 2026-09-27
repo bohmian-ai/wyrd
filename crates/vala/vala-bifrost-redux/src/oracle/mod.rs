@@ -72,6 +72,8 @@ pub mod follower;
 mod live;
 #[cfg(feature = "test-support")]
 pub use live::live_source_batches_for_test;
+#[cfg(feature = "test-support")]
+pub use live::set_live_fragment_batch_bound_for_test;
 mod participant_cut;
 pub mod peer;
 pub mod planner;

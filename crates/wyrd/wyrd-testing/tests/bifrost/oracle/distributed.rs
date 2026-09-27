@@ -7,10 +7,15 @@
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
-use vala_bifrost_redux::oracle::iceberg_projection_probe;
+use vala_bifrost_redux::oracle::{
+    iceberg_projection_probe, set_live_fragment_batch_bound_for_test,
+};
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
-use wyrd_server::oracle::{ScribeFragmentFault, arm_scribe_fragment_fault_for_test};
+use wyrd_server::oracle::{
+    ScribeFragmentFault, arm_scribe_fragment_fault_for_test,
+    arm_tail_listing_ticket_rejection_for_test,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, QueryExecutionPath, QueryTerminalErrorCode, QueryTerminalOutcome,
@@ -1660,12 +1665,15 @@ fn table_parquet_files(
 /// One table holds published ids 1..=3 and live ids 101..=103 on node 0's
 /// Scribe; node 1 reads. Each fault is driven at the boundary that owns it:
 ///
-/// - a failed stream listing, and a selected Scribe refused before its first
-///   row, each yield `Degraded` with `LiveTailUnavailable` and only the
+/// - an unavailable stream listing, and a selected Scribe refused before its
+///   first row, each yield `Degraded` with `LiveTailUnavailable` and only the
 ///   published rows;
+/// - a listing the ready Scribe refuses for its missing ticket fails rather
+///   than degrades, because a trust-boundary refusal is not availability loss;
 /// - a Scribe lost after its first row, a stream without its footer, a
-///   rejected peer ticket, and a refused follower lease each yield `Failed`,
-///   and the client rejects the stream instead of accepting preceding rows;
+///   rejected peer ticket, a refused follower lease, and a real live snapshot
+///   over its signed batch ceiling each yield `Failed`, and the client
+///   rejects the stream instead of accepting preceding rows;
 /// - a Scribe stopped before discovery is absent rather than lost, so the
 ///   query succeeds with best-effort coverage and no warning;
 /// - deleting the published data files fails the query rather than hiding
@@ -1701,6 +1709,12 @@ async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
         reader_node.set_tail_discovery_unavailable_for_test(false);
         expect_degraded("failed stream listing", &listing?)?;
 
+        arm_tail_listing_ticket_rejection_for_test();
+        expect_failed(
+            "stream listing refused for its ticket",
+            &observe_query(&reader, &sql).await?,
+        )?;
+
         for (case, fault) in [
             (
                 "Scribe unavailable before its first row",
@@ -1731,6 +1745,13 @@ async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
                 expect_failed(case, &observed)?;
             }
         }
+
+        // Three separate live appends are three memtable batches, so a signed
+        // ceiling of one makes the real bounded snapshot refuse for capacity.
+        set_live_fragment_batch_bound_for_test(Some(1));
+        let over_bound = observe_query(&reader, &sql).await;
+        set_live_fragment_batch_bound_for_test(None);
+        expect_failed("live snapshot over its batch bound", &over_bound?)?;
     }
 
     let stopped = cluster.server(0).ok_or("missing node 0")?.node_id();

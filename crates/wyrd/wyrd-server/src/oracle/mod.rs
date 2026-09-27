@@ -40,6 +40,8 @@ pub use query_audit::OracleQueryAudit;
 pub use tail_audit::PostgresTailSecurityAudit;
 pub use tail_authority::ScribeTailAuthority;
 pub use tail_discovery::RegistryTailStreamDiscovery;
+#[cfg(feature = "test-support")]
+pub use tail_discovery::arm_tail_listing_ticket_rejection_for_test;
 
 /// Closes the local serving latch once this Oracle's reader epoch is lost.
 ///

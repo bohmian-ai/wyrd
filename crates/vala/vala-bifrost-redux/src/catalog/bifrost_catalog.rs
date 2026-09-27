@@ -1536,10 +1536,17 @@ fn field_shape_matches(expected: &Field, actual: &Field) -> bool {
 /// same layout over the same schema canonicalize byte-identically and the
 /// engine can never refuse a declaration a caller could have made.
 ///
+/// The resolved schema must map to at most [`MAX_PHYSICAL_LEAF_COLUMNS`]
+/// Parquet leaf columns, managed columns included. Checking here, before any
+/// table exists, is what lets every accepted write stage without a later
+/// shape refusal.
+///
 /// # Errors
 ///
-/// Returns [`BifrostCatalogError::Registration`] when the declaration carries more
-/// than [`MAX_SORT_KEYS`](crate::catalog::layout::MAX_SORT_KEYS) sort keys, or
+/// Returns [`BifrostCatalogError::Registration`] carrying `SchemaParse` when
+/// the physical schema cannot be mapped to Parquet or exceeds the leaf limit,
+/// and carrying a layout error when the declaration carries more than
+/// [`MAX_SORT_KEYS`](crate::catalog::layout::MAX_SORT_KEYS) sort keys, or
 /// names a column absent from the resolved schema or repeated within one list.
 fn resolve_registration_layout(
     fqn: &str,
@@ -1551,6 +1558,19 @@ fn resolve_registration_layout(
         || Schema::new(with_managed_columns(user_fields.to_vec())),
         Clone::clone,
     );
+    let schema_refusal = |detail: String| {
+        BifrostCatalogError::Registration(wyrd_spec::vala::BifrostError::SchemaParse { detail })
+    };
+    let leaves = parquet::arrow::ArrowSchemaConverter::new()
+        .convert(&arrow_schema)
+        .map_err(|error| schema_refusal(format!("{fqn} has no Parquet mapping: {error}")))?
+        .num_columns();
+    if leaves > MAX_PHYSICAL_LEAF_COLUMNS {
+        return Err(schema_refusal(format!(
+            "{fqn} maps to {leaves} Parquet leaf columns including managed columns; \
+             at most {MAX_PHYSICAL_LEAF_COLUMNS} are allowed"
+        )));
+    }
     let layout = PhysicalLayout::resolve(fqn, &arrow_schema, declared)
         .map_err(BifrostCatalogError::Registration)?;
     Ok((arrow_schema, layout))
@@ -1596,6 +1616,10 @@ async fn acquire_table_advisory_lock(
         .map_err(vala_sql::SqlError::from)
         .map_err(BifrostCatalogError::Sql)
 }
+
+/// Most Parquet leaf columns one registered table may map to, managed columns
+/// included.
+pub const MAX_PHYSICAL_LEAF_COLUMNS: usize = 256;
 
 /// Iceberg property naming a table's explicit Forge compaction file target.
 const TARGET_FILE_SIZE_PROPERTY: &str = TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES;
@@ -1750,7 +1774,9 @@ mod schema_shape_tests {
 mod tests {
     use std::collections::HashMap;
 
-    use super::PinnedIcebergFile;
+    use arrow::datatypes::{DataType, Field};
+
+    use super::{MAX_PHYSICAL_LEAF_COLUMNS, PinnedIcebergFile, resolve_registration_layout};
     use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
 
     /// Builds one Forge-style rewrite output's manifest `DataFile` with typed
@@ -1879,6 +1905,50 @@ mod tests {
             other_field.event_time,
             EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing)
         );
+    }
+
+    /// Registration admits exactly 256 physical Parquet leaves, managed
+    /// columns included, refuses the 257th with the typed schema refusal, and
+    /// admits every built-in its lazy creation resolves.
+    ///
+    /// # Panics
+    /// Panics when the boundary schema is refused or the next one admitted.
+    #[test]
+    fn registration_admits_256_physical_leaves_including_managed_columns() {
+        let managed = resolve_registration_layout("vala.datasets.probe", &[], None, None)
+            .expect("an empty user schema resolves")
+            .0;
+        let managed_leaves = parquet::arrow::ArrowSchemaConverter::new()
+            .convert(&managed)
+            .expect("managed columns map to Parquet")
+            .num_columns();
+        let user = |count: usize| {
+            (0..count)
+                .map(|index| Field::new(format!("c{index}"), DataType::Int64, true))
+                .collect::<Vec<_>>()
+        };
+        let at_limit = user(MAX_PHYSICAL_LEAF_COLUMNS - managed_leaves);
+        resolve_registration_layout("vala.datasets.wide", &at_limit, None, None)
+            .expect("256 physical leaves register");
+        let over = user(MAX_PHYSICAL_LEAF_COLUMNS - managed_leaves + 1);
+        let error = resolve_registration_layout("vala.datasets.wide", &over, None, None)
+            .expect_err("257 physical leaves are refused");
+        assert_eq!(
+            error.into_public().code(),
+            "WYRD_VALA_400_SCHEMA_PARSE",
+            "the refusal is the typed schema error"
+        );
+
+        for definition in crate::tables::builtin_tables() {
+            let fqn = format!("{}.{}", definition.namespace, definition.name);
+            resolve_registration_layout(
+                &fqn,
+                &(definition.arrow_fields)(),
+                Some(&(definition.physical_layout)()),
+                Some(&(definition.schema)()),
+            )
+            .unwrap_or_else(|error| panic!("lazily created built-in {fqn} registers: {error}"));
+        }
     }
 }
 

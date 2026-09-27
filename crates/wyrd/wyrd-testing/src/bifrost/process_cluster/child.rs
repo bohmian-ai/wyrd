@@ -45,12 +45,18 @@ use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 /// 256 MiB unmanaged reserve is the budget the query grant is derived from. A
 /// Scribe or Forge pod is sized to complete one table lifecycle instead, which
 /// its own boot-time capacity check refuses to do inside the Oracle envelope.
-const fn pod_system_resources(
+///
+/// `memory_limit_bytes` replaces that per-target envelope only for the
+/// benchmark launch, whose container enforces the same bytes; every journey
+/// topology passes `None`.
+pub(super) const fn pod_system_resources(
     target: ProcessNodeTarget,
+    memory_limit_bytes: Option<usize>,
 ) -> vala_bifrost_redux::resources::SystemResourceSnapshot {
-    let memory_limit_bytes = match target {
-        ProcessNodeTarget::Oracle => 512 * 1024 * 1024,
-        _ => 2 * 1024 * 1024 * 1024,
+    let memory_limit_bytes = match (memory_limit_bytes, target) {
+        (Some(bytes), _) => bytes,
+        (None, ProcessNodeTarget::Oracle) => 512 * 1024 * 1024,
+        (None, _) => 2 * 1024 * 1024 * 1024,
     };
     vala_bifrost_redux::resources::SystemResourceSnapshot {
         memory_limit_bytes,
@@ -424,6 +430,14 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: "the inactive-query slot is empty".to_owned(),
                 })?,
             },
+            ControlRequest::CaptureResourceEvidence { directory } => {
+                match capture_resource_evidence(&server, &telemetry, &directory) {
+                    Ok(evidence) => emit(&ControlResponse::ResourceEvidence(evidence))?,
+                    Err(error) => emit(&ControlResponse::Failed {
+                        detail: error.to_string(),
+                    })?,
+                }
+            }
             ControlRequest::Shutdown => {
                 emit(&ControlResponse::ShuttingDown)?;
                 break;
@@ -588,6 +602,9 @@ struct ChildConfig {
     /// one. `None` keeps the memory-derived count every pod ran on before a
     /// journey needed to saturate an admission class deterministically.
     oracle_query_slot_limit: Option<usize>,
+    /// Memory envelope this child's plan is resolved from, when the benchmark
+    /// launch states one. `None` keeps the per-target journey envelope.
+    memory_limit_bytes: Option<usize>,
 }
 
 /// Accepts one query's rows only behind a fully validated success terminal.
@@ -696,6 +713,15 @@ impl ChildConfig {
                 })?),
                 Err(_) => None,
             },
+            memory_limit_bytes: match std::env::var(env::MEMORY_LIMIT_BYTES) {
+                Ok(value) => Some(value.parse().map_err(|error| {
+                    ProcessClusterError::Resource(format!(
+                        "{} is not a byte count: {error}",
+                        env::MEMORY_LIMIT_BYTES
+                    ))
+                })?),
+                Err(_) => None,
+            },
         })
     }
 
@@ -799,7 +825,10 @@ impl ChildConfig {
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_data_root(self.data_root.clone())
-            .with_system_resources_for_test(pod_system_resources(self.target));
+            .with_system_resources_for_test(pod_system_resources(
+                self.target,
+                self.memory_limit_bytes,
+            ));
         let server = match self.oracle_query_slot_limit {
             Some(slots) => server.with_oracle_query_slot_limit_for_test(slots),
             None => server,
@@ -1203,6 +1232,48 @@ fn metric_totals(
         }
     }
     Ok(totals)
+}
+
+/// Writes this process's raw metrics exposition and cgroup files into
+/// `directory` and reports its effective limits and resource plan.
+///
+/// The cgroup files are read from `/sys/fs/cgroup`, which inside a container
+/// with a private cgroup namespace is the container's own cgroup. A file that
+/// does not exist — no cgroup limit, or a host process at the root — is simply
+/// not written and, for the two limits, reported absent.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when this target composed no Bifrost
+/// resources, and [`ProcessClusterError::Resource`] when a file cannot be
+/// written.
+fn capture_resource_evidence(
+    server: &WyrdTestServer,
+    telemetry: &crate::bifrost::BifrostTelemetryCapture,
+    directory: &std::path::Path,
+) -> Result<super::ResourceEvidence, ProcessClusterError> {
+    let resource = |error: std::io::Error| ProcessClusterError::Resource(error.to_string());
+    let plan = server
+        .state()
+        .bifrost_resources()
+        .ok_or_else(|| ProcessClusterError::Child("no Bifrost resources composed".to_owned()))?
+        .plan();
+    std::fs::write(directory.join("metrics.prom"), telemetry.render()).map_err(resource)?;
+    let mut limits = std::collections::BTreeMap::new();
+    for file in super::CGROUP_EVIDENCE_FILES {
+        if let Ok(contents) =
+            std::fs::read_to_string(std::path::Path::new("/sys/fs/cgroup").join(file))
+        {
+            std::fs::write(directory.join(file), &contents).map_err(resource)?;
+            limits.insert(file, contents.trim().to_owned());
+        }
+    }
+    Ok(super::ResourceEvidence {
+        cpu_max: limits.remove("cpu.max"),
+        memory_max: limits.remove("memory.max"),
+        plan_memory_limit_bytes: plan.memory_limit_bytes,
+        plan_effective_cpu: plan.effective_cpu,
+    })
 }
 
 /// Resolves this child's own Oracle engine.

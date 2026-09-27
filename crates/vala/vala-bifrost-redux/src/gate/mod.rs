@@ -53,8 +53,8 @@ use wyrd_spec::vala::error::BifrostError;
 /// Output past the expanded-data limit is the caller's oversized request and
 /// becomes [`IngestError::PayloadTooLarge`]; any other projection failure is a
 /// defect in the projector and stays internal.
-fn projection_error(signal: &str, error: TableError) -> IngestError {
-    match error {
+fn projection_error(signal: &str, error: &TableError) -> IngestError {
+    match *error {
         TableError::OutputTooLarge { bytes, limit } => IngestError::PayloadTooLarge {
             bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
             limit: u64::try_from(limit).unwrap_or(u64::MAX),
@@ -777,7 +777,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             auth.principal.card_ref_scope(),
             self.limits.expanded_bytes(),
         )
-        .map_err(|error| projection_error("trace", error))?;
+        .map_err(|error| projection_error("trace", &error))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Traces, "spans"),
@@ -819,7 +819,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             auth.principal.card_ref_scope(),
             self.limits.expanded_bytes(),
         )
-        .map_err(|error| projection_error("metric", error))?;
+        .map_err(|error| projection_error("metric", &error))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Metrics, "points"),
@@ -861,7 +861,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             auth.principal.card_ref_scope(),
             self.limits.expanded_bytes(),
         )
-        .map_err(|error| projection_error("log", error))?;
+        .map_err(|error| projection_error("log", &error))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Logs, "records"),

@@ -53,14 +53,13 @@ const OVERSIZED_CEILING_PERCENT: u64 = 180;
 ///
 /// Registration cannot see a worker's operator limits, so it checks only what
 /// holds under every deployment: the target is representable on this platform,
-/// its oversized ceiling does not overflow, it is above the default small-file
-/// threshold, and it is at least the default row-group target a newly
-/// registered table writes with. [`ForgeTablePolicy::extract`] re-checks the
+/// its oversized ceiling does not overflow, and it is at least the default
+/// row-group target a newly registered table writes with, which also places it
+/// above the default small-file threshold. [`ForgeTablePolicy::extract`] re-checks the
 /// full table and worker combination at planning.
 #[must_use]
 pub(crate) fn registrable_target_file_size_bytes(bytes: u64) -> bool {
-    bytes > crate::forge::compact::DEFAULT_SMALL_FILE_THRESHOLD_BYTES
-        && bytes >= ROW_GROUP_TARGET_DEFAULT
+    bytes >= ROW_GROUP_TARGET_DEFAULT
         && bytes.checked_mul(OVERSIZED_CEILING_PERCENT).is_some()
         && usize::try_from(bytes).is_ok()
 }

@@ -1558,8 +1558,10 @@ mod tests {
     /// Panics when an overflowing wire ceiling produces an envelope.
     #[test]
     fn configured_ceilings_refuse_overflowing_limits() {
-        let mut limits = crate::gate::limits::IngestLimits::default();
-        limits.max_frame_bytes = usize::MAX / 2;
+        let limits = crate::gate::limits::IngestLimits {
+            max_frame_bytes: usize::MAX / 2,
+            ..crate::gate::limits::IngestLimits::default()
+        };
         assert!(matches!(
             configured_maximum_envelope_bytes(limits),
             Err(ScribeError::DecodedPayloadTooLarge { .. })

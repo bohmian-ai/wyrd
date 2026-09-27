@@ -793,6 +793,40 @@ struct PointColumns {
     run_id: Vec<Option<String>>,
 }
 
+/// Returns the variable-length payload bytes one point appends to the columns.
+///
+/// Counts descriptor strings, attribute encodings, correlation text, numeric
+/// list elements at eight bytes each (quantiles contribute a quantile and a
+/// value), and exemplar attribute encodings. Fixed widths and the repeated
+/// resource and scope bytes are charged by the caller.
+fn point_payload_bytes(descriptor: &MetricDescriptor, row: &PointRow) -> usize {
+    let numeric_elements = row.bucket_counts.as_ref().map_or(0, Vec::len)
+        + row.explicit_bounds.as_ref().map_or(0, Vec::len)
+        + row
+            .positive_buckets
+            .as_ref()
+            .map_or(0, |buckets| buckets.counts.len())
+        + row
+            .negative_buckets
+            .as_ref()
+            .map_or(0, |buckets| buckets.counts.len())
+        + 2 * row.quantile_values.as_ref().map_or(0, Vec::len);
+    descriptor.name.len()
+        + descriptor.description.len()
+        + descriptor.unit.len()
+        + descriptor.metadata.len()
+        + descriptor.kind.len()
+        + row.attributes.len()
+        + row.correlation.card_ref.as_ref().map_or(0, String::len)
+        + row.correlation.run_id.as_ref().map_or(0, String::len)
+        + numeric_elements * size_of::<i64>()
+        + row
+            .exemplars
+            .iter()
+            .map(|exemplar| exemplar.filtered_attributes.len())
+            .sum::<usize>()
+}
+
 impl PointColumns {
     /// Append one already-validated point as a canonical row.
     ///
@@ -811,31 +845,7 @@ impl PointColumns {
         resource: &ResourceEnvelope,
         scope: &ScopeEnvelope,
     ) -> usize {
-        let numeric_elements = row.bucket_counts.as_ref().map_or(0, Vec::len)
-            + row.explicit_bounds.as_ref().map_or(0, Vec::len)
-            + row
-                .positive_buckets
-                .as_ref()
-                .map_or(0, |buckets| buckets.counts.len())
-            + row
-                .negative_buckets
-                .as_ref()
-                .map_or(0, |buckets| buckets.counts.len())
-            + 2 * row.quantile_values.as_ref().map_or(0, Vec::len);
-        let payload_bytes = descriptor.name.len()
-            + descriptor.description.len()
-            + descriptor.unit.len()
-            + descriptor.metadata.len()
-            + descriptor.kind.len()
-            + row.attributes.len()
-            + row.correlation.card_ref.as_ref().map_or(0, String::len)
-            + row.correlation.run_id.as_ref().map_or(0, String::len)
-            + numeric_elements * size_of::<i64>()
-            + row
-                .exemplars
-                .iter()
-                .map(|exemplar| exemplar.filtered_attributes.len())
-                .sum::<usize>();
+        let payload_bytes = point_payload_bytes(descriptor, &row);
         self.metric_name.push(descriptor.name.clone());
         self.description.push(descriptor.description.clone());
         self.unit.push(descriptor.unit.clone());

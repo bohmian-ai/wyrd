@@ -3155,9 +3155,12 @@ mod tests {
         }
     }
 
+    /// Builds one resource group's body nesting the given records under one scope.
+    type NestRecords = fn(&str) -> String;
+
     /// Returns each signal's preflight, resource-group key, and a builder that
     /// nests `rows` empty records under one scope.
-    fn signals() -> [(Preflight, &'static str, fn(&str) -> String); 3] {
+    fn signals() -> [(Preflight, &'static str, NestRecords); 3] {
         [
             (preflight_trace_json, "resourceSpans", |rows| {
                 format!(r#""scopeSpans":[{{"spans":[{rows}]}}]"#)
@@ -3184,8 +3187,8 @@ mod tests {
     fn json_preflight_refuses_typed_backing_above_expanded_ceiling() {
         let limits = small_limits();
         for (preflight, root, _) in signals() {
-            let few = format!(r#"{{"{root}":[{}]}}"#, vec!["{}"; 8].join(","));
-            let many = format!(r#"{{"{root}":[{}]}}"#, vec!["{}"; 1300].join(","));
+            let few = format!(r#"{{"{root}":[{}]}}"#, ["{}"; 8].join(","));
+            let many = format!(r#"{{"{root}":[{}]}}"#, ["{}"; 1300].join(","));
             assert!(many.len() <= limits.request_bytes);
             assert!(preflight(few.as_bytes(), limits).is_ok());
             assert!(matches!(

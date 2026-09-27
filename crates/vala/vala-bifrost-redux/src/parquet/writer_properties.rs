@@ -340,7 +340,13 @@ mod tests {
         writer.close().expect("footer");
         let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).expect("footer parses");
         let groups = reader.metadata().row_groups();
-        assert_eq!(groups.iter().map(|group| group.num_rows()).sum::<i64>(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+                .sum::<i64>(),
+            2
+        );
         assert!(
             groups
                 .iter()

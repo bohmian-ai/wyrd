@@ -185,9 +185,17 @@ The principal size boundaries are independent:
 |---|---|
 | WAL segment | 512 MiB encoded default per shard WAL file |
 | Active shard generation | `min(512 MiB, floor(active_generation_budget / 16))`, plus age and pressure |
-| Parquet row group | 32 MiB logical or 131,072 rows |
-| Scribe hot object | approximately 512 MiB encoded, with bounded residue |
-| Forge rewrite output | approximately 1 GiB according to the table property |
+| Ingest request | one `scribe.ingest_request_bytes` wire ceiling, 16 MiB default |
+| Ingest expanded data | derived 4x the wire ceiling (64 MiB default), enforced before WAL; no row cap |
+| Parquet row group | soft 128 MiB encoded target; a single large accepted row fits a group of its own |
+| Scribe hot object | approximately 512 MiB encoded whole-file target, `WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES` override, with bounded residue |
+| Forge rewrite output | the table's optional registered compaction target, else the deployment default of approximately 1 GiB (`WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`) |
+
+Ingest has exactly one size setting. The wire ceiling bounds encoded request
+bytes; the expanded ceiling is derived, never configured, and bounds decoded
+Arrow memory plus managed columns (and, for OTLP, the projected output) before
+anything is appended to the WAL. A request above either ceiling is refused
+with `PayloadTooLarge`. Row count is not a limit.
 
 The generation maximum age and staging maximum dwell are each 600 seconds by
 default. Configuration validates checked arithmetic and proves that one maximum
@@ -256,8 +264,8 @@ be split across claims and a later member cannot join an existing claim.
 
 `ParquetBatchEncoder` performs a bounded external merge in canonical
 `PhysicalLayout` order with `(wyrd_batch_id, wyrd_row_ordinal)` as the stable
-tie-breaker. It writes 32 MiB logical or 131,072-row Parquet row groups and
-closes immutable hot objects around 512 MiB encoded. A completed row group is
+tie-breaker. It writes Parquet row groups toward a soft 128 MiB target and
+closes immutable hot objects around the 512 MiB whole-file target. A completed row group is
 indivisible, and a smaller object is valid for dwell, partition close,
 pressure, drain, or final residue. The 512 MiB target is independent of WAL,
 active-memory, row-group, and Forge output geometry.
@@ -583,7 +591,9 @@ checksum, and operation evidence.
 ### Managed compaction and publication
 
 Iceberg maintenance rewrites eligible live files toward the table's
-`write.target-file-size-bytes`, normally approximately 1 GiB. Row-group size is
+`write.target-file-size-bytes`: the table's optional registered compaction
+target when one is set, otherwise the deployment default resolved once per
+attempt (approximately 1 GiB, overridable by environment). Row-group size is
 independent and normally 128 MiB. A physical file rolls from the managed
 writer's encoded estimate after a completed write; partition and end-of-stream
 residue are valid. Neither target is a universal physical object-size

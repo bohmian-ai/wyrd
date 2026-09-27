@@ -9,6 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api as tail;
+use wyrd_spec::vala::assignment_authority::ScanPredicate;
 use wyrd_tonic::tonic::metadata::MetadataValue;
 use wyrd_tonic::tonic::{Code, Request, transport::Channel};
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
@@ -19,6 +20,7 @@ use crate::contracts::ScribeError;
 use crate::scribe::memtable::{Memtable, ReadableBatchLimits};
 use crate::scribe::routing::shard_for;
 use crate::scribe::shards::ScribeShardRuntime;
+use crate::scribe::staged_tail::{StagedRunWindows, StagedTailReader};
 use crate::scribe::stream_identity::StreamIdentity;
 
 /// The only tail protocol revision understood by the Scribe v1 reader.
@@ -620,6 +622,12 @@ impl LiveTailBatches {
     /// again, a slow consumer holds production back rather than accumulating
     /// output here.
     ///
+    /// Staged Parquet opens and decodes run on the blocking pool through
+    /// [`StagedRunWindows`], never on the polling worker. The staged lease
+    /// travels with each blocking step: dropping the stream mid-window starts
+    /// no further window and releases the lease once that read exits, while
+    /// the memtable references and producer accounting release at the drop.
+    ///
     /// # Errors
     ///
     /// The stream yields [`ScribeError::Internal`] when a signed predicate
@@ -641,7 +649,9 @@ impl LiveTailBatches {
         } = self;
         Box::pin(async_stream::try_stream! {
             let _open = open;
-            let _staged = staged;
+            let staged = staged.map(Arc::new);
+            let required_columns: Arc<[String]> = required_columns.into();
+            let predicates: Arc<[ScanPredicate]> = predicates.into();
             let mut produced = false;
             for batch in memtable {
                 #[cfg(feature = "test-support")]
@@ -655,15 +665,23 @@ impl LiveTailBatches {
                 produced = true;
                 yield rows;
             }
-            let reader = crate::scribe::staged_tail::StagedTailReader::default();
+            let reader = StagedTailReader::default();
             for source in &unserved {
                 for run in &source.runs {
-                    for window in reader.run_batches(run, &required_columns, &predicates)? {
+                    let mut windows = StagedRunWindows::open(
+                        reader,
+                        run.clone(),
+                        Arc::clone(&required_columns),
+                        Arc::clone(&predicates),
+                        staged.clone(),
+                    )
+                    .await?;
+                    while let Some((rest, rows)) = windows.next().await? {
                         #[cfg(feature = "test-support")]
                         if produced {
                             scribe_live_production_pause_for_test().hold().await;
                         }
-                        let rows = window?;
+                        windows = rest;
                         produced = true;
                         yield rows;
                     }
@@ -1010,6 +1028,7 @@ mod tests {
     };
     use crate::scribe::hot_source::HotAuthority;
     use crate::scribe::memtable::Memtable;
+    use crate::scribe::staged_tail::STAGED_WINDOW_GATE;
     use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
     use crate::scribe::wal::WalLsn;
     use arrow::array::{Int64Array, RecordBatch};
@@ -1220,6 +1239,15 @@ mod tests {
     /// # Panics
     /// Panics when any fixture step fails.
     fn staged_generation_fixture() -> StagedGenerationFixture {
+        staged_generation_fixture_with_runs(1)
+    }
+
+    /// Builds a [`StagedGenerationFixture`] whose generation is staged as
+    /// `runs` identical runs of rows `[1, 2, 3]`, one decode window each.
+    ///
+    /// # Panics
+    /// Panics when any fixture step fails.
+    fn staged_generation_fixture_with_runs(runs: usize) -> StagedGenerationFixture {
         use crate::catalog::TableRef;
         use crate::scribe::assembly::StagedMemberId;
         use crate::scribe::hot_source::{HotAuthority, ScribeHotSourceRegistry};
@@ -1274,6 +1302,13 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("staged run directory");
         let run = write_staged_run(directory.path(), schema, &rows);
+        let runs = (0..runs)
+            .map(|index| {
+                let copy = directory.path().join(format!("run-copy-{index}.parquet"));
+                std::fs::copy(&run, &copy).expect("fixture staged run copies");
+                copy
+            })
+            .collect();
         let member = StagedMemberId::new(0, generation.get());
         registry
             .advance(
@@ -1281,7 +1316,7 @@ mod tests {
                 generation,
                 HotAuthority::StagedRun {
                     member,
-                    runs: vec![run],
+                    runs,
                     bytes: 4_096,
                     wal: (WalLsn::new(1), WalLsn::new(1)),
                 },
@@ -1410,6 +1445,84 @@ mod tests {
             0,
             "dropping the stream releases the lease"
         );
+    }
+
+    /// A staged window read blocks only its blocking-pool thread, and a
+    /// cancelled read releases its staged lease after that read exits.
+    ///
+    /// The generation is staged as two runs, one window each, and the first
+    /// window read is held on its blocking thread. While it is held the async
+    /// runtime still runs other tasks and the lease is held. Cancelling the
+    /// reading task leaves the lease with the in-flight read; releasing the
+    /// read then drops the lease without a second window ever being read.
+    ///
+    /// # Panics
+    /// Panics when the runtime is blocked, the lease is released before the
+    /// in-flight read exits or not at all, or a further window is read.
+    #[tokio::test]
+    async fn a_cancelled_staged_read_releases_its_lease_after_the_blocking_window() {
+        let StagedGenerationFixture {
+            service,
+            memtable,
+            registry,
+            key,
+            generation,
+            member,
+            request,
+            directory: _directory,
+        } = staged_generation_fixture_with_runs(2);
+        memtable
+            .complete_staged(generation.get(), member)
+            .expect("the shard marks the generation durable");
+        let stream = service
+            .open_live_batches(request)
+            .await
+            .expect("the live read opens")
+            .into_stream();
+        STAGED_WINDOW_GATE.arm();
+        let reading =
+            tokio::spawn(
+                async move { futures_util::TryStreamExt::try_collect::<Vec<_>>(stream).await },
+            );
+        let (windows, _) =
+            tokio::task::spawn_blocking(|| STAGED_WINDOW_GATE.wait_until(|state| state.held))
+                .await
+                .expect("gate waiter joins");
+        assert_eq!(windows, 1, "exactly the first window is being read");
+
+        assert_eq!(
+            tokio::spawn(async { 7 }).await.expect("probe task joins"),
+            7,
+            "the runtime keeps scheduling while a staged window is read"
+        );
+        assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
+
+        reading.abort();
+        assert!(
+            reading
+                .await
+                .expect_err("the read is cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            1,
+            "the in-flight window keeps its run leased after cancellation"
+        );
+
+        let exits_before = STAGED_WINDOW_GATE.wait_until(|_| true).1;
+        STAGED_WINDOW_GATE.release();
+        let (windows, _) = tokio::task::spawn_blocking(move || {
+            STAGED_WINDOW_GATE.wait_until(|state| state.exits > exits_before)
+        })
+        .await
+        .expect("gate waiter joins");
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            0,
+            "the lease releases once the in-flight window exits"
+        );
+        assert_eq!(windows, 1, "no further window is read after cancellation");
     }
 
     /// A signed predicate is applied inside Scribe, so a selective live-tail

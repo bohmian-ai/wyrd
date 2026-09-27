@@ -11,12 +11,18 @@
 //! a [`ScribeHotSourceRegistry`](crate::scribe::hot_source::ScribeHotSourceRegistry)
 //! resolved and returns rows from exactly those.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tokio::sync::oneshot;
+use wyrd_spec::vala::assignment_authority::ScanPredicate;
 
 use crate::contracts::ScribeError;
+use crate::scribe::hot_source::StagedSourceLease;
 
 /// Rows decoded per Parquet window yielded to a live producer.
 ///
@@ -50,33 +56,39 @@ impl StagedTailReader {
     /// schema and reused for every window; a window retaining no row is
     /// skipped.
     ///
+    /// This is synchronous file IO; an async caller reaches it only through
+    /// [`StagedRunWindows`], which runs it on the blocking pool.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the run cannot be opened or its
     /// projection cannot be resolved; the iterator yields
     /// [`ScribeError::Internal`] when a batch cannot be decoded or reordered,
     /// or the signed predicate cannot be compiled or evaluated.
-    pub(crate) fn run_batches<'a>(
+    pub(crate) fn run_batches(
         self,
-        run: &'a std::path::Path,
-        required_columns: &'a [String],
-        predicates: &'a [wyrd_spec::vala::assignment_authority::ScanPredicate],
-    ) -> Result<impl Iterator<Item = Result<RecordBatch, ScribeError>> + 'a, ScribeError> {
-        let file = std::fs::File::open(run).map_err(run_failure(run, "open"))?;
+        run: PathBuf,
+        required_columns: Arc<[String]>,
+        predicates: Arc<[ScanPredicate]>,
+    ) -> Result<impl Iterator<Item = Result<RecordBatch, ScribeError>> + Send + 'static, ScribeError>
+    {
+        let file = std::fs::File::open(&run).map_err(run_failure(&run, "open"))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(run_failure(run, "read the metadata of"))?
+            .map_err(run_failure(&run, "read the metadata of"))?
             .with_batch_size(self.batch_rows);
-        let projection = projection_mask(&builder, required_columns, run)?;
+        let projection = projection_mask(&builder, &required_columns, &run)?;
         let schema = builder.schema().clone();
         let reader = builder
             .with_projection(projection)
             .build()
-            .map_err(run_failure(run, "start reading"))?;
+            .map_err(run_failure(&run, "start reading"))?;
         let mut filter = None;
         Ok(reader
             .map(move |batch| {
-                let batch = batch.map_err(run_failure(run, "decode a batch from"))?;
-                let batch = reorder(&batch, &schema, required_columns, run)?;
+                #[cfg(test)]
+                STAGED_WINDOW_GATE.pass();
+                let batch = batch.map_err(run_failure(&run, "decode a batch from"))?;
+                let batch = reorder(&batch, &schema, &required_columns, &run)?;
                 if predicates.is_empty() {
                     return Ok(batch);
                 }
@@ -85,7 +97,7 @@ impl StagedTailReader {
                     None => filter.insert(
                         crate::oracle::exec::ScanPredicateFilter::compile(
                             &batch.schema(),
-                            predicates,
+                            &predicates,
                         )
                         .map_err(|error| ScribeError::Internal {
                             detail: format!(
@@ -99,6 +111,197 @@ impl StagedTailReader {
                 })
             })
             .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0)))
+    }
+}
+
+/// Boxed window iterator one staged run decodes on the blocking pool.
+type StagedWindows = Box<dyn Iterator<Item = Result<RecordBatch, ScribeError>> + Send>;
+
+/// One staged run decoded window by window off the async runtime.
+///
+/// Opening and every window decode are synchronous Parquet IO, so each runs
+/// as one blocking-pool task that takes this value, advances it once, and
+/// hands it back through a oneshot. Exactly one window is requested per pull,
+/// so demand and residency stay one window.
+///
+/// The value carries the staged lease protecting its file. If the async
+/// consumer is dropped while a window is being read, the blocking task finds
+/// the receiver gone and drops this value, and with it the lease, itself —
+/// only after its protected read has exited, and without starting another
+/// window.
+pub(crate) struct StagedRunWindows {
+    /// Remaining decode windows of the run.
+    windows: StagedWindows,
+    /// Staged lease keeping the run's file readable while it is decoded.
+    _lease: Option<Arc<StagedSourceLease>>,
+}
+
+impl StagedRunWindows {
+    /// Opens `run` on the blocking pool under `lease`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reader's open or projection failure, and
+    /// [`ScribeError::Internal`] when the blocking task cannot report back.
+    /// Cancellation before this returns leaves the blocking task to drop the
+    /// opened run and its lease when the open finishes.
+    pub(crate) async fn open(
+        reader: StagedTailReader,
+        run: PathBuf,
+        required_columns: Arc<[String]>,
+        predicates: Arc<[ScanPredicate]>,
+        lease: Option<Arc<StagedSourceLease>>,
+    ) -> Result<Self, ScribeError> {
+        Self::on_blocking_pool(move || {
+            let windows = reader.run_batches(run, required_columns, predicates)?;
+            Ok(Self {
+                windows: Box::new(windows),
+                _lease: lease,
+            })
+        })
+        .await
+    }
+
+    /// Decodes the next window on the blocking pool.
+    ///
+    /// Returns `None` once the run is exhausted, which drops this value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window's decode, projection, or predicate failure, and
+    /// [`ScribeError::Internal`] when the blocking task cannot report back.
+    /// Cancellation while the window is read stops production after it.
+    pub(crate) async fn next(mut self) -> Result<Option<(Self, RecordBatch)>, ScribeError> {
+        Self::on_blocking_pool(move || match self.windows.next() {
+            None => Ok(None),
+            Some(window) => window.map(|batch| Some((self, batch))),
+        })
+        .await
+    }
+
+    /// Runs one synchronous step on the blocking pool and awaits its result.
+    ///
+    /// The result travels through a oneshot rather than the join handle, so
+    /// when the awaiting future has been dropped the result, and any run and
+    /// lease it holds, is dropped inside the blocking task as soon as the
+    /// step returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the step's own error, and [`ScribeError::Internal`] when the
+    /// blocking task ended without reporting, such as by panicking.
+    async fn on_blocking_pool<T: Send + 'static>(
+        step: impl FnOnce() -> Result<T, ScribeError> + Send + 'static,
+    ) -> Result<T, ScribeError> {
+        let (sender, receiver) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            // A closed receiver means the consumer is gone; the returned
+            // result is dropped right here, releasing what it holds.
+            drop(sender.send(step()));
+            #[cfg(test)]
+            STAGED_WINDOW_GATE.exit();
+        });
+        receiver.await.map_err(|_| ScribeError::Internal {
+            detail: "staged run read ended without a result".to_owned(),
+        })?
+    }
+}
+
+/// Test gate that holds one staged window read on its blocking thread.
+///
+/// Armed, the next window read blocks inside its blocking task until the test
+/// releases it, so a test can prove the async runtime stays responsive and
+/// observe what a cancelled read still holds. Every window read is counted.
+#[cfg(test)]
+pub(crate) struct StagedWindowGate {
+    /// Gate state shared with the blocking reader.
+    state: std::sync::Mutex<StagedWindowGateState>,
+    /// Signals every state change.
+    changed: std::sync::Condvar,
+}
+
+/// Observable state of [`StagedWindowGate`].
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct StagedWindowGateState {
+    /// Whether the next window read should block.
+    pub(crate) armed: bool,
+    /// Whether a read is blocked at the gate.
+    pub(crate) held: bool,
+    /// Window reads started.
+    pub(crate) windows: usize,
+    /// Blocking steps that have finished and dropped any unreceived result.
+    pub(crate) exits: usize,
+}
+
+/// The one process gate staged window reads pass under test.
+#[cfg(test)]
+pub(crate) static STAGED_WINDOW_GATE: StagedWindowGate = StagedWindowGate {
+    state: std::sync::Mutex::new(StagedWindowGateState {
+        armed: false,
+        held: false,
+        windows: 0,
+        exits: 0,
+    }),
+    changed: std::sync::Condvar::new(),
+};
+
+#[cfg(test)]
+impl StagedWindowGate {
+    /// Locks the state, recovering it from a poisoned test.
+    fn lock(&self) -> std::sync::MutexGuard<'_, StagedWindowGateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Arms the gate for the next window read.
+    pub(crate) fn arm(&self) {
+        self.lock().armed = true;
+    }
+
+    /// Counts a window read and blocks it while the gate is armed.
+    fn pass(&self) {
+        let mut state = self.lock();
+        state.windows += 1;
+        if state.armed {
+            state.held = true;
+            self.changed.notify_all();
+            while state.armed {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.held = false;
+        }
+    }
+
+    /// Records one finished blocking step.
+    fn exit(&self) {
+        self.lock().exits += 1;
+        self.changed.notify_all();
+    }
+
+    /// Releases a held read.
+    pub(crate) fn release(&self) {
+        self.lock().armed = false;
+        self.changed.notify_all();
+    }
+
+    /// Blocks the calling thread until `ready` holds, returning a snapshot.
+    pub(crate) fn wait_until(
+        &self,
+        ready: impl Fn(&StagedWindowGateState) -> bool,
+    ) -> (usize, usize) {
+        let mut state = self.lock();
+        while !ready(&state) {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        (state.windows, state.exits)
     }
 }
 
@@ -251,7 +454,7 @@ mod tests {
         predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
     ) -> Result<Vec<RecordBatch>, ScribeError> {
         StagedTailReader::default()
-            .run_batches(run, columns, predicates)?
+            .run_batches(run.to_path_buf(), columns.into(), predicates.into())?
             .collect()
     }
 

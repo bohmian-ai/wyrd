@@ -118,7 +118,10 @@ Every query pins one published cut: an Iceberg snapshot and committed Scribe
 hot objects not represented by that snapshot. Oracle also discovers active
 streams on ready Scribes and sends live work only to owners of relevant table
 partitions. Scribe scans its own memtable or staged authority and streams
-bounded Arrow results to Oracle. An unavailable Scribe missing before
+bounded Arrow results to Oracle, producing each batch only when Oracle pulls
+it. The scan's memtable references, staged-run leases, and follower admission
+belong to that stream and are released when it completes, is cancelled, or is
+dropped; the query deadline is its only timeout. An unavailable Scribe missing before
 discovery is outside the known live set. A known live source lost before rows
 degrades the result; loss after rows fails the query. Published-source,
 security, tenant, schema, resource, cancellation, and deadline failures fail.

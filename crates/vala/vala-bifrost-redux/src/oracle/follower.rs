@@ -423,7 +423,8 @@ impl OracleCatalogResolver {
 /// A signed closure can legitimately select nothing once the leader has pruned
 /// it, and that is a correct empty result rather than an error: the follower
 /// still returns a plan at the closure schema so the union above it sees the
-/// same columns every other fragment produces.
+/// same columns every other fragment produces. A Scribe follower uses it for a
+/// sibling Scribe's placeholder, which this node must not read.
 ///
 /// # Errors
 /// Returns a scrubbed message when the empty in-memory source cannot be built.
@@ -438,7 +439,7 @@ fn empty_assignment_leaf(
             full_schema,
         })
         .map_err(|_| {
-            FollowerResolutionError::Fault("authenticated Oracle empty provider failed".to_owned())
+            FollowerResolutionError::Fault("authenticated empty provider failed".to_owned())
         })
 }
 
@@ -1094,21 +1095,7 @@ where
             cut.writer_epoch,
         );
         if assignment.scan_id != local_scan_id {
-            let batch = RecordBatch::new_empty(Arc::clone(&required_schema));
-            return MemorySourceConfig::try_new_exec(
-                &[vec![batch]],
-                Arc::clone(&required_schema),
-                None,
-            )
-            .map(|plan| ResolvedFollowerSource {
-                plan: plan as Arc<dyn ExecutionPlan>,
-                full_schema,
-            })
-            .map_err(|_| {
-                FollowerResolutionError::Fault(
-                    "authenticated Scribe empty provider failed".to_owned(),
-                )
-            });
+            return empty_assignment_leaf(&required_schema, full_schema);
         }
         let start_partition = TimePartition::from_wire(cut.start_partition);
         let end_partition = TimePartition::from_wire(cut.end_partition);

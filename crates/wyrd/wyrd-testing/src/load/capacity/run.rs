@@ -76,6 +76,15 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// How long held streams have to all open before a mixed run is refused.
 const LIVE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Idle interval before every row after the first.
+///
+/// Outlives the 30-second longest lifetime of a private Scribe tail-discovery
+/// ticket, so single-use nonces one row minted no longer occupy the pod's
+/// replay window when the next row, or the live fixture's preflight, starts.
+/// Each row therefore begins from a quiesced pod instead of inheriting the
+/// previous row's residue.
+const ROW_QUIESCE: Duration = Duration::from_secs(31);
+
 /// Largest gRPC message the seeding client sends or accepts.
 const CLIENT_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -392,9 +401,9 @@ impl QueryCapacityBenchmark {
 
     /// Runs the four [`RUN_ORDER`] combinations and writes the report.
     ///
-    /// The live fixture is acknowledged between the no-live baselines and the
-    /// first mixed row, and every mixed row holds
-    /// [`live_stream_target`] streams.
+    /// Every row after the first starts after [`ROW_QUIESCE`]. The live
+    /// fixture is acknowledged between the no-live baselines and the first
+    /// mixed row, and every mixed row holds [`live_stream_target`] streams.
     ///
     /// # Errors
     ///
@@ -404,7 +413,11 @@ impl QueryCapacityBenchmark {
         write_json(&self.settings.output.join("metadata.json"), &self.metadata)?;
         let mut rows = Vec::new();
         let mut live_loaded = false;
-        for (rate, live) in RUN_ORDER {
+        for (index, (rate, live)) in RUN_ORDER.into_iter().enumerate() {
+            if index > 0 {
+                // Quiesce.
+                tokio::time::sleep(ROW_QUIESCE).await;
+            }
             let target = if live {
                 if !live_loaded {
                     self.load_live().await?;
@@ -751,6 +764,11 @@ impl MeasuredWindow {
     /// Assembles the report row: category counts and latency percentiles from
     /// the client run, counter and cumulative cgroup deltas between the
     /// snapshots, and whether the offered rate was sustained.
+    ///
+    /// An unsustained row names its saturated boundary in order: the driver,
+    /// cgroup memory (OOM kills), cgroup CPU (throttling), the failing terminal
+    /// category with the most measured terminals, PostgreSQL, and otherwise
+    /// query latency.
     fn report(self) -> CombinationReport {
         let Self {
             rate,
@@ -799,8 +817,19 @@ impl MeasuredWindow {
             "cgroup memory"
         } else if cgroup.get("cpu.stat:nr_throttled").copied().unwrap_or(0.0) > 0.0 {
             "cgroup cpu"
-        } else if outcomes[&ShortQueryOutcome::AdmissionRefused] > 0 {
-            "oracle admission"
+        } else if let Some((_, boundary)) = [
+            (ShortQueryOutcome::AdmissionRefused, "oracle admission"),
+            (ShortQueryOutcome::TransportError, "query transport"),
+            (ShortQueryOutcome::Failed, "query failure"),
+            (ShortQueryOutcome::Deadline, "query deadline"),
+        ]
+        .into_iter()
+        .map(|(outcome, boundary)| (outcomes[&outcome], boundary))
+        .filter(|(count, _)| *count > 0)
+        .max_by_key(|(count, _)| *count)
+        {
+            // The failing category with the most measured terminals.
+            boundary
         } else if after.postgres_select_ms > 100.0 {
             "postgres"
         } else {
@@ -1013,8 +1042,10 @@ async fn short_query(queries: Arc<Bifrost>, bucket: u64) -> ProbeResult {
     }
 }
 
-/// Maps a client error onto its report category by its stable code.
+/// Maps a client error onto its report category by its stable code, and
+/// logs the error at debug level so a failing category can be diagnosed.
 fn classify_error(error: &BifrostClientError) -> ShortQueryOutcome {
+    tracing::debug!(%error, "short query failed");
     if let Some(terminal) = error.terminal() {
         return match terminal.error.as_ref().map(|error| error.code) {
             Some(QueryTerminalErrorCode::QueryTimeout) => ShortQueryOutcome::Deadline,

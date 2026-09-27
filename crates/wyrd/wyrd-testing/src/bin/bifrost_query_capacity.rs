@@ -32,10 +32,28 @@ async fn benchmark() -> Result<(), CapacityError> {
     Ok(())
 }
 
+/// Installs the driver's stderr log subscriber when `RUST_LOG` asks for one.
+///
+/// The pod child logs its own view under the same variable; this makes the
+/// driver's client-side failures, such as each failed short query's error,
+/// readable alongside it.
+fn install_tracing() {
+    let Ok(filter) = std::env::var("RUST_LOG") else {
+        return;
+    };
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(std::io::stderr)
+            .finish(),
+    );
+}
+
 /// Runs the benchmark on a multi-thread runtime, which the driver needs for
 /// its blocking pod control calls, and exits nonzero on failure.
 #[tokio::main]
 async fn main() -> ExitCode {
+    install_tracing();
     match benchmark().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

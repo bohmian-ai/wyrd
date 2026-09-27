@@ -4350,27 +4350,9 @@ impl WyrdTestServerBuilder {
                     (Some(Arc::new(root)), settings)
                 }
             };
-            let handle = if matches!(settings.backend, BackendConfig::Local { .. }) {
-                // The filesystem service resumes a listing from `start_after`
-                // correctly but does not advertise the capability, and Forge
-                // workers refuse to start on a staging backend that cannot
-                // resume a bounded orphan scan. A Local fixture stands in for a
-                // production object store, so it declares the support it
-                // actually has; a caller wanting the incapable backend supplies
-                // its own plain storage handle instead.
-                let operator = wyrd_storage::factory::build_operator(&settings.backend)
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
-                    .layer(opendal::layers::CapabilityOverrideLayer::new(
-                        |mut capability| {
-                            capability.list_with_start_after = true;
-                            capability
-                        },
-                    ));
-                wyrd_storage::StorageHandle::from_settings_with_operator(settings, operator).await
-            } else {
-                wyrd_storage::StorageHandle::from_settings(settings).await
-            }
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let handle = fixture_storage_handle(settings)
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (root, handle)
         };
         if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)
@@ -5255,6 +5237,37 @@ fn claim_port(port: u16) -> Result<bool, WyrdTestServerError> {
         Err(std::fs::TryLockError::Error(error)) => {
             Err(WyrdTestServerError::Bind(error.to_string()))
         }
+    }
+}
+
+/// Opens a test fixture's storage handle, declaring the cursor listing a Local
+/// backend actually has.
+///
+/// The filesystem service resumes a listing from `start_after` correctly but
+/// does not advertise the capability, and Forge workers refuse to start on a
+/// staging backend that cannot resume a bounded orphan scan. A Local fixture
+/// stands in for a production object store, so it declares the support it
+/// actually has; every other backend is opened unchanged, and a caller wanting
+/// the incapable backend supplies its own plain storage handle instead. Both
+/// the in-process server and every process-cluster child open storage here.
+///
+/// # Errors
+///
+/// Returns the [`wyrd_storage::StorageError`] from building the operator or
+/// opening the handle.
+pub(crate) async fn fixture_storage_handle(
+    settings: StorageSettings,
+) -> Result<Arc<wyrd_storage::StorageHandle>, wyrd_storage::StorageError> {
+    if matches!(settings.backend, BackendConfig::Local { .. }) {
+        let operator = wyrd_storage::factory::build_operator(&settings.backend)?.layer(
+            opendal::layers::CapabilityOverrideLayer::new(|mut capability| {
+                capability.list_with_start_after = true;
+                capability
+            }),
+        );
+        wyrd_storage::StorageHandle::from_settings_with_operator(settings, operator).await
+    } else {
+        wyrd_storage::StorageHandle::from_settings(settings).await
     }
 }
 

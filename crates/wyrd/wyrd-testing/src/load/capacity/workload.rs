@@ -1,4 +1,4 @@
-//! The fixed `vala.bifrost.query_capacity` fixture and its nine SQL strings.
+//! The fixed `vala.datasets.query_capacity` fixture and its nine SQL strings.
 //!
 //! Everything the benchmark writes and asks lives here, in plain constants and
 //! one-line builders, so a reader can check a report's numbers against the
@@ -11,7 +11,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sha2::{Digest as _, Sha256};
 
 /// Fully qualified table every benchmark query reads.
-pub const TABLE: &str = "vala.bifrost.query_capacity";
+///
+/// `vala.datasets` because it is the one namespace whose tables a public
+/// client may register.
+pub const TABLE: &str = "vala.datasets.query_capacity";
 
 /// Rows written, flushed, and published before the no-live baseline.
 pub const PUBLISHED_ROWS: i64 = 1_048_576;
@@ -111,14 +114,14 @@ mod tests {
         assert_eq!(LIVE_END - LIVE_START, 32_768);
         assert_eq!(
             short_sql(7),
-            "SELECT id FROM vala.bifrost.query_capacity WHERE id >= 917504 AND id < 917524 \
+            "SELECT id FROM vala.datasets.query_capacity WHERE id >= 917504 AND id < 917524 \
              ORDER BY id LIMIT 20"
         );
         assert_eq!(short_expected(7).first(), Some(&917_504));
         assert_eq!(short_expected(7).len(), 20);
         assert_eq!(
             live_sql(),
-            "SELECT id FROM vala.bifrost.query_capacity WHERE id >= 1048576 AND id < 1081344"
+            "SELECT id FROM vala.datasets.query_capacity WHERE id >= 1048576 AND id < 1081344"
         );
         let batch = rows(0, 3).expect("fixture rows");
         assert_eq!(batch.num_rows(), 3);

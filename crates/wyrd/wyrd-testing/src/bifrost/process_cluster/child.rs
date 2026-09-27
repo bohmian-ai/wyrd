@@ -805,7 +805,7 @@ impl ChildConfig {
             crate::server::oracle_peer_credentials_from_key(Arc::clone(&fixture), api_key)
                 .await
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-        let storage = wyrd_storage::StorageHandle::from_settings(wyrd_storage::StorageSettings {
+        let storage = crate::server::fixture_storage_handle(wyrd_storage::StorageSettings {
             backend: wyrd_storage::BackendConfig::Local {
                 root: self.storage_root.clone(),
             },

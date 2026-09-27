@@ -478,7 +478,7 @@ scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner &&
 """
 
 [tasks."test:bifrost:journey:oracle"]
-description = "Tier-1 journeys: query execution, distributed dispatch, peer security, tail fencing, spill, telemetry"
+description = "Tier-1 journeys: query execution, distributed dispatch, peer security, live Scribe reads, spill, telemetry"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:oracle:inner'"
 [tasks."test:bifrost:journey:oracle:inner"]
 hide = true

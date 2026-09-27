@@ -1815,6 +1815,10 @@ mod tests {
                     source: QuerySource::HotSealed,
                     outcome: SourceCompletionOutcome::Complete,
                 },
+                SourceCompletion {
+                    source: QuerySource::LiveTail,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
             ],
             error: Some(QueryTerminalError {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,

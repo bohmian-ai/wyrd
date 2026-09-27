@@ -492,14 +492,14 @@ fn poisoned_registry() -> BifrostError {
 }
 
 /// Interval between two checks that a released graph's children are gone.
-const GRAPH_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
+pub(super) const GRAPH_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Maximum number of drain checks before a graph is released regardless.
 ///
 /// Ten milliseconds apart, this bounds the wait at five seconds: long enough
 /// for upstream's own post-EOS task-cache eviction, short enough that a genuine
 /// leak still surfaces inside one query's lifetime.
-const GRAPH_DRAIN_POLLS: usize = 500;
+pub(super) const GRAPH_DRAIN_POLLS: usize = 500;
 
 /// Installs the query-owned runtime on every follower session for a graph.
 ///

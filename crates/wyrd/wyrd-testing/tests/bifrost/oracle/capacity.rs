@@ -1213,6 +1213,10 @@ fn prove_no_durable_admission_telemetry(cluster: &WyrdTestCluster) -> Result<(),
 /// Rows written to the fixture table the refusal journey reads.
 const REFUSAL_ROWS: i64 = 24;
 
+/// Acknowledged but unflushed rows, so every refusal-journey query also reads
+/// a live Scribe source.
+const REFUSAL_LIVE_ROWS: i64 = 8;
+
 /// Deadline the stalled memory holder is submitted with, in milliseconds.
 ///
 /// Long enough that the refusal, the release, and the cancel below all happen
@@ -1242,6 +1246,11 @@ const QUERY_ADMISSION_REJECTED_CODE: &str = "WYRD_VALA_429_QUERY_ADMISSION_REJEC
 
 /// A memory refusal under a fully occupied Oracle root leaves the pod healthy
 /// and its next query serviceable.
+///
+/// The table holds published and live Scribe rows, so the refused query has a
+/// live source: its refusal must still end the whole query as a failure, never
+/// a successful or degraded partial, and the next query must read both
+/// sources with a `Success` terminal.
 ///
 /// # Panics
 ///
@@ -1287,6 +1296,14 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     }
     ingest.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
+    for id in REFUSAL_ROWS + 1..=REFUSAL_ROWS + REFUSAL_LIVE_ROWS {
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            [journey_row(id, "refusal-live")],
+        )
+        .await?;
+    }
 
     let server = cluster.server(0).ok_or("missing Oracle node")?;
     let resources = server
@@ -1368,9 +1385,24 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         );
     }
     let next = client(server, "memory-refusal-next").await?;
-    let served = query_rows(&next, &table).await?;
-    if served != u64::try_from(REFUSAL_ROWS)? {
-        return Err(format!("the next query returned {served} rows after the refusal").into());
+    let mut stream = wyrd_client::Bifrost::query_only(&next)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id FROM vala.bifrost.{table}"),
+            deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
+        })
+        .await?;
+    let mut served = 0_u64;
+    while let Some(batch) = stream.next_batch().await? {
+        served = served.saturating_add(u64::try_from(batch.num_rows())?);
+    }
+    let outcome = stream.terminal().map(|terminal| terminal.outcome);
+    if served != u64::try_from(REFUSAL_ROWS + REFUSAL_LIVE_ROWS)?
+        || outcome != Some(QueryTerminalOutcome::Success)
+    {
+        return Err(format!(
+            "the next query returned {served} published and live rows ending {outcome:?}"
+        )
+        .into());
     }
 
     cluster.shutdown().await?;

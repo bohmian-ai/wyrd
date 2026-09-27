@@ -435,8 +435,28 @@ async fn emit_window(
 /// writes two batches of different sizes. Returns the Service's credential.
 ///
 /// # Panics
-/// Panics when hydration, startup, an emit, or the drain fails.
+/// Panics when hydration, startup, an emit, the drain, or the flush fails.
 async fn emit_rows<T: Serialize>(
+    server: &WyrdTestServer,
+    admin: &WyrdClient,
+    service: &RegistrationReceipt,
+    bundle: &Path,
+    rows: &[T],
+) -> String {
+    let credential = emit_live_rows(server, admin, service, bundle, rows).await;
+    server.flush_bifrost().await.expect("flush server Scribe");
+    credential
+}
+
+/// Emit `rows` as Drift observations of `service` and leave them live.
+///
+/// The client drains, so every row is acknowledged, but the server Scribe is
+/// not flushed: the rows stay in its live tail until something publishes
+/// them. Returns the Service's credential.
+///
+/// # Panics
+/// Panics when hydration, startup, an emit, or the drain fails.
+async fn emit_live_rows<T: Serialize>(
     server: &WyrdTestServer,
     admin: &WyrdClient,
     service: &RegistrationReceipt,
@@ -468,7 +488,6 @@ async fn emit_rows<T: Serialize>(
         run.observe().drift(row, None).expect("drift emits");
     }
     state.shutdown().await.expect("state drains");
-    server.flush_bifrost().await.expect("flush server Scribe");
     credential
 }
 
@@ -487,6 +506,10 @@ fn connect(server: &WyrdTestServer, credential: &str) -> WyrdClient {
 
 /// Prove PSI, SPC, and Custom Drift fit, score server-side, persist results,
 /// and dispatch only a failed scheduled binding result.
+///
+/// Drift runs through the ordinary query service with no source selector:
+/// observations left live in Scribe score from the same live source every
+/// caller reads, and only a successful terminal becomes a judgment.
 ///
 /// # Panics
 /// Panics when any journey step or structured-error expectation fails.
@@ -547,6 +570,27 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
         now - chrono::Duration::hours(1),
         now + chrono::Duration::hours(1),
     );
+    // Drift reads through the ordinary query, so observations still live in
+    // Scribe score like any other caller's rows, with no source selector.
+    let live = subject(&cards, root.path(), "drift-live-subject").await;
+    emit_live_rows(
+        &server,
+        &admin,
+        &live,
+        &root.path().join("bundle-live"),
+        &[ScoreOnly { score: 1.0 }, ScoreOnly { score: 2.0 }],
+    )
+    .await;
+    let (result, features) = complete(
+        &server,
+        &verifier_of(&server, &live).await,
+        &query,
+        &direct(&custom, &live, window.0, window.1),
+    )
+    .await;
+    assert_eq!(result.verdict, "passed", "{result:?}");
+    assert_eq!(verdicts(&features), [("score", "Custom", "no_drift")]);
+
     let subject = service
         .root
         .uid

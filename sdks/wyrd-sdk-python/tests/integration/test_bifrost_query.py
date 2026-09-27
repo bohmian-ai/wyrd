@@ -23,10 +23,13 @@ def test_bifrost_query_yields_pyarrow_and_terminal(wyrd_server: WyrdTestServer) 
     batches, terminal = asyncio.run(query())
     assert batches
     assert all(isinstance(batch, pyarrow.RecordBatch) for batch in batches)
-    assert sum(batch.num_rows for batch in batches) == 2
+    ids = [value for batch in batches for value in batch.column("id").to_pylist()]
+    assert ids == [1, 2, 3], "one query reads the published cut and the live row"
     assert terminal is not None
     assert terminal["outcome"] == "success"
-    assert terminal["row_count"] == 2
+    assert terminal["row_count"] == 3
+    assert terminal["warnings"] == []
+    assert "freshness" not in terminal
 
 
 @pytest.mark.integration
@@ -52,10 +55,10 @@ def test_query_stream_schema_once_eos(wyrd_server: WyrdTestServer) -> None:
     schemas = {batch.schema for batch in batches}
     assert len(schemas) == 1
     assert [field.name for field in batches[0].schema] == ["id", "value"]
-    assert sum(batch.num_rows for batch in batches) == 2
+    assert sum(batch.num_rows for batch in batches) == 3
     assert terminal is not None
     assert terminal["outcome"] == "success"
-    assert terminal["row_count"] == 2
+    assert terminal["row_count"] == 3
     assert bytes(terminal["arrow_ipc_eos"]) == b"\xff\xff\xff\xff\x00\x00\x00\x00"
 
 

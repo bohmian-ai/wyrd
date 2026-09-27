@@ -4186,8 +4186,8 @@ mod tests {
     /// Writes one real file of `groups` row groups through the production
     /// writer recipe, one row group per supplied value block, and returns its
     /// bytes. Flushing between blocks is what makes the file multi-row-group:
-    /// `MAX_ROW_GROUP_ROWS` is 131,072 and is not configurable, so no
-    /// row-count-driven fixture could produce two groups at unit scale.
+    /// the production row-group target is 128 MiB of encoded bytes, so no
+    /// size-driven fixture could produce two groups at unit scale.
     fn write_grouped_fixture(schema: &SchemaRef, blocks: &[RecordBatch]) -> bytes::Bytes {
         let rows: usize = blocks.iter().map(RecordBatch::num_rows).sum();
         let properties = crate::parquet::writer_properties::bifrost_writer_properties(

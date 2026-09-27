@@ -201,7 +201,7 @@ impl ScribeMemberStager {
         let key = ScribeAssemblyKey::new(
             request.frozen.seal_key.tenant,
             request.frozen.seal_key.table.clone(),
-            crate::parquet::memory::schema_fingerprint(request.frozen.schema.as_ref()),
+            crate::parquet::footer::schema_fingerprint(request.frozen.schema.as_ref()),
             request.layout,
             request.frozen.seal_key.partition,
             request.origin.node_id,

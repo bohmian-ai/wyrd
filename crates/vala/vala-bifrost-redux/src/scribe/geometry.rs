@@ -12,8 +12,9 @@
 //! 3. **Per-`SealKey` early seal** — an optional size or age that rotates one key
 //!    *earlier* than its shard would. A key may seal earlier on size, age, or
 //!    pressure; it may never seal later.
-//! 4. **Parquet row group** — 32 MiB logical / 131,072 rows, owned by
-//!    [`crate::parquet::memory`] and not restated here.
+//! 4. **Parquet row group** — a soft 128 MiB estimated encoded-size target
+//!    over parquet-rs row-count defaults, owned by
+//!    [`crate::parquet::writer_properties`] and not restated here.
 //! 5. **Scribe hot object** — the approximately 512 MiB staging assembly target.
 //!
 //! Forge's Iceberg rewrite target is a sixth geometry owned by `forge`, kept

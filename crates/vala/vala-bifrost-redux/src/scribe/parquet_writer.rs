@@ -5,7 +5,7 @@
 //! `(data_tenant_id, wyrd_event_time)` and takes its partition day from the
 //! seal-key (never from row min/max).
 
-use std::io::{BufReader, BufWriter, Read, Seek};
+use std::io::{BufReader, BufWriter, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,10 +26,7 @@ use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
 use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
-use crate::parquet::memory::{
-    BifrostArrowLogicalSizer, BifrostFooterAccumulator, BifrostParquetMemoryEnvelope,
-    MAX_LOGICAL_ROW_GROUP_BYTES, MAX_ROW_GROUP_ROWS, validate_writer_v2_structure,
-};
+use crate::parquet::footer::BifrostFooterIdentity;
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use crate::resources::ScribeClaimScratch;
 use crate::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES;
@@ -134,7 +131,7 @@ pub struct ParquetEncoded {
 /// Move-owned nonempty artifact set and its generation scratch authority.
 #[derive(Debug)]
 pub struct BoundedParquetArtifactSet {
-    /// Contiguous writer-v2 artifacts in publication order.
+    /// Contiguous Scribe Parquet artifacts in publication order.
     artifacts: Vec<BoundedParquetArtifact>,
     /// Exact generation directory whose charge follows the artifacts.
     scratch: Option<ScribeClaimScratch>,
@@ -154,7 +151,7 @@ impl BoundedParquetArtifactSet {
             })
         {
             return Err(ScribeError::Internal {
-                detail: "writer-v2 artifact set must be nonempty and contiguous".to_owned(),
+                detail: "Scribe Parquet artifact set must be nonempty and contiguous".to_owned(),
             });
         }
         Ok(Self {
@@ -173,7 +170,7 @@ impl BoundedParquetArtifactSet {
     ) -> Result<(), ScribeError> {
         if self.scratch.replace(scratch).is_some() {
             return Err(ScribeError::Internal {
-                detail: "writer-v2 artifact set already owns scratch".to_owned(),
+                detail: "Scribe Parquet artifact set already owns scratch".to_owned(),
             });
         }
         Ok(())
@@ -197,10 +194,10 @@ impl BoundedParquetArtifactSet {
         tokio::task::spawn_blocking(move || scratch.cleanup())
             .await
             .map_err(|error| ScribeError::Internal {
-                detail: format!("writer-v2 scratch cleanup task failed: {error}"),
+                detail: format!("Scribe Parquet scratch cleanup task failed: {error}"),
             })?
             .map_err(|error| ScribeError::Internal {
-                detail: format!("writer-v2 scratch cleanup failed: {error}"),
+                detail: format!("Scribe Parquet scratch cleanup failed: {error}"),
             })
     }
 
@@ -235,7 +232,7 @@ impl<'a> IntoIterator for &'a BoundedParquetArtifactSet {
     }
 }
 
-/// One sealed writer-v2 object retained on generation-owned scratch.
+/// One sealed Scribe Parquet object retained on generation-owned scratch.
 #[derive(Debug, Clone)]
 pub struct BoundedParquetArtifact {
     /// Contiguous zero-based position within the generation.
@@ -343,9 +340,9 @@ pub struct ArtifactPlan<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when the merge fails, a batch violates the
-/// logical row-group contract, an artifact cannot be opened, written, sealed,
-/// inspected, or checksummed, or the claim produced no rows at all.
+/// Returns [`ScribeError::Internal`] when the merge fails, a batch is empty, an
+/// artifact cannot be opened, written, sealed, inspected, or checksummed, or
+/// the claim produced no rows at all.
 pub fn encode_ordered_claim(
     plan: ArtifactPlan<'_>,
     footer_reservation: crate::scribe::memory::EncodedFooterReservation,
@@ -470,11 +467,7 @@ impl<'a> ParquetBatchEncoder<'a> {
     }
 }
 
-/// One artifact that is open for appended row groups.
-///
-/// The writer stays open across completed row groups, so the two row-dependent
-/// footer fields are folded in as the rows stream past rather than recomputed
-/// from a second concatenated batch at close time.
+/// One artifact that is open for appended ordered batches.
 struct OpenArtifact {
     /// Contiguous generation-global ordinal already assigned to this artifact.
     ordinal: u16,
@@ -486,39 +479,29 @@ struct OpenArtifact {
     schema: Arc<Schema>,
     /// Open Parquet encoder owning the buffered sink.
     writer: ArrowWriter<BufWriter<std::fs::File>>,
-    /// Running max-standalone-row and per-leaf maxima evidence.
-    footer: BifrostFooterAccumulator,
-    /// Rows appended so far across every completed row group.
+    /// Rows appended so far across every batch.
     rows: usize,
 }
 
-/// Appends completed row groups to one artifact and rolls at the object target.
+/// Appends ordered batches to one artifact and rolls at the object target.
 ///
-/// Row-group admission is logical and happens before a row is written: at most
-/// 32 MiB of canonical logical input or 131,072 rows per group, measured by
-/// [`BifrostArrowLogicalSizer`]. Encoded Parquet size is data dependent, so a
-/// group whose compressed bytes land above that logical bound is still a valid
-/// group and is accepted after structural, footer, schema, and statistics
-/// validation. Rolling is the only size decision made from encoded bytes, it is
-/// taken only between completed groups, and it never deletes, retries, or
-/// refuses a group that was already written.
+/// Row groups are shaped by parquet-rs under the shared writer recipe's soft
+/// encoded row-group target, so any accepted batch is writable: a row larger
+/// than the target lands in a group of its own. Rolling is the only size
+/// decision this writer makes, from flushed encoded bytes; it is taken only
+/// after a batch has been handed to the encoder, it is approximate, and it
+/// never deletes, retries, or refuses rows that were already written.
 struct RollingArtifactWriter<'a> {
     /// Scratch, identity, layout, and the object target this writer obeys.
     plan: ArtifactPlan<'a>,
     /// Next generation-global ordinal to assign.
     next_ordinal: usize,
-    /// Artifact currently accepting row groups, if one is open.
+    /// Artifact currently accepting batches, if one is open.
     open: Option<OpenArtifact>,
     /// Sealed artifacts in contiguous publication order.
     artifacts: Vec<BoundedParquetArtifact>,
     /// Footer-derived statistics for every sealed row group in write order.
     row_group_stats: Vec<RowGroupStats>,
-    /// Ordered slices accumulated toward the next complete row group.
-    pending: Vec<RecordBatch>,
-    /// Rows currently accumulated in `pending`.
-    pending_rows: usize,
-    /// Canonical logical bytes currently accumulated in `pending`.
-    pending_logical_bytes: u64,
 }
 
 impl<'a> RollingArtifactWriter<'a> {
@@ -530,134 +513,42 @@ impl<'a> RollingArtifactWriter<'a> {
             open: None,
             artifacts: Vec::new(),
             row_group_stats: Vec::new(),
-            pending: Vec::new(),
-            pending_rows: 0,
-            pending_logical_bytes: 0,
         }
     }
 
-    /// Accumulates one already ordered batch toward complete row groups.
+    /// Writes one already ordered batch and rolls if the object target is met.
     ///
-    /// The batch is split by the canonical logical sizer, and its slices join
-    /// whatever the previous batches left pending rather than becoming row
-    /// groups of their own. A claim assembles many staged runs, and most of
-    /// them are far smaller than a group: writing one group per input would
-    /// make the footer grow with the number of runs merged instead of with the
-    /// object's size, and a large claim would then describe more structure than
-    /// the footer contract admits. A group is cut only when the next slice
-    /// would carry it past the canonical row or logical-byte ceiling, so a
-    /// sealed object holds the fewest groups its rows allow.
+    /// The encoder buffers rows toward its row-group target and flushes
+    /// completed groups itself, so small inputs from many staged runs share
+    /// groups rather than each becoming one. Once the artifact's flushed
+    /// encoded bytes reach the plan's object target it is sealed; the next
+    /// batch opens another.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when logical slicing refuses the
-    /// batch, the batch is empty, or writing a completed row group fails.
+    /// Returns [`ScribeError::Internal`] when the batch is empty, the artifact
+    /// cannot be opened, the batch cannot be written, or sealing a due
+    /// artifact fails.
     fn append_ordered_batch(&mut self, ordered_batch: &RecordBatch) -> Result<(), ScribeError> {
-        let slices = BifrostArrowLogicalSizer::slice(ordered_batch).map_err(|detail| {
-            ScribeError::Internal {
-                detail: format!("writer-v2 logical slicing refused: {detail}"),
-            }
-        })?;
-        if slices.is_empty() {
+        if ordered_batch.num_rows() == 0 {
             return Err(ScribeError::Internal {
-                detail: "writer-v2 cannot publish an empty artifact set".to_owned(),
+                detail: "Scribe Parquet writer cannot publish an empty batch".to_owned(),
             });
         }
-        for slice in slices {
-            if self.pending_would_overflow(slice.len, slice.logical_bytes) {
-                self.write_pending_row_group()?;
-            }
-            self.pending
-                .push(ordered_batch.slice(slice.offset, slice.len));
-            self.pending_rows = self.pending_rows.saturating_add(slice.len);
-            self.pending_logical_bytes = self
-                .pending_logical_bytes
-                .saturating_add(slice.logical_bytes);
-        }
-        Ok(())
-    }
-
-    /// Whether adding one more slice would break this writer's group ceilings.
-    ///
-    /// Nothing pending never overflows: the sizer already bounded that slice to
-    /// one admissible group, so it always starts the next one.
-    fn pending_would_overflow(&self, rows: usize, logical_bytes: u64) -> bool {
-        !self.pending.is_empty()
-            && (self.pending_rows.saturating_add(rows) > MAX_ROW_GROUP_ROWS
-                || self.pending_logical_bytes.saturating_add(logical_bytes)
-                    > self.group_logical_ceiling())
-    }
-
-    /// Returns the logical bytes one row group of this writer may accumulate.
-    ///
-    /// The canonical ceiling bounds every group, and the object target bounds it
-    /// again: rolling happens only between completed groups, so a group larger
-    /// than the object it lands in would make the target unreachable rather
-    /// than approximate.
-    fn group_logical_ceiling(&self) -> u64 {
-        MAX_LOGICAL_ROW_GROUP_BYTES.min(self.plan.target_object_bytes.max(1))
-    }
-
-    /// Writes everything accumulated so far as exactly one Parquet row group.
-    ///
-    /// Concatenation happens here rather than at slice time so the rows are
-    /// materialized once, in write order, and only for a group that is due.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the pending slices cannot be
-    /// concatenated or the completed group cannot be written.
-    fn write_pending_row_group(&mut self) -> Result<(), ScribeError> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let pending = std::mem::take(&mut self.pending);
-        self.pending_rows = 0;
-        self.pending_logical_bytes = 0;
-        let schema = pending[0].schema();
-        let group = if pending.len() == 1 {
-            pending
-                .into_iter()
-                .next()
-                .expect("a one-element pending group has its batch")
-        } else {
-            concat_batches(&schema, &pending).map_err(|error| ScribeError::Internal {
-                detail: format!("concatenate writer-v2 row-group slices: {error}"),
-            })?
-        };
-        self.append_row_group(&group)
-    }
-
-    /// Writes one admitted slice as a complete row group and rolls if it is due.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the artifact cannot be opened,
-    /// the row group cannot be observed, written, or flushed, or sealing the
-    /// artifact this group completed fails.
-    fn append_row_group(&mut self, group: &RecordBatch) -> Result<(), ScribeError> {
         if self.open.is_none() {
-            self.open = Some(self.open_artifact(group)?);
+            self.open = Some(self.open_artifact(ordered_batch)?);
         }
         let Some(open) = self.open.as_mut() else {
             return Err(ScribeError::Internal {
-                detail: "writer-v2 rolling writer lost its open artifact".to_owned(),
+                detail: "Scribe Parquet rolling writer lost its open artifact".to_owned(),
             });
         };
-        open.footer
-            .observe(group)
-            .map_err(|detail| ScribeError::Internal {
-                detail: format!("writer-v2 footer evidence refused a row group: {detail}"),
-            })?;
         open.writer
-            .write(group)
+            .write(ordered_batch)
             .map_err(|error| ScribeError::Internal {
-                detail: format!("write writer-v2 Parquet row group: {error}"),
+                detail: format!("write Scribe Parquet batch: {error}"),
             })?;
-        open.writer.flush().map_err(|error| ScribeError::Internal {
-            detail: format!("flush writer-v2 Parquet row group: {error}"),
-        })?;
-        open.rows = open.rows.saturating_add(group.num_rows());
+        open.rows = open.rows.saturating_add(ordered_batch.num_rows());
         let written = u64::try_from(open.writer.bytes_written()).unwrap_or(u64::MAX);
         if written >= self.plan.target_object_bytes {
             self.seal_open_artifact()?;
@@ -665,20 +556,18 @@ impl<'a> RollingArtifactWriter<'a> {
         Ok(())
     }
 
-    /// Opens the next artifact for the row group that is about to be written.
+    /// Opens the next artifact for the batch that is about to be written.
     ///
-    /// Bloom sizing is a per-row-group hint, so it is derived from the group
-    /// that opens the artifact; the canonical sizer already bounds every group
-    /// the artifact can receive to the same row ceiling.
+    /// Bloom sizing is a per-row-group hint, so it is derived from the batch
+    /// that opens the artifact.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the ordinal exceeds `u16`, the
-    /// scratch file cannot be created, the Parquet encoder cannot be built, or
-    /// the schema is outside the writer-v2 footer contract.
+    /// scratch file cannot be created, or the Parquet encoder cannot be built.
     fn open_artifact(&mut self, group: &RecordBatch) -> Result<OpenArtifact, ScribeError> {
         let ordinal = u16::try_from(self.next_ordinal).map_err(|_| ScribeError::Internal {
-            detail: "writer-v2 artifact ordinal exceeds u16".to_owned(),
+            detail: "Scribe Parquet artifact ordinal exceeds u16".to_owned(),
         })?;
         self.next_ordinal = self.next_ordinal.saturating_add(1);
         let object_identity = format!("{}-{ordinal:05}.parquet", self.plan.object_base);
@@ -687,11 +576,9 @@ impl<'a> RollingArtifactWriter<'a> {
             .scratch_dir
             .join(format!("artifact-{ordinal:05}.parquet"));
         let file = std::fs::File::create(&scratch_path).map_err(|error| ScribeError::Internal {
-            detail: format!("create writer-v2 scratch artifact: {error}"),
+            detail: format!("create Scribe Parquet scratch artifact: {error}"),
         })?;
         let schema = group.schema();
-        let footer = BifrostFooterAccumulator::new(schema.as_ref())
-            .map_err(|detail| ScribeError::Internal { detail })?;
         let writer = ArrowWriter::try_new(
             BufWriter::new(file),
             Arc::clone(&schema),
@@ -702,7 +589,7 @@ impl<'a> RollingArtifactWriter<'a> {
             )),
         )
         .map_err(|error| ScribeError::Internal {
-            detail: format!("create writer-v2 Parquet encoder: {error}"),
+            detail: format!("create Scribe Parquet Parquet encoder: {error}"),
         })?;
         Ok(OpenArtifact {
             ordinal,
@@ -710,23 +597,21 @@ impl<'a> RollingArtifactWriter<'a> {
             scratch_path,
             schema,
             writer,
-            footer,
             rows: 0,
         })
     }
 
-    /// Seals the open artifact, stamping the accumulated footer evidence.
+    /// Seals the open artifact, stamping its footer identity.
     ///
     /// Sealing with nothing open is the ordinary boundary case — a candidate
-    /// whose last row group already reached the target — and is not an error.
+    /// whose last batch already reached the target — and is not an error.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when footer evidence is incomplete,
-    /// the Parquet artifact cannot be sealed or measured, the sealed file is
-    /// empty, or footer inspection or checksumming refuses it.
+    /// Returns [`ScribeError::Internal`] when the object identity is empty, the
+    /// Parquet artifact cannot be sealed or measured, the sealed file is empty,
+    /// or footer inspection or checksumming refuses it.
     fn seal_open_artifact(&mut self) -> Result<(), ScribeError> {
-        self.write_pending_row_group()?;
         let Some(open) = self.open.take() else {
             return Ok(());
         };
@@ -736,26 +621,25 @@ impl<'a> RollingArtifactWriter<'a> {
             scratch_path,
             schema,
             mut writer,
-            footer,
             rows,
         } = open;
-        for field in footer
-            .finish(&object_identity)
+        for field in BifrostFooterIdentity::new(schema.as_ref(), &object_identity)
             .map_err(|detail| ScribeError::Internal { detail })?
+            .key_values()
         {
             writer.append_key_value_metadata(field);
         }
         writer.close().map_err(|error| ScribeError::Internal {
-            detail: format!("seal writer-v2 Parquet artifact: {error}"),
+            detail: format!("seal Scribe Parquet Parquet artifact: {error}"),
         })?;
         let file_size = std::fs::metadata(&scratch_path)
             .map_err(|error| ScribeError::Internal {
-                detail: format!("stat writer-v2 scratch artifact: {error}"),
+                detail: format!("stat Scribe Parquet scratch artifact: {error}"),
             })?
             .len();
         if file_size == 0 {
             return Err(ScribeError::Internal {
-                detail: "writer-v2 sealed artifact is empty".to_owned(),
+                detail: "Scribe Parquet sealed artifact is empty".to_owned(),
             });
         }
         let evidence =
@@ -913,19 +797,16 @@ struct SealedArtifactEvidence {
 
 /// Validates one sealed artifact and returns everything its footer proves.
 ///
-/// Validation is exact for everything the writer contract owns: trailer magic,
-/// footer envelope size, compact-Thrift preflight, footer metadata fields,
-/// schema, structural counts, and per-group statistics. Encoded row-group size
-/// is deliberately not among them. The 32 MiB bound is a logical input bound
-/// applied before a group is written, and a compressed group that lands above
-/// it is data-dependent variance, not a defect, so it is accepted here.
+/// The footer must parse, carry this artifact's schema fingerprint and object
+/// identity, and give every row group event-time statistics. Row-group and
+/// footer sizes are not checked: they follow from soft writer targets, and a
+/// large accepted row is valid data rather than a defect.
 ///
 /// # Errors
-/// Returns an internal persistence error for a malformed trailer, an
-/// out-of-contract footer envelope, unreadable Parquet metadata, a footer
-/// envelope that contradicts the expected schema or object identity, a
-/// structural limit violation, a row group with missing statistics, or a
-/// footer whose Iceberg projection is not representable.
+/// Returns an internal persistence error for unreadable Parquet metadata, a
+/// footer identity that contradicts the expected schema or object, a row
+/// group with missing statistics, or a footer whose Iceberg projection is not
+/// representable.
 fn inspect_sealed_artifact(
     path: &Path,
     expected_schema: &Schema,
@@ -934,73 +815,17 @@ fn inspect_sealed_artifact(
 ) -> Result<SealedArtifactEvidence, ScribeError> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    let mut file = std::fs::File::open(path).map_err(|error| ScribeError::Internal {
-        detail: format!("open sealed writer-v2 artifact: {error}"),
-    })?;
-    let file_bytes = file
-        .metadata()
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("stat sealed writer-v2 artifact: {error}"),
-        })?
-        .len();
-    if file_bytes < 8 {
-        return Err(ScribeError::Internal {
-            detail: "sealed writer-v2 artifact is shorter than its trailer".to_owned(),
-        });
-    }
-    let mut trailer = [0_u8; 8];
-    file.seek(std::io::SeekFrom::Start(file_bytes - 8))
-        .and_then(|_| file.read_exact(&mut trailer))
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("read sealed writer-v2 trailer: {error}"),
-        })?;
-    if &trailer[4..] != b"PAR1" {
-        return Err(ScribeError::Internal {
-            detail: "sealed writer-v2 trailer magic is invalid".to_owned(),
-        });
-    }
-    let footer_bytes = u64::from(u32::from_le_bytes(
-        trailer[..4]
-            .try_into()
-            .expect("four-byte Scribe footer length is exact"),
-    ));
-    crate::parquet::memory::validate_encoded_footer_bytes(footer_bytes)
-        .map_err(|detail| ScribeError::Internal { detail })?;
-    let footer_start = file_bytes
-        .checked_sub(8)
-        .and_then(|end| end.checked_sub(footer_bytes))
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "sealed writer-v2 footer extends before the file start".to_owned(),
-        })?;
-    let mut encoded_footer =
-        vec![
-            0_u8;
-            usize::try_from(footer_bytes).map_err(|_| ScribeError::Internal {
-                detail: "sealed writer-v2 footer exceeds address space".to_owned(),
-            })?
-        ];
-    file.seek(std::io::SeekFrom::Start(footer_start))
-        .and_then(|_| file.read_exact(&mut encoded_footer))
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("read sealed writer-v2 footer preflight bytes: {error}"),
-        })?;
-    crate::parquet::footer_preflight::preflight_compact_thrift(&encoded_footer)
-        .map_err(|detail| ScribeError::Internal { detail })?;
-    file.rewind().map_err(|error| ScribeError::Internal {
-        detail: format!("rewind sealed writer-v2 artifact: {error}"),
+    let file = std::fs::File::open(path).map_err(|error| ScribeError::Internal {
+        detail: format!("open sealed Scribe Parquet artifact: {error}"),
     })?;
     let reader = SerializedFileReader::new(file).map_err(|e| ScribeError::Internal {
         detail: format!("failed to parse Parquet metadata: {e}"),
     })?;
 
     let metadata = reader.metadata();
-    BifrostParquetMemoryEnvelope::from_footer(
-        metadata.file_metadata(),
-        expected_schema,
-        expected_object_identity,
-    )
-    .map_err(|detail| ScribeError::Internal { detail })?;
-    validate_writer_v2_structure(metadata).map_err(|detail| ScribeError::Internal { detail })?;
+    BifrostFooterIdentity::new(expected_schema, expected_object_identity)
+        .and_then(|identity| identity.verify(metadata.file_metadata()))
+        .map_err(|detail| ScribeError::Internal { detail })?;
     let mut row_group_stats = Vec::new();
 
     for rg in metadata.row_groups() {
@@ -1074,7 +899,7 @@ fn derive_data_file_metrics(
 /// Returns an internal persistence error when the sealed artifact cannot be read.
 fn checksum_file(path: &Path) -> Result<String, ScribeError> {
     let file = std::fs::File::open(path).map_err(|error| ScribeError::Internal {
-        detail: format!("open writer-v2 artifact for checksum: {error}"),
+        detail: format!("open Scribe Parquet artifact for checksum: {error}"),
     })?;
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
@@ -1083,7 +908,7 @@ fn checksum_file(path: &Path) -> Result<String, ScribeError> {
         let read = reader
             .read(&mut chunk)
             .map_err(|error| ScribeError::Internal {
-                detail: format!("read writer-v2 artifact for checksum: {error}"),
+                detail: format!("read Scribe Parquet artifact for checksum: {error}"),
             })?;
         if read == 0 {
             return Ok(hex::encode(hasher.finalize()));
@@ -1155,7 +980,6 @@ mod tests {
 
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
-    use crate::parquet::memory::{MAX_LOGICAL_ROW_GROUP_BYTES, MAX_ROW_GROUP_ROWS};
     use crate::scribe::seal_key::{SealKey, TimePartition};
 
     /// Builds one metadata-light stored batch with the requested row count.
@@ -1279,11 +1103,6 @@ mod tests {
         assert_candidates_cover_batches_within_bounds(&first.1, &first_candidates);
         assert_candidates_cover_batches_within_bounds(&second.1, &second_candidates);
         assert_eq!(
-            crate::parquet::writer_properties::PARQUET_WRITE_BATCH_ROWS,
-            8_192
-        );
-        assert_eq!(crate::parquet::memory::MAX_ROW_GROUP_ROWS, 128 * 1024);
-        assert_eq!(
             largest_candidate_bytes_from_facts([
                 (60 * 1024, 60),
                 (40 * 1024, 40),
@@ -1382,7 +1201,7 @@ mod tests {
             &layout,
             crate::scribe::memory::EncodedFooterReservation::for_test(),
         )
-        .expect("writer-v2 encode");
+        .expect("Scribe Parquet encode");
         (scratch, encoded)
     }
 
@@ -1453,8 +1272,7 @@ mod tests {
     }
 
     /// Number of high-cardinality payload columns in the low-compressibility
-    /// fixture, chosen so one admitted row group encodes above 32 MiB while its
-    /// logical input stays inside the 32 MiB slicing bound.
+    /// fixture, chosen so one batch encodes to many MiB.
     const INCOMPRESSIBLE_PAYLOAD_COLUMNS: usize = 48;
 
     /// Builds one deterministic low-compressibility frozen member.
@@ -1462,9 +1280,7 @@ mod tests {
     /// Every payload column holds distinct pseudo-random 32-bit values, so the
     /// dictionary the writer recipe enables never collapses: the encoder writes
     /// both a dictionary page and its index stream, and ZSTD cannot recover
-    /// either. Encoded bytes therefore exceed the Arrow logical measure by
-    /// roughly half, which is exactly the data-dependent variance the writer
-    /// must accept rather than treat as an overflow.
+    /// either, so the encoded size tracks the row count.
     fn incompressible_frozen(tenant: DataTenantId, rows: usize) -> FrozenMemtable {
         let tenant_value = tenant.to_string();
         let mut fields = vec![
@@ -1554,61 +1370,49 @@ mod tests {
             .collect()
     }
 
-    /// A row group inside the logical contract stays valid when its encoded
-    /// bytes exceed 32 MiB, and it is the completed group that rolls the object.
+    /// A batch whose encoding passes the object target is written whole into
+    /// one artifact, never refused, split, or re-encoded, and a retry
+    /// reproduces it byte for byte.
     ///
-    /// The fixture's first slice is admitted by the pre-write contract — it is
-    /// exactly `MAX_ROW_GROUP_ROWS` rows and under 32 MiB of logical input —
-    /// yet its compressed row group lands above 32 MiB. The writer keeps it:
-    /// the artifact is sealed once, is never deleted, bisected, re-encoded, or
-    /// refused, and the object rolls only after that group completed, so the
-    /// remaining rows open the next artifact.
+    /// Rolling is decided only after a batch is written, so a target far below
+    /// one batch's encoded size is a soft overshoot, not a failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch is refused, split across artifacts, fails to
+    /// overshoot the target, loses statistics, or encodes differently on retry.
     #[test]
-    fn encoded_row_group_above_the_logical_bound_is_accepted_and_rolls_after_completion() {
+    fn a_batch_encoding_past_the_object_target_is_one_deterministic_artifact() {
         let tenant = DataTenantId::new_v7();
-        let residue_rows = 16;
-        let frozen = incompressible_frozen(tenant, MAX_ROW_GROUP_ROWS + residue_rows);
+        let rows = 150_000;
+        let target = 1024 * 1024;
+        let frozen = incompressible_frozen(tenant, rows);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
         let scratch = tempfile::tempdir().expect("rolling scratch");
-        let encoded = encode_with_target(
-            &frozen,
-            &binding,
-            tenant,
-            scratch.path(),
-            MAX_LOGICAL_ROW_GROUP_BYTES,
-        )
-        .expect("low-compressibility encode is accepted");
+        let encoded = encode_with_target(&frozen, &binding, tenant, scratch.path(), target)
+            .expect("an encoding past the target is accepted");
 
         let facts = encoded
             .artifacts
             .iter()
             .map(|artifact| (artifact.ordinal, artifact.row_count))
             .collect::<Vec<_>>();
-        assert_eq!(
-            facts,
-            vec![(0, MAX_ROW_GROUP_ROWS), (1, residue_rows)],
-            "the completed oversized group must close its object and the rest must open the next"
-        );
-
-        let oversized = &encoded.artifacts[0];
-        assert_eq!(
-            oversized.row_group_stats.len(),
-            1,
-            "the admitted slice must be exactly one flushed row group"
-        );
-        let sizes = compressed_row_group_sizes(&oversized.scratch_path);
-        assert_eq!(sizes.len(), 1);
+        assert_eq!(facts, vec![(0, rows)], "one batch is one artifact");
+        let artifact = &encoded.artifacts[0];
         assert!(
-            u64::try_from(sizes[0]).expect("compressed size is non-negative")
-                > MAX_LOGICAL_ROW_GROUP_BYTES,
-            "the fixture must actually encode above 32 MiB, observed {} bytes",
-            sizes[0]
+            artifact.file_size > target,
+            "the fixture must overshoot the target, observed {} bytes",
+            artifact.file_size
         );
+        let sizes = compressed_row_group_sizes(&artifact.scratch_path);
+        assert_eq!(sizes.len(), artifact.row_group_stats.len());
         assert!(
-            oversized.row_group_stats[0].min_event_time.is_some()
-                && oversized.row_group_stats[0].max_event_time.is_some(),
-            "statistics must survive the accepted oversized group"
+            artifact
+                .row_group_stats
+                .iter()
+                .all(|stats| stats.min_event_time.is_some() && stats.max_event_time.is_some()),
+            "statistics must survive every group"
         );
 
         let mut sealed = std::fs::read_dir(scratch.path())
@@ -1618,19 +1422,13 @@ mod tests {
         sealed.sort_unstable();
         assert_eq!(
             sealed.len(),
-            2,
+            1,
             "no artifact may be deleted or re-encoded: {sealed:?}"
         );
 
         let retry_scratch = tempfile::tempdir().expect("retry scratch");
-        let retried = encode_with_target(
-            &frozen,
-            &binding,
-            tenant,
-            retry_scratch.path(),
-            MAX_LOGICAL_ROW_GROUP_BYTES,
-        )
-        .expect("deterministic retry is accepted");
+        let retried = encode_with_target(&frozen, &binding, tenant, retry_scratch.path(), target)
+            .expect("deterministic retry is accepted");
         let identity = |encoded: &ParquetEncoded| {
             encoded
                 .artifacts
@@ -1692,77 +1490,50 @@ mod tests {
         }
     }
 
-    /// Asserts one sealed footer's eight envelope fields, by their exact wire
-    /// names, describe the artifact that carries them.
+    /// Asserts one sealed footer's identity fields, by their exact wire names,
+    /// describe the artifact that carries them.
     ///
-    /// A claim parses these fields from a file it did not write, so each has to
-    /// be present, non-empty, versioned where a future form must fail closed,
-    /// and — for the fingerprint and object identity — the artifact's own
-    /// rather than a sibling's.
+    /// A claim parses these fields from a file it did not write, so the
+    /// fingerprint and object identity must be the artifact's own rather than a
+    /// sibling's, and no retired size-policy field may reappear.
     ///
-    /// The footer's fingerprint is the Parquet memory envelope's exact layout
-    /// identity, which is a different question from the catalog identity the
-    /// artifact reports: the envelope binds stored memory estimates to the Arrow
-    /// layout that produced them, so it must separate spellings — `Utf8` from
-    /// `LargeUtf8`, nullable from required — that the catalog deliberately
-    /// normalizes across an Iceberg round trip. `sealed_fingerprint` is
-    /// therefore computed through the envelope's own entry point.
+    /// The footer's fingerprint is the exact Arrow layout identity, which is a
+    /// different question from the catalog identity the artifact reports: it
+    /// must separate spellings — `Utf8` from `LargeUtf8`, nullable from
+    /// required — that the catalog deliberately normalizes across an Iceberg
+    /// round trip, so `sealed_fingerprint` is computed through the footer
+    /// owner's own entry point.
     ///
     /// # Panics
     ///
-    /// Panics when a field is missing, empty, unversioned, or names another
-    /// artifact.
-    fn assert_footer_envelope_names_this_artifact(
+    /// Panics when a field is missing, names another artifact, or a retired
+    /// field is present.
+    fn assert_footer_identity_names_this_artifact(
         fields: &std::collections::BTreeMap<String, String>,
         artifact: &BoundedParquetArtifact,
         sealed_fingerprint: &str,
     ) {
         assert_eq!(
-            fields.get("wyrd.bifrost.writer_recipe").map(String::as_str),
-            Some(crate::parquet::memory::WRITER_RECIPE)
-        );
-        assert_eq!(
             fields
-                .get("wyrd.bifrost.memory_envelope_version")
-                .map(String::as_str),
-            Some(crate::parquet::memory::PARQUET_MEMORY_ENVELOPE_VERSION)
-        );
-        assert_eq!(
-            fields
-                .get("wyrd.bifrost.row_group_logical_bytes")
-                .map(String::as_str),
-            Some(MAX_LOGICAL_ROW_GROUP_BYTES.to_string().as_str()),
-            "the decode contract a claim must honour is stated in the file"
-        );
-        assert_eq!(
-            fields
-                .get("wyrd.bifrost.schema_fingerprint")
+                .get(crate::parquet::footer::KEY_SCHEMA)
                 .map(String::as_str),
             Some(sealed_fingerprint),
-            "the footer fingerprint is the exact layout the envelope sealed"
+            "the footer fingerprint is the exact layout the writer sealed"
         );
         assert_eq!(
             fields
-                .get("wyrd.bifrost.object_identity")
+                .get(crate::parquet::footer::KEY_OBJECT)
                 .map(String::as_str),
             Some(artifact.object_identity.as_str()),
             "each artifact names itself, never its sibling"
         );
-        for required in [
-            "wyrd.bifrost.decode_workspace_bytes",
-            "wyrd.bifrost.max_logical_row_bytes",
-            "wyrd.bifrost.leaf_width_profile",
-        ] {
-            assert!(
-                fields.get(required).is_some_and(|value| !value.is_empty()),
-                "{required} must be present and non-empty"
-            );
-        }
-        assert!(
+        assert_eq!(
             fields
-                .get("wyrd.bifrost.leaf_width_profile")
-                .is_some_and(|profile| profile.starts_with("v1:")),
-            "the leaf profile is versioned so an unknown form fails closed"
+                .keys()
+                .filter(|key| key.starts_with("wyrd.bifrost."))
+                .count(),
+            2,
+            "only the identity fields are stamped: {fields:?}"
         );
     }
 
@@ -1770,13 +1541,12 @@ mod tests {
     /// evidence a later claim needs, per artifact, across a rolled object.
     ///
     /// A claim reads objects it did not write. Everything it must decide —
-    /// which writer recipe and envelope version produced the file, which
-    /// schema it holds, which committed object it is, how much decode memory
-    /// one row group can demand, and where its row groups and their event-time
-    /// bounds are — has to be readable from that file's own footer. This owner
-    /// encodes a member that rolls into two artifacts and proves each footer
-    /// stands alone: identities are per artifact and never shared, the eight
-    /// envelope fields are present and exact, the returned row-group statistics
+    /// which schema it holds, which committed object it is, and where its row
+    /// groups and their event-time bounds are — has to be readable from that
+    /// file's own footer. This owner encodes a member that rolls into two
+    /// artifacts and proves each footer stands alone: identities are per
+    /// artifact and never shared, the identity fields are exact, the returned
+    /// row-group statistics
     /// are the footer's own, and the physical size, checksum and row count
     /// agree with the bytes on disk.
     ///
@@ -1788,8 +1558,12 @@ mod tests {
     #[test]
     fn parquet_footer_preserves_complete_claim_evidence() {
         let tenant = DataTenantId::new_v7();
-        let residue_rows = 16;
-        let frozen = incompressible_frozen(tenant, MAX_ROW_GROUP_ROWS + residue_rows);
+        let mut frozen = incompressible_frozen(tenant, FILE_CANDIDATE_TARGET_ROWS + 16);
+        let whole = frozen.batches.remove(0);
+        frozen.batches = vec![
+            whole.slice(0, FILE_CANDIDATE_TARGET_ROWS),
+            whole.slice(FILE_CANDIDATE_TARGET_ROWS, 16),
+        ];
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
         let scratch = tempfile::tempdir().expect("rolling scratch");
@@ -1798,7 +1572,7 @@ mod tests {
             &binding,
             tenant,
             scratch.path(),
-            MAX_LOGICAL_ROW_GROUP_BYTES,
+            DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
         )
         .expect("the rolling writer seals the member");
         assert_eq!(
@@ -1824,7 +1598,7 @@ mod tests {
             let fields: std::collections::BTreeMap<String, String> = metadata
                 .file_metadata()
                 .key_value_metadata()
-                .expect("a sealed footer carries the writer envelope")
+                .expect("a sealed footer carries its identity")
                 .iter()
                 .map(|field| {
                     (
@@ -1836,10 +1610,10 @@ mod tests {
                 })
                 .collect();
 
-            assert_footer_envelope_names_this_artifact(
+            assert_footer_identity_names_this_artifact(
                 &fields,
                 artifact,
-                &hex::encode(crate::parquet::memory::schema_fingerprint(frozen.schema.as_ref()).0),
+                &hex::encode(crate::parquet::footer::schema_fingerprint(frozen.schema.as_ref()).0),
             );
 
             assert_row_group_stats_match_footer(metadata, artifact);

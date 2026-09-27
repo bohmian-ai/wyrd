@@ -2,19 +2,32 @@
 
 use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
-use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::file::properties::{
+    DEFAULT_MAX_ROW_GROUP_ROW_COUNT, EnabledStatistics, WriterProperties,
+};
 use parquet::schema::types::ColumnPath;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
-/// Number of rows handed to parquet-rs for one internal column write batch.
-pub(crate) const PARQUET_WRITE_BATCH_ROWS: usize = 8_192;
+/// Estimated encoded bytes at which a Bifrost writer closes a row group.
+///
+/// A soft throughput target, not a size or memory limit: parquet-rs flushes a
+/// group once its estimated encoded size passes this value, so a group may
+/// overshoot by the batch that crossed it, and a single large accepted row
+/// always fits a group of its own. Forge rewrites replace it with the table's
+/// declared `write.parquet.row-group-size-bytes` when one is set.
+pub const BIFROST_ROW_GROUP_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
-use super::memory::MAX_ROW_GROUP_ROWS;
+/// Target false-positive probability of every Bifrost Bloom filter.
 const BLOOM_FPP: f64 = 0.01;
 
+/// Derives a row group's Bloom-filter distinct-value hint from its row count.
+///
+/// # Panics
+/// Never panics: the row count is first bounded by parquet-rs's row-group row
+/// maximum, which fits in `u64`.
 fn bloom_filter_ndv(row_count: usize) -> u64 {
-    let ndv =
-        u64::try_from(row_count.min(MAX_ROW_GROUP_ROWS)).expect("bounded row count fits in u64");
+    let ndv = u64::try_from(row_count.min(DEFAULT_MAX_ROW_GROUP_ROW_COUNT))
+        .expect("bounded row count fits in u64");
     if ndv > 1_000 {
         (ndv / 100).max(1_000)
     } else {
@@ -25,8 +38,10 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 /// Parquet [`WriterProperties`] for every Bifrost data file.
 ///
 /// ZSTD level 3 (writes are once-per-frame after bounded admission; reads are
-/// scan-bound, so the extra compression over SNAPPY is worth it). Row groups are capped at 131,072
-/// rows because parquet-58 has no byte-based row-group flush.
+/// scan-bound, so the extra compression over SNAPPY is worth it). Row groups
+/// close at the soft [`BIFROST_ROW_GROUP_TARGET_BYTES`] encoded target or at
+/// parquet-rs's default row maximum, whichever comes first; write batch and
+/// page sizing keep parquet-rs defaults.
 ///
 /// Dictionary encoding is on by default so low-cardinality string and
 /// identifier columns encode as `RLE_DICTIONARY`; parquet-rs owns dictionary
@@ -46,7 +61,7 @@ pub fn bifrost_writer_properties(row_count: usize, bloom_columns: &[String]) -> 
     bifrost_writer_properties_with_metadata(row_count, Vec::new(), bloom_columns)
 }
 
-/// Parquet properties carrying the exact writer-v2 footer metadata.
+/// Parquet properties carrying caller-supplied footer metadata.
 ///
 /// Dictionary encoding is enabled globally and disabled for
 /// [`WYRD_EVENT_TIME`], which keeps `DELTA_BINARY_PACKED` as its actual
@@ -54,9 +69,9 @@ pub fn bifrost_writer_properties(row_count: usize, bloom_columns: &[String]) -> 
 /// request as a *fallback* used only after a dictionary overflows, so
 /// `set_column_encoding` alone would leave the column dictionary-encoded.
 ///
-/// The caller must construct metadata through the common memory-contract
-/// owner so producer paths cannot invent alternate field spellings, and must
-/// pass the canonical Bloom column union resolved from the table's registered
+/// The caller must construct footer identity metadata through
+/// [`crate::parquet::footer`] so producer paths cannot invent alternate field
+/// spellings, and must pass the canonical Bloom column union resolved from the table's registered
 /// physical layout so every producer writes one identical footer recipe.
 ///
 /// # Panics
@@ -75,14 +90,13 @@ pub fn bifrost_writer_properties_with_metadata(
     builder.build()
 }
 
-/// Parquet properties for a Forge rewrite output, with an encoded row-group cap.
+/// Parquet properties for a Forge rewrite output at a table's row-group target.
 ///
-/// Identical to every other Bifrost producer's recipe except for one added
-/// term: the rewrite writer also honours the table's declared encoded
-/// row-group target. A rewrite is the only producer whose inputs are already
-/// compressed, so its row groups would otherwise be bounded only by the row
-/// count and could grow far past what a reader wants to buffer. The row-count
-/// cap is kept as well; whichever bound is reached first flushes the group.
+/// Identical to every other Bifrost producer's recipe except that the soft
+/// encoded row-group target is the table's resolved
+/// `write.parquet.row-group-size-bytes` instead of
+/// [`BIFROST_ROW_GROUP_TARGET_BYTES`]. The row-count default is kept as well;
+/// whichever bound is reached first flushes the group.
 ///
 /// # Panics
 ///
@@ -92,7 +106,7 @@ pub fn bifrost_rewrite_writer_properties(
     row_group_target_bytes: u64,
     bloom_columns: &[String],
 ) -> WriterProperties {
-    recipe_builder(MAX_ROW_GROUP_ROWS, bloom_columns)
+    recipe_builder(DEFAULT_MAX_ROW_GROUP_ROW_COUNT, bloom_columns)
         .set_max_row_group_bytes(Some(
             usize::try_from(row_group_target_bytes).unwrap_or(usize::MAX),
         ))
@@ -113,8 +127,7 @@ fn recipe_builder(
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
         ))
-        .set_write_batch_size(PARQUET_WRITE_BATCH_ROWS)
-        .set_max_row_group_row_count(Some(MAX_ROW_GROUP_ROWS))
+        .set_max_row_group_bytes(Some(BIFROST_ROW_GROUP_TARGET_BYTES))
         .set_dictionary_enabled(true)
         .set_column_dictionary_enabled(ColumnPath::from(WYRD_EVENT_TIME), false)
         .set_column_encoding(
@@ -157,8 +170,7 @@ mod tests {
     /// The one writer recipe every Bifrost producer builds: dictionary
     /// encoding on by default so low-cardinality columns compress, off for
     /// `wyrd_event_time` so `DELTA_BINARY_PACKED` is its real encoding rather
-    /// than a post-overflow fallback, and one deterministic footer recipe
-    /// marker stamped by the memory-contract owner.
+    /// than a post-overflow fallback.
     #[test]
     fn writer_recipe_encoding_contract() {
         let bloom_columns = declared_recipe();
@@ -186,8 +198,6 @@ mod tests {
             properties.encoding(&event_time),
             Some(Encoding::DELTA_BINARY_PACKED)
         );
-
-        assert_eq!(super::super::memory::WRITER_RECIPE, "bifrost-writer-v2");
     }
 
     #[test]
@@ -202,9 +212,25 @@ mod tests {
         );
         assert_eq!(
             properties.max_row_group_row_count(),
-            Some(MAX_ROW_GROUP_ROWS)
+            Some(DEFAULT_MAX_ROW_GROUP_ROW_COUNT)
         );
-        assert_eq!(properties.write_batch_size(), PARQUET_WRITE_BATCH_ROWS);
+        assert_eq!(
+            properties.max_row_group_bytes(),
+            Some(BIFROST_ROW_GROUP_TARGET_BYTES)
+        );
+        assert_eq!(BIFROST_ROW_GROUP_TARGET_BYTES, 128 * 1024 * 1024);
+        assert_eq!(
+            properties.write_batch_size(),
+            parquet::file::properties::DEFAULT_WRITE_BATCH_SIZE
+        );
+        assert_eq!(
+            properties.data_page_size_limit(),
+            parquet::file::properties::DEFAULT_PAGE_SIZE
+        );
+        assert_eq!(
+            properties.data_page_row_count_limit(),
+            parquet::file::properties::DEFAULT_DATA_PAGE_ROW_COUNT_LIMIT
+        );
         assert!(!properties.dictionary_enabled(&timestamp));
         assert_eq!(
             properties.encoding(&timestamp),
@@ -259,10 +285,67 @@ mod tests {
         }
     }
 
+    /// The Bloom distinct-value hint scales with rows and is bounded by the
+    /// row-group row maximum.
     #[test]
     fn writer_recipe_bloom_ndv_is_bounded() {
         assert_eq!(bloom_filter_ndv(1_000), 1_000);
         assert_eq!(bloom_filter_ndv(50_000), 1_000);
-        assert_eq!(bloom_filter_ndv(200_000), 1_310);
+        assert_eq!(bloom_filter_ndv(200_000), 2_000);
+        assert_eq!(bloom_filter_ndv(usize::MAX), 10_485);
+    }
+
+    /// The row-group target is soft: a row larger than the target is written
+    /// into a group of its own rather than refused, and the group's encoded
+    /// size overshoots the target.
+    ///
+    /// # Panics
+    /// Panics when the oversized row is refused or no group overshoots.
+    #[test]
+    fn row_group_target_is_soft_for_an_oversized_row() {
+        use std::sync::Arc;
+
+        use arrow::array::{RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let target = 1_024_u64;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            false,
+        )]));
+        let mut state = 0x9E37_79B9_u32;
+        let noisy = (0..256 * 1024)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                char::from(b'a' + u8::try_from(state % 26).expect("letter"))
+            })
+            .collect::<String>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![noisy.as_str(), "small"]))],
+        )
+        .expect("batch");
+        let mut bytes = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            &mut bytes,
+            schema,
+            Some(bifrost_rewrite_writer_properties(target, &[])),
+        )
+        .expect("writer");
+        writer.write(&batch).expect("an oversized row is written");
+        writer.close().expect("footer");
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).expect("footer parses");
+        let groups = reader.metadata().row_groups();
+        assert_eq!(groups.iter().map(|group| group.num_rows()).sum::<i64>(), 2);
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.compressed_size().unsigned_abs() > target),
+            "a group overshoots the soft target"
+        );
     }
 }

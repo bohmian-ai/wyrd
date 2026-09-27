@@ -631,7 +631,7 @@ impl ScribeStagingRuntime {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
             })?;
         let schema = run_schema(&run)?;
-        if crate::parquet::memory::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
+        if crate::parquet::footer::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
             return Err(ScribeError::Internal {
                 detail: "a recovered staged run's schema is not the schema its key names"
                     .to_owned(),
@@ -1248,7 +1248,7 @@ mod tests {
             .expect("the member names a run");
         let on_disk = run_schema(&run).expect("the run carries its schema");
         assert_eq!(
-            crate::parquet::memory::schema_fingerprint(on_disk.as_ref()),
+            crate::parquet::footer::schema_fingerprint(on_disk.as_ref()),
             key.schema_fingerprint(),
             "the schema restore reads back is the schema the key names"
         );

@@ -476,6 +476,55 @@ pub(crate) mod tests {
         )
     }
 
+    /// Writes `requests` batches of 1 KiB constant-label rows into one row group.
+    ///
+    /// Each batch stands for one accepted compressible request; together they
+    /// encode to a few KiB yet decode to about `requests * rows_per_request`
+    /// KiB, the shape of many accepted writes staged into a single group.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot write its own run.
+    fn write_compressible_requests(
+        directory: &Path,
+        requests: i64,
+        rows_per_request: i64,
+    ) -> PathBuf {
+        let schema = fixture_schema();
+        let label = "x".repeat(1024);
+        let path = directory.join("compressible-requests.parquet");
+        let file = std::fs::File::create(&path).expect("fixture staged run file");
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1024 * 1024))
+            .build();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
+                .expect("fixture run writer");
+        for request in 0..requests {
+            let start = request * rows_per_request;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        start..start + rows_per_request,
+                    )),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..rows_per_request).map(|_| label.as_str()),
+                    )),
+                ],
+            )
+            .expect("fixture request batch");
+            writer.write(&batch).expect("fixture request rows");
+        }
+        let metadata = writer.close().expect("fixture run footer");
+        assert_eq!(
+            metadata.num_row_groups(),
+            1,
+            "every request shares one group"
+        );
+        path
+    }
+
     /// Opens `run` charged to `pool` and drains every batch it returns.
     ///
     /// # Errors
@@ -750,6 +799,41 @@ pub(crate) mod tests {
             decoded > grant,
             "the decoded total {decoded} exceeds the grant"
         );
+    }
+
+    /// Several accepted compressible requests staged into one row group that
+    /// decodes above 256 MiB read back whole under a 32 MiB grant.
+    ///
+    /// Only the group's few-KiB encoded fetch and one 8,192-row, 8 MiB output
+    /// batch are charged at a time, so the group's uncompressed total never
+    /// has to fit the grant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read is refused, loses a row, or retains its grant.
+    #[tokio::test]
+    async fn compressible_requests_in_one_group_above_256_mib_read_under_a_small_grant() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_compressible_requests(root.path(), 5, 60_000);
+        let grant = 32 * 1024 * 1024;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(grant));
+        let mut read = StagedTailReader::default()
+            .open(run, Arc::from(Vec::new()), Arc::from(Vec::new()), &pool)
+            .await
+            .expect("the compressible run opens");
+        let mut rows = 0;
+        let mut decoded = 0;
+        while let Some(batch) = read.next_rows().await.expect("each batch fits the grant") {
+            rows += batch.num_rows();
+            decoded += batch.get_array_memory_size();
+        }
+        drop(read);
+        assert_eq!(rows, 300_000);
+        assert!(
+            decoded > 256 * 1024 * 1024,
+            "the decoded total {decoded} exceeds 256 MiB"
+        );
+        assert_eq!(pool.reserved(), 0, "the drained read returns its grant");
     }
 
     /// A decoded batch larger than the remaining grant fails the read at that

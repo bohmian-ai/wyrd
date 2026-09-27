@@ -4893,6 +4893,104 @@ mod tests {
         assert_hot_scan_baselines(&governor, &query_pool);
     }
 
+    /// Several accepted compressible requests published into one row group
+    /// that decodes above 256 MiB stream back whole under a 32 MiB query pool.
+    ///
+    /// The leader charges each fetched range and each retained output batch,
+    /// never the group's uncompressed total, so the whole group reads as
+    /// 8,192-row, 8 MiB batches.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scan is refused, loses a row, or retains a charge.
+    #[tokio::test]
+    async fn hot_parquet_compressible_group_above_256_mib_streams_under_a_small_pool() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let (requests, rows_per_request) = (5_i64, 60_000_i64);
+        let label = "x".repeat(1024);
+        let directory = tempfile::tempdir().expect("compressible fixture directory");
+        let path = directory.path().join("compressible.parquet");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(&path).expect("compressible file"),
+            Arc::clone(&schema),
+            Some(
+                crate::parquet::writer_properties::bifrost_writer_properties(
+                    usize::try_from(requests * rows_per_request).expect("rows fit usize"),
+                    &[],
+                ),
+            ),
+        )
+        .expect("compressible writer");
+        for request in 0..requests {
+            let start = request * rows_per_request;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        start..start + rows_per_request,
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from_iter_values(
+                        (0..rows_per_request).map(|_| label.as_str()),
+                    )),
+                ],
+            )
+            .expect("compressible request batch");
+            writer.write(&batch).expect("compressible request rows");
+        }
+        let metadata = writer.close().expect("compressible footer");
+        assert_eq!(
+            metadata.num_row_groups(),
+            1,
+            "every request shares one group"
+        );
+        let bytes = bytes::Bytes::from(std::fs::read(&path).expect("compressible bytes"));
+        let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
+        let telemetry = Arc::new(OracleTelemetry::new());
+        let query_pool = crate::resources::bounded_memory_pool(32 * 1024 * 1024);
+        let exec = HotParquetExec::new(
+            vec![HotFileSource {
+                metadata_key: fixture_metadata_key(&path.to_string_lossy(), bytes.len()),
+                location: path.to_string_lossy().into_owned(),
+                size_bytes: bytes.len(),
+                event_time: unusable_event_time(),
+            }],
+            FileIO::new_with_fs(),
+            fixture_storage(),
+            Arc::clone(&schema),
+            HotParquetPlan::Leader,
+            Arc::new(OracleScanMetricsHandle::default()),
+            Vec::new(),
+        )
+        .with_test_reader(counting_slice_reader(&bytes, &Arc::new(AtomicU64::new(0))));
+        let mut batches = exec
+            .execute(
+                0,
+                bound_leader_task(
+                    oracle_memory_resources(&governor, 1024),
+                    &telemetry,
+                    Arc::clone(&query_pool),
+                ),
+            )
+            .expect("production hot stream");
+        let mut rows = 0;
+        let mut decoded = 0;
+        while let Some(batch) = batches.next().await {
+            let batch = batch.expect("each batch fits the query pool");
+            rows += batch.num_rows();
+            decoded += batch.get_array_memory_size();
+        }
+        drop(batches);
+        assert_eq!(rows, 300_000);
+        assert!(
+            decoded > 256 * 1024 * 1024,
+            "the decoded total {decoded} exceeds 256 MiB"
+        );
+        assert_hot_scan_baselines(&governor, &query_pool);
+    }
+
     /// Footer metadata is fetched only through governed ranged IO.
     #[tokio::test]
     async fn hot_parquet_metadata_ranges_use_governed_reader() {

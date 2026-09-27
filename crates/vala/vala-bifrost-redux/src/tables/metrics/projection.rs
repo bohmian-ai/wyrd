@@ -31,11 +31,12 @@ use crate::otlp_contract::MetricsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, bool_column,
+    OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, bool_column,
     bool_opt_column, checked_i64, encode_attributes, f64_column, f64_opt_column,
-    fixed_binary_opt_column, i32_column, i32_opt_column, i64_column, i64_opt_column, internal,
-    list_column, nested_fields, projected_signal_schema, span_id_bytes, struct_column,
-    trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, validate_canonical_user_batch,
+    fixed_binary_opt_column, fixed_row_bytes, i32_column, i32_opt_column, i64_column,
+    i64_opt_column, internal, list_column, nested_fields, projected_signal_schema, span_id_bytes,
+    struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
+    validate_canonical_user_batch,
 };
 use wyrd_spec::reference::CardRefScope;
 
@@ -150,13 +151,18 @@ const KIND_SPECIFIC_COLUMNS: [&str; 20] = [
 ///
 /// # Errors
 ///
+/// Returns [`TableError::OutputTooLarge`] as soon as the running Arrow output
+/// of accepted points crosses `output_limit_bytes`, before the batch is built.
 /// Returns [`TableError::Internal`] only when the accepted rows cannot be
 /// assembled into the canonical Arrow batch.
 pub fn project_resource_metrics(
     resource_metrics: &[ResourceMetrics],
     card_scope: Option<&CardRefScope>,
+    output_limit_bytes: usize,
 ) -> Result<(RecordBatch, MetricsOutcome), TableError> {
     let mut columns = PointColumns::default();
+    let mut budget = OutputBudget::new(output_limit_bytes);
+    let widths = MetricOutputWidths::new();
     let mut rejected: i64 = 0;
     let mut rejection_message: Option<String> = None;
     let reject =
@@ -184,7 +190,18 @@ pub fn project_resource_metrics(
                 };
                 for row in point_rows(metric, card_scope) {
                     match row {
-                        Ok(row) => columns.push(&descriptor, row, &envelope, &scope_envelope),
+                        Ok(row) => {
+                            let exemplars = row.exemplars.len();
+                            let payload_bytes =
+                                columns.push(&descriptor, row, &envelope, &scope_envelope);
+                            budget.charge(
+                                widths.row
+                                    + payload_bytes
+                                    + exemplars * widths.exemplar
+                                    + envelope.repeated_bytes()
+                                    + scope_envelope.repeated_bytes(),
+                            )?;
+                        }
                         Err(reason) => {
                             reject(reason, 1, &mut rejected, &mut rejection_message);
                         }
@@ -205,6 +222,36 @@ pub fn project_resource_metrics(
             rejection_message,
         },
     ))
+}
+
+/// Fixed Arrow bytes one projected point row and each exemplar retain.
+///
+/// The point projector charges these with each accepted row, and the server's
+/// OTLP preflight charges the same widths per wire point and exemplar.
+#[derive(Clone, Copy, Debug)]
+pub struct MetricOutputWidths {
+    /// Fixed bytes of one point row, correlation columns included.
+    pub row: usize,
+    /// Fixed bytes of one nested exemplar.
+    pub exemplar: usize,
+}
+
+impl MetricOutputWidths {
+    /// Derives the widths from the canonical point ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            row: fixed_row_bytes(projected_signal_schema(METRIC_FIELDS).fields()),
+            exemplar: fixed_row_bytes(&Fields::from(vec![EXEMPLAR_ELEMENT.to_arrow()])),
+        }
+    }
+}
+
+impl Default for MetricOutputWidths {
+    /// Derives the widths from the canonical ledger, as [`Self::new`] does.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Return the canonical user-column schema of `vala.metrics.points`.
@@ -752,13 +799,43 @@ impl PointColumns {
     /// Appending is infallible: every rejection is decided before this point,
     /// so no rejected point can leave a partial row or a partial nested
     /// collection behind.
+    ///
+    /// Returns the variable-length payload bytes the point itself appended:
+    /// descriptor strings, attribute encodings, correlation text, numeric list
+    /// elements, and exemplar attribute encodings. The caller adds fixed row
+    /// and exemplar widths and the repeated resource and scope bytes.
     fn push(
         &mut self,
         descriptor: &MetricDescriptor,
         row: PointRow,
         resource: &ResourceEnvelope,
         scope: &ScopeEnvelope,
-    ) {
+    ) -> usize {
+        let numeric_elements = row.bucket_counts.as_ref().map_or(0, Vec::len)
+            + row.explicit_bounds.as_ref().map_or(0, Vec::len)
+            + row
+                .positive_buckets
+                .as_ref()
+                .map_or(0, |buckets| buckets.counts.len())
+            + row
+                .negative_buckets
+                .as_ref()
+                .map_or(0, |buckets| buckets.counts.len())
+            + 2 * row.quantile_values.as_ref().map_or(0, Vec::len);
+        let payload_bytes = descriptor.name.len()
+            + descriptor.description.len()
+            + descriptor.unit.len()
+            + descriptor.metadata.len()
+            + descriptor.kind.len()
+            + row.attributes.len()
+            + row.correlation.card_ref.as_ref().map_or(0, String::len)
+            + row.correlation.run_id.as_ref().map_or(0, String::len)
+            + numeric_elements * size_of::<i64>()
+            + row
+                .exemplars
+                .iter()
+                .map(|exemplar| exemplar.filtered_attributes.len())
+                .sum::<usize>();
         self.metric_name.push(descriptor.name.clone());
         self.description.push(descriptor.description.clone());
         self.unit.push(descriptor.unit.clone());
@@ -846,6 +923,7 @@ impl PointColumns {
         self.scope_schema_url.push(scope.schema_url.clone());
 
         self.rows += 1;
+        payload_bytes
     }
 
     /// Assemble the accepted rows into the canonical point batch.

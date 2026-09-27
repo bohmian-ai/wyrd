@@ -343,6 +343,7 @@ impl ScribeImpl {
                     sources: native_sources,
                     source_count: native_source_count,
                     definition,
+                    expanded_limit_bytes: self.ingest_limits.expanded_bytes(),
                 })))
             }
             IngressPayload::Canonical(canonical) => {

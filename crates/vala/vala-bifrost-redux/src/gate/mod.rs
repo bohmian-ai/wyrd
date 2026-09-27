@@ -33,6 +33,7 @@ use crate::contracts::{
 pub use crate::gate::auth::{AuthContext, IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 pub use crate::gate::error::IngestError;
 pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
+
 use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
@@ -40,12 +41,29 @@ use crate::scribe::execution_lanes::require_card_scope;
 use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity};
 use crate::tables::{
     CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, SpansTable,
+    TableError,
 };
 use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
 
+/// Maps a canonical OTLP projection failure to its ingest refusal.
+///
+/// Output past the expanded-data limit is the caller's oversized request and
+/// becomes [`IngestError::PayloadTooLarge`]; any other projection failure is a
+/// defect in the projector and stays internal.
+fn projection_error(signal: &str, error: TableError) -> IngestError {
+    match error {
+        TableError::OutputTooLarge { bytes, limit } => IngestError::PayloadTooLarge {
+            bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+            limit: u64::try_from(limit).unwrap_or(u64::MAX),
+        },
+        TableError::Internal(_) => {
+            IngestError::Internal(format!("{signal} projection failed: {error}"))
+        }
+    }
+}
 fn record_gate_event(event: &'static str) {
     metrics::counter!("bifrost_gate_events_total", "stage" => event).increment(1);
 }
@@ -347,10 +365,11 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.limits.otlp
     }
 
-    /// Returns the tonic frame ceiling derived from the same boot snapshot.
+    /// Returns the ingest wire ceiling, applied exactly as both the ingest gRPC
+    /// decoded-message ceiling and the ingest HTTP body ceiling.
     #[must_use]
     pub const fn otlp_decoding_message_size(&self) -> usize {
-        self.limits.max_decoding_message_size
+        self.limits.max_frame_bytes
     }
 
     /// Construct a Gate with a required Scribe capability.
@@ -660,7 +679,7 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// Mount the Gate on the shared tonic router.
     #[must_use]
     pub fn into_server(self) -> BifrostIngestServiceServer<Self> {
-        let size = self.limits.max_decoding_message_size;
+        let size = self.limits.max_frame_bytes;
         BifrostIngestServiceServer::new(self).max_decoding_message_size(size)
     }
 
@@ -753,13 +772,12 @@ impl<A: GateAudit + 'static> Gate<A> {
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        crate::otlp_limits::enforce_trace_limits(&decoded.request, decoded.wire_bytes, self.limits)
-            .map_err(IngestError::from_scribe)?;
         let (batch, outcome) = crate::tables::traces::project_resource_spans(
             &decoded.request.resource_spans,
             auth.principal.card_ref_scope(),
+            self.limits.expanded_bytes(),
         )
-        .map_err(|error| IngestError::Internal(format!("trace projection failed: {error}")))?;
+        .map_err(|error| projection_error("trace", error))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Traces, "spans"),
@@ -796,17 +814,12 @@ impl<A: GateAudit + 'static> Gate<A> {
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        crate::otlp_limits::enforce_metric_limits(
-            &decoded.request,
-            decoded.wire_bytes,
-            self.limits,
-        )
-        .map_err(IngestError::from_scribe)?;
         let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
             &decoded.request.resource_metrics,
             auth.principal.card_ref_scope(),
+            self.limits.expanded_bytes(),
         )
-        .map_err(|error| IngestError::Internal(format!("metric projection failed: {error}")))?;
+        .map_err(|error| projection_error("metric", error))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Metrics, "points"),
@@ -843,13 +856,12 @@ impl<A: GateAudit + 'static> Gate<A> {
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        crate::otlp_limits::enforce_log_limits(&decoded.request, decoded.wire_bytes, self.limits)
-            .map_err(IngestError::from_scribe)?;
         let (batch, outcome) = crate::tables::logs::project_resource_logs(
             &decoded.request.resource_logs,
             auth.principal.card_ref_scope(),
+            self.limits.expanded_bytes(),
         )
-        .map_err(|error| IngestError::Internal(format!("log projection failed: {error}")))?;
+        .map_err(|error| projection_error("log", error))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Logs, "records"),

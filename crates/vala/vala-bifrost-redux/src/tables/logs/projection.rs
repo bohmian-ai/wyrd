@@ -20,10 +20,11 @@ use crate::otlp_contract::LogsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, binary_opt_column,
-    bool_column, checked_i64, encode_any_value, encode_attributes, fixed_binary_opt_column,
-    i32_column, i64_column, list_column, projected_signal_schema, span_id_bytes, trace_id_bytes,
-    u32_as_i64_column, utf8_column, utf8_opt_column,
+    OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column,
+    binary_opt_column, bool_column, checked_i64, encode_any_value, encode_attributes,
+    fixed_binary_opt_column, fixed_row_bytes, i32_column, i64_column, list_column,
+    projected_signal_schema, span_id_bytes, trace_id_bytes, u32_as_i64_column, utf8_column,
+    utf8_opt_column,
 };
 use wyrd_spec::reference::CardRefScope;
 
@@ -42,13 +43,18 @@ const MAX_EVENT_NAME_BYTES: usize = 256;
 ///
 /// # Errors
 ///
-/// Returns [`TableError::Internal`] only when the accepted rows cannot be
-/// assembled into the canonical Arrow batch.
+/// Returns [`TableError::OutputTooLarge`] as soon as the running Arrow output
+/// of accepted records crosses `output_limit_bytes`, before the batch is
+/// built. Returns [`TableError::Internal`] only when the accepted rows cannot
+/// be assembled into the canonical Arrow batch.
 pub fn project_resource_logs(
     resource_logs: &[ResourceLogs],
     card_scope: Option<&CardRefScope>,
+    output_limit_bytes: usize,
 ) -> Result<(RecordBatch, LogsOutcome), TableError> {
     let mut columns = LogColumns::default();
+    let mut budget = OutputBudget::new(output_limit_bytes);
+    let row_bytes = log_row_output_bytes();
     let mut rejected: i64 = 0;
     let mut rejection_message: Option<String> = None;
 
@@ -57,9 +63,17 @@ pub fn project_resource_logs(
         for scope in &resource.scope_logs {
             let scope_envelope = ScopeEnvelope::project(scope.scope.as_ref(), &scope.schema_url);
             for record in &scope.log_records {
-                if let Err(reason) = columns.push(record, &envelope, &scope_envelope, card_scope) {
-                    rejected = rejected.saturating_add(1);
-                    rejection_message.get_or_insert_with(|| reason.to_owned());
+                match columns.push(record, &envelope, &scope_envelope, card_scope) {
+                    Ok(payload_bytes) => budget.charge(
+                        row_bytes
+                            + payload_bytes
+                            + envelope.repeated_bytes()
+                            + scope_envelope.repeated_bytes(),
+                    )?,
+                    Err(reason) => {
+                        rejected = rejected.saturating_add(1);
+                        rejection_message.get_or_insert_with(|| reason.to_owned());
+                    }
                 }
             }
         }
@@ -76,6 +90,15 @@ pub fn project_resource_logs(
             rejection_message,
         },
     ))
+}
+
+/// Returns the fixed Arrow bytes one projected log row retains.
+///
+/// The log projector charges this with each accepted row, and the server's
+/// OTLP preflight charges it per wire record.
+#[must_use]
+pub fn log_row_output_bytes() -> usize {
+    fixed_row_bytes(projected_signal_schema(LOG_FIELDS).fields())
 }
 
 /// Return the canonical user-column schema of `vala.logs.records`.
@@ -125,13 +148,17 @@ impl LogColumns {
     /// record attribute, an over-long severity text or event name, or a body or
     /// attribute payload beyond the configured material limits. Nothing is
     /// appended when an error is returned.
+    ///
+    /// On success returns the variable-length payload bytes the record itself
+    /// appended; the caller adds fixed widths and the repeated resource and
+    /// scope bytes.
     fn push(
         &mut self,
         record: &LogRecord,
         resource: &ResourceEnvelope,
         scope: &ScopeEnvelope,
         card_scope: Option<&CardRefScope>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<usize, &'static str> {
         if record.severity_text.len() > MAX_SEVERITY_TEXT_BYTES {
             return Err("log severity_text exceeds the accepted length");
         }
@@ -162,6 +189,12 @@ impl LogColumns {
             return Err("log attributes exceed the accepted payload size");
         }
         let correlation = RecordCorrelation::extract(&record.attributes, card_scope)?;
+        let payload_bytes = record.severity_text.len()
+            + record.event_name.len()
+            + body.as_ref().map_or(0, Vec::len)
+            + attributes.len()
+            + correlation.card_ref.as_ref().map_or(0, String::len)
+            + correlation.run_id.as_ref().map_or(0, String::len);
 
         self.time_unix_nano.push(time_unix_nano);
         self.observed_time_unix_nano.push(observed_time_unix_nano);
@@ -199,7 +232,7 @@ impl LogColumns {
         self.run_id.push(correlation.run_id);
 
         self.rows += 1;
-        Ok(())
+        Ok(payload_bytes)
     }
 
     /// Assemble the accepted rows into the projected log batch.

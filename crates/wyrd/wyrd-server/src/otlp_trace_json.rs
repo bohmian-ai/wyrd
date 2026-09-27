@@ -380,61 +380,6 @@ mod tests {
         assert!(crate::otlp_json::preflight_trace_json(input, test_limits()).is_err());
     }
 
-    /// Proves trace resource, scope, record, attribute, and value-byte caps reject cap plus one.
-    #[test]
-    fn trace_json_enforces_signal_preflight_caps() {
-        for (field, accepted, refused) in [
-            (
-                "resources",
-                br#"{"resourceSpans":[{}]}"#.as_slice(),
-                br#"{"resourceSpans":[{},{}]}"#.as_slice(),
-            ),
-            (
-                "scopes",
-                br#"{"resourceSpans":[{"scopeSpans":[{}]}]}"#.as_slice(),
-                br#"{"resourceSpans":[{"scopeSpans":[{},{}]}]}"#.as_slice(),
-            ),
-            (
-                "records",
-                br#"{"resourceSpans":[{"scopeSpans":[{"spans":[{}]}]}]}"#.as_slice(),
-                br#"{"resourceSpans":[{"scopeSpans":[{"spans":[{},{}]}]}]}"#.as_slice(),
-            ),
-            (
-                "attributes",
-                br#"{"resourceSpans":[{"resource":{"attributes":[{}]}}]}"#.as_slice(),
-                br#"{"resourceSpans":[{"resource":{"attributes":[{},{}]}}]}"#.as_slice(),
-            ),
-        ] {
-            let mut limits = test_limits();
-            match field {
-                "resources" => limits.resources = 1,
-                "scopes" => limits.scopes = 1,
-                "records" => limits.records = 1,
-                "attributes" => limits.attributes = 1,
-                _ => unreachable!("closed test limit field"),
-            }
-            assert!(crate::otlp_json::preflight_trace_json(accepted, limits).is_ok());
-            assert!(crate::otlp_json::preflight_trace_json(refused, limits).is_err());
-        }
-
-        let mut limits = test_limits();
-        limits.value_bytes = 1;
-        assert!(
-            crate::otlp_json::preflight_trace_json(
-                br#"{"resourceSpans":[{"schemaUrl":"a"}]}"#,
-                limits,
-            )
-            .is_ok()
-        );
-        assert!(
-            crate::otlp_json::preflight_trace_json(
-                br#"{"resourceSpans":[{"schemaUrl":"ab"}]}"#,
-                limits,
-            )
-            .is_err()
-        );
-    }
-
     /// Proves trace attributes accept value depth eight and reject depth nine.
     #[test]
     fn trace_json_enforces_any_value_depth_eight() {
@@ -479,11 +424,6 @@ mod tests {
     fn test_limits() -> vala_bifrost_redux::gate::OtlpWireLimits {
         vala_bifrost_redux::gate::OtlpWireLimits {
             request_bytes: 1 << 20,
-            resources: 16,
-            scopes: 16,
-            records: 128,
-            attributes: 1024,
-            value_bytes: 1 << 20,
             value_depth: 8,
             time_partitions: 32,
         }

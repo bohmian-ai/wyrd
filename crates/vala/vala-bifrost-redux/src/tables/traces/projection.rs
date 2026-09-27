@@ -11,7 +11,7 @@
 //! [`super::spans::SPAN_FIELDS`]; nothing in this module restates them.
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use wyrd_tonic::otlp::common::v1::KeyValue;
@@ -25,11 +25,11 @@ use crate::otlp_contract::IngestOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, checked_i64,
-    encode_attributes, fixed_binary_column, fixed_binary_opt_column, i32_column, i32_opt_column,
-    i64_column, i64_opt_column, internal, last_attribute, last_string_attribute, list_column,
-    nested_fields, projected_signal_schema, span_id_bytes, struct_column, trace_id_bytes,
-    u32_as_i64_column, utf8_column, utf8_opt_column,
+    OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, bool_column,
+    checked_i64, encode_attributes, fixed_binary_column, fixed_binary_opt_column, fixed_row_bytes,
+    i32_column, i32_opt_column, i64_column, i64_opt_column, internal, last_attribute,
+    last_string_attribute, list_column, nested_fields, projected_signal_schema, span_id_bytes,
+    struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
 };
 use wyrd_spec::reference::CardRefScope;
 
@@ -79,14 +79,19 @@ const GEN_AI_INT_PROMOTIONS: [&str; 2] =
 ///
 /// # Errors
 ///
+/// Returns [`TableError::OutputTooLarge`] as soon as the running Arrow output
+/// of accepted spans crosses `output_limit_bytes`, before the batch is built.
 /// Returns [`TableError::Internal`] only when the accepted rows cannot be
 /// assembled into the canonical Arrow batch, which indicates a defect in this
 /// projection rather than caller input.
 pub fn project_resource_spans(
     resource_spans: &[ResourceSpans],
     card_scope: Option<&CardRefScope>,
+    output_limit_bytes: usize,
 ) -> Result<(RecordBatch, IngestOutcome), TableError> {
     let mut columns = SpanColumns::default();
+    let mut budget = OutputBudget::new(output_limit_bytes);
+    let widths = SpanOutputWidths::new();
     let mut rejected: i64 = 0;
     let mut rejection_message: Option<String> = None;
 
@@ -107,9 +112,19 @@ pub fn project_resource_spans(
                         columns.push(span, &envelope, &scope_envelope, service_name, card_scope)
                     }
                 };
-                if let Err(reason) = outcome {
-                    rejected = rejected.saturating_add(1);
-                    rejection_message.get_or_insert_with(|| reason.to_owned());
+                match outcome {
+                    Ok(payload_bytes) => budget.charge(
+                        widths.row
+                            + payload_bytes
+                            + envelope.repeated_bytes()
+                            + scope_envelope.repeated_bytes()
+                            + span.events.len() * widths.event
+                            + span.links.len() * widths.link,
+                    )?,
+                    Err(reason) => {
+                        rejected = rejected.saturating_add(1);
+                        rejection_message.get_or_insert_with(|| reason.to_owned());
+                    }
                 }
             }
         }
@@ -126,6 +141,40 @@ pub fn project_resource_spans(
             rejection_message,
         },
     ))
+}
+
+/// Fixed Arrow bytes one projected span row and each nested element retain.
+///
+/// The span projector charges these with each accepted row, and the server's
+/// OTLP preflight charges the same widths per wire record and element, so both
+/// bounds share one definition of a row's fixed output.
+#[derive(Clone, Copy, Debug)]
+pub struct SpanOutputWidths {
+    /// Fixed bytes of one span row, correlation columns included.
+    pub row: usize,
+    /// Fixed bytes of one nested span event.
+    pub event: usize,
+    /// Fixed bytes of one nested span link.
+    pub link: usize,
+}
+
+impl SpanOutputWidths {
+    /// Derives the widths from the canonical span ledger.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            row: fixed_row_bytes(projected_signal_schema(SPAN_FIELDS).fields()),
+            event: fixed_row_bytes(&Fields::from(vec![SPAN_EVENT_ELEMENT.to_arrow()])),
+            link: fixed_row_bytes(&Fields::from(vec![SPAN_LINK_ELEMENT.to_arrow()])),
+        }
+    }
+}
+
+impl Default for SpanOutputWidths {
+    /// Derives the widths from the canonical ledger, as [`Self::new`] does.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Validate the resource-level facts every descendant span inherits.
@@ -236,6 +285,10 @@ impl SpanColumns {
     /// source attribute carries the wrong protocol type, or an optional
     /// correlation attribute that is wrongly typed or malformed. Nothing is
     /// appended when an error is returned.
+    ///
+    /// On success returns the variable-length payload bytes the span itself
+    /// appended (strings, attribute encodings, and event and link payloads);
+    /// the caller adds fixed widths and the repeated resource and scope bytes.
     fn push(
         &mut self,
         span: &Span,
@@ -243,7 +296,7 @@ impl SpanColumns {
         scope: &ScopeEnvelope,
         service_name: Option<&str>,
         card_scope: Option<&CardRefScope>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<usize, &'static str> {
         let trace_id = trace_id_bytes(&span.trace_id)?;
         let span_id = span_id_bytes(&span.span_id)?;
         let parent = if span.parent_span_id.is_empty() {
@@ -271,8 +324,25 @@ impl SpanColumns {
         let correlation = RecordCorrelation::extract(&span.attributes, card_scope)?;
         Self::validate_events(span)?;
         Self::validate_links(span)?;
-        self.push_events(span);
-        self.push_links(span);
+        let attributes = encode_attributes(&span.attributes);
+        let payload_bytes = self.push_events(span)
+            + self.push_links(span)
+            + span.trace_state.len()
+            + span.name.len()
+            + span
+                .status
+                .as_ref()
+                .map_or(0, |status| status.message.len())
+            + attributes.len()
+            + service_name.map_or(0, str::len)
+            + promotions
+                .strings
+                .iter()
+                .flatten()
+                .map(String::len)
+                .sum::<usize>()
+            + correlation.card_ref.as_ref().map_or(0, String::len)
+            + correlation.run_id.as_ref().map_or(0, String::len);
 
         self.trace_id.push(trace_id.to_vec());
         self.span_id.push(span_id.to_vec());
@@ -289,7 +359,7 @@ impl SpanColumns {
             .push(span.status.as_ref().map(|status| status.code));
         self.status_message
             .push(span.status.as_ref().map(|status| status.message.clone()));
-        self.attributes.push(encode_attributes(&span.attributes));
+        self.attributes.push(attributes);
         self.dropped_attributes_count
             .push(span.dropped_attributes_count);
         self.event_lengths.push(Some(span.events.len()));
@@ -327,7 +397,7 @@ impl SpanColumns {
         self.run_id.push(correlation.run_id);
 
         self.rows += 1;
-        Ok(())
+        Ok(payload_bytes)
     }
 
     /// Validate one span's ordered events without mutating any column.
@@ -378,30 +448,46 @@ impl SpanColumns {
     }
 
     /// Append one validated span's ordered events into the flattened storage.
-    fn push_events(&mut self, span: &Span) {
+    ///
+    /// Returns the event names and attribute encodings' payload bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a validated event time exceeds `i64`, which validation
+    /// against the span's checked end time rules out.
+    fn push_events(&mut self, span: &Span) -> usize {
+        let mut payload_bytes = 0;
         for event in &span.events {
             self.event_time.push(
                 checked_i64(event.time_unix_nano)
                     .expect("a validated event time never exceeds its span's checked end"),
             );
+            let attributes = encode_attributes(&event.attributes);
+            payload_bytes += event.name.len() + attributes.len();
             self.event_name.push(event.name.clone());
-            self.event_attributes
-                .push(encode_attributes(&event.attributes));
+            self.event_attributes.push(attributes);
             self.event_dropped.push(event.dropped_attributes_count);
         }
+        payload_bytes
     }
 
     /// Append one validated span's ordered links into the flattened storage.
-    fn push_links(&mut self, span: &Span) {
+    ///
+    /// Returns the links' `trace_state` and attribute encodings' payload bytes;
+    /// fixed-width identifiers are charged with the link's fixed width.
+    fn push_links(&mut self, span: &Span) -> usize {
+        let mut payload_bytes = 0;
         for link in &span.links {
             self.link_trace_id.push(link.trace_id.clone());
             self.link_span_id.push(link.span_id.clone());
+            let attributes = encode_attributes(&link.attributes);
+            payload_bytes += link.trace_state.len() + attributes.len();
             self.link_trace_state.push(link.trace_state.clone());
             self.link_flags.push(link.flags);
-            self.link_attributes
-                .push(encode_attributes(&link.attributes));
+            self.link_attributes.push(attributes);
             self.link_dropped.push(link.dropped_attributes_count);
         }
+        payload_bytes
     }
 
     /// Assemble the accepted rows into the canonical span batch.

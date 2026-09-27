@@ -16,6 +16,9 @@ use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, V
 #[cfg(test)]
 use std::borrow::Cow;
 use vala_bifrost_redux::gate::{IngestError, OtlpWireLimits};
+use vala_bifrost_redux::tables::logs::log_row_output_bytes;
+use vala_bifrost_redux::tables::metrics::MetricOutputWidths;
+use vala_bifrost_redux::tables::traces::SpanOutputWidths;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
@@ -30,6 +33,10 @@ use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, span};
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
+use crate::otlp_decode::{
+    GROUP_FAN_OUT, ProjectedOutput, RESOURCE_FAN_OUT, enforce_expanded_ceiling,
+};
+
 /// Maximum JSON object/array nesting accepted at the transport boundary.
 const MAX_JSON_SYNTAX_DEPTH: usize = 128;
 
@@ -43,8 +50,20 @@ pub(crate) struct JsonDecodePlan {
     pub(crate) wire_bytes: usize,
     /// Exact recursively retained capacity of the generated request.
     pub(crate) decode_bytes: usize,
+    /// Conservative canonical Arrow-plus-managed output the request projects to.
+    pub(crate) projected_bytes: usize,
     /// Maximum scalable lexical/base64 scratch simultaneously live during decode.
     pub(crate) scratch_bytes: usize,
+}
+
+impl JsonDecodePlan {
+    /// Returns the simultaneous typed-backing, projected-output, and scratch
+    /// demand the caller reserves before generated decode.
+    pub(crate) const fn reservation_bytes(&self) -> usize {
+        self.decode_bytes
+            .saturating_add(self.projected_bytes)
+            .saturating_add(self.scratch_bytes)
+    }
 }
 
 /// Error returned by the bounded JSON cursor.
@@ -181,9 +200,12 @@ fn preflight_signal_json(
     root_bytes: usize,
 ) -> Result<JsonDecodePlan, IngestError> {
     if input.len() > limits.request_bytes {
-        return Err(malformed("OTLP JSON request byte limit exceeded"));
+        return Err(IngestError::PayloadTooLarge {
+            bytes: u64::try_from(input.len()).unwrap_or(u64::MAX),
+            limit: u64::try_from(limits.request_bytes).unwrap_or(u64::MAX),
+        });
     }
-    let mut facts = JsonFacts::new(limits, root_bytes);
+    let mut facts = JsonFacts::new(limits, root, root_bytes);
     let mut cursor = JsonCursor::new(input);
     scan_message(&mut cursor, root, 0, &mut facts)
         .and_then(|()| {
@@ -195,9 +217,11 @@ fn preflight_signal_json(
             }
         })
         .map_err(json_ingest_error)?;
+    enforce_expanded_ceiling(facts.decode_bytes, facts.output.bytes(), limits)?;
     Ok(JsonDecodePlan {
         wire_bytes: input.len(),
         decode_bytes: facts.decode_bytes,
+        projected_bytes: facts.output.bytes(),
         scratch_bytes: facts.scratch_bytes,
     })
 }
@@ -285,88 +309,95 @@ enum MessageKind {
     LogRecord,
 }
 
-/// Exact counters and public-layout facts retained during preflight.
+/// Fixed Arrow widths the JSON preflight charges for one signal's rows.
+///
+/// Widths a signal does not project stay zero.
+#[derive(Clone, Copy, Debug, Default)]
+struct JsonOutputWidths {
+    /// Fixed bytes of one projected record row.
+    row: usize,
+    /// Fixed bytes of one nested span event.
+    event: usize,
+    /// Fixed bytes of one nested span link.
+    link: usize,
+    /// Fixed bytes of one nested metric exemplar.
+    exemplar: usize,
+}
+
+impl JsonOutputWidths {
+    /// Selects the canonical widths of the signal whose export root is `root`.
+    fn for_root(root: MessageKind) -> Self {
+        match root {
+            MessageKind::TraceRequest => {
+                let widths = SpanOutputWidths::new();
+                Self {
+                    row: widths.row,
+                    event: widths.event,
+                    link: widths.link,
+                    exemplar: 0,
+                }
+            }
+            MessageKind::MetricsRequest => {
+                let widths = MetricOutputWidths::new();
+                Self {
+                    row: widths.row,
+                    exemplar: widths.exemplar,
+                    ..Self::default()
+                }
+            }
+            _ => Self {
+                row: log_row_output_bytes(),
+                ..Self::default()
+            },
+        }
+    }
+}
+
+/// Exact generated-capacity and projected-output facts retained during preflight.
 struct JsonFacts {
     /// Shared immutable transport/Scribe limits.
     limits: OtlpWireLimits,
-    /// Resource-group count.
-    resources: usize,
-    /// Scope-group count.
-    scopes: usize,
-    /// Signal-record count.
-    records: usize,
-    /// Attribute-entry count.
-    attributes: usize,
-    /// Retained variable-width byte count.
-    value_bytes: usize,
+    /// Fixed Arrow widths of the signal being walked.
+    widths: JsonOutputWidths,
     /// Exact recursively retained generated capacity.
     decode_bytes: usize,
     /// Maximum temporary string/base64 capacity used for one scalar.
     scratch_bytes: usize,
+    /// Conservative projected canonical output.
+    output: ProjectedOutput,
 }
 
 impl JsonFacts {
     /// Creates a fact set with the root generated layout charged once.
-    const fn new(limits: OtlpWireLimits, root_bytes: usize) -> Self {
+    fn new(limits: OtlpWireLimits, root: MessageKind, root_bytes: usize) -> Self {
         Self {
             limits,
-            resources: 0,
-            scopes: 0,
-            records: 0,
-            attributes: 0,
-            value_bytes: 0,
+            widths: JsonOutputWidths::for_root(root),
             decode_bytes: root_bytes,
             scratch_bytes: 0,
+            output: ProjectedOutput::default(),
         }
-    }
-
-    /// Adds a checked amount and enforces its configured ceiling.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JsonDecodeError`] when the addition overflows or the resulting
-    /// counter exceeds `limit`.
-    fn add_bounded(
-        value: &mut usize,
-        amount: usize,
-        limit: usize,
-        label: &'static str,
-    ) -> Result<(), JsonDecodeError> {
-        *value = value
-            .checked_add(amount)
-            .ok_or_else(|| JsonDecodeError::at(0, format!("OTLP JSON {label} overflow")))?;
-        if *value > limit {
-            return Err(JsonDecodeError::at(
-                0,
-                format!("OTLP JSON {label} limit exceeded"),
-            ));
-        }
-        Ok(())
     }
 
     /// Charges exact retained public-layout/backing bytes.
     ///
     /// # Errors
     ///
-    /// Returns [`JsonDecodeError`] when the material-byte total overflows or
-    /// exceeds the configured material ceiling.
+    /// Returns [`JsonDecodeError`] when the material-byte total overflows.
     fn add_decode(&mut self, amount: usize) -> Result<(), JsonDecodeError> {
-        Self::add_bounded(&mut self.decode_bytes, amount, usize::MAX, "material")
+        self.decode_bytes = self
+            .decode_bytes
+            .checked_add(amount)
+            .ok_or_else(|| JsonDecodeError::at(0, "OTLP JSON material overflow"))?;
+        Ok(())
     }
 
     /// Charges retained variable-width bytes and their backing allocation.
     ///
     /// # Errors
     ///
-    /// Returns [`JsonDecodeError`] when value or material bytes overflow or
-    /// exceed their configured ceilings.
+    /// Returns [`JsonDecodeError`] when material bytes overflow.
     fn add_value(&mut self, amount: usize) -> Result<(), JsonDecodeError> {
-        Self::add_bounded(
-            &mut self.value_bytes,
-            amount,
-            self.limits.value_bytes,
-            "value bytes",
-        )?;
         self.add_decode(amount)
     }
 
@@ -375,40 +406,53 @@ impl JsonFacts {
         self.scratch_bytes = self.scratch_bytes.max(amount);
     }
 
-    /// Charges a resource, scope, record, or attribute cardinality.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JsonDecodeError`] when the applicable resource, scope, record,
-    /// or attribute count overflows or exceeds its configured ceiling.
-    fn count_kind(&mut self, kind: MessageKind) -> Result<(), JsonDecodeError> {
+    /// Opens a projected-output frame for a group or record element whose
+    /// generated struct is `layout` bytes, or charges the fixed width of a
+    /// nested event, link, or exemplar.
+    fn open_element(&mut self, kind: MessageKind, layout: usize) {
         match kind {
             MessageKind::ResourceSpans
             | MessageKind::ResourceMetrics
-            | MessageKind::ResourceLogs => Self::add_bounded(
-                &mut self.resources,
-                1,
-                self.limits.resources,
-                "resource count",
-            ),
-            MessageKind::ScopeSpans | MessageKind::ScopeMetrics | MessageKind::ScopeLogs => {
-                Self::add_bounded(&mut self.scopes, 1, self.limits.scopes, "scope count")
+            | MessageKind::ResourceLogs
+            | MessageKind::ScopeSpans
+            | MessageKind::ScopeMetrics
+            | MessageKind::ScopeLogs
+            | MessageKind::Metric
+            | MessageKind::Span
+            | MessageKind::NumberPoint
+            | MessageKind::HistogramPoint
+            | MessageKind::ExponentialHistogramPoint
+            | MessageKind::SummaryPoint
+            | MessageKind::LogRecord => self.output.open(self.decode_bytes, layout),
+            MessageKind::Event => self.output.add(self.widths.event),
+            MessageKind::Link => self.output.add(self.widths.link),
+            MessageKind::Exemplar => self.output.add(self.widths.exemplar),
+            _ => {}
+        }
+    }
+
+    /// Closes the frame [`Self::open_element`] opened for `kind`, charging a
+    /// group's fan-out or a record's row.
+    fn close_element(&mut self, kind: MessageKind) {
+        match kind {
+            MessageKind::ResourceSpans
+            | MessageKind::ResourceMetrics
+            | MessageKind::ResourceLogs => {
+                self.output.close_group(self.decode_bytes, RESOURCE_FAN_OUT);
             }
+            MessageKind::ScopeSpans
+            | MessageKind::ScopeMetrics
+            | MessageKind::ScopeLogs
+            | MessageKind::Metric => self.output.close_group(self.decode_bytes, GROUP_FAN_OUT),
             MessageKind::Span
             | MessageKind::NumberPoint
             | MessageKind::HistogramPoint
             | MessageKind::ExponentialHistogramPoint
             | MessageKind::SummaryPoint
             | MessageKind::LogRecord => {
-                Self::add_bounded(&mut self.records, 1, self.limits.records, "record count")
+                self.output.close_record(self.decode_bytes, self.widths.row);
             }
-            MessageKind::KeyValue => Self::add_bounded(
-                &mut self.attributes,
-                1,
-                self.limits.attributes,
-                "attribute count",
-            ),
-            _ => Ok(()),
+            _ => {}
         }
     }
 }
@@ -1043,9 +1087,10 @@ fn scan_message_array(
         return cursor.consume_expected(b']');
     }
     loop {
-        facts.count_kind(kind)?;
+        facts.open_element(kind, layout);
         facts.add_decode(layout)?;
         scan_message(cursor, kind, value_depth, facts)?;
+        facts.close_element(kind);
         match cursor.peek() {
             Some(b',') => cursor.consume_expected(b',')?,
             Some(b']') => {
@@ -3092,8 +3137,103 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonCursor, decode_json_exact, preflight_json_syntax};
+    use super::{
+        JsonCursor, JsonDecodePlan, decode_json_exact, preflight_json_syntax, preflight_logs_json,
+        preflight_metrics_json, preflight_trace_json,
+    };
     use serde::Deserialize;
+    use vala_bifrost_redux::gate::{IngestError, OtlpWireLimits};
+
+    /// One OTLP JSON preflight under test.
+    type Preflight = fn(&[u8], OtlpWireLimits) -> Result<JsonDecodePlan, IngestError>;
+
+    /// Wire limits whose derived expanded ceiling is 16 KiB.
+    fn small_limits() -> OtlpWireLimits {
+        OtlpWireLimits {
+            request_bytes: 4096,
+            ..vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS
+        }
+    }
+
+    /// Returns each signal's preflight, resource-group key, and a builder that
+    /// nests `rows` empty records under one scope.
+    fn signals() -> [(Preflight, &'static str, fn(&str) -> String); 3] {
+        [
+            (preflight_trace_json, "resourceSpans", |rows| {
+                format!(r#""scopeSpans":[{{"spans":[{rows}]}}]"#)
+            }),
+            (preflight_logs_json, "resourceLogs", |rows| {
+                format!(r#""scopeLogs":[{{"logRecords":[{rows}]}}]"#)
+            }),
+            (preflight_metrics_json, "resourceMetrics", |rows| {
+                format!(
+                    r#""scopeMetrics":[{{"metrics":[{{"name":"m","gauge":{{"dataPoints":[{rows}]}}}}]}}]"#
+                )
+            }),
+        ]
+    }
+
+    /// Proves a small JSON request whose empty resource groups expand past
+    /// four times the wire ceiling in generated backing is refused as too large.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture exceeds the wire ceiling or the preflight
+    /// accepts it.
+    #[test]
+    fn json_preflight_refuses_typed_backing_above_expanded_ceiling() {
+        let limits = small_limits();
+        for (preflight, root, _) in signals() {
+            let few = format!(r#"{{"{root}":[{}]}}"#, vec!["{}"; 8].join(","));
+            let many = format!(r#"{{"{root}":[{}]}}"#, vec!["{}"; 1300].join(","));
+            assert!(many.len() <= limits.request_bytes);
+            assert!(preflight(few.as_bytes(), limits).is_ok());
+            assert!(matches!(
+                preflight(many.as_bytes(), limits),
+                Err(IngestError::PayloadTooLarge { .. })
+            ));
+        }
+    }
+
+    /// Proves repeated resource attributes are charged once per projected row:
+    /// one row fits, while four rows cross the expanded ceiling on projected
+    /// output alone even though generated backing still fits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture exceeds the wire ceiling, the one-row request
+    /// is refused, or the four-row request is accepted.
+    #[test]
+    fn json_preflight_refuses_projected_fan_out_above_expanded_ceiling() {
+        let limits = small_limits();
+        let generous = OtlpWireLimits {
+            request_bytes: 1 << 20,
+            ..limits
+        };
+        let attributes = (0..4)
+            .map(|index| format!(r#"{{"key":"{}"}}"#, index.to_string().repeat(400)))
+            .collect::<Vec<_>>()
+            .join(",");
+        for (preflight, root, scope) in signals() {
+            let request = |rows: usize| {
+                format!(
+                    r#"{{"{root}":[{{"resource":{{"attributes":[{attributes}]}},{}}}]}}"#,
+                    scope(&vec!["{}"; rows].join(","))
+                )
+            };
+            let plan = preflight(request(1).as_bytes(), limits).expect("one row fits");
+            assert!(plan.projected_bytes <= limits.expanded_bytes());
+            let four_rows = request(4);
+            assert!(four_rows.len() <= limits.request_bytes);
+            let unbounded = preflight(four_rows.as_bytes(), generous).expect("generous preflight");
+            assert!(unbounded.decode_bytes <= limits.expanded_bytes());
+            assert!(unbounded.projected_bytes > limits.expanded_bytes());
+            assert!(matches!(
+                preflight(four_rows.as_bytes(), limits),
+                Err(IngestError::PayloadTooLarge { .. })
+            ));
+        }
+    }
 
     /// Minimal generated-message analogue used to prove exact sequence capacity.
     #[derive(Debug, Deserialize)]

@@ -4,7 +4,9 @@ pub mod points;
 pub mod projection;
 
 pub use points::PointsTable;
-pub use projection::{canonical_metric_schema, project_resource_metrics, validate_metric_points};
+pub use projection::{
+    MetricOutputWidths, canonical_metric_schema, project_resource_metrics, validate_metric_points,
+};
 
 #[cfg(test)]
 mod tests {
@@ -214,8 +216,8 @@ mod tests {
     #[test]
     fn all_pinned_metric_point_kinds_project_without_narrowing() {
         let requested = all_kind_request();
-        let (batch, outcome) =
-            project_resource_metrics(&requested, None).expect("every pinned kind projects");
+        let (batch, outcome) = project_resource_metrics(&requested, None, usize::MAX)
+            .expect("every pinned kind projects");
         assert_eq!(outcome.accepted_points, 5);
         assert_eq!(outcome.rejected_points, 0);
         assert!(outcome.rejection_message.is_none());
@@ -371,8 +373,8 @@ mod tests {
             ),
         ]);
 
-        let (batch, outcome) =
-            project_resource_metrics(&requested, None).expect("the valid point still projects");
+        let (batch, outcome) = project_resource_metrics(&requested, None, usize::MAX)
+            .expect("the valid point still projects");
         assert_eq!(outcome.accepted_points, 1);
         assert_eq!(outcome.rejected_points, 4);
         assert_eq!(
@@ -479,7 +481,7 @@ mod tests {
             }),
         )]);
         let (batch, outcome) =
-            project_resource_metrics(&requested, Some(&correlation_fixture::scope()))
+            project_resource_metrics(&requested, Some(&correlation_fixture::scope()), usize::MAX)
                 .expect("projection completes");
 
         assert_eq!(outcome.accepted_points, 3);

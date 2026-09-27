@@ -495,6 +495,7 @@ pub(super) fn span_batch(values: &[i64]) -> arrow::record_batch::RecordBatch {
             schema_url: "https://wyrd.test/schemas/scribe-journey".to_owned(),
         }],
         None,
+        usize::MAX,
     )
     .expect("span batch");
     assert_eq!(

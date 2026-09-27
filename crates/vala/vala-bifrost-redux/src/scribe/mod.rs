@@ -15,7 +15,7 @@ pub mod hot_source;
 pub mod hot_stage;
 mod ingress;
 pub mod manifest;
-mod material_plan;
+pub(crate) mod material_plan;
 pub mod member_stager;
 pub mod memory;
 pub mod memtable;
@@ -2085,7 +2085,6 @@ mod constructor_rotation_tests {
         let defaults = crate::gate::limits::IngestLimits::default();
         let ingest_limits = crate::gate::limits::IngestLimits {
             max_frame_bytes: configured_request_bytes,
-            max_decoding_message_size: configured_request_bytes + 64 * 1024,
             otlp: crate::gate::limits::OtlpWireLimits {
                 request_bytes: configured_request_bytes,
                 ..defaults.otlp

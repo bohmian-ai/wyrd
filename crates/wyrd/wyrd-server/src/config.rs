@@ -387,33 +387,6 @@ pub struct ScribeRuntimeConfig {
     /// value; the soft target is validated with the rest of Scribe geometry.
     #[serde(default = "default_scribe_staging_target_file_size_bytes")]
     pub staging_target_file_size_bytes: u64,
-    /// Maximum field count in one canonical native IPC schema.
-    #[serde(default = "default_ingest_native_fields")]
-    pub ingest_native_fields: usize,
-    /// Maximum record-batch/source count in one canonical native IPC stream.
-    #[serde(default = "default_ingest_native_sources")]
-    pub ingest_native_sources: usize,
-    /// Maximum logical rows or signal records in one request.
-    #[serde(default = "default_ingest_rows")]
-    pub ingest_rows: usize,
-    /// Maximum OTLP resource groups in one request.
-    #[serde(default = "default_ingest_otlp_resources")]
-    pub ingest_otlp_resources: usize,
-    /// Maximum OTLP instrumentation-scope groups in one request.
-    #[serde(default = "default_ingest_otlp_scopes")]
-    pub ingest_otlp_scopes: usize,
-    /// Maximum OTLP signal records in one request.
-    #[serde(default = "default_ingest_otlp_records")]
-    pub ingest_otlp_records: usize,
-    /// Maximum OTLP attribute nodes in one request.
-    #[serde(default = "default_ingest_otlp_attributes")]
-    pub ingest_otlp_attributes: usize,
-    /// Maximum cumulative OTLP key, value, body, and identifier bytes.
-    #[serde(default = "default_ingest_otlp_value_bytes")]
-    pub ingest_otlp_value_bytes: usize,
-    /// Maximum recursive OTLP `AnyValue` nesting depth.
-    #[serde(default = "default_ingest_otlp_value_depth")]
-    pub ingest_otlp_value_depth: usize,
     /// Maximum distinct event-day partitions in one request.
     #[serde(default = "default_ingest_time_partitions")]
     pub ingest_time_partitions: usize,
@@ -1461,51 +1434,6 @@ fn default_scribe_staging_target_file_size_bytes() -> u64 {
     vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES
 }
 
-/// Returns the immutable V1 native field hard maximum.
-fn default_ingest_native_fields() -> usize {
-    vala_bifrost_redux::gate::limits::BIFROST_NATIVE_FIELD_LIMIT
-}
-
-/// Returns the immutable V1 native source hard maximum.
-fn default_ingest_native_sources() -> usize {
-    vala_bifrost_redux::gate::limits::BIFROST_NATIVE_SOURCE_LIMIT
-}
-
-/// Returns the immutable V1 logical row hard maximum.
-fn default_ingest_rows() -> usize {
-    vala_bifrost_redux::gate::limits::BIFROST_INGEST_ROW_LIMIT
-}
-
-/// Returns the immutable V1 OTLP resource hard maximum.
-fn default_ingest_otlp_resources() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.resources
-}
-
-/// Returns the immutable V1 OTLP scope hard maximum.
-fn default_ingest_otlp_scopes() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.scopes
-}
-
-/// Returns the immutable V1 OTLP record hard maximum.
-fn default_ingest_otlp_records() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.records
-}
-
-/// Returns the immutable V1 OTLP attribute hard maximum.
-fn default_ingest_otlp_attributes() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.attributes
-}
-
-/// Returns the immutable V1 OTLP cumulative-value-byte hard maximum.
-fn default_ingest_otlp_value_bytes() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.value_bytes
-}
-
-/// Returns the immutable V1 OTLP recursive-value-depth hard maximum.
-fn default_ingest_otlp_value_depth() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.value_depth
-}
-
 /// Returns the immutable V1 event-day hard maximum.
 fn default_ingest_time_partitions() -> usize {
     vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.time_partitions
@@ -1534,15 +1462,6 @@ impl Default for ScribeRuntimeConfig {
             seal_key_early_seal_bytes: None,
             seal_key_max_age_secs: None,
             staging_target_file_size_bytes: default_scribe_staging_target_file_size_bytes(),
-            ingest_native_fields: default_ingest_native_fields(),
-            ingest_native_sources: default_ingest_native_sources(),
-            ingest_rows: default_ingest_rows(),
-            ingest_otlp_resources: default_ingest_otlp_resources(),
-            ingest_otlp_scopes: default_ingest_otlp_scopes(),
-            ingest_otlp_records: default_ingest_otlp_records(),
-            ingest_otlp_attributes: default_ingest_otlp_attributes(),
-            ingest_otlp_value_bytes: default_ingest_otlp_value_bytes(),
-            ingest_otlp_value_depth: default_ingest_otlp_value_depth(),
             ingest_time_partitions: default_ingest_time_partitions(),
             ingest_wal_workspace_bytes: default_ingest_wal_workspace_bytes(),
         }
@@ -1582,9 +1501,14 @@ impl ScribeRuntimeConfig {
         if self.ingest_request_bytes == 0 {
             return Err("scribe.ingest_request_bytes must be at least 1".to_owned());
         }
-        if self.ingest_request_bytes.checked_add(64 * 1024).is_none() {
+        if self
+            .ingest_request_bytes
+            .checked_mul(vala_bifrost_redux::gate::limits::BIFROST_INGEST_EXPANSION_FACTOR)
+            .is_none()
+        {
             return Err(
-                "scribe.ingest_request_bytes plus tonic framing allowance exceeds usize".to_owned(),
+                "scribe.ingest_request_bytes times the expanded-data factor exceeds usize"
+                    .to_owned(),
             );
         }
         if u32::try_from(self.ingest_request_bytes).is_err() {
@@ -1595,47 +1519,6 @@ impl ScribeRuntimeConfig {
         self.scribe_geometry()
             .map_err(|error| format!("scribe geometry configuration is invalid: {error}"))?;
         let ingest_values = [
-            (
-                "ingest_native_fields",
-                self.ingest_native_fields,
-                default_ingest_native_fields(),
-            ),
-            (
-                "ingest_native_sources",
-                self.ingest_native_sources,
-                default_ingest_native_sources(),
-            ),
-            ("ingest_rows", self.ingest_rows, default_ingest_rows()),
-            (
-                "ingest_otlp_resources",
-                self.ingest_otlp_resources,
-                default_ingest_otlp_resources(),
-            ),
-            (
-                "ingest_otlp_scopes",
-                self.ingest_otlp_scopes,
-                default_ingest_otlp_scopes(),
-            ),
-            (
-                "ingest_otlp_records",
-                self.ingest_otlp_records,
-                default_ingest_otlp_records(),
-            ),
-            (
-                "ingest_otlp_attributes",
-                self.ingest_otlp_attributes,
-                default_ingest_otlp_attributes(),
-            ),
-            (
-                "ingest_otlp_value_bytes",
-                self.ingest_otlp_value_bytes,
-                default_ingest_otlp_value_bytes(),
-            ),
-            (
-                "ingest_otlp_value_depth",
-                self.ingest_otlp_value_depth,
-                default_ingest_otlp_value_depth(),
-            ),
             (
                 "ingest_time_partitions",
                 self.ingest_time_partitions,
@@ -1691,31 +1574,18 @@ impl ScribeRuntimeConfig {
 
     /// Freezes the validated operator-selected limits passed to Gate and Scribe.
     ///
-    /// # Panics
-    ///
-    /// Panics only when called before [`Self::validate`] has established that
-    /// the tonic framing allowance can be added without overflow.
+    /// The configured request bytes become the single wire ceiling; the
+    /// expanded-data ceiling is derived from it, and the OTLP value depth is a
+    /// fixed structural rule rather than an operator setting.
     #[must_use]
     pub fn ingest_limits(&self) -> vala_bifrost_redux::gate::limits::IngestLimits {
         vala_bifrost_redux::gate::limits::IngestLimits {
             max_frame_bytes: self.ingest_request_bytes,
-            max_decoding_message_size: self
-                .ingest_request_bytes
-                .checked_add(64 * 1024)
-                .expect("validated request bound plus tonic framing allowance must fit"),
             otlp: vala_bifrost_redux::gate::limits::OtlpWireLimits {
                 request_bytes: self.ingest_request_bytes,
-                resources: self.ingest_otlp_resources,
-                scopes: self.ingest_otlp_scopes,
-                records: self.ingest_otlp_records,
-                attributes: self.ingest_otlp_attributes,
-                value_bytes: self.ingest_otlp_value_bytes,
-                value_depth: self.ingest_otlp_value_depth,
+                value_depth: vala_bifrost_redux::gate::limits::BIFROST_OTLP_VALUE_DEPTH_LIMIT,
                 time_partitions: self.ingest_time_partitions,
             },
-            native_fields: self.ingest_native_fields,
-            native_sources: self.ingest_native_sources,
-            rows: self.ingest_rows,
             wal_workspace_bytes: self.ingest_wal_workspace_bytes,
         }
     }
@@ -4230,32 +4100,8 @@ minimum_slots = 2
         assert_rejected!(generation_max_age_secs, 0);
         assert_rejected!(staging_target_file_size_bytes, 0);
         assert_rejected!(ingest_request_bytes, 0);
-        assert_rejected!(ingest_native_fields, 0);
-        assert_rejected!(ingest_native_sources, 0);
-        assert_rejected!(ingest_rows, 0);
-        assert_rejected!(ingest_otlp_resources, 0);
-        assert_rejected!(ingest_otlp_scopes, 0);
-        assert_rejected!(ingest_otlp_records, 0);
-        assert_rejected!(ingest_otlp_attributes, 0);
-        assert_rejected!(ingest_otlp_value_bytes, 0);
-        assert_rejected!(ingest_otlp_value_depth, 0);
         assert_rejected!(ingest_time_partitions, 0);
         assert_rejected!(ingest_wal_workspace_bytes, 0);
-        assert_rejected!(ingest_native_fields, default_ingest_native_fields() + 1);
-        assert_rejected!(ingest_native_sources, default_ingest_native_sources() + 1);
-        assert_rejected!(ingest_rows, default_ingest_rows() + 1);
-        assert_rejected!(ingest_otlp_resources, default_ingest_otlp_resources() + 1);
-        assert_rejected!(ingest_otlp_scopes, default_ingest_otlp_scopes() + 1);
-        assert_rejected!(ingest_otlp_records, default_ingest_otlp_records() + 1);
-        assert_rejected!(ingest_otlp_attributes, default_ingest_otlp_attributes() + 1);
-        assert_rejected!(
-            ingest_otlp_value_bytes,
-            default_ingest_otlp_value_bytes() + 1
-        );
-        assert_rejected!(
-            ingest_otlp_value_depth,
-            default_ingest_otlp_value_depth() + 1
-        );
         assert_rejected!(ingest_time_partitions, default_ingest_time_partitions() + 1);
         assert_rejected!(
             ingest_wal_workspace_bytes,
@@ -4266,7 +4112,14 @@ minimum_slots = 2
         assert_rejected!(ingest_request_bytes, u32::MAX as usize + 1);
     }
 
-    /// Proves the 200 MiB request value is a default rather than a hard cap.
+    /// Proves the request value is a default rather than a hard cap, and that
+    /// it is frozen exactly — with no framing allowance — as the one wire
+    /// ceiling from which the 4x expanded ceiling derives.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a supported value fails validation or is not propagated
+    /// exactly.
     #[test]
     fn scribe_runtime_propagates_supported_request_above_default() {
         let request_bytes = default_ingest_request_bytes() + 1024 * 1024;
@@ -4280,8 +4133,14 @@ minimum_slots = 2
 
         let limits = config.ingest_limits();
         assert_eq!(limits.max_frame_bytes, request_bytes);
-        assert_eq!(limits.max_decoding_message_size, request_bytes + 64 * 1024);
         assert_eq!(limits.otlp.request_bytes, request_bytes);
+        assert_eq!(limits.expanded_bytes(), 4 * request_bytes);
+        assert_eq!(
+            ScribeRuntimeConfig::default()
+                .ingest_limits()
+                .expanded_bytes(),
+            64 * 1024 * 1024
+        );
     }
 
     /// Proves one lower operator limit is frozen into the shared Gate/Scribe snapshot.
@@ -4290,15 +4149,6 @@ minimum_slots = 2
     fn scribe_runtime_freezes_lower_ingest_limits() {
         let config = ScribeRuntimeConfig {
             ingest_request_bytes: 1024,
-            ingest_native_fields: 4,
-            ingest_native_sources: 2,
-            ingest_rows: 8,
-            ingest_otlp_resources: 2,
-            ingest_otlp_scopes: 3,
-            ingest_otlp_records: 8,
-            ingest_otlp_attributes: 16,
-            ingest_otlp_value_bytes: 512,
-            ingest_otlp_value_depth: 3,
             ingest_time_partitions: 2,
             ingest_wal_workspace_bytes: 256,
             ..ScribeRuntimeConfig::default()
@@ -4307,15 +4157,11 @@ minimum_slots = 2
 
         let frozen = config.ingest_limits();
         assert_eq!(frozen.max_frame_bytes, 1024);
-        assert_eq!(frozen.native_fields, 4);
-        assert_eq!(frozen.native_sources, 2);
-        assert_eq!(frozen.rows, 8);
-        assert_eq!(frozen.otlp.resources, 2);
-        assert_eq!(frozen.otlp.scopes, 3);
-        assert_eq!(frozen.otlp.records, 8);
-        assert_eq!(frozen.otlp.attributes, 16);
-        assert_eq!(frozen.otlp.value_bytes, 512);
-        assert_eq!(frozen.otlp.value_depth, 3);
+        assert_eq!(frozen.expanded_bytes(), 4096);
+        assert_eq!(
+            frozen.otlp.value_depth,
+            vala_bifrost_redux::gate::limits::BIFROST_OTLP_VALUE_DEPTH_LIMIT
+        );
         assert_eq!(frozen.otlp.time_partitions, 2);
         assert_eq!(frozen.wal_workspace_bytes, 256);
     }

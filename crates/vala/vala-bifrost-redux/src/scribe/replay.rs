@@ -2128,6 +2128,7 @@ mod tests {
         let (rows, outcome) = crate::tables::traces::project_resource_spans(
             &[span(1, true), span(2, false), span(3, true)],
             None,
+            usize::MAX,
         )
         .expect("canonical trace projection");
         assert_eq!((outcome.accepted_spans, outcome.rejected_spans), (2, 1));

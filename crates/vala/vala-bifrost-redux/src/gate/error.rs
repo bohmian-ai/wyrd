@@ -75,12 +75,13 @@ pub enum IngestError {
         /// Fully-qualified table name whose schema does not match.
         table: String,
     },
-    /// The server-measured canonical payload exceeded Scribe's 32 MiB limit.
+    /// The request's wire bytes or expanded canonical output exceeded the
+    /// configured ingest limit.
     #[error("ingest payload too large ({bytes} > {limit} bytes)")]
     PayloadTooLarge {
-        /// Measured canonical transport bytes.
+        /// Measured wire or expanded-output bytes.
         bytes: u64,
-        /// Scribe's fixed limit.
+        /// Configured wire or derived expanded-data limit.
         limit: u64,
     },
     /// The request exceeded the aggregate row bound.

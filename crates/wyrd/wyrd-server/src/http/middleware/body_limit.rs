@@ -212,7 +212,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tower::{ServiceBuilder, ServiceExt, service_fn};
     use vala_bifrost_redux::gate::limits::{
-        BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES, BifrostTransportAdmission,
+        BIFROST_INGEST_REQUEST_LIMIT_BYTES, BifrostTransportAdmission,
     };
 
     /// Server edge and tonic peers can share the same exact transport owner.
@@ -225,12 +225,12 @@ mod tests {
         let admission = BifrostTransportAdmission::for_tests();
         let layer = wyrd_body_limit(
             1024,
-            Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+            Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
             Some(admission.clone()),
         );
         assert_eq!(layer.max_bytes, 1024);
         let first = admission
-            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("first maximum message");
         let second = admission
             .try_acquire_unknown()
@@ -249,17 +249,17 @@ mod tests {
     async fn bifrost_transport_admission_pessimistically_rejects_unknown_http2_body() {
         let admission = BifrostTransportAdmission::for_tests();
         let first = admission
-            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("first maximum message");
         let second = admission
-            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("exact aggregate boundary");
         let invoked = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&invoked);
         let service = ServiceBuilder::new()
             .layer(wyrd_body_limit(
                 1024,
-                Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+                Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
                 Some(admission.clone()),
             ))
             .service(service_fn(move |_request: Request<Body>| {
@@ -279,7 +279,7 @@ mod tests {
         assert!(!invoked.load(Ordering::Acquire));
         assert_eq!(
             admission.used_bytes(),
-            2 * BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
+            2 * BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
         drop((first, second));
     }
@@ -294,7 +294,7 @@ mod tests {
         let service = ServiceBuilder::new()
             .layer(wyrd_body_limit(
                 16,
-                Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+                Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
                 Some(admission),
             ))
             .service(service_fn(move |_request: Request<Body>| {

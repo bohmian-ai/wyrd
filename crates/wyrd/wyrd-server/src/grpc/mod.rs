@@ -5,7 +5,9 @@
 //! module owns is [`build_app_grpc`]: the single code path that mounts the
 //! Gate-served ingest service, shared by `main.rs` and the `wyrd-testing`
 //! harness. The ingest service itself is `vala_bifrost_redux::gate::Gate`; this
-//! module binds the socket and wraps it in transport admission, nothing more.
+//! module binds the socket and wraps the ingest services in transport
+//! admission, nothing more. The public query service keeps tonic's default
+//! decoded-message ceiling and is not charged against ingest admission.
 pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
@@ -334,11 +336,8 @@ where
             metrics,
             transport.clone(),
         ))
-        .add_service(GrpcTransportAdmissionService::new(logs, transport.clone()))
-        .add_service(GrpcTransportAdmissionService::new(
-            bifrost_query.into_server(),
-            transport,
-        )))
+        .add_service(GrpcTransportAdmissionService::new(logs, transport))
+        .add_service(bifrost_query.into_server()))
 }
 
 /// Selects the role-owned peer security audit for this process.
@@ -481,7 +480,7 @@ mod tests {
     use wyrd_tonic::tonic::codegen::Bytes;
 
     use vala_bifrost_redux::gate::limits::{
-        BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES, BifrostTransportAdmission,
+        BIFROST_INGEST_REQUEST_LIMIT_BYTES, BifrostTransportAdmission,
     };
 
     /// Minimal tonic-shaped service recording admission state before body decode.
@@ -727,7 +726,7 @@ mod tests {
             admission: admission.clone(),
         };
         let service = GrpcTransportAdmissionService::new(probe.clone(), admission.clone());
-        let request = Request::new(framed_body(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES));
+        let request = Request::new(framed_body(BIFROST_INGEST_REQUEST_LIMIT_BYTES));
         service
             .oneshot(request)
             .await
@@ -735,13 +734,13 @@ mod tests {
         assert!(invoked.load(Ordering::Acquire));
         assert_eq!(
             observed_bytes.load(Ordering::Acquire),
-            BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
+            BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
         assert_eq!(admission.used_bytes(), 0);
 
         invoked.store(false, Ordering::Release);
         let service = GrpcTransportAdmissionService::new(probe, admission.clone());
-        let request = Request::new(framed_body(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES + 1));
+        let request = Request::new(framed_body(BIFROST_INGEST_REQUEST_LIMIT_BYTES + 1));
         let response = service
             .oneshot(request)
             .await

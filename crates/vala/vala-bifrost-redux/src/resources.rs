@@ -1855,6 +1855,8 @@ impl BifrostRuntimeResources {
     }
     /// Detects process-visible resources and constructs the shared role graph.
     ///
+    /// The transport message maximum is the default ingest request ceiling.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError`] when detection or checked root-policy
@@ -1862,7 +1864,7 @@ impl BifrostRuntimeResources {
     pub fn detect(policy: BifrostResourcePolicy) -> Result<Self, BifrostResourceError> {
         Self::detect_with_transport_message_limit(
             policy,
-            crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
         )
     }
 
@@ -1890,6 +1892,8 @@ impl BifrostRuntimeResources {
     /// stage as live boot; callers may vary observations but cannot request a
     /// derived grant or construct a sibling governor.
     ///
+    /// The transport message maximum is the default ingest request ceiling.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError`] when the observation cannot satisfy the
@@ -1901,7 +1905,7 @@ impl BifrostRuntimeResources {
         Self::from_snapshot_with_transport_message_limit(
             snapshot,
             policy,
-            crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
         )
     }
 

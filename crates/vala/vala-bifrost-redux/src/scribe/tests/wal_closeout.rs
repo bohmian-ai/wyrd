@@ -379,7 +379,7 @@ async fn scribe_invalid_rejection_emits_exact_owner_reason() {
         DataTenantId::new_v7(),
         "invalid",
         Uuid::now_v7(),
-        crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES + 1,
+        crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES + 1,
     )
     .await
     .expect_err("oversized request rejects append");

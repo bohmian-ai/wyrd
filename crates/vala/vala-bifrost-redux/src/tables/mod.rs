@@ -42,6 +42,17 @@ pub enum TableError {
     /// The source batch is missing a required field or uses an unexpected type.
     #[error("table projection error: {0}")]
     Internal(String),
+    /// Projected canonical output grew past the request's expanded-data limit.
+    ///
+    /// Raised while rows accumulate, before the batch is assembled, so an
+    /// oversized request is refused without building its Arrow output.
+    #[error("projected output of {bytes} bytes exceeds the {limit}-byte expanded-data limit")]
+    OutputTooLarge {
+        /// Output bytes accounted when the limit was crossed.
+        bytes: usize,
+        /// Expanded-data limit in bytes.
+        limit: usize,
+    },
 }
 
 /// Correlation columns appended to a built-in table.
@@ -1656,6 +1667,40 @@ mod tests {
         .expect("the Parquet batches concatenate")
     }
 
+    /// Each OTLP projector charges its running output within a factor of two
+    /// of the batch it builds and refuses once the charge crosses its limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a projector accepts output above half its actual size or
+    /// refuses a limit of twice its actual size.
+    #[test]
+    fn otlp_projectors_refuse_running_output_above_limit() {
+        use crate::scribe::material_plan::retained_slice_bytes;
+
+        let project = |label: &str, limit: usize| match label {
+            "spans" => crate::tables::traces::project_resource_spans(&span_fixture(), None, limit)
+                .map(|(batch, _)| batch),
+            "logs" => crate::tables::logs::project_resource_logs(&log_fixture(), None, limit)
+                .map(|(batch, _)| batch),
+            _ => crate::tables::metrics::project_resource_metrics(&metric_fixture(), None, limit)
+                .map(|(batch, _)| batch),
+        };
+        for label in ["spans", "logs", "points"] {
+            let actual =
+                retained_slice_bytes(&project(label, usize::MAX).expect("unbounded projection"))
+                    .expect("retained bytes");
+            assert!(
+                matches!(
+                    project(label, actual / 2),
+                    Err(TableError::OutputTooLarge { .. })
+                ),
+                "{label} refuses output above half its actual size"
+            );
+            project(label, actual * 2).expect("twice the actual output fits");
+        }
+    }
+
     /// The canonical schemas survive Arrow, IPC, Parquet, and Iceberg intact.
     ///
     /// # Panics
@@ -1664,12 +1709,15 @@ mod tests {
     /// lost by any leg of the round trip.
     #[test]
     fn canonical_signal_schemas_round_trip_arrow_parquet_and_iceberg() {
-        let (spans, _) = crate::tables::traces::project_resource_spans(&span_fixture(), None)
-            .expect("the span fixture projects");
-        let (logs, _) = crate::tables::logs::project_resource_logs(&log_fixture(), None)
-            .expect("the log fixture projects");
-        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture(), None)
-            .expect("the metric fixture projects");
+        let (spans, _) =
+            crate::tables::traces::project_resource_spans(&span_fixture(), None, usize::MAX)
+                .expect("the span fixture projects");
+        let (logs, _) =
+            crate::tables::logs::project_resource_logs(&log_fixture(), None, usize::MAX)
+                .expect("the log fixture projects");
+        let (points, _) =
+            crate::tables::metrics::project_resource_metrics(&metric_fixture(), None, usize::MAX)
+                .expect("the metric fixture projects");
 
         for (label, projected) in [("spans", spans), ("logs", logs), ("points", points)] {
             // The appended correlation columns are Scribe's stamping contract,
@@ -1777,12 +1825,15 @@ mod tests {
     fn builtin_registry_dispatches_canonical_value_validation() {
         use arrow::array::{Array, BinaryArray, Int64Array};
 
-        let (spans, _) = crate::tables::traces::project_resource_spans(&span_fixture(), None)
-            .expect("the span fixture projects");
-        let (logs, _) = crate::tables::logs::project_resource_logs(&log_fixture(), None)
-            .expect("the log fixture projects");
-        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture(), None)
-            .expect("the metric fixture projects");
+        let (spans, _) =
+            crate::tables::traces::project_resource_spans(&span_fixture(), None, usize::MAX)
+                .expect("the span fixture projects");
+        let (logs, _) =
+            crate::tables::logs::project_resource_logs(&log_fixture(), None, usize::MAX)
+                .expect("the log fixture projects");
+        let (points, _) =
+            crate::tables::metrics::project_resource_metrics(&metric_fixture(), None, usize::MAX)
+                .expect("the metric fixture projects");
 
         for (namespace, name, projected) in [
             ("traces", "spans", spans),
@@ -1825,8 +1876,9 @@ mod tests {
 
         // A summary point may not populate a numeric kind's column, which the
         // ledger schema alone cannot express.
-        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture(), None)
-            .expect("the metric fixture projects");
+        let (points, _) =
+            crate::tables::metrics::project_resource_metrics(&metric_fixture(), None, usize::MAX)
+                .expect("the metric fixture projects");
         let points = crate::tables::signal::without_correlation_columns(&points)
             .expect("the correlation columns split off cleanly");
         let kind_violation = RecordBatch::try_new(

@@ -137,8 +137,9 @@ fn projected_metric_batch(partition: crate::catalog::layout::TimePartition) -> R
         }],
         schema_url: String::new(),
     }];
-    let (projected, outcome) = crate::tables::metrics::project_resource_metrics(&request, None)
-        .expect("the owning metrics projector accepts the fixture");
+    let (projected, outcome) =
+        crate::tables::metrics::project_resource_metrics(&request, None, usize::MAX)
+            .expect("the owning metrics projector accepts the fixture");
     assert_eq!(outcome.accepted_points, 4);
 
     let timestamp = partition.start_utc().timestamp_micros();

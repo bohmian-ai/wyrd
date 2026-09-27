@@ -16,15 +16,18 @@ const ROWS_PER_BATCH: i64 = 6_000;
 
 /// Public requests the case sends.
 ///
-/// `BATCHES * ROWS_PER_BATCH` must exceed the canonical 131,072-row group
-/// bound, because a merged object below that bound would close with a single
-/// row group and the physical half of this owner would prove nothing.
+/// `BATCHES * ROWS_PER_BATCH` passes the retired 131,072-row group bound, so a
+/// writer still rolling groups at that size would close a second group here.
 const BATCHES: i64 = 24;
 
-/// Canonical rows one Parquet row group holds before the writer rolls.
-const ROW_GROUP_ROWS: i64 = 131_072;
+/// Rows one Parquet row group holds before the writer rolls.
+///
+/// The shared writer recipe keeps parquet-rs's row ceiling beside its soft
+/// 128 MiB encoded target; these tiny rows stay far below that target, so the
+/// row ceiling alone decides how few groups a packed object needs.
+const ROW_GROUP_ROWS: u64 = parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT as u64;
 
-/// One publication covers every shard's generation exactly once, in multi-group
+/// One publication covers every shard's generation exactly once, in packed
 /// objects.
 ///
 /// Batches route by `(tenant, table, batch_id)`, so one table's rows are sealed
@@ -32,21 +35,16 @@ const ROW_GROUP_ROWS: i64 = 131_072;
 /// those generations into hot objects, and each generation may end up merged
 /// into an object with its peers rather than owning one. Three things have to
 /// hold at once: every generation's rows reach exactly one published object, an
-/// object built from members on more than one shard closes with more than one
-/// row group, and a second publication pass finds nothing left to do.
+/// object built from members on more than one shard packs them into the fewest
+/// row groups its rows allow, and a second publication pass finds nothing left
+/// to do.
 ///
-/// The group count is asserted exactly, not merely as "more than one". A claim
-/// merges many staged runs, most of them far smaller than a group; writing one
-/// group per run would still clear a `> 1` check while making the footer grow
-/// with the number of runs merged instead of with the object's size. The
-/// fewest-groups-its-rows-allow form is the one that separates packed groups
-/// from per-run groups.
-///
-/// The row target is the load-bearing part of the physical claim. A merged
-/// object holding fewer than one row group's worth of rows would satisfy every
-/// exactly-once assertion while still being written one input run per group, so
-/// the case sends past the canonical group bound and then reads the sealed
-/// footer's split offsets rather than trusting the object count.
+/// The group count is asserted exactly. A claim merges many staged runs, most
+/// of them far smaller than a group; writing one group per run would make the
+/// footer grow with the number of runs merged instead of with the object's
+/// size. The fewest-groups-its-rows-allow form is the one that separates packed
+/// groups from per-run groups, and it reads the sealed footer's split offsets
+/// rather than trusting the object count.
 ///
 /// The case drives real appends until the production router has spread the
 /// table across several shards, so the merge it proves is the one production
@@ -56,12 +54,12 @@ const ROW_GROUP_ROWS: i64 = 131_072;
 ///
 /// Panics when a public append or read fails, when the router leaves the table
 /// on one shard, when no published object was merged from members on more than
-/// one shard, when such an object closed with a single, non-ascending, or
-/// unpacked set of row groups, when the published objects do not account for exactly the
+/// one shard, when such an object closed with a non-ascending or unpacked set
+/// of row groups, when the published objects do not account for exactly the
 /// acknowledged rows, or when a second publication pass republishes them.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
-async fn scribe_cross_shard_generations_publish_multi_group_objects_once() {
+async fn scribe_cross_shard_generations_publish_packed_objects_once() {
     let server = start_scribe_server().await;
     let tenant = server.data_tenant_id();
     let name = unique_table("cross_shard");
@@ -78,12 +76,6 @@ async fn scribe_cross_shard_generations_publish_multi_group_objects_once() {
         expected.extend_from_slice(&rows);
     }
     expected.sort_unstable();
-    assert!(
-        expected.len() as i64 > ROW_GROUP_ROWS,
-        "the case must send past the canonical row-group bound to prove a \
-         multi-group object; it sent {}",
-        expected.len()
-    );
 
     let occupied_shards = server
         .scribe_inspection_snapshot()
@@ -163,7 +155,6 @@ async fn scribe_cross_shard_generations_publish_multi_group_objects_once() {
          shard: {claims:?}"
     );
 
-    let mut multi_group = 0_usize;
     for file in &published {
         if !merged.contains(&file.object_key.as_str()) {
             continue;
@@ -177,21 +168,12 @@ async fn scribe_cross_shard_generations_publish_multi_group_objects_once() {
         let rows = file.promotion_record.data_file.record_count;
         assert_eq!(
             offsets.len() as u64,
-            rows.div_ceil(ROW_GROUP_ROWS as u64),
+            rows.div_ceil(ROW_GROUP_ROWS),
             "a merged object must hold the fewest groups its {rows} rows allow, \
              not one per input run, in {}: {offsets:?}",
             file.object_key
         );
-        if offsets.len() > 1 {
-            multi_group += 1;
-        }
     }
-    assert!(
-        multi_group > 0,
-        "a cross-shard merge holding {} rows must close at least one object with \
-         more than one row group; every merged object closed with one",
-        expected.len()
-    );
 
     // A second pass has nothing left to publish: the same rows, the same
     // objects, and the same durable file-list identities.

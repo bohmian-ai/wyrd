@@ -1,0 +1,354 @@
+[
+  {
+    "offered_rate": 500,
+    "target_live_streams": 0,
+    "live_streams_sampled": [
+      0,
+      0
+    ],
+    "interactive_units_sampled": [
+      0.0,
+      1.0
+    ],
+    "scheduled": 30000,
+    "sent": 30000,
+    "missed_launches": 0,
+    "abandoned": 0,
+    "drain_completions": 1,
+    "outcomes": {
+      "success": 512,
+      "degraded": 0,
+      "failed": 0,
+      "admission_refused": 2026,
+      "deadline": 0,
+      "transport_error": 27461,
+      "wrong_result": 0
+    },
+    "successes_per_second": 8.533333333333333,
+    "first_row_us": [
+      55937,
+      59127,
+      62843
+    ],
+    "terminal_us": [
+      55955,
+      59150,
+      62855
+    ],
+    "max_driver_lag_us": 1540,
+    "driver_cpu_seconds": 2.04,
+    "server_deltas": {
+      "bifrost_gate_query_streams_total": 30000.0,
+      "bifrost_scribe_rows_total": 2048.0,
+      "oracle_admission_total{class=analytical,outcome=admitted}": 0.0,
+      "oracle_admission_total{class=analytical,outcome=rejected}": 0.0,
+      "oracle_admission_total{class=interactive,outcome=admitted}": 512.0,
+      "oracle_admission_total{class=interactive,outcome=rejected}": 0.0,
+      "oracle_query_files_scanned_total": 2304.0,
+      "oracle_query_row_groups_pruned_total": 1792.0,
+      "oracle_query_row_groups_scanned_total": 256.0,
+      "oracle_query_rows_total": 10240.0
+    },
+    "cgroup": {
+      "cpu.stat:burst_usec": 0.0,
+      "cpu.stat:core_sched.force_idle_usec": 0.0,
+      "cpu.stat:nice_usec": 0.0,
+      "cpu.stat:nr_bursts": 0.0,
+      "cpu.stat:nr_periods": 600.0,
+      "cpu.stat:nr_throttled": 0.0,
+      "cpu.stat:system_usec": 2607042.0,
+      "cpu.stat:throttled_usec": 0.0,
+      "cpu.stat:usage_usec": 18154626.0,
+      "cpu.stat:user_usec": 15547584.0,
+      "memory.current:value": 483717120.0,
+      "memory.events:high": 0.0,
+      "memory.events:low": 0.0,
+      "memory.events:max": 0.0,
+      "memory.events:oom": 0.0,
+      "memory.events:oom_group_kill": 0.0,
+      "memory.events:oom_kill": 0.0,
+      "memory.events:sock_throttled": 0.0,
+      "memory.max:value": 8589934592.0,
+      "memory.peak:value": 484311040.0
+    },
+    "postgres_select_ms": [
+      1.086092,
+      1.225338
+    ],
+    "live": {
+      "completed": 0,
+      "refused": 0,
+      "not_interactive": 0,
+      "failed": 0
+    },
+    "sustained": false,
+    "saturated_boundary": "query transport",
+    "invalid": []
+  },
+  {
+    "offered_rate": 1000,
+    "target_live_streams": 0,
+    "live_streams_sampled": [
+      0,
+      0
+    ],
+    "interactive_units_sampled": [
+      0.0,
+      2.0
+    ],
+    "scheduled": 60000,
+    "sent": 59758,
+    "missed_launches": 242,
+    "abandoned": 0,
+    "drain_completions": 972,
+    "outcomes": {
+      "success": 388,
+      "degraded": 0,
+      "failed": 0,
+      "admission_refused": 3592,
+      "deadline": 0,
+      "transport_error": 54806,
+      "wrong_result": 0
+    },
+    "successes_per_second": 6.466666666666667,
+    "first_row_us": [
+      72304,
+      76800,
+      79065
+    ],
+    "terminal_us": [
+      72318,
+      76821,
+      79080
+    ],
+    "max_driver_lag_us": 17443,
+    "driver_cpu_seconds": 5.0,
+    "server_deltas": {
+      "bifrost_gate_query_streams_total": 58790.0,
+      "bifrost_scribe_rows_total": 512.0,
+      "oracle_admission_total{class=analytical,outcome=admitted}": 0.0,
+      "oracle_admission_total{class=analytical,outcome=rejected}": 0.0,
+      "oracle_admission_total{class=interactive,outcome=admitted}": 388.0,
+      "oracle_admission_total{class=interactive,outcome=rejected}": 0.0,
+      "oracle_query_files_scanned_total": 388.0,
+      "oracle_query_row_groups_pruned_total": 0.0,
+      "oracle_query_row_groups_scanned_total": 0.0,
+      "oracle_query_rows_total": 7760.0
+    },
+    "cgroup": {
+      "cpu.stat:burst_usec": 0.0,
+      "cpu.stat:core_sched.force_idle_usec": 0.0,
+      "cpu.stat:nice_usec": 0.0,
+      "cpu.stat:nr_bursts": 0.0,
+      "cpu.stat:nr_periods": 600.0,
+      "cpu.stat:nr_throttled": 0.0,
+      "cpu.stat:system_usec": 3862455.0,
+      "cpu.stat:throttled_usec": 0.0,
+      "cpu.stat:usage_usec": 32035923.0,
+      "cpu.stat:user_usec": 28173468.0,
+      "memory.current:value": 1016164352.0,
+      "memory.events:high": 0.0,
+      "memory.events:low": 0.0,
+      "memory.events:max": 0.0,
+      "memory.events:oom": 0.0,
+      "memory.events:oom_group_kill": 0.0,
+      "memory.events:oom_kill": 0.0,
+      "memory.events:sock_throttled": 0.0,
+      "memory.max:value": 8589934592.0,
+      "memory.peak:value": 1017462784.0
+    },
+    "postgres_select_ms": [
+      0.5608,
+      0.685188
+    ],
+    "live": {
+      "completed": 0,
+      "refused": 0,
+      "not_interactive": 0,
+      "failed": 0
+    },
+    "sustained": false,
+    "saturated_boundary": "query transport",
+    "invalid": []
+  },
+  {
+    "offered_rate": 500,
+    "target_live_streams": 4,
+    "live_streams_sampled": [
+      0,
+      4
+    ],
+    "interactive_units_sampled": [
+      0.0,
+      6.0
+    ],
+    "scheduled": 30000,
+    "sent": 30000,
+    "missed_launches": 0,
+    "abandoned": 0,
+    "drain_completions": 4,
+    "outcomes": {
+      "success": 488,
+      "degraded": 0,
+      "failed": 0,
+      "admission_refused": 2981,
+      "deadline": 0,
+      "transport_error": 26527,
+      "wrong_result": 0
+    },
+    "successes_per_second": 8.133333333333333,
+    "first_row_us": [
+      105812,
+      112495,
+      115838
+    ],
+    "terminal_us": [
+      105826,
+      112519,
+      115852
+    ],
+    "max_driver_lag_us": 1609,
+    "driver_cpu_seconds": 3.389999999999999,
+    "server_deltas": {
+      "bifrost_gate_query_streams_total": 50080.0,
+      "bifrost_scribe_rows_total": 1538.0,
+      "oracle_admission_total{class=analytical,outcome=admitted}": 0.0,
+      "oracle_admission_total{class=analytical,outcome=rejected}": 0.0,
+      "oracle_admission_total{class=interactive,outcome=admitted}": 506.0,
+      "oracle_admission_total{class=interactive,outcome=rejected}": 0.0,
+      "oracle_query_files_scanned_total": 488.0,
+      "oracle_query_row_groups_pruned_total": 0.0,
+      "oracle_query_row_groups_scanned_total": 0.0,
+      "oracle_query_rows_total": 599584.0
+    },
+    "cgroup": {
+      "cpu.stat:burst_usec": 0.0,
+      "cpu.stat:core_sched.force_idle_usec": 0.0,
+      "cpu.stat:nice_usec": 0.0,
+      "cpu.stat:nr_bursts": 0.0,
+      "cpu.stat:nr_periods": 600.0,
+      "cpu.stat:nr_throttled": 0.0,
+      "cpu.stat:system_usec": 3611313.0,
+      "cpu.stat:throttled_usec": 0.0,
+      "cpu.stat:usage_usec": 35454648.0,
+      "cpu.stat:user_usec": 31843334.0,
+      "memory.current:value": 1067311104.0,
+      "memory.events:high": 0.0,
+      "memory.events:low": 0.0,
+      "memory.events:max": 0.0,
+      "memory.events:oom": 0.0,
+      "memory.events:oom_group_kill": 0.0,
+      "memory.events:oom_kill": 0.0,
+      "memory.events:sock_throttled": 0.0,
+      "memory.max:value": 8589934592.0,
+      "memory.peak:value": 1068404736.0
+    },
+    "postgres_select_ms": [
+      0.7316360000000001,
+      1.096743
+    ],
+    "live": {
+      "completed": 25,
+      "refused": 142,
+      "not_interactive": 0,
+      "failed": 25687
+    },
+    "sustained": false,
+    "saturated_boundary": "query transport",
+    "invalid": [
+      "4 held streams added 4 Interactive admissions and 0 used units",
+      "held streams occupied 0 units near the end of their hold, not 4",
+      "held live streams did not all complete: LiveStreamTally { completed: 25, refused: 142, not_interactive: 0, failed: 25687 }"
+    ]
+  },
+  {
+    "offered_rate": 1000,
+    "target_live_streams": 4,
+    "live_streams_sampled": [
+      0,
+      4
+    ],
+    "interactive_units_sampled": [
+      0.0,
+      5.0
+    ],
+    "scheduled": 60000,
+    "sent": 60000,
+    "missed_launches": 0,
+    "abandoned": 0,
+    "drain_completions": 1020,
+    "outcomes": {
+      "success": 471,
+      "degraded": 0,
+      "failed": 0,
+      "admission_refused": 3601,
+      "deadline": 0,
+      "transport_error": 54908,
+      "wrong_result": 0
+    },
+    "successes_per_second": 7.85,
+    "first_row_us": [
+      108163,
+      116807,
+      123245
+    ],
+    "terminal_us": [
+      108180,
+      116839,
+      123265
+    ],
+    "max_driver_lag_us": 2628,
+    "driver_cpu_seconds": 5.130000000000001,
+    "server_deltas": {
+      "bifrost_gate_query_streams_total": 57237.0,
+      "bifrost_scribe_rows_total": 512.0,
+      "oracle_admission_total{class=analytical,outcome=admitted}": 0.0,
+      "oracle_admission_total{class=analytical,outcome=rejected}": 0.0,
+      "oracle_admission_total{class=interactive,outcome=admitted}": 473.0,
+      "oracle_admission_total{class=interactive,outcome=rejected}": 0.0,
+      "oracle_query_files_scanned_total": 471.0,
+      "oracle_query_row_groups_pruned_total": 0.0,
+      "oracle_query_row_groups_scanned_total": 0.0,
+      "oracle_query_rows_total": 74956.0
+    },
+    "cgroup": {
+      "cpu.stat:burst_usec": 0.0,
+      "cpu.stat:core_sched.force_idle_usec": 0.0,
+      "cpu.stat:nice_usec": 0.0,
+      "cpu.stat:nr_bursts": 0.0,
+      "cpu.stat:nr_periods": 600.0,
+      "cpu.stat:nr_throttled": 0.0,
+      "cpu.stat:system_usec": 4105841.0,
+      "cpu.stat:throttled_usec": 0.0,
+      "cpu.stat:usage_usec": 34909860.0,
+      "cpu.stat:user_usec": 30804020.0,
+      "memory.current:value": 1088364544.0,
+      "memory.events:high": 0.0,
+      "memory.events:low": 0.0,
+      "memory.events:max": 0.0,
+      "memory.events:oom": 0.0,
+      "memory.events:oom_group_kill": 0.0,
+      "memory.events:oom_kill": 0.0,
+      "memory.events:sock_throttled": 0.0,
+      "memory.max:value": 8589934592.0,
+      "memory.peak:value": 1089204224.0
+    },
+    "postgres_select_ms": [
+      0.614903,
+      0.6335489999999999
+    ],
+    "live": {
+      "completed": 14,
+      "refused": 42,
+      "not_interactive": 0,
+      "failed": 665
+    },
+    "sustained": false,
+    "saturated_boundary": "query transport",
+    "invalid": [
+      "4 held streams added 4 Interactive admissions and 0 used units",
+      "held streams occupied 0 units near the end of their hold, not 4",
+      "held live streams did not all complete: LiveStreamTally { completed: 14, refused: 42, not_interactive: 0, failed: 665 }"
+    ]
+  }
+]

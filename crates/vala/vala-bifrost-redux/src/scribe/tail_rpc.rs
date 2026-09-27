@@ -982,6 +982,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{FetchLiveTailService, TailReadError, TailTicketAudience, TailTicketClaims};
+    use crate::scribe::hot_source::HotAuthority;
     use crate::scribe::memtable::Memtable;
     use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
     use crate::scribe::wal::WalLsn;
@@ -1293,8 +1294,6 @@ mod tests {
     /// after publication, or the lease does not follow the stream.
     #[tokio::test]
     async fn an_open_live_read_keeps_staged_runs_across_publication() {
-        use crate::scribe::hot_source::HotAuthority;
-
         let StagedGenerationFixture {
             service,
             memtable,

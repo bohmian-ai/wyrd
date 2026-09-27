@@ -973,6 +973,8 @@ impl QueryTerminalFrame {
 #[cfg(test)]
 mod query_terminal_tests {
     use super::*;
+    use QueryTerminalOutcome::{Degraded, Failed, Success};
+    use SourceCompletionOutcome::{Complete, Unavailable};
 
     /// Exact Arrow IPC end-of-stream marker: one continuation token followed by
     /// a zero-length message, which is what `StreamWriter::finish` appends.
@@ -1021,8 +1023,6 @@ mod query_terminal_tests {
     /// and no freshness field; only consistent combinations validate.
     #[test]
     fn closed_terminal_matrix_validates() {
-        use QueryTerminalOutcome::{Degraded, Failed, Success};
-        use SourceCompletionOutcome::{Complete, Unavailable};
         let warn = || vec![QueryWarning::LiveTailUnavailable];
 
         let success = terminal(Success, Complete, vec![]);

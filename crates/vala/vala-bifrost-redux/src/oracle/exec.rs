@@ -3710,11 +3710,14 @@ mod tests {
     use datafusion::physical_plan::union::UnionExec;
     use wyrd_runtime::Principal;
     use wyrd_runtime::permission::PermissionSet;
+    use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::AuthMethod;
     use wyrd_spec::vala::api::FollowerScanAssignment;
     use wyrd_spec::vala::api::QueryStreamFrame;
+
+    use crate::oracle::live::LiveTableRoutes;
 
     /// In-memory audit sink used only to inspect physical plan structure.
     struct NoopAudit;
@@ -6687,8 +6690,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics if the fixed hour boundary is rejected, which is a fixture bug.
-    fn one_live_route(tenant: wyrd_spec::DataTenantId) -> crate::oracle::live::LiveTableRoutes {
-        crate::oracle::live::LiveTableRoutes {
+    fn one_live_route(tenant: DataTenantId) -> LiveTableRoutes {
+        LiveTableRoutes {
             binding: wyrd_spec::vala::api::TenantTableBinding {
                 tenant_id: tenant,
                 namespace: "traces".to_owned(),

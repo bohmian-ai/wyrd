@@ -17,6 +17,7 @@ use wyrd_spec::vala::api::{
     QueryWarning,
 };
 use wyrd_spec::vala::error::BifrostError;
+use wyrd_testing::bifrost::process_cluster::{BifrostProcessCluster, ProcessNodeTarget};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use crate::support::*;
@@ -969,6 +970,11 @@ fn execution_delta(before: &[u64], after: &[u64]) -> Vec<u64> {
 /// Nothing is flushed, so every returned row can only have come from a live
 /// Scribe fragment: the query is live-only and still plans, admits, and
 /// succeeds.
+///
+/// # Errors
+///
+/// Returns an error when the cluster, ingest, or query fails, or when rows or
+/// fragment routes differ from the expected owners.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
@@ -1082,10 +1088,14 @@ async fn grouped_counts(
 ///
 /// Published rows alone, or live rows drained anywhere but the two Scribe
 /// fragments, cannot produce these counts and deltas together.
+///
+/// # Errors
+///
+/// Returns an error when the process cluster, ingest, publication, or query
+/// fails, or when counts or per-node fragment deltas differ.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), JourneyError> {
-    use wyrd_testing::bifrost::process_cluster::{BifrostProcessCluster, ProcessNodeTarget};
     /// Oracle pod the public query enters.
     const COORDINATOR: usize = 0;
     /// Oracle pods that may run published work.
@@ -1291,6 +1301,11 @@ async fn open_paused_live_query(
 /// then released, and the query succeeds with every row. Cancelling an open
 /// read and separately dropping a public client stream each release the
 /// producer, its snapshot, and its follower lease.
+///
+/// # Errors
+///
+/// Returns an error when the cluster, ingest, or query fails, or when batch
+/// production, held resources, or their release differ from the contract.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), JourneyError> {
@@ -1442,6 +1457,11 @@ async fn seed_published_and_live(
 /// rows. An ordered limit whose top row exists only live still returns it,
 /// so DataFusion rather than an Oracle early-stop rule decides when a live
 /// child is no longer needed.
+///
+/// # Errors
+///
+/// Returns an error when setup or a query fails, or when the limited result,
+/// fragment cancellation, or resource release differs.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn limit_stops_unneeded_live_fragment_without_footer() -> Result<(), JourneyError> {
@@ -1650,6 +1670,11 @@ fn table_parquet_files(
 ///   query succeeds with best-effort coverage and no warning;
 /// - deleting the published data files fails the query rather than hiding
 ///   the published loss as a live omission.
+///
+/// # Errors
+///
+/// Returns an error when setup fails or any fault case reaches a terminal
+/// class other than the one listed above.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {

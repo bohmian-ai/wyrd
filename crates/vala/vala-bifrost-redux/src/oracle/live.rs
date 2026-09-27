@@ -13,10 +13,12 @@
 //! security, resource, cancellation, or deadline fault, fails the query.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion::common::tree_node::TreeNodeRecursion;
+use chrono::{DateTime, Utc};
+use datafusion::common::tree_node::{Transformed, TreeNode as _, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::PhysicalExpr;
@@ -401,7 +403,6 @@ impl datafusion::physical_optimizer::PhysicalOptimizerRule for LiveUnionBoundary
         plan: Arc<dyn ExecutionPlan>,
         _config: &datafusion::config::ConfigOptions,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        use datafusion::common::tree_node::{Transformed, TreeNode as _};
         let holds_live = |plan: &Arc<dyn ExecutionPlan>| {
             plan.exists(|node| Ok(node.downcast_ref::<LiveScribeExec>().is_some()))
         };
@@ -572,9 +573,9 @@ pub fn live_source_batches_for_test() -> usize {
 }
 
 /// Returns the time left before `deadline`, zero once it has passed.
-fn remaining(deadline: chrono::DateTime<chrono::Utc>) -> std::time::Duration {
+fn remaining(deadline: DateTime<Utc>) -> Duration {
     deadline
-        .signed_duration_since(chrono::Utc::now())
+        .signed_duration_since(Utc::now())
         .to_std()
         .unwrap_or_default()
 }

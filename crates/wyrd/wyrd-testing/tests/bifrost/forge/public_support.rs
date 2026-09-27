@@ -12,6 +12,7 @@ use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::WyrdTestServer;
 
 use arrow::datatypes::{DataType, Field};
@@ -311,8 +312,8 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
 }
 
 /// Builds the one customer read shape this journey is allowed to use.
-fn public_query(sql: String) -> wyrd_spec::vala::api::BifrostQueryRequest {
-    wyrd_spec::vala::api::BifrostQueryRequest {
+fn public_query(sql: String) -> BifrostQueryRequest {
+    BifrostQueryRequest {
         sql,
         deadline_ms: Some(120_000),
     }

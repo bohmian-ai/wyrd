@@ -320,7 +320,13 @@ pub(crate) async fn seed_foreign_hot_row(
     conn.commit().await?;
     Ok(())
 }
+
 /// Drain a public query stream and require its terminal row count to match frames.
+///
+/// # Errors
+///
+/// Returns client or Arrow errors, and an error when the terminal is missing
+/// or its row count differs from the frames received.
 pub(crate) async fn query_rows(client: &WyrdClient, table: &str) -> Result<u64, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {

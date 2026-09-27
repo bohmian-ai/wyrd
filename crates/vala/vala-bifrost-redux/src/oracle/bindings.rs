@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::vala::api::QueryClass;
 use wyrd_spec::vala::error::BifrostError;
@@ -245,11 +246,9 @@ impl OracleExecutionBindings {
     ///
     /// Returns a `DataFusion` execution error when the query planned a live
     /// leaf but bound no dispatcher, which means plan and bindings disagree.
-    pub(super) fn live(&self) -> datafusion::error::Result<&LiveDispatch> {
+    pub(super) fn live(&self) -> DataFusionResult<&LiveDispatch> {
         self.live.as_ref().ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
-                "Oracle plan leaf has no bound live dispatch".to_owned(),
-            )
+            DataFusionError::Execution("Oracle plan leaf has no bound live dispatch".to_owned())
         })
     }
 

@@ -83,7 +83,11 @@ A finding is a root cause, not a symptom. Before reporting, each reviewer:
    belongs) is what permits the defect; and
 3. sweeps for siblings: every other site in the candidate with the same root
    cause or pattern, found through callers, references, and the same rule.
-   Siblings are locations of one finding, never separate findings.
+   Siblings are locations of one finding, never separate findings. When the
+   defect is a missing check (cancellation, validation, authorization,
+   cleanup), find siblings from the sinks, not a code pattern: list every
+   externally visible effect and success result the facade can reach, and
+   show whether the check precedes each one.
 
 Each finding records its ID, classification, root cause, defect class, every
 sibling location, violated obligation or written rule, evidence, observable
@@ -360,7 +364,9 @@ the root-cause correction touches; never narrow it below that.
 
 The remediation task packages validated findings for a fresh implementation
 agent; it is not another design plan. Do not specify helpers, private methods,
-local control flow, fixture structure, or optional improvements. Route it
+local control flow, check placement, fixture structure, or optional
+improvements. For a missing check, state the rule and its complete sink list;
+the closure proof covers every sink. Route it
 directly to `$wyrd-implement`. A later review reassesses the complete cumulative
 candidate against the original task.
 

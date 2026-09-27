@@ -236,6 +236,21 @@ fn bifrost_error_from_code(
         "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH" => BifrostError::FingerprintMismatch {
             table: table_from_message("schema fingerprint mismatch: "),
         },
+        "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH" => {
+            BifrostError::CompactionTargetMismatch {
+                table: table_from_message("compaction target mismatch for table: "),
+            }
+        }
+        "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET" => {
+            let (bytes, table) = message
+                .strip_prefix("invalid compaction target file size ")
+                .and_then(|rest| rest.split_once(" for table "))
+                .unwrap_or_default();
+            BifrostError::InvalidCompactionTarget {
+                table: table.to_owned(),
+                bytes: bytes.parse().unwrap_or_default(),
+            }
+        }
         "WYRD_VALA_400_QUERY_INVALID_SQL" => BifrostError::QueryInvalidSql {
             detail: message
                 .strip_prefix("invalid or unsupported query SQL: ")
@@ -416,6 +431,28 @@ mod tests {
         assert_eq!(
             conflict.code(),
             "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
+        );
+
+        let target_conflict = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH",
+            "detail": "compaction target mismatch for table: vala.datasets.events",
+            "details": {},
+        }));
+        assert_eq!(target_conflict.status(), 409);
+        assert_eq!(
+            target_conflict.code(),
+            "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH"
+        );
+
+        let invalid_target = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET",
+            "detail": "invalid compaction target file size 1 for table vala.datasets.events",
+            "details": {},
+        }));
+        assert_eq!(invalid_target.status(), 400);
+        assert_eq!(
+            invalid_target.to_string(),
+            "invalid compaction target file size 1 for table vala.datasets.events"
         );
 
         let invalid_sql = from_problem_json(&serde_json::json!({

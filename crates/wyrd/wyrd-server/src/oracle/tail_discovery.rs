@@ -8,10 +8,9 @@ use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use vala_bifrost_redux::oracle::{DiscoveredTailRoute, TailStreamDiscovery};
 use vala_bifrost_redux::scribe::tail_rpc::{
-    TailReadError, TailReadTransport, TailTicketAudience, TailTicketClaims, TailTicketMinter,
-    TonicTailReadTransport,
+    TailReadError, TailTicketAudience, TailTicketClaims, TailTicketMinter, TonicTailReadTransport,
 };
-use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
+use wyrd_spec::vala::api::TenantTableBinding;
 
 /// Production resolver that owns no persistent route registry.
 pub struct RegistryTailStreamDiscovery {
@@ -23,10 +22,6 @@ pub struct RegistryTailStreamDiscovery {
     tls: Option<BifrostPeerTls>,
     /// Server-owned domain-separated ticket signer.
     minter: Arc<dyn TailTicketMinter>,
-    /// Local node identity used to select an optional zero-copy transport.
-    local_node: NodeId,
-    /// Optional local authorized transport.
-    local_transport: Option<Arc<dyn TailReadTransport>>,
     /// Test-tier private discovery outage switch.
     #[cfg(feature = "test-support")]
     unavailable: AtomicBool,
@@ -40,16 +35,12 @@ impl RegistryTailStreamDiscovery {
         credentials: Arc<dyn OraclePeerCredentials>,
         tls: Option<BifrostPeerTls>,
         minter: Arc<dyn TailTicketMinter>,
-        local_node: NodeId,
-        local_transport: Option<Arc<dyn TailReadTransport>>,
     ) -> Self {
         Self {
             cluster,
             credentials,
             tls,
             minter,
-            local_node,
-            local_transport,
             #[cfg(feature = "test-support")]
             unavailable: AtomicBool::new(false),
         }
@@ -64,7 +55,7 @@ impl RegistryTailStreamDiscovery {
         &self,
         address: &str,
         deadline: Instant,
-    ) -> Result<Arc<dyn TailReadTransport>, TailReadError> {
+    ) -> Result<TonicTailReadTransport, TailReadError> {
         let endpoint = self
             .tls
             .as_ref()
@@ -93,11 +84,9 @@ impl RegistryTailStreamDiscovery {
             })?;
         let client =
             wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient::new(channel);
-        Ok(Arc::new(
-            TonicTailReadTransport::new(client, &bearer).map_err(|_| TailReadError::State {
-                detail: "tail credential metadata is invalid".to_owned(),
-            })?,
-        ))
+        TonicTailReadTransport::new(client, &bearer).map_err(|_| TailReadError::State {
+            detail: "tail credential metadata is invalid".to_owned(),
+        })
     }
 }
 
@@ -148,15 +137,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
                 continue;
             }
             let node_id = lease.key.node_id;
-            let transport = if node_id == self.local_node {
-                if let Some(transport) = self.local_transport.clone() {
-                    transport
-                } else {
-                    self.remote_transport(&lease.address, deadline).await?
-                }
-            } else {
-                self.remote_transport(&lease.address, deadline).await?
-            };
+            let transport = self.remote_transport(&lease.address, deadline).await?;
             let epoch = lease.fencing_token;
             let ticket = self
                 .minter
@@ -201,7 +182,6 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
                 routes.push(DiscoveredTailRoute {
                     time_partition: stream.time_partition,
                     stream: stream.stream,
-                    transport: Arc::clone(&transport),
                 });
             }
         }

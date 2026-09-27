@@ -45,7 +45,6 @@ use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
-use crate::scribe::tail_rpc::TailReadTransport;
 
 mod admission;
 pub mod analytical;
@@ -102,7 +101,7 @@ pub use spill::OracleSpillRuntime;
 pub fn query_lifecycle_observer_for_test() -> std::sync::Arc<query_stream::QueryLifecycleObserver> {
     query_stream::query_lifecycle_observer_for_test()
 }
-mod tail_fence;
+mod tail_discovery;
 pub mod telemetry;
 
 use telemetry::{
@@ -140,7 +139,7 @@ fn test_query_stream_from_physical(
     query_stream::OracleQueryStream::test_from_physical(schema, batches, scan_stats)
 }
 
-pub use tail_fence::{DiscoveredTailRoute, TailStreamDiscovery};
+pub use tail_discovery::{DiscoveredTailRoute, TailStreamDiscovery};
 
 /// Default maximum SQL request size accepted by the synchronous query floor.
 pub const DEFAULT_MAX_SQL_BYTES: usize = 64 * 1024;
@@ -1116,7 +1115,7 @@ pub struct OracleBuildConfig {
     /// follower even when it holds a valid peer certificate.
     pub peer_credentials: Option<Arc<dyn dispatcher::OraclePeerCredentials>>,
     /// Query-scoped live Scribe discovery owner.
-    pub tail_discovery: Option<Arc<dyn tail_fence::TailStreamDiscovery>>,
+    pub tail_discovery: Option<Arc<dyn tail_discovery::TailStreamDiscovery>>,
     /// Optional node-aware local/tonic directory used for immutable sealed leaves.
     pub peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
     /// Engine limits and lifecycle values.
@@ -1401,7 +1400,7 @@ pub struct Oracle {
     /// from its own admitted grant after the class is derived.
     planning_runtime: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
     /// Query-scoped live Scribe discovery owner.
-    tail_discovery: Option<Arc<dyn tail_fence::TailStreamDiscovery>>,
+    tail_discovery: Option<Arc<dyn tail_discovery::TailStreamDiscovery>>,
     /// Test-tier one-shot refusal armed immediately before the distributed build.
     ///
     /// Selection has two distinct pre-selection refusals that both fall back to
@@ -3511,7 +3510,7 @@ impl Oracle {
         };
         let query_id = roster.attempt_id().as_uuid();
         for cut in cuts {
-            let binding = tail_fence::wire_binding(cut)?;
+            let binding = tail_discovery::wire_binding(cut)?;
             let mut listed = discovery.discover(&binding, query_id, deadline).await;
             if let Err(crate::scribe::tail_rpc::TailReadError::State { detail }) = &listed
                 && (detail.contains("stale") || detail.contains("epoch"))
@@ -3825,7 +3824,7 @@ fn follower_scan_assignment(
         });
     Ok(wyrd_spec::vala::api::FollowerScanAssignment {
         scan_id: placeholder.scan_id().to_owned(),
-        binding: tail_fence::wire_binding(cut)?,
+        binding: tail_discovery::wire_binding(cut)?,
         reader_cut,
         persisted: wyrd_spec::vala::api::PersistedFileAssignment { files },
         scribe_provider_cut: None,

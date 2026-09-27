@@ -27,10 +27,7 @@ use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFin
 use vala_bifrost_redux::scribe::tail_rpc::{
     TailTicketAudience, TailTicketClaims, TailTicketMinter,
 };
-use vala_bifrost_redux::scribe::{
-    replay::replay_wal_directory,
-    tail_rpc::{LocalTailReadTransport, TailReadTransport, TonicTailReadTransport},
-};
+use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTailReadTransport};
 use vala_sql::TenantConn;
 use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
@@ -41,11 +38,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AcquireTailFenceRequest as DomainAcquireTailFenceRequest,
-    SchemaFingerprint as WireSchemaFingerprint, TailCursor,
-    TailPageRequest as DomainTailPageRequest, TenantTableBinding,
-};
+use wyrd_spec::vala::api::TenantTableBinding;
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::logs::v1::ResourceLogs;
@@ -63,7 +56,7 @@ use wyrd_tonic::tonic::{Code, Request, Status};
 use wyrd_tonic::tonic_health::server::health_reporter;
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
-use wyrd_tonic::wyrd::v1::{AcquireTailFenceRequest, InsertBatchRequest, ReleaseTailFenceRequest};
+use wyrd_tonic::wyrd::v1::{InsertBatchRequest, ListActiveStreamsRequest};
 
 /// Seed one additional data tenant through the composed fixture's operator.
 ///
@@ -119,9 +112,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
 /// The instant the private-tail fixture writes its rows at.
 ///
 /// Production Scribe admission bounds event time to a window around now, so a
-/// frozen literal would age out of the accepted range and start failing. The
-/// batch timestamp and the fence request's time partition both derive from
-/// this one value so they always name the same UTC partition.
+/// frozen literal would age out of the accepted range and start failing.
 fn fixture_event_time() -> DateTime<Utc> {
     Utc::now()
 }
@@ -157,61 +148,65 @@ fn non_empty_tail_batch() -> RecordBatch {
 /// so the tail fixtures seed and read this one.
 const TAIL_TABLE: &str = "tail_events";
 
-/// Creates a metadata-only fence request matching the seeded logical schema.
-fn non_empty_tail_request(tenant: DataTenantId) -> DomainAcquireTailFenceRequest {
-    let expected = ReduxSchemaFingerprint::from_arrow_schema(&Schema::new(vec![Field::new(
-        "value",
-        DataType::Int64,
-        false,
-    )]));
-    DomainAcquireTailFenceRequest {
-        query_id: uuid::Uuid::now_v7(),
-        binding: TenantTableBinding {
-            tenant_id: tenant,
-            namespace: "datasets".to_owned(),
-            table: TAIL_TABLE.to_owned(),
-        },
-        time_partition: vala_bifrost_redux::catalog::TimeGranularity::Hour
-            .bucket(fixture_event_time())
-            .expect("fixture instant buckets to an exact hour")
-            .to_wire(),
-        exclusive_sealed: TailCursor {
-            writer_epoch: 1,
-            wal_lsn: 0,
-            batch_id: uuid::Uuid::nil(),
-            row_ordinal: 0,
-        },
-        deadline: chrono::Utc::now() + ChronoDuration::seconds(5),
-        schema_fingerprint: WireSchemaFingerprint::new(hex::encode(expected.0))
-            .expect("fixture fingerprint is valid"),
-        tail_protocol_version: 1,
+/// Names the private-tail fixture table for `tenant` on the discovery wire.
+fn tail_binding(tenant: DataTenantId) -> TenantTableBinding {
+    TenantTableBinding {
+        tenant_id: tenant,
+        namespace: "datasets".to_owned(),
+        table: TAIL_TABLE.to_owned(),
     }
 }
 
-/// Mints the private acquire ticket bound to the fixture's exact stream tuple.
-fn mint_tail_ticket(state: &AppState, request: &DomainAcquireTailFenceRequest) -> Vec<u8> {
+/// Mints a List ticket for `ticket_tenant` bound to the fixture Scribe stream.
+///
+/// The ticket's tenant is independent of the binding a caller later presents,
+/// so a denial proof can present one tenant's ticket against another's table.
+fn mint_list_ticket(
+    state: &AppState,
+    query_id: uuid::Uuid,
+    ticket_tenant: DataTenantId,
+) -> Vec<u8> {
     let ingest = state
         .bifrost_ingest()
         .expect("fixture retains ingest runtime");
     let authority = ingest
         .tail_authority()
         .expect("fixture retains tail authority");
-    let stream = ingest.tail_reader().stream_identity();
+    let stream = ingest.tail_service().stream();
     authority
         .mint_tail_ticket(&TailTicketClaims {
-            query_id: request.query_id,
-            tenant_id: request.binding.tenant_id,
+            query_id,
+            tenant_id: ticket_tenant,
             canonical_table: format!("vala.datasets.{TAIL_TABLE}"),
             node_id: stream.node_id.as_uuid(),
             writer_epoch: u64::try_from(stream.writer_epoch.as_i64())
                 .expect("fixture epoch is non-negative"),
-            deadline: request.deadline,
-            audience: TailTicketAudience::Acquire,
+            deadline: chrono::Utc::now() + ChronoDuration::seconds(5),
+            audience: TailTicketAudience::List,
             // The authority refuses a replayed nonce, so each fixture ticket
             // derives its own from the query it is bound to.
-            nonce: request.query_id.as_bytes().to_vec(),
+            nonce: query_id.as_bytes().to_vec(),
         })
         .expect("fixture tail ticket signs")
+}
+
+/// Builds one raw authenticated `ListActiveStreams` request.
+fn list_request(
+    binding: TenantTableBinding,
+    query_id: uuid::Uuid,
+    ticket: Vec<u8>,
+    bearer: &str,
+) -> Request<ListActiveStreamsRequest> {
+    let mut request = Request::new(ListActiveStreamsRequest {
+        tail_ticket: ticket,
+        binding: Some(binding.into()),
+        query_id: query_id.as_bytes().to_vec(),
+    });
+    request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        format!("Bearer {bearer}").parse().expect("metadata value"),
+    );
+    request
 }
 
 /// Creates the server-verified identity used to seed the embedded Scribe.
@@ -729,7 +724,7 @@ async fn scribe_tail_unauthenticated_is_rejected_before_lookup() {
 
     let mut client = ScribeTailServiceClient::new(connect_peer_channel(bind, &authority).await);
     let status = client
-        .acquire_fence(Request::new(AcquireTailFenceRequest::default()))
+        .list_active_streams(Request::new(ListActiveStreamsRequest::default()))
         .await
         .expect_err("missing workload token must fail before request conversion");
     shutdown.cancel();
@@ -738,28 +733,23 @@ async fn scribe_tail_unauthenticated_is_rejected_before_lookup() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Produces identical bounded non-empty pages through local and generated-tonic readers.
+/// Lists the seeded live partition through the authenticated generated-tonic client.
 ///
 /// # Panics
-/// Panics if contiguous batching, byte limits, or continuation differ across transports.
+/// Panics if discovery fails or names another stream than the local Scribe.
 #[tokio::test]
-async fn scribe_tail_local_and_tonic_pages_match() {
+async fn scribe_tail_tonic_lists_seeded_partition() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let state = server.state();
     let tenant = server.data_tenant_id();
     seed_tail_rows(state, tenant).await;
-    let request = non_empty_tail_request(tenant);
-    let local_reader = state
+    let stream = state
         .bifrost_ingest()
         .expect("embedded state retains Scribe")
-        .tail_reader();
-    let local = LocalTailReadTransport::new(local_reader);
-    let local_fence = local
-        .acquire_fence(request.clone())
-        .await
-        .expect("local metadata fence acquires");
+        .tail_service()
+        .stream();
 
     let (bind, shutdown, authority) = serve_peer_grpc(state).await;
     let remote = TonicTailReadTransport::new(
@@ -767,121 +757,33 @@ async fn scribe_tail_local_and_tonic_pages_match() {
         &server.peer_bearer().await.expect("peer bearer exchanges"),
     )
     .expect("peer bearer configures remote transport");
-    let query_id = request.query_id;
-    let remote_lease = remote
-        .acquire_fence_with_capability(request.clone(), mint_tail_ticket(state, &request))
-        .await
-        .expect("remote metadata fence and capability acquire");
-    let remote_fence = remote_lease.fence.clone();
-    assert_eq!(local_fence.inclusive_live, remote_fence.inclusive_live);
-
-    let complete = local
-        .read_page(DomainTailPageRequest {
+    let query_id = uuid::Uuid::now_v7();
+    let streams = remote
+        .list_active_streams(
+            tail_binding(tenant),
             query_id,
-            fence_id: local_fence.fence_id,
-            after: None,
-            max_rows: 16,
-            max_encoded_bytes: 1024 * 1024,
-        })
-        .await
-        .expect("contiguous rows share one page batch");
-    assert!(complete.complete);
-    assert_eq!(complete.batches.len(), 1);
-    assert_eq!(complete.batches[0].num_rows(), 2);
-    let bytes = vala_bifrost_redux::scribe::tail_rpc::encode_tail_batch_exact(&complete.batches[0])
-        .expect("complete page encodes")
-        .len();
-    let bounded = remote
-        .read_page_with_capability(
-            DomainTailPageRequest {
-                query_id,
-                fence_id: remote_fence.fence_id,
-                after: None,
-                max_rows: 16,
-                max_encoded_bytes: u32::try_from(bytes - 1).expect("page fits wire limit"),
-            },
-            remote_lease.capability.clone(),
+            mint_list_ticket(state, query_id, tenant),
         )
         .await
-        .expect("byte ceiling splits the contiguous batch");
-    assert!(!bounded.complete);
-    assert_eq!(bounded.batches.len(), 1);
-    assert_eq!(bounded.batches[0].num_rows(), 1);
-
-    let local_first = local
-        .read_page(DomainTailPageRequest {
-            query_id,
-            fence_id: local_fence.fence_id,
-            after: None,
-            max_rows: 1,
-            max_encoded_bytes: 1024 * 1024,
-        })
-        .await
-        .expect("local first page reads");
-    let remote_first = remote
-        .read_page_with_capability(
-            DomainTailPageRequest {
-                query_id,
-                fence_id: remote_fence.fence_id,
-                after: None,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            },
-            remote_lease.capability.clone(),
-        )
-        .await
-        .expect("remote first page reads");
-    assert_eq!(local_first.batches, remote_first.batches);
-    assert_eq!(local_first.next, remote_first.next);
-    assert!(!local_first.complete);
-    assert!(!remote_first.complete);
-
-    let local_second = local
-        .read_page(DomainTailPageRequest {
-            query_id,
-            fence_id: local_fence.fence_id,
-            after: local_first.next,
-            max_rows: 1,
-            max_encoded_bytes: 1024 * 1024,
-        })
-        .await
-        .expect("local continuation reads");
-    let remote_second = remote
-        .read_page_with_capability(
-            DomainTailPageRequest {
-                query_id,
-                fence_id: remote_fence.fence_id,
-                after: remote_first.next,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            },
-            remote_lease.capability.clone(),
-        )
-        .await
-        .expect("remote continuation reads");
-    assert_eq!(local_second.batches, remote_second.batches);
-    assert_eq!(local_second.next, remote_second.next);
-    assert!(local_second.complete);
-    assert!(remote_second.complete);
-
-    assert!(
-        local
-            .release_fence(local_fence.fence_id)
-            .expect("local fence release succeeds")
-            .released
+        .expect("authorized discovery lists the seeded partition");
+    assert_eq!(streams.len(), 1, "one live partition holds the seeded rows");
+    assert_eq!(
+        streams[0].stream.node_id.as_uuid(),
+        stream.node_id.as_uuid()
     );
-    remote
-        .release_fence_with_capability(query_id, remote_fence.fence_id, remote_lease.capability)
-        .await
-        .expect("remote fence release succeeds");
+    assert_eq!(
+        streams[0].stream.writer_epoch,
+        u64::try_from(stream.writer_epoch.as_i64()).expect("fixture epoch is non-negative")
+    );
     shutdown.cancel();
 
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Denies cross-tenant page and release RPCs without exposing or removing the fence.
+/// Denies discovery whose signed ticket does not bind the presented request,
+/// auditing each denial under the tenant the ticket names.
 #[tokio::test]
-async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
+async fn scribe_tail_cross_tenant_and_cross_query_listing_are_denied() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -891,23 +793,11 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
     seed_tenant(&server, owner_tenant, "tail-owner").await;
     seed_tenant(&server, other_tenant, "tail-other").await;
     seed_tail_rows(state, owner_tenant).await;
+    seed_tail_rows(state, other_tenant).await;
 
     let (bind, shutdown, authority) = serve_peer_grpc(state).await;
     let channel = connect_peer_channel(bind, &authority).await;
     let peer_bearer = server.peer_bearer().await.expect("peer bearer exchanges");
-    let owner =
-        TonicTailReadTransport::new(ScribeTailServiceClient::new(channel.clone()), &peer_bearer)
-            .expect("owner transport configures");
-    let owner_request = non_empty_tail_request(owner_tenant);
-    let owner_query_id = owner_request.query_id;
-    let owner_lease = owner
-        .acquire_fence_with_capability(
-            owner_request.clone(),
-            mint_tail_ticket(state, &owner_request),
-        )
-        .await
-        .expect("owner fence acquires");
-    let fence = owner_lease.fence.clone();
     let assertion_pool = server
         .pg_fixture()
         .superuser_pool()
@@ -941,100 +831,31 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
 
     // On the peer plane the listener admits exactly one system-owner Service
     // principal, so a foreign *token* never reaches the tail service at all.
-    // The reachable cross-tenant vector is a capability the foreign tenant
-    // legitimately holds for its own fence, replayed against this one. It must
-    // be a real page-audience capability: an acquire ticket fails decode
-    // before any tenant is known, and an undecodable credential is refused
-    // without a TailBinding violation to audit.
-    let other_request = non_empty_tail_request(other_tenant);
-    let other_lease = owner
-        .acquire_fence_with_capability(
-            other_request.clone(),
-            mint_tail_ticket(state, &other_request),
-        )
-        .await
-        .expect("foreign tenant acquires its own fence");
-    let other_capability = other_lease.capability.clone();
+    // The reachable vectors are a legitimately signed ticket presented against
+    // a request it does not bind: another tenant's table, or another query.
     let mut client = ScribeTailServiceClient::new(channel);
-    let mut page: Request<wyrd_tonic::wyrd::v1::TailPageRequest> = Request::new(
-        DomainTailPageRequest {
-            query_id: owner_query_id,
-            fence_id: fence.fence_id,
-            after: None,
-            max_rows: 1,
-            max_encoded_bytes: 1024 * 1024,
-        }
-        .into(),
-    );
-    page.get_mut().tail_capability = other_capability.clone();
-    page.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {peer_bearer}")
-            .parse()
-            .expect("metadata value"),
-    );
-    let page_status = client
-        .read_fence_page(page)
+    let cross_tenant_query = uuid::Uuid::now_v7();
+    let cross_tenant_status = client
+        .list_active_streams(list_request(
+            tail_binding(other_tenant),
+            cross_tenant_query,
+            mint_list_ticket(state, cross_tenant_query, owner_tenant),
+            &peer_bearer,
+        ))
         .await
-        .expect_err("foreign tenant cannot read retained rows");
-    assert_eq!(page_status.code(), Code::PermissionDenied);
+        .expect_err("an owner ticket cannot list another tenant's table");
+    assert_eq!(cross_tenant_status.code(), Code::PermissionDenied);
 
-    let mut wrong_query_page: Request<wyrd_tonic::wyrd::v1::TailPageRequest> = Request::new(
-        DomainTailPageRequest {
-            query_id: uuid::Uuid::now_v7(),
-            fence_id: fence.fence_id,
-            after: None,
-            max_rows: 1,
-            max_encoded_bytes: 1024 * 1024,
-        }
-        .into(),
-    );
-    wrong_query_page.get_mut().tail_capability = owner_lease.capability.clone();
-    wrong_query_page.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {peer_bearer}")
-            .parse()
-            .expect("metadata value"),
-    );
-    let wrong_query_status = client
-        .read_fence_page(wrong_query_page)
+    let cross_query_status = client
+        .list_active_streams(list_request(
+            tail_binding(owner_tenant),
+            uuid::Uuid::now_v7(),
+            mint_list_ticket(state, uuid::Uuid::now_v7(), owner_tenant),
+            &peer_bearer,
+        ))
         .await
-        .expect_err("query mismatch cannot read retained rows");
-    assert_eq!(wrong_query_status.code(), Code::PermissionDenied);
-
-    let mut release = Request::new(ReleaseTailFenceRequest {
-        query_id: owner_query_id.as_bytes().to_vec(),
-        fence_id: fence.fence_id.as_uuid().as_bytes().to_vec(),
-        tail_capability: other_capability.clone(),
-    });
-    release.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {peer_bearer}")
-            .parse()
-            .expect("metadata value"),
-    );
-    let release_status = client
-        .release_fence(release)
-        .await
-        .expect_err("foreign tenant cannot remove retained rows");
-    assert_eq!(release_status.code(), Code::PermissionDenied);
-
-    let mut wrong_query_release = Request::new(ReleaseTailFenceRequest {
-        query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
-        fence_id: fence.fence_id.as_uuid().as_bytes().to_vec(),
-        tail_capability: owner_lease.capability.clone(),
-    });
-    wrong_query_release.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {peer_bearer}")
-            .parse()
-            .expect("metadata value"),
-    );
-    let wrong_query_release_status = client
-        .release_fence(wrong_query_release)
-        .await
-        .expect_err("query mismatch cannot release retained rows");
-    assert_eq!(wrong_query_release_status.code(), Code::PermissionDenied);
+        .expect_err("a ticket for another query cannot list this one");
+    assert_eq!(cross_query_status.code(), Code::PermissionDenied);
 
     /// One `bifrost.scribe.tail_security` audit row projected from
     /// `vala.audit_staging`: `(data_tenant_id, principal_id, principal_kind,
@@ -1047,13 +868,12 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
         String,
         Option<String>,
     );
-    // The violation is audited under the tenant the presented capability names,
+    // The violation is audited under the tenant the presented ticket names,
     // not the transport caller: on the peer plane every caller is the same
-    // system-owner Service principal. Two denials carry the foreign
-    // capability and two carry the owner's, so each tenant commits two rows.
-    for (tenant, seq_before, count_before) in [
-        (owner_tenant, owner_seq_before, owner_count_before),
-        (other_tenant, other_seq_before, other_count_before),
+    // system-owner Service principal. Both denials carry owner tickets.
+    for (tenant, seq_before, count_before, expected) in [
+        (owner_tenant, owner_seq_before, owner_count_before, 2),
+        (other_tenant, other_seq_before, other_count_before, 0),
     ] {
         let security_rows: Vec<SecurityAuditRow> = sqlx::query_as(
             "SELECT data_tenant_id, principal_id, principal_kind, permission, \
@@ -1069,8 +889,8 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
         .expect("durable tail-security audit rows");
         assert_eq!(
             security_rows.len() as i64,
-            2,
-            "one committed TailBinding row per denied page/release request"
+            expected,
+            "one committed TailBinding row per denied listing, under the ticket tenant"
         );
         let count_after: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM vala.audit_staging \
@@ -1080,7 +900,7 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
         .fetch_one(&assertion_pool)
         .await
         .expect("tail-security audit observation");
-        assert_eq!(count_after - count_before, 2);
+        assert_eq!(count_after - count_before, expected);
         for (data_tenant_id, principal_id, principal_kind, permission, outcome, detail) in
             security_rows
         {
@@ -1107,25 +927,6 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
     .await
     .expect("system audit-chain observation");
     assert_eq!(system_seq_after, system_seq_before);
-
-    let owner_page = owner
-        .read_page_with_capability(
-            DomainTailPageRequest {
-                query_id: owner_query_id,
-                fence_id: fence.fence_id,
-                after: None,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            },
-            owner_lease.capability.clone(),
-        )
-        .await
-        .expect("denied release leaves the owner fence readable");
-    assert_eq!(owner_page.batches.len(), 1);
-    owner
-        .release_fence_with_capability(owner_query_id, fence.fence_id, owner_lease.capability)
-        .await
-        .expect("owner can still release its fence");
     shutdown.cancel();
 
     server.shutdown().await.expect("server shuts down");

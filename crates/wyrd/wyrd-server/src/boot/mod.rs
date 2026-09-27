@@ -800,12 +800,12 @@ pub async fn compose_bifrost(
                 "WAL recovery failed before role activation: {error}"
             )));
         }
-        if let Err(error) = scribe.tail_reader() {
+        if let Err(error) = scribe.tail_service() {
             if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
                 tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after tail failure");
             }
             return Err(ServerBootError::Scribe(format!(
-                "tail reader failed before role activation: {error}"
+                "tail service failed before role activation: {error}"
             )));
         }
         if let Err(error) = cluster_registry.activate(&scribe_role).await {
@@ -1832,8 +1832,6 @@ impl<'a> OracleRoleBuilder<'a> {
             tail_tls,
             Arc::clone(&tail_authority)
                 as Arc<dyn vala_bifrost_redux::scribe::tail_rpc::TailTicketMinter>,
-            node_id,
-            None,
         ));
         let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
             authority.clone();

@@ -351,8 +351,6 @@ pub struct BifrostQueryResourceSnapshot {
     pub memory_bytes: u64,
     /// Local leader or peer-worker slot units currently retained.
     pub peer_slots: u64,
-    /// Scribe tail fences currently retained for Fused reads.
-    pub tail_fences: u64,
 }
 
 /// Production-owner Oracle residual state captured without a test adapter.
@@ -1437,7 +1435,6 @@ impl WyrdTestServer {
             admission_slots: snapshot.admission_slots,
             memory_bytes: snapshot.memory_bytes,
             peer_slots: snapshot.peer_slots,
-            tail_fences: snapshot.tail_fences,
         })
     }
 
@@ -2198,18 +2195,6 @@ impl WyrdTestServer {
         self.inner
             .state
             .scribe_inspection_snapshot_for_test()
-            .map_err(WyrdTestServerError::Start)
-    }
-
-    /// Return the exact live-tail fences retained by this server's Scribe.
-    ///
-    /// # Errors
-    /// Returns an error when the server has no Scribe or the production fence
-    /// registry cannot be inspected.
-    pub fn active_bifrost_tail_fences(&self) -> Result<u64, WyrdTestServerError> {
-        self.inner
-            .state
-            .active_scribe_tail_fences_for_test()
             .map_err(WyrdTestServerError::Start)
     }
 

@@ -1423,7 +1423,6 @@ macro_rules! private_uuid_id {
     };
 }
 
-private_uuid_id!(TailFenceId, "Opaque identity for one Scribe tail fence.");
 private_uuid_id!(
     ReservationId,
     "Opaque identity for one pending Oracle worker reservation."
@@ -1649,21 +1648,7 @@ pub struct TenantTableBinding {
     pub table: String,
 }
 
-/// Stable position within one Scribe writer stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TailCursor {
-    /// Writer boot epoch.
-    pub writer_epoch: WriterEpoch,
-    /// WAL sequence within the epoch.
-    pub wal_lsn: WalLsn,
-    /// Exact UUID batch identity.
-    pub batch_id: uuid::Uuid,
-    /// Stable row ordinal within the batch.
-    pub row_ordinal: u32,
-}
-
-/// Identity of the fenced stream; cursors intentionally carry no node ID.
+/// Identity of one Scribe writer stream serving a live partition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct TailStreamIdentity {
@@ -1671,91 +1656,6 @@ pub struct TailStreamIdentity {
     pub node_id: NodeId,
     /// Writer boot epoch.
     pub writer_epoch: WriterEpoch,
-}
-
-/// Request to acquire one immutable Scribe tail fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct AcquireTailFenceRequest {
-    /// Query identity bound into the private signed tail ticket.
-    pub query_id: uuid::Uuid,
-    /// Tenant/table binding.
-    pub binding: TenantTableBinding,
-    /// Exact time partition the fence is bound to.
-    pub time_partition: TimePartitionWire,
-    /// Exclusive sealed cursor.
-    pub exclusive_sealed: TailCursor,
-    /// Absolute execution deadline.
-    pub deadline: DateTime<Utc>,
-    /// Expected schema fingerprint.
-    pub schema_fingerprint: SchemaFingerprint,
-    /// Required tail protocol version.
-    pub tail_protocol_version: u16,
-}
-
-/// Immutable interval and stream identity returned by Scribe.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TailReadFence {
-    /// Fence identity.
-    pub fence_id: TailFenceId,
-    /// Tenant/table binding.
-    pub binding: TenantTableBinding,
-    /// Exact time partition the fence is bound to.
-    pub time_partition: TimePartitionWire,
-    /// Fenced stream identity.
-    pub stream: TailStreamIdentity,
-    /// Exclusive sealed cursor.
-    pub exclusive_sealed: TailCursor,
-    /// Inclusive live cursor.
-    pub inclusive_live: TailCursor,
-    /// Exact schema fingerprint.
-    pub schema_fingerprint: SchemaFingerprint,
-    /// Tail protocol version.
-    pub tail_protocol_version: u16,
-    /// Fence expiry.
-    pub expires_at: DateTime<Utc>,
-}
-
-/// Request for one bounded page inside a tail fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TailPageRequest {
-    /// Query identity authorized to read the fence.
-    pub query_id: uuid::Uuid,
-    /// Fence identity.
-    pub fence_id: TailFenceId,
-    /// Cursor after which reading resumes.
-    pub after: Option<TailCursor>,
-    /// Maximum returned rows.
-    pub max_rows: u32,
-    /// Maximum encoded response bytes.
-    pub max_encoded_bytes: u32,
-}
-
-/// One transport-owned Arrow IPC batch in a tail page.
-pub type TailBatch = Vec<u8>;
-
-/// One bounded page from an immutable tail fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TailPage {
-    /// Owned Arrow IPC batches.
-    pub batches: Vec<TailBatch>,
-    /// Last included cursor when more data may follow.
-    pub next: Option<TailCursor>,
-    /// Whether the fence interval is exhausted.
-    pub complete: bool,
-}
-
-/// Idempotent request to release one tail fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct ReleaseTailFenceRequest {
-    /// Query identity authorized to release the fence.
-    pub query_id: uuid::Uuid,
-    /// Fence identity.
-    pub fence_id: TailFenceId,
 }
 
 /// Fenced request to reserve worker slots.
@@ -2941,10 +2841,6 @@ mod bifrost_wire_tests {
     /// Private tail and peer DTOs remain schema-generatable pure contracts.
     #[test]
     fn private_query_schema_types_do_not_panic() {
-        let _ = schema_for!(super::AcquireTailFenceRequest);
-        let _ = schema_for!(super::TailReadFence);
-        let _ = schema_for!(super::TailPageRequest);
-        let _ = schema_for!(super::TailPage);
         let _ = schema_for!(super::ReserveNodeSlotsRequest);
         let _ = schema_for!(super::ReserveNodeSlotsResponse);
         let _ = schema_for!(super::ReleaseNodeSlotsRequest);

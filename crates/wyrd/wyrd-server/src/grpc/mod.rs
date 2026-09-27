@@ -414,11 +414,11 @@ pub fn build_peer_grpc(
                 match scribe.tail_authority() {
                     Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
                         state.clone(),
-                        scribe.tail_reader(),
+                        scribe.tail_service(),
                         authority,
                     )
                     .into_server(),
-                    None => scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_reader())
+                    None => scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_service())
                         .into_server(),
                 },
                 transport.clone(),

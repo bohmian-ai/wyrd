@@ -189,8 +189,6 @@ pub struct ClusterCleanupSnapshot {
     pub scribe_inflight: u64,
     /// Persistent Scribe WAL streams retained by the server runtime.
     pub scribe_wal_streams: u64,
-    /// Exact Oracle tail fences observed after the cancellation owner released.
-    pub oracle_tail_fences: u64,
     /// Forge claims/attempts still active at the cleanup checkpoint.
     pub forge_active_claims: u64,
     /// Forge attempts still owned by a non-terminal task.
@@ -711,7 +709,6 @@ async fn exercise_query_cancellation(
         admission_slots: 0,
         memory_bytes: 0,
         peer_slots: 0,
-        tail_fences: 0,
     };
     task.abort();
     let _ = task.await;
@@ -2147,7 +2144,6 @@ async fn cleanup_snapshot(
         scribe_queued: queued,
         scribe_inflight: inflight,
         scribe_wal_streams: wal_streams,
-        oracle_tail_fences: inspection.active_tail_fences,
         forge_active_claims: inspection.forge_active_claims,
         forge_active_attempts: inspection.forge_active_attempts,
         forge_historical_attempts: inspection.forge_historical_attempts,

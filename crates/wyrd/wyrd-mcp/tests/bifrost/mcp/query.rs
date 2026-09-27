@@ -344,7 +344,6 @@ mod pg_tests {
         admission_slots: 0,
         memory_bytes: 0,
         peer_slots: 0,
-        tail_fences: 0,
     };
 
     /// An agent debugging a trace reads it once, completely, and can call it off.

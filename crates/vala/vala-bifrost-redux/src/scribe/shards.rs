@@ -1531,11 +1531,7 @@ impl ShardOwner {
             .into_iter()
             .map(|batch| HotBatch {
                 partition_day: batch.partition_day,
-                wal_lsn: batch.meta.wal_lsn_max,
-                origin: crate::scribe::tail_rpc::HotBatchSource::Append {
-                    batch_id: batch.meta.batch_id,
-                    generation: batch.generation,
-                },
+                generation: batch.generation,
                 rows: batch.batch,
             })
             .collect())

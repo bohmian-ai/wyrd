@@ -22,9 +22,7 @@ use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, RunningQueryRegistry};
 use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, ScribeResources};
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::scribe::tail_rpc::{
-    FetchLiveTailService, ScribeTailReader, TailFenceConfig,
-};
+use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
 use wyrd_storage::StorageHandle;
@@ -423,8 +421,6 @@ pub struct Scribe {
     lifecycle: RoleLifecycle,
     /// Shared tenant-qualified catalog retained by the selected data subsystem.
     catalog: Arc<BifrostCatalog>,
-    /// One fence reader shared by every local and authenticated tonic tail read.
-    tail_reader: Arc<ScribeTailReader>,
     /// Optional domain-separated authority for private tail RPCs.
     tail_authority: Option<Arc<crate::oracle::ScribeTailAuthority>>,
     /// Raw-ticket verifier for Scribe-targeted physical fragments.
@@ -869,10 +865,6 @@ impl Scribe {
             ))
             .with_audit(fragment_query_audit.clone()),
         );
-        let tail_reader = Arc::new(ScribeTailReader::new(
-            Arc::clone(&tail_service),
-            TailFenceConfig::default(),
-        ));
         let advertise_ready = Arc::new(AtomicBool::new(true));
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
@@ -893,7 +885,6 @@ impl Scribe {
             registered_role,
             lifecycle: RoleLifecycle::serving(),
             catalog,
-            tail_reader,
             tail_authority: None,
             fragment_verifier,
             fragment_security_audit,
@@ -986,15 +977,9 @@ impl Scribe {
         Arc::clone(&self.fragment_security_audit)
     }
 
-    /// Returns the shared Scribe-owned tail reader mounted only on private paths.
+    /// Returns the exact role-local live source served by this Scribe.
     #[must_use]
-    pub fn tail_reader(&self) -> Arc<ScribeTailReader> {
-        Arc::clone(&self.tail_reader)
-    }
-
-    /// Returns the exact role-local source used by the retained tail reader.
-    #[must_use]
-    pub(crate) fn tail_service(&self) -> Arc<FetchLiveTailService> {
+    pub fn tail_service(&self) -> Arc<FetchLiveTailService> {
         Arc::clone(&self.tail_service)
     }
 
@@ -2394,13 +2379,6 @@ impl AppState {
         self.bifrost.scribe().map(|runtime| runtime.scribe())
     }
 
-    /// Borrow the private Scribe tail reader for observation-only journey checks.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn bifrost_tail_reader_for_test(&self) -> Option<Arc<ScribeTailReader>> {
-        self.bifrost.scribe().map(|runtime| runtime.tail_reader())
-    }
-
     /// Flush the private Scribe runtime for the test harness only.
     #[cfg(feature = "test-support")]
     pub async fn flush_scribe_for_test(
@@ -2448,21 +2426,6 @@ impl AppState {
         runtime
             .scribe()
             .inspection_snapshot()
-            .map_err(|error| error.to_string())
-    }
-
-    /// Return the exact active fence count from this server's Scribe owner.
-    ///
-    /// # Errors
-    /// Returns an error when Scribe is absent or its fence registry cannot be read.
-    #[cfg(feature = "test-support")]
-    pub fn active_scribe_tail_fences_for_test(&self) -> Result<u64, String> {
-        let Some(runtime) = self.bifrost.scribe() else {
-            return Err("Scribe is not configured".to_owned());
-        };
-        runtime
-            .tail_reader()
-            .active_fence_count_for_test()
             .map_err(|error| error.to_string())
     }
 }

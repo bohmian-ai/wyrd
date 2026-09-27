@@ -423,10 +423,9 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     );
 
     let binding = TenantTableBinding::resolve((tenant, table)).expect("binding");
-    let hot = scribe
-        .tail_service()
-        .expect("tail service")
-        .fetch_hot_batches(FetchLiveTailRequest {
+    let stored = live_rows(
+        &scribe,
+        FetchLiveTailRequest {
             binding,
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -439,10 +438,10 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
             predicates: Vec::new(),
             max_batches: 64,
             max_retained_bytes: 64 * 1024 * 1024,
-        })
-        .await
-        .expect("hot snapshot");
-    let stored: Vec<RecordBatch> = hot.into_iter().map(|batch| batch.rows).collect();
+        },
+        "hot snapshot",
+    )
+    .await;
 
     assert_payload_modes_agree(&stored, canonical_batch_id, arrow_batch_id, total_rows);
     assert_managed_columns_are_table_owned(&stored, tenant);
@@ -530,20 +529,10 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         max_batches: 64,
         max_retained_bytes: 64 * 1024 * 1024,
     };
-    let hot = scribe
-        .tail_service()
-        .expect("tail service")
-        .fetch_hot_batches(request.clone())
-        .await
-        .expect("hot snapshot");
+    let hot = live_rows(&scribe, request.clone(), "hot snapshot").await;
     assert_eq!(hot.len(), 1);
-    assert!(matches!(
-        hot[0].origin,
-        crate::scribe::tail_rpc::HotBatchSource::Append { batch_id: served, .. }
-            if served == *batch_id.as_bytes()
-    ));
-    assert_eq!(hot[0].rows.schema().fields().len(), 1);
-    assert_eq!(hot[0].rows.schema().field(0).name(), "value");
+    assert_eq!(hot[0].schema().fields().len(), 1);
+    assert_eq!(hot[0].schema().field(0).name(), "value");
 
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
@@ -648,10 +637,9 @@ async fn assert_pointer_identity(
     source_value: &ArrayRef,
     stream: StreamIdentity,
 ) {
-    let hot = scribe
-        .tail_service()
-        .expect("tail service")
-        .fetch_hot_batches(FetchLiveTailRequest {
+    let hot = live_rows(
+        scribe,
+        FetchLiveTailRequest {
             binding: TenantTableBinding::resolve((tenant, table.clone())).expect("pointer binding"),
             target_stream: stream,
             start_partition: day,
@@ -660,11 +648,12 @@ async fn assert_pointer_identity(
             predicates: Vec::new(),
             max_batches: 64,
             max_retained_bytes: 64 * 1024 * 1024,
-        })
-        .await
-        .expect("pointer hot snapshot");
+        },
+        "pointer hot snapshot",
+    )
+    .await;
     assert_eq!(hot.len(), 1);
-    assert!(Arc::ptr_eq(source_value, hot[0].rows.column(0)));
+    assert!(Arc::ptr_eq(source_value, hot[0].column(0)));
 }
 
 /// Build one batch spanning two event-day partitions.
@@ -711,24 +700,36 @@ async fn assert_cross_day_materialization(
         max_batches: 64,
         max_retained_bytes: 64 * 1024 * 1024,
     };
-    let day_one_hot = scribe
-        .tail_service()
-        .expect("tail service")
-        .fetch_hot_batches(read_day(day_one))
-        .await
-        .expect("day one snapshot");
-    let day_two_hot = scribe
-        .tail_service()
-        .expect("tail service")
-        .fetch_hot_batches(read_day(day_two))
-        .await
-        .expect("day two snapshot");
+    let day_one_hot = live_rows(scribe, read_day(day_one), "day one snapshot").await;
+    let day_two_hot = live_rows(scribe, read_day(day_two), "day two snapshot").await;
     assert_eq!(day_one_hot.len(), 1);
     assert_eq!(day_two_hot.len(), 1);
-    assert_eq!(day_one_hot[0].rows.num_rows(), 1);
-    assert_eq!(day_two_hot[0].rows.num_rows(), 1);
-    assert_eq!(hot_value(&day_one_hot[0].rows), 101);
-    assert_eq!(hot_value(&day_two_hot[0].rows), 202);
+    assert_eq!(day_one_hot[0].num_rows(), 1);
+    assert_eq!(day_two_hot[0].num_rows(), 1);
+    assert_eq!(hot_value(&day_one_hot[0]), 101);
+    assert_eq!(hot_value(&day_two_hot[0]), 202);
+}
+
+/// Opens one live read on `scribe` and drains every batch it produces.
+///
+/// # Panics
+/// Panics with `context` when the read cannot open or a batch fails.
+async fn live_rows(
+    scribe: &ScribeImpl,
+    request: FetchLiveTailRequest,
+    context: &str,
+) -> Vec<RecordBatch> {
+    futures_util::TryStreamExt::try_collect(
+        scribe
+            .tail_service()
+            .expect("tail service")
+            .open_live_batches(request)
+            .await
+            .expect(context)
+            .into_stream(),
+    )
+    .await
+    .expect(context)
 }
 
 /// Read the fixture's single hot value.
@@ -750,10 +751,9 @@ async fn assert_other_tenant_isolated(
     day: crate::catalog::layout::TimePartition,
     stream: StreamIdentity,
 ) {
-    let other = scribe
-        .tail_service()
-        .expect("tail service")
-        .fetch_hot_batches(FetchLiveTailRequest {
+    let other = live_rows(
+        scribe,
+        FetchLiveTailRequest {
             binding: TenantTableBinding::resolve((DataTenantId::new_v7(), table.clone()))
                 .expect("other tenant binding"),
             target_stream: stream,
@@ -763,9 +763,10 @@ async fn assert_other_tenant_isolated(
             predicates: Vec::new(),
             max_batches: 64,
             max_retained_bytes: 64 * 1024 * 1024,
-        })
-        .await
-        .expect("other tenant snapshot");
+        },
+        "other tenant snapshot",
+    )
+    .await;
     assert!(other.is_empty(), "hot snapshots must be tenant isolated");
 }
 

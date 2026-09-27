@@ -2691,21 +2691,11 @@ pub(crate) mod tests {
         )]));
         let day = crate::test_support::day_partition(2026, 8, 19);
         let (_key, memtable) = scribe_cohort_memtable(tenant_id, day, &schema);
-        let role_resources = crate::resources::BifrostRuntimeResources::composed_for_test(
-            crate::resources::MIN_UNMANAGED_RESERVE_BYTES
-                + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
-            crate::resources::MIN_SCRATCH_FREE_BYTES,
-            [crate::resources::BifrostRole::Scribe],
-        );
         let stream = StreamIdentity::new(
             crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
             WriterEpoch::new(2),
         );
-        let service = Arc::new(FetchLiveTailService::new(
-            stream,
-            memtable,
-            role_resources.scribe().expect("Scribe capability"),
-        ));
+        let service = Arc::new(FetchLiveTailService::new(stream, memtable));
         let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
         let session = SessionContext::new().state();
         let binding = TenantTableBinding {
@@ -2906,21 +2896,11 @@ pub(crate) mod tests {
         let schema = closure_fixture_schema();
         let day = crate::test_support::day_partition(2026, 8, 19);
         let (_key, memtable) = closure_fixture_memtable(tenant_id, day, &schema);
-        let role_resources = crate::resources::BifrostRuntimeResources::composed_for_test(
-            crate::resources::MIN_UNMANAGED_RESERVE_BYTES
-                + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
-            crate::resources::MIN_SCRATCH_FREE_BYTES,
-            [crate::resources::BifrostRole::Scribe],
-        );
         let stream = StreamIdentity::new(
             crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
             WriterEpoch::new(2),
         );
-        let service = Arc::new(FetchLiveTailService::new(
-            stream,
-            memtable,
-            role_resources.scribe().expect("Scribe capability"),
-        ));
+        let service = Arc::new(FetchLiveTailService::new(stream, memtable));
         let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
         (tenant_id, schema, stream, resolver)
     }

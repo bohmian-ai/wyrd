@@ -11,8 +11,6 @@ pub struct DiscoveredTailRoute {
     pub time_partition: wyrd_spec::vala::api::TimePartitionWire,
     /// Exact node and writer epoch returned by discovery.
     pub stream: wyrd_spec::vala::api::TailStreamIdentity,
-    /// Authorized transport to that exact Scribe incarnation.
-    pub transport: Arc<dyn TailReadTransport>,
 }
 
 /// Query-scoped resolver for live Scribe streams.

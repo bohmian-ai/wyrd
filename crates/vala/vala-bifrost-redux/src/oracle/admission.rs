@@ -480,8 +480,6 @@ pub struct QueryResourceSnapshot {
     pub memory_bytes: u64,
     /// Local peer-worker slot units retained by this query.
     pub peer_slots: u64,
-    /// Live-tail fences retained by this query.
-    pub tail_fences: u64,
     /// Memory ceiling admission issued this exact query.
     ///
     /// Fixed at admission and never renegotiated, so it is the bound every
@@ -524,7 +522,6 @@ impl QueryResourceProbe {
             admission_slots: slot_units,
             memory_bytes,
             peer_slots: slot_units,
-            tail_fences: 0,
             granted_memory_bytes: shape.map_or(0, |shape| {
                 u64::try_from(shape.granted_memory_bytes).unwrap_or(u64::MAX)
             }),

@@ -139,7 +139,6 @@ def test_bifrost_query_cancellation_releases_all_resources(
         "admission_slots": 0,
         "memory_bytes": 0,
         "peer_slots": 0,
-        "tail_fences": 0,
     }
     wyrd_server.stall_next_query_after_schema()
 
@@ -167,8 +166,6 @@ def test_bifrost_query_cancellation_releases_all_resources(
     assert active["admission_slots"] > baseline["admission_slots"]
     assert active["memory_bytes"] > baseline["memory_bytes"]
     assert active["peer_slots"] > baseline["peer_slots"]
-    # The live tail is drained into query-owned memory before schema emission.
-    assert active["tail_fences"] == baseline["tail_fences"]
     assert released == baseline
 
 

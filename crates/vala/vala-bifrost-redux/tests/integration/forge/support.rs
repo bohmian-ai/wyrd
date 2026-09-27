@@ -1081,52 +1081,6 @@ impl PromotionIntegrationFixture {
         )
     }
 
-    /// Returns the real Scribe every fixture append and seal is published through.
-    ///
-    /// A live-tail proof needs the same writer that owns the sealed objects, so
-    /// the reader it builds observes exactly the state this fixture produced.
-    pub(crate) fn scribe(&self) -> &Arc<ScribeImpl> {
-        &self.scribe
-    }
-
-    /// Appends one batch through real ingress and leaves it unsealed.
-    ///
-    /// `file_number` separates the appended values the same way the seeded
-    /// seals do, so a live-tail read can tell live rows from sealed ones.
-    ///
-    /// # Panics
-    ///
-    /// Panics when registration lookup or ingest fails.
-    pub(crate) async fn append_without_seal(&self, file_number: i64) {
-        append_only(
-            &self.scribe,
-            &self.catalog,
-            self.tenant,
-            &self.binding,
-            &ingress_batch(&ingress_schema(), file_number),
-        )
-        .await;
-    }
-
-    /// Returns the registered projected source fingerprint of the fixture table.
-    ///
-    /// A live-tail acquisition validates every retained batch against this exact
-    /// value, so a proof must ask the catalog rather than recompute it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the table has no durable registration.
-    pub(crate) async fn schema_fingerprint(&self) -> wyrd_spec::vala::api::SchemaFingerprint {
-        let registered = self
-            .catalog
-            .table_registration(&self.binding.table_ref, self.tenant)
-            .await
-            .expect("fixture table registration")
-            .0;
-        wyrd_spec::vala::api::SchemaFingerprint::new(hex::encode(registered.0))
-            .expect("a registered fingerprint is a canonical wire fingerprint")
-    }
-
     /// Reads the promotion settlement columns of the fixture table, in durable order.
     ///
     /// # Panics

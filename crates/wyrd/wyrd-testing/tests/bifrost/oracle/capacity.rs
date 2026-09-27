@@ -615,8 +615,6 @@ struct OwnershipBaseline {
     peer_pending: u64,
     /// Running peer reservations across every node.
     peer_running: u64,
-    /// Live-tail fences retained by every Scribe.
-    active_tail_fences: u64,
 }
 
 /// Projects the live-ownership half of the cluster's own inspection.
@@ -636,7 +634,6 @@ async fn ownership_baseline(cluster: &WyrdTestCluster) -> Result<OwnershipBaseli
         spill_file_bytes: inspection.spill_file_bytes,
         peer_pending: inspection.peer_pending,
         peer_running: inspection.peer_running,
-        active_tail_fences: inspection.active_tail_fences,
     })
 }
 

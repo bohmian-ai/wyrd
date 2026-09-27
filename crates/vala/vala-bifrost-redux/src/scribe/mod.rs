@@ -64,10 +64,7 @@ pub use crate::scribe::memtable::SealTriggerReason;
 pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::FetchLiveTailService;
-pub use crate::scribe::tail_rpc::{
-    LocalTailReadTransport, ScribeTailReader, TailFenceConfig, TailReadTransport,
-    TonicTailReadTransport,
-};
+pub use crate::scribe::tail_rpc::TonicTailReadTransport;
 
 /// Derives the largest replayable Scribe envelope admitted by configured limits.
 ///
@@ -2676,24 +2673,7 @@ impl ScribeImpl {
         Ok(FetchLiveTailService::with_runtime(
             stream,
             Arc::clone(&self.shards),
-            self.memory.clone(),
             Arc::clone(&self.hot_sources),
-        ))
-    }
-
-    /// Construct the bounded, fence-owning Scribe tail reader for new Oracle paths.
-    ///
-    /// The returned reader retains only shallow Arrow snapshots from this Scribe's
-    /// shard runtime and owns the bounded fence protocol used by Oracle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when this Scribe's node identity cannot produce a
-    /// typed stream identity for the reader.
-    pub fn tail_reader(&self) -> Result<ScribeTailReader, ScribeError> {
-        Ok(ScribeTailReader::new(
-            Arc::new(self.tail_service()?),
-            TailFenceConfig::default(),
         ))
     }
 }

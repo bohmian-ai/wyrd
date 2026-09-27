@@ -7,18 +7,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use vala_bifrost_redux::scribe::tail_rpc::{
-    TailFenceConfig, TailReadError, TailSecurityAudit, TailTicketAudience, TailTicketBinding,
-    TailTicketClaims, TailTicketMinter, TailTicketVerifier,
+    TailReadError, TailSecurityAudit, TailTicketAudience, TailTicketBinding, TailTicketClaims,
+    TailTicketMinter, TailTicketVerifier,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::TailReadFence;
 
 const DOMAIN: &[u8] = b"wyrd.scribe.tail.v1\0";
 const MAX_TICKET_TTL: chrono::Duration = chrono::Duration::seconds(30);
 const MAX_CLAIMS_BYTES: usize = 16 * 1024;
+/// Maximum unexpired ticket nonces retained for replay rejection.
+///
+/// Every nonce expires within [`MAX_TICKET_TTL`], so this bounds concurrent
+/// discovery tickets in flight rather than total history.
+const MAX_REPLAY_NONCES: usize = 256;
 
 #[derive(Debug, Serialize, Deserialize)]
-/// Signed wire representation of a short-lived list or acquire ticket.
+/// Signed wire representation of a short-lived active-stream discovery ticket.
 struct TicketWire {
     /// Narrow operation audience.
     audience: u8,
@@ -66,36 +70,6 @@ impl TicketWire {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-/// Signed wire representation of a reusable retained-fence capability.
-struct CapabilityWire {
-    /// Query owning the retained fence.
-    query_id: uuid::Uuid,
-    /// Tenant owning the retained fence.
-    tenant_id: uuid::Uuid,
-    /// Canonical table identity.
-    canonical_table: String,
-    /// Scribe node serving the retained fence.
-    node_id: uuid::Uuid,
-    /// Writer epoch serving the retained fence.
-    writer_epoch: u64,
-    /// Retained fence identity.
-    fence_id: uuid::Uuid,
-    /// Granularity tag of the exact time partition the fence is bound to.
-    ///
-    /// Bound alongside `partition_start_unix_micros` so a capability minted for
-    /// one hour cannot be replayed against another partition of the same
-    /// stream: both the tag and the start must match the fence presented at
-    /// page or release time.
-    partition_granularity: u8,
-    /// UTC start of the exact time partition, in microseconds since the epoch.
-    partition_start_unix_micros: i64,
-    /// Capability expiry in epoch milliseconds.
-    expires_ms: i64,
-    /// Narrow page/release audience.
-    audience: u8,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 /// Envelope signed by the server-owned Ed25519 key.
 struct SignedWire {
     /// Signing-key identifier used for rotation and domain separation.
@@ -116,7 +90,7 @@ pub struct ScribeTailAuthority {
     keyring: Arc<PeerTicketKeyring>,
     /// Nonce replay set retained only through ticket expiry.
     replay: Mutex<HashMap<Vec<u8>, DateTime<Utc>>>,
-    /// Maximum replay entries derived from the tail fence capacity.
+    /// Maximum unexpired replay entries retained at once.
     replay_capacity: usize,
     /// Durable audit sink required before authorization denials escape.
     audit: Arc<dyn TailSecurityAudit>,
@@ -160,7 +134,7 @@ impl ScribeTailAuthority {
         Self {
             keyring,
             replay: Mutex::new(HashMap::new()),
-            replay_capacity: TailFenceConfig::default().max_fences.max(1),
+            replay_capacity: MAX_REPLAY_NONCES,
             audit,
         }
     }
@@ -225,9 +199,6 @@ impl ScribeTailAuthority {
     fn audience(value: TailTicketAudience) -> u8 {
         match value {
             TailTicketAudience::List => 1,
-            TailTicketAudience::Acquire => 2,
-            TailTicketAudience::Page => 3,
-            TailTicketAudience::Release => 4,
         }
     }
 
@@ -238,9 +209,6 @@ impl ScribeTailAuthority {
     fn parse_audience(value: u8) -> Result<TailTicketAudience, TailReadError> {
         match value {
             1 => Ok(TailTicketAudience::List),
-            2 => Ok(TailTicketAudience::Acquire),
-            3 => Ok(TailTicketAudience::Page),
-            4 => Ok(TailTicketAudience::Release),
             _ => Err(TailReadError::Authorization {
                 detail: "tail ticket audience is invalid".to_owned(),
             }),
@@ -264,10 +232,10 @@ impl ScribeTailAuthority {
 }
 
 impl TailTicketMinter for ScribeTailAuthority {
-    /// Signs one short-lived list or acquire claim set.
+    /// Signs one short-lived active-stream discovery claim set.
     ///
     /// The signed acceptance expiry is bounded independently; the query's exact
-    /// deadline remains unchanged for request binding and retained-fence execution.
+    /// deadline remains unchanged for request binding.
     ///
     /// # Errors
     /// Returns authorization failure for expired queries, short nonces, or
@@ -282,35 +250,6 @@ impl TailTicketMinter for ScribeTailAuthority {
         serde_json::to_vec(&Self::wire(claims, now))
             .map_err(|_| TailReadError::Authorization {
                 detail: "tail ticket encoding failed".to_owned(),
-            })
-            .and_then(|payload| self.sign(payload))
-    }
-
-    /// Signs a capability bound to the exact fence returned by Scribe.
-    ///
-    /// # Errors
-    /// Returns authorization failure when the capability envelope cannot be
-    /// encoded or signed.
-    fn mint_tail_capability(
-        &self,
-        claims: &TailTicketClaims,
-        fence: &TailReadFence,
-    ) -> Result<Vec<u8>, TailReadError> {
-        let wire = CapabilityWire {
-            query_id: claims.query_id,
-            tenant_id: claims.tenant_id.as_uuid(),
-            canonical_table: claims.canonical_table.clone(),
-            node_id: fence.stream.node_id.as_uuid(),
-            writer_epoch: fence.stream.writer_epoch,
-            fence_id: fence.fence_id.as_uuid(),
-            partition_granularity: fence.time_partition.granularity_tag(),
-            partition_start_unix_micros: fence.time_partition.start_unix_micros(),
-            expires_ms: fence.expires_at.timestamp_millis(),
-            audience: Self::audience(TailTicketAudience::Page),
-        };
-        serde_json::to_vec(&wire)
-            .map_err(|_| TailReadError::Authorization {
-                detail: "tail capability encoding failed".to_owned(),
             })
             .and_then(|payload| self.sign(payload))
     }
@@ -354,52 +293,6 @@ impl TailTicketVerifier for ScribeTailAuthority {
             return Err(error);
         }
         Ok(())
-    }
-
-    /// Decodes the signed capability owner tuple before the retained-fence check.
-    ///
-    /// # Errors
-    /// Returns authorization failure for malformed signatures, audience, or
-    /// expired capability claims; audit failure also closes the operation.
-    async fn decode_tail_capability(
-        &self,
-        encoded: &[u8],
-        expected_audience: TailTicketAudience,
-    ) -> Result<(uuid::Uuid, DataTenantId, String), TailReadError> {
-        let wire: CapabilityWire = match self.decode(encoded) {
-            Ok(wire) => wire,
-            Err(error) => {
-                self.audit
-                    .append_unverified_tail_rejection("signature")
-                    .await?;
-                return Err(error);
-            }
-        };
-        if wire.audience != Self::audience(expected_audience)
-            || DateTime::from_timestamp_millis(wire.expires_ms)
-                .is_none_or(|expiry| expiry <= Utc::now())
-        {
-            let tenant = DataTenantId::new(wire.tenant_id);
-            if let Ok(tenant) = tenant {
-                self.audit
-                    .append_verified_tail_violation(tenant, "audience")
-                    .await?;
-            } else {
-                self.audit
-                    .append_unverified_tail_rejection("audience")
-                    .await?;
-            }
-            return Err(TailReadError::Authorization {
-                detail: "tail capability audience or expiry is invalid".to_owned(),
-            });
-        }
-        Ok((
-            wire.query_id,
-            DataTenantId::new(wire.tenant_id).map_err(|_| TailReadError::Authorization {
-                detail: "tail capability tenant is invalid".to_owned(),
-            })?,
-            wire.canonical_table,
-        ))
     }
 
     /// Verifies a ticket before operation-specific binding checks and consumes
@@ -572,51 +465,6 @@ impl TailTicketVerifier for ScribeTailAuthority {
         let _ = audience;
         Ok(())
     }
-
-    /// Verifies the exact query/tenant/table/fence tuple for page or release.
-    ///
-    /// # Errors
-    /// Returns authorization failure for malformed, expired, or mismatched
-    /// capabilities; audit failure also closes the operation.
-    async fn verify_tail_capability(
-        &self,
-        encoded: &[u8],
-        query_id: uuid::Uuid,
-        tenant_id: DataTenantId,
-        canonical_table: &str,
-        fence: &TailReadFence,
-        audience: TailTicketAudience,
-    ) -> Result<(), TailReadError> {
-        let wire: CapabilityWire = match self.decode(encoded) {
-            Ok(wire) => wire,
-            Err(error) => {
-                self.audit
-                    .append_unverified_tail_rejection("signature")
-                    .await?;
-                return Err(error);
-            }
-        };
-        if wire.query_id != query_id
-            || wire.tenant_id != tenant_id.as_uuid()
-            || wire.canonical_table != canonical_table
-            || wire.node_id != fence.stream.node_id.as_uuid()
-            || wire.writer_epoch != fence.stream.writer_epoch
-            || wire.fence_id != fence.fence_id.as_uuid()
-            || wire.partition_granularity != fence.time_partition.granularity_tag()
-            || wire.partition_start_unix_micros != fence.time_partition.start_unix_micros()
-            || wire.audience != Self::audience(audience)
-            || DateTime::from_timestamp_millis(wire.expires_ms)
-                .is_none_or(|expiry| expiry <= Utc::now())
-        {
-            self.audit
-                .append_verified_tail_violation(tenant_id, "binding")
-                .await?;
-            return Err(TailReadError::Authorization {
-                detail: "tail capability tuple is invalid".to_owned(),
-            });
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -631,10 +479,6 @@ mod tests {
         TailTicketMinter, TailTicketVerifier,
     };
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::vala::api::{
-        SchemaFingerprint, TailCursor, TailReadFence, TailStreamIdentity, TimeGranularityWire,
-        TimePartitionWire,
-    };
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -698,94 +542,52 @@ mod tests {
             .expect("fixture key parses")
     }
 
-    fn fence_for(
-        claims: &TailTicketClaims,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> TailReadFence {
-        TailReadFence {
-            fence_id: wyrd_spec::vala::api::TailFenceId::new(uuid::Uuid::new_v4()),
-            binding: wyrd_spec::vala::api::TenantTableBinding {
-                tenant_id: claims.tenant_id,
-                namespace: "bifrost".to_owned(),
-                table: "events".to_owned(),
-            },
-            time_partition: TimePartitionWire::new(
-                TimeGranularityWire::Hour,
-                chrono::DateTime::from_timestamp(1_754_179_200, 0).expect("fixture instant"),
-            )
-            .expect("fixture instant is an exact hour boundary"),
-            stream: TailStreamIdentity {
-                node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::new_v4()),
-                writer_epoch: 1,
-            },
-            exclusive_sealed: TailCursor {
-                writer_epoch: 1,
-                wal_lsn: 0,
-                batch_id: uuid::Uuid::nil(),
-                row_ordinal: 0,
-            },
-            inclusive_live: TailCursor {
-                writer_epoch: 1,
-                wal_lsn: 1,
-                batch_id: uuid::Uuid::nil(),
-                row_ordinal: 0,
-            },
-            schema_fingerprint: SchemaFingerprint::new("fixture").expect("fingerprint"),
-            tail_protocol_version: 1,
-            expires_at,
-        }
-    }
-
-    /// Long query deadlines retain short-lived, single-use List and Acquire
-    /// authorization without shortening the bound request's execution budget.
+    /// Long query deadlines retain short-lived, single-use List authorization
+    /// without shortening the bound request's execution budget.
     ///
     /// # Panics
     /// Panics if a healthy long query cannot mint or use its ticket, or replay
     /// is accepted without an audit denial.
     #[tokio::test]
-    async fn replayed_list_and_acquire_tickets_are_audited() {
+    async fn replayed_list_tickets_are_audited() {
         let audit = Arc::new(RecordingAudit::default());
         let authority = authority(Arc::clone(&audit));
-        for (audience, nonce) in [
-            (TailTicketAudience::List, 1),
-            (TailTicketAudience::Acquire, 2),
-        ] {
-            let mut claims = claims(audience, nonce);
-            claims.deadline = chrono::Utc::now() + chrono::Duration::seconds(60);
-            let ticket = authority.mint_tail_ticket(&claims).expect("ticket signs");
-            let wire: TicketWire = authority.decode(&ticket).expect("signed claims decode");
-            let now = chrono::Utc::now();
-            let (deadline, expiry) = wire.validate_deadlines(now).expect("ticket is usable");
-            assert_eq!(
-                deadline.timestamp_millis(),
-                claims.deadline.timestamp_millis()
-            );
-            assert!(expiry - now <= MAX_TICKET_TTL);
-            assert!(expiry < deadline);
-            let decoded = authority
-                .verify_tail_ticket_unbound(&ticket, audience)
-                .await
-                .expect("first use succeeds");
-            assert_eq!(
-                decoded.deadline.timestamp_millis(),
-                claims.deadline.timestamp_millis()
-            );
-            assert!(matches!(
-                authority
-                    .verify_tail_ticket_unbound(&ticket, audience)
-                    .await,
-                Err(TailReadError::Authorization { .. })
-            ));
-            authority.clear_replay_state();
+        let (audience, nonce) = (TailTicketAudience::List, 1);
+        let mut claims = claims(audience, nonce);
+        claims.deadline = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let ticket = authority.mint_tail_ticket(&claims).expect("ticket signs");
+        let wire: TicketWire = authority.decode(&ticket).expect("signed claims decode");
+        let now = chrono::Utc::now();
+        let (deadline, expiry) = wire.validate_deadlines(now).expect("ticket is usable");
+        assert_eq!(
+            deadline.timestamp_millis(),
+            claims.deadline.timestamp_millis()
+        );
+        assert!(expiry - now <= MAX_TICKET_TTL);
+        assert!(expiry < deadline);
+        let decoded = authority
+            .verify_tail_ticket_unbound(&ticket, audience)
+            .await
+            .expect("first use succeeds");
+        assert_eq!(
+            decoded.deadline.timestamp_millis(),
+            claims.deadline.timestamp_millis()
+        );
+        assert!(matches!(
             authority
                 .verify_tail_ticket_unbound(&ticket, audience)
-                .await
-                .expect("shutdown clears bounded replay state");
-        }
+                .await,
+            Err(TailReadError::Authorization { .. })
+        ));
+        authority.clear_replay_state();
+        authority
+            .verify_tail_ticket_unbound(&ticket, audience)
+            .await
+            .expect("shutdown clears bounded replay state");
         let reasons = audit.reasons.lock().expect("audit lock");
         assert_eq!(
             reasons.iter().filter(|reason| *reason == "replay").count(),
-            2
+            1
         );
     }
 
@@ -797,55 +599,51 @@ mod tests {
     #[tokio::test]
     async fn long_query_tickets_keep_expiry_and_exact_binding() {
         let authority = authority(Arc::new(RecordingAudit::default()));
-        for (audience, nonce) in [
-            (TailTicketAudience::List, 11),
-            (TailTicketAudience::Acquire, 12),
-        ] {
-            let mut claims = claims(audience, nonce);
-            claims.deadline = chrono::Utc::now() + chrono::Duration::seconds(60);
-            let ticket = authority
-                .mint_tail_ticket(&claims)
-                .expect("long query signs");
-            let mut changed = claims.clone();
-            changed.query_id = uuid::Uuid::new_v4();
-            assert!(
-                authority
-                    .verify_tail_ticket(&ticket, &changed)
-                    .await
-                    .is_err()
-            );
+        let (audience, nonce) = (TailTicketAudience::List, 11);
+        let mut claims = claims(audience, nonce);
+        claims.deadline = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let ticket = authority
+            .mint_tail_ticket(&claims)
+            .expect("long query signs");
+        let mut changed = claims.clone();
+        changed.query_id = uuid::Uuid::new_v4();
+        assert!(
+            authority
+                .verify_tail_ticket(&ticket, &changed)
+                .await
+                .is_err()
+        );
+        authority
+            .verify_tail_ticket(&ticket, &claims)
+            .await
+            .expect("exact request verifies");
+        assert!(
             authority
                 .verify_tail_ticket(&ticket, &claims)
                 .await
-                .expect("exact request verifies");
-            assert!(
-                authority
-                    .verify_tail_ticket(&ticket, &claims)
-                    .await
-                    .is_err()
-            );
+                .is_err()
+        );
 
-            let mut wire: TicketWire = authority.decode(&ticket).expect("signed ticket decodes");
-            let expiry = chrono::DateTime::from_timestamp_millis(wire.expires_ms)
-                .expect("signed expiry is valid");
-            assert!(wire.validate_deadlines(expiry).is_err());
-            wire.expires_ms =
-                (chrono::Utc::now() - chrono::Duration::milliseconds(1)).timestamp_millis();
-            let expired = authority
-                .sign(serde_json::to_vec(&wire).expect("claims encode"))
-                .expect("expired fixture signs");
-            authority.clear_replay_state();
-            assert!(matches!(
-                authority
-                    .verify_tail_ticket_unbound(&expired, audience)
-                    .await,
-                Err(TailReadError::Authorization { .. })
-            ));
-            assert!(matches!(
-                authority.verify_tail_ticket(&expired, &claims).await,
-                Err(TailReadError::Authorization { .. })
-            ));
-        }
+        let mut wire: TicketWire = authority.decode(&ticket).expect("signed ticket decodes");
+        let expiry = chrono::DateTime::from_timestamp_millis(wire.expires_ms)
+            .expect("signed expiry is valid");
+        assert!(wire.validate_deadlines(expiry).is_err());
+        wire.expires_ms =
+            (chrono::Utc::now() - chrono::Duration::milliseconds(1)).timestamp_millis();
+        let expired = authority
+            .sign(serde_json::to_vec(&wire).expect("claims encode"))
+            .expect("expired fixture signs");
+        authority.clear_replay_state();
+        assert!(matches!(
+            authority
+                .verify_tail_ticket_unbound(&expired, audience)
+                .await,
+            Err(TailReadError::Authorization { .. })
+        ));
+        assert!(matches!(
+            authority.verify_tail_ticket(&expired, &claims).await,
+            Err(TailReadError::Authorization { .. })
+        ));
     }
 
     /// A verified binding denial fails closed when its audit append is unavailable.
@@ -856,7 +654,7 @@ mod tests {
             ..RecordingAudit::default()
         });
         let authority = authority(audit);
-        let claims = claims(TailTicketAudience::Acquire, 3);
+        let claims = claims(TailTicketAudience::List, 3);
         let binding = TailTicketBinding {
             query_id: uuid::Uuid::new_v4(),
             tenant_id: claims.tenant_id,
@@ -869,153 +667,5 @@ mod tests {
             authority.verify_tail_ticket_binding(&claims, &binding).await,
             Err(TailReadError::Authorization { detail }) if detail == "injected audit outage"
         ));
-        let fence = fence_for(&claims, chrono::Utc::now() + chrono::Duration::seconds(5));
-        let capability = authority
-            .mint_tail_capability(&claims, &fence)
-            .expect("capability signs");
-        // Release and page share this exact capability validator; an audit
-        // outage must reject before either can mutate/read retained state.
-        assert!(matches!(
-            authority
-                .verify_tail_capability(
-                    &capability,
-                    uuid::Uuid::new_v4(),
-                    claims.tenant_id,
-                    "vala.bifrost.events",
-                    &fence,
-                    TailTicketAudience::Page,
-                )
-                .await,
-            Err(TailReadError::Authorization { detail }) if detail == "injected audit outage"
-        ));
-    }
-
-    /// A page capability is bound to one exact `TimePartition`, so it cannot be
-    /// replayed against a neighbouring hour or against a day that begins at the
-    /// same instant.
-    ///
-    /// Granularity and start are separate fields in the signed tuple; a
-    /// capability that only bound the start instant would authorize a whole
-    /// day's rows for an hour's fence.
-    #[tokio::test]
-    async fn tail_capability_binds_time_partition() {
-        let audit = Arc::new(RecordingAudit::default());
-        let authority = authority(Arc::clone(&audit));
-        let claims = claims(TailTicketAudience::Page, 7);
-        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(5);
-        let fence = fence_for(&claims, expires_at);
-        let capability = authority
-            .mint_tail_capability(&claims, &fence)
-            .expect("capability signs");
-
-        // The minting fence itself verifies.
-        authority
-            .verify_tail_capability(
-                &capability,
-                claims.query_id,
-                claims.tenant_id,
-                &claims.canonical_table,
-                &fence,
-                TailTicketAudience::Page,
-            )
-            .await
-            .expect("the exact minting fence verifies");
-
-        let start = fence.time_partition.start_utc();
-        let mut neighbouring_hour = fence.clone();
-        neighbouring_hour.time_partition = TimePartitionWire::new(
-            TimeGranularityWire::Hour,
-            start + chrono::Duration::hours(1),
-        )
-        .expect("the following hour is an exact boundary");
-
-        let mut same_instant_day = fence.clone();
-        same_instant_day.time_partition = TimePartitionWire::new(TimeGranularityWire::Day, start)
-            .expect("the fixture instant is also an exact day boundary");
-
-        for (label, forged) in [
-            ("neighbouring hour", neighbouring_hour),
-            ("same-instant day", same_instant_day),
-        ] {
-            let outcome = authority
-                .verify_tail_capability(
-                    &capability,
-                    claims.query_id,
-                    claims.tenant_id,
-                    &claims.canonical_table,
-                    &forged,
-                    TailTicketAudience::Page,
-                )
-                .await;
-            assert!(
-                matches!(outcome, Err(TailReadError::Authorization { .. })),
-                "{label} must not satisfy a capability minted for another partition"
-            );
-        }
-
-        let reasons = audit.reasons.lock().expect("audit lock").clone();
-        assert_eq!(
-            reasons,
-            vec!["binding".to_owned(), "binding".to_owned()],
-            "each partition mismatch is audited as a verified binding violation"
-        );
-    }
-
-    /// Expired capabilities are rejected even when retained metadata remains present.
-    #[tokio::test]
-    async fn expired_capability_is_rejected_before_page_access() {
-        let audit = Arc::new(RecordingAudit::default());
-        let authority = authority(Arc::clone(&audit));
-        let claims = claims(TailTicketAudience::Acquire, 4);
-        let fence = fence_for(&claims, chrono::Utc::now() - chrono::Duration::seconds(1));
-        let capability = authority
-            .mint_tail_capability(&claims, &fence)
-            .expect("capability signs");
-        assert!(
-            authority
-                .decode_tail_capability(&capability, TailTicketAudience::Page)
-                .await
-                .is_err()
-        );
-        assert!(
-            audit
-                .reasons
-                .lock()
-                .expect("audit lock")
-                .contains(&"audience".to_owned())
-        );
-        let mut live_fence = fence.clone();
-        live_fence.expires_at = chrono::Utc::now() + chrono::Duration::seconds(5);
-        let live_capability = authority
-            .mint_tail_capability(&claims, &live_fence)
-            .expect("live capability signs");
-        assert!(
-            authority
-                .verify_tail_capability(
-                    &live_capability,
-                    uuid::Uuid::new_v4(),
-                    claims.tenant_id,
-                    "vala.bifrost.events",
-                    &live_fence,
-                    TailTicketAudience::Page,
-                )
-                .await
-                .is_err()
-        );
-        // Release uses the same page-audience capability validator and must
-        // reject the same cross-query tuple before mutating the tombstone.
-        assert!(
-            authority
-                .verify_tail_capability(
-                    &live_capability,
-                    uuid::Uuid::new_v4(),
-                    claims.tenant_id,
-                    "vala.bifrost.events",
-                    &live_fence,
-                    TailTicketAudience::Page,
-                )
-                .await
-                .is_err()
-        );
     }
 }

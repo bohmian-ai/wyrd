@@ -452,8 +452,6 @@ pub struct OracleMembershipInspection {
 pub struct OracleInspection {
     /// Durable Scribe and Oracle membership rows.
     pub memberships: Vec<OracleMembershipInspection>,
-    /// Live-tail fences retained across every Scribe process.
-    pub active_tail_fences: u64,
     /// Active local Oracle queries across running pods.
     pub active_queries: u64,
     /// Queued local Oracle queries across running pods.
@@ -1912,17 +1910,6 @@ impl WyrdTestCluster {
             .fetch_one(pool)
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let active_tail_fences = self
-            .servers
-            .values()
-            .filter_map(Option::as_ref)
-            .filter(|server| server.bifrost_scribe().is_some())
-            .map(|server| server.active_bifrost_tail_fences())
-            .try_fold(0_u64, |total, count| {
-                count
-                    .map(|count| total.saturating_add(count))
-                    .map_err(|error| ClusterError::Resource(error.to_string()))
-            })?;
         let mut runtime = OracleRuntimeInspection::default();
         for server in self.servers.values().flatten() {
             if let Ok(snapshot) = server.oracle_runtime_inspection() {
@@ -1953,7 +1940,6 @@ impl WyrdTestCluster {
         }
         Ok(OracleInspection {
             memberships,
-            active_tail_fences,
             active_queries: runtime.active_queries,
             queued_queries: runtime.queued_queries,
             reserved_memory_bytes: runtime.reserved_memory_bytes,
@@ -2073,11 +2059,12 @@ impl WyrdTestCluster {
             .servers()
             .filter(|server| server.bifrost_scribe().is_some())
         {
-            let reader = scribe_server
+            let source = scribe_server
                 .state()
-                .bifrost_tail_reader_for_test()
-                .ok_or_else(|| ClusterError::Resource("Scribe tail reader missing".to_owned()))?;
-            let streams = reader
+                .bifrost_ingest()
+                .map(|runtime| runtime.tail_service())
+                .ok_or_else(|| ClusterError::Resource("Scribe tail service missing".to_owned()))?;
+            let streams = source
                 .list_active_streams(&binding)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             if streams

@@ -905,9 +905,6 @@ const ORACLE_CALIBRATION_PROPOSALS: &[&str] = &[
     "placement.jitter_max_millis",
     "reservation.pending_ttl_seconds",
     "membership.expiration_seconds",
-    "tail.fence_ttl_seconds",
-    "tail.page_rows",
-    "tail.page_encoded_bytes",
     "distribution.max_workers_per_query",
     "distribution.fragment_target_rows",
     "distribution.fragment_target_bytes",
@@ -924,7 +921,6 @@ const ORACLE_CALIBRATION_PROPOSALS: &[&str] = &[
     "performance.p99_ttfb_millis",
     "performance.minimum_rows_per_second",
     "performance.last_stable_concurrency",
-    "performance.maximum_tail_page_millis",
     "performance.maximum_object_store_throttle_rate",
 ];
 

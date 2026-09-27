@@ -793,7 +793,6 @@ fn snapshot_to_map(snapshot: BifrostQueryResourceSnapshot) -> BTreeMap<String, u
         ("admission_slots".to_owned(), snapshot.admission_slots),
         ("memory_bytes".to_owned(), snapshot.memory_bytes),
         ("peer_slots".to_owned(), snapshot.peer_slots),
-        ("tail_fences".to_owned(), snapshot.tail_fences),
     ])
 }
 
@@ -815,7 +814,6 @@ fn snapshot_from_map(
         admission_slots: value("admission_slots")?,
         memory_bytes: value("memory_bytes")?,
         peer_slots: value("peer_slots")?,
-        tail_fences: value("tail_fences")?,
     })
 }
 

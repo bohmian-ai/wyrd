@@ -441,3 +441,30 @@ report. All required lanes must be green before the task is reported complete.
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+Commits `4b617f0f9..e2207970d` on `vcc/task-005`. Journeys ran through
+`scripts/postgres/with-test-postgres.sh` with migrations, one at a time.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 one request, three-tier terminal, no visibility/freshness input | `wyrd-spec` `BifrostQueryRequest{sql,deadline_ms}`, `QueryTerminalFrame` (4b617f0f9, 950e73ef4); client, CLI, MCP and SDK projections | `wyrd-spec` `query_terminal_tests::{closed_terminal_matrix_validates, query_request_has_no_source_selectors_and_validation_is_closed}`; `codegen:check`; Python `test_bifrost_query.py` (8 pass); TS `oracle-query.test.ts` (8 pass) asserting no `freshness` | PASS |
+| AC-002 only relevant Scribes execute live fragments | Oracle `discover_live_routes` + route selection before the one plan (7a2dab924) | `distributed::live_query_routes_only_relevant_scribes` | PASS |
+| AC-003 published work stays distributed beside live leaves | `LiveUnionBoundary`, `LiveScribeExec` (5a4e9188c) | `distributed::published_workers_and_live_scribes_share_one_plan` | PASS |
+| AC-004 bounded streaming, >30 s lifetime, release on cancel/drop | `LiveTailBatches::into_stream`, `LiveTailPartition`, query-owned lease (b8b4ec66b) | `distributed::live_stream_backpressure_and_query_owned_lifetime`; redux `tail_rpc` staged-lease tests | PASS |
+| AC-005 LIMIT stop without footer; Degraded vs Failed matrix | `LiveFragmentRead::into_stream`; `live_execution_status_error` (Scribe open: `Unavailable`→degradable, `ResourceExhausted`→`Capacity`); test-only `ScribeFragmentFault` hook in `wyrd-server` `oracle/peer_service.rs` (6553f5adc) | `distributed::limit_stops_unneeded_live_fragment_without_footer`; `distributed::live_query_terminal_failure_matrix` (listing loss and pre-row loss Degraded; late loss, missing footer, ticket rejection, capacity refusal and deleted published files Failed and client-rejected; absent-before-discovery Success); `oracle::dispatcher::tests::live_scribe_open_status_separates_availability_from_faults`; `write_read::scribe_undialable_private_peer_degrades_live_coverage` | PASS |
+| AC-006 Drift uses the one query; judgment only after a non-failed terminal; docs state both races | `ScheduledQueryCaller` unchanged; Drift journey live step (7143e5e0c, e2207970d); docs (32443a1ee, 9a88a61f1) | `drift_verification::drift_methods_fit_score_persist_and_dispatch` scores unflushed observations; failed terminal → no outcome pinned by `query::scheduled::tests::scheduled_terminal_requires_clean_eof` (unit only: injecting a failure into the server-side scheduled query needs a hook that does not exist); `docs:check` | PASS |
+| AC-007 tail-fence acquire/page/release and 30 s lifetime removed; listing kept | 86d133769, 40a644ab6 | Source sweep finds no tail-fence surface (the persisted `tail_fence` audit enum value is kept for historical rows); `test:bifrost:journey:oracle` 33/33 | PASS |
+| AC-008 fmt, lints, codegen, docs, `verify:bifrost`, `gate` | — | `fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`, `ts:build`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `test:principals:integration` (18/18), `docs:check`, `check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, `git diff --check` pass. `verify:bifrost`: 8/9 lanes passed; `unit:rust` failed on a fixture that listed only two source tiers, fixed in a026fd6e3 and rerun at 220/220. `gate` stops at `check:skills-sync` because of uncommitted `.agents/skills/wyrd-task-review/` edits this task did not make | BLOCKED |
+
+Non-goals stayed excluded: no public mode or class option, verifier-only
+route, Flight listener, durable owner index, replacement tail lease, second
+planner, scheduler, aggregate or join pushdown, persistent state,
+compatibility mode, or ACK/publication change.
+
+Material risk: `scribe::write_read::scribe_write_flush_read_user_journey`
+failed once and passed on the rerun and in `verify:bifrost`. It compares two
+runs' published file layout. Scribe assembly claims whatever members are
+ready at that moment, so the layout depends on timing. This task does not
+touch that code.

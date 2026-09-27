@@ -1,7 +1,8 @@
 //! One single-pod query capacity benchmark: setup, warmup, measurement, drain.
 //!
-//! The pod is one containerized `All` child of [`BifrostProcessCluster`]; the
-//! driver, the parent, and PostgreSQL run outside its limit. Every measured
+//! The pod is one local `All` child of [`BifrostProcessCluster`] in its own
+//! limited systemd user scope; the driver, the parent, and PostgreSQL run
+//! outside that cgroup. Every measured
 //! query goes through `wyrd_client::Bifrost` over the pod's public listeners,
 //! and every server figure comes from the pod's installed production recorder
 //! and its own cgroup.
@@ -30,15 +31,27 @@ use wyrd_spec::vala::api::{
 use super::schedule::{FixedRateDriver, FixedRateRun, ProbeResult, ShortQueryOutcome};
 use super::workload;
 use crate::bifrost::process_cluster::{
-    BenchmarkContainer, BifrostProcessCluster, CGROUP_EVIDENCE_FILES, ProcessClusterError,
-    ProcessNode,
+    BifrostProcessCluster, CGROUP_EVIDENCE_FILES, ProcessClusterError, ProcessNode,
 };
 
-/// Offered short-query rates, in queries per second.
-pub const OFFERED_RATES: [u64; 2] = [500, 1_000];
+/// The four measured combinations, in run order: offered short queries per
+/// second, and whether live streams are held during the window.
+///
+/// Both baselines run before the live fixture is even acknowledged, so the
+/// no-live rows measure published data alone; the mixed rows follow.
+pub const RUN_ORDER: [(u64, bool); 4] = [(500, false), (1_000, false), (500, true), (1_000, true)];
 
-/// Fractions of the resolved Interactive slot units held by live streams.
-pub const LIVE_OCCUPANCY: [f64; 4] = [0.0, 0.25, 0.5, 1.0];
+/// Live streams a mixed row holds: half the Interactive slot units, at least
+/// one.
+///
+/// Interactive admits up to the pod's whole slot limit (it borrows whatever
+/// Analytical is not using), so `interactive_slots` is the resolved
+/// `bifrost_oracle_local_slot_units{kind="limit"}` gauge. Each live stream
+/// holds one Interactive unit.
+#[must_use]
+pub fn live_stream_target(interactive_slots: f64) -> usize {
+    ((interactive_slots / 2.0).floor() as usize).max(1)
+}
 
 /// How long each live stream is kept admitted before it is drained.
 const LIVE_HOLD: Duration = Duration::from_secs(5);
@@ -111,8 +124,8 @@ pub struct BenchmarkSettings {
 }
 
 impl BenchmarkSettings {
-    /// Reads `WYRD_BENCH_OUTPUT_DIR`, `WYRD_BENCH_WARMUP_SECONDS` (default 60),
-    /// and `WYRD_BENCH_MEASURE_SECONDS` (default 300).
+    /// Reads `WYRD_BENCH_OUTPUT_DIR`, `WYRD_BENCH_WARMUP_SECONDS` (default 15),
+    /// and `WYRD_BENCH_MEASURE_SECONDS` (default 60).
     ///
     /// The durations exist so one short smoke interval can check the raw
     /// samples against the report before a dedicated run; the benchmark itself
@@ -134,8 +147,8 @@ impl BenchmarkSettings {
                 || PathBuf::from("target/bifrost-query-capacity"),
                 PathBuf::from,
             ),
-            warmup: seconds("WYRD_BENCH_WARMUP_SECONDS", 60)?,
-            measurement: seconds("WYRD_BENCH_MEASURE_SECONDS", 300)?,
+            warmup: seconds("WYRD_BENCH_WARMUP_SECONDS", 15)?,
+            measurement: seconds("WYRD_BENCH_MEASURE_SECONDS", 60)?,
         })
     }
 }
@@ -153,10 +166,12 @@ pub struct RunMetadata {
     pub host_cpus: usize,
     /// `MemTotal` of the driver host, in bytes.
     pub host_memory_bytes: u64,
-    /// Pod container `cpu.max`.
-    pub container_cpu_max: Option<String>,
-    /// Pod container `memory.max`.
-    pub container_memory_max: Option<String>,
+    /// The pod's own cgroup-v2 path under `/sys/fs/cgroup`.
+    pub child_cgroup: Option<String>,
+    /// That cgroup's `cpu.max`.
+    pub child_cpu_max: Option<String>,
+    /// That cgroup's `memory.max`.
+    pub child_memory_max: Option<String>,
     /// Resolved Oracle slot units reported by the pod's recorder.
     pub oracle_slot_limit: f64,
     /// Resolved Interactive floor slot units reported by the pod's recorder.
@@ -205,14 +220,12 @@ pub struct LiveStreamTally {
     pub failed: u64,
 }
 
-/// One offered-rate / live-occupancy report row.
+/// One offered-rate / held-live-stream report row.
 #[derive(Debug, Clone, Serialize)]
 pub struct CombinationReport {
     /// Offered short queries per second.
     pub offered_rate: u64,
-    /// Fraction of Interactive slot units meant to be held by live streams.
-    pub live_occupancy: f64,
-    /// Live streams the occupancy asked for.
+    /// Live streams the row holds, each one Interactive slot unit.
     pub target_live_streams: usize,
     /// Smallest and largest open live-stream count sampled in the window.
     pub live_streams_sampled: [usize; 2],
@@ -243,7 +256,7 @@ pub struct CombinationReport {
     /// Server counter deltas across the window.
     pub server_deltas: BTreeMap<String, f64>,
     /// Pod cgroup deltas and levels across the window.
-    pub container: BTreeMap<String, f64>,
+    pub cgroup: BTreeMap<String, f64>,
     /// PostgreSQL `SELECT 1` latency before and after the window, ms.
     pub postgres_select_ms: [f64; 2],
     /// Held live-stream outcomes.
@@ -262,7 +275,7 @@ struct Snapshot {
     /// Counter totals, including the labelled admission series.
     counters: BTreeMap<String, f64>,
     /// Pod cgroup readings by `file:key`.
-    container: BTreeMap<String, f64>,
+    cgroup: BTreeMap<String, f64>,
     /// Driver process CPU seconds.
     driver_cpu_seconds: f64,
     /// PostgreSQL `SELECT 1` round trip, milliseconds.
@@ -271,8 +284,11 @@ struct Snapshot {
 
 /// A running single-pod benchmark and everything it seeded.
 pub struct QueryCapacityBenchmark {
-    /// The one containerized pod and its shared resources.
+    /// The one scoped pod and its shared resources.
     cluster: BifrostProcessCluster,
+    /// Public ingest client that seeded the table and later acknowledges the
+    /// live fixture.
+    writer: Bifrost,
     /// Public query client every measured and live query uses.
     queries: Arc<Bifrost>,
     /// Operator settings.
@@ -282,24 +298,24 @@ pub struct QueryCapacityBenchmark {
 }
 
 impl QueryCapacityBenchmark {
-    /// Setup: launches the verified pod, seeds the fixture, and preflights
-    /// every statement.
+    /// Setup: launches the verified pod, seeds the published fixture, and
+    /// preflights every short statement.
     ///
     /// Writes IDs `0..1,048,576` in eight 131,072-ID batches through the public
-    /// ingest client, flushing and publishing each, then acknowledges IDs
-    /// `1,048,576..1,081,344` without flushing. Each short statement must then
-    /// return its exact 20 IDs and the live statement all 32,768 live IDs
-    /// across more than one batch, all with terminal `Success`.
+    /// ingest client, flushing and publishing each. Each short statement must
+    /// then return its exact 20 IDs with terminal `Success`. The live fixture
+    /// is not written here: [`Self::load_live`] acknowledges it only after both
+    /// baselines.
     ///
     /// # Errors
     ///
     /// Returns [`CapacityError::Cluster`] when the pod cannot be launched or is
     /// not limited to its envelope, [`CapacityError::Client`] when
     /// registration, ingest, or a preflight query fails, and
-    /// [`CapacityError::Preflight`] when a result differs from the fixture.
+    /// [`CapacityError::Preflight`] when a result differs from the fixture or
+    /// the reported Oracle slot gauge differs from the pod's installed count.
     pub async fn setup(binary: &Path, settings: BenchmarkSettings) -> Result<Self, CapacityError> {
-        let mut cluster =
-            BifrostProcessCluster::start_benchmark(binary, BenchmarkContainer::from_env()).await?;
+        let mut cluster = BifrostProcessCluster::start_benchmark(binary).await?;
         let api_key = cluster
             .provision_foreign_public_api_key("query-capacity")
             .await?;
@@ -316,7 +332,6 @@ impl QueryCapacityBenchmark {
             let node = pod(&mut cluster)?;
             tokio::task::block_in_place(|| node.flush().and_then(|()| node.refresh_snapshot()))?;
         }
-        write_ids(&writer, workload::LIVE_START, workload::LIVE_END).await?;
 
         let queries = Arc::new(Bifrost::query_only(&client));
         let mut sql = Vec::new();
@@ -333,7 +348,37 @@ impl QueryCapacityBenchmark {
             sql.push(workload::short_sql(bucket));
             expected_digests.push(workload::id_digest(&expected));
         }
-        let (mut live, batches) = preflight(&queries, &workload::live_sql()).await?;
+        let live: Vec<i64> = (workload::LIVE_START..workload::LIVE_END).collect();
+        sql.push(workload::live_sql());
+        expected_digests.push(workload::id_digest(&live));
+
+        let metadata =
+            RunMetadata::collect(&mut cluster, binary, &settings, sql, expected_digests)?;
+        Ok(Self {
+            cluster,
+            writer,
+            queries,
+            settings,
+            metadata,
+        })
+    }
+
+    /// Acknowledges the live fixture without flushing it, then preflights the
+    /// live statement.
+    ///
+    /// Writes IDs `1,048,576..1,081,344` through the same public ingest client
+    /// in bounded batches and never flushes them, so they stay in Scribe. The
+    /// live statement must then return all 32,768 live IDs across more than one
+    /// batch with terminal `Success`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapacityError::Client`] when ingest or the preflight query
+    /// fails and [`CapacityError::Preflight`] when its IDs differ from the
+    /// fixture or arrive in one batch.
+    async fn load_live(&self) -> Result<(), CapacityError> {
+        write_ids(&self.writer, workload::LIVE_START, workload::LIVE_END).await?;
+        let (mut live, batches) = preflight(&self.queries, &workload::live_sql()).await?;
         live.sort_unstable();
         let expected: Vec<i64> = (workload::LIVE_START..workload::LIVE_END).collect();
         if live != expected || batches < 2 {
@@ -342,21 +387,14 @@ impl QueryCapacityBenchmark {
                 live.len()
             )));
         }
-        sql.push(workload::live_sql());
-        expected_digests.push(workload::id_digest(&expected));
-
-        let metadata =
-            RunMetadata::collect(&mut cluster, binary, &settings, sql, expected_digests)?;
-        Ok(Self {
-            cluster,
-            queries,
-            settings,
-            metadata,
-        })
+        Ok(())
     }
 
-    /// Runs every offered-rate / live-occupancy combination and writes the
-    /// report.
+    /// Runs the four [`RUN_ORDER`] combinations and writes the report.
+    ///
+    /// The live fixture is acknowledged between the no-live baselines and the
+    /// first mixed row, and every mixed row holds
+    /// [`live_stream_target`] streams.
     ///
     /// # Errors
     ///
@@ -365,12 +403,20 @@ impl QueryCapacityBenchmark {
     pub async fn run(mut self) -> Result<Vec<CombinationReport>, CapacityError> {
         write_json(&self.settings.output.join("metadata.json"), &self.metadata)?;
         let mut rows = Vec::new();
-        for rate in OFFERED_RATES {
-            for occupancy in LIVE_OCCUPANCY {
-                let row = self.measure(rate, occupancy).await?;
-                println!("{}", render_row(&row));
-                rows.push(row);
-            }
+        let mut live_loaded = false;
+        for (rate, live) in RUN_ORDER {
+            let target = if live {
+                if !live_loaded {
+                    self.load_live().await?;
+                    live_loaded = true;
+                }
+                live_stream_target(self.metadata.oracle_slot_limit)
+            } else {
+                0
+            };
+            let row = self.measure(rate, target).await?;
+            println!("{}", render_row(&row));
+            rows.push(row);
         }
         write_json(&self.settings.output.join("report.json"), &rows)?;
         let table = render_table(&self.metadata, &rows);
@@ -381,7 +427,8 @@ impl QueryCapacityBenchmark {
         Ok(rows)
     }
 
-    /// Warmup, measurement, and drain for one combination.
+    /// Warmup, measurement, and drain for one combination holding `target`
+    /// live streams.
     ///
     /// Held streams start and are verified first, so the measured window
     /// begins with the intended occupancy already in place.
@@ -392,13 +439,12 @@ impl QueryCapacityBenchmark {
     async fn measure(
         &mut self,
         rate: u64,
-        occupancy: f64,
+        target: usize,
     ) -> Result<CombinationReport, CapacityError> {
-        let label = format!("{rate}qps-{:03}pct", (occupancy * 100.0).round() as u64);
+        let label = format!("{rate}qps-{target}live");
         let raw = self.settings.output.join(&label);
         std::fs::create_dir_all(&raw).map_err(|error| CapacityError::Output(error.to_string()))?;
         let mut invalid = Vec::new();
-        let target = (occupancy * self.metadata.oracle_slot_limit).round() as usize;
         let live = if target == 0 {
             None
         } else {
@@ -451,7 +497,6 @@ impl QueryCapacityBenchmark {
         }
         Ok(MeasuredWindow {
             rate,
-            occupancy,
             target,
             streams,
             units,
@@ -565,7 +610,7 @@ impl QueryCapacityBenchmark {
             .map_err(|error| CapacityError::Output(error.to_string()))?;
         tokio::task::block_in_place(|| node.capture_resource_evidence(&captured))?;
         std::fs::create_dir_all(raw).map_err(|error| CapacityError::Output(error.to_string()))?;
-        let mut container = BTreeMap::new();
+        let mut cgroup = BTreeMap::new();
         for file in CGROUP_EVIDENCE_FILES
             .iter()
             .copied()
@@ -577,7 +622,7 @@ impl QueryCapacityBenchmark {
             std::fs::write(raw.join(file), &contents)
                 .map_err(|error| CapacityError::Output(error.to_string()))?;
             if !matches!(file, "metrics.prom" | "cpu.max") {
-                container.extend(cgroup_values(file, &contents));
+                cgroup.extend(cgroup_values(file, &contents));
             }
         }
         let mut counters = tokio::task::block_in_place(|| node.metric_totals(&COUNTER_FAMILIES))?;
@@ -592,7 +637,7 @@ impl QueryCapacityBenchmark {
         }
         Ok(Snapshot {
             counters,
-            container,
+            cgroup,
             driver_cpu_seconds: driver_cpu_seconds(),
             postgres_select_ms,
         })
@@ -605,7 +650,9 @@ impl RunMetadata {
     ///
     /// # Errors
     ///
-    /// Returns cluster control failures and binary read failures.
+    /// Returns cluster control failures, binary read failures, and
+    /// [`CapacityError::Preflight`] when the reported slot gauge differs from
+    /// the pod's installed Oracle slot count.
     fn collect(
         cluster: &mut BifrostProcessCluster,
         binary: &Path,
@@ -624,6 +671,12 @@ impl RunMetadata {
         let oracle_slot_limit = tokio::task::block_in_place(|| slot_units(node, "limit"))?;
         let oracle_interactive_floor =
             tokio::task::block_in_place(|| slot_units(node, "interactive_floor"))?;
+        if (oracle_slot_limit - evidence.oracle_slot_units as f64).abs() > f64::EPSILON {
+            return Err(CapacityError::Preflight(format!(
+                "the pod reports {oracle_slot_limit} Oracle slot units but installed {}",
+                evidence.oracle_slot_units
+            )));
+        }
         let postgres = std::env::var("WYRD_DATABASE_URL")
             .ok()
             .and_then(|url| url::Url::parse(&url).ok())
@@ -651,13 +704,14 @@ impl RunMetadata {
             server_binary_sha256: hex::encode(Sha256::digest(&binary_bytes)),
             host_cpus: std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
             host_memory_bytes: host_memory_bytes(),
-            container_cpu_max: evidence.cpu_max,
-            container_memory_max: evidence.memory_max,
+            child_cgroup: evidence.cgroup,
+            child_cpu_max: evidence.cpu_max,
+            child_memory_max: evidence.memory_max,
             oracle_slot_limit,
             oracle_interactive_floor,
             placement: format!(
-                "driver and process-cluster parent on the host outside the pod container; \
-                 PostgreSQL at {postgres} outside the pod container"
+                "driver and process-cluster parent on this host outside the pod's cgroup; \
+                 PostgreSQL at {postgres} outside the pod's cgroup"
             ),
             schema: format!("{:?}", workload::schema()),
             published_rows: workload::PUBLISHED_ROWS,
@@ -675,9 +729,7 @@ impl RunMetadata {
 struct MeasuredWindow {
     /// Offered short queries per second.
     rate: u64,
-    /// Intended live occupancy fraction.
-    occupancy: f64,
-    /// Live streams the occupancy asked for.
+    /// Live streams the row holds.
     target: usize,
     /// Smallest and largest open live-stream count sampled.
     streams: [usize; 2],
@@ -702,7 +754,6 @@ impl MeasuredWindow {
     fn report(self) -> CombinationReport {
         let Self {
             rate,
-            occupancy,
             target,
             streams,
             units,
@@ -726,15 +777,15 @@ impl MeasuredWindow {
                 )
             })
             .collect();
-        let mut container = BTreeMap::new();
-        for (key, value) in &after.container {
+        let mut cgroup = BTreeMap::new();
+        for (key, value) in &after.cgroup {
             let cumulative = key.starts_with("cpu.stat:") || key.starts_with("memory.events:");
             let reported = if cumulative {
-                value - before.container.get(key).copied().unwrap_or(0.0)
+                value - before.cgroup.get(key).copied().unwrap_or(0.0)
             } else {
                 *value
             };
-            container.insert(key.clone(), reported);
+            cgroup.insert(key.clone(), reported);
         }
         let sustained = invalid.is_empty()
             && run.missed_launches == 0
@@ -744,20 +795,10 @@ impl MeasuredWindow {
             "none"
         } else if run.max_launch_lag > MAX_DRIVER_LAG {
             "driver"
-        } else if container
-            .get("memory.events:oom_kill")
-            .copied()
-            .unwrap_or(0.0)
-            > 0.0
-        {
-            "container memory"
-        } else if container
-            .get("cpu.stat:nr_throttled")
-            .copied()
-            .unwrap_or(0.0)
-            > 0.0
-        {
-            "container cpu"
+        } else if cgroup.get("memory.events:oom_kill").copied().unwrap_or(0.0) > 0.0 {
+            "cgroup memory"
+        } else if cgroup.get("cpu.stat:nr_throttled").copied().unwrap_or(0.0) > 0.0 {
+            "cgroup cpu"
         } else if outcomes[&ShortQueryOutcome::AdmissionRefused] > 0 {
             "oracle admission"
         } else if after.postgres_select_ms > 100.0 {
@@ -767,7 +808,6 @@ impl MeasuredWindow {
         };
         CombinationReport {
             offered_rate: rate,
-            live_occupancy: occupancy,
             target_live_streams: target,
             live_streams_sampled: if streams[0] == usize::MAX {
                 [0, 0]
@@ -791,7 +831,7 @@ impl MeasuredWindow {
             max_driver_lag_us: u64::try_from(run.max_launch_lag.as_micros()).unwrap_or(u64::MAX),
             driver_cpu_seconds: after.driver_cpu_seconds - before.driver_cpu_seconds,
             server_deltas,
-            container,
+            cgroup,
             postgres_select_ms: [before.postgres_select_ms, after.postgres_select_ms],
             live,
             sustained,
@@ -1280,9 +1320,8 @@ fn millis(micros: Option<u64>) -> String {
 fn render_row(row: &CombinationReport) -> String {
     let count = |outcome| row.outcomes.get(&outcome).copied().unwrap_or(0);
     format!(
-        "{:>5} {:>4.0}% {:>3}/{:<3} {:>8.1} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>5} {:<16} {}",
+        "{:>5} {:>3}/{:<3} {:>8.1} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>5} {:<16} {}",
         row.offered_rate,
-        row.live_occupancy * 100.0,
         row.live_streams_sampled[0],
         row.target_live_streams,
         row.successes_per_second,
@@ -1313,7 +1352,7 @@ fn render_table(metadata: &RunMetadata, rows: &[CombinationReport]) -> String {
     let mut out = format!(
         "Bifrost single-pod query capacity\n\
          commit {} binary {} ({})\n\
-         host {} CPUs {} bytes; pod cpu.max {:?} memory.max {:?}; Oracle slots {} (interactive floor {})\n\
+         host {} CPUs {} bytes; pod cgroup {:?} cpu.max {:?} memory.max {:?}; Oracle slots {} (interactive floor {})\n\
          {}\n\
          data: {} published + {} live rows; {} files, {} row groups, {} bytes\n\
          warmup {}s, measurement {}s per row\n",
@@ -1322,8 +1361,9 @@ fn render_table(metadata: &RunMetadata, rows: &[CombinationReport]) -> String {
         metadata.server_binary_sha256,
         metadata.host_cpus,
         metadata.host_memory_bytes,
-        metadata.container_cpu_max,
-        metadata.container_memory_max,
+        metadata.child_cgroup,
+        metadata.child_cpu_max,
+        metadata.child_memory_max,
         metadata.oracle_slot_limit,
         metadata.oracle_interactive_floor,
         metadata.placement,
@@ -1339,7 +1379,7 @@ fn render_table(metadata: &RunMetadata, rows: &[CombinationReport]) -> String {
         out.push_str(&format!("  {digest}  {sql}\n"));
     }
     out.push_str(
-        "\n rate  live  held/tgt  ok/s   p95ms   p99ms  1st99  ok     degr   fail   refuse dline  transp wrong  missed drained sust  boundary         validity\n",
+        "\n rate held/tgt  ok/s   p95ms   p99ms  1st99  ok     degr   fail   refuse dline  transp wrong  missed drained sust  boundary         validity\n",
     );
     for row in rows {
         out.push_str(&render_row(row));
@@ -1351,6 +1391,31 @@ fn render_table(metadata: &RunMetadata, rows: &[CombinationReport]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The benchmark runs exactly four rows: both no-live baselines first,
+    /// then the same rates with half the Interactive slot units held live.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a live row precedes a baseline, the rates or row count
+    /// change, or the held-stream target is not `max(1, floor(slots / 2))`.
+    #[test]
+    fn query_capacity_runs_baselines_before_four_row_live_order() {
+        assert_eq!(
+            RUN_ORDER,
+            [(500, false), (1_000, false), (500, true), (1_000, true)]
+        );
+        assert_eq!(
+            [0.0, 1.0, 2.0, 3.0, 8.0, 9.0].map(live_stream_target),
+            [1, 1, 1, 1, 4, 4]
+        );
+        assert_eq!(
+            BenchmarkSettings::from_env()
+                .map(|settings| (settings.warmup, settings.measurement))
+                .ok(),
+            Some((Duration::from_secs(15), Duration::from_secs(60)))
+        );
+    }
 
     /// Cgroup files parse into flat readings and skip limits.
     ///

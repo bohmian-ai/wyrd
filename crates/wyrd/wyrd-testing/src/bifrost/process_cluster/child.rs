@@ -1235,44 +1235,63 @@ fn metric_totals(
 }
 
 /// Writes this process's raw metrics exposition and cgroup files into
-/// `directory` and reports its effective limits and resource plan.
+/// `directory` and reports its effective limits, resource plan, and Oracle
+/// slot counts.
 ///
-/// The cgroup files are read from `/sys/fs/cgroup`, which inside a container
-/// with a private cgroup namespace is the container's own cgroup. A file that
-/// does not exist — no cgroup limit, or a host process at the root — is simply
-/// not written and, for the two limits, reported absent.
+/// The cgroup files are read from this process's own cgroup-v2 directory:
+/// the `0::` entry of `/proc/self/cgroup`, joined under `/sys/fs/cgroup`. On a
+/// host that is the systemd scope the benchmark launched the child in, not the
+/// cgroup root. A file that does not exist — no unified cgroup, or no limit
+/// there — is simply not written and, for the two limits, reported absent.
 ///
 /// # Errors
 ///
 /// Returns [`ProcessClusterError::Child`] when this target composed no Bifrost
-/// resources, and [`ProcessClusterError::Resource`] when a file cannot be
-/// written.
+/// resources or no Oracle, and [`ProcessClusterError::Resource`] when the plan
+/// derives no Oracle slot count or a file cannot be written.
 fn capture_resource_evidence(
     server: &WyrdTestServer,
     telemetry: &crate::bifrost::BifrostTelemetryCapture,
     directory: &std::path::Path,
 ) -> Result<super::ResourceEvidence, ProcessClusterError> {
     let resource = |error: std::io::Error| ProcessClusterError::Resource(error.to_string());
-    let plan = server
+    let resources = server
         .state()
         .bifrost_resources()
-        .ok_or_else(|| ProcessClusterError::Child("no Bifrost resources composed".to_owned()))?
-        .plan();
+        .ok_or_else(|| ProcessClusterError::Child("no Bifrost resources composed".to_owned()))?;
+    let plan = resources.plan();
+    let plan_oracle_slots = vala_bifrost_redux::resources::oracle_worker_slots(plan)
+        .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
+    let oracle_slot_units = resources
+        .oracle()
+        .map(|oracle| usize::try_from(oracle.class_split().total_units()).unwrap_or(usize::MAX))
+        .ok_or_else(|| ProcessClusterError::Child("this target composes no Oracle".to_owned()))?;
     std::fs::write(directory.join("metrics.prom"), telemetry.render()).map_err(resource)?;
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|entries| {
+            entries
+                .lines()
+                .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+        });
     let mut limits = std::collections::BTreeMap::new();
-    for file in super::CGROUP_EVIDENCE_FILES {
-        if let Ok(contents) =
-            std::fs::read_to_string(std::path::Path::new("/sys/fs/cgroup").join(file))
-        {
-            std::fs::write(directory.join(file), &contents).map_err(resource)?;
-            limits.insert(file, contents.trim().to_owned());
+    if let Some(cgroup) = &cgroup {
+        let path = std::path::Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/'));
+        for file in super::CGROUP_EVIDENCE_FILES {
+            if let Ok(contents) = std::fs::read_to_string(path.join(file)) {
+                std::fs::write(directory.join(file), &contents).map_err(resource)?;
+                limits.insert(file, contents.trim().to_owned());
+            }
         }
     }
     Ok(super::ResourceEvidence {
+        cgroup,
         cpu_max: limits.remove("cpu.max"),
         memory_max: limits.remove("memory.max"),
         plan_memory_limit_bytes: plan.memory_limit_bytes,
         plan_effective_cpu: plan.effective_cpu,
+        plan_oracle_slots,
+        oracle_slot_units,
     })
 }
 

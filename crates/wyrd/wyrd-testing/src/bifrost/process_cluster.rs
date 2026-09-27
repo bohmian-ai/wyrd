@@ -120,7 +120,7 @@ mod env {
     pub const ORACLE_QUERY_SLOT_LIMIT: &str = "WYRD_PEER_TEST_ORACLE_QUERY_SLOT_LIMIT";
     /// Memory envelope the child injects into its resource plan, when the
     /// topology states one. Absent for every journey topology; only the
-    /// benchmark launch sets it, to the same bytes its container is limited to.
+    /// benchmark launch sets it, to the same bytes its systemd scope is limited to.
     pub const MEMORY_LIMIT_BYTES: &str = "WYRD_PEER_TEST_MEMORY_LIMIT_BYTES";
 }
 
@@ -671,7 +671,7 @@ pub struct OracleOwnershipSnapshot {
 /// Cgroup files a child copies into its resource-evidence directory.
 ///
 /// `cpu.max` and `memory.max` are the limits the benchmark verifies; the rest
-/// are the container resource evidence a report carries — CPU usage and
+/// are the child resource evidence a report carries — CPU usage and
 /// throttling, current and peak memory, and OOM events.
 pub const CGROUP_EVIDENCE_FILES: [&str; 6] = [
     "cpu.max",
@@ -685,9 +685,12 @@ pub const CGROUP_EVIDENCE_FILES: [&str; 6] = [
 /// A child's effective OS limits and the resource plan it booted with.
 ///
 /// Produced inside the child, so the limits are what its own cgroup enforces
-/// rather than what the parent believes it asked a container runtime for.
+/// rather than what the parent believes it asked systemd for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceEvidence {
+    /// The child's cgroup-v2 path from `/proc/self/cgroup`, relative to
+    /// `/sys/fs/cgroup`; absent when the process reports no unified cgroup.
+    pub cgroup: Option<String>,
     /// Contents of the child's `cpu.max`, absent when no cgroup limit exists.
     pub cpu_max: Option<String>,
     /// Contents of the child's `memory.max`, absent when no cgroup limit exists.
@@ -696,6 +699,11 @@ pub struct ResourceEvidence {
     pub plan_memory_limit_bytes: usize,
     /// Effective CPU count the child's resource plan was resolved from.
     pub plan_effective_cpu: usize,
+    /// Oracle slot units the child's resource plan derives.
+    pub plan_oracle_slots: usize,
+    /// Oracle slot units the child installed and reports through its
+    /// `bifrost_oracle_local_slot_units{kind="limit"}` gauge.
+    pub oracle_slot_units: usize,
 }
 
 impl ResourceEvidence {
@@ -705,13 +713,15 @@ impl ResourceEvidence {
     /// A benchmark number is only evidence for the envelope it ran under, so a
     /// child whose cgroup is unlimited, differently limited, or whose plan was
     /// resolved from a different snapshot is refused rather than measured.
-    /// `cpu.max` must be exactly `effective_cpu` periods of quota, and
-    /// `memory.max` exactly `memory_limit_bytes`.
+    /// `cpu.max` must be exactly `effective_cpu` periods of quota,
+    /// `memory.max` exactly `memory_limit_bytes`, and the installed Oracle slot
+    /// count the one that plan derives.
     ///
     /// # Errors
     ///
     /// Returns [`ProcessClusterError::Resource`] naming the first limit that is
-    /// absent, unlimited, malformed, or different from the envelope.
+    /// absent, unlimited, malformed, or different from the envelope, or an
+    /// installed slot count the plan does not derive.
     pub fn verify_envelope(
         &self,
         effective_cpu: usize,
@@ -753,108 +763,59 @@ impl ResourceEvidence {
                 self.plan_effective_cpu, self.plan_memory_limit_bytes
             ));
         }
+        if self.oracle_slot_units != self.plan_oracle_slots {
+            return refuse(format!(
+                "the child installed {} Oracle slot units, but its plan derives {}",
+                self.oracle_slot_units, self.plan_oracle_slots
+            ));
+        }
         Ok(())
     }
 }
 
-/// Opt-in container launch for the single-pod query capacity benchmark.
+/// CPUs the benchmark child's scope is limited to and its plan uses.
+pub const BENCHMARK_EFFECTIVE_CPU: usize = 4;
+
+/// Memory limit of the benchmark child's scope, with no swap, which its plan
+/// also uses: 8 GiB.
+pub const BENCHMARK_MEMORY_LIMIT_BYTES: usize = 8_589_934_592;
+
+/// Rewrites a prepared child command to run in its own systemd user scope.
 ///
-/// Wraps the one `All` child in a Linux container limited to
-/// [`Self::EFFECTIVE_CPU`] CPUs and [`Self::MEMORY_LIMIT_BYTES`] of memory with
-/// no swap, while the parent, the benchmark driver, and PostgreSQL stay outside
-/// that limit. The child keeps its stdin/stdout control protocol, host
-/// networking, and private roots: its binary and the shared and child roots
-/// are bind-mounted at the same absolute paths, so nothing about the launch
-/// except the enforced envelope differs from a journey child.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BenchmarkContainer {
-    /// Container runtime CLI, `docker` unless the operator names another.
-    runtime: String,
-    /// Image whose userland runs the host-built child binary.
-    image: String,
-}
-
-impl BenchmarkContainer {
-    /// CPUs the benchmark container is limited to and the child's plan uses.
-    pub const EFFECTIVE_CPU: usize = 4;
-    /// Memory and memory-plus-swap limit, 8 GiB, which the child's plan uses.
-    pub const MEMORY_LIMIT_BYTES: usize = 8_589_934_592;
-    /// Image used when `WYRD_BENCH_CONTAINER_IMAGE` is unset; its glibc must
-    /// be at least the build host's.
-    pub const DEFAULT_IMAGE: &str = "ubuntu:24.04";
-    /// Parent environment prefixes passed through to the containerized child.
-    ///
-    /// The database and logging settings the child reads come from the
-    /// parent's environment; values are forwarded by name through the runtime
-    /// CLI's own environment so no credential appears in its argv.
-    const PASSTHROUGH_PREFIXES: [&str; 3] = ["WYRD_", "DATABASE_URL", "RUST_LOG"];
-
-    /// Uses `runtime` to launch the child in `image`.
-    #[must_use]
-    pub fn new(runtime: impl Into<String>, image: impl Into<String>) -> Self {
-        Self {
-            runtime: runtime.into(),
-            image: image.into(),
-        }
+/// `systemd-run --scope` places itself in a new transient `unit` limited to
+/// [`BENCHMARK_EFFECTIVE_CPU`] CPUs and [`BENCHMARK_MEMORY_LIMIT_BYTES`] with
+/// no swap, then execs `child` in place. The child therefore keeps the parent's
+/// PID, stdin/stdout control pipes, environment, working directory, loopback
+/// listeners, and private roots, while the parent, the benchmark driver, and
+/// PostgreSQL stay outside that cgroup. `--collect` removes the unit once the
+/// child exits, so the existing kill-and-reap path also stops the scope.
+/// (`--pipe` is rejected in scope mode and unnecessary: the exec keeps the
+/// child's own stdio.)
+fn benchmark_scope(child: &Command, unit: &str) -> Command {
+    let mut command = Command::new("systemd-run");
+    command
+        .args(["--user", "--scope", "--quiet", "--collect", "--unit", unit])
+        .arg(format!(
+            "--property=CPUQuota={}%",
+            BENCHMARK_EFFECTIVE_CPU * 100
+        ))
+        .arg(format!(
+            "--property=MemoryMax={BENCHMARK_MEMORY_LIMIT_BYTES}"
+        ))
+        .arg("--property=MemorySwapMax=0")
+        .arg("--")
+        .arg(child.get_program())
+        .args(child.get_args());
+    for (key, value) in child.get_envs() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
     }
-
-    /// Reads the runtime and image from `WYRD_BENCH_CONTAINER_RUNTIME` and
-    /// `WYRD_BENCH_CONTAINER_IMAGE`, defaulting to `docker` and
-    /// [`Self::DEFAULT_IMAGE`].
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self::new(
-            std::env::var("WYRD_BENCH_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_owned()),
-            std::env::var("WYRD_BENCH_CONTAINER_IMAGE")
-                .unwrap_or_else(|_| Self::DEFAULT_IMAGE.to_owned()),
-        )
+    if let Some(directory) = child.get_current_dir() {
+        command.current_dir(directory);
     }
-
-    /// Rewrites a prepared child command into a limited container run.
-    ///
-    /// Every environment value `child` carries is forwarded by name, as is
-    /// every parent variable under [`Self::PASSTHROUGH_PREFIXES`]. `mounts` are
-    /// bind-mounted read-write at the same absolute path, and the container
-    /// runs as `owner` (`uid:gid`) so files it writes under the parent's
-    /// temporary roots stay removable by the parent.
-    fn wrap(&self, child: &Command, name: &str, owner: &str, mounts: &[&Path]) -> Command {
-        let mut command = Command::new(&self.runtime);
-        command.args([
-            "run",
-            "--rm",
-            "-i",
-            "--name",
-            name,
-            "--network=host",
-            "--user",
-            owner,
-            &format!("--cpus={}", Self::EFFECTIVE_CPU),
-            &format!("--memory={}", Self::MEMORY_LIMIT_BYTES),
-            &format!("--memory-swap={}", Self::MEMORY_LIMIT_BYTES),
-        ]);
-        for (key, value) in child.get_envs() {
-            if let Some(value) = value {
-                command.arg("-e").arg(key).env(key, value);
-            }
-        }
-        for (key, value) in std::env::vars_os() {
-            let forwarded = key.to_str().is_some_and(|key| {
-                Self::PASSTHROUGH_PREFIXES
-                    .iter()
-                    .any(|prefix| key.starts_with(prefix))
-            });
-            if forwarded && child.get_envs().all(|(set, _)| set != key.as_os_str()) {
-                command.arg("-e").arg(&key).env(&key, value);
-            }
-        }
-        for mount in mounts {
-            command
-                .arg("--mount")
-                .arg(format!("type=bind,source={0},target={0}", mount.display()));
-        }
-        command.arg(&self.image).arg(child.get_program());
-        command
-    }
+    command
 }
 
 /// One directory tree's entry and byte occupancy at a moment.
@@ -2153,9 +2114,9 @@ pub struct BifrostProcessCluster {
     /// capacity is a property of the topology rather than of whatever the
     /// injected memory envelope happens to divide into.
     oracle_query_slot_limit: Option<usize>,
-    /// Container every child is launched in, set only by
-    /// [`Self::start_benchmark`].
-    benchmark: Option<BenchmarkContainer>,
+    /// Whether every child is launched in its own limited systemd scope with
+    /// the benchmark envelope, set only by [`Self::start_benchmark`].
+    benchmark: bool,
 }
 
 impl std::fmt::Debug for BifrostProcessCluster {
@@ -2230,36 +2191,28 @@ impl BifrostProcessCluster {
         targets: &[ProcessNodeTarget],
         oracle_query_slot_limit: Option<usize>,
     ) -> Result<Self, ProcessClusterError> {
-        Self::launch_topology(binary.into(), targets, oracle_query_slot_limit, None).await
+        Self::launch_topology(binary.into(), targets, oracle_query_slot_limit, false).await
     }
 
-    /// Launches one mixed `All` pod inside a limited container for the query
-    /// capacity benchmark.
+    /// Launches one mixed `All` pod as a local child in its own limited
+    /// systemd user scope for the query capacity benchmark.
     ///
-    /// The child boots with a [`BenchmarkContainer::EFFECTIVE_CPU`]-CPU,
-    /// [`BenchmarkContainer::MEMORY_LIMIT_BYTES`]-byte injected resource
-    /// snapshot, and the container enforces exactly that envelope. Before
-    /// returning, the child's own `cpu.max`, `memory.max`, and resolved plan
-    /// are read back and compared with it; a mismatch, an unlimited cgroup, or
-    /// an unready child is refused and the pod torn down. Oracle admission is
-    /// left on its derived slot count.
+    /// The child boots with a [`BENCHMARK_EFFECTIVE_CPU`]-CPU,
+    /// [`BENCHMARK_MEMORY_LIMIT_BYTES`]-byte injected resource snapshot, and
+    /// [`benchmark_scope`] enforces exactly that envelope. Before returning,
+    /// the `cpu.max`, `memory.max`, resolved plan, and installed Oracle slot
+    /// count of the child's own cgroup are read back and compared with it; a
+    /// mismatch, an unlimited cgroup, or an unready child is refused and the
+    /// pod torn down. Oracle admission is left on its derived slot count.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::start`], and
     /// [`ProcessClusterError::Resource`] when the child's effective limits or
     /// plan differ from the injected envelope.
-    pub async fn start_benchmark(
-        binary: impl Into<PathBuf>,
-        container: BenchmarkContainer,
-    ) -> Result<Self, ProcessClusterError> {
-        let mut cluster = Self::launch_topology(
-            binary.into(),
-            &[ProcessNodeTarget::All],
-            None,
-            Some(container),
-        )
-        .await?;
+    pub async fn start_benchmark(binary: impl Into<PathBuf>) -> Result<Self, ProcessClusterError> {
+        let mut cluster =
+            Self::launch_topology(binary.into(), &[ProcessNodeTarget::All], None, true).await?;
         let verified = cluster.verify_benchmark_envelope();
         match verified {
             Ok(()) => Ok(cluster),
@@ -2291,10 +2244,8 @@ impl BifrostProcessCluster {
         let directory = node.root().join("launch-evidence");
         std::fs::create_dir_all(&directory)
             .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-        node.capture_resource_evidence(&directory)?.verify_envelope(
-            BenchmarkContainer::EFFECTIVE_CPU,
-            BenchmarkContainer::MEMORY_LIMIT_BYTES,
-        )
+        node.capture_resource_evidence(&directory)?
+            .verify_envelope(BENCHMARK_EFFECTIVE_CPU, BENCHMARK_MEMORY_LIMIT_BYTES)
     }
 
     /// Prepares the shared resources and launches one child per target.
@@ -2306,7 +2257,7 @@ impl BifrostProcessCluster {
         binary: PathBuf,
         targets: &[ProcessNodeTarget],
         oracle_query_slot_limit: Option<usize>,
-        benchmark: Option<BenchmarkContainer>,
+        benchmark: bool,
     ) -> Result<Self, ProcessClusterError> {
         let fixture = Arc::new(
             PgFixture::start()
@@ -2727,38 +2678,18 @@ impl BifrostProcessCluster {
         if let Some(slots) = self.oracle_query_slot_limit {
             command.env(env::ORACLE_QUERY_SLOT_LIMIT, slots.to_string());
         }
-        let container = match &self.benchmark {
-            None => None,
-            Some(benchmark) => {
-                command.env(
-                    env::MEMORY_LIMIT_BYTES,
-                    BenchmarkContainer::MEMORY_LIMIT_BYTES.to_string(),
-                );
-                let name = format!("wyrd-bench-{label}-{}", uuid::Uuid::now_v7().simple());
-                let owner = {
-                    use std::os::unix::fs::MetadataExt as _;
-                    let roots = std::fs::metadata(self.shared.node_roots.path())
-                        .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-                    format!("{}:{}", roots.uid(), roots.gid())
-                };
-                let wrapped = benchmark.wrap(
-                    &command,
-                    &name,
-                    &owner,
-                    &[
-                        self.binary.as_path(),
-                        self.shared.storage_root.path(),
-                        self.shared.node_roots.path(),
-                    ],
-                );
-                command = wrapped;
-                command
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                Some((benchmark.runtime.clone(), name))
-            }
-        };
+        if self.benchmark {
+            command.env(
+                env::MEMORY_LIMIT_BYTES,
+                BENCHMARK_MEMORY_LIMIT_BYTES.to_string(),
+            );
+            let unit = format!("wyrd-bench-{label}-{}", uuid::Uuid::now_v7().simple());
+            command = benchmark_scope(&command, &unit);
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
         let mut child = command
             .spawn()
             .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
@@ -2824,8 +2755,7 @@ impl BifrostProcessCluster {
 
         let (command_tx, command_rx) = channel::<ReaperCommand>();
         let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
-        let reaper_thread =
-            std::thread::spawn(move || reap(child, container.as_ref(), &command_rx, &exit_tx));
+        let reaper_thread = std::thread::spawn(move || reap(child, &command_rx, &exit_tx));
 
         let mut node = ProcessNode {
             label: plan.label.clone(),
@@ -2900,13 +2830,8 @@ fn natural_exit_failure(pid: u32, status: &std::process::ExitStatus) -> Option<S
 /// Separated onto its own thread because the parent must be able to both wait
 /// for an orderly exit and force one, and `std::process::Child` offers no way
 /// to do that from a single blocking call.
-///
-/// `container` names the runtime CLI and container of a benchmark child. A
-/// kill removes that container first, because killing the runtime CLI alone
-/// leaves the containerized server running.
 fn reap(
     mut child: Child,
-    container: Option<&(String, String)>,
     commands: &Receiver<ReaperCommand>,
     exited: &std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
@@ -2932,26 +2857,6 @@ fn reap(
         }
         match commands.recv_timeout(Duration::from_millis(50)) {
             Ok(ReaperCommand::Kill) | Err(RecvTimeoutError::Disconnected) => {
-                if let Some((runtime, name)) = container {
-                    match Command::new(runtime)
-                        .args(["rm", "--force", name])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                    {
-                        Ok(status) if status.success() => {}
-                        Ok(status) => {
-                            first.get_or_insert(format!(
-                                "container {name} could not be removed: {status}"
-                            ));
-                        }
-                        Err(error) => {
-                            first.get_or_insert(format!(
-                                "container {name} could not be removed: {error}"
-                            ));
-                        }
-                    }
-                }
                 if let Err(error) = child.kill() {
                     first.get_or_insert(format!("child pid {pid} could not be killed: {error}"));
                 }
@@ -3022,24 +2927,29 @@ mod tests {
     /// The benchmark launch refuses a pod whose OS limits or plan are not its
     /// envelope, while journey pods keep their existing snapshot.
     ///
-    /// Covers the three places the envelope is stated: the container runtime
-    /// arguments, the child's injected resource snapshot, and the read-back
-    /// verification that refuses absent, unlimited, or mismatched limits.
+    /// Covers the three places the envelope is stated: the systemd scope
+    /// wrapped around the local child, the child's injected resource snapshot,
+    /// and the read-back verification that refuses absent, unlimited, or
+    /// mismatched limits and a slot count the plan does not derive.
     ///
     /// # Panics
     ///
     /// Panics when a wrong envelope verifies, the exact one does not, a
-    /// journey snapshot moved, or the runtime arguments leak an environment
-    /// value or omit a limit.
+    /// journey snapshot moved, or the scope launches through a container
+    /// runtime, leaks an environment value into its argv, omits a limit, or
+    /// does not exec the unchanged child command.
     #[test]
     fn benchmark_launch_refuses_mismatched_or_absent_limits() {
-        let cpus = BenchmarkContainer::EFFECTIVE_CPU;
-        let bytes = BenchmarkContainer::MEMORY_LIMIT_BYTES;
+        let cpus = BENCHMARK_EFFECTIVE_CPU;
+        let bytes = BENCHMARK_MEMORY_LIMIT_BYTES;
         let exact = ResourceEvidence {
+            cgroup: Some("/user.slice/app.slice/wyrd-bench-pod-0.scope".to_owned()),
             cpu_max: Some("400000 100000".to_owned()),
             memory_max: Some("8589934592".to_owned()),
             plan_memory_limit_bytes: bytes,
             plan_effective_cpu: cpus,
+            plan_oracle_slots: 8,
+            oracle_slot_units: 8,
         };
         exact
             .verify_envelope(cpus, bytes)
@@ -3101,6 +3011,13 @@ mod tests {
                     ..exact.clone()
                 },
             ),
+            (
+                "installed slots",
+                ResourceEvidence {
+                    oracle_slot_units: 4,
+                    ..exact.clone()
+                },
+            ),
         ];
         for (case, evidence) in broken {
             assert!(
@@ -3126,36 +3043,39 @@ mod tests {
         );
 
         let mut child = Command::new("/opt/node");
-        child.env(env::DATABASE, "secret-database-value");
-        let wrapped = BenchmarkContainer::new("docker", "image:tag").wrap(
-            &child,
-            "pod",
-            "1000:1000",
-            &[Path::new("/roots")],
-        );
-        let args: Vec<String> = wrapped
+        child
+            .arg("--flag")
+            .env(env::DATABASE, "secret-database-value")
+            .current_dir("/roots");
+        let scoped = benchmark_scope(&child, "wyrd-bench-pod-0-1");
+        assert_eq!(scoped.get_program(), "systemd-run");
+        let args: Vec<String> = scoped
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        for required in [
-            "--cpus=4",
-            "--memory=8589934592",
-            "--memory-swap=8589934592",
-            "--network=host",
-            "type=bind,source=/roots,target=/roots",
-            env::DATABASE,
-        ] {
-            assert!(
-                args.iter().any(|arg| arg == required),
-                "missing {required}: {args:?}"
-            );
-        }
-        assert!(
-            args.iter()
-                .all(|arg| !arg.contains("secret-database-value")),
-            "environment values stay out of the runtime argv"
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--unit",
+                "wyrd-bench-pod-0-1",
+                "--property=CPUQuota=400%",
+                "--property=MemoryMax=8589934592",
+                "--property=MemorySwapMax=0",
+                "--",
+                "/opt/node",
+                "--flag",
+            ]
         );
-        assert_eq!(args[args.len() - 2..], ["image:tag", "/opt/node"]);
+        assert!(
+            scoped.get_envs().any(|(key, value)| key == env::DATABASE
+                && value == Some("secret-database-value".as_ref())),
+            "the child environment is inherited, not put in argv"
+        );
+        assert_eq!(scoped.get_current_dir(), Some(Path::new("/roots")));
     }
 
     /// The ownership control shape survives the control protocol unchanged.

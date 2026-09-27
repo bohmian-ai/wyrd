@@ -1,9 +1,10 @@
 //! Opt-in single-pod Bifrost query capacity benchmark.
 //!
-//! Run through `mise run bench:bifrost:query-capacity` on a dedicated Linux
-//! runner with a container runtime; never on a shared workstation. Launches the
-//! sibling `bifrost_peer_test_node` binary (or `WYRD_BENCH_NODE_BINARY`) as one
-//! containerized pod, then runs every offered-rate / live-occupancy row and
+//! Run through `mise run bench:bifrost:query-capacity` on a Linux host with a
+//! systemd user manager that delegates the `cpu` and `memory` controllers.
+//! Launches the sibling `bifrost_peer_test_node` binary (or
+//! `WYRD_BENCH_NODE_BINARY`) as one local pod in its own 4-CPU/8-GiB systemd
+//! user scope, then runs the four offered-rate / held-live-stream rows and
 //! writes the report under `WYRD_BENCH_OUTPUT_DIR`.
 
 use std::path::PathBuf;

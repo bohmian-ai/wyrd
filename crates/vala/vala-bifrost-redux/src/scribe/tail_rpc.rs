@@ -20,7 +20,7 @@ use crate::contracts::ScribeError;
 use crate::scribe::memtable::{Memtable, ReadableBatchLimits};
 use crate::scribe::routing::shard_for;
 use crate::scribe::shards::ScribeShardRuntime;
-use crate::scribe::staged_tail::{StagedRunWindows, StagedTailReader};
+use crate::scribe::staged_tail::StagedTailReader;
 use crate::scribe::stream_identity::StreamIdentity;
 
 /// The only tail protocol revision understood by the Scribe v1 reader.
@@ -615,26 +615,31 @@ impl LiveTailBatches {
 
     /// Produces this read's rows one batch per pull.
     ///
-    /// Memtable batches come first, then each unserved staged run decoded one
-    /// bounded window at a time; each batch is filtered by the signed
-    /// predicates just before it is yielded and batches retaining no row are
-    /// skipped. Because the next batch is produced only when the consumer polls
-    /// again, a slow consumer holds production back rather than accumulating
-    /// output here.
+    /// Memtable batches come first, then each unserved staged run read one
+    /// Parquet batch at a time through Parquet's async stream; each batch is
+    /// filtered by the signed predicates just before it is yielded and batches
+    /// retaining no row are skipped. Because the next batch is produced only
+    /// when the consumer polls again, a slow consumer holds production back
+    /// rather than accumulating output here.
     ///
-    /// Staged Parquet opens and decodes run on the blocking pool through
-    /// [`StagedRunWindows`], never on the polling worker. The staged lease
-    /// travels with each blocking step: dropping the stream mid-window starts
-    /// no further window and releases the lease once that read exits, while
-    /// the memtable references and producer accounting release at the drop.
+    /// Staged reads charge their fetched row groups and decoded batches to
+    /// `memory_pool`, the follower's query grant; a read the grant cannot hold
+    /// fails the stream.
+    ///
+    /// The stream owns the staged lease, the open run, and the memtable
+    /// references. Dropping it — at completion, cancellation, or disconnect —
+    /// releases all of them together and starts no later batch or run; no
+    /// Wyrd task keeps reading on its behalf.
     ///
     /// # Errors
     ///
     /// The stream yields [`ScribeError::Internal`] when a signed predicate
-    /// cannot be compiled or evaluated, or a staged run cannot be opened,
-    /// projected, or decoded; it ends after the first error.
+    /// cannot be compiled or evaluated, a staged run cannot be opened,
+    /// projected, or decoded, or a staged read exceeds the remaining grant; it
+    /// ends after the first error.
     pub fn into_stream(
         self,
+        memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     ) -> futures_util::stream::BoxStream<
         'static,
         Result<arrow::record_batch::RecordBatch, ScribeError>,
@@ -649,7 +654,7 @@ impl LiveTailBatches {
         } = self;
         Box::pin(async_stream::try_stream! {
             let _open = open;
-            let staged = staged.map(Arc::new);
+            let _staged = staged;
             let required_columns: Arc<[String]> = required_columns.into();
             let predicates: Arc<[ScanPredicate]> = predicates.into();
             let mut produced = false;
@@ -668,20 +673,19 @@ impl LiveTailBatches {
             let reader = StagedTailReader::default();
             for source in &unserved {
                 for run in &source.runs {
-                    let mut windows = StagedRunWindows::open(
-                        reader,
-                        run.clone(),
-                        Arc::clone(&required_columns),
-                        Arc::clone(&predicates),
-                        staged.clone(),
-                    )
-                    .await?;
-                    while let Some((rest, rows)) = windows.next().await? {
+                    let mut run = reader
+                        .open(
+                            run.clone(),
+                            Arc::clone(&required_columns),
+                            Arc::clone(&predicates),
+                            &memory_pool,
+                        )
+                        .await?;
+                    while let Some(rows) = run.next_rows().await? {
                         #[cfg(feature = "test-support")]
                         if produced {
                             scribe_live_production_pause_for_test().hold().await;
                         }
-                        windows = rest;
                         produced = true;
                         yield rows;
                     }
@@ -1028,7 +1032,7 @@ mod tests {
     };
     use crate::scribe::hot_source::HotAuthority;
     use crate::scribe::memtable::Memtable;
-    use crate::scribe::staged_tail::STAGED_WINDOW_GATE;
+    use crate::scribe::staged_tail::tests::unbounded_pool;
     use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
     use crate::scribe::wal::WalLsn;
     use arrow::array::{Int64Array, RecordBatch};
@@ -1181,7 +1185,7 @@ mod tests {
                 .open_live_batches(request)
                 .await
                 .expect("live read opens")
-                .into_stream(),
+                .into_stream(unbounded_pool()),
         )
         .await
         .expect("live read drains")
@@ -1421,7 +1425,7 @@ mod tests {
                 },
             )
             .expect("the generation publishes");
-        let mut stream = open.into_stream();
+        let mut stream = open.into_stream(unbounded_pool());
         let batch = futures_util::StreamExt::next(&mut stream)
             .await
             .expect("the staged run yields a batch")
@@ -1447,20 +1451,19 @@ mod tests {
         );
     }
 
-    /// A staged window read blocks only its blocking-pool thread, and a
-    /// cancelled read releases its staged lease after that read exits.
+    /// Cancelling a staged read releases its lease at once and reads no
+    /// further run.
     ///
-    /// The generation is staged as two runs, one window each, and the first
-    /// window read is held on its blocking thread. While it is held the async
-    /// runtime still runs other tasks and the lease is held. Cancelling the
-    /// reading task leaves the lease with the in-flight read; releasing the
-    /// read then drops the lease without a second window ever being read.
+    /// The generation is staged as two runs. A read that yielded the first
+    /// run's rows and is then dropped holds nothing afterwards; a read
+    /// cancelled at an arbitrary await inside its staged reads also holds
+    /// nothing once its task is gone, because no Wyrd task reads on a dropped
+    /// stream's behalf.
     ///
     /// # Panics
-    /// Panics when the runtime is blocked, the lease is released before the
-    /// in-flight read exits or not at all, or a further window is read.
+    /// Panics when the lease outlives either dropped read.
     #[tokio::test]
-    async fn a_cancelled_staged_read_releases_its_lease_after_the_blocking_window() {
+    async fn a_cancelled_staged_read_releases_its_lease_immediately() {
         let StagedGenerationFixture {
             service,
             memtable,
@@ -1474,55 +1477,45 @@ mod tests {
         memtable
             .complete_staged(generation.get(), member)
             .expect("the shard marks the generation durable");
+
+        let mut stream = service
+            .open_live_batches(request.clone())
+            .await
+            .expect("the live read opens")
+            .into_stream(unbounded_pool());
+        let first = futures_util::StreamExt::next(&mut stream)
+            .await
+            .expect("the first run yields")
+            .expect("the first run reads");
+        assert_eq!(first.num_rows(), 3);
+        assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
+        drop(stream);
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            0,
+            "dropping a read between runs releases its lease"
+        );
+
         let stream = service
             .open_live_batches(request)
             .await
-            .expect("the live read opens")
-            .into_stream();
-        STAGED_WINDOW_GATE.arm();
+            .expect("the live read reopens")
+            .into_stream(unbounded_pool());
         let reading =
             tokio::spawn(
                 async move { futures_util::TryStreamExt::try_collect::<Vec<_>>(stream).await },
             );
-        let (windows, _) =
-            tokio::task::spawn_blocking(|| STAGED_WINDOW_GATE.wait_until(|state| state.held))
-                .await
-                .expect("gate waiter joins");
-        assert_eq!(windows, 1, "exactly the first window is being read");
-
-        assert_eq!(
-            tokio::spawn(async { 7 }).await.expect("probe task joins"),
-            7,
-            "the runtime keeps scheduling while a staged window is read"
-        );
-        assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
-
+        tokio::task::yield_now().await;
         reading.abort();
-        assert!(
-            reading
-                .await
-                .expect_err("the read is cancelled")
-                .is_cancelled()
-        );
-        assert_eq!(
-            registry.leases(&key, generation).expect("locked"),
-            1,
-            "the in-flight window keeps its run leased after cancellation"
-        );
-
-        let exits_before = STAGED_WINDOW_GATE.wait_until(|_| true).1;
-        STAGED_WINDOW_GATE.release();
-        let (windows, _) = tokio::task::spawn_blocking(move || {
-            STAGED_WINDOW_GATE.wait_until(|state| state.exits > exits_before)
-        })
-        .await
-        .expect("gate waiter joins");
+        match reading.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(rows) => assert_eq!(rows.expect("the read completes").len(), 2),
+        }
         assert_eq!(
             registry.leases(&key, generation).expect("locked"),
             0,
-            "the lease releases once the in-flight window exits"
+            "a read cancelled mid-run releases its lease as soon as it is gone"
         );
-        assert_eq!(windows, 1, "no further window is read after cancellation");
     }
 
     /// A signed predicate is applied inside Scribe, so a selective live-tail

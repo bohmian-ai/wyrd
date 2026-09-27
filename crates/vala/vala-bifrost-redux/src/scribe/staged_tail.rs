@@ -3,42 +3,54 @@
 //! Once a generation's rows are staged, its Arrow is gone: the runs on the
 //! staging volume are the only local copy until the claim that owns them
 //! publishes. A live-tail reader must therefore be able to read Parquet, but it
-//! decodes one bounded window at a time under the caller's projection and
-//! signed predicate, so a staged member that is large by construction never
-//! moves into memory whole; the consumer's pull rate bounds what is resident.
+//! reads through Parquet's async stream one row group and one decoded batch per
+//! pull under the caller's projection and signed predicate, so a staged member
+//! that is large by construction never moves into memory whole; the consumer's
+//! pull rate bounds what is resident.
+//!
+//! Memory is charged to the follower's query grant, not to a private ceiling:
+//! a row group's projected encoded bytes are reserved before they are fetched
+//! and held until the group is done, and each decoded batch is charged while it
+//! is retained. The accounting is best effort — Parquet's decoder allocates
+//! beyond what it reports — but it refuses a read the grant plainly cannot
+//! hold before touching the file.
 //!
 //! The reader decides nothing about authority. It is handed the staged sources
 //! a [`ScribeHotSourceRegistry`](crate::scribe::hot_source::ScribeHotSourceRegistry)
 //! resolved and returns rows from exactly those.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
-use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use tokio::sync::oneshot;
+use arrow::datatypes::{Schema, SchemaRef};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use futures_util::StreamExt;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::arrow::async_reader::ParquetRecordBatchStream;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
+use parquet::file::metadata::RowGroupMetaData;
+use parquet::schema::types::SchemaDescriptor;
 use wyrd_spec::vala::assignment_authority::ScanPredicate;
 
 use crate::contracts::ScribeError;
-use crate::scribe::hot_source::StagedSourceLease;
+use crate::oracle::exec::ScanPredicateFilter;
 
-/// Rows decoded per Parquet window yielded to a live producer.
+/// Rows decoded per Parquet batch yielded to a live producer.
 ///
-/// Small enough that one resident window stays modest however large the member
+/// Small enough that one resident batch stays modest however large the member
 /// is, large enough that a normal read is not dominated by per-batch overhead.
 const STAGED_READ_BATCH_ROWS: usize = 8 * 1024;
 
-/// Reads bounded Arrow batches out of durable staged runs.
+/// Opens durable staged runs as grant-accounted async Arrow batch streams.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StagedTailReader {
-    /// Rows decoded per window yielded to the live producer.
+    /// Rows decoded per batch yielded to the live producer.
     batch_rows: usize,
 }
 
 impl Default for StagedTailReader {
-    /// Builds a reader with the module's decode window.
+    /// Builds a reader with the module's output batch size.
     fn default() -> Self {
         Self {
             batch_rows: STAGED_READ_BATCH_ROWS,
@@ -47,262 +59,224 @@ impl Default for StagedTailReader {
 }
 
 impl StagedTailReader {
-    /// Opens one run and yields its decode windows lazily, retaining only the
-    /// rows its signed predicate authorizes.
+    /// Opens one staged run for a live read charged to `memory_pool`.
     ///
-    /// Each window is decoded only when the iterator is advanced, so a live
-    /// producer that yields between windows never holds more than one decoded
-    /// window. The predicate is compiled once per run against the projected
-    /// schema and reused for every window; a window retaining no row is
-    /// skipped.
-    ///
-    /// This is synchronous file IO; an async caller reaches it only through
-    /// [`StagedRunWindows`], which runs it on the blocking pool.
+    /// Reads only the footer, asynchronously, and projects the caller's
+    /// required columns by name. No row group is fetched until the returned
+    /// run is pulled; each is then reserved against `memory_pool` first.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the run cannot be opened or its
-    /// projection cannot be resolved; the iterator yields
-    /// [`ScribeError::Internal`] when a batch cannot be decoded or reordered,
-    /// or the signed predicate cannot be compiled or evaluated.
-    pub(crate) fn run_batches(
+    /// Returns [`ScribeError::Internal`] when the run cannot be opened, its
+    /// footer is unreadable, or a required column is absent.
+    pub(crate) async fn open(
         self,
         run: PathBuf,
         required_columns: Arc<[String]>,
         predicates: Arc<[ScanPredicate]>,
-    ) -> Result<impl Iterator<Item = Result<RecordBatch, ScribeError>> + Send + 'static, ScribeError>
-    {
-        let file = std::fs::File::open(&run).map_err(run_failure(&run, "open"))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(run_failure(&run, "read the metadata of"))?
-            .with_batch_size(self.batch_rows);
-        let projection = projection_mask(&builder, &required_columns, &run)?;
-        let schema = builder.schema().clone();
-        let reader = builder
-            .with_projection(projection)
-            .build()
-            .map_err(run_failure(&run, "start reading"))?;
-        let mut filter = None;
-        Ok(reader
-            .map(move |batch| {
-                #[cfg(test)]
-                STAGED_WINDOW_GATE.pass();
-                let batch = batch.map_err(run_failure(&run, "decode a batch from"))?;
-                let batch = reorder(&batch, &schema, &required_columns, &run)?;
-                if predicates.is_empty() {
-                    return Ok(batch);
+        memory_pool: &Arc<dyn MemoryPool>,
+    ) -> Result<StagedRun, ScribeError> {
+        let mut file = tokio::fs::File::open(&run)
+            .await
+            .map_err(run_failure(&run, "open"))?;
+        let metadata = ArrowReaderMetadata::load_async(&mut file, ArrowReaderOptions::new())
+            .await
+            .map_err(run_failure(&run, "read the metadata of"))?;
+        let schema = Arc::clone(metadata.schema());
+        let projection =
+            projection_mask(&schema, metadata.parquet_schema(), &required_columns, &run)?;
+        Ok(StagedRun {
+            file,
+            metadata,
+            projection,
+            batch_rows: self.batch_rows,
+            next_group: 0,
+            group: None,
+            fetched: MemoryConsumer::new("scribe-staged-row-group").register(memory_pool),
+            decoded: MemoryConsumer::new("scribe-staged-decoded-batch").register(memory_pool),
+            schema,
+            required_columns,
+            predicates,
+            filter: None,
+            run,
+        })
+    }
+}
+
+/// One opened staged run producing signed, projected rows one batch per pull.
+///
+/// Owns the open file, the current row group's async Parquet stream, and both
+/// grant reservations. Dropping it stops the read and releases the
+/// reservations: no later batch or group is decoded, and no Wyrd task outlives
+/// it. A file operation Tokio already started keeps its own descriptor open
+/// until it returns, so the run stays readable for it even if retirement
+/// unlinks the path.
+pub(crate) struct StagedRun {
+    /// Open run file; each row group reads through its own clone of it.
+    file: tokio::fs::File,
+    /// Footer read once at open and shared by every row-group stream.
+    metadata: ArrowReaderMetadata,
+    /// Parquet projection of the caller's required columns.
+    projection: ProjectionMask,
+    /// Rows decoded per output batch.
+    batch_rows: usize,
+    /// Index of the next row group to read.
+    next_group: usize,
+    /// Stream over the row group being read, if one is open.
+    group: Option<ParquetRecordBatchStream<tokio::fs::File>>,
+    /// Grant reservation for the open row group's projected encoded bytes.
+    fetched: MemoryReservation,
+    /// Grant reservation for the decoded batch last returned.
+    decoded: MemoryReservation,
+    /// The run's own Arrow schema, which carries each column's field.
+    schema: SchemaRef,
+    /// Signed projection closure, in caller order.
+    required_columns: Arc<[String]>,
+    /// Signed predicate conjunction every returned row must satisfy.
+    predicates: Arc<[ScanPredicate]>,
+    /// Predicate compiled against the first decoded batch and then reused.
+    filter: Option<ScanPredicateFilter>,
+    /// Path of the run, named in every failure.
+    run: PathBuf,
+}
+
+impl StagedRun {
+    /// Pulls batches until one retains a signed row, returning it.
+    ///
+    /// The charge for the previously returned batch is released first, since
+    /// the caller has consumed it by pulling again. Row groups are read one at
+    /// a time: before a group is fetched its projected encoded bytes are
+    /// reserved, and the reservation is released when the group is exhausted.
+    /// Each decoded batch is charged, reordered to the caller's column order,
+    /// and filtered before anything else is decoded. A batch retaining no row
+    /// is dropped only after it was awaited, and the task yields to the
+    /// runtime before the next pull, so a long zero-match run neither emits
+    /// empty batches nor holds a worker for the whole run. Returns `None` once
+    /// the run is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a row group's projected fetch or
+    /// a decoded batch does not fit the remaining grant, a batch cannot be
+    /// decoded or reordered, or the signed predicate cannot be compiled or
+    /// evaluated. The run must not be pulled again after an error.
+    pub(crate) async fn next_rows(&mut self) -> Result<Option<RecordBatch>, ScribeError> {
+        self.decoded.free();
+        loop {
+            let Some(group) = self.group.as_mut() else {
+                if !self.open_next_group().await? {
+                    return Ok(None);
                 }
-                let filter = match &filter {
-                    Some(filter) => filter,
-                    None => filter.insert(
-                        crate::oracle::exec::ScanPredicateFilter::compile(
-                            &batch.schema(),
-                            &predicates,
-                        )
-                        .map_err(|error| ScribeError::Internal {
-                            detail: format!(
-                                "live-tail predicate is invalid for this snapshot: {error}"
-                            ),
-                        })?,
-                    ),
-                };
-                filter.retain(batch).map_err(|error| ScribeError::Internal {
-                    detail: format!("live-tail predicate evaluation failed: {error}"),
-                })
-            })
-            .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0)))
-    }
-}
-
-/// Boxed window iterator one staged run decodes on the blocking pool.
-type StagedWindows = Box<dyn Iterator<Item = Result<RecordBatch, ScribeError>> + Send>;
-
-/// One staged run decoded window by window off the async runtime.
-///
-/// Opening and every window decode are synchronous Parquet IO, so each runs
-/// as one blocking-pool task that takes this value, advances it once, and
-/// hands it back through a oneshot. Exactly one window is requested per pull,
-/// so demand and residency stay one window.
-///
-/// The value carries the staged lease protecting its file. If the async
-/// consumer is dropped while a window is being read, the blocking task finds
-/// the receiver gone and drops this value, and with it the lease, itself —
-/// only after its protected read has exited, and without starting another
-/// window.
-pub(crate) struct StagedRunWindows {
-    /// Remaining decode windows of the run.
-    windows: StagedWindows,
-    /// Staged lease keeping the run's file readable while it is decoded.
-    _lease: Option<Arc<StagedSourceLease>>,
-}
-
-impl StagedRunWindows {
-    /// Opens `run` on the blocking pool under `lease`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the reader's open or projection failure, and
-    /// [`ScribeError::Internal`] when the blocking task cannot report back.
-    /// Cancellation before this returns leaves the blocking task to drop the
-    /// opened run and its lease when the open finishes.
-    pub(crate) async fn open(
-        reader: StagedTailReader,
-        run: PathBuf,
-        required_columns: Arc<[String]>,
-        predicates: Arc<[ScanPredicate]>,
-        lease: Option<Arc<StagedSourceLease>>,
-    ) -> Result<Self, ScribeError> {
-        Self::on_blocking_pool(move || {
-            let windows = reader.run_batches(run, required_columns, predicates)?;
-            Ok(Self {
-                windows: Box::new(windows),
-                _lease: lease,
-            })
-        })
-        .await
-    }
-
-    /// Decodes the next window on the blocking pool.
-    ///
-    /// Returns `None` once the run is exhausted, which drops this value.
-    ///
-    /// # Errors
-    ///
-    /// Returns the window's decode, projection, or predicate failure, and
-    /// [`ScribeError::Internal`] when the blocking task cannot report back.
-    /// Cancellation while the window is read stops production after it.
-    pub(crate) async fn next(mut self) -> Result<Option<(Self, RecordBatch)>, ScribeError> {
-        Self::on_blocking_pool(move || match self.windows.next() {
-            None => Ok(None),
-            Some(window) => window.map(|batch| Some((self, batch))),
-        })
-        .await
-    }
-
-    /// Runs one synchronous step on the blocking pool and awaits its result.
-    ///
-    /// The result travels through a oneshot rather than the join handle, so
-    /// when the awaiting future has been dropped the result, and any run and
-    /// lease it holds, is dropped inside the blocking task as soon as the
-    /// step returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns the step's own error, and [`ScribeError::Internal`] when the
-    /// blocking task ended without reporting, such as by panicking.
-    async fn on_blocking_pool<T: Send + 'static>(
-        step: impl FnOnce() -> Result<T, ScribeError> + Send + 'static,
-    ) -> Result<T, ScribeError> {
-        let (sender, receiver) = oneshot::channel();
-        tokio::task::spawn_blocking(move || {
-            // A closed receiver means the consumer is gone; the returned
-            // result is dropped right here, releasing what it holds.
-            drop(sender.send(step()));
-            #[cfg(test)]
-            STAGED_WINDOW_GATE.exit();
-        });
-        receiver.await.map_err(|_| ScribeError::Internal {
-            detail: "staged run read ended without a result".to_owned(),
-        })?
-    }
-}
-
-/// Test gate that holds one staged window read on its blocking thread.
-///
-/// Armed, the next window read blocks inside its blocking task until the test
-/// releases it, so a test can prove the async runtime stays responsive and
-/// observe what a cancelled read still holds. Every window read is counted.
-#[cfg(test)]
-pub(crate) struct StagedWindowGate {
-    /// Gate state shared with the blocking reader.
-    state: std::sync::Mutex<StagedWindowGateState>,
-    /// Signals every state change.
-    changed: std::sync::Condvar,
-}
-
-/// Observable state of [`StagedWindowGate`].
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct StagedWindowGateState {
-    /// Whether the next window read should block.
-    pub(crate) armed: bool,
-    /// Whether a read is blocked at the gate.
-    pub(crate) held: bool,
-    /// Window reads started.
-    pub(crate) windows: usize,
-    /// Blocking steps that have finished and dropped any unreceived result.
-    pub(crate) exits: usize,
-}
-
-/// The one process gate staged window reads pass under test.
-#[cfg(test)]
-pub(crate) static STAGED_WINDOW_GATE: StagedWindowGate = StagedWindowGate {
-    state: std::sync::Mutex::new(StagedWindowGateState {
-        armed: false,
-        held: false,
-        windows: 0,
-        exits: 0,
-    }),
-    changed: std::sync::Condvar::new(),
-};
-
-#[cfg(test)]
-impl StagedWindowGate {
-    /// Locks the state, recovering it from a poisoned test.
-    fn lock(&self) -> std::sync::MutexGuard<'_, StagedWindowGateState> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Arms the gate for the next window read.
-    pub(crate) fn arm(&self) {
-        self.lock().armed = true;
-    }
-
-    /// Counts a window read and blocks it while the gate is armed.
-    fn pass(&self) {
-        let mut state = self.lock();
-        state.windows += 1;
-        if state.armed {
-            state.held = true;
-            self.changed.notify_all();
-            while state.armed {
-                state = self
-                    .changed
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
+            };
+            let Some(batch) = group.next().await else {
+                self.group = None;
+                self.fetched.free();
+                continue;
+            };
+            let batch = batch.map_err(run_failure(&self.run, "decode a batch from"))?;
+            self.decoded
+                .try_resize(batch.get_array_memory_size())
+                .map_err(grant_refusal(&self.run, "a decoded batch"))?;
+            let rows = self.retain(reorder(
+                &batch,
+                &self.schema,
+                &self.required_columns,
+                &self.run,
+            )?)?;
+            if rows.num_rows() > 0 {
+                return Ok(Some(rows));
             }
-            state.held = false;
+            self.decoded.free();
+            tokio::task::yield_now().await;
         }
     }
 
-    /// Records one finished blocking step.
-    fn exit(&self) {
-        self.lock().exits += 1;
-        self.changed.notify_all();
+    /// Reserves and opens the next row group, returning `false` at the end.
+    ///
+    /// The group's projected encoded bytes are reserved before its stream is
+    /// built, so a group the grant cannot hold is refused before any of it is
+    /// fetched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the projected bytes overflow or
+    /// exceed the remaining grant, or the file cannot be cloned or read.
+    async fn open_next_group(&mut self) -> Result<bool, ScribeError> {
+        let Some(group) = self.metadata.metadata().row_groups().get(self.next_group) else {
+            return Ok(false);
+        };
+        let fetched = projected_encoded_bytes(group, &self.projection).ok_or_else(|| {
+            ScribeError::Internal {
+                detail: format!(
+                    "staged run {} row group {} projects more bytes than this platform can address",
+                    self.run.display(),
+                    self.next_group
+                ),
+            }
+        })?;
+        self.fetched
+            .try_resize(fetched)
+            .map_err(grant_refusal(&self.run, "a row group fetch"))?;
+        let file = self
+            .file
+            .try_clone()
+            .await
+            .map_err(run_failure(&self.run, "reopen"))?;
+        let stream =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(file, self.metadata.clone())
+                .with_batch_size(self.batch_rows)
+                .with_projection(self.projection.clone())
+                .with_row_groups(vec![self.next_group])
+                .build()
+                .map_err(run_failure(&self.run, "start reading"))?;
+        self.group = Some(stream);
+        self.next_group += 1;
+        Ok(true)
     }
 
-    /// Releases a held read.
-    pub(crate) fn release(&self) {
-        self.lock().armed = false;
-        self.changed.notify_all();
-    }
-
-    /// Blocks the calling thread until `ready` holds, returning a snapshot.
-    pub(crate) fn wait_until(
-        &self,
-        ready: impl Fn(&StagedWindowGateState) -> bool,
-    ) -> (usize, usize) {
-        let mut state = self.lock();
-        while !ready(&state) {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// Keeps the rows of `batch` the signed predicate authorizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the predicate cannot be compiled
+    /// against the projected schema or cannot be evaluated.
+    fn retain(&mut self, batch: RecordBatch) -> Result<RecordBatch, ScribeError> {
+        if self.predicates.is_empty() {
+            return Ok(batch);
         }
-        (state.windows, state.exits)
+        let filter = match &self.filter {
+            Some(filter) => filter,
+            None => self.filter.insert(
+                ScanPredicateFilter::compile(&batch.schema(), &self.predicates).map_err(
+                    |error| ScribeError::Internal {
+                        detail: format!(
+                            "live-tail predicate is invalid for this snapshot: {error}"
+                        ),
+                    },
+                )?,
+            ),
+        };
+        filter.retain(batch).map_err(|error| ScribeError::Internal {
+            detail: format!("live-tail predicate evaluation failed: {error}"),
+        })
     }
+}
+
+/// Sums the encoded bytes of `group`'s projected column chunks.
+///
+/// This is what the async reader fetches for the group. Returns `None` when
+/// the sum overflows or does not fit `usize`.
+fn projected_encoded_bytes(group: &RowGroupMetaData, projection: &ProjectionMask) -> Option<usize> {
+    group
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(leaf, _)| projection.leaf_included(*leaf))
+        .try_fold(0_u64, |total, (_, chunk)| {
+            total.checked_add(chunk.byte_range().1)
+        })
+        .and_then(|total| usize::try_from(total).ok())
 }
 
 /// Builds the Parquet projection for the caller's required columns.
@@ -312,15 +286,15 @@ impl StagedWindowGate {
 /// Returns [`ScribeError::Internal`] when a required column is not in the run's
 /// own schema, which means the run was written under a different schema than
 /// the reader was told to expect.
-fn projection_mask<T: parquet::file::reader::ChunkReader>(
-    builder: &ParquetRecordBatchReaderBuilder<T>,
+fn projection_mask(
+    schema: &Schema,
+    parquet_schema: &SchemaDescriptor,
     required_columns: &[String],
-    run: &std::path::Path,
+    run: &Path,
 ) -> Result<ProjectionMask, ScribeError> {
     if required_columns.is_empty() {
         return Ok(ProjectionMask::all());
     }
-    let schema = builder.schema();
     let mut leaves = Vec::with_capacity(required_columns.len());
     for name in required_columns {
         let index = schema.index_of(name).map_err(|_| ScribeError::Internal {
@@ -331,7 +305,7 @@ fn projection_mask<T: parquet::file::reader::ChunkReader>(
         })?;
         leaves.push(index);
     }
-    Ok(ProjectionMask::roots(builder.parquet_schema(), leaves))
+    Ok(ProjectionMask::roots(parquet_schema, leaves))
 }
 
 /// Returns the projected batch with columns in the caller's requested order.
@@ -348,7 +322,7 @@ fn reorder(
     batch: &RecordBatch,
     schema: &SchemaRef,
     required_columns: &[String],
-    run: &std::path::Path,
+    run: &Path,
 ) -> Result<RecordBatch, ScribeError> {
     if required_columns.is_empty() {
         return Ok(batch.clone());
@@ -373,23 +347,34 @@ fn reorder(
                     ),
                 })?,
         );
-        columns.push(std::sync::Arc::clone(batch.column(index)));
+        columns.push(Arc::clone(batch.column(index)));
     }
-    RecordBatch::try_new(
-        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
-        columns,
-    )
-    .map_err(|error| ScribeError::Internal {
-        detail: format!(
-            "staged run {} could not be projected to the requested columns: {error}",
-            run.display()
-        ),
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
+        ScribeError::Internal {
+            detail: format!(
+                "staged run {} could not be projected to the requested columns: {error}",
+                run.display()
+            ),
+        }
     })
+}
+
+/// Builds the refusal for a read step the follower grant cannot hold.
+fn grant_refusal<E: std::fmt::Display>(
+    run: &Path,
+    subject: &'static str,
+) -> impl Fn(E) -> ScribeError {
+    let run = run.display().to_string();
+    move |error| ScribeError::Internal {
+        detail: format!(
+            "resources exhausted: {subject} of staged run {run} exceeds the follower grant: {error}"
+        ),
+    }
 }
 
 /// Builds the refusal describing one failed staged-run read step.
 fn run_failure<E: std::fmt::Display>(
-    run: &std::path::Path,
+    run: &Path,
     action: &'static str,
 ) -> impl Fn(E) -> ScribeError {
     let run = run.display().to_string();
@@ -399,14 +384,24 @@ fn run_failure<E: std::fmt::Display>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, UnboundedMemoryPool};
+    use parquet::file::properties::WriterProperties;
+    use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
 
     use super::*;
+
+    /// Returns a pool that admits every reservation, for reads whose grant is
+    /// not under test.
+    pub(crate) fn unbounded_pool() -> Arc<dyn MemoryPool> {
+        Arc::new(UnboundedMemoryPool::default())
+    }
 
     /// Builds the two-column schema every staged fixture run is written under.
     fn fixture_schema() -> SchemaRef {
@@ -416,46 +411,104 @@ mod tests {
         ]))
     }
 
-    /// Writes one staged run holding `rows` sequential ordinals and labels.
+    /// Writes one staged run of `rows` ordinals labelled by `label`, closing a
+    /// row group every `group_rows` rows.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot write its own run, which would be a
     /// fixture bug rather than reader behavior.
-    fn write_run(directory: &Path, name: &str, rows: i64) -> PathBuf {
+    fn write_run_with(
+        directory: &Path,
+        name: &str,
+        rows: i64,
+        group_rows: usize,
+        label: impl Fn(i64) -> String,
+    ) -> PathBuf {
         let schema = fixture_schema();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from_iter_values(0..rows)),
-                Arc::new(StringArray::from_iter_values(
-                    (0..rows).map(|ordinal| format!("row-{ordinal}")),
-                )),
+                Arc::new(StringArray::from_iter_values((0..rows).map(label))),
             ],
         )
         .expect("fixture staged batch");
         let path = directory.join(name);
         let file = std::fs::File::create(&path).expect("fixture staged run file");
-        let mut writer =
-            parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("fixture run writer");
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(group_rows))
+            .build();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, Some(properties))
+            .expect("fixture run writer");
         writer.write(&batch).expect("fixture run rows");
         writer.close().expect("fixture run footer");
         path
     }
 
-    /// Drains every window [`StagedTailReader::run_batches`] yields for `run`.
+    /// Writes one single-group staged run of `rows` sequential ordinals.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot write its own run.
+    fn write_run(directory: &Path, name: &str, rows: i64) -> PathBuf {
+        write_run_with(directory, name, rows, 1024 * 1024, |ordinal| {
+            format!("row-{ordinal}")
+        })
+    }
+
+    /// Writes one row group whose 64 KiB rows repeat a single label.
+    ///
+    /// The group encodes to a few KiB but decodes to `rows * 64 KiB`, the
+    /// shape of many accepted compressible writes staged together.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot write its own run.
+    fn write_compressible_run(directory: &Path, rows: i64) -> PathBuf {
+        let label = "x".repeat(64 * 1024);
+        write_run_with(
+            directory,
+            "compressible.parquet",
+            rows,
+            1024 * 1024,
+            move |_| label.clone(),
+        )
+    }
+
+    /// Opens `run` charged to `pool` and drains every batch it returns.
     ///
     /// # Errors
     ///
-    /// Returns the first open or decode failure the reader reports.
-    fn drain(
+    /// Returns the first open, grant, decode, or predicate failure the reader
+    /// reports.
+    async fn drain_in(
+        pool: &Arc<dyn MemoryPool>,
         run: &Path,
         columns: &[String],
-        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+        predicates: &[ScanPredicate],
     ) -> Result<Vec<RecordBatch>, ScribeError> {
-        StagedTailReader::default()
-            .run_batches(run.to_path_buf(), columns.into(), predicates.into())?
-            .collect()
+        let mut run = StagedTailReader::default()
+            .open(run.to_path_buf(), columns.into(), predicates.into(), pool)
+            .await?;
+        let mut batches = Vec::new();
+        while let Some(rows) = run.next_rows().await? {
+            batches.push(rows);
+        }
+        Ok(batches)
+    }
+
+    /// Drains `run` under an unbounded grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first open, decode, or predicate failure the reader reports.
+    async fn drain(
+        run: &Path,
+        columns: &[String],
+        predicates: &[ScanPredicate],
+    ) -> Result<Vec<RecordBatch>, ScribeError> {
+        drain_in(&unbounded_pool(), run, columns, predicates).await
     }
 
     /// A staged read returns the requested columns in the caller's order.
@@ -468,12 +521,14 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the projection is dropped, reordered wrongly, or widened.
-    #[test]
-    fn a_staged_read_projects_exactly_the_requested_columns_in_caller_order() {
+    #[tokio::test]
+    async fn a_staged_read_projects_exactly_the_requested_columns_in_caller_order() {
         let root = tempfile::tempdir().expect("staged root");
         let run = write_run(root.path(), "run-1.parquet", 4);
         let columns = vec!["label".to_owned(), "ordinal".to_owned()];
-        let batches = drain(&run, &columns, &[]).expect("the staged run reads");
+        let batches = drain(&run, &columns, &[])
+            .await
+            .expect("the staged run reads");
 
         assert_eq!(batches.len(), 1);
         let rows = &batches[0];
@@ -482,31 +537,85 @@ mod tests {
         assert_eq!(rows.schema().field(1).name(), "ordinal");
     }
 
-    /// A staged read yields only the rows its signed predicate authorizes and
-    /// skips a window retaining none of them.
+    /// A staged read over many row groups yields only the rows its signed
+    /// predicate authorizes, in order, skips every batch retaining none, and
+    /// releases its grant once drained.
     ///
     /// # Panics
     ///
-    /// Panics when an empty window is yielded or a matching row is dropped.
-    #[test]
-    fn a_staged_read_filters_and_skips_windows_retaining_no_row() {
-        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
-
+    /// Panics when an empty batch is yielded, a matching row is dropped or
+    /// reordered, or grant bytes remain charged after the read.
+    #[tokio::test]
+    async fn a_staged_read_filters_and_skips_batches_retaining_no_row() {
         let root = tempfile::tempdir().expect("staged root");
-        let older = write_run(root.path(), "older.parquet", 1);
-        let later = write_run(root.path(), "later.parquet", 2);
+        let run = write_run_with(root.path(), "groups.parquet", 40_000, 5_000, |ordinal| {
+            format!("row-{ordinal}")
+        });
+        let pool = unbounded_pool();
         let columns = vec!["ordinal".to_owned()];
-        let predicates = vec![ScanPredicate::Eq("ordinal".to_owned(), ScanLiteral::I64(1))];
-
+        let none = vec![ScanPredicate::Eq(
+            "ordinal".to_owned(),
+            ScanLiteral::I64(-1),
+        )];
         assert!(
-            drain(&older, &columns, &predicates)
-                .expect("the older run reads")
+            drain_in(&pool, &run, &columns, &none)
+                .await
+                .expect("the zero-match run reads")
                 .is_empty(),
-            "a window retaining no row is skipped, not yielded empty"
+            "a batch retaining no row is skipped, not yielded empty"
         );
-        let batches = drain(&later, &columns, &predicates).expect("the later run reads");
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(pool.reserved(), 0, "a drained read holds no grant");
+
+        let some = vec![ScanPredicate::Gt(
+            "ordinal".to_owned(),
+            ScanLiteral::I64(9_990),
+        )];
+        let batches = drain_in(&pool, &run, &columns, &some)
+            .await
+            .expect("the selective run reads");
+        assert!(batches.iter().all(|batch| batch.num_rows() > 0));
+        let ordinals = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ordinal column")
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, (9_991..40_000).collect::<Vec<_>>());
+        assert_eq!(pool.reserved(), 0, "a drained read holds no grant");
+    }
+
+    /// Dropping a staged read mid-run releases every grant byte it charged.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the open read holds no charge or its drop leaves one.
+    #[tokio::test]
+    async fn a_dropped_staged_read_releases_its_grant() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_run_with(root.path(), "groups.parquet", 40_000, 5_000, |ordinal| {
+            format!("row-{ordinal}")
+        });
+        let pool = unbounded_pool();
+        let mut read = StagedTailReader::default()
+            .open(run, Arc::from(Vec::new()), Arc::from(Vec::new()), &pool)
+            .await
+            .expect("the staged run opens");
+        read.next_rows()
+            .await
+            .expect("the first batch reads")
+            .expect("the run has rows");
+        assert!(
+            pool.reserved() > 0,
+            "a mid-run read holds its group and batch"
+        );
+        drop(read);
+        assert_eq!(pool.reserved(), 0);
     }
 
     /// A required column the run does not carry is refused, naming the run.
@@ -518,16 +627,168 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the read succeeds or refuses without naming the run.
-    #[test]
-    fn a_missing_required_column_refuses_and_names_the_run() {
+    #[tokio::test]
+    async fn a_missing_required_column_refuses_and_names_the_run() {
         let root = tempfile::tempdir().expect("staged root");
         let run = write_run(root.path(), "run-1.parquet", 2);
         let columns = vec!["absent".to_owned()];
-        let error =
-            drain(&run, &columns, &[]).expect_err("a column the run does not carry is refused");
+        let error = drain(&run, &columns, &[])
+            .await
+            .expect_err("a column the run does not carry is refused");
 
         let detail = error.to_string();
         assert!(detail.contains("absent"), "{detail}");
         assert!(detail.contains("run-1.parquet"), "{detail}");
+    }
+
+    /// A zero-match predicate over a many-group run returns nothing, decodes
+    /// it one batch per pull, and lets other tasks on the same worker run
+    /// between batches.
+    ///
+    /// On a single-threaded runtime a ticking task can only advance while the
+    /// read yields, so it advancing once per skipped batch proves no batch —
+    /// and no group — is decoded without handing the worker back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a row is returned or the ticking task is starved.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_match_staged_read_returns_nothing_and_does_not_starve_the_runtime() {
+        let root = tempfile::tempdir().expect("staged root");
+        let rows = 16 * STAGED_READ_BATCH_ROWS;
+        let run = write_run_with(
+            root.path(),
+            "groups.parquet",
+            i64::try_from(rows).expect("fixture rows fit i64"),
+            4 * STAGED_READ_BATCH_ROWS,
+            |ordinal| format!("row-{ordinal}"),
+        );
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = Arc::clone(&ticks);
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let predicates = vec![ScanPredicate::Eq(
+            "ordinal".to_owned(),
+            ScanLiteral::I64(-1),
+        )];
+        let batches = drain(&run, &["ordinal".to_owned()], &predicates)
+            .await
+            .expect("the zero-match run reads");
+        ticker.abort();
+
+        assert!(batches.is_empty(), "no empty batch is returned");
+        assert!(
+            ticks.load(Ordering::Relaxed) >= rows / STAGED_READ_BATCH_ROWS,
+            "another task ran fewer than once per decoded batch"
+        );
+    }
+
+    /// A row group whose projected encoded bytes exceed the grant is refused
+    /// before it is fetched.
+    ///
+    /// The run's data pages are corrupted, so any fetch and decode would fail
+    /// with a decode error; getting the grant refusal instead proves the
+    /// refusal came first.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read opens a group, fails for another reason, or does
+    /// not name the run.
+    #[tokio::test]
+    async fn a_staged_row_group_fetch_above_the_grant_is_refused_before_fetch() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_run(root.path(), "run-1.parquet", 4_096);
+        let mut bytes = std::fs::read(&run).expect("run bytes");
+        for byte in &mut bytes[4..64] {
+            *byte = 0xFF;
+        }
+        std::fs::write(&run, bytes).expect("corrupt run");
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1_024));
+
+        let detail = drain_in(&pool, &run, &[], &[])
+            .await
+            .expect_err("a group above the grant is refused")
+            .to_string();
+        assert!(detail.contains("row group fetch"), "{detail}");
+        assert!(detail.contains("run-1.parquet"), "{detail}");
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    /// A compressible row group whose decoded total exceeds the grant still
+    /// reads, because each decoded batch is charged and released on its own.
+    ///
+    /// 512 rows of 64 KiB decode to 32 MiB; the grant is 16 MiB, which holds
+    /// the few-KiB encoded fetch plus one 8,192-row-capped batch at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read is refused or loses a row.
+    #[tokio::test]
+    async fn a_compressible_group_above_the_grant_reads_in_charged_batches() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_compressible_run(root.path(), 512);
+        let grant = 16 * 1024 * 1024;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(grant));
+        let mut read = StagedTailReader { batch_rows: 64 }
+            .open(run, Arc::from(Vec::new()), Arc::from(Vec::new()), &pool)
+            .await
+            .expect("the compressible run opens");
+        let mut rows = 0;
+        let mut decoded = 0;
+        while let Some(batch) = read.next_rows().await.expect("each batch fits the grant") {
+            rows += batch.num_rows();
+            decoded += batch.get_array_memory_size();
+        }
+        assert_eq!(rows, 512);
+        assert!(
+            decoded > grant,
+            "the decoded total {decoded} exceeds the grant"
+        );
+    }
+
+    /// A decoded batch larger than the remaining grant fails the read at that
+    /// batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read succeeds or fails for another reason.
+    #[tokio::test]
+    async fn a_decoded_staged_batch_above_the_grant_fails_the_read() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_compressible_run(root.path(), 512);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * 1024 * 1024));
+        let detail = drain_in(&pool, &run, &[], &[])
+            .await
+            .expect_err("a 32 MiB batch does not fit a 4 MiB grant")
+            .to_string();
+        assert!(detail.contains("decoded batch"), "{detail}");
+        assert!(detail.contains("resources exhausted"), "{detail}");
+    }
+
+    /// A staged run whose data pages are corrupt fails the read instead of
+    /// returning partial or empty rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the corrupt run reads successfully.
+    #[tokio::test]
+    async fn a_corrupt_staged_run_fails_the_read() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_run(root.path(), "run-1.parquet", 64);
+        let mut bytes = std::fs::read(&run).expect("run bytes");
+        for byte in &mut bytes[4..64] {
+            *byte = 0xFF;
+        }
+        std::fs::write(&run, bytes).expect("corrupt run");
+
+        drain(&run, &[], &[])
+            .await
+            .expect_err("a corrupt data page fails the read");
     }
 }

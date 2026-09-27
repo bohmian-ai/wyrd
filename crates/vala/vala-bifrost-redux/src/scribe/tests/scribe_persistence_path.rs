@@ -8,6 +8,7 @@ use crate::namespaces::BifrostNamespace;
 use crate::scribe::ScribeImpl;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::seal_key::SealKey;
+use crate::scribe::staged_tail::tests::unbounded_pool;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
 use crate::scribe::wal::{WalConfig, WalWriter};
@@ -726,7 +727,7 @@ async fn live_rows(
             .open_live_batches(request)
             .await
             .expect(context)
-            .into_stream(),
+            .into_stream(unbounded_pool()),
     )
     .await
     .expect(context)

@@ -1167,8 +1167,9 @@ impl PartitionStream for LiveTailPartition {
     /// Takes the producer and streams its batches projected to the closure.
     ///
     /// A second execution yields one internal error instead of rows, because
-    /// the live cut has already been handed out.
-    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+    /// the live cut has already been handed out. Staged reads are charged to
+    /// the task's memory pool, which is the follower's granted pool.
+    fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
         let schema = Arc::clone(&self.schema);
         let taken = self
             .batches
@@ -1177,7 +1178,7 @@ impl PartitionStream for LiveTailPartition {
             .take();
         let stream = match taken {
             Some(batches) => batches
-                .into_stream()
+                .into_stream(Arc::clone(ctx.memory_pool()))
                 .map(move |batch| {
                     batch
                         .map_err(|error| DataFusionError::External(Box::new(error)))

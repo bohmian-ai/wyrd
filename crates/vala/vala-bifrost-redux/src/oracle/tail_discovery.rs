@@ -3,14 +3,16 @@
 //! Oracle lists each pinned table's reported streams before planning; the
 //! routes name exact Scribe incarnations and writer epochs and retain no rows.
 
+use wyrd_spec::vala::api::{TailStreamIdentity, TenantTableBinding, TimePartitionWire};
+
 use super::*;
 
 /// One query-scoped live-tail route discovered from an authoritative Scribe.
 pub struct DiscoveredTailRoute {
     /// Exact time partition retained by the Scribe stream.
-    pub time_partition: wyrd_spec::vala::api::TimePartitionWire,
+    pub time_partition: TimePartitionWire,
     /// Exact node and writer epoch returned by discovery.
-    pub stream: wyrd_spec::vala::api::TailStreamIdentity,
+    pub stream: TailStreamIdentity,
 }
 
 /// Query-scoped resolver for live Scribe streams.
@@ -19,14 +21,20 @@ pub trait TailStreamDiscovery: Send + Sync {
     /// Refreshes authoritative membership and lists active streams for one binding.
     ///
     /// # Errors
-    /// Returns [`BifrostError::QueryVisibilityUnavailable`] for stale membership,
-    /// authorization, TLS, discovery, or audit failures.
+    /// Returns the listing's [`TailReadError`] class:
+    /// [`TailReadError::Unavailable`] only when a ready Scribe cannot be
+    /// reached or refuses as unavailable, [`TailReadError::StaleIdentity`] when
+    /// a listed stream names another incarnation or epoch,
+    /// [`TailReadError::DeadlineElapsed`] at the deadline, and the fatal
+    /// [`TailReadError::Authorization`], [`TailReadError::Binding`], or
+    /// [`TailReadError::State`] class for membership, ticket, credential,
+    /// tenant, binding, or malformed-response failures.
     async fn discover(
         &self,
-        binding: &wyrd_spec::vala::api::TenantTableBinding,
+        binding: &TenantTableBinding,
         query_id: uuid::Uuid,
         deadline: Instant,
-    ) -> Result<Vec<DiscoveredTailRoute>, crate::scribe::tail_rpc::TailReadError>;
+    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError>;
 
     /// Toggles a test-tier discovery outage without changing production behavior.
     #[cfg(feature = "test-support")]
@@ -37,10 +45,8 @@ pub trait TailStreamDiscovery: Send + Sync {
 ///
 /// # Errors
 /// Returns visibility unavailable when the catalog namespace is malformed.
-pub(super) fn wire_binding(
-    cut: &PinnedSealedTable,
-) -> Result<wyrd_spec::vala::api::TenantTableBinding, BifrostError> {
-    Ok(wyrd_spec::vala::api::TenantTableBinding {
+pub(super) fn wire_binding(cut: &PinnedSealedTable) -> Result<TenantTableBinding, BifrostError> {
+    Ok(TenantTableBinding {
         tenant_id: cut.binding.tenant,
         namespace: cut
             .binding

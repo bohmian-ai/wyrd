@@ -3704,6 +3704,7 @@ mod tests {
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use async_trait::async_trait;
+    use datafusion::common::tree_node::TreeNode;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::logical_expr::{col, lit};
     use datafusion::physical_plan::sorts::sort::SortExec;
@@ -6727,7 +6728,6 @@ mod tests {
     /// the closure contract this owner pins.
     #[tokio::test]
     async fn projected_leaf_union_preserves_predicate_and_tenant_columns() {
-        use datafusion::common::tree_node::TreeNode;
         use datafusion::execution::context::SessionContext;
         use datafusion::logical_expr::{col, lit};
         use datafusion::physical_plan::collect;

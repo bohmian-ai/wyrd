@@ -22,6 +22,7 @@ use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
+use futures_util::StreamExt as _;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
 use prost::Message;
 use thiserror::Error;
@@ -1168,7 +1169,6 @@ impl PartitionStream for LiveTailPartition {
     /// A second execution yields one internal error instead of rows, because
     /// the live cut has already been handed out.
     fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-        use futures_util::StreamExt as _;
         let schema = Arc::clone(&self.schema);
         let taken = self
             .batches

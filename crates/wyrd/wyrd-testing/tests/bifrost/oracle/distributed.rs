@@ -1375,3 +1375,109 @@ async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), Journ
     pause.release();
     Ok(())
 }
+
+/// Returns the writer Scribe's cumulative live fragment footers.
+///
+/// # Errors
+///
+/// Returns an error when node 0 carries no Scribe runtime.
+fn writer_fragment_footers(cluster: &WyrdTestCluster) -> Result<u64, JourneyError> {
+    Ok(cluster
+        .server(0)
+        .ok_or("missing writer node")?
+        .state()
+        .bifrost_ingest()
+        .ok_or("writer node has no Scribe runtime")?
+        .fragment_inspection()
+        .1)
+}
+
+/// A completed `LIMIT` plan stops an opened live fragment it no longer needs.
+///
+/// Published ids stay below the predicate and live ids 101..=103 sit on one
+/// unflushed Scribe. With the Scribe producer paused after its first batch,
+/// `LIMIT 1` completes from that batch alone: the query succeeds with one
+/// row, the paused fragment is cancelled without a footer, and its producer,
+/// snapshot, and follower lease release without producing the remaining
+/// rows. An ordered limit whose top row exists only live still returns it,
+/// so DataFusion rather than an Oracle early-stop rule decides when a live
+/// child is no longer needed.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn limit_stops_unneeded_live_fragment_without_footer() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_live_limit");
+    let table_fqn = format!("vala.bifrost.{table}");
+    let live_node = cluster.server(0).ok_or("missing node 0")?;
+    let published_node = cluster.server(2).ok_or("missing node 2")?;
+    register_table(live_node, tenant, &table).await?;
+    let published = writer(published_node, "limit-published-writer").await?;
+    for id in 1..=3 {
+        published
+            .write(
+                &table_fqn,
+                &journey_schema(),
+                [journey_row(id, marker_value(id))],
+            )
+            .await?;
+    }
+    published_node.flush_bifrost().await?;
+    let live = client(live_node, "limit-live-writer").await?;
+    let now = chrono::Utc::now().timestamp_micros();
+    for id in 101..=103 {
+        append_event_time_row(&live, &table_fqn, id, now).await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    let baseline = live_node
+        .state()
+        .bifrost_ingest()
+        .ok_or("writer node has no Scribe runtime")?
+        .resources()
+        .snapshot()?
+        .scribe_memory_used_bytes;
+    let reader = client(cluster.server(1).ok_or("missing node 1")?, "limit-reader").await?;
+    let query = wyrd_client::Bifrost::query_only(&reader);
+
+    let case = "limit stops a paused live fragment";
+    let footers = writer_fragment_footers(&cluster)?;
+    let mut stream = open_paused_live_query(
+        &query,
+        &format!("SELECT id FROM {table_fqn} WHERE id > 100 LIMIT 1"),
+        case,
+    )
+    .await?;
+    let mut ids = Vec::new();
+    while let Some(batch) = tokio::time::timeout(LIVE_SETTLE_TIMEOUT, stream.next_batch()).await?? {
+        let column = batch
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or("query result id column is not Int64")?;
+        ids.extend(column.iter().flatten());
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    if terminal.outcome != QueryTerminalOutcome::Success || terminal.error.is_some() {
+        return Err(format!("{case}: ended {:?} {:?}", terminal.outcome, terminal.error).into());
+    }
+    // Shard lanes do not preserve append order, so any one live id qualifies.
+    if ids.len() != 1 || !(101..=103).contains(&ids[0]) {
+        return Err(format!("{case}: expected exactly one live id, saw {ids:?}").into());
+    }
+    drop(stream);
+    await_live_released(&cluster, baseline, case).await?;
+    let pause = vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test();
+    pause.release();
+    if writer_fragment_footers(&cluster)? != footers {
+        return Err(format!("{case}: the stopped fragment still wrote a footer").into());
+    }
+
+    let ordered = query_ids(
+        &reader,
+        format!("SELECT id FROM {table_fqn} ORDER BY id DESC LIMIT 2"),
+    )
+    .await?;
+    if ordered != vec![103, 102] {
+        return Err(format!("ordered limit expected live ids [103, 102], saw {ordered:?}").into());
+    }
+    Ok(())
+}

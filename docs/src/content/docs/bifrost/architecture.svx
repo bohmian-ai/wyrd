@@ -154,7 +154,7 @@ Any Scribe accepts any write on any table. No coordination on write path. Multip
 - **LSN.** `u64` append-position in one Scribe pod's local WAL.
 - **Stream identity.** `(node_id, writer_epoch)` identifies the WAL stream producing a file.
 - **Cross-pod LSNs are unrelated.** LSNs from different pods or different epochs of the same pod are incomparable.
-- **Oracle deduplication.** Per-stream watermark prevents double-counting live-tail data.
+- **Live overlap.** One live scan reads each Scribe generation once, but no watermark reconciles it with the pinned published cut: publication between planning and opening the scan can briefly omit or duplicate rows.
 
 ### Postgres-leased Forge
 

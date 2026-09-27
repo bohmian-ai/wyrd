@@ -444,7 +444,7 @@ report. All required lanes must be green before the task is reported complete.
 
 ## Implementation Evidence
 
-Commits `4b617f0f9..e2207970d` on `vcc/task-005`. Journeys ran through
+Commits `d1ec13200..abadc452e` (4b617f0f9 through abadc452e) on `vcc/task-005`. Journeys ran through
 `scripts/postgres/with-test-postgres.sh` with migrations, one at a time.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
@@ -456,15 +456,16 @@ Commits `4b617f0f9..e2207970d` on `vcc/task-005`. Journeys ran through
 | AC-005 LIMIT stop without footer; Degraded vs Failed matrix | `LiveFragmentRead::into_stream`; `live_execution_status_error` (Scribe open: `Unavailable`→degradable, `ResourceExhausted`→`Capacity`); test-only `ScribeFragmentFault` hook in `wyrd-server` `oracle/peer_service.rs` (6553f5adc) | `distributed::limit_stops_unneeded_live_fragment_without_footer`; `distributed::live_query_terminal_failure_matrix` (listing loss and pre-row loss Degraded; late loss, missing footer, ticket rejection, capacity refusal and deleted published files Failed and client-rejected; absent-before-discovery Success); `oracle::dispatcher::tests::live_scribe_open_status_separates_availability_from_faults`; `write_read::scribe_undialable_private_peer_degrades_live_coverage` | PASS |
 | AC-006 Drift uses the one query; judgment only after a non-failed terminal; docs state both races | `ScheduledQueryCaller` unchanged; Drift journey live step (7143e5e0c, e2207970d); docs (32443a1ee, 9a88a61f1) | `drift_verification::drift_methods_fit_score_persist_and_dispatch` scores unflushed observations; failed terminal → no outcome pinned by `query::scheduled::tests::scheduled_terminal_requires_clean_eof` (unit only: injecting a failure into the server-side scheduled query needs a hook that does not exist); `docs:check` | PASS |
 | AC-007 tail-fence acquire/page/release and 30 s lifetime removed; listing kept | 86d133769, 40a644ab6 | Source sweep finds no tail-fence surface (the persisted `tail_fence` audit enum value is kept for historical rows); `test:bifrost:journey:oracle` 33/33 | PASS |
-| AC-008 fmt, lints, codegen, docs, `verify:bifrost`, `gate` | — | `fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`, `ts:build`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `test:principals:integration` (18/18), `docs:check`, `check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, `git diff --check` pass. `verify:bifrost`: 8/9 lanes passed; `unit:rust` failed on a fixture that listed only two source tiers, fixed in a026fd6e3 and rerun at 220/220. `gate`: every dependency except `check:skills-sync` ran one at a time and passed (47/47, including `check`, `test:rust`, `test:bifrost:gate`, `test:gateway:gate`, `test:identity:journey`, `py:test:integration`, `ts:test:integration`, `py:test:unit`, `ts:test:unit`, and every `check:*` and examples lane). `check:skills-sync` fails only because of uncommitted `.agents/skills/wyrd-task-review/` edits outside this task, left untouched | PASS (skills-sync excluded) |
+| AC-008 fmt, lints, codegen, docs, `verify:bifrost`, `gate` | — | `fmt`, `lints`, `py:format`, `py:lints`, `py:typecheck`, `ts:build`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `test:principals:integration` (18/18), `docs:check`, `check:client-tier`, `check:pyo3-scope`, `check:unwrap-audit`, `git diff --check` pass. `verify:bifrost`: 8/9 lanes passed; `unit:rust` failed on a fixture that listed only two source tiers, fixed in a026fd6e3 and rerun at 220/220. `gate`: every dependency except `check:skills-sync` ran one at a time and passed (47/47, including `check`, `test:rust`, `test:bifrost:gate`, `test:gateway:gate`, `test:identity:journey`, `py:test:integration`, `ts:test:integration`, `py:test:unit`, `ts:test:unit`, and every `check:*` and examples lane). `check:skills-sync` passes after the approved `wyrd-task-review` edits were synced and committed (e15c610af) | PASS |
 
 Non-goals stayed excluded: no public mode or class option, verifier-only
 route, Flight listener, durable owner index, replacement tail lease, second
 planner, scheduler, aggregate or join pushdown, persistent state,
 compatibility mode, or ACK/publication change.
 
-Material risk: `scribe::write_read::scribe_write_flush_read_user_journey`
-failed once and passed on the rerun and in `verify:bifrost`. It compares two
-runs' published file layout. Scribe assembly claims whatever members are
-ready at that moment, so the layout depends on timing. This task does not
-touch that code.
+Flake fixed: `scribe::write_read::scribe_write_flush_read_user_journey` failed
+once because the canonical workload's rows took the server receipt time as
+their event time. A run whose two writes to one table straddled an hour
+boundary put those rows in two hourly partitions and published two files, so
+the cache-off/cache-on layout parity failed. The runner now writes one pinned
+`wyrd_event_time` per run (e7f053c7d); the focused journey passes.

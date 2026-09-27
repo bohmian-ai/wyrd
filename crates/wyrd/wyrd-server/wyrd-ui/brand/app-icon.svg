@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Wyrd">
   <title>Wyrd</title>
-  <style>.w{fill:#5036D5}.o{stroke:#10201D}@media (prefers-color-scheme: dark){.w{fill:#A894FF}.o{stroke:#0E1413}}</style>
+  <style>.w{fill:#4d5ef0}.o{stroke:#101014}@media (prefers-color-scheme: dark){.w{fill:#7a8cff}.o{stroke:#0b0c12}}</style>
   <path class="w o" d="M42 92 L30 92 L6 8 L22 8 Z" stroke-width="2"/>
   <path class="w o" d="M58 92 L70 92 L94 8 L78 8 Z" stroke-width="2"/>
-  <path class="o" d="M44 8 h12 v84 h-12 z" fill="#D7F33F" stroke-width="2"/>
+  <path class="o" d="M44 8 h12 v84 h-12 z" fill="#c5f23b" stroke-width="2"/>
 </svg>

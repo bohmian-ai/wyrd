@@ -3,7 +3,7 @@ id: TASK-001
 kind: implementation
 status: proposed
 spec: SPEC-canonical-evidence-thread-design-system
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-001, REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-029, REQ-030, REQ-031, INV-001, INV-002, INV-003, INV-004, INV-005, INV-009, INV-010, AC-001, AC-005, AC-009]
 depends_on: []
 parent_task:
@@ -82,6 +82,7 @@ Status: `IMPLEMENTED` — awaiting `$wyrd-task-review`.
 | Brand references, logo variants, favicon preserve README mark geometry and name | Generator owns the README paths and renders `brand/logo.svg`, `logo-light.svg`, `app-icon.svg`, `docs/src/assets/wyrd-mark.svg`, `docs/public/favicon.svg`; workbench wordmark `bohmian` → `Wyrd` | Test "every Wyrd mark rendering keeps the exact README geometry"; `renders/styleguide.html` headless render (both modes) | PASS |
 | Both fonts bundled; no remote font request | `@fontsource/familjen-grotesk@5.3.0`, `@fontsource/fragment-mono@5.3.0` in workbench and docs; Google Fonts import removed from `src/app.css`; old faces removed from docs | Workbench `pnpm build` and docs build emit local `familjen-grotesk-*`/`fragment-mono-*` woff2; `grep googleapis\|gstatic` over build output: none | PASS |
 | Brand source, contracts, built components, registry, rendered reference agree; no retired shadow/arcade/warm-paper contract | `components.json` rewritten for Evidence Thread; workbench components migrated off retired tokens and hard-offset shadows; `DESIGN.md`, `brand-skill.md`, wyrd-ui skill rewritten; `renders/` reduced to one token-driven `styleguide.html` | `vitest run src/lib/components/component-contracts.test.ts` (19), `vitest run src/lib/registry.test.ts` (4), `pnpm test` (171), `pnpm check` 0 errors/0 warnings, `pnpm build`, `mise run docs:check` | PASS (see limits) |
+| Revision 3: Atom-aligned blue-charcoal dark values for every REQ-005 role, incl. declare/evidence ink and code syntax roles | `brand/palette.json` dark values; `brand/gen-theme.test.mjs` `ROLES` extended to all 25 spec rows; `brand/DESIGN.md` table and dark-mode guidance regenerated from the palette | `mise run check:tokens` (5 tests; all 34 pairs pass in both modes); `mise run check:skills-sync`; `mise run docs:check` (a11y AA light + dark, 61 pages); workbench `vitest` 171 and `pnpm check` 0/0 | PASS |
 
 Commands (all passing): `mise exec -- node --test brand/gen-theme.test.mjs` (RED first: missing exports), `mise run check:tokens`, `mise exec -- pnpm exec vitest run src/lib/components/component-contracts.test.ts`, `mise exec -- pnpm exec vitest run src/lib/registry.test.ts`, `mise exec -- pnpm test`, `mise exec -- pnpm check`, `mise exec -- pnpm build` (workbench), `mise run docs:check`, `mise run check:skills-sync`, `git diff --check`.
 

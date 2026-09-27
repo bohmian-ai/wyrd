@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: proposed
 spec: SPEC-canonical-evidence-thread-design-system
-spec_revision: 2
+spec_revision: 3
 requirements: [REQ-002, REQ-003, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-025, REQ-026, REQ-027, REQ-028, REQ-029, REQ-031, REQ-032, REQ-033, REQ-034, REQ-042, REQ-044, INV-001, INV-002, INV-003, INV-004, INV-005, INV-007, INV-008, INV-009, INV-010, INV-011, INV-012, AC-002, AC-003, AC-004, AC-005, AC-006, AC-008, AC-009, AC-010, AC-011, AC-012, AC-014, AC-015]
 depends_on: [TASK-001]
 parent_task:
@@ -89,3 +89,22 @@ Return to spec authority if the required docs path needs changed server/API cont
 - [Wyrd doctrine](../../../../architecture/wyrd-doctrine.mdx)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+Status: `BLOCKED` on REQ-034. The local guide cannot yet reach a real server health/readiness result and client connection: a fresh server does not boot without `bifrost.peer.api_key`, which only a running server can issue. The owner is refactoring server startup. Everything else below is in place for review once that lands.
+
+Revision 3 reconciliation: the packet now cites revision 3. The only revision 3 change in TASK-002's scope is the REQ-005 dark palette, which docs consume only through the generated `docs/src/styles/wyrd-tokens.css`. `git grep` over `docs/src` finds no literal hex or `rgb()` colour outside that projection. The added full-screen dark review (AC-002) is recorded below.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Home says what Wyrd does and points to one obvious local start | `docs/src/routes/+page.svelte`: one primary action, the Declare → Observe → Verify spine, and three next tasks. The hint now states what the linked page actually delivers (a DataCard example) instead of a running server | Screenshots `d-home-{light,dark}-{1440,320}` | PASS |
+| Local guide reaches real health/readiness and a client connection, with dev-only limits visible | Not done; the current `get-started` page runs the local DataCard example only | Blocked (server boot) | FAIL |
+| First level small and task-first; required journeys discoverable; planned work not shown as done | `derived-nav.ts` task-first sections. `Sidebar.svelte`: a topic's index page is linked from its subhead rather than repeated under it (removes "Overview / Overview", "Tutorials / Tutorials", "How-to / How-to", "Bifrost / Bifrost"). `overview/index.svx`: the kind count is corrected and next steps are task-first | `vitest run src/lib/derived-nav.test.ts`; screenshot `d-overview-dark-1440` | PASS (journey inventory for REQ-033–041 not yet written) |
+| Search, sidebar/current location, contents, theme, copy, reference links, and llms indexes usable at 320px and 200% zoom | `docs.css`: the search label stays on one line and truncates at narrow widths (it wrapped to two lines at 320px); heading anchors no longer render H1s as indigo underlined links | `vitest` (44 tests incl. `theme.test.ts`, `derived-nav.test.ts`, `mdsvex/CodeBlock.test.ts`); `mise run docs:check` (build, pagefind 61 pages, a11y AA light + dark); screenshots at 320px | PASS (200% zoom and keyboard walkthrough not re-run this pass) |
+| Canonical mark and tokens in both modes; no arcade skin, old fonts, old mark, or remote fonts | Generated tokens and mark only. The home hint moved from mono to sans (DESIGN.md: prose is never mono) | `mise run check:tokens`; `mise run docs:check` | PASS |
+| AC-002 (rev 3): full-screen dark review with prose, metadata, borders, and code visible together | Home, local guide (code blocks visible), and overview at 1440×900 and 320px, in both modes, from the built site | Headless Chrome captures; found and fixed four defects (H1 link styling, duplicated nav labels, wrapped search label, mono prose). No glare or stark code blocks in dark: code surface `#262B33` sits on canvas `#282C34`, delimited by a 1px rule | PASS (docs). The workbench full-screen review belongs to TASK-006 |
+
+Commands: `mise exec -- pnpm exec vitest run src/lib/theme.test.ts src/lib/derived-nav.test.ts src/lib/mdsvex/CodeBlock.test.ts` (31 pass), `mise exec -- pnpm exec vitest run` in `docs/` (44 pass), `mise run docs:svelte:check` (0/0), `mise run docs:check`, `mise run check:tokens`, `mise run check:skills-sync`, `git diff --check`.
+
+Non-goals held: no server/API change, no new search platform, no URL changes, no docs-only palette.

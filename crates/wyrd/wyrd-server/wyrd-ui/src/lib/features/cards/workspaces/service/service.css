@@ -329,14 +329,17 @@
 /* Aliases are runtime names (not registry identity), so they carry the
    Observation voice; the runtime principal carries the observe chip. */
 .svc .def-columns .alias {
-  color: var(--observe);
   font-weight: var(--weight-strong);
+  text-decoration: underline;
+  text-decoration-color: var(--observe);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
 }
 .svc .def-columns .principal-chip {
   font: var(--weight-strong) 10px var(--font-mono);
   letter-spacing: 0.4px;
-  background: var(--observe-soft);
-  color: var(--observe);
+  background: var(--observe);
+  color: var(--evidence-ink);
   border-radius: var(--r);
   padding: 2px 7px;
 }

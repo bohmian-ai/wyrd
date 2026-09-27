@@ -11,43 +11,43 @@
 :root,
 :root[data-theme="light"] {
   /* surface */
-  --bg: #F3F6F5;
-  --surface: #FFFFFF;
-  --surface-2: #E7EEEC;
-  --surface-hover: #EDF2F0;
+  --bg: #f5f6f8;
+  --surface: #ffffff;
+  --surface-2: #eef0f4;
+  --surface-hover: #e9ecf2;
 
   /* ink */
-  --text: #10201D;
-  --muted: #53645F;
-  --border: #9AACAA;
-  --border-soft: #D7E1DE;
+  --text: #101014;
+  --muted: #62626d;
+  --border: #d9dde5;
+  --border-soft: #e8ebf0;
 
   /* declare */
-  --declare: #5036D5;
-  --declare-soft: #EAE6FF;
-  --declare-ink: #FFFFFF;
+  --declare: #4d5ef0;
+  --declare-soft: #eceefe;
+  --declare-ink: #ffffff;
 
   /* observe */
-  --observe: #007563;
-  --observe-soft: #BDF5E7;
+  --observe: #c5f23b;
+  --observe-soft: #f3fce0;
 
   /* evidence */
-  --evidence: #D7F33F;
-  --evidence-ink: #10201D;
+  --evidence: #c5f23b;
+  --evidence-ink: #0b0c12;
 
   /* status */
-  --ok: #187B45;
-  --warn: #A65F00;
-  --danger: #B52828;
-  --danger-soft: #F9E8E7;
+  --ok: #3dbe5a;
+  --warn: #f0a13c;
+  --danger: #e2484d;
+  --danger-soft: #fbe9ea;
 
   /* code */
-  --code-bg: #0E1716;
-  --code-text: #DCF5EE;
-  --code-muted: #9AB0AB;
-  --code-keyword: #A894FF;
-  --code-string: #67B891;
-  --code-number: #FFB455;
+  --code-bg: #12141c;
+  --code-text: #e6e4da;
+  --code-muted: #8f92a5;
+  --code-keyword: #7a8cff;
+  --code-string: #c5f23b;
+  --code-number: #f0a13c;
 
   /* type */
   --weight-strong: 700;
@@ -57,43 +57,43 @@
 }
 :root[data-theme="dark"] {
   /* surface */
-  --bg: #0E1413;
-  --surface: #131A19;
-  --surface-2: #19211F;
-  --surface-hover: #1F2826;
+  --bg: #0b0c12;
+  --surface: #12141c;
+  --surface-2: #1a1d28;
+  --surface-hover: #1f2230;
 
   /* ink */
-  --text: #E3E9E7;
-  --muted: #A3AEAB;
-  --border: #434E4C;
-  --border-soft: #222A28;
+  --text: #e6e4da;
+  --muted: #8f92a5;
+  --border: #252838;
+  --border-soft: #1c1f2c;
 
   /* declare */
-  --declare: #A894FF;
-  --declare-soft: #241F46;
-  --declare-ink: #0E1413;
+  --declare: #7a8cff;
+  --declare-soft: #1a2040;
+  --declare-ink: #0b0c12;
 
   /* observe */
-  --observe: #67B891;
-  --observe-soft: #15352F;
+  --observe: #c5f23b;
+  --observe-soft: #394523;
 
   /* evidence */
-  --evidence: #B8D14A;
-  --evidence-ink: #10201D;
+  --evidence: #c5f23b;
+  --evidence-ink: #0b0c12;
 
   /* status */
-  --ok: #50DA83;
-  --warn: #FFB455;
-  --danger: #FF715E;
-  --danger-soft: #3B1D1B;
+  --ok: #3dbe5a;
+  --warn: #f0a13c;
+  --danger: #e2484d;
+  --danger-soft: #2b1a22;
 
   /* code */
-  --code-bg: #050908;
-  --code-text: #DCF5EE;
-  --code-muted: #9AB0AB;
-  --code-keyword: #A894FF;
-  --code-string: #67B891;
-  --code-number: #FFB455;
+  --code-bg: #12141c;
+  --code-text: #e6e4da;
+  --code-muted: #8f92a5;
+  --code-keyword: #7a8cff;
+  --code-string: #c5f23b;
+  --code-number: #f0a13c;
 
   /* type */
   --weight-strong: 600;

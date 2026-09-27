@@ -42,8 +42,12 @@ designed but not yet built.
 - Light and dark are **two complete renderings of the same system**: same information,
   hierarchy, actions, geometry, and accessibility semantics. Neither is a fallback or an
   inversion.
-- Dark neutrals are near-neutral with only a trace of the teal hue (saturation ≈0.1): a
-  green-tinted dark reads as a glow over a full screen.
+- The color values are the palette approved on 2026-09-26: cool paper and white in light
+  mode, blue-black canvas and lighter panels in dark mode, cobalt (light) / periwinkle (dark)
+  as the primary accent, and lime as the observation and evidence signal. Lime, green, amber,
+  and red are the same hue in both modes; only the primary accent and the neutrals shift.
+  Code blocks sit on the dark panel field in both modes, lifted above the dark canvas.
+  Layout, type, geometry, and interaction behavior remain shared.
 - The workbench applies mode via `data-mode="light|dark"`; the docs site via
   `data-theme="light|dark"` on `:root`. Both are projections of the same values.
 
@@ -51,48 +55,52 @@ designed but not yet built.
 
 | Role | Token | Light | Dark | Meaning |
 |---|---|---:|---:|---|
-| Canvas | `--bg` | `#F3F6F5` | `#0E1413` | application/page field |
-| Surface | `--surface` | `#FFFFFF` | `#131A19` | primary panel and chrome |
-| Surface secondary | `--surface-2` | `#E7EEEC` | `#19211F` | subordinate regions, neutral controls |
-| Surface hover | `--surface-hover` | `#EDF2F0` | `#1F2826` | neutral interaction feedback |
-| Ink | `--text` | `#10201D` | `#E3E9E7` | primary text, strongest rule |
-| Muted ink | `--muted` | `#53645F` | `#A3AEAB` | supporting text, metadata |
-| Rule | `--border` | `#9AACAA` | `#434E4C` | structural dividers, control borders |
-| Rule soft | `--border-soft` | `#D7E1DE` | `#222A28` | row and subordinate dividers |
-| Declare / primary | `--declare` | `#5036D5` | `#A894FF` | Declaration, links, selection, focus, primary action |
-| Declare soft | `--declare-soft` | `#EAE6FF` | `#241F46` | selected/contextual declaration field |
-| On declare | `--declare-ink` | `#FFFFFF` | `#0E1413` | label on a `--declare` fill |
-| Observe | `--observe` | `#007563` | `#67B891` | observed facts, Observation identity |
-| Observe soft | `--observe-soft` | `#BDF5E7` | `#15352F` | selected/contextual observation field |
-| Retained Evidence | `--evidence` | `#D7F33F` | `#B8D14A` | retained-evidence signal, mark spine |
-| On evidence | `--evidence-ink` | `#10201D` | `#10201D` | label/outline on an `--evidence` fill |
-| Success | `--ok` | `#187B45` | `#50DA83` | success, with a non-color cue |
-| Warning | `--warn` | `#A65F00` | `#FFB455` | caution, with a non-color cue |
-| Failure | `--danger` | `#B52828` | `#FF715E` | failed judgment or error, with a non-color cue |
-| Failure soft | `--danger-soft` | `#F9E8E7` | `#3B1D1B` | failure context field |
-| Code surface | `--code-bg` | `#0E1716` | `#050908` | code and terminal blocks |
-| Code ink | `--code-text` | `#DCF5EE` | `#DCF5EE` | default code text |
-| Code comment | `--code-muted` | `#9AB0AB` | `#9AB0AB` | code comments and punctuation |
-| Code keyword | `--code-keyword` | `#A894FF` | `#A894FF` | keywords and storage |
-| Code string | `--code-string` | `#67B891` | `#67B891` | strings and literal values |
-| Code number | `--code-number` | `#FFB455` | `#FFB455` | numbers, constants, function names |
+| Canvas | `--bg` | `#f5f6f8` | `#0b0c12` | application/page field |
+| Surface | `--surface` | `#ffffff` | `#12141c` | primary panel and chrome |
+| Surface secondary | `--surface-2` | `#eef0f4` | `#1a1d28` | subordinate regions, neutral controls |
+| Surface hover | `--surface-hover` | `#e9ecf2` | `#1f2230` | neutral interaction feedback |
+| Ink | `--text` | `#101014` | `#e6e4da` | primary text, strongest rule |
+| Muted ink | `--muted` | `#62626d` | `#8f92a5` | supporting text, metadata |
+| Rule | `--border` | `#d9dde5` | `#252838` | structural dividers, control borders |
+| Rule soft | `--border-soft` | `#e8ebf0` | `#1c1f2c` | row and subordinate dividers |
+| Declare / primary | `--declare` | `#4d5ef0` | `#7a8cff` | Declaration, links, selection, focus, primary action |
+| Declare soft | `--declare-soft` | `#eceefe` | `#1a2040` | selected/contextual declaration field |
+| On declare | `--declare-ink` | `#ffffff` | `#0b0c12` | label on a `--declare` fill |
+| Observe | `--observe` | `#c5f23b` | `#c5f23b` | observed facts, Observation identity |
+| Observe soft | `--observe-soft` | `#f3fce0` | `#394523` | selected/contextual observation field |
+| Retained Evidence | `--evidence` | `#c5f23b` | `#c5f23b` | retained-evidence signal, mark spine |
+| On evidence | `--evidence-ink` | `#0b0c12` | `#0b0c12` | label/outline on an `--evidence` fill |
+| Success | `--ok` | `#3dbe5a` | `#3dbe5a` | success, with a non-color cue |
+| Warning | `--warn` | `#f0a13c` | `#f0a13c` | caution, with a non-color cue |
+| Failure | `--danger` | `#e2484d` | `#e2484d` | failed judgment or error, with a non-color cue |
+| Failure soft | `--danger-soft` | `#fbe9ea` | `#2b1a22` | failure context field |
+| Code surface | `--code-bg` | `#12141c` | `#12141c` | code and terminal blocks |
+| Code ink | `--code-text` | `#e6e4da` | `#e6e4da` | default code text |
+| Code comment | `--code-muted` | `#8f92a5` | `#8f92a5` | code comments and punctuation |
+| Code keyword | `--code-keyword` | `#7a8cff` | `#7a8cff` | keywords and storage |
+| Code string | `--code-string` | `#c5f23b` | `#c5f23b` | strings and literal values |
+| Code number | `--code-number` | `#f0a13c` | `#f0a13c` | numbers, constants, function names |
 | Strong weight | `--weight-strong` | `700` | `600` | headings, labels, emphasis; lighter in dark, where light ink renders heavier |
 
 ### Color semantics
 
-- **Indigo (`--declare`)** is Declaration and the primary action: links, selection, focus,
+- **Cobalt (`--declare`)** is Declaration and the primary action: links, selection, focus,
   the one strong action on a surface.
-- **Green (`--observe`)** is observed fact and Observation identity.
-- **Lime (`--evidence`)** is reserved for retained Evidence, the Wyrd mark's center spine,
+- **Lime (`--observe`)** is observed fact and Observation identity. It is the same lime in
+  both modes and is never text on a light field: render it as a fill carrying
+  `--evidence-ink`, a chart line, or a two-pixel underline beneath ordinary ink.
+- **Lime (`--evidence`)** marks retained Evidence, the Wyrd mark's center spine,
   and direct interaction feedback that signifies evidence capture or retention (for example
-  a "copied" or "retained" confirmation). It is never a general accent, secondary action,
-  hover, or wash. It is a fill carrying `--evidence-ink`; it is never text on a light
-  surface (1.3:1 on white). As a line (an underline or rule) it is 1px; dark mode tones it
-  down to `#B8D14A` so the lime marks evidence without vibrating against the dark field.
-- **Red, amber, and success green** keep failure, warning, and success meaning. They are
-  never palette accents or chart series.
-- No accent becomes a decorative page wash. The canvas stays a neutral mineral field in both
-  modes: no full-screen indigo, lime, gradient, or dark-neon background.
+  a "copied" or "retained" confirmation). `--observe` shares this hue in both modes, so
+  observation and evidence must always be distinguished by labels and context. Lime is never
+  a general accent, secondary action, hover, or wash. It is a fill carrying `--evidence-ink`;
+  it is never text on a light surface (1.3:1 on white). As a line it is 1px.
+- **Red, amber, and success green** keep failure, warning, and success meaning and are the
+  same hue in both modes. Status labels always carry a glyph or word and a two-pixel colored
+  border; the hue alone is not the contrast contract. Amber and red are not palette accents;
+  amber may serve as a third chart series after cobalt and lime.
+- No accent becomes a decorative page wash. The canvas stays cool paper or blue-black:
+  no full-screen cobalt, lime, gradient, or neon background.
 
 ---
 
@@ -250,7 +258,6 @@ heterogeneous `value`.
 ## What this system retired
 
 Recorded so nobody re-adds it by accident: the parent-company mark and wordmark in Wyrd
-chrome; the warm-paper and blue-cast palettes; the blue/lime "two voices" and lime secondary
-actions; the client/server/control plane colors; the five-pixel radius, 2–3px borders, and
+chrome; lime secondary actions; the client/server/control plane color roles; the five-pixel radius, 2–3px borders, and
 hard-offset shadow dial with its lift/sink motion; Archivo, Space Grotesk, JetBrains Mono,
 Fraunces, and the arcade/pixel faces; and runtime Google Fonts imports.

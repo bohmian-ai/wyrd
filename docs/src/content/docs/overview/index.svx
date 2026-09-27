@@ -82,7 +82,7 @@ Python, validated, registered, referenced, and resolvable at runtime.
 **Skald** runs agents and workflows over registered prompts today. You can
 register a full inference pipeline, trace it, and run agents against it.
 
-The other thirteen kinds plus `External` are reserved structure: their
+The other twelve registrable kinds are reserved structure: their
 specs and schemas are authored, but there is no runtime behind them yet.
 Every page that references a reserved kind says so. See [Cards](/cards/)
 for per-kind status.
@@ -91,9 +91,8 @@ for per-kind status.
 
 ## Where to go next
 
-- [Get started](/get-started/): install Wyrd and register your first card.
-- [Where Wyrd fits](/overview/where-wyrd-fits/): the AI-stack position, the
-  Mitari platform, and what Wyrd is deliberately not.
+- [Run Wyrd locally](/get-started/): clone the repo and run a first DataCard example.
+- [Run Wyrd for a team](/self-hosting/): Postgres, object storage, secrets, and readiness.
+- [Declare and verify components](/how-to/): author and register Data, Model, and Prompt Cards.
+- [Automate with the API](/api/): OpenAPI, schemas, stable errors, the CLI, and agent workflows.
 - [Concepts](/concepts/): the Card / Spec / Run / Observation ontology.
-- [For agents](/for-agents/): stable paths, a copyable workflow, and the
-  rules agents follow.

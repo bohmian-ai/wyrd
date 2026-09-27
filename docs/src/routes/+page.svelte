@@ -40,7 +40,7 @@
   </p>
   <div class="start">
     <a class="button primary" href={`${base}/get-started/`}>Run Wyrd locally</a>
-    <small>Ends with a running server and a verified client connection</small>
+    <small>Clone the repo and run a first DataCard example</small>
   </div>
 
   <h2>How it works</h2>

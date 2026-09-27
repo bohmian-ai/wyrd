@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Wyrd">
   <title>Wyrd</title>
-  <path d="M42 92 L30 92 L6 8 L22 8 Z" fill="#5036D5" stroke="#10201D" stroke-width="2"/>
-  <path d="M58 92 L70 92 L94 8 L78 8 Z" fill="#5036D5" stroke="#10201D" stroke-width="2"/>
-  <path d="M44 8 h12 v84 h-12 z" fill="#D7F33F" stroke="#10201D" stroke-width="2"/>
+  <path d="M42 92 L30 92 L6 8 L22 8 Z" fill="#4d5ef0" stroke="#101014" stroke-width="2"/>
+  <path d="M58 92 L70 92 L94 8 L78 8 Z" fill="#4d5ef0" stroke="#101014" stroke-width="2"/>
+  <path d="M44 8 h12 v84 h-12 z" fill="#c5f23b" stroke="#101014" stroke-width="2"/>
 </svg>

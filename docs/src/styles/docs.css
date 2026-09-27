@@ -199,6 +199,10 @@ svg {
 }
 .site-head .search-open span {
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .site-head .search-open kbd {
   padding: 3px 6px;
@@ -261,6 +265,13 @@ svg {
   color: var(--muted);
   font-size: 12px;
   font-weight: 600;
+}
+.side h3:has(a) {
+  padding: 0;
+}
+.side h3 a {
+  padding-block: 2px;
+  font: inherit;
 }
 .side ul {
   margin: 0;
@@ -372,11 +383,11 @@ svg {
   margin: 22px 0 6px;
   font-size: 15px;
 }
-.prose :is(h2, h3, h4) a {
+.prose :is(h1, h2, h3, h4) a {
   color: inherit;
   text-decoration: none;
 }
-.prose :is(h2, h3, h4) a:hover {
+.prose :is(h1, h2, h3, h4) a:hover {
   text-decoration: underline;
 }
 .prose p,
@@ -753,7 +764,8 @@ table.ref .ty {
 }
 .home .start small {
   color: var(--muted);
-  font: 12px/1.4 var(--font-mono);
+  font-size: 14px;
+  line-height: 1.4;
 }
 .home h2 {
   margin: 56px 0 14px;
@@ -885,6 +897,7 @@ table.ref .ty {
   }
   .site-head .search-open {
     width: auto;
+    min-width: 0;
     flex: 1;
     height: 44px;
   }

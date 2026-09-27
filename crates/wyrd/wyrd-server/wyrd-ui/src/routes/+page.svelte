@@ -102,6 +102,15 @@
     fill: var(--observe);
     opacity: 0.9;
   }
+  /* Lime at thread opacity vanishes on the light canvas; deepen it toward ink
+     there only. The token itself stays the same lime in both modes. */
+  :global([data-mode='light']) .outgoing {
+    stroke: color-mix(in srgb, var(--observe) 70%, var(--text));
+    opacity: 0.55;
+  }
+  :global([data-mode='light']) .outgoing-node {
+    fill: color-mix(in srgb, var(--observe) 70%, var(--text));
+  }
   .connection-web rect {
     fill: var(--text);
   }

@@ -16,16 +16,26 @@
     <section>
       <h2>{g.label}</h2>
       {#each g.sections as section (section.label)}
-        {#if g.sections.length > 1}<h3>{section.label}</h3>{/if}
-        <ul>
-          {#each section.items as it (it.path)}
-            <li>
-              <a href={`${base}${it.path}`} aria-current={it.path === current ? 'page' : undefined}
-                >{it.label}</a
-              >
-            </li>
-          {/each}
-        </ul>
+        <!-- A topic's index page shares its label, so the subhead links to it instead of repeating it. -->
+        {@const index = g.sections.length > 1 && section.items[0]?.label === section.label ? section.items[0] : undefined}
+        {#if g.sections.length > 1}
+          <h3>
+            {#if index}<a href={`${base}${index.path}`} aria-current={index.path === current ? 'page' : undefined}
+                >{section.label}</a
+              >{:else}{section.label}{/if}
+          </h3>
+        {/if}
+        {#if section.items.length > (index ? 1 : 0)}
+          <ul>
+            {#each index ? section.items.slice(1) : section.items as it (it.path)}
+              <li>
+                <a href={`${base}${it.path}`} aria-current={it.path === current ? 'page' : undefined}
+                  >{it.label}</a
+                >
+              </li>
+            {/each}
+          </ul>
+        {/if}
       {/each}
     </section>
   {/each}

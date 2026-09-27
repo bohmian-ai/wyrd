@@ -1,6 +1,6 @@
 ---
 id: SPEC-canonical-evidence-thread-design-system
-revision: 2
+revision: 6
 status: approved
 ---
 
@@ -117,39 +117,52 @@ provenance, not crime-scene, policing, or compliance theater.
   applications; production rendering MUST NOT depend on a request to a
   third-party font service.
 - **REQ-005**: The canonical palette MUST expose the following semantic roles
-  and mode values. Implementation-specific token names MAY differ, but every
-  consumer MUST map to these roles rather than restating literals.
+  and mode values. The values below are the palette the user approved on
+  2026-09-26 from the Impeccable HTML mock
+  (`.impeccable/mocks/color/wyrd-color.html`). The current layout,
+  typography, borders, spacing, components, and theme behavior remain unchanged.
+  Implementation-specific token names MAY differ, but every consumer MUST map
+  to these roles rather than restating literals.
 
 | Semantic role | Light | Dark | Meaning |
 |---|---:|---:|---|
-| Canvas | `#F3F6F5` | `#0E1413` | application/page field |
-| Surface | `#FFFFFF` | `#131A19` | primary panel and chrome |
-| Surface secondary | `#E7EEEC` | `#19211F` | subordinate regions and controls |
-| Surface hover | `#EDF2F0` | `#1F2826` | neutral interaction feedback |
-| Ink | `#10201D` | `#E3E9E7` | primary text and strongest rule |
-| Muted ink | `#53645F` | `#A3AEAB` | supporting text and metadata |
-| Rule | `#9AACAA` | `#434E4C` | structural dividers and control borders |
-| Rule soft | `#D7E1DE` | `#222A28` | row and subordinate dividers |
-| Declare / primary | `#5036D5` | `#A894FF` | Declaration identity, links, selection, primary action |
-| Declare soft | `#EAE6FF` | `#241F46` | selected or contextual declaration field |
-| Observe | `#007563` | `#67B891` | observed facts and Observation identity |
-| Observe soft | `#BDF5E7` | `#15352F` | selected or contextual observation field |
-| Retained Evidence | `#D7F33F` | `#B8D14A` | retained-evidence signal and logo spine |
-| Success | `#187B45` | `#50DA83` | successful state, with non-color cue |
-| Warning | `#A65F00` | `#FFB455` | caution state, with non-color cue |
-| Failure | `#B52828` | `#FF715E` | failed judgment or error, with non-color cue |
-| Failure soft | `#F9E8E7` | `#3B1D1B` | failure context field |
-| Code surface | `#0E1716` | `#050908` | code and terminal blocks |
-| Code ink | `#DCF5EE` | `#DCF5EE` | default code text |
+| Canvas | `#f5f6f8` | `#0b0c12` | application/page field |
+| Surface | `#ffffff` | `#12141c` | primary panel and chrome |
+| Surface secondary | `#eef0f4` | `#1a1d28` | subordinate regions and controls |
+| Surface hover | `#e9ecf2` | `#1f2230` | neutral interaction feedback |
+| Ink | `#101014` | `#e6e4da` | primary text and strongest rule |
+| Muted ink | `#62626d` | `#8f92a5` | supporting text and metadata |
+| Rule | `#d9dde5` | `#252838` | structural dividers and control borders |
+| Rule soft | `#e8ebf0` | `#1c1f2c` | row and subordinate dividers |
+| Declare / primary | `#4d5ef0` | `#7a8cff` | Declaration identity, links, selection, primary action |
+| Declare soft | `#eceefe` | `#1a2040` | selected or contextual declaration field |
+| Declare ink | `#ffffff` | `#0b0c12` | label on a primary-action fill |
+| Observe | `#c5f23b` | `#c5f23b` | observed facts and Observation identity |
+| Observe soft | `#f3fce0` | `#394523` | selected or contextual observation field |
+| Retained Evidence | `#c5f23b` | `#c5f23b` | retained-evidence signal and logo spine |
+| Evidence ink | `#0b0c12` | `#0b0c12` | label and outline on retained-evidence fill |
+| Success | `#3dbe5a` | `#3dbe5a` | successful state, with non-color cue |
+| Warning | `#f0a13c` | `#f0a13c` | caution state, with non-color cue |
+| Failure | `#e2484d` | `#e2484d` | failed judgment or error, with non-color cue |
+| Failure soft | `#fbe9ea` | `#2b1a22` | failure context field |
+| Code surface | `#12141c` | `#12141c` | code and terminal blocks, dark in both modes |
+| Code ink | `#e6e4da` | `#e6e4da` | default code text |
+| Code muted | `#8f92a5` | `#8f92a5` | code comments and punctuation |
+| Code keyword | `#7a8cff` | `#7a8cff` | declaration syntax |
+| Code string | `#c5f23b` | `#c5f23b` | strings and literal values |
+| Code number | `#f0a13c` | `#f0a13c` | numbers, constants, and function names |
 
-- **REQ-006**: Indigo MUST identify Declaration and the primary action; green
-  MUST identify observed facts; red and amber MUST retain failure and warning
-  meaning; lime MUST be reserved for retained Evidence, the Wyrd mark's center
-  spine, and direct interaction feedback that signifies evidence capture or
-  retention. These colors MUST NOT become decorative page washes.
-- **REQ-007**: The normal documentation and workbench canvas MUST remain a
-  neutral mineral field. Neither surface may use an entire-screen indigo,
-  lime, gradient, or dark-neon field as its default content background.
+- **REQ-006**: Cobalt MUST identify Declaration and the primary action; the
+  main-palette green/lime MUST identify observed facts; red and amber MUST retain failure and warning
+  meaning. Lime also marks retained Evidence, the Wyrd mark's center spine, and direct
+  interaction feedback that signifies evidence capture or retention. Observation and Evidence
+  MUST have non-color cues where their hues coincide in dark mode. These colors MUST NOT
+  become decorative page washes.
+- **REQ-007**: The normal documentation and workbench canvas MUST use the
+  main-palette warm paper (light) or blue-black (dark). Neither surface may use an entire-screen cobalt,
+  lime, gradient, or dark-neon field as its default content background. In dark
+  mode the canvas MUST be darker than primary panels, which in turn MUST be
+  darker than subordinate and hovered surfaces.
 - **REQ-008**: Persistent surfaces MUST use a flat, ruled grammar: primarily
   one-pixel structural rules, restrained approximately two-pixel corners, and
   no decorative elevation. Hard-offset shadows, glassmorphism, glow, scanlines,
@@ -448,7 +461,10 @@ provenance, not crime-scene, policing, or compliance theater.
   representative documentation home/task page and a representative workbench
   evidence/verification page in both light and dark modes. The matrix proves
   shared identity, surface-specific density, responsive behavior, and the
-  absence of full-screen accent fields and superseded styling.
+  absence of full-screen accent fields and superseded styling. Dark-mode
+  review MUST include a full-screen, real-display inspection of the docs and
+  workbench with sustained prose, metadata, borders, and code visible together;
+  isolated swatches and small cropped mocks do not establish visual comfort.
 - **AC-003**: Accessibility evidence covers automated contrast for every used
   token pair in both modes plus keyboard navigation, visible focus, landmarks,
   headings, theme control, search, disclosures, code copy, status cues, 200%
@@ -507,13 +523,44 @@ provenance, not crime-scene, policing, or compliance theater.
 
 ## Open material decisions
 
-None. The user has made the complete developer docsite the primary outcome.
-Evidence Thread remains the approved shared visual system. The requested
-journeys are fixed; current implementation evidence determines whether each
-can be documented as runnable or must show its precise capability boundary.
+None. The shared light/dark palette was resolved by the user on 2026-09-26
+(revision 6). Layout, typography, components, spacing, and docsite journeys are
+not reopened. No separate docsite palette is authorized.
 
 ## Revision history
 
+- **Revision 6 — 2026-09-26 — approved by the user**: Replace the rejected
+  revision 5 values with the palette the user chose from the Impeccable HTML
+  mock. Cobalt `#4d5ef0` (light) / periwinkle `#7a8cff` (dark) is the only hue
+  that shifts per mode; lime `#c5f23b`, green `#3dbe5a`, amber `#f0a13c`, and
+  red `#e2484d` are identical in both modes. Neutrals follow the Bohmian site
+  (cool paper `#f5f6f8` / blue-black `#0b0c12`, panels lighter than the dark
+  canvas). Code blocks use the dark panel field `#12141c` in both modes. Lime
+  is never text on a light field: it renders as a fill with `--evidence-ink`,
+  a chart line, or an underline. The status hues are no longer light-mode
+  text-contrast contracts; the token gate's `pairs` were reconciled to that
+  decision. Layout, typography, and components are unchanged.
+- **Revision 5 — 2026-09-26 — draft, not approved (rejected by the user)**: Keep the current Evidence Thread
+  styling and return colors only to the current Wyrd palette on `main`.
+  The user explicitly corrected the rollback scope: layout, typography,
+  borders, components, spacing, and docsite journeys remain; color values
+  change through the one canonical palette and generated projections.
+  An implementor recorded this as approved without the user's approval; the
+  user explicitly rejected it on 2026-09-26. Its palette values remain in the
+  worktree only as an exploration reference pending a new color decision.
+- **Revision 4 — 2026-09-25 — draft**: Corrected the dark surface hierarchy
+  identified during review: the canvas becomes `#1C2128`, below the existing
+  `#242932` primary panel and lighter subordinate surfaces. All other revision
+  3 palette values, semantic roles, docsite scope, and contrast obligations
+  remain unchanged. The proposed canvas passes all 34 existing dark-mode token
+  contrast pairs. Awaiting explicit user approval.
+- **Revision 3 — 2026-09-25 — approved**: Adopted a complete Atom-aligned
+  blue-charcoal dark palette for both docs and workbench, with less stark
+  primary text and code contrast while preserving Wyrd's semantic color roles
+  and all 34 existing token contrast pairs. Kept the approved light palette,
+  canonical brand ownership, task-first docsite scope, and all prior journeys.
+  Added full-screen dark-mode visual review to acceptance. Explicitly approved
+  by the user on 2026-09-25; revision 2 task packets need reconciliation.
 - **Revision 2 — 2026-09-24 — approved**: Corrected the omitted primary outcome:
   build the developer docsite across the user's named local, self-hosted,
   identity, service, model, Kubernetes, and API journeys. Added requirements

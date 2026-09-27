@@ -4,28 +4,33 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { contrastFailures, loadPalette, paletteErrors, renderTargets } from './gen-theme.mjs';
 
-// The approved semantic roles and mode values (SPEC-canonical-evidence-thread-design-system
-// REQ-005), keyed by the token that carries each role.
+// The semantic roles retain the current design, with the color values approved 2026-09-26.
 const ROLES = {
-  '--bg': ['#F3F6F5', '#0E1413'],
-  '--surface': ['#FFFFFF', '#131A19'],
-  '--surface-2': ['#E7EEEC', '#19211F'],
-  '--surface-hover': ['#EDF2F0', '#1F2826'],
-  '--text': ['#10201D', '#E3E9E7'],
-  '--muted': ['#53645F', '#A3AEAB'],
-  '--border': ['#9AACAA', '#434E4C'],
-  '--border-soft': ['#D7E1DE', '#222A28'],
-  '--declare': ['#5036D5', '#A894FF'],
-  '--declare-soft': ['#EAE6FF', '#241F46'],
-  '--observe': ['#007563', '#67B891'],
-  '--observe-soft': ['#BDF5E7', '#15352F'],
-  '--evidence': ['#D7F33F', '#B8D14A'],
-  '--ok': ['#187B45', '#50DA83'],
-  '--warn': ['#A65F00', '#FFB455'],
-  '--danger': ['#B52828', '#FF715E'],
-  '--danger-soft': ['#F9E8E7', '#3B1D1B'],
-  '--code-bg': ['#0E1716', '#050908'],
-  '--code-text': ['#DCF5EE', '#DCF5EE']
+  '--bg': ['#f5f6f8', '#0b0c12'],
+  '--surface': ['#ffffff', '#12141c'],
+  '--surface-2': ['#eef0f4', '#1a1d28'],
+  '--surface-hover': ['#e9ecf2', '#1f2230'],
+  '--text': ['#101014', '#e6e4da'],
+  '--muted': ['#62626d', '#8f92a5'],
+  '--border': ['#d9dde5', '#252838'],
+  '--border-soft': ['#e8ebf0', '#1c1f2c'],
+  '--declare': ['#4d5ef0', '#7a8cff'],
+  '--declare-soft': ['#eceefe', '#1a2040'],
+  '--declare-ink': ['#ffffff', '#0b0c12'],
+  '--observe': ['#c5f23b', '#c5f23b'],
+  '--observe-soft': ['#f3fce0', '#394523'],
+  '--evidence': ['#c5f23b', '#c5f23b'],
+  '--evidence-ink': ['#0b0c12', '#0b0c12'],
+  '--ok': ['#3dbe5a', '#3dbe5a'],
+  '--warn': ['#f0a13c', '#f0a13c'],
+  '--danger': ['#e2484d', '#e2484d'],
+  '--danger-soft': ['#fbe9ea', '#2b1a22'],
+  '--code-bg': ['#12141c', '#12141c'],
+  '--code-text': ['#e6e4da', '#e6e4da'],
+  '--code-muted': ['#8f92a5', '#8f92a5'],
+  '--code-keyword': ['#7a8cff', '#7a8cff'],
+  '--code-string': ['#c5f23b', '#c5f23b'],
+  '--code-number': ['#f0a13c', '#f0a13c']
 };
 
 // The README Wyrd mark geometry (REQ-002). Renderings may recolor, never redraw.
@@ -76,7 +81,7 @@ test('every Wyrd mark rendering keeps the exact README geometry', () => {
     const drawn = [...content.matchAll(/ d="([^"]+)"/g)].map((m) => m[1]);
     assert.deepEqual(drawn, MARK_PATHS, `${path} geometry`);
     assert.match(content, /viewBox="0 0 100 100"/, `${path} viewBox`);
-    assert.match(content, /#D7F33F/, `${path} spine is retained-evidence lime`);
+    assert.match(content, new RegExp(ROLES["--evidence"][0]), `${path} spine is retained-evidence lime`);
   }
 });
 

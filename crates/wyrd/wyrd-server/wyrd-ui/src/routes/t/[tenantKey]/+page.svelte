@@ -169,7 +169,10 @@
   /* Observe carries the Observation voice, with the "!" glyph and label as the
      textual channel. */
   .summary.observe strong {
-    color: var(--observe);
+    text-decoration: underline;
+    text-decoration-color: var(--observe);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
   }
   .work :global(.wy-panel-body) {
     padding: 0 10px 10px;

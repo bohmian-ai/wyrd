@@ -201,12 +201,14 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        compaction_target_file_size_bytes: int | None = None,
     ) -> None:
         schema = model.model_json_schema()
         self._native = _native.bifrost.TableConfig.from_json_schema(
             table,
             json.dumps(schema),
             _layout_json(partition_granularity, sort_keys, bloom_columns),
+            compaction_target_file_size_bytes,
         )
 
     @classmethod
@@ -224,6 +226,7 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        compaction_target_file_size_bytes: int | None = None,
     ) -> TableConfig:
         """Build from an explicit ``pyarrow.Schema``.
 
@@ -236,6 +239,7 @@ class TableConfig:
                 table,
                 schema.serialize().to_pybytes(),
                 _layout_json(partition_granularity, sort_keys, bloom_columns),
+                compaction_target_file_size_bytes,
             )
         )
 
@@ -271,6 +275,14 @@ class TableConfig:
         """
 
         return pyarrow.ipc.open_stream(self._native.arrow_schema_ipc).schema
+
+    @property
+    def compaction_target_file_size_bytes(self) -> int | None:
+        """The explicit Forge compaction file target, or ``None`` for the
+        server's deployment default."""
+
+        value = self._native.compaction_target_file_size_bytes
+        return None if value is None else int(value)
 
     @property
     def resolved(self) -> ResolvedTable | None:
@@ -757,9 +769,10 @@ class PhysicalLayout(TypedDict):
 
 
 class _TableDescriptionOptional(TypedDict, total=False):
-    """The whole-physical-schema identity only a canonical built-in publishes."""
+    """Description fields the server omits when they do not apply."""
 
     canonical_physical_fingerprint: str
+    compaction_target_file_size_bytes: int
 
 
 class TableDescription(_TableDescriptionOptional):

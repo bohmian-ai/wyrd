@@ -68,9 +68,10 @@ class PhysicalLayout(TypedDict):
     bloom_columns: list[str]
 
 class _TableDescriptionOptional(TypedDict, total=False):
-    """The whole-physical-schema identity only a canonical built-in publishes."""
+    """Description fields the server omits when they do not apply."""
 
     canonical_physical_fingerprint: str
+    compaction_target_file_size_bytes: int
 
 class TableDescription(_TableDescriptionOptional):
     """Server projection of one registered table's stored physical schema."""
@@ -148,6 +149,7 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        compaction_target_file_size_bytes: int | None = None,
     ) -> None: ...
     @staticmethod
     def from_arrow(
@@ -156,6 +158,7 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        compaction_target_file_size_bytes: int | None = None,
     ) -> TableConfig:
         """Build from an explicit Arrow schema, for types JSON Schema cannot express."""
         ...
@@ -175,6 +178,10 @@ class TableConfig:
     @property
     def arrow_schema(self) -> pyarrow.Schema:
         """The declared user columns only."""
+        ...
+    @property
+    def compaction_target_file_size_bytes(self) -> int | None:
+        """The explicit Forge compaction file target, or ``None`` for the deployment default."""
         ...
     @property
     def resolved(self) -> ResolvedTable | None:

@@ -396,8 +396,9 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 /// # Errors
 ///
 /// Returns a napi error when the table is not `namespace.name`, the document is
-/// not one mappable JSON Schema, a declared column is server-owned, or the
-/// layout is not one physical-layout declaration.
+/// not one mappable JSON Schema, a declared column is server-owned, the
+/// layout is not one physical-layout declaration, or the compaction target is
+/// not a non-negative integer.
 // justification: napi boundary; a JavaScript string is primitive and cannot be
 // passed by reference, so the generated binding requires an owned String
 #[allow(clippy::needless_pass_by_value)]
@@ -406,11 +407,16 @@ pub fn table_config_from_json_schema(
     table: String,
     schema_json: String,
     layout_json: Option<String>,
+    compaction_target_file_size_bytes: Option<f64>,
 ) -> Result<NativeTableConfig> {
     let schema: Value = serde_json::from_str(&schema_json)
         .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
     let config = TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
-    NativeTableConfig::project(&apply_layout(config, layout_json.as_deref())?)
+    let config = apply_layout(config, layout_json.as_deref())?;
+    NativeTableConfig::project(&apply_compaction_target(
+        config,
+        compaction_target_file_size_bytes,
+    )?)
 }
 
 /// Fetches an already-registered table's config by name.
@@ -465,6 +471,30 @@ fn apply_layout(config: TableConfig, layout_json: Option<&str>) -> Result<TableC
                 napi::Error::from_reason(format!("invalid physical layout: {error}"))
             })?;
             Ok(config.with_layout(layout))
+        }
+    }
+}
+
+/// Applies one optional explicit Forge compaction file target to a config.
+///
+/// JavaScript numbers arrive as `f64`; only an exact non-negative integer
+/// survives the lossless decimal round trip into `u64`. The accepted byte
+/// range stays the server's registration check, so every SDK shares one
+/// catalog error for an out-of-range target.
+///
+/// # Errors
+///
+/// Returns a napi error for a non-finite, fractional, or negative number.
+fn apply_compaction_target(config: TableConfig, bytes: Option<f64>) -> Result<TableConfig> {
+    match bytes {
+        None => Ok(config),
+        Some(bytes) => {
+            let bytes: u64 = bytes.to_string().parse().map_err(|_| {
+                napi::Error::from_reason(format!(
+                    "compaction target must be a non-negative integer byte count, got {bytes}"
+                ))
+            })?;
+            Ok(config.with_compaction_target_file_size_bytes(bytes))
         }
     }
 }

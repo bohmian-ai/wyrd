@@ -101,7 +101,8 @@ export interface PhysicalLayout {
  *
  * A writer declares `user_fields`, supplies `correlation_fields`, and may
  * supply `managed_candidates`. `canonical_physical_fingerprint` is present only
- * for a canonical signal table.
+ * for a canonical signal table; `compaction_target_file_size_bytes` only when
+ * the table declared an explicit Forge compaction file target.
  */
 export interface TableDescription {
   readonly entry: TableEntry;
@@ -110,6 +111,7 @@ export interface TableDescription {
   readonly managed_candidates: readonly FieldDescription[];
   readonly canonical_physical_fingerprint?: string;
   readonly physical_layout: PhysicalLayout;
+  readonly compaction_target_file_size_bytes?: number;
 }
 
 export interface RunningQueryProgress {
@@ -499,20 +501,32 @@ export class TableConfig {
    * dependency of this SDK and any peer offering the same method works
    * unchanged.
    *
-   * @throws when the resulting document does not map to an Arrow schema, or
-   * declares a column the write path already owns.
+   * `compactionTargetFileSizeBytes` pins the table's Forge compaction file
+   * target; omitted, the table follows the server's deployment default.
+   * Registration records it once, and a later registration naming a different
+   * target is refused rather than silently changing it.
+   *
+   * @throws when the resulting document does not map to an Arrow schema,
+   * declares a column the write path already owns, or the compaction target is
+   * not a non-negative integer.
    */
   static fromJsonSchema(
     table: string,
     schema: Readonly<Record<string, unknown>> | JsonSchemaSource,
     layout?: TableLayout,
+    compactionTargetFileSizeBytes?: number,
   ): TableConfig {
     const document =
       typeof (schema as JsonSchemaSource).toJSONSchema === "function"
         ? (schema as JsonSchemaSource).toJSONSchema()
         : schema;
     return new TableConfig(
-      tableConfigFromJsonSchema(table, JSON.stringify(document), layoutJson(layout)),
+      tableConfigFromJsonSchema(
+        table,
+        JSON.stringify(document),
+        layoutJson(layout),
+        compactionTargetFileSizeBytes,
+      ),
     );
   }
 
@@ -550,6 +564,17 @@ export class TableConfig {
    */
   get arrowSchema(): Schema {
     return tableFromIPC(new Uint8Array(this.#native.schemaIpc)).schema;
+  }
+
+  /**
+   * The explicit Forge compaction file target, declared or described, or
+   * undefined when the table follows the server's deployment default.
+   */
+  get compactionTargetFileSizeBytes(): number | undefined {
+    const wire = JSON.parse(this.#native.configJson) as {
+      compaction_target_file_size_bytes?: number;
+    };
+    return wire.compaction_target_file_size_bytes;
   }
 
   /** The server-assigned identity, or undefined while unregistered. */

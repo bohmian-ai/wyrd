@@ -389,6 +389,40 @@ def test_registering_a_different_schema_on_one_name_conflicts(
 
 
 @pytest.mark.integration
+def test_compaction_target_registers_describes_and_conflicts(
+    wyrd_server: WyrdTestServer,
+) -> None:
+    """An explicit compaction target is stored, described back, idempotent, and fenced."""
+
+    fqn = f"vala.datasets.target_{uuid.uuid4().hex}"
+    target = 256 * 1024 * 1024
+
+    def writer(bytes_: int | None) -> Bifrost:
+        return Bifrost(
+            TableConfig(Fixture, fqn, compaction_target_file_size_bytes=bytes_),
+            server_url=wyrd_server.base_url,
+            credential=wyrd_server.api_key,
+        )
+
+    assert writer(target).register() == "created"
+    described = TableConfig.describe(
+        fqn, server_url=wyrd_server.base_url, credential=wyrd_server.api_key
+    )
+    assert described.compaction_target_file_size_bytes == target
+    assert writer(target).register() == "already_exists"
+    assert writer(None).register() == "already_exists"
+
+    with pytest.raises(WyrdError) as captured:
+        writer(target * 2).register()
+    assert captured.value.code == "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH"
+    assert captured.value.status == 409
+    unchanged = TableConfig.describe(
+        fqn, server_url=wyrd_server.base_url, credential=wyrd_server.api_key
+    )
+    assert unchanged.compaction_target_file_size_bytes == target
+
+
+@pytest.mark.integration
 def test_negative_non_select_query_is_refused(wyrd_server: WyrdTestServer) -> None:
     """The read plane is read-only: a mutation never reaches execution."""
 

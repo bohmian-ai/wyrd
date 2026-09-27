@@ -540,23 +540,7 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
     let spc = register(&cards, &root.path().join("drift-spc.yaml")).await;
     let unfit = register(&cards, &root.path().join("drift-spc-unfit.yaml")).await;
     let custom = register(&cards, &root.path().join("drift-custom.yaml")).await;
-    let custom_status = cards
-        .get(CardSelector::exact(custom.root.clone()))
-        .await
-        .expect("custom verifier reads")
-        .status
-        .and_then(|status| status.verification);
-    assert!(
-        custom_status.and_then(|status| status.baseline).is_none(),
-        "a Custom Verifier is ready without a fit job"
-    );
-    assert_eq!(wait_baseline(&cards, &psi, "ready").await, None);
-    assert_eq!(wait_baseline(&cards, &spc, "ready").await, None);
-    assert_eq!(
-        wait_baseline(&cards, &unfit, "failed").await.as_deref(),
-        Some("baseline_fit_failed"),
-        "a baseline that cannot fit fails visibly"
-    );
+    assert_baselines_settle(&cards, [&psi, &spc], &unfit, &custom).await;
     register(&cards, &root.path().join("trigger.yaml")).await;
     let service = register(&cards, &root.path().join("service.yaml")).await;
     let service_b = register(&cards, &root.path().join("service-b.yaml")).await;
@@ -570,27 +554,16 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
         now - chrono::Duration::hours(1),
         now + chrono::Duration::hours(1),
     );
-    // Drift reads through the ordinary query, so observations still live in
-    // Scribe score like any other caller's rows, with no source selector.
-    let live = subject(&cards, root.path(), "drift-live-subject").await;
-    emit_live_rows(
+    assert_live_observations_score(
         &server,
+        &cards,
         &admin,
-        &live,
-        &root.path().join("bundle-live"),
-        &[ScoreOnly { score: 1.0 }, ScoreOnly { score: 2.0 }],
-    )
-    .await;
-    let (result, features) = complete(
-        &server,
-        &verifier_of(&server, &live).await,
         &query,
-        &direct(&custom, &live, window.0, window.1),
+        &custom,
+        root.path(),
+        window,
     )
     .await;
-    assert_eq!(result.verdict, "passed", "{result:?}");
-    assert_eq!(verdicts(&features), [("score", "Custom", "no_drift")]);
-
     let subject = service
         .root
         .uid
@@ -642,6 +615,78 @@ async fn drift_methods_fit_score_persist_and_dispatch() {
     )
     .await;
     server.shutdown().await.expect("test server shuts down");
+}
+
+/// Fitted Verifiers settle their baselines and a Custom Verifier needs none.
+///
+/// Each of `fitted` reaches a ready baseline, `unfit` fails visibly with
+/// `baseline_fit_failed`, and `custom` carries no baseline status at all.
+///
+/// # Panics
+/// Panics when a Card cannot be read or a baseline settles differently.
+async fn assert_baselines_settle(
+    cards: &Cards,
+    fitted: [&RegistrationReceipt; 2],
+    unfit: &RegistrationReceipt,
+    custom: &RegistrationReceipt,
+) {
+    let custom_status = cards
+        .get(CardSelector::exact(custom.root.clone()))
+        .await
+        .expect("custom verifier reads")
+        .status
+        .and_then(|status| status.verification);
+    assert!(
+        custom_status.and_then(|status| status.baseline).is_none(),
+        "a Custom Verifier is ready without a fit job"
+    );
+    for verifier in fitted {
+        assert_eq!(wait_baseline(cards, verifier, "ready").await, None);
+    }
+    assert_eq!(
+        wait_baseline(cards, unfit, "failed").await.as_deref(),
+        Some("baseline_fit_failed"),
+        "a baseline that cannot fit fails visibly"
+    );
+}
+
+/// Drift reads through the ordinary query, so observations still live in
+/// Scribe score like any other caller's rows, with no source selector.
+///
+/// A fresh subject emits two Custom observations whose mean sits at the
+/// threshold, without flushing the server Scribe, and a direct Custom run
+/// must pass on exactly those live rows.
+///
+/// # Panics
+/// Panics when registration, emission, or the run fails, or the run does not
+/// pass with the Custom feature.
+async fn assert_live_observations_score(
+    server: &WyrdTestServer,
+    cards: &Cards,
+    admin: &WyrdClient,
+    query: &Bifrost,
+    custom: &RegistrationReceipt,
+    root: &Path,
+    window: (DateTime<Utc>, DateTime<Utc>),
+) {
+    let live = subject(cards, root, "drift-live-subject").await;
+    emit_live_rows(
+        server,
+        admin,
+        &live,
+        &root.join("bundle-live"),
+        &[ScoreOnly { score: 1.0 }, ScoreOnly { score: 2.0 }],
+    )
+    .await;
+    let (result, features) = complete(
+        server,
+        &verifier_of(server, &live).await,
+        query,
+        &direct(custom, &live, window.0, window.1),
+    )
+    .await;
+    assert_eq!(result.verdict, "passed", "{result:?}");
+    assert_eq!(verdicts(&features), [("score", "Custom", "no_drift")]);
 }
 
 /// An observation carrying only the Custom metric, no PSI or SPC feature.

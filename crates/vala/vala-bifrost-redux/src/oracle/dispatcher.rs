@@ -2611,6 +2611,11 @@ impl TonicOraclePeerTransport {
 
     /// Connects to the exact selected worker after live fence resolution.
     ///
+    /// The client lifts tonic's 4 MiB default decode cap: one worker frame is
+    /// one batch the authenticated worker already materialized under its own
+    /// grants, and a batch of accepted rows can exceed 4 MiB. A codec cap here
+    /// would refuse acknowledged data after ACK instead of bounding memory.
+    ///
     /// # Errors
     /// Returns retryable failure for absent, invalid, or unreachable endpoints.
     async fn client(
@@ -2628,7 +2633,7 @@ impl TonicOraclePeerTransport {
             .connect()
             .await
             .map_err(|_| DispatchError::Unavailable)?;
-        Ok(OraclePeerServiceClient::new(channel))
+        Ok(OraclePeerServiceClient::new(channel).max_decoding_message_size(usize::MAX))
     }
 
     /// Stamps a freshly minted reserve ticket onto one request copy.
@@ -2818,7 +2823,10 @@ impl TonicOraclePeerTransport {
         let mut stream = response.into_inner();
         let output = async_stream::stream! {
             while let Some(frame) = stream.next().await {
-                yield frame.map_err(|status| stream_status_error(&status)).and_then(|frame| frame.try_into().map_err(|error| {
+                yield frame.map_err(|status| {
+                    tracing::warn!(code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
+                    stream_status_error(&status)
+                }).and_then(|frame| frame.try_into().map_err(|error| {
                     tracing::warn!(?error, "Oracle leader could not decode a worker frame");
                     DispatchError::Terminal
                 }));

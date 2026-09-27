@@ -236,6 +236,12 @@ fn bifrost_error_from_code(
         "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH" => BifrostError::FingerprintMismatch {
             table: table_from_message("schema fingerprint mismatch: "),
         },
+        "WYRD_VALA_400_SCHEMA_PARSE" => BifrostError::SchemaParse {
+            detail: message
+                .strip_prefix("schema parse failed: ")
+                .unwrap_or(message)
+                .to_owned(),
+        },
         "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH" => {
             BifrostError::CompactionTargetMismatch {
                 table: table_from_message("compaction target mismatch for table: "),
@@ -443,6 +449,15 @@ mod tests {
             target_conflict.code(),
             "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH"
         );
+
+        let schema = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_400_SCHEMA_PARSE",
+            "detail": "schema parse failed: too many leaves",
+            "details": {},
+        }));
+        assert_eq!(schema.status(), 400);
+        assert_eq!(schema.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+        assert_eq!(schema.to_string(), "schema parse failed: too many leaves");
 
         let invalid_target = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET",

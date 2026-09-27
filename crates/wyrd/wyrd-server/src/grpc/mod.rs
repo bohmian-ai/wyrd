@@ -31,6 +31,7 @@ use std::task::{Context, Poll};
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use tower::Service;
+use vala_bifrost_redux::gate::IngestError;
 use wyrd_tonic::tonic::Status;
 use wyrd_tonic::tonic::body::Body;
 use wyrd_tonic::tonic::codegen::http::{Request, Response};
@@ -266,6 +267,19 @@ where
                     );
                 }
             };
+            // A message above the one wire ceiling is the caller's payload,
+            // not occupied capacity: refuse it with the typed ingest 413
+            // before tonic decodes a byte of it.
+            if let Some(bytes) = declared
+                && bytes > admission.message_limit_bytes()
+            {
+                return Ok(IngestError::PayloadTooLarge {
+                    bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                    limit: u64::try_from(admission.message_limit_bytes()).unwrap_or(u64::MAX),
+                }
+                .into_status()
+                .into_http());
+            }
             let lease = declared.map_or_else(
                 || admission.try_acquire_unknown(),
                 |bytes| admission.try_acquire(bytes),
@@ -710,7 +724,8 @@ mod tests {
         assert_eq!(head.declared(), Ok(None));
     }
 
-    /// Actual gRPC frame length admits the exact cap and refuses one byte over.
+    /// Actual gRPC frame length admits the exact cap and refuses one byte over
+    /// with the typed payload-too-large refusal.
     ///
     /// # Panics
     ///
@@ -751,6 +766,14 @@ mod tests {
                 .get("grpc-status")
                 .and_then(|value| value.to_str().ok()),
             Some("8")
+        );
+        let refusal = Status::from_header_map(response.headers()).expect("a gRPC refusal status");
+        assert_eq!(
+            wyrd_tonic::tonic_types::StatusExt::get_error_details(&refusal)
+                .error_info()
+                .map(|info| info.reason.as_str()),
+            Some("WYRD_VALA_413_PAYLOAD_TOO_LARGE"),
+            "an over-ceiling message is the typed payload refusal"
         );
         assert!(!invoked.load(Ordering::Acquire));
         assert_eq!(admission.used_bytes(), 0);

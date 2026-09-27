@@ -357,6 +357,14 @@ impl ReadyOracleForwarder {
     }
 
     /// Connects one endpoint without sending any query envelope bytes.
+    ///
+    /// The client lifts tonic's 4 MiB default decode cap: a forwarded query
+    /// frame carries one result batch the owning leader already materialized,
+    /// and a batch of acknowledged rows can exceed 4 MiB.
+    ///
+    /// # Errors
+    /// Returns peer-security failure for missing or invalid TLS, and role
+    /// unavailability when the endpoint cannot be reached.
     async fn connect(
         &self,
         address: String,
@@ -370,7 +378,9 @@ impl ReadyOracleForwarder {
         endpoint
             .connect()
             .await
-            .map(OraclePeerServiceClient::new)
+            .map(|channel| {
+                OraclePeerServiceClient::new(channel).max_decoding_message_size(usize::MAX)
+            })
             .map_err(|_| BifrostError::OracleRoleUnavailable)
     }
 

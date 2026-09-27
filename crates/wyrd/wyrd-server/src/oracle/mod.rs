@@ -34,6 +34,8 @@ pub use peer_authority::OraclePeerAuthority;
 pub use peer_credentials::ServerBifrostPeerCredentials;
 pub use peer_keyring::{PeerKeyringError, PeerTicketKeyring};
 pub use peer_service::OraclePeerGrpc;
+#[cfg(feature = "test-support")]
+pub use peer_service::{ScribeFragmentFault, arm_scribe_fragment_fault_for_test};
 pub use query_audit::OracleQueryAudit;
 pub use tail_audit::PostgresTailSecurityAudit;
 pub use tail_authority::ScribeTailAuthority;

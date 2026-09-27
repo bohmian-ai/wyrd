@@ -10,9 +10,11 @@ use arrow::array::{Array, Int64Array};
 use vala_bifrost_redux::oracle::iceberg_projection_probe;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
+use wyrd_server::oracle::{ScribeFragmentFault, arm_scribe_fragment_fault_for_test};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, QueryExecutionPath, QueryTerminalErrorCode, QueryTerminalOutcome,
+    QueryWarning,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
@@ -1392,6 +1394,44 @@ fn writer_fragment_footers(cluster: &WyrdTestCluster) -> Result<u64, JourneyErro
         .1)
 }
 
+/// Seeds one table with published ids 1..=3 and unflushed live ids 101..=103.
+///
+/// Node 2 writes and publishes the low ids; node 0 appends the high ids and
+/// keeps them in its Scribe, so node 0 is the table's only live source. Oracle
+/// snapshots are refreshed so every reader sees the published cut.
+///
+/// # Errors
+///
+/// Returns cluster, registration, write, flush, or refresh failures.
+async fn seed_published_and_live(
+    cluster: &WyrdTestCluster,
+    prefix: &str,
+) -> Result<String, JourneyError> {
+    let table = unique_table(prefix);
+    let table_fqn = format!("vala.bifrost.{table}");
+    let live_node = cluster.server(0).ok_or("missing node 0")?;
+    let published_node = cluster.server(2).ok_or("missing node 2")?;
+    register_table(live_node, cluster.data_tenant_id(), &table).await?;
+    let published = writer(published_node, "seed-published-writer").await?;
+    for id in 1..=3 {
+        published
+            .write(
+                &table_fqn,
+                &journey_schema(),
+                [journey_row(id, marker_value(id))],
+            )
+            .await?;
+    }
+    published_node.flush_bifrost().await?;
+    let live = client(live_node, "seed-live-writer").await?;
+    let now = chrono::Utc::now().timestamp_micros();
+    for id in 101..=103 {
+        append_event_time_row(&live, &table_fqn, id, now).await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    Ok(table_fqn)
+}
+
 /// A completed `LIMIT` plan stops an opened live fragment it no longer needs.
 ///
 /// Published ids stay below the predicate and live ids 101..=103 sit on one
@@ -1406,29 +1446,8 @@ fn writer_fragment_footers(cluster: &WyrdTestCluster) -> Result<u64, JourneyErro
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn limit_stops_unneeded_live_fragment_without_footer() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
-    let tenant = cluster.data_tenant_id();
-    let table = unique_table("oracle_live_limit");
-    let table_fqn = format!("vala.bifrost.{table}");
+    let table_fqn = seed_published_and_live(&cluster, "oracle_live_limit").await?;
     let live_node = cluster.server(0).ok_or("missing node 0")?;
-    let published_node = cluster.server(2).ok_or("missing node 2")?;
-    register_table(live_node, tenant, &table).await?;
-    let published = writer(published_node, "limit-published-writer").await?;
-    for id in 1..=3 {
-        published
-            .write(
-                &table_fqn,
-                &journey_schema(),
-                [journey_row(id, marker_value(id))],
-            )
-            .await?;
-    }
-    published_node.flush_bifrost().await?;
-    let live = client(live_node, "limit-live-writer").await?;
-    let now = chrono::Utc::now().timestamp_micros();
-    for id in 101..=103 {
-        append_event_time_row(&live, &table_fqn, id, now).await?;
-    }
-    cluster.refresh_oracle_snapshots().await?;
     let baseline = live_node
         .state()
         .bifrost_ingest()
@@ -1479,5 +1498,248 @@ async fn limit_stops_unneeded_live_fragment_without_footer() -> Result<(), Journ
     if ordered != vec![103, 102] {
         return Err(format!("ordered limit expected live ids [103, 102], saw {ordered:?}").into());
     }
+    Ok(())
+}
+
+/// How one matrix query ended, as a public client observed it.
+struct ObservedQuery {
+    /// Ids the client received before the stream ended.
+    ids: Vec<i64>,
+    /// Whether the client raised an error instead of ending cleanly.
+    rejected: bool,
+    /// Terminal outcome, `Failed` for an early typed refusal.
+    outcome: QueryTerminalOutcome,
+    /// Terminal warnings; empty for an early refusal.
+    warnings: Vec<QueryWarning>,
+}
+
+/// Runs `sql` to its end and records what the client observed.
+///
+/// An early typed refusal counts as a rejected `Failed` query with no rows. A
+/// stream error after the terminal frame is the client's rejection of a
+/// failed stream and is recorded rather than returned.
+///
+/// # Errors
+///
+/// Returns client or Arrow errors that carry no terminal, and an error when a
+/// cleanly ended stream has no terminal frame.
+async fn observe_query(client: &WyrdClient, sql: &str) -> Result<ObservedQuery, JourneyError> {
+    let opened = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: None,
+        })
+        .await;
+    let mut stream = match opened {
+        Ok(stream) => stream,
+        Err(BifrostClientError::Transport(WyrdError::Vala { .. })) => {
+            return Ok(ObservedQuery {
+                ids: Vec::new(),
+                rejected: true,
+                outcome: QueryTerminalOutcome::Failed,
+                warnings: Vec::new(),
+            });
+        }
+        Err(other) => return Err(other.into()),
+    };
+    let mut ids = Vec::new();
+    let mut rejected = false;
+    loop {
+        match stream.next_batch().await {
+            Ok(Some(batch)) => {
+                let column = batch
+                    .column_by_name("id")
+                    .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                    .ok_or("query result id column is not Int64")?;
+                ids.extend(column.iter().flatten());
+            }
+            Ok(None) => break,
+            Err(_) if stream.terminal().is_some() => {
+                rejected = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    Ok(ObservedQuery {
+        ids,
+        rejected,
+        outcome: terminal.outcome,
+        warnings: terminal.warnings.clone(),
+    })
+}
+
+/// Requires a clean `Degraded` result with only the published ids.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when the outcome, warning, or rows differ.
+fn expect_degraded(case: &str, observed: &ObservedQuery) -> Result<(), JourneyError> {
+    if observed.rejected
+        || observed.outcome != QueryTerminalOutcome::Degraded
+        || observed.warnings != vec![QueryWarning::LiveTailUnavailable]
+        || observed.ids != vec![1, 2, 3]
+    {
+        return Err(format!(
+            "{case}: expected Degraded published-only rows, saw {:?} {:?} rejected={} {:?}",
+            observed.outcome, observed.warnings, observed.rejected, observed.ids
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Requires a `Failed` result the client refused to accept as complete.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when the query did not fail or the client
+/// ended the stream cleanly.
+fn expect_failed(case: &str, observed: &ObservedQuery) -> Result<(), JourneyError> {
+    if observed.outcome != QueryTerminalOutcome::Failed || !observed.rejected {
+        return Err(format!(
+            "{case}: expected a rejected Failed query, saw {:?} rejected={} {:?}",
+            observed.outcome, observed.rejected, observed.ids
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Collects every Parquet file under `root` whose path names `table`.
+///
+/// # Errors
+///
+/// Returns filesystem errors from walking `root`.
+fn table_parquet_files(
+    root: &std::path::Path,
+    table: &str,
+) -> Result<Vec<std::path::PathBuf>, JourneyError> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "parquet")
+                && path.to_string_lossy().contains(table)
+            {
+                found.push(path);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Every live-read fault reaches exactly one terminal class.
+///
+/// One table holds published ids 1..=3 and live ids 101..=103 on node 0's
+/// Scribe; node 1 reads. Each fault is driven at the boundary that owns it:
+///
+/// - a failed stream listing, and a selected Scribe refused before its first
+///   row, each yield `Degraded` with `LiveTailUnavailable` and only the
+///   published rows;
+/// - a Scribe lost after its first row, a stream without its footer, a
+///   rejected peer ticket, and a refused follower lease each yield `Failed`,
+///   and the client rejects the stream instead of accepting preceding rows;
+/// - a Scribe stopped before discovery is absent rather than lost, so the
+///   query succeeds with best-effort coverage and no warning;
+/// - deleting the published data files fails the query rather than hiding
+///   the published loss as a live omission.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let table_fqn = seed_published_and_live(&cluster, "oracle_live_faults").await?;
+    let sql = format!("SELECT id FROM {table_fqn} ORDER BY id");
+    {
+        let reader_node = cluster.server(1).ok_or("missing node 1")?;
+        let reader = client(reader_node, "fault-matrix-reader").await?;
+        let complete = observe_query(&reader, &sql).await?;
+        if complete.rejected
+            || complete.outcome != QueryTerminalOutcome::Success
+            || complete.ids != vec![1, 2, 3, 101, 102, 103]
+        {
+            return Err(format!(
+                "baseline: expected every row, saw {:?} rejected={} {:?}",
+                complete.outcome, complete.rejected, complete.ids
+            )
+            .into());
+        }
+
+        reader_node.set_tail_discovery_unavailable_for_test(true);
+        let listing = observe_query(&reader, &sql).await;
+        reader_node.set_tail_discovery_unavailable_for_test(false);
+        expect_degraded("failed stream listing", &listing?)?;
+
+        for (case, fault) in [
+            (
+                "Scribe unavailable before its first row",
+                ScribeFragmentFault::UnavailableBeforeRows,
+            ),
+            (
+                "Scribe lost after its first row",
+                ScribeFragmentFault::UnavailableAfterFirstBatch,
+            ),
+            (
+                "Scribe stream without its footer",
+                ScribeFragmentFault::OmitFooter,
+            ),
+            (
+                "rejected Scribe peer ticket",
+                ScribeFragmentFault::RejectTicket,
+            ),
+            (
+                "Scribe follower capacity refused",
+                ScribeFragmentFault::CapacityRefused,
+            ),
+        ] {
+            arm_scribe_fragment_fault_for_test(fault);
+            let observed = observe_query(&reader, &sql).await?;
+            if fault == ScribeFragmentFault::UnavailableBeforeRows {
+                expect_degraded(case, &observed)?;
+            } else {
+                expect_failed(case, &observed)?;
+            }
+        }
+    }
+
+    let stopped = cluster.server(0).ok_or("missing node 0")?.node_id();
+    cluster.stop_node(stopped).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(
+        cluster.server(1).ok_or("missing node 1")?,
+        "fault-matrix-after-stop",
+    )
+    .await?;
+    let absent = observe_query(&reader, &sql).await?;
+    if absent.rejected
+        || absent.outcome != QueryTerminalOutcome::Success
+        || !absent.warnings.is_empty()
+        || !absent.ids.starts_with(&[1, 2, 3])
+    {
+        return Err(format!(
+            "Scribe absent before discovery: expected Success, saw {:?} {:?} rejected={} {:?}",
+            absent.outcome, absent.warnings, absent.rejected, absent.ids
+        )
+        .into());
+    }
+
+    let table = table_fqn.rsplit('.').next().ok_or("table name missing")?;
+    let files = table_parquet_files(cluster.storage_root(), table)?;
+    if files.is_empty() {
+        return Err("published source fault: no published data file to remove".into());
+    }
+    for file in files {
+        std::fs::remove_file(file)?;
+    }
+    expect_failed(
+        "published data file lost",
+        &observe_query(&reader, &sql).await?,
+    )?;
     Ok(())
 }

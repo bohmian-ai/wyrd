@@ -7,10 +7,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use url::Url;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use wyrd_client::bifrost::BifrostClientError;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalErrorCode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, ScribeCacheMode, ScribeCheckpointNameV1, ScribeProductionEvidenceV1,
     ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeStorageDrainObservationV1,
@@ -516,21 +515,23 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
     );
 }
 
-/// An undialable ready Scribe peer fails a public read with its typed 503.
+/// An undialable ready Scribe peer degrades a public read to known live loss.
 ///
 /// This drives the public SDK against an active, unflushed generation so Oracle
 /// must use the private Scribe RPC. The test then replaces only the durable
 /// membership address with a concrete closed loopback endpoint and refreshes
-/// the production registry snapshot. No successful terminal may be returned.
+/// the production registry snapshot. The known Scribe is unreachable before
+/// any row, so the query ends `Degraded` with `LiveTailUnavailable` and returns
+/// none of the unreachable live rows; it is never reported as complete.
 ///
 /// # Panics
 ///
 /// Panics when setup fails, the HTTPS endpoint is invalid or unreachable,
-/// fault injection changes its host/scheme, or the public SDK loses the typed
-/// visibility refusal before or after the response stream opens.
+/// fault injection changes its host/scheme, or the public query fails, emits a
+/// live row, or ends without the degraded terminal.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
-async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
+async fn scribe_undialable_private_peer_degrades_live_coverage() {
     let server = start_scribe_server().await;
     let tenant = server.data_tenant_id();
     let table = register_table(
@@ -604,45 +605,32 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         .await
         .expect("Oracle observes the undialable membership");
 
-    let started = wyrd_client::Bifrost::query_only(writer.client())
+    let mut stream = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
             deadline_ms: Some(5_000),
         })
-        .await;
-    let error = match started {
-        Err(error) => error,
-        Ok(mut stream) => match stream.next_batch().await {
-            Err(error) => error,
-            Ok(Some(_)) => panic!("undialable strict read emitted a successful batch"),
-            Ok(None) => panic!("undialable strict read emitted a successful terminal"),
-        },
-    };
-    let projected = wyrd_spec::error::WyrdError::from(&error);
-    assert_eq!(
-        projected.code(),
-        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE"
-    );
-    assert_eq!(projected.status(), 503);
-    match &error {
-        BifrostClientError::FailedTerminal { terminal } => {
-            assert_eq!(
-                terminal.outcome,
-                wyrd_spec::vala::api::QueryTerminalOutcome::Failed
-            );
-            assert_eq!(
-                terminal.error.as_ref().expect("failed terminal error").code,
-                QueryTerminalErrorCode::QueryVisibilityUnavailable
-            );
-        }
-        BifrostClientError::Transport(wyrd_spec::error::WyrdError::Vala {
-            error: wyrd_spec::vala::error::BifrostError::QueryVisibilityUnavailable,
-        }) => {}
-        other => panic!("expected typed visibility refusal, got {other:?}"),
+        .await
+        .expect("a known live loss does not refuse the query");
+    while let Some(batch) = stream
+        .next_batch()
+        .await
+        .expect("a known live loss reaches a degraded terminal")
+    {
+        assert_eq!(
+            batch.num_rows(),
+            0,
+            "an unreachable Scribe emitted a live row"
+        );
     }
+    let terminal = stream.terminal().expect("degraded terminal");
     assert_eq!(
-        error_code(&error),
-        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE"
+        terminal.outcome,
+        wyrd_spec::vala::api::QueryTerminalOutcome::Degraded
+    );
+    assert_eq!(
+        terminal.warnings,
+        vec![wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable]
     );
 
     server.shutdown().await.expect("the server drains cleanly");
@@ -693,11 +681,6 @@ async fn append_active_row(writer: &wyrd_testing::bifrost::write::BifrostWriter,
         .write(table, &schema, [br#"{"value": 7}"#.to_vec()])
         .await
         .expect("active row append");
-}
-
-/// Returns the public stable code without consuming the typed SDK error.
-fn error_code(error: &BifrostClientError) -> &'static str {
-    wyrd_spec::error::WyrdError::from(error).code()
 }
 
 /// Optional and scoped Card correlation, end to end through the public routes.

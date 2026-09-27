@@ -2809,7 +2809,11 @@ impl TonicOraclePeerTransport {
             .await
             .map_err(|status| {
                 tracing::warn!(code = ?status.code(), "Oracle peer execute rejected");
-                execution_status_error(&status)
+                if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
+                    live_execution_status_error(&status)
+                } else {
+                    execution_status_error(&status)
+                }
             })?;
         let mut stream = response.into_inner();
         let output = async_stream::stream! {
@@ -3111,6 +3115,21 @@ fn execution_status_error(status: &Status) -> DispatchError {
             cause: EligibleSourceLossCause::ProviderResolution,
         },
         _ => status_error(status),
+    }
+}
+
+/// Classifies a live Scribe fragment's open refusal.
+///
+/// Live coverage is best effort, so a Scribe that answers `Unavailable` is an
+/// availability loss the caller may degrade before any row — unlike a
+/// published worker, which fails closed. A capacity refusal is a resource
+/// fault and never becomes a live omission. Every other code keeps the
+/// published classification.
+fn live_execution_status_error(status: &Status) -> DispatchError {
+    match status.code() {
+        wyrd_tonic::tonic::Code::Unavailable => DispatchError::Unavailable,
+        wyrd_tonic::tonic::Code::ResourceExhausted => DispatchError::Capacity,
+        _ => execution_status_error(status),
     }
 }
 
@@ -5611,6 +5630,30 @@ mod tests {
         assert!(matches!(
             status_error(&Status::deadline_exceeded("deadline")),
             DispatchError::Unavailable
+        ));
+    }
+
+    /// A live Scribe open refusal separates availability from resource and trust faults.
+    ///
+    /// Only `Unavailable` may become a degradable live loss; capacity stays a
+    /// resource fault and a denied ticket stays terminal.
+    #[test]
+    fn live_scribe_open_status_separates_availability_from_faults() {
+        assert!(matches!(
+            live_execution_status_error(&Status::unavailable("scribe outage")),
+            DispatchError::Unavailable
+        ));
+        assert!(matches!(
+            live_execution_status_error(&Status::resource_exhausted("follower lease")),
+            DispatchError::Capacity
+        ));
+        assert!(matches!(
+            live_execution_status_error(&Status::permission_denied("ticket")),
+            DispatchError::Terminal
+        ));
+        assert!(matches!(
+            live_execution_status_error(&Status::aborted("foreign tenant")),
+            DispatchError::TenantInvariant
         ));
     }
 

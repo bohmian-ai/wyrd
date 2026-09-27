@@ -34,6 +34,53 @@ pub struct OraclePeerGrpc {
     bifrost: Arc<Bifrost>,
 }
 
+/// One fault a test-tier journey injects into the next Scribe fragment.
+///
+/// Each drives a live-read failure at the Scribe boundary that owns it, so
+/// Oracle's terminal decision is observed against the real frames a peer
+/// would send rather than a leader-side simulation.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ScribeFragmentFault {
+    /// Refuse the fragment as unavailable before it produces any frame.
+    UnavailableBeforeRows = 1,
+    /// Fail the stream as unavailable right after its first batch frame.
+    UnavailableAfterFirstBatch = 2,
+    /// End an otherwise complete stream without its footer.
+    OmitFooter = 3,
+    /// Reject the fragment's peer ticket as a trust-boundary failure.
+    RejectTicket = 4,
+    /// Refuse the fragment's follower lease as a capacity fault.
+    CapacityRefused = 5,
+}
+
+/// The armed fault, `0` when none; consumed by exactly one Scribe fragment.
+#[cfg(feature = "test-support")]
+static SCRIBE_FRAGMENT_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Arms `fault` for the next Scribe fragment executed in this process.
+///
+/// The arming is process-wide and consumed once, so a journey arms it only
+/// while a single Scribe serves the queried table.
+#[cfg(feature = "test-support")]
+pub fn arm_scribe_fragment_fault_for_test(fault: ScribeFragmentFault) {
+    SCRIBE_FRAGMENT_FAULT.store(fault as u8, std::sync::atomic::Ordering::Release);
+}
+
+/// Takes the armed fault, leaving none armed.
+#[cfg(feature = "test-support")]
+fn take_scribe_fragment_fault() -> Option<ScribeFragmentFault> {
+    match SCRIBE_FRAGMENT_FAULT.swap(0, std::sync::atomic::Ordering::AcqRel) {
+        1 => Some(ScribeFragmentFault::UnavailableBeforeRows),
+        2 => Some(ScribeFragmentFault::UnavailableAfterFirstBatch),
+        3 => Some(ScribeFragmentFault::OmitFooter),
+        4 => Some(ScribeFragmentFault::RejectTicket),
+        5 => Some(ScribeFragmentFault::CapacityRefused),
+        _ => None,
+    }
+}
+
 /// Starts one Scribe attempt before polling any result batch, including an empty stream.
 fn start_scribe_attempt(
     encoder: &mut AttemptEncoder,
@@ -169,6 +216,20 @@ impl OraclePeerGrpc {
                 "Scribe fragment target does not match the local owner"
             );
             return Err(DispatchError::Terminal);
+        }
+        #[cfg(feature = "test-support")]
+        let fault = take_scribe_fragment_fault();
+        #[cfg(feature = "test-support")]
+        match fault {
+            Some(ScribeFragmentFault::UnavailableBeforeRows) => {
+                return Err(DispatchError::Unavailable);
+            }
+            Some(ScribeFragmentFault::RejectTicket) => {
+                tracing::error!("Scribe peer ticket verification failed (injected)");
+                return Err(DispatchError::Terminal);
+            }
+            Some(ScribeFragmentFault::CapacityRefused) => return Err(DispatchError::Capacity),
+            _ => {}
         }
         let verifier: Arc<dyn PeerTicketVerifier> = scribe.fragment_verifier();
         let verified = verifier
@@ -313,6 +374,15 @@ impl OraclePeerGrpc {
                     yield Ok(schema);
                 }
                 yield Ok(batch);
+                #[cfg(feature = "test-support")]
+                if fault == Some(ScribeFragmentFault::UnavailableAfterFirstBatch) {
+                    yield Err(DispatchError::Unavailable);
+                    return;
+                }
+            }
+            #[cfg(feature = "test-support")]
+            if fault == Some(ScribeFragmentFault::OmitFooter) {
+                return;
             }
             let footer = encoder
                 .finish_physical(&plan_fingerprint, scan_evidence.finalize())

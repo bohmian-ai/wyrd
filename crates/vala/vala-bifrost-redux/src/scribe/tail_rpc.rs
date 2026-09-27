@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api as tail;
 use wyrd_tonic::tonic::metadata::MetadataValue;
-use wyrd_tonic::tonic::{Request, transport::Channel};
+use wyrd_tonic::tonic::{Code, Request, transport::Channel};
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
 use crate::catalog::TenantTableBinding;
@@ -245,8 +245,10 @@ impl TonicTailReadTransport {
     /// Discovers active event-day scopes through the private Scribe RPC.
     ///
     /// # Errors
-    /// Returns [`TailReadError::State`] for transport, conversion, or server
-    /// status failures.
+    /// Returns the [`TailReadError`] class of the server status (see
+    /// [`tonic_error`]), [`TailReadError::Binding`] for an unreadable returned
+    /// partition, and [`TailReadError::State`] for a malformed returned stream
+    /// identity.
     pub async fn list_active_streams(
         &self,
         binding: tail::TenantTableBinding,
@@ -324,10 +326,23 @@ impl TonicTailReadTransport {
     }
 }
 
-/// Converts an authenticated remote status into the local reader error shape.
+/// Converts a remote listing status into its closed local failure class.
+///
+/// The class, not the message, is what Oracle's query terminal decides on:
+/// only `Unavailable` is availability loss of the listed Scribe. A deadline
+/// stays a deadline, credential and tenant refusals stay authorization, a
+/// rejected binding stays a binding fault, and every other status, including
+/// cancellation and internal Scribe state failure, is a fatal state fault.
 fn tonic_error(status: &wyrd_tonic::tonic::Status) -> TailReadError {
-    TailReadError::State {
-        detail: status.to_string(),
+    let detail = status.message().to_owned();
+    match status.code() {
+        Code::Unavailable => TailReadError::Unavailable { detail },
+        Code::DeadlineExceeded => TailReadError::DeadlineElapsed,
+        Code::Unauthenticated | Code::PermissionDenied => TailReadError::Authorization { detail },
+        Code::InvalidArgument => TailReadError::Binding,
+        _ => TailReadError::State {
+            detail: status.to_string(),
+        },
     }
 }
 
@@ -346,6 +361,15 @@ pub enum TailReadError {
     /// Scribe state could not produce a consistent shallow snapshot.
     #[error("tail Scribe state failed: {detail}")]
     State { detail: String },
+    /// A ready Scribe could not be reached or was not serving the listing.
+    ///
+    /// This is the only listing failure Oracle treats as live-source loss.
+    #[error("tail Scribe unavailable: {detail}")]
+    Unavailable { detail: String },
+    /// A listed stream names a different incarnation or writer epoch than the
+    /// membership snapshot the listing was sent to.
+    #[error("tail stream identity is stale")]
+    StaleIdentity,
 }
 
 /// Converts the private wire binding into the established local table owner.
@@ -981,7 +1005,9 @@ impl FetchLiveTailService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{FetchLiveTailService, TailReadError, TailTicketAudience, TailTicketClaims};
+    use super::{
+        FetchLiveTailService, TailReadError, TailTicketAudience, TailTicketClaims, tonic_error,
+    };
     use crate::scribe::hot_source::HotAuthority;
     use crate::scribe::memtable::Memtable;
     use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
@@ -989,6 +1015,7 @@ mod tests {
     use arrow::array::{Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use wyrd_spec::DataTenantId;
+    use wyrd_tonic::tonic::Status;
 
     /// Builds one direct live-tail service over a memtable holding two
     /// appended batches of `value` rows, so a selective fetch can be compared
@@ -1062,6 +1089,43 @@ mod tests {
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         (FetchLiveTailService::new(stream, memtable), binding)
+    }
+
+    /// A listing status keeps its closed class instead of one state error.
+    ///
+    /// Only `Unavailable` is availability loss Oracle may degrade. Credential
+    /// and tenant refusals stay authorization, a rejected binding stays a
+    /// binding fault, a deadline stays a deadline, and cancellation or an
+    /// internal Scribe failure is a fatal state fault.
+    ///
+    /// # Panics
+    /// Panics when any status maps to a different class.
+    #[test]
+    fn listing_status_keeps_its_failure_class() {
+        assert!(matches!(
+            tonic_error(&Status::unavailable("scribe down")),
+            TailReadError::Unavailable { .. }
+        ));
+        for refused in [
+            Status::unauthenticated("bad bearer"),
+            Status::permission_denied("bad ticket"),
+        ] {
+            assert!(matches!(
+                tonic_error(&refused),
+                TailReadError::Authorization { .. }
+            ));
+        }
+        assert!(matches!(
+            tonic_error(&Status::invalid_argument("binding")),
+            TailReadError::Binding
+        ));
+        assert!(matches!(
+            tonic_error(&Status::deadline_exceeded("late")),
+            TailReadError::DeadlineElapsed
+        ));
+        for fatal in [Status::cancelled("gone"), Status::internal("state")] {
+            assert!(matches!(tonic_error(&fatal), TailReadError::State { .. }));
+        }
     }
 
     /// Writes `rows` as one staged Parquet run under `directory`.

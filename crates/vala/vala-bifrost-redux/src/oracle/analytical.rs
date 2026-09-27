@@ -3536,6 +3536,7 @@ fn install_graph_runtime(
 
 #[cfg(test)]
 mod tests {
+    use crate::oracle::follower::{FollowerResolutionError, ResolvedFollowerSource};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// One full-grant session shape for fixtures that do not vary the grant.
@@ -4047,9 +4048,11 @@ mod tests {
             _assignment: &wyrd_spec::vala::api::FollowerScanAssignment,
             _session: &SessionState,
             _reader_io_permit: Option<&super::super::reader_pins::ReaderIoPermit>,
-        ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
+        ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
-            Err("counting fixture resolver refuses every assignment".to_owned())
+            Err(FollowerResolutionError::Fault(
+                "counting fixture resolver refuses every assignment".to_owned(),
+            ))
         }
     }
 

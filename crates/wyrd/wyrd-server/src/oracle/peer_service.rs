@@ -3,12 +3,14 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use datafusion::error::DataFusionError;
 use futures_util::{Stream, StreamExt};
 use vala_bifrost_redux::oracle::dispatcher::{
-    AttemptEncoder, DispatchError, PEER_PROTOCOL_VERSION, WorkerExecution,
+    AttemptEncoder, DispatchError, EligibleSourceLossCause, PEER_PROTOCOL_VERSION, WorkerExecution,
 };
 use vala_bifrost_redux::oracle::follower::{
-    AuthenticatedFollowerContext, PhysicalPlanFollowerError, authenticated_preflight,
+    AuthenticatedFollowerContext, FollowerResolutionError, PhysicalPlanFollowerError,
+    authenticated_preflight,
 };
 use vala_bifrost_redux::oracle::peer::{
     PeerSecurityAudit, PeerTicketClaims, PeerTicketVerifier, ReservationBinding,
@@ -325,14 +327,9 @@ impl OraclePeerGrpc {
             .fragment_follower()
             .execute(&request, authenticated, &sessions)
             .await
-            .map_err(|error| match error {
-                PhysicalPlanFollowerError::Preflight(_)
-                | PhysicalPlanFollowerError::PostResolutionDecode(_)
-                | PhysicalPlanFollowerError::AuthorityAlreadyInstalled => DispatchError::Terminal,
-                PhysicalPlanFollowerError::Resolution(_) => DispatchError::EligibleSourceLoss {
-                    cause: vala_bifrost_redux::oracle::dispatcher::EligibleSourceLossCause::ProviderResolution,
-                },
-                PhysicalPlanFollowerError::Execution(_) => DispatchError::Unavailable,
+            .map_err(|error| {
+                tracing::warn!(?error, "Scribe physical follower could not start");
+                scribe_start_error(&error)
             })?;
         scribe.record_fragment_execution();
         // Split now, finalize after drain: the scan counters are written during
@@ -361,13 +358,7 @@ impl OraclePeerGrpc {
                     // The Oracle follower stream logs its own cause the same
                     // way; this is the Scribe half of that pair.
                     tracing::warn!(?error, "Scribe follower execution stream failed");
-                    if vala_bifrost_redux::oracle::is_stale_iceberg_object_error(&error) {
-                        DispatchError::StaleObject
-                    } else if vala_bifrost_redux::oracle::is_tenant_invariant_error(&error) {
-                        DispatchError::TenantInvariant
-                    } else {
-                        DispatchError::Unavailable
-                    }
+                    scribe_stream_error(&error)
                 })?;
                 let (schema, batch) = encoder.encode(&batch).map_err(|_| DispatchError::Terminal)?;
                 if let Some(schema) = schema {
@@ -592,11 +583,86 @@ fn dispatch_status(error: DispatchError) -> Status {
     }
 }
 
+/// Maps a Scribe follower failure before its stream exists to its dispatch outcome.
+///
+/// Only a source gone from this incarnation is live-source loss, which the
+/// leader may degrade before rows. A local bound refusal is capacity. Schema,
+/// projection, predicate, integrity, preflight, decode, and local execution
+/// faults are terminal and fail the query.
+fn scribe_start_error(error: &PhysicalPlanFollowerError) -> DispatchError {
+    match error {
+        PhysicalPlanFollowerError::Resolution(FollowerResolutionError::SourceLoss(_)) => {
+            DispatchError::EligibleSourceLoss {
+                cause: EligibleSourceLossCause::ProviderResolution,
+            }
+        }
+        PhysicalPlanFollowerError::Resolution(FollowerResolutionError::Capacity(_)) => {
+            DispatchError::Capacity
+        }
+        PhysicalPlanFollowerError::Resolution(FollowerResolutionError::Fault(_))
+        | PhysicalPlanFollowerError::Execution(_)
+        | PhysicalPlanFollowerError::Preflight(_)
+        | PhysicalPlanFollowerError::PostResolutionDecode(_)
+        | PhysicalPlanFollowerError::AuthorityAlreadyInstalled => DispatchError::Terminal,
+    }
+}
+
+/// Maps a failure inside an open Scribe follower stream to its dispatch outcome.
+///
+/// The stream reads this node's own memtable and staged runs, so a failure is
+/// a local fault rather than loss of a remote source: it is terminal at any
+/// row. Stale-object and tenant-invariant failures keep their own classes.
+fn scribe_stream_error(error: &DataFusionError) -> DispatchError {
+    if vala_bifrost_redux::oracle::is_stale_iceberg_object_error(error) {
+        DispatchError::StaleObject
+    } else if vala_bifrost_redux::oracle::is_tenant_invariant_error(error) {
+        DispatchError::TenantInvariant
+    } else {
+        DispatchError::Terminal
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use vala_bifrost_redux::oracle::attempt::AttemptBuffer;
+
+    /// Only source loss degrades a Scribe fragment; every other cause fails.
+    ///
+    /// Resolution classes decided at the Scribe open survive to the dispatch
+    /// outcome: a changed incarnation is eligible source loss, a bounded
+    /// snapshot refusal is capacity, and a schema, projection, or local
+    /// execution fault is terminal. A failure inside the open local stream is
+    /// terminal rather than unavailable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any class maps to a different dispatch outcome.
+    #[test]
+    fn scribe_fragment_failure_classes_survive_to_dispatch() {
+        let resolution = |class| scribe_start_error(&PhysicalPlanFollowerError::Resolution(class));
+        assert!(matches!(
+            resolution(FollowerResolutionError::SourceLoss("gone".to_owned())),
+            DispatchError::EligibleSourceLoss { .. }
+        ));
+        assert!(matches!(
+            resolution(FollowerResolutionError::Capacity("bound".to_owned())),
+            DispatchError::Capacity
+        ));
+        assert!(matches!(
+            resolution(FollowerResolutionError::Fault("schema".to_owned())),
+            DispatchError::Terminal
+        ));
+        assert!(matches!(
+            scribe_start_error(&PhysicalPlanFollowerError::Execution("open".to_owned())),
+            DispatchError::Terminal
+        ));
+        assert!(matches!(
+            scribe_stream_error(&DataFusionError::Execution("staged decode".to_owned())),
+            DispatchError::Terminal
+        ));
+    }
 
     /// The Scribe follower session is shaped by the lease this node charged.
     ///

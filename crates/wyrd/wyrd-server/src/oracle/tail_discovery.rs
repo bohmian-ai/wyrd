@@ -49,8 +49,11 @@ impl RegistryTailStreamDiscovery {
     /// Connects to one ready Scribe endpoint with the bounded private bearer.
     ///
     /// # Errors
-    /// Returns [`TailReadError`] when endpoint construction, connection,
-    /// credential exchange, or metadata encoding fails before listing.
+    /// Returns [`TailReadError::Unavailable`] when the ready endpoint cannot be
+    /// connected, [`TailReadError::DeadlineElapsed`] when connecting outlasts
+    /// the deadline, [`TailReadError::Authorization`] when this node's workload
+    /// credential cannot be issued or encoded, and [`TailReadError::State`]
+    /// when the peer identity or endpoint is misconfigured.
     async fn remote_transport(
         &self,
         address: &str,
@@ -72,19 +75,19 @@ impl RegistryTailStreamDiscovery {
         let channel = tokio::time::timeout(remaining, endpoint.connect())
             .await
             .map_err(|_| TailReadError::DeadlineElapsed)?
-            .map_err(|_| TailReadError::State {
+            .map_err(|_| TailReadError::Unavailable {
                 detail: "tail endpoint connection failed".to_owned(),
             })?;
-        let bearer = self
-            .credentials
-            .bearer(false)
-            .await
-            .map_err(|_| TailReadError::State {
-                detail: "tail credential exchange failed".to_owned(),
-            })?;
+        let bearer =
+            self.credentials
+                .bearer(false)
+                .await
+                .map_err(|_| TailReadError::Authorization {
+                    detail: "tail credential exchange failed".to_owned(),
+                })?;
         let client =
             wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient::new(channel);
-        TonicTailReadTransport::new(client, &bearer).map_err(|_| TailReadError::State {
+        TonicTailReadTransport::new(client, &bearer).map_err(|_| TailReadError::Authorization {
             detail: "tail credential metadata is invalid".to_owned(),
         })
     }
@@ -95,8 +98,13 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
     /// Refreshes membership, lists active streams, and returns ephemeral routes.
     ///
     /// # Errors
-    /// Returns [`TailReadError`] when membership, authentication, listing, or
-    /// returned stream identity validation fails before a route is published.
+    /// Returns the listing's own [`TailReadError`] class unchanged:
+    /// [`TailReadError::Unavailable`] only when a ready Scribe cannot be
+    /// reached or refuses as unavailable, [`TailReadError::StaleIdentity`]
+    /// when a listed stream names another incarnation or epoch,
+    /// [`TailReadError::DeadlineElapsed`] at the deadline, and a fatal
+    /// authorization, binding, or state class for membership refresh, ticket
+    /// mint, credential, tenant, binding, or malformed-response failures.
     async fn discover(
         &self,
         binding: &TenantTableBinding,
@@ -105,7 +113,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
         #[cfg(feature = "test-support")]
         if self.unavailable.load(Ordering::Acquire) {
-            return Err(TailReadError::State {
+            return Err(TailReadError::Unavailable {
                 detail: "injected private Scribe discovery outage".to_owned(),
             });
         }
@@ -167,17 +175,12 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
             )
             .await
             .map_err(|_| TailReadError::DeadlineElapsed)?
-            .map_err(|error| {
+            .inspect_err(|error| {
                 tracing::warn!(error = ?error, node_id = %node_id.as_uuid(), "private Scribe tail listing failed");
-                TailReadError::State {
-                    detail: "tail stream listing failed".to_owned(),
-                }
             })?;
             for stream in streams {
                 if stream.stream.node_id != node_id || stream.stream.writer_epoch != epoch {
-                    return Err(TailReadError::State {
-                        detail: "tail stream identity is stale".to_owned(),
-                    });
+                    return Err(TailReadError::StaleIdentity);
                 }
                 routes.push(DiscoveredTailRoute {
                     time_partition: stream.time_partition,

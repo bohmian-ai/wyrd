@@ -45,6 +45,7 @@ use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
+use crate::scribe::tail_rpc::TailReadError;
 
 mod admission;
 pub mod analytical;
@@ -3485,16 +3486,20 @@ impl Oracle {
     ///
     /// Discovery is authenticated and query-scoped; its routes name exact Scribe
     /// incarnations and writer epochs and retain no rows. One stale-epoch
-    /// answer is retried once with a fresh resolver cut. Any other listing
-    /// failure omits that table's live sources and marks the query `Degraded`,
-    /// while an elapsed deadline fails it. A node without discovery or a peer
+    /// answer is retried once with a fresh resolver cut. A ready Scribe that is
+    /// unavailable, or still stale after the retry, is known live-source loss:
+    /// that table's live sources are omitted and the query is `Degraded`. Every
+    /// other listing failure reveals a security, tenant, binding, or state
+    /// fault and fails the query. A node without discovery or a peer
     /// dispatcher plans no live source at all.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::QueryTimeout`] when the deadline has elapsed, and
+    /// Returns [`BifrostError::QueryTimeout`] when the deadline has elapsed,
     /// [`BifrostError::QueryVisibilityUnavailable`] when a pinned table has no
-    /// wire binding.
+    /// wire binding, [`BifrostError::QueryPeerSecurity`] when listing is
+    /// refused for credential, ticket, tenant, or binding reasons, and
+    /// [`BifrostError::QueryExecutionFailed`] for any other listing fault.
     async fn discover_live_routes(
         &self,
         roster: &participant_cut::OracleQueryAttemptRoster,
@@ -3512,9 +3517,7 @@ impl Oracle {
         for cut in cuts {
             let binding = tail_discovery::wire_binding(cut)?;
             let mut listed = discovery.discover(&binding, query_id, deadline).await;
-            if let Err(crate::scribe::tail_rpc::TailReadError::State { detail }) = &listed
-                && (detail.contains("stale") || detail.contains("epoch"))
-            {
+            if matches!(listed, Err(TailReadError::StaleIdentity)) {
                 listed = discovery.discover(&binding, query_id, deadline).await;
             }
             let routes = match listed {
@@ -3522,7 +3525,7 @@ impl Oracle {
                 Err(_) if Instant::now() >= deadline => {
                     return Err(BifrostError::QueryTimeout);
                 }
-                Err(error) => {
+                Err(error @ (TailReadError::Unavailable { .. } | TailReadError::StaleIdentity)) => {
                     tracing::warn!(
                         table = %binding.table,
                         ?error,
@@ -3530,6 +3533,20 @@ impl Oracle {
                     );
                     discovered.listing_lost = true;
                     continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        table = %binding.table,
+                        ?error,
+                        "Oracle fails a query whose live stream listing was refused"
+                    );
+                    return Err(match error {
+                        TailReadError::DeadlineElapsed => BifrostError::QueryTimeout,
+                        TailReadError::Authorization { .. } | TailReadError::Binding => {
+                            BifrostError::QueryPeerSecurity
+                        }
+                        _ => BifrostError::QueryExecutionFailed,
+                    });
                 }
             };
             if routes.is_empty() {

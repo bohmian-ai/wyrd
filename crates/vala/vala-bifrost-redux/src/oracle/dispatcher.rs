@@ -3719,6 +3719,7 @@ impl From<PeerSecurityError> for DispatchError {
 
 #[cfg(test)]
 mod tests {
+    use crate::oracle::follower::{FollowerResolutionError, ResolvedFollowerSource};
 
     /// Builds one empty attempt buffer for classification-only proofs.
     ///
@@ -3874,7 +3875,7 @@ mod tests {
             assignment: &FollowerScanAssignment,
             _session: &datafusion::execution::session_state::SessionState,
             _reader_io_permit: Option<&crate::oracle::reader_pins::ReaderIoPermit>,
-        ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
+        ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, false),
                 Field::new(
@@ -3922,7 +3923,7 @@ mod tests {
                 plan: plan as Arc<dyn datafusion::physical_plan::ExecutionPlan>,
                 full_schema: schema,
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| FollowerResolutionError::Fault(error.to_string()))
         }
     }
 
@@ -4729,7 +4730,7 @@ mod tests {
             assignment: &FollowerScanAssignment,
             session: &datafusion::execution::session_state::SessionState,
             reader_io_permit: Option<&crate::oracle::reader_pins::ReaderIoPermit>,
-        ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
+        ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             TestFollowerResolver
                 .resolve(target_role, assignment, session, reader_io_permit)

@@ -169,6 +169,8 @@ fn tail_status(error: TailReadError) -> Status {
         TailReadError::Binding => Status::invalid_argument(error.to_string()),
         TailReadError::Authorization { .. } => Status::permission_denied(error.to_string()),
         TailReadError::State { .. } => Status::internal(error.to_string()),
+        TailReadError::Unavailable { .. } => Status::unavailable(error.to_string()),
+        TailReadError::StaleIdentity => Status::failed_precondition(error.to_string()),
     }
 }
 

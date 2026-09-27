@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
 use iceberg::TableCreation;
 use iceberg::io::{FileIO, FileIOBuilder};
-use iceberg::spec::{FormatVersion, Transform};
+use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
 use sha2::{Digest as _, Sha256};
 use vala_sql::queries::file_list::HotFileCatalog;
 use vala_sql::{TenantConn, ValaPostgres};
@@ -869,20 +869,26 @@ impl BifrostCatalog {
                 "built-in tables must be provisioned with ensure_builtin".to_owned(),
             ));
         }
-        self.create_table_locked(request, None).await
+        self.create_table_locked(request, None, None).await
     }
 
     /// Register a caller-owned dataset in the tenant-qualified dataset namespace.
     ///
+    /// `compaction_target_file_size_bytes`, when supplied, becomes the new
+    /// table's explicit `write.target-file-size-bytes` property; omitted, the
+    /// table follows Forge's deployment default. On an existing table it must
+    /// match the stored explicit target or be omitted.
+    ///
     /// # Errors
     /// Returns a typed catalog error when the dataset name, schema, physical table,
-    /// control row, or audit event is invalid.
+    /// compaction target, control row, or audit event is invalid.
     pub async fn register_dataset(
         &self,
         tenant: DataTenantId,
         table: TableRef,
         user_fields: Vec<Field>,
         physical_layout: Option<PhysicalLayoutWire>,
+        compaction_target_file_size_bytes: Option<u64>,
         audit: Option<AuditEvent>,
     ) -> Result<TableUid, BifrostCatalogError> {
         if table.namespace != BifrostNamespace::Datasets {
@@ -899,6 +905,7 @@ impl BifrostCatalog {
                 audit,
             },
             None,
+            compaction_target_file_size_bytes,
         )
         .await
     }
@@ -928,6 +935,7 @@ impl BifrostCatalog {
                 audit: None,
             },
             Some((definition.schema)()),
+            None,
         )
         .await
     }
@@ -949,14 +957,21 @@ impl BifrostCatalog {
     /// fields. It selects no resolver: every declaration, built-in or caller,
     /// resolves through the one [`PhysicalLayout::resolve`] entry point.
     ///
+    /// `compaction_target_file_size_bytes` is checked for intrinsic shape
+    /// before the transaction, compared under the advisory lock against an
+    /// existing physical table's explicit target, and otherwise written as the
+    /// new table's `write.target-file-size-bytes` in its create transaction.
+    ///
     /// # Errors
-    /// Returns [`BifrostCatalogError::Layout`] for an invalid or conflicting
-    /// declaration, [`BifrostCatalogError::FingerprintMismatch`] for a schema
-    /// conflict, and metadata, Iceberg, SQL, or audit errors otherwise.
+    /// Returns [`BifrostCatalogError::Registration`] for an invalid or
+    /// conflicting layout or compaction target,
+    /// [`BifrostCatalogError::FingerprintMismatch`] for a schema conflict, and
+    /// metadata, Iceberg, SQL, or audit errors otherwise.
     async fn create_table_locked(
         &self,
         request: CreateTableRequest,
         canonical_schema: Option<arrow::datatypes::SchemaRef>,
+        compaction_target_file_size_bytes: Option<u64>,
     ) -> Result<TableUid, BifrostCatalogError> {
         reject_reserved_field_names(&request.user_fields)?;
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
@@ -970,6 +985,13 @@ impl BifrostCatalog {
             request.physical_layout.as_ref(),
             canonical_schema.as_deref(),
         )?;
+        if let Some(bytes) = compaction_target_file_size_bytes
+            && !crate::forge::managed::policy::registrable_target_file_size_bytes(bytes)
+        {
+            return Err(BifrostCatalogError::Registration(
+                wyrd_spec::vala::BifrostError::InvalidCompactionTarget { table: fqn, bytes },
+            ));
+        }
         let layout_wire = layout.to_wire();
         let layout_json = serde_json::to_value(&layout_wire).map_err(|error| {
             BifrostCatalogError::MetadataMismatch(format!(
@@ -988,7 +1010,7 @@ impl BifrostCatalog {
                 return Err(BifrostCatalogError::FingerprintMismatch(fqn));
             }
             if layout_wire_from_row(&row)? != layout_wire {
-                return Err(BifrostCatalogError::Layout(
+                return Err(BifrostCatalogError::Registration(
                     wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch { table: fqn },
                 ));
             }
@@ -999,6 +1021,7 @@ impl BifrostCatalog {
             }
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
+            assert_compaction_target(physical.metadata(), compaction_target_file_size_bytes, &fqn)?;
             // A concurrent winner already created the row; this request's
             // verdict still commits once, in the transaction that observed it.
             append_registration_audit(&mut conn, request.audit.as_ref(), &fqn).await?;
@@ -1010,9 +1033,15 @@ impl BifrostCatalog {
         if physical_exists {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
+            assert_compaction_target(physical.metadata(), compaction_target_file_size_bytes, &fqn)?;
         } else {
-            self.create_physical_table(&binding, &arrow_schema, &layout)
-                .await?;
+            self.create_physical_table(
+                &binding,
+                &arrow_schema,
+                &layout,
+                compaction_target_file_size_bytes,
+            )
+            .await?;
         }
 
         let table_uid = TableUid::new_v7();
@@ -1037,7 +1066,10 @@ impl BifrostCatalog {
     /// derived from `layout` and `binding`, so the canonical layout stays the
     /// single authority for the table's shape. The Forge data path is written
     /// as `write.data.path` so the managed rewrite core roots its outputs under
-    /// the recipe segment instead of the default data root.
+    /// the recipe segment instead of the default data root. A supplied
+    /// `compaction_target_file_size_bytes` is written as the table's explicit
+    /// `write.target-file-size-bytes`; omitted, no target property is written
+    /// so Forge resolves its deployment default at planning time.
     ///
     /// # Errors
     ///
@@ -1049,6 +1081,7 @@ impl BifrostCatalog {
         binding: &TenantTableBinding,
         arrow_schema: &Schema,
         layout: &PhysicalLayout,
+        compaction_target_file_size_bytes: Option<u64>,
     ) -> Result<(), BifrostCatalogError> {
         let iceberg_schema = crate::tables::iceberg_schema_for(arrow_schema)?;
         let partition_spec = layout
@@ -1063,6 +1096,19 @@ impl BifrostCatalog {
             binding.object_prefix
         );
         let forge_data_location = crate::catalog::layout::forge_data_location(&location);
+        let mut properties = std::collections::HashMap::from([
+            (
+                crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
+                layout.bloom_columns_property(),
+            ),
+            (
+                crate::catalog::layout::WRITE_DATA_PATH_PROPERTY.to_owned(),
+                forge_data_location,
+            ),
+        ]);
+        if let Some(bytes) = compaction_target_file_size_bytes {
+            properties.insert(TARGET_FILE_SIZE_PROPERTY.to_owned(), bytes.to_string());
+        }
         let creation = TableCreation::builder()
             .name(binding.table_name.clone())
             .location(location)
@@ -1070,16 +1116,7 @@ impl BifrostCatalog {
             .format_version(FormatVersion::V2)
             .partition_spec(partition_spec)
             .sort_order(sort_order)
-            .properties(std::collections::HashMap::from([
-                (
-                    crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
-                    layout.bloom_columns_property(),
-                ),
-                (
-                    crate::catalog::layout::WRITE_DATA_PATH_PROPERTY.to_owned(),
-                    forge_data_location,
-                ),
-            ]))
+            .properties(properties)
             .build();
         self.catalog
             .create_table(binding.physical_namespace(), creation)
@@ -1339,12 +1376,12 @@ impl BifrostCatalog {
         // ledger's after the first nested column — and it is the ledger's ids
         // that Scribe enforces on every stamped canonical batch. Describing the
         // stored ids would hand a writer a schema its own batches fail against.
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
         let arrow_schema = if let Some(definition) = builtin {
             (definition.schema)()
         } else {
-            let binding = TenantTableBinding::resolve((tenant, table.clone()))
-                .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-            let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
             Arc::new(iceberg::arrow::schema_to_arrow_schema(
                 iceberg_table.metadata().current_schema(),
             )?)
@@ -1359,6 +1396,9 @@ impl BifrostCatalog {
                 .and_then(|definition| (definition.canonical_physical_fingerprint)())
                 .map(crate::tables::CanonicalPhysicalFingerprint::to_hex),
             physical_layout: layout_wire_from_row(&row)?,
+            compaction_target_file_size_bytes: explicit_compaction_target(
+                iceberg_table.metadata(),
+            )?,
         })
     }
 
@@ -1498,7 +1538,7 @@ fn field_shape_matches(expected: &Field, actual: &Field) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`BifrostCatalogError::Layout`] when the declaration carries more
+/// Returns [`BifrostCatalogError::Registration`] when the declaration carries more
 /// than [`MAX_SORT_KEYS`](crate::catalog::layout::MAX_SORT_KEYS) sort keys, or
 /// names a column absent from the resolved schema or repeated within one list.
 fn resolve_registration_layout(
@@ -1512,7 +1552,7 @@ fn resolve_registration_layout(
         Clone::clone,
     );
     let layout = PhysicalLayout::resolve(fqn, &arrow_schema, declared)
-        .map_err(BifrostCatalogError::Layout)?;
+        .map_err(BifrostCatalogError::Registration)?;
     Ok((arrow_schema, layout))
 }
 
@@ -1555,6 +1595,60 @@ async fn acquire_table_advisory_lock(
         .map(|_| ())
         .map_err(vala_sql::SqlError::from)
         .map_err(BifrostCatalogError::Sql)
+}
+
+/// Iceberg property naming a table's explicit Forge compaction file target.
+const TARGET_FILE_SIZE_PROPERTY: &str = TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES;
+
+/// Reads the explicit compaction file target a physical table stores.
+///
+/// `None` means the table declares none and follows Forge's deployment
+/// default.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored property
+/// is not a base-ten byte count.
+fn explicit_compaction_target(
+    metadata: &TableMetadata,
+) -> Result<Option<u64>, BifrostCatalogError> {
+    metadata
+        .properties()
+        .get(TARGET_FILE_SIZE_PROPERTY)
+        .map(|raw| {
+            raw.parse::<u64>().map_err(|error| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "stored {TARGET_FILE_SIZE_PROPERTY}={raw:?} is not a byte count: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// Checks a re-registration's compaction target against the stored one.
+///
+/// Omission always matches and leaves the stored property untouched; a
+/// supplied value must equal the table's explicit target.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::Registration`] carrying
+/// `CompactionTargetMismatch` when a supplied target differs from the stored
+/// explicit target (including when none is stored), and a metadata mismatch
+/// when the stored property is malformed.
+fn assert_compaction_target(
+    metadata: &TableMetadata,
+    supplied: Option<u64>,
+    fqn: &str,
+) -> Result<(), BifrostCatalogError> {
+    match supplied {
+        Some(bytes) if explicit_compaction_target(metadata)? != Some(bytes) => {
+            Err(BifrostCatalogError::Registration(
+                wyrd_spec::vala::BifrostError::CompactionTargetMismatch {
+                    table: fqn.to_owned(),
+                },
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1980,6 +2074,7 @@ mod production_pin_tests {
                     )],
                     None,
                     None,
+                    None,
                 )
                 .await
                 .expect("dataset registers");
@@ -2095,6 +2190,7 @@ mod production_pin_tests {
                         arrow::datatypes::DataType::Int64,
                         true,
                     )],
+                    None,
                     None,
                     None,
                 )

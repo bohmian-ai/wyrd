@@ -1303,6 +1303,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
             metadata: std::collections::BTreeMap::new(),
         }],
         physical_layout: None,
+        compaction_target_file_size_bytes: None,
     };
     let refused = delegated
         .request_json::<_, serde_json::Value>(

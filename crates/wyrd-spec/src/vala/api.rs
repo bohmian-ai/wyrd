@@ -133,6 +133,13 @@ pub struct BifrostTableDescription {
     pub canonical_physical_fingerprint: Option<String>,
     /// The server-resolved canonical physical layout, fully populated.
     pub physical_layout: PhysicalLayoutWire,
+    /// The table's explicit Forge compaction file target, in bytes.
+    ///
+    /// Present only when the table stores its own
+    /// `write.target-file-size-bytes`; omitted means Forge compacts it toward
+    /// the deployment default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_target_file_size_bytes: Option<u64>,
 }
 
 // ── Arrow-free schema / field wire types ────────────────────────────────────
@@ -365,6 +372,16 @@ pub struct RegisterTableRequest {
     /// an explicit empty `bloom_columns` means "managed floor only".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_layout: Option<PhysicalLayoutWire>,
+    /// Optional soft file target Forge compacts this table toward, in bytes.
+    ///
+    /// Omitted, the table stores no explicit target and follows the Forge
+    /// deployment default (1 GiB unless the operator moved it). Supplied, it
+    /// must be at least 134217728 (the 128 MiB row-group target) and is stored
+    /// as the table's `write.target-file-size-bytes` Iceberg property. A
+    /// re-register may omit it or repeat the stored value; a different value
+    /// is `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_target_file_size_bytes: Option<u64>,
 }
 
 /// Whether a register call created a new table or matched an existing one.
@@ -2805,6 +2822,7 @@ mod bifrost_wire_tests {
                 }],
                 bloom_columns: vec!["run_id".to_string()],
             },
+            compaction_target_file_size_bytes: Some(1_073_741_824),
         };
         bifrost_wire_round_trip(&entry);
         bifrost_wire_round_trip(&desc);

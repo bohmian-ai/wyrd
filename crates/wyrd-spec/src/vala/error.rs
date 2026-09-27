@@ -763,6 +763,41 @@ column to let the server stamp receipt time."
         /// Canonical `<namespace>.<name>` of the conflicting table.
         table: String,
     },
+
+    /// A register call supplied a compaction file target Forge could not honor.
+    ///
+    /// The target must be representable on the server, safe under Forge's
+    /// oversized-file arithmetic, above the default small-file threshold, and
+    /// at least the table's row-group target. Reported before any durable
+    /// state changes.
+    #[error("invalid compaction target file size {bytes} for table {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET",
+        status = 400,
+        title = "Invalid Bifrost compaction target",
+        remediation = "Omit compaction_target_file_size_bytes to follow the deployment default, or supply at least 134217728 bytes."
+    )]
+    InvalidCompactionTarget {
+        /// Canonical `<namespace>.<name>` of the table being registered.
+        table: String,
+        /// The rejected byte count.
+        bytes: u64,
+    },
+
+    /// A register retry supplied a compaction file target that differs from
+    /// the table's existing explicit target, or supplied one for a table that
+    /// follows the deployment default.
+    #[error("compaction target mismatch for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH",
+        status = 409,
+        title = "Bifrost compaction target mismatch",
+        remediation = "Retry with the table's registered compaction target, omit it, or register a different table."
+    )]
+    CompactionTargetMismatch {
+        /// Canonical `<namespace>.<name>` of the conflicting table.
+        table: String,
+    },
 }
 
 /// Declaration slot named by [`BifrostError::InvalidPhysicalLayout`].

@@ -239,6 +239,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             vec![Field::new("value", DataType::Int64, false)],
             None,
             None,
+            None,
         )
         .await
         .expect("tail fixture dataset registers for the authenticated tenant");
@@ -634,6 +635,7 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
             tenant,
             TableRef::new(BifrostNamespace::Datasets, TABLE_NAME),
             vec![Field::new("value", DataType::Int64, false)],
+            None,
             None,
             None,
         )

@@ -199,6 +199,7 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         },
+        compaction_target_file_size_bytes: None,
     }
 }
 

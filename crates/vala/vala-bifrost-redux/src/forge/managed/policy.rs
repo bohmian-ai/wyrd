@@ -49,6 +49,22 @@ const FILE_TARGET_PROPERTY: &str = TableProperties::PROPERTY_WRITE_TARGET_FILE_S
 /// refusal an operator can read and a failure deep inside planning.
 const OVERSIZED_CEILING_PERCENT: u64 = 180;
 
+/// Reports whether `bytes` is a file target a table may declare at registration.
+///
+/// Registration cannot see a worker's operator limits, so it checks only what
+/// holds under every deployment: the target is representable on this platform,
+/// its oversized ceiling does not overflow, it is above the default small-file
+/// threshold, and it is at least the default row-group target a newly
+/// registered table writes with. [`ForgeTablePolicy::extract`] re-checks the
+/// full table and worker combination at planning.
+#[must_use]
+pub(crate) fn registrable_target_file_size_bytes(bytes: u64) -> bool {
+    bytes > crate::forge::compact::DEFAULT_SMALL_FILE_THRESHOLD_BYTES
+        && bytes >= ROW_GROUP_TARGET_DEFAULT
+        && bytes.checked_mul(OVERSIZED_CEILING_PERCENT).is_some()
+        && usize::try_from(bytes).is_ok()
+}
+
 /// The complete, already-consistent terms one managed rewrite executes under.
 ///
 /// Every field is derived, never defaulted at the point of use: the identity
@@ -490,6 +506,28 @@ mod tests {
             268_435_456,
             "a declared table property wins over the deployment default"
         );
+    }
+
+    /// Registration admits exactly the targets planning can honor under the
+    /// default threshold and row-group target.
+    ///
+    /// # Panics
+    /// Panics when a boundary target is classified wrongly.
+    #[test]
+    fn registrable_targets_clear_the_row_group_target_and_ceiling() {
+        assert!(!registrable_target_file_size_bytes(0));
+        assert!(!registrable_target_file_size_bytes(
+            ROW_GROUP_TARGET_DEFAULT - 1
+        ));
+        assert!(registrable_target_file_size_bytes(ROW_GROUP_TARGET_DEFAULT));
+        assert!(registrable_target_file_size_bytes(1 << 30));
+        assert!(!registrable_target_file_size_bytes(u64::MAX));
+        let registered = metadata_with(vec![(
+            FILE_TARGET_PROPERTY,
+            &ROW_GROUP_TARGET_DEFAULT.to_string(),
+        )]);
+        ForgeTablePolicy::extract(&registered, &ForgeConfig::default())
+            .expect("the smallest registrable target plans under default limits");
     }
 
     /// Every impossible geometry is refused before any planning happens.

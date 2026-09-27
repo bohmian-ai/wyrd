@@ -67,6 +67,9 @@ fn assert_registered_layout_matches(
 ///
 /// Dataset registration requires `bifrost_table:write`. A matching-fingerprint re-register returns
 /// `AlreadyExists`; a conflicting schema is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
+/// A supplied `compaction_target_file_size_bytes` must match an existing
+/// table's explicit target (`WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`);
+/// omitting it on an existing table leaves the stored target unchanged.
 ///
 /// Exactly one canonical audit row records the verdict. A created table, or a
 /// concurrent winner's matching row, commits its `Allowed` row inside
@@ -142,6 +145,14 @@ pub async fn register_table(
                     &existing.physical_layout,
                     body.physical_layout.as_ref(),
                 )?;
+                if let Some(bytes) = body.compaction_target_file_size_bytes
+                    && existing.compaction_target_file_size_bytes != Some(bytes)
+                {
+                    return Err(wyrd_spec::vala::BifrostError::CompactionTargetMismatch {
+                        table: fqn,
+                    }
+                    .into());
+                }
                 Ok(RegisterTableResponse {
                     outcome: RegisterOutcome::AlreadyExists,
                     table_uid: existing.entry.table_uid,
@@ -161,6 +172,7 @@ pub async fn register_table(
                     table,
                     user_fields,
                     body.physical_layout.clone(),
+                    body.compaction_target_file_size_bytes,
                     Some(allowed.clone()),
                 )
                 .await
@@ -386,6 +398,7 @@ mod pg_tests {
             name: name.to_owned(),
             fields,
             physical_layout: None,
+            compaction_target_file_size_bytes: None,
         }
     }
 
@@ -413,6 +426,98 @@ mod pg_tests {
             assert_eq!(second.outcome, RegisterOutcome::AlreadyExists);
             assert_eq!(first.table_uid, second.table_uid);
             assert_eq!(first.fingerprint, second.fingerprint);
+        });
+    }
+
+    /// An explicit compaction target is stored on create, described back,
+    /// accepted when repeated or omitted, and refused when it differs or is
+    /// below the row-group target — without changing the stored target.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start or any registration or describe
+    /// outcome differs from the documented contract.
+    #[test]
+    fn bifrost_tables_register_compaction_target_is_stored_and_fenced() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([
+                Permission::bifrost_table_write(),
+                Permission::bifrost_table_read(),
+            ])
+            .await;
+            let name = unique_name();
+            let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
+            let target = 256 * 1024 * 1024;
+            req.compaction_target_file_size_bytes = Some(target);
+            let created = register_table(&state, caller.clone(), req.clone())
+                .await
+                .expect("an explicit target registers");
+            assert_eq!(created.outcome, RegisterOutcome::Created);
+            let described = || async {
+                describe_table(
+                    &state,
+                    caller.clone(),
+                    "vala.datasets".to_owned(),
+                    name.clone(),
+                )
+                .await
+                .expect("registered table describes")
+                .compaction_target_file_size_bytes
+            };
+            assert_eq!(described().await, Some(target));
+
+            let repeated = register_table(&state, caller.clone(), req.clone())
+                .await
+                .expect("the same target is idempotent");
+            assert_eq!(repeated.outcome, RegisterOutcome::AlreadyExists);
+            req.compaction_target_file_size_bytes = None;
+            register_table(&state, caller.clone(), req.clone())
+                .await
+                .expect("omission on an existing table is accepted");
+            req.compaction_target_file_size_bytes = Some(target * 2);
+            let conflict = register_table(&state, caller.clone(), req)
+                .await
+                .expect_err("a different target conflicts");
+            assert_eq!(
+                conflict.code(),
+                "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH"
+            );
+            assert_eq!(
+                described().await,
+                Some(target),
+                "the stored target is unchanged"
+            );
+
+            let mut small = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
+            small.compaction_target_file_size_bytes = Some(64 * 1024 * 1024);
+            let invalid = register_table(&state, caller.clone(), small)
+                .await
+                .expect_err("a target below the row-group target is refused");
+            assert_eq!(
+                invalid.code(),
+                "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET"
+            );
+
+            let default_name = unique_name();
+            register_table(
+                &state,
+                caller.clone(),
+                register_req(&default_name, vec![field("id", DataTypeSpec::Int64)]),
+            )
+            .await
+            .expect("an omitted target registers");
+            let default = describe_table(
+                &state,
+                caller.clone(),
+                "vala.datasets".to_owned(),
+                default_name,
+            )
+            .await
+            .expect("default table describes");
+            assert_eq!(
+                default.compaction_target_file_size_bytes, None,
+                "an omitted target stores no property and follows the deployment default"
+            );
         });
     }
 

@@ -421,8 +421,6 @@ pub struct Scribe {
     lifecycle: RoleLifecycle,
     /// Shared tenant-qualified catalog retained by the selected data subsystem.
     catalog: Arc<BifrostCatalog>,
-    /// Optional domain-separated authority for private tail RPCs.
-    tail_authority: Option<Arc<crate::oracle::ScribeTailAuthority>>,
     /// Raw-ticket verifier for Scribe-targeted physical fragments.
     fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Durable security audit for rejected Scribe fragment authority.
@@ -885,7 +883,6 @@ impl Scribe {
             registered_role,
             lifecycle: RoleLifecycle::serving(),
             catalog,
-            tail_authority: None,
             fragment_verifier,
             fragment_security_audit,
             fragment_query_audit,
@@ -897,22 +894,6 @@ impl Scribe {
             snapshot_poller_abort,
             advertise_ready,
         }
-    }
-
-    /// Injects the server-owned private Scribe-tail authority.
-    #[must_use]
-    pub fn with_tail_authority(
-        mut self,
-        authority: Arc<crate::oracle::ScribeTailAuthority>,
-    ) -> Self {
-        self.tail_authority = Some(authority);
-        self
-    }
-
-    /// Returns the private tail authority used by the gRPC adapter.
-    #[must_use]
-    pub fn tail_authority(&self) -> Option<Arc<crate::oracle::ScribeTailAuthority>> {
-        self.tail_authority.clone()
     }
 
     /// Borrows the exact Scribe role fence retained by this runtime.
@@ -1031,9 +1012,6 @@ impl Scribe {
     ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
-        if let Some(authority) = &self.tail_authority {
-            authority.clear_replay_state();
-        }
         if !self.ingest.shutdown(deadline).await {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
                 detail: "Scribe shutdown did not flush every retained owner".to_owned(),

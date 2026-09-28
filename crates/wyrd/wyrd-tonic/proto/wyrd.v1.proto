@@ -91,7 +91,7 @@ enum TimeGranularity { TIME_GRANULARITY_UNSPECIFIED = 0; TIME_GRANULARITY_HOUR =
 // granularity; a noncanonical start fails conversion.
 message TimePartition { TimeGranularity granularity = 1; sint64 start_unix_micros = 2; }
 message TailStreamIdentity { string node_id = 1; uint64 writer_epoch = 2; }
-message ListActiveStreamsRequest { bytes tail_ticket = 1; TenantTableBinding binding = 2; bytes query_id = 3; }
+message ListActiveStreamsRequest { TenantTableBinding binding = 1; }
 message ActiveTailStream { TimePartition time_partition = 1; TailStreamIdentity stream = 2; }
 message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }

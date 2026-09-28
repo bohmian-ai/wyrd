@@ -759,26 +759,6 @@ impl Memtable {
             .is_some_and(|entries| entries.iter().any(ImmutableEntry::is_pending)))
     }
 
-    /// Snapshot every active seal-key currently held by the memtable whose
-    /// tenant equals `tenant`. Used by `ScribeImpl::force_seal` to drive a
-    /// per-tenant seal loop without exposing the private `MemtableBucket` type.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
-    pub fn active_seal_keys_for_tenant(
-        &self,
-        tenant: DataTenantId,
-    ) -> Result<Vec<SealKey>, ScribeError> {
-        let buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
-            detail: format!("memtable bucket lock poisoned: {e}"),
-        })?;
-        Ok(buckets
-            .keys()
-            .filter(|k| k.tenant == tenant)
-            .cloned()
-            .collect())
-    }
-
     /// Snapshot all active seal-keys held by this shard's memtable.
     ///
     /// Under batch-spread routing a shard may hold buckets for any (tenant,
@@ -797,23 +777,41 @@ impl Memtable {
         Ok(buckets.keys().cloned().collect())
     }
 
-    /// Snapshot writable and pending immutable seal keys for one tenant.
-    pub fn seal_keys_for_tenant(&self, tenant: DataTenantId) -> Result<Vec<SealKey>, ScribeError> {
-        let writable = self.active_seal_keys_for_tenant(tenant)?;
+    /// Snapshot writable and pending immutable seal keys for one tenant table.
+    ///
+    /// Only keys of `table` are collected, so a listing never copies the
+    /// tenant's other tables. The result may repeat a key held both writable
+    /// and pending; the caller deduplicates.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if either memtable lock is poisoned.
+    pub fn seal_keys_for_table(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<SealKey>, ScribeError> {
+        let matches = |key: &SealKey| key.tenant == tenant && key.table == *table;
+        let mut keys = self
+            .writable
+            .lock()
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("memtable bucket lock poisoned: {e}"),
+            })?
+            .keys()
+            .filter(|key| matches(key))
+            .cloned()
+            .collect::<Vec<_>>();
         let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
-        let mut keys = writable;
         keys.extend(
             immutable
                 .iter()
                 .filter(|(key, entries)| {
-                    key.tenant == tenant && entries.iter().any(ImmutableEntry::is_pending)
+                    matches(key) && entries.iter().any(ImmutableEntry::is_pending)
                 })
                 .map(|(key, _)| key.clone()),
         );
-        keys.sort_by_key(ToString::to_string);
-        keys.dedup();
         Ok(keys)
     }
 

@@ -387,14 +387,6 @@ pub enum BifrostSecurityViolationKind {
     /// the operation was refused before any plan decode, task-cache lookup,
     /// provider construction, or object I/O.
     PeerStageBinding,
-    /// Invalid Scribe-tail ticket audience.
-    TailAudience,
-    /// Scribe-tail tenant or table binding mismatch.
-    TailBinding,
-    /// Scribe-tail fence or writer epoch mismatch.
-    TailFence,
-    /// Replayed Scribe-tail ticket or capability.
-    TailReplay,
 }
 
 fn is_secret_like(value: &str) -> bool {

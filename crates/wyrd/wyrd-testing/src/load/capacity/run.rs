@@ -76,15 +76,6 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// How long held streams have to all open before a mixed run is refused.
 const LIVE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Idle interval before every row after the first.
-///
-/// Outlives the 30-second longest lifetime of a private Scribe tail-discovery
-/// ticket, so single-use nonces one row minted no longer occupy the pod's
-/// replay window when the next row, or the live fixture's preflight, starts.
-/// Each row therefore begins from a quiesced pod instead of inheriting the
-/// previous row's residue.
-const ROW_QUIESCE: Duration = Duration::from_secs(31);
-
 /// Largest gRPC message the seeding client sends or accepts.
 const CLIENT_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -401,8 +392,8 @@ impl QueryCapacityBenchmark {
 
     /// Runs the four [`RUN_ORDER`] combinations and writes the report.
     ///
-    /// Every row after the first starts after [`ROW_QUIESCE`]. The live
-    /// fixture is acknowledged between the no-live baselines and the first
+    /// Rows run back to back; each drains its own streams before the next. The
+    /// live fixture is acknowledged between the no-live baselines and the first
     /// mixed row, and every mixed row holds [`live_stream_target`] streams.
     ///
     /// # Errors
@@ -413,11 +404,7 @@ impl QueryCapacityBenchmark {
         write_json(&self.settings.output.join("metadata.json"), &self.metadata)?;
         let mut rows = Vec::new();
         let mut live_loaded = false;
-        for (index, (rate, live)) in RUN_ORDER.into_iter().enumerate() {
-            if index > 0 {
-                // Quiesce.
-                tokio::time::sleep(ROW_QUIESCE).await;
-            }
+        for (rate, live) in RUN_ORDER {
             let target = if live {
                 if !live_loaded {
                     self.load_live().await?;

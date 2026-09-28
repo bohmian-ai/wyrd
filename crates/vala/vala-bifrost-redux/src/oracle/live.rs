@@ -59,9 +59,9 @@ const LIVE_TAIL_UNAVAILABLE: &str = "live_tail_unavailable";
 
 /// One reported Scribe stream partition that may hold a table's live rows.
 ///
-/// Every field comes verbatim from authenticated discovery: the Scribe
+/// Every field comes from discovery on the attempt's frozen roster: the Scribe
 /// incarnation that reported the stream, the writer epoch it reported under,
-/// and the exact time partition it retains. The fragment later dispatched for
+/// that participant's endpoint, and the exact time partition it retains. The fragment later dispatched for
 /// this route is signed for exactly this incarnation and epoch, so a Scribe
 /// that restarts in between refuses it rather than answering for another cut.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,11 @@ pub(crate) struct LiveScribeRoute {
     pub(crate) node_id: NodeId,
     /// Writer epoch (the Scribe's role fence) the stream was reported under.
     pub(crate) writer_epoch: u64,
+    /// Private endpoint of the frozen roster participant that reported it.
+    ///
+    /// The fragment dials this exact endpoint, so listing and row reads name
+    /// one participant of one frozen cut.
+    pub(crate) endpoint: String,
     /// Exact time partition the stream retains.
     pub(crate) time_partition: TimePartitionWire,
 }
@@ -274,7 +279,7 @@ impl LiveScribeExec {
                 node_id: route.node_id,
                 role: ClusterRole::Scribe,
                 worker_fence: route.writer_epoch,
-                endpoint: None,
+                endpoint: Some(route.endpoint.clone()),
             },
         ))
     }
@@ -862,6 +867,7 @@ mod tests {
         let route = |start| LiveScribeRoute {
             node_id: NodeId::new(uuid::Uuid::now_v7()),
             writer_epoch: 1,
+            endpoint: "https://scribe.internal".to_owned(),
             time_partition: hour(start),
         };
         let early = route(1_787_493_600_000_000);

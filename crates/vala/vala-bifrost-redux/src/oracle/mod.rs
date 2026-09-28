@@ -2125,7 +2125,7 @@ impl Oracle {
         BifrostError,
     > {
         let deadline_ms = self.capture_query_deadline(&request)?;
-        let (roster, planned) = self
+        let (mut roster, planned) = self
             .prepare_query_attempt(&context, &request, deadline_ms)
             .await?;
         let handle = self
@@ -2140,7 +2140,7 @@ impl Oracle {
                 &context,
                 &request.sql,
                 &planned.cuts,
-                &roster,
+                &mut roster,
                 work_units,
                 Instant::now()
                     + Duration::from_millis(
@@ -2275,28 +2275,46 @@ impl Oracle {
                 .map_err(|_| BifrostError::QueryTimeout)?;
             }
         }
-        let now = chrono::Utc::now();
-        if Instant::now() >= deadline || now >= wall_deadline {
+        if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
             return Err(BifrostError::QueryTimeout);
         }
-        let observed_age = now
-            .signed_duration_since(snapshot.observed_at())
-            .to_std()
-            .unwrap_or_default();
         let attempt_id = QueryId::new(
             uuid::Uuid::parse_str(context.request_id.as_str())
                 .map_err(|_| BifrostError::QueryExecutionFailed)?,
         );
-        let roster = participant_cut::OracleQueryAttemptRoster::freeze(
-            &snapshot,
+        let roster = self.freeze_roster(&snapshot, attempt_id, wall_deadline)?;
+        Ok((roster, planned))
+    }
+
+    /// Freezes one attempt roster led by this Oracle from a membership snapshot.
+    ///
+    /// The snapshot's own age is accepted, since it is the one this node is
+    /// already routing with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::OracleRoleUnavailable`] for any freeze refusal:
+    /// stale or conflicting membership, an absent leader, or an elapsed deadline.
+    fn freeze_roster(
+        &self,
+        snapshot: &crate::cluster::ClusterSnapshot,
+        attempt_id: QueryId,
+        wall_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<participant_cut::OracleQueryAttemptRoster, BifrostError> {
+        let now = chrono::Utc::now();
+        let observed_age = now
+            .signed_duration_since(snapshot.observed_at())
+            .to_std()
+            .unwrap_or_default();
+        participant_cut::OracleQueryAttemptRoster::freeze(
+            snapshot,
             attempt_id,
             self.admission.local_role.key.node_id,
             wall_deadline,
             now,
             observed_age.saturating_add(Duration::from_secs(1)),
         )
-        .map_err(|_| BifrostError::OracleRoleUnavailable)?;
-        Ok((roster, planned))
+        .map_err(|_| BifrostError::OracleRoleUnavailable)
     }
 
     /// Runs one SQL query's single terminal attempt.
@@ -2511,7 +2529,7 @@ impl Oracle {
             request,
             tables,
             deadline,
-            roster,
+            mut roster,
             prepared,
             analytical,
             query_telemetry,
@@ -2526,7 +2544,7 @@ impl Oracle {
                 context,
                 &request.sql,
                 &planned.cuts,
-                &roster,
+                &mut roster,
                 work_units,
                 deadline,
             )
@@ -3430,7 +3448,7 @@ impl Oracle {
         context: &AuthorizedQueryContext,
         sql: &str,
         cuts: &[PinnedSealedTable],
-        roster: &participant_cut::OracleQueryAttemptRoster,
+        roster: &mut participant_cut::OracleQueryAttemptRoster,
         work_units: usize,
         deadline: Instant,
     ) -> Result<RetainedPhysicalPlan, BifrostError> {
@@ -3486,47 +3504,81 @@ impl Oracle {
 
     /// Lists every pinned table's reported Scribe streams before planning.
     ///
-    /// Discovery is authenticated and query-scoped; its routes name exact Scribe
-    /// incarnations and writer epochs and retain no rows. One stale-epoch
-    /// answer is retried once with a fresh resolver cut. A ready Scribe that is
-    /// unavailable, or still stale after the retry, is known live-source loss:
-    /// that table's live sources are omitted and the query is `Degraded`. Every
-    /// other listing failure reveals a security, tenant, binding, or state
-    /// fault and fails the query. A node without discovery or a peer
-    /// dispatcher plans no live source at all.
+    /// Discovery lists exactly the attempt's frozen Scribe roster; its routes
+    /// name exact Scribe incarnations and writer epochs and retain no rows. A
+    /// stale-epoch answer means the roster itself is stale, so the attempt
+    /// restarts once before any row: the roster is refrozen from a refreshed
+    /// membership snapshot and every table is listed again against it, never
+    /// mixing nodes from two cuts. A Scribe that is unavailable, or still stale
+    /// on the refrozen roster, is known live-source loss: that table's live
+    /// sources are omitted and the query is `Degraded`. Every other listing
+    /// failure reveals a credential, tenant, binding, or state fault and fails
+    /// the query. A node without discovery or a peer dispatcher plans no live
+    /// source at all.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryTimeout`] when the deadline has elapsed,
     /// [`BifrostError::QueryVisibilityUnavailable`] when a pinned table has no
-    /// wire binding, [`BifrostError::QueryPeerSecurity`] when listing is
-    /// refused for credential, ticket, tenant, or binding reasons, and
+    /// wire binding, [`BifrostError::OracleRoleUnavailable`] when the roster
+    /// cannot be refrozen, [`BifrostError::QueryPeerSecurity`] when listing is
+    /// refused for credential, tenant, or binding reasons, and
     /// [`BifrostError::QueryExecutionFailed`] for any other listing fault.
     async fn discover_live_routes(
         &self,
-        roster: &participant_cut::OracleQueryAttemptRoster,
+        roster: &mut participant_cut::OracleQueryAttemptRoster,
         cuts: &[PinnedSealedTable],
         deadline: Instant,
     ) -> Result<LiveDiscovery, BifrostError> {
-        let mut discovered = LiveDiscovery::default();
         let (Some(discovery), Some(_)) = (
-            self.tail_discovery.clone(),
+            self.tail_discovery.as_deref(),
             self.fragment_dispatcher.as_ref(),
         ) else {
-            return Ok(discovered);
+            return Ok(LiveDiscovery::default());
         };
-        let query_id = roster.attempt_id().as_uuid();
+        if let Some(discovered) = self
+            .list_live_routes(discovery, roster, cuts, deadline, false)
+            .await?
+        {
+            return Ok(discovered);
+        }
+        tracing::info!("Oracle restarts live discovery once on a refrozen Scribe roster");
+        *roster = self.refreeze_roster(roster).await?;
+        self.list_live_routes(discovery, roster, cuts, deadline, true)
+            .await?
+            .ok_or(BifrostError::QueryExecutionFailed)
+    }
+
+    /// Lists every pinned table once against one frozen roster.
+    ///
+    /// Returns `Ok(None)` when a Scribe answered with a stale identity and
+    /// `stale_is_loss` is false, which asks the caller to refreeze and restart;
+    /// with `stale_is_loss` a stale answer is recorded as listing loss instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stable errors as [`Self::discover_live_routes`], except
+    /// roster refreeze failure.
+    async fn list_live_routes(
+        &self,
+        discovery: &dyn tail_discovery::TailStreamDiscovery,
+        roster: &participant_cut::OracleQueryAttemptRoster,
+        cuts: &[PinnedSealedTable],
+        deadline: Instant,
+        stale_is_loss: bool,
+    ) -> Result<Option<LiveDiscovery>, BifrostError> {
+        let mut discovered = LiveDiscovery::default();
         for cut in cuts {
             let binding = tail_discovery::wire_binding(cut)?;
-            let mut listed = discovery.discover(&binding, query_id, deadline).await;
-            if matches!(listed, Err(TailReadError::StaleIdentity)) {
-                listed = discovery.discover(&binding, query_id, deadline).await;
-            }
-            let routes = match listed {
+            let routes = match discovery
+                .discover(&binding, roster.scribes(), deadline)
+                .await
+            {
                 Ok(routes) => routes,
                 Err(_) if Instant::now() >= deadline => {
                     return Err(BifrostError::QueryTimeout);
                 }
+                Err(TailReadError::StaleIdentity) if !stale_is_loss => return Ok(None),
                 Err(error @ (TailReadError::Unavailable { .. } | TailReadError::StaleIdentity)) => {
                     tracing::warn!(
                         table = %binding.table,
@@ -3554,23 +3606,58 @@ impl Oracle {
             if routes.is_empty() {
                 continue;
             }
+            let routes = routes
+                .into_iter()
+                .map(|route| {
+                    let endpoint = roster
+                        .scribes()
+                        .iter()
+                        .find(|scribe| scribe.node_id == route.stream.node_id)
+                        .map(|scribe| scribe.endpoint.clone())
+                        .ok_or(BifrostError::QueryExecutionFailed)?;
+                    Ok(live::LiveScribeRoute {
+                        node_id: route.stream.node_id,
+                        writer_epoch: route.stream.writer_epoch,
+                        endpoint,
+                        time_partition: route.time_partition,
+                    })
+                })
+                .collect::<Result<Vec<_>, BifrostError>>()?;
             discovered.tables.insert(
                 cut.binding.table_ref.fqn(),
                 live::LiveTableRoutes {
                     binding,
                     table_uid: uuid::Uuid::from_bytes(*cut.table_uid.as_bytes()),
-                    routes: routes
-                        .into_iter()
-                        .map(|route| live::LiveScribeRoute {
-                            node_id: route.stream.node_id,
-                            writer_epoch: route.stream.writer_epoch,
-                            time_partition: route.time_partition,
-                        })
-                        .collect(),
+                    routes,
                 },
             );
         }
-        Ok(discovered)
+        Ok(Some(discovered))
+    }
+
+    /// Freezes a replacement roster for the same attempt from fresh membership.
+    ///
+    /// The attempt identity, leader, and deadline are kept; only membership is
+    /// reread, so the replacement names the Scribe incarnations serving now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::OracleRoleUnavailable`] when membership cannot be
+    /// refreshed or the refreshed snapshot cannot freeze a roster for this
+    /// leader before the deadline.
+    async fn refreeze_roster(
+        &self,
+        roster: &participant_cut::OracleQueryAttemptRoster,
+    ) -> Result<participant_cut::OracleQueryAttemptRoster, BifrostError> {
+        self.cluster
+            .refresh_snapshot()
+            .await
+            .map_err(|_| BifrostError::OracleRoleUnavailable)?;
+        self.freeze_roster(
+            &self.cluster.snapshot(),
+            roster.attempt_id(),
+            roster.deadline(),
+        )
     }
 
     /// Lowers one validated statement to its optimized physical plan.

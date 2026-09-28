@@ -6800,6 +6800,7 @@ mod tests {
             routes: vec![crate::oracle::live::LiveScribeRoute {
                 node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
                 writer_epoch: 1,
+                endpoint: "https://scribe.internal".to_owned(),
                 time_partition: wyrd_spec::vala::api::TimePartitionWire::new(
                     wyrd_spec::vala::api::TimeGranularityWire::Hour,
                     chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)

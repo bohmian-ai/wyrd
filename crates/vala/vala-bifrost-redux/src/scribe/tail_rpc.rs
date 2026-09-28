@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api as tail;
 use wyrd_spec::vala::assignment_authority::ScanPredicate;
@@ -25,205 +24,6 @@ use crate::scribe::stream_identity::StreamIdentity;
 
 /// The only tail protocol revision understood by the Scribe v1 reader.
 pub const TAIL_PROTOCOL_VERSION: u16 = 1;
-
-/// Operation audience carried by a private Scribe-tail ticket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TailTicketAudience {
-    /// Metadata-only active-stream discovery.
-    List,
-}
-
-/// Transport-neutral claims signed by the server tail authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TailTicketClaims {
-    /// Query identity owning the private operation.
-    pub query_id: uuid::Uuid,
-    /// Tenant bound by the authenticated query context.
-    pub tenant_id: DataTenantId,
-    /// Canonical tenant table name.
-    pub canonical_table: String,
-    /// Exact Scribe node and writer epoch selected by discovery.
-    pub node_id: uuid::Uuid,
-    /// Current writer epoch for stale-incarnation rejection.
-    pub writer_epoch: u64,
-    /// Absolute query deadline in UTC.
-    pub deadline: chrono::DateTime<chrono::Utc>,
-    /// Narrow operation audience.
-    pub audience: TailTicketAudience,
-    /// Single-use replay identity retained through expiry.
-    pub nonce: Vec<u8>,
-}
-
-impl TailTicketClaims {
-    /// Validates the signed claims against one operation's exact request tuple.
-    ///
-    /// # Errors
-    /// Returns [`TailReadError::Authorization`] when query, tenant, table,
-    /// stream, epoch, or deadline differs from the signed request.
-    pub fn validate_binding(
-        &self,
-        query_id: uuid::Uuid,
-        tenant_id: DataTenantId,
-        canonical_table: &str,
-        node_id: uuid::Uuid,
-        writer_epoch: u64,
-        deadline: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), TailReadError> {
-        if self.query_id != query_id
-            || self.tenant_id != tenant_id
-            || self.canonical_table != canonical_table
-            || self.node_id != node_id
-            || self.writer_epoch != writer_epoch
-            || self.deadline < deadline
-        {
-            return Err(TailReadError::Authorization {
-                detail: "tail ticket binding is invalid".to_owned(),
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Exact request tuple a signed tail ticket must authorize.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TailTicketBinding {
-    /// Query identity selected by Oracle.
-    pub query_id: uuid::Uuid,
-    /// Tenant identity selected by the authenticated request.
-    pub tenant_id: DataTenantId,
-    /// Canonical table selected by the catalog cut.
-    pub canonical_table: String,
-    /// Scribe node selected by discovery.
-    pub node_id: uuid::Uuid,
-    /// Writer epoch selected by discovery.
-    pub writer_epoch: u64,
-    /// Request deadline the ticket must cover.
-    pub deadline: chrono::DateTime<chrono::Utc>,
-}
-
-/// Narrow signer for private active-stream discovery tickets.
-pub trait TailTicketMinter: Send + Sync {
-    /// Signs one operation-scoped claim set.
-    ///
-    /// # Errors
-    /// Returns a closed authority error when claims cannot be encoded or signed.
-    fn mint_tail_ticket(&self, claims: &TailTicketClaims) -> Result<Vec<u8>, TailReadError>;
-}
-
-/// Durable audit collaborator required before returning a tail authorization
-/// rejection.  The server maps these narrow reasons to its audit catalog.
-#[async_trait]
-pub trait TailSecurityAudit: Send + Sync {
-    /// Records a failure whose tenant claim is not trusted.
-    ///
-    /// # Errors
-    /// Returns [`TailReadError`] when the durable audit append is unavailable.
-    async fn append_unverified_tail_rejection(&self, reason: &str) -> Result<(), TailReadError>;
-
-    /// Records a failure after the signed tenant claim is verified.
-    ///
-    /// # Errors
-    /// Returns [`TailReadError`] when the durable audit append is unavailable.
-    async fn append_verified_tail_violation(
-        &self,
-        tenant_id: DataTenantId,
-        reason: &str,
-    ) -> Result<(), TailReadError>;
-}
-
-/// No-op audit used only by isolated transport tests.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopTailSecurityAudit;
-
-#[async_trait]
-impl TailSecurityAudit for NoopTailSecurityAudit {
-    /// Accepts the isolated unverified rejection.
-    ///
-    /// # Errors
-    /// This test-only sink never fails.
-    async fn append_unverified_tail_rejection(&self, _reason: &str) -> Result<(), TailReadError> {
-        Ok(())
-    }
-
-    /// Accepts the isolated tenant violation.
-    ///
-    /// # Errors
-    /// This test-only sink never fails.
-    async fn append_verified_tail_violation(
-        &self,
-        _tenant_id: DataTenantId,
-        _reason: &str,
-    ) -> Result<(), TailReadError> {
-        Ok(())
-    }
-}
-
-/// Narrow verifier for private active-stream discovery tickets.
-#[async_trait]
-pub trait TailTicketVerifier: Send + Sync {
-    /// Records a rejection whose signed tenant tuple is not trusted.
-    ///
-    /// # Errors
-    /// Returns [`TailReadError`] when durable audit cannot append the rejection.
-    async fn audit_unverified_rejection(&self, _reason: &str) -> Result<(), TailReadError> {
-        Ok(())
-    }
-
-    /// Records a rejection after a signed tenant tuple has been decoded.
-    ///
-    /// # Errors
-    /// Returns [`TailReadError`] when durable audit cannot append the rejection.
-    async fn audit_verified_violation(
-        &self,
-        _tenant_id: DataTenantId,
-        _reason: &str,
-    ) -> Result<(), TailReadError> {
-        Ok(())
-    }
-
-    /// Validates one decoded ticket against the exact operation tuple.
-    ///
-    /// # Errors
-    /// Returns [`TailReadError::Authorization`] for any tuple mismatch or
-    /// [`TailReadError`] when the rejection audit fails.
-    async fn verify_tail_ticket_binding(
-        &self,
-        claims: &TailTicketClaims,
-        binding: &TailTicketBinding,
-    ) -> Result<(), TailReadError> {
-        claims.validate_binding(
-            binding.query_id,
-            binding.tenant_id,
-            &binding.canonical_table,
-            binding.node_id,
-            binding.writer_epoch,
-            binding.deadline,
-        )
-    }
-
-    /// Verifies signature, key, expiry, audience, and consumes the nonce before
-    /// the caller checks operation-specific bindings.
-    async fn verify_tail_ticket_unbound(
-        &self,
-        _encoded: &[u8],
-        _audience: TailTicketAudience,
-    ) -> Result<TailTicketClaims, TailReadError> {
-        Err(TailReadError::Authorization {
-            detail: "tail authority does not expose unbound claims".to_owned(),
-        })
-    }
-
-    /// Verifies claims before Scribe state is listed or mutated.
-    ///
-    /// # Errors
-    /// Returns [`TailReadError`] for signature, audience, expiry, binding,
-    /// epoch, replay, or audit failures.
-    async fn verify_tail_ticket(
-        &self,
-        encoded: &[u8],
-        expected: &TailTicketClaims,
-    ) -> Result<(), TailReadError>;
-}
 
 /// One active partition scope returned by private Scribe discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,16 +54,12 @@ impl TonicTailReadTransport {
     pub async fn list_active_streams(
         &self,
         binding: tail::TenantTableBinding,
-        query_id: uuid::Uuid,
-        ticket: Vec<u8>,
     ) -> Result<Vec<ActiveTailStream>, TailReadError> {
         let mut client = self.client.clone();
         let response = client
             .list_active_streams(self.authenticated_request(
                 wyrd_tonic::wyrd::v1::ListActiveStreamsRequest {
-                    tail_ticket: ticket,
                     binding: Some(binding.into()),
-                    query_id: query_id.as_bytes().to_vec(),
                 },
             ))
             .await
@@ -351,7 +147,7 @@ fn tonic_error(status: &wyrd_tonic::tonic::Status) -> TailReadError {
 /// Errors local to live-tail discovery before tonic maps them to statuses.
 #[derive(Debug, thiserror::Error)]
 pub enum TailReadError {
-    /// A private ticket failed cryptographic or tuple validation.
+    /// The private caller credential or its tenant binding was refused.
     #[error("tail authorization failed: {detail}")]
     Authorization { detail: String },
     /// The query deadline elapsed before discovery completed.
@@ -777,30 +573,22 @@ impl FetchLiveTailService {
         binding: &tail::TenantTableBinding,
     ) -> Result<Vec<(tail::TimePartitionWire, tail::TailStreamIdentity)>, TailReadError> {
         let binding = binding_from_wire(binding)?;
-        let keys = self
-            .active_seal_keys_for_tenant(binding.tenant)
+        let partitions = self
+            .active_partitions_for_table(binding.tenant, &binding.table_ref)
             .map_err(|error| TailReadError::State {
                 detail: error.to_string(),
             })?;
         tracing::debug!(
             tenant = %binding.tenant,
             table = %binding.table_ref,
-            active_key_count = keys.len(),
-            active_keys = ?keys,
-            "listed active Scribe tail keys"
+            active_partition_count = partitions.len(),
+            "listed active Scribe tail partitions"
         );
         let stream = self.stream;
         let writer_epoch =
             u64::try_from(stream.writer_epoch.as_i64()).map_err(|_| TailReadError::State {
                 detail: "Scribe writer epoch is negative".to_owned(),
             })?;
-        let mut partitions = keys
-            .into_iter()
-            .filter(|key| key.table == binding.table_ref)
-            .map(|key| key.partition)
-            .collect::<Vec<_>>();
-        partitions.sort();
-        partitions.dedup();
         Ok(partitions
             .into_iter()
             .map(TimePartition::to_wire)
@@ -816,40 +604,48 @@ impl FetchLiveTailService {
             .collect())
     }
 
-    /// Lists the tenant-owned table/day scopes that still have live Scribe
-    /// state.  The list is a point-in-time discovery cut; retirement is driven
-    /// by the durable file-list commit and therefore naturally removes a key
-    /// from subsequent cuts.
+    /// Lists the partitions of one tenant table that still have live Scribe
+    /// state, sorted and deduplicated.
+    ///
+    /// Writable, pending immutable, and staged keys are all scanned for `table`
+    /// alone. The list is a point-in-time discovery cut; retirement is driven
+    /// by the durable file-list commit and therefore naturally removes a
+    /// partition from subsequent cuts.
     ///
     /// # Errors
-    /// Returns [`ScribeError`] when a shard inspection snapshot or test
-    /// memtable lock cannot be read.
-    pub fn active_seal_keys_for_tenant(
+    /// Returns [`ScribeError`] when a shard inspection snapshot, memtable lock,
+    /// or staged registry lock cannot be read.
+    pub fn active_partitions_for_table(
         &self,
         tenant: DataTenantId,
-    ) -> Result<Vec<crate::scribe::seal_key::SealKey>, ScribeError> {
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<TimePartition>, ScribeError> {
         let mut keys = if let Some(memtable) = &self.memtable {
-            memtable.seal_keys_for_tenant(tenant)?
+            memtable.seal_keys_for_table(tenant, table)?
         } else {
             self.shards
                 .as_ref()
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "tail source has no shard runtime".to_owned(),
                 })?
-                .active_seal_keys_for_tenant(tenant)?
+                .active_seal_keys_for_table(tenant, table)?
         };
         if let Some(hot_sources) = &self.hot_sources {
             keys.extend(
                 hot_sources
-                    .staged_seal_keys_for_tenant(tenant)
+                    .staged_seal_keys_for_table(tenant, table)
                     .map_err(|error| ScribeError::Internal {
                         detail: format!("discover staged live-tail keys: {error}"),
                     })?,
             );
         }
-        keys.sort_by_key(ToString::to_string);
-        keys.dedup();
-        Ok(keys)
+        let mut partitions = keys
+            .into_iter()
+            .map(|key| key.partition)
+            .collect::<Vec<_>>();
+        partitions.sort();
+        partitions.dedup();
+        Ok(partitions)
     }
 
     /// Return the canonical pod-local shard for a live-tail scope.
@@ -1027,9 +823,7 @@ impl FetchLiveTailService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{
-        FetchLiveTailService, TailReadError, TailTicketAudience, TailTicketClaims, tonic_error,
-    };
+    use super::{FetchLiveTailService, TailReadError, tonic_error};
     use crate::scribe::hot_source::HotAuthority;
     use crate::scribe::memtable::Memtable;
     use crate::scribe::staged_tail::tests::unbounded_pool;
@@ -1112,6 +906,74 @@ mod tests {
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         (FetchLiveTailService::new(stream, memtable), binding)
+    }
+
+    /// Listing collects only the named tenant table's partitions.
+    ///
+    /// The same memtable holds the listed table, another table of the same
+    /// tenant, and the same table of another tenant, each on its own day. Only
+    /// the listed table's day is returned, once, although it is held both
+    /// frozen and writable.
+    ///
+    /// # Panics
+    /// Panics when a fixture insert fails or the listing names another table's
+    /// or tenant's partition.
+    #[test]
+    fn listing_collects_only_the_named_table() {
+        use crate::catalog::TableRef;
+        use crate::scribe::seal_key::SealKey;
+
+        let tenant = DataTenantId::new_v7();
+        let listed_day = crate::test_support::day_partition(2026, 7, 14);
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let (service, binding) = selective_tail_fixture(tenant, listed_day, stream);
+        let memtable = service
+            .memtable
+            .as_ref()
+            .expect("fixture is direct-memtable");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let rows = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![9]))])
+            .expect("valid fixture batch");
+        for key in [
+            SealKey::new(
+                tenant,
+                TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "other"),
+                crate::test_support::day_partition(2026, 7, 15),
+            ),
+            SealKey::new(
+                DataTenantId::new_v7(),
+                binding.table_ref.clone(),
+                crate::test_support::day_partition(2026, 7, 16),
+            ),
+        ] {
+            let meta = crate::scribe::wal::ScribeAppendMeta {
+                batch_id: *uuid::Uuid::now_v7().as_bytes(),
+                schema_fingerprint: [0; 32],
+                data_digest: [0; 32],
+                data_len: 0,
+                payload_digest: [0; 32],
+                payload_len: 0,
+                slice_index: 0,
+                slice_count: 1,
+                rows_accepted: 1,
+                wal_lsn_min: WalLsn::new(3),
+                wal_lsn_max: WalLsn::new(3),
+                seal_key: key.to_string(),
+            };
+            memtable
+                .insert(&key, meta, rows.clone())
+                .expect("unlisted fixture batch inserts");
+        }
+
+        let partitions = service
+            .active_partitions_for_table(tenant, &binding.table_ref)
+            .expect("listing reads the memtable");
+
+        assert_eq!(partitions, vec![listed_day]);
     }
 
     /// A listing status keeps its closed class instead of one state error.
@@ -1569,33 +1431,5 @@ mod tests {
             .expect("Int64 value column")
             .value(0);
         assert_eq!(retained, 2);
-    }
-
-    /// Rejects a signed ticket tuple when the caller changes the tenant binding.
-    #[test]
-    fn ticket_binding_rejects_cross_tenant_request() {
-        let signed_tenant = DataTenantId::new_v7();
-        let requested_tenant = DataTenantId::new_v7();
-        let claims = TailTicketClaims {
-            query_id: uuid::Uuid::new_v4(),
-            tenant_id: signed_tenant,
-            canonical_table: "vala.bifrost.events".to_owned(),
-            node_id: uuid::Uuid::new_v4(),
-            writer_epoch: 7,
-            deadline: chrono::Utc::now() + chrono::Duration::seconds(5),
-            audience: TailTicketAudience::List,
-            nonce: vec![1; 16],
-        };
-        assert!(matches!(
-            claims.validate_binding(
-                claims.query_id,
-                requested_tenant,
-                &claims.canonical_table,
-                claims.node_id,
-                claims.writer_epoch,
-                claims.deadline,
-            ),
-            Err(TailReadError::Authorization { .. })
-        ));
     }
 }

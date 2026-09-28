@@ -958,11 +958,6 @@ pub async fn compose_bifrost(
         None
     };
     let scribe = if let Some(parts) = scribe {
-        let tail_audit = Arc::new(
-            crate::oracle::PostgresTailSecurityAudit::try_new(&postgres)
-                .await
-                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-        );
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres)
                 .await
@@ -975,34 +970,26 @@ pub async fn compose_bifrost(
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
-        Some(Arc::new(
-            Scribe::new(crate::state::ScribeBuildInputs {
-                ingest: parts.scribe,
-                catalog: Arc::clone(&bifrost),
-                resources: bifrost_resources.scribe().ok_or_else(|| {
-                    ServerBootError::Scribe(
-                        "selected Scribe role has no root-derived resource capability".to_owned(),
-                    )
-                })?,
-                cluster: Arc::clone(&cluster_registry),
-                registered_role: parts.scribe_role,
-                fragment_verifier: fragment_authority,
-                fragment_security_audit,
-                fragment_query_audit: query_audit.clone().ok_or_else(|| {
-                    ServerBootError::Scribe(
-                        "selected Scribe role has no tenant-tripwire audit owner".to_owned(),
-                    )
-                })?,
-                owns_fragment_query_audit: !roles.contains(&BifrostRuntimeRole::Oracle),
-                role_shutdown: shutdown.clone(),
-            })
-            .with_tail_authority(Arc::new(
-                crate::oracle::ScribeTailAuthority::from_keyring(
-                    Arc::clone(&peer_keyring),
-                    tail_audit,
-                ),
-            )),
-        ))
+        Some(Arc::new(Scribe::new(crate::state::ScribeBuildInputs {
+            ingest: parts.scribe,
+            catalog: Arc::clone(&bifrost),
+            resources: bifrost_resources.scribe().ok_or_else(|| {
+                ServerBootError::Scribe(
+                    "selected Scribe role has no root-derived resource capability".to_owned(),
+                )
+            })?,
+            cluster: Arc::clone(&cluster_registry),
+            registered_role: parts.scribe_role,
+            fragment_verifier: fragment_authority,
+            fragment_security_audit,
+            fragment_query_audit: query_audit.clone().ok_or_else(|| {
+                ServerBootError::Scribe(
+                    "selected Scribe role has no tenant-tripwire audit owner".to_owned(),
+                )
+            })?,
+            owns_fragment_query_audit: !roles.contains(&BifrostRuntimeRole::Oracle),
+            role_shutdown: shutdown.clone(),
+        })))
     } else {
         None
     };
@@ -1820,21 +1807,9 @@ impl<'a> OracleRoleBuilder<'a> {
             .ok_or_else(|| {
                 ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
             })?;
-        let tail_audit = Arc::new(
-            crate::oracle::PostgresTailSecurityAudit::try_new(&postgres)
-                .await
-                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-        );
-        let tail_authority = Arc::new(crate::oracle::ScribeTailAuthority::from_keyring(
-            Arc::clone(&peer_keyring),
-            tail_audit,
-        ));
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
-            Arc::clone(&cluster),
             Arc::clone(&peer_credentials),
             tail_tls,
-            Arc::clone(&tail_authority)
-                as Arc<dyn vala_bifrost_redux::scribe::tail_rpc::TailTicketMinter>,
         ));
         let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
             authority.clone();

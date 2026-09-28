@@ -24,9 +24,6 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
-use vala_bifrost_redux::scribe::tail_rpc::{
-    TailTicketAudience, TailTicketClaims, TailTicketMinter,
-};
 use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTailReadTransport};
 use vala_sql::TenantConn;
 use wyrd_auth_verify::TokenPrincipalRef;
@@ -35,7 +32,7 @@ use wyrd_server::AppState;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, build_peer_grpc, serve_grpc};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::TenantTableBinding;
@@ -157,50 +154,10 @@ fn tail_binding(tenant: DataTenantId) -> TenantTableBinding {
     }
 }
 
-/// Mints a List ticket for `ticket_tenant` bound to the fixture Scribe stream.
-///
-/// The ticket's tenant is independent of the binding a caller later presents,
-/// so a denial proof can present one tenant's ticket against another's table.
-fn mint_list_ticket(
-    state: &AppState,
-    query_id: uuid::Uuid,
-    ticket_tenant: DataTenantId,
-) -> Vec<u8> {
-    let ingest = state
-        .bifrost_ingest()
-        .expect("fixture retains ingest runtime");
-    let authority = ingest
-        .tail_authority()
-        .expect("fixture retains tail authority");
-    let stream = ingest.tail_service().stream();
-    authority
-        .mint_tail_ticket(&TailTicketClaims {
-            query_id,
-            tenant_id: ticket_tenant,
-            canonical_table: format!("vala.datasets.{TAIL_TABLE}"),
-            node_id: stream.node_id.as_uuid(),
-            writer_epoch: u64::try_from(stream.writer_epoch.as_i64())
-                .expect("fixture epoch is non-negative"),
-            deadline: chrono::Utc::now() + ChronoDuration::seconds(5),
-            audience: TailTicketAudience::List,
-            // The authority refuses a replayed nonce, so each fixture ticket
-            // derives its own from the query it is bound to.
-            nonce: query_id.as_bytes().to_vec(),
-        })
-        .expect("fixture tail ticket signs")
-}
-
 /// Builds one raw authenticated `ListActiveStreams` request.
-fn list_request(
-    binding: TenantTableBinding,
-    query_id: uuid::Uuid,
-    ticket: Vec<u8>,
-    bearer: &str,
-) -> Request<ListActiveStreamsRequest> {
+fn list_request(binding: TenantTableBinding, bearer: &str) -> Request<ListActiveStreamsRequest> {
     let mut request = Request::new(ListActiveStreamsRequest {
-        tail_ticket: ticket,
         binding: Some(binding.into()),
-        query_id: query_id.as_bytes().to_vec(),
     });
     request.metadata_mut().insert(
         "x-wyrd-access-token",
@@ -759,13 +716,8 @@ async fn scribe_tail_tonic_lists_seeded_partition() {
         &server.peer_bearer().await.expect("peer bearer exchanges"),
     )
     .expect("peer bearer configures remote transport");
-    let query_id = uuid::Uuid::now_v7();
     let streams = remote
-        .list_active_streams(
-            tail_binding(tenant),
-            query_id,
-            mint_list_ticket(state, query_id, tenant),
-        )
+        .list_active_streams(tail_binding(tenant))
         .await
         .expect("authorized discovery lists the seeded partition");
     assert_eq!(streams.len(), 1, "one live partition holds the seeded rows");
@@ -782,10 +734,20 @@ async fn scribe_tail_tonic_lists_seeded_partition() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Denies discovery whose signed ticket does not bind the presented request,
-/// auditing each denial under the tenant the ticket names.
+/// Listing trusts the authenticated internal peer and is scoped to one table.
+///
+/// The peer plane admits one system-owner Service principal, which may list
+/// any tenant's table: that is the accepted listing trust model, and no ticket
+/// is presented. What it lists is still exactly the named tenant table, so
+/// another tenant's live rows and another table of the same tenant never
+/// appear. A peer presenting an unverifiable bearer is refused before lookup.
+///
+/// # Panics
+/// Panics when an authorized listing fails or names another tenant's or
+/// table's partitions, or when the unverifiable bearer is not refused as
+/// `Unauthenticated`.
 #[tokio::test]
-async fn scribe_tail_cross_tenant_and_cross_query_listing_are_denied() {
+async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -795,140 +757,52 @@ async fn scribe_tail_cross_tenant_and_cross_query_listing_are_denied() {
     seed_tenant(&server, owner_tenant, "tail-owner").await;
     seed_tenant(&server, other_tenant, "tail-other").await;
     seed_tail_rows(state, owner_tenant).await;
-    seed_tail_rows(state, other_tenant).await;
 
     let (bind, shutdown, authority) = serve_peer_grpc(state).await;
-    let channel = connect_peer_channel(bind, &authority).await;
+    let mut client = ScribeTailServiceClient::new(connect_peer_channel(bind, &authority).await);
     let peer_bearer = server.peer_bearer().await.expect("peer bearer exchanges");
-    let assertion_pool = server
-        .pg_fixture()
-        .superuser_pool()
+
+    let owner = client
+        .list_active_streams(list_request(tail_binding(owner_tenant), &peer_bearer))
         .await
-        .expect("fixture exposes a migrator assertion pool");
+        .expect("the internal peer lists the owner's table")
+        .into_inner();
+    assert_eq!(
+        owner.streams.len(),
+        1,
+        "the owner's seeded partition is listed"
+    );
 
-    let (owner_seq_before, owner_count_before): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_staging \
-         WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
-    )
-    .bind(owner_tenant.as_uuid())
-    .fetch_one(&assertion_pool)
-    .await
-    .expect("owner tail-security audit baseline");
-    let (other_seq_before, other_count_before): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_staging \
-         WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
-    )
-    .bind(other_tenant.as_uuid())
-    .fetch_one(&assertion_pool)
-    .await
-    .expect("foreign tail-security audit baseline");
-    let system_seq_before: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging \
-         WHERE data_tenant_id = $1",
-    )
-    .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-    .fetch_one(&assertion_pool)
-    .await
-    .expect("system audit-chain baseline");
-
-    // On the peer plane the listener admits exactly one system-owner Service
-    // principal, so a foreign *token* never reaches the tail service at all.
-    // The reachable vectors are a legitimately signed ticket presented against
-    // a request it does not bind: another tenant's table, or another query.
-    let mut client = ScribeTailServiceClient::new(channel);
-    let cross_tenant_query = uuid::Uuid::now_v7();
-    let cross_tenant_status = client
-        .list_active_streams(list_request(
-            tail_binding(other_tenant),
-            cross_tenant_query,
-            mint_list_ticket(state, cross_tenant_query, owner_tenant),
-            &peer_bearer,
-        ))
+    let other = client
+        .list_active_streams(list_request(tail_binding(other_tenant), &peer_bearer))
         .await
-        .expect_err("an owner ticket cannot list another tenant's table");
-    assert_eq!(cross_tenant_status.code(), Code::PermissionDenied);
+        .expect("the internal peer lists another tenant's table")
+        .into_inner();
+    assert!(
+        other.streams.is_empty(),
+        "another tenant never sees the owner's rows"
+    );
 
-    let cross_query_status = client
+    let mut other_table = tail_binding(owner_tenant);
+    other_table.table = "tail_events_absent".to_owned();
+    let absent = client
+        .list_active_streams(list_request(other_table, &peer_bearer))
+        .await
+        .expect("the internal peer lists an idle table")
+        .into_inner();
+    assert!(
+        absent.streams.is_empty(),
+        "another table never sees these rows"
+    );
+
+    let refused = client
         .list_active_streams(list_request(
             tail_binding(owner_tenant),
-            uuid::Uuid::now_v7(),
-            mint_list_ticket(state, uuid::Uuid::now_v7(), owner_tenant),
-            &peer_bearer,
+            "not-a-workload-token",
         ))
         .await
-        .expect_err("a ticket for another query cannot list this one");
-    assert_eq!(cross_query_status.code(), Code::PermissionDenied);
-
-    /// One `bifrost.scribe.tail_security` audit row projected from
-    /// `vala.audit_staging`: `(data_tenant_id, principal_id, principal_kind,
-    /// permission, outcome, detail)`.
-    type SecurityAuditRow = (
-        uuid::Uuid,
-        uuid::Uuid,
-        String,
-        String,
-        String,
-        Option<String>,
-    );
-    // The violation is audited under the tenant the presented ticket names,
-    // not the transport caller: on the peer plane every caller is the same
-    // system-owner Service principal. Both denials carry owner tickets.
-    for (tenant, seq_before, count_before, expected) in [
-        (owner_tenant, owner_seq_before, owner_count_before, 2),
-        (other_tenant, other_seq_before, other_count_before, 0),
-    ] {
-        let security_rows: Vec<SecurityAuditRow> = sqlx::query_as(
-            "SELECT data_tenant_id, principal_id, principal_kind, permission, \
-                    outcome, detail::text \
-             FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security' AND seq > $2 \
-             ORDER BY seq",
-        )
-        .bind(tenant.as_uuid())
-        .bind(seq_before)
-        .fetch_all(&assertion_pool)
-        .await
-        .expect("durable tail-security audit rows");
-        assert_eq!(
-            security_rows.len() as i64,
-            expected,
-            "one committed TailBinding row per denied listing, under the ticket tenant"
-        );
-        let count_after: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_one(&assertion_pool)
-        .await
-        .expect("tail-security audit observation");
-        assert_eq!(count_after - count_before, expected);
-        for (data_tenant_id, principal_id, principal_kind, permission, outcome, detail) in
-            security_rows
-        {
-            assert_eq!(data_tenant_id, tenant.as_uuid());
-            assert_eq!(principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
-            assert_eq!(principal_kind, "service");
-            assert_eq!(permission, "bifrost:query:tail");
-            assert_eq!(outcome, "denied");
-            let detail: serde_json::Value =
-                serde_json::from_str(&detail.expect("security detail is present"))
-                    .expect("security detail is valid JSON");
-            assert_eq!(detail["kind"], "bifrost_security_violation");
-            assert_eq!(detail["violation"], "tail_binding");
-            assert_eq!(detail["phase"], "peer");
-            assert!(detail["query_digest"].is_null());
-        }
-    }
-    let system_seq_after: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging \
-         WHERE data_tenant_id = $1",
-    )
-    .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-    .fetch_one(&assertion_pool)
-    .await
-    .expect("system audit-chain observation");
-    assert_eq!(system_seq_after, system_seq_before);
+        .expect_err("an unverifiable bearer is refused");
+    assert_eq!(refused.code(), Code::Unauthenticated);
     shutdown.cancel();
 
     server.shutdown().await.expect("server shuts down");

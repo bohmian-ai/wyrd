@@ -1,7 +1,8 @@
 //! Authenticated query-scoped discovery of active Scribe live streams.
 //!
-//! Oracle lists each pinned table's reported streams before planning; the
-//! routes name exact Scribe incarnations and writer epochs and retain no rows.
+//! Oracle lists each pinned table's reported streams on its frozen Scribe
+//! roster before planning; the routes name exact Scribe incarnations and
+//! writer epochs and retain no rows.
 
 use wyrd_spec::vala::api::{TailStreamIdentity, TenantTableBinding, TimePartitionWire};
 
@@ -18,21 +19,24 @@ pub struct DiscoveredTailRoute {
 /// Query-scoped resolver for live Scribe streams.
 #[async_trait::async_trait]
 pub trait TailStreamDiscovery: Send + Sync {
-    /// Refreshes authoritative membership and lists active streams for one binding.
+    /// Lists active streams for one binding on exactly the frozen Scribes.
+    ///
+    /// `scribes` is the query attempt's frozen roster; discovery never rereads
+    /// membership, so every route names a participant of that one cut.
     ///
     /// # Errors
     /// Returns the listing's [`TailReadError`] class:
-    /// [`TailReadError::Unavailable`] only when a ready Scribe cannot be
-    /// reached or refuses as unavailable, [`TailReadError::StaleIdentity`] when
-    /// a listed stream names another incarnation or epoch,
+    /// [`TailReadError::Unavailable`] only when a Scribe cannot be reached or
+    /// refuses as unavailable, [`TailReadError::StaleIdentity`] when a listed
+    /// stream names another incarnation or epoch than the frozen participant,
     /// [`TailReadError::DeadlineElapsed`] at the deadline, and the fatal
     /// [`TailReadError::Authorization`], [`TailReadError::Binding`], or
-    /// [`TailReadError::State`] class for membership, ticket, credential,
-    /// tenant, binding, or malformed-response failures.
+    /// [`TailReadError::State`] class for credential, tenant, binding, or
+    /// malformed-response failures.
     async fn discover(
         &self,
         binding: &TenantTableBinding,
-        query_id: uuid::Uuid,
+        scribes: &[OracleQueryParticipant],
         deadline: Instant,
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError>;
 

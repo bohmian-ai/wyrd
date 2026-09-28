@@ -1,27 +1,24 @@
-//! Opt-in single-pod Bifrost query capacity benchmark.
+//! Opt-in Bifrost OLAP capacity benchmark.
 //!
-//! Measures how many fixed short reads per second one mixed Bifrost pod, a
-//! local process limited to 4 CPUs and 8 GiB by its own systemd user scope,
-//! answers through the public Rust client, alone and with live streams holding
-//! Interactive slot units, with the live fixture on its own Scribe and on a
-//! second Scribe pod; then measures the durable public write rate and reads
-//! every acknowledged batch back. It runs only through its own `mise` command,
-//! and fails when a query row misses its requirement or an acknowledged batch
-//! does not read back. The write rate has no approved target and is reported
-//! only.
+//! Seeds `vala.datasets.events` through the public write API into one local
+//! pod limited to 4 CPUs and 8 GiB by its own systemd user scope, then runs
+//! the named read cases — selective and small-aggregate concurrency sweeps,
+//! medium and table aggregates, the broad window, the full scan, reads during
+//! writes, a full Oracle queue, and a remote-live window — through the public
+//! Rust client, and reports every row as PASS, FAIL, or INVALID with its
+//! reason. `WYRD_BENCH_HEAVY_SCAN=1` runs the separate 100-million-row scan
+//! qualification instead. It runs only through its own `mise` command.
 //!
-//! [`workload`] holds the fixture and SQL, [`schedule`] the open-loop
-//! fixed-rate driver, and [`run`] the setup, warmup, measurement, and drain
-//! steps over [`crate::bifrost::process_cluster::BifrostProcessCluster`].
+//! [`workload`] holds the fixture, statements, answers, and targets,
+//! [`schedule`] the client drivers, and [`run`] the visible sequence and the
+//! report over [`crate::bifrost::process_cluster::BifrostProcessCluster`].
 
 pub mod run;
 pub mod schedule;
 pub mod workload;
 
-pub use run::{
-    BenchmarkSettings, CapacityError, CombinationReport, QueryCapacityBenchmark, ScribePlacement,
-    WriteReport,
-};
+pub use run::{BenchmarkSettings, CapacityError, QueryCapacityBenchmark, Report};
 pub use schedule::{
-    FixedRateDriver, FixedRateRun, ProbeResult, ShortQueryOutcome, ShortQuerySample,
+    ClosedLoopDriver, FixedRateDriver, FixedRateRun, ProbeResult, ShortQueryOutcome,
+    ShortQuerySample,
 };

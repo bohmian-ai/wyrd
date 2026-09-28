@@ -1,13 +1,19 @@
-//! Fixed-rate, open-loop short-query scheduling.
+//! Client query scheduling: fixed-rate open loop and fixed-concurrency closed
+//! loop, both producing the same raw samples.
 //!
-//! Requests launch on a wall-clock arrival schedule, never on the completion of
-//! earlier requests, so a slow server shows up as latency and refusals rather
-//! than as a silently lowered offered rate. In-flight client work is bounded:
-//! an arrival that finds the bound full is counted as a missed launch instead
-//! of queueing without limit.
+//! [`FixedRateDriver`] launches on a wall-clock arrival schedule, never on the
+//! completion of earlier requests, so a slow server shows up as latency and
+//! refusals rather than as a silently lowered offered rate. In-flight client
+//! work is bounded: an arrival that finds the bound full is counted as a
+//! missed launch instead of queueing without limit.
+//!
+//! [`ClosedLoopDriver`] keeps a fixed number of clients busy, each issuing its
+//! next query as soon as the previous one ends, which is how a concurrency
+//! sweep finds the rate a given client count can sustain.
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -175,14 +181,14 @@ impl FixedRateDriver {
                 (sequence, scheduled, sent, probe, terminal)
             });
             while let Some(done) = tasks.try_join_next() {
-                run.record(done, start, end);
+                run.record_joined(done, start, end);
             }
         }
         // Drain: collect what finishes in time, abort the rest.
         let drain_deadline = end + drain_timeout;
         while !tasks.is_empty() {
             match tokio::time::timeout_at(drain_deadline, tasks.join_next()).await {
-                Ok(Some(done)) => run.record(done, start, end),
+                Ok(Some(done)) => run.record_joined(done, start, end),
                 Ok(None) => break,
                 Err(_) => {
                     run.abandoned += u64::try_from(tasks.len()).unwrap_or(u64::MAX);
@@ -196,26 +202,111 @@ impl FixedRateDriver {
     }
 }
 
+/// Fixed-concurrency closed-loop scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosedLoopDriver {
+    /// Clients issuing queries back to back.
+    concurrency: usize,
+}
+
+impl ClosedLoopDriver {
+    /// Keeps `concurrency` clients, at least one, busy.
+    #[must_use]
+    pub fn new(concurrency: usize) -> Self {
+        Self {
+            concurrency: concurrency.max(1),
+        }
+    }
+
+    /// Runs until `window` has elapsed or `limit` queries have been issued.
+    ///
+    /// Each client takes the next sequence number, issues `issue(sequence)`,
+    /// waits for its terminal, and repeats; it starts nothing once the window
+    /// has closed or the limit is reached. Terminals of queries still running
+    /// when the window closes are kept but marked as drain completions. The
+    /// returned run's window is the shorter of `window` and the time until the
+    /// last terminal, so a count-limited run reports its real duration and
+    /// every one of its terminals as measured. Every sample is sent on its own
+    /// schedule, so scheduled and sent times are equal.
+    ///
+    /// # Panics
+    ///
+    /// Never deliberately; a panicking client is counted as abandoned.
+    pub async fn run<F, Fut>(&self, window: Duration, limit: u64, issue: F) -> FixedRateRun
+    where
+        F: Fn(u64) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ProbeResult> + Send + 'static,
+    {
+        let issue = Arc::new(issue);
+        let next = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        let end = start + window;
+        let mut clients = JoinSet::new();
+        for _ in 0..self.concurrency {
+            let (issue, next) = (Arc::clone(&issue), Arc::clone(&next));
+            clients.spawn(async move {
+                let mut done = Vec::new();
+                while Instant::now() < end {
+                    let sequence = next.fetch_add(1, Ordering::Relaxed);
+                    if sequence >= limit {
+                        break;
+                    }
+                    let sent = Instant::now();
+                    let probe = issue(sequence).await;
+                    done.push((sequence, sent, sent, probe, Instant::now()));
+                }
+                done
+            });
+        }
+        let mut run = FixedRateRun::default();
+        let mut last = start;
+        while let Some(joined) = clients.join_next().await {
+            let Ok(done) = joined else {
+                run.abandoned += 1;
+                continue;
+            };
+            for finished in done {
+                last = last.max(finished.4);
+                run.scheduled += 1;
+                run.sent += 1;
+                run.record(finished, start, end);
+            }
+        }
+        run.window = window.min(last - start);
+        run
+    }
+}
+
 /// Microseconds from `from` to `to`, saturating at zero and `u64::MAX`.
 fn micros(from: Instant, to: Instant) -> u64 {
     u64::try_from(to.saturating_duration_since(from).as_micros()).unwrap_or(u64::MAX)
 }
 
 impl FixedRateRun {
-    /// Converts one finished request into a sample.
+    /// Converts one joined request task into a sample.
     ///
     /// A request whose task panicked has no terminal and is counted as
     /// abandoned rather than guessed into a category.
-    fn record(
+    fn record_joined(
         &mut self,
         done: Result<(u64, Instant, Instant, ProbeResult, Instant), tokio::task::JoinError>,
         start: Instant,
         end: Instant,
     ) {
-        let Ok((sequence, scheduled, sent, probe, terminal)) = done else {
-            self.abandoned += 1;
-            return;
-        };
+        match done {
+            Ok(done) => self.record(done, start, end),
+            Err(_) => self.abandoned += 1,
+        }
+    }
+
+    /// Converts one finished request, `(sequence, scheduled, sent, probe,
+    /// terminal)`, into a sample relative to the window `start..end`.
+    fn record(
+        &mut self,
+        (sequence, scheduled, sent, probe, terminal): (u64, Instant, Instant, ProbeResult, Instant),
+        start: Instant,
+        end: Instant,
+    ) {
         self.samples.push(ShortQuerySample {
             sequence,
             scheduled_us: micros(start, scheduled),
@@ -263,7 +354,7 @@ impl FixedRateRun {
         &self,
         latency: impl Fn(&ShortQuerySample) -> Option<u64>,
     ) -> [Option<u64>; 3] {
-        let mut values: Vec<u64> = self
+        let values: Vec<u64> = self
             .samples
             .iter()
             .filter(|sample| {
@@ -271,12 +362,20 @@ impl FixedRateRun {
             })
             .filter_map(latency)
             .collect();
-        values.sort_unstable();
-        [0.50, 0.95, 0.99].map(|quantile| {
-            let rank = (quantile * values.len() as f64).ceil() as usize;
-            values.get(rank.saturating_sub(1)).copied()
-        })
+        percentiles(values)
     }
+}
+
+/// Nearest-rank p50/p95/p99 of `values`; `None` when there are none.
+///
+/// The benchmark's one percentile rule, shared by query and write latencies.
+#[must_use]
+pub fn percentiles(mut values: Vec<u64>) -> [Option<u64>; 3] {
+    values.sort_unstable();
+    [0.50, 0.95, 0.99].map(|quantile| {
+        let rank = (quantile * values.len() as f64).ceil() as usize;
+        values.get(rank.saturating_sub(1)).copied()
+    })
 }
 
 #[cfg(test)]
@@ -361,5 +460,38 @@ mod tests {
             run.success_percentiles(|sample| Some(sample.terminal_latency_us)),
             [Some(505_000); 3]
         );
+    }
+
+    /// A closed loop keeps exactly its client count busy, and a count-limited
+    /// run reports its real duration with every terminal measured.
+    ///
+    /// Four clients answering in 100 ms of paused time finish 40 queries in a
+    /// one-second window; one client limited to three queries finishes them
+    /// in 300 ms.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the counts, measured terminals, or window differ.
+    #[tokio::test(start_paused = true)]
+    async fn closed_loop_driver_bounds_clients_and_counts() {
+        let answer = |_| async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ProbeResult {
+                outcome: ShortQueryOutcome::Success,
+                first_row_at: None,
+            }
+        };
+        let windowed = ClosedLoopDriver::new(4)
+            .run(Duration::from_secs(1), u64::MAX, answer)
+            .await;
+        assert_eq!(windowed.sent, 40);
+        assert_eq!(windowed.measured(ShortQueryOutcome::Success), 40);
+        assert_eq!(windowed.window, Duration::from_secs(1));
+
+        let limited = ClosedLoopDriver::new(1)
+            .run(Duration::from_secs(3_600), 3, answer)
+            .await;
+        assert_eq!(limited.measured(ShortQueryOutcome::Success), 3);
+        assert_eq!(limited.window, Duration::from_millis(300));
     }
 }

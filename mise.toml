@@ -486,7 +486,7 @@ description = "wyrd-testing `oracle` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all"
 
 [tasks."bench:bifrost:query-capacity"]
-description = "Opt-in benchmark: local Bifrost processes in 4-CPU/8-GiB systemd user cgroups; short-query capacity with colocated and remote live Scribes, and the durable public write rate with read-back, through the public client. Fails on a missed row requirement or read-back. Linux with a delegating systemd user manager; part of no gate or verify lane."
+description = "Opt-in benchmark: local Bifrost processes in 4-CPU/8-GiB systemd user cgroups; a 10M-row public-ingest events fixture, selective and small-aggregate concurrency sweeps, medium and table aggregates, broad window, full scan, reads during writes, a full Oracle queue, and a remote-live window through the public client. WYRD_BENCH_HEAVY_SCAN=1 runs the 100M-row scan qualification instead. Fails on any row that is not PASS. Linux with a delegating systemd user manager; part of no gate or verify lane."
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo build --locked --release -p wyrd-testing --bin bifrost_peer_test_node && cargo run --locked --release -p wyrd-testing --bin bifrost_query_capacity'"
 
 [tasks."test:bifrost:journey:otlp"]

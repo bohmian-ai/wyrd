@@ -2751,6 +2751,10 @@ impl BifrostProcessCluster {
         // nothing at all, so a diagnosing run that already asked for logs
         // through `RUST_LOG` gets every child line on the parent's stderr.
         let echo = std::env::var_os("RUST_LOG").is_some();
+        // Every line is also kept whole in `stderr.log` under the child's root,
+        // so a benchmark can save the pod's complete log beside its report.
+        let mut log = std::fs::File::create(root.join("stderr.log"))
+            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         let stderr_thread = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
@@ -2758,6 +2762,7 @@ impl BifrostProcessCluster {
                 if echo {
                     eprintln!("[child {pid}] {line}");
                 }
+                let _ = writeln!(log, "{line}");
                 match drain_tail.lock() {
                     Ok(mut tail) => tail.push(line),
                     Err(poisoned) => poisoned.into_inner().push(line),

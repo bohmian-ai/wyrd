@@ -1686,6 +1686,9 @@ impl<'a> OracleRoleBuilder<'a> {
                 std::time::Duration::from_millis(config.oracle.max_queue_wait_ms),
                 |value| value.max_queue_wait,
             ),
+            default_deadline: std::time::Duration::from_millis(
+                config.oracle.default_query_deadline_ms,
+            ),
             ..OracleConfig::default()
         };
         let operator_pool = postgres.operator_pool().ok_or_else(|| {

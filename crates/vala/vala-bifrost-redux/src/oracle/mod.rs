@@ -1182,12 +1182,17 @@ pub struct OracleBuildConfig {
     pub config: OracleConfig,
 }
 
+/// Total query deadline when a caller supplies no `deadline_ms`.
+///
+/// It covers planning, queueing, and execution for both query classes.
+pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(7_200);
+
 /// Local Oracle limits and bounded lifecycle settings.
 #[derive(Debug, Clone, Copy)]
 pub struct OracleConfig {
     /// Maximum SQL bytes accepted before metadata access.
     pub max_sql_bytes: usize,
-    /// Default query deadline.
+    /// Total query deadline applied when the caller supplies none.
     pub default_deadline: Duration,
     /// Fixed pod-local per-tenant Interactive slot-unit cap.
     pub tenant_interactive_slots: u32,
@@ -1205,9 +1210,9 @@ pub struct OracleConfig {
     pub interactive_slots: u32,
     /// Maximum Analytical slot units; zero is a valid disabled class.
     pub analytical_slots: u32,
-    /// Maximum queued waiters.
+    /// Maximum queued waiters across both classes.
     pub queue_capacity: u32,
-    /// Absolute queue wait cap.
+    /// Longest queue wait for either class; the total deadline may end it sooner.
     pub max_queue_wait: Duration,
     /// Bytes one Analytical attempt may retain as spill scratch.
     pub analytical_scratch_bytes: u64,
@@ -1217,7 +1222,7 @@ impl Default for OracleConfig {
     fn default() -> Self {
         Self {
             max_sql_bytes: DEFAULT_MAX_SQL_BYTES,
-            default_deadline: Duration::from_secs(30),
+            default_deadline: DEFAULT_QUERY_DEADLINE,
             tenant_interactive_slots: 12,
             tenant_analytical_slots: 4,
             max_workers_per_query: 2,
@@ -1226,8 +1231,8 @@ impl Default for OracleConfig {
             attempt_memory_bytes: 8 * 1024 * 1024,
             interactive_slots: 8,
             analytical_slots: 4,
-            queue_capacity: 64,
-            max_queue_wait: Duration::from_millis(250),
+            queue_capacity: admission::DEFAULT_QUEUE_CAPACITY,
+            max_queue_wait: admission::DEFAULT_MAX_QUEUE_WAIT,
             analytical_scratch_bytes: 64 * 1024 * 1024,
         }
     }

@@ -11,6 +11,16 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
+/// Waiting places per Oracle node, shared by both query classes.
+///
+/// Running queries hold execution slots, not places; only waiters count here.
+pub(crate) const DEFAULT_QUEUE_CAPACITY: u32 = 1_000;
+
+/// Longest time a query of either class may wait for an execution slot.
+///
+/// A waiter also stops at its total query deadline when that comes first.
+pub(crate) const DEFAULT_MAX_QUEUE_WAIT: Duration = Duration::from_secs(3_600);
+
 /// Private pod-local admission limits computed by server boot.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OracleAdmissionConfig {
@@ -35,8 +45,8 @@ impl Default for OracleAdmissionConfig {
             analytical_slots: 4,
             tenant_interactive_slots: 12,
             tenant_analytical_slots: 4,
-            queue_capacity: 64,
-            max_queue_wait: Duration::from_millis(250),
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            max_queue_wait: DEFAULT_MAX_QUEUE_WAIT,
         }
     }
 }
@@ -733,8 +743,9 @@ impl OracleAdmission {
     /// Acquires one class/tenant/memory/spill aggregate with a fixed absolute wait deadline.
     ///
     /// # Errors
-    /// Returns admission rejection when the queue is full, closed, cancelled, or the absolute
-    /// deadline expires before a grant.
+    /// Returns admission rejection when the queue is full, closed, or cancelled,
+    /// and [`BifrostError::QueryTimeout`] when the absolute wait deadline
+    /// expires before a grant.
     #[cfg(test)]
     #[tracing::instrument(name = "bifrost.oracle.admission", skip_all)]
     pub(super) async fn admit(
@@ -842,6 +853,14 @@ impl OracleAdmission {
                     OracleAdmissionOutcome::Rejected,
                     reason,
                 );
+                if !state.closed {
+                    tracing::warn!(
+                        reason = "queue_full",
+                        queued = state.queued,
+                        capacity = state.queue_capacity,
+                        "Oracle refused a query because every waiting place is taken"
+                    );
+                }
                 return Err(BifrostError::QueryAdmissionRejected);
             }
             let class = match class_kind {
@@ -871,8 +890,9 @@ impl OracleAdmission {
     /// Waits for a grant while preserving absolute deadlines and rollback.
     ///
     /// # Errors
-    /// Returns query-admission rejection when the grant channel closes, the
-    /// deadline expires, or either cancellation token wins the race.
+    /// Returns [`BifrostError::QueryTimeout`] when the earlier of the queue
+    /// limit and the total deadline passes, and query-admission rejection when
+    /// the grant channel closes or either cancellation token wins the race.
     async fn wait_for_grant(
         &self,
         waiter: PreparedWaiter,
@@ -907,13 +927,15 @@ impl OracleAdmission {
                 }
                 grant = &mut receiver => return grant.map_err(|_| BifrostError::QueryAdmissionRejected),
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_deadline)) => {
+                    // The earlier of the queue limit and the total deadline has
+                    // passed: a timeout, not a capacity refusal to retry.
                     self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
                     OracleTelemetry::record_admission(
                         query_class,
                         OracleAdmissionOutcome::Rejected,
                         OracleAdmissionReason::QueueDeadline,
                     );
-                    return Err(BifrostError::QueryAdmissionRejected);
+                    return Err(BifrostError::QueryTimeout);
                 }
                 () = cancellation.cancelled() => {
                     self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
@@ -2209,7 +2231,7 @@ pub(in crate::oracle) mod tests {
                 cancellation: CancellationToken::new(),
             })
             .await;
-        assert!(matches!(result, Err(BifrostError::QueryAdmissionRejected)));
+        assert!(matches!(result, Err(BifrostError::QueryTimeout)));
         assert!(started.elapsed() < Duration::from_millis(250));
         drop(first);
     }
@@ -2432,7 +2454,7 @@ pub(in crate::oracle) mod tests {
                 cancellation: CancellationToken::new(),
             })
             .await;
-        assert!(matches!(timeout, Err(BifrostError::QueryAdmissionRejected)));
+        assert!(matches!(timeout, Err(BifrostError::QueryTimeout)));
         drop(held);
     }
 
@@ -3181,6 +3203,195 @@ pub(in crate::oracle) mod tests {
             .try_recv()
             .expect("the queued request is granted by the release");
         rejecting.rollback_grant(waiting_grant);
+    }
+
+    /// Places in the production queue, shared by both query classes.
+    const PRODUCTION_QUEUE_PLACES: usize = 1_000;
+
+    /// Builds one waiting request for `class` whose total deadline is `total`.
+    fn waiting_request(
+        class: QueryClass,
+        total: Duration,
+        cancellation: CancellationToken,
+    ) -> PreparedAdmission {
+        PreparedAdmission {
+            tenant: DataTenantId::new_v7(),
+            query_class: class,
+            local_ratio: 1.0,
+            deadline: Instant::now() + total,
+            cancellation,
+        }
+    }
+
+    /// Admits one-unit Interactive queries until every slot unit is held, so
+    /// every later query of either class has to wait in the queue.
+    async fn saturate(owner: &Arc<OracleAdmission>) -> Vec<AdmittedQueryGuard> {
+        let mut held = Vec::new();
+        for _ in 0..ANALYTICAL_QUERY_SLOT_UNITS {
+            held.push(
+                owner
+                    .admit(waiting_request(
+                        QueryClass::Interactive,
+                        Duration::from_secs(60),
+                        CancellationToken::new(),
+                    ))
+                    .await
+                    .expect("a holder takes one free slot unit"),
+            );
+        }
+        held
+    }
+
+    /// Admission config with two slot units that Interactive may borrow.
+    fn saturable(queue_capacity: u32, max_queue_wait: Duration) -> OracleAdmissionConfig {
+        OracleAdmissionConfig {
+            interactive_slots: 0,
+            analytical_slots: ANALYTICAL_QUERY_SLOT_UNITS,
+            tenant_interactive_slots: ANALYTICAL_QUERY_SLOT_UNITS,
+            tenant_analytical_slots: ANALYTICAL_QUERY_SLOT_UNITS,
+            queue_capacity,
+            max_queue_wait,
+        }
+    }
+
+    /// Waits for the queue to report `expected` waiters without sleeping.
+    async fn await_queued(owner: &Arc<OracleAdmission>, expected: u32) {
+        for _ in 0..10_000 {
+            if owner.shared.state.lock().expect("state").queued == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the queue never reached {expected} waiters");
+    }
+
+    /// Both query classes share one 1,000-place queue, one queue-wait limit, and
+    /// one total deadline; the earlier limit ends a wait as a query timeout,
+    /// the 1,001st waiter is the retryable queue-full overload, and a cancelled
+    /// or expired waiter frees its place.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a default, bound, timeout, or release claim fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_queries_obey_queue_and_total_deadlines_and_one_thousand_places() {
+        let defaults = OracleAdmissionConfig::default();
+        assert_eq!(defaults.queue_capacity, 1_000);
+        assert_eq!(defaults.max_queue_wait, Duration::from_secs(3_600));
+        let engine = OracleConfig::default();
+        assert_eq!(engine.queue_capacity, 1_000);
+        assert_eq!(engine.max_queue_wait, Duration::from_secs(3_600));
+        assert_eq!(engine.default_deadline, Duration::from_secs(7_200));
+
+        // A waiter under the production queue limit outlives the old 250 ms
+        // timer, then runs once capacity frees.
+        let waiting = owner(saturable(defaults.queue_capacity, defaults.max_queue_wait));
+        let held = saturate(&waiting).await;
+        let waiting_owner = Arc::clone(&waiting);
+        let mut waiter = tokio::spawn(async move {
+            waiting_owner
+                .admit(waiting_request(
+                    QueryClass::Analytical,
+                    Duration::from_secs(60),
+                    CancellationToken::new(),
+                ))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), &mut waiter)
+                .await
+                .is_err(),
+            "a saturated waiter must remain queued beyond 250 ms"
+        );
+        drop(held);
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("the waiter runs once capacity frees")
+            .release();
+
+        // The earlier limit wins for both classes, and each is a query timeout
+        // that leaves no queued place behind.
+        for class in [QueryClass::Interactive, QueryClass::Analytical] {
+            for (queue_limit, total) in [
+                (Duration::from_millis(50), Duration::from_secs(30)),
+                (Duration::from_secs(30), Duration::from_millis(50)),
+            ] {
+                let expiring = owner(saturable(4, queue_limit));
+                let held = saturate(&expiring).await;
+                let started = Instant::now();
+                let result = expiring
+                    .admit(waiting_request(class, total, CancellationToken::new()))
+                    .await;
+                assert!(
+                    matches!(result, Err(BifrostError::QueryTimeout)),
+                    "{class:?} queue {queue_limit:?} total {total:?} did not time out: {:?}",
+                    result.err()
+                );
+                assert!(started.elapsed() < Duration::from_secs(10));
+                assert_eq!(expiring.shared.state.lock().expect("state").queued, 0);
+                drop(held);
+            }
+        }
+
+        // One thousand waiters of both classes fit; the next is the retryable
+        // overload, and cancelling one waiter returns its place.
+        let full = owner(saturable(defaults.queue_capacity, defaults.max_queue_wait));
+        let held = saturate(&full).await;
+        let mut cancellations = Vec::with_capacity(PRODUCTION_QUEUE_PLACES);
+        let mut waiters = Vec::with_capacity(PRODUCTION_QUEUE_PLACES);
+        for index in 0..PRODUCTION_QUEUE_PLACES {
+            let class = if index % 2 == 0 {
+                QueryClass::Interactive
+            } else {
+                QueryClass::Analytical
+            };
+            let cancellation = CancellationToken::new();
+            cancellations.push(cancellation.clone());
+            let waiting_owner = Arc::clone(&full);
+            waiters.push(tokio::spawn(async move {
+                waiting_owner
+                    .admit(waiting_request(
+                        class,
+                        Duration::from_secs(60),
+                        cancellation,
+                    ))
+                    .await
+            }));
+        }
+        await_queued(&full, 1_000).await;
+        assert!(matches!(
+            full.admit(waiting_request(
+                QueryClass::Interactive,
+                Duration::from_secs(60),
+                CancellationToken::new(),
+            ))
+            .await,
+            Err(BifrostError::QueryAdmissionRejected)
+        ));
+        cancellations[0].cancel();
+        await_queued(&full, 999).await;
+        let replacement_owner = Arc::clone(&full);
+        let replacement = tokio::spawn(async move {
+            replacement_owner
+                .admit(waiting_request(
+                    QueryClass::Analytical,
+                    Duration::from_secs(60),
+                    CancellationToken::new(),
+                ))
+                .await
+        });
+        await_queued(&full, 1_000).await;
+
+        for cancellation in &cancellations {
+            cancellation.cancel();
+        }
+        replacement.abort();
+        drop(held);
+        for waiter in waiters {
+            let _ = waiter.await;
+        }
+        let _ = replacement.await;
     }
 
     /// Local probe release remains idempotent through its watch state.

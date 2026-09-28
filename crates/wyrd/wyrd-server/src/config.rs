@@ -484,12 +484,22 @@ impl BifrostRoles {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OracleRuntimeConfig {
-    /// Admission waiters.
+    /// Waiting places in this node's query queue, shared by both classes.
     #[serde(default = "default_oracle_admission_waiters")]
     pub admission_waiters: usize,
-    /// Maximum absolute time a query may wait in the local admission queues.
+    /// Longest time a query of either class may wait for an execution slot.
+    ///
+    /// A waiter also stops at its total query deadline when that is earlier.
+    /// `WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS` overrides it.
     #[serde(default = "default_oracle_max_queue_wait_ms")]
     pub max_queue_wait_ms: u64,
+    /// Total query deadline for both classes when a caller sends no `deadline_ms`.
+    ///
+    /// It covers planning, queueing, and execution and does not restart when a
+    /// query leaves the queue. `WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS`
+    /// overrides it.
+    #[serde(default = "default_oracle_default_query_deadline_ms")]
+    pub default_query_deadline_ms: u64,
     /// Maximum remote workers, excluding the leader.
     #[serde(default = "default_oracle_max_workers_per_query")]
     pub max_workers_per_query: usize,
@@ -506,12 +516,17 @@ pub struct OracleRuntimeConfig {
     pub allow_unapproved_profile: bool,
 }
 
+/// Default waiting places per Oracle node across both query classes.
 fn default_oracle_admission_waiters() -> usize {
-    64
+    1_000
 }
-/// Default maximum absolute Oracle admission queue wait in milliseconds.
+/// Default maximum Oracle queue wait in milliseconds: one hour.
 fn default_oracle_max_queue_wait_ms() -> u64 {
-    250
+    3_600_000
+}
+/// Default total Oracle query deadline in milliseconds: two hours.
+fn default_oracle_default_query_deadline_ms() -> u64 {
+    7_200_000
 }
 fn default_oracle_max_workers_per_query() -> usize {
     2
@@ -525,6 +540,7 @@ impl Default for OracleRuntimeConfig {
         Self {
             admission_waiters: default_oracle_admission_waiters(),
             max_queue_wait_ms: default_oracle_max_queue_wait_ms(),
+            default_query_deadline_ms: default_oracle_default_query_deadline_ms(),
             max_workers_per_query: default_oracle_max_workers_per_query(),
             max_frame_bytes: default_oracle_max_frame_bytes(),
             calibration_profile: PathBuf::new(),
@@ -2543,6 +2559,16 @@ impl WyrdServerConfig {
             "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
             self.forge.target_file_size_bytes,
         )?;
+        self.bifrost.oracle.max_queue_wait_ms = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS",
+            Some(self.bifrost.oracle.max_queue_wait_ms),
+        )?
+        .unwrap_or(self.bifrost.oracle.max_queue_wait_ms);
+        self.bifrost.oracle.default_query_deadline_ms = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS",
+            Some(self.bifrost.oracle.default_query_deadline_ms),
+        )?
+        .unwrap_or(self.bifrost.oracle.default_query_deadline_ms);
         self.bifrost.scribe.staging_target_file_size_bytes = parse_optional_env(
             "WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES",
             Some(self.bifrost.scribe.staging_target_file_size_bytes),
@@ -2842,8 +2868,12 @@ impl WyrdServerConfig {
                     message: "bifrost.oracle.max_workers_per_query must be at most 63".to_owned(),
                 });
             }
+            // Both time limits share the caller `deadline_ms` range, so every
+            // configured value is one a deadline can represent.
+            let representable_ms = 1..=u64::from(u32::MAX);
             if self.bifrost.oracle.admission_waiters == 0
-                || self.bifrost.oracle.max_queue_wait_ms == 0
+                || !representable_ms.contains(&self.bifrost.oracle.max_queue_wait_ms)
+                || !representable_ms.contains(&self.bifrost.oracle.default_query_deadline_ms)
                 || self.bifrost.oracle.max_frame_bytes == 0
             {
                 return Err(ConfigError::Invalid {
@@ -3733,6 +3763,60 @@ maintenance_interval_secs = 45
                 matches!(error, ConfigError::BadEnvVar { ref key, .. } if key == "WYRD_SCRIBE_WAL_DIR")
             );
         });
+    }
+
+    /// Proves both query classes default to a 1,000-place queue, a one-hour
+    /// queue limit, and a two-hour total deadline; that both limits have
+    /// environment overrides; and that zero or unrepresentable limits fail.
+    #[test]
+    fn oracle_queue_and_deadline_limits_default_override_and_validate() {
+        let defaults = OracleRuntimeConfig::default();
+        assert_eq!(defaults.admission_waiters, 1_000);
+        assert_eq!(defaults.max_queue_wait_ms, 3_600_000);
+        assert_eq!(defaults.default_query_deadline_ms, 7_200_000);
+
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars(
+            [
+                ("WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS", Some("1500")),
+                (
+                    "WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS",
+                    Some("2500"),
+                ),
+            ],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config.apply_env_overrides().expect("valid overrides");
+                assert_eq!(config.bifrost.oracle.max_queue_wait_ms, 1_500);
+                assert_eq!(config.bifrost.oracle.default_query_deadline_ms, 2_500);
+            },
+        );
+        temp_env::with_vars(
+            [("WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS", Some("-1"))],
+            || {
+                assert!(matches!(
+                    WyrdServerConfig::default().apply_env_overrides(),
+                    Err(ConfigError::BadEnvVar { ref key, .. })
+                        if key == "WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS"
+                ));
+            },
+        );
+
+        for (queue_ms, total_ms) in [
+            (0, 7_200_000),
+            (3_600_000, 0),
+            (u64::from(u32::MAX) + 1, 7_200_000),
+            (3_600_000, u64::from(u32::MAX) + 1),
+        ] {
+            let mut config = WyrdServerConfig::default();
+            config.bifrost.oracle.allow_unapproved_profile = true;
+            config.bifrost.oracle.max_queue_wait_ms = queue_ms;
+            config.bifrost.oracle.default_query_deadline_ms = total_ms;
+            assert!(
+                config.validate().is_err(),
+                "queue {queue_ms} ms and total {total_ms} ms must be refused"
+            );
+        }
     }
 
     /// Proves Oracle's protocol and allocation bounds fail closed.

@@ -911,9 +911,9 @@ impl OracleAdmission {
             // capacity a queued leader is waiting for can appear without any local
             // release. Re-running the scheduler on the shared resource-change epoch
             // is what turns that into a grant without a polling loop.
-            let epoch = self.shared.resources.memory_epoch();
+            let epoch = self.shared.resources.capacity_epoch();
             tokio::select! {
-                resource_change = self.shared.resources.wait_for_memory_change(epoch) => {
+                resource_change = self.shared.resources.wait_for_capacity_change(epoch) => {
                     if resource_change.is_err() {
                         self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
                         OracleTelemetry::record_admission(

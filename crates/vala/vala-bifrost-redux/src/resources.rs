@@ -1818,6 +1818,12 @@ struct ResourceState {
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
     memory_epoch: u64,
+    /// Advances only when Oracle slot units or scratch return to the ledger.
+    ///
+    /// Oracle admission refuses on slots and scratch alone, so its waiters
+    /// follow this epoch rather than `memory_epoch`, which also moves on every
+    /// query-memory grow and shrink and would wake the whole queue per batch.
+    oracle_capacity_epoch: u64,
     poisoned: bool,
 }
 
@@ -2636,27 +2642,31 @@ impl OracleResources {
         self.memory_root.limit_bytes()
     }
 
-    /// Captures the shared root capacity epoch before an admission attempt.
+    /// Captures the Oracle slot-and-scratch epoch before an admission attempt.
     #[must_use]
-    pub fn memory_epoch(&self) -> u64 {
-        self.governor.memory_epoch()
+    pub fn capacity_epoch(&self) -> u64 {
+        self.governor.oracle_capacity_epoch()
     }
 
-    /// Waits until a release, resize, or poison advances the root capacity epoch.
+    /// Waits until a slot or scratch return, or poison, advances the Oracle capacity epoch.
     ///
     /// Waiting never grants capacity. A queued Oracle leader uses this to learn
-    /// that a follower or sibling query returned slot units or memory, then
+    /// that a follower or sibling query returned slot units or scratch, then
     /// re-runs its own scheduler; it must never treat a wake as an admission.
+    /// Query-memory growth and shrink do not advance this epoch because Oracle
+    /// admission never refuses on resident query memory.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError::Poisoned`] when root accounting becomes
     /// untrustworthy before or during the wait.
-    pub async fn wait_for_memory_change(
+    pub async fn wait_for_capacity_change(
         &self,
         observed_epoch: u64,
     ) -> Result<u64, BifrostResourceError> {
-        self.governor.wait_for_memory_change(observed_epoch).await
+        self.governor
+            .wait_for_oracle_capacity_change(observed_epoch)
+            .await
     }
 
     /// Returns aggregate slot units currently held across leaders and followers.
@@ -2765,6 +2775,8 @@ struct ResourceGovernorInner {
     state: Mutex<ResourceState>,
     /// Lost-wakeup-safe notification paired with `ResourceState::memory_epoch`.
     memory_changed: Notify,
+    /// Lost-wakeup-safe notification paired with `ResourceState::oracle_capacity_epoch`.
+    oracle_capacity_changed: Notify,
     /// Cgroup hard limit used by the live external-pressure tripwire.
     cgroup_limit_bytes: Option<usize>,
     /// Live cgroup usage cached for at most one second under the root owner.
@@ -2994,6 +3006,7 @@ impl BifrostResourceGovernor {
                 oracle_class_split: OnceLock::new(),
                 state: Mutex::new(ResourceState::default()),
                 memory_changed: Notify::new(),
+                oracle_capacity_changed: Notify::new(),
                 cgroup_limit_bytes: crate::scribe::memory::read_cgroup_limit(),
                 cgroup_current: Mutex::new(None),
                 health: BifrostResourceHealth::default(),
@@ -3169,6 +3182,7 @@ impl BifrostResourceGovernor {
                 .health
                 .poison(BifrostResourcePoisonReason::Accounting);
             self.inner.memory_changed.notify_waiters();
+            self.notify_oracle_capacity();
             return Err(BifrostResourceError::Poisoned {
                 detail: "Scribe root attribution does not reconcile to live ownership".to_owned(),
             });
@@ -3316,6 +3330,46 @@ impl BifrostResourceGovernor {
             }
             notified.await;
         }
+    }
+
+    /// Returns the Oracle slot-and-scratch epoch from the authoritative lock.
+    fn oracle_capacity_epoch(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .map_or(u64::MAX, |state| state.oracle_capacity_epoch)
+    }
+
+    /// Waits for a strictly newer Oracle capacity epoch without granting capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error when the root becomes untrustworthy.
+    async fn wait_for_oracle_capacity_change(
+        &self,
+        observed_epoch: u64,
+    ) -> Result<u64, BifrostResourceError> {
+        loop {
+            let notified = self.inner.oracle_capacity_changed.notified();
+            let current_epoch = { self.lock_state()?.oracle_capacity_epoch };
+            if current_epoch > observed_epoch {
+                return Ok(current_epoch);
+            }
+            notified.await;
+        }
+    }
+
+    /// Advances the Oracle capacity epoch after slots or scratch returned.
+    ///
+    /// The caller holds the state lock and must call
+    /// [`Self::notify_oracle_capacity`] after dropping it.
+    fn advance_oracle_capacity(state: &mut ResourceState) {
+        state.oracle_capacity_epoch = state.oracle_capacity_epoch.wrapping_add(1);
+    }
+
+    /// Wakes queued Oracle admission after a capacity return or poison.
+    fn notify_oracle_capacity(&self) {
+        self.inner.oracle_capacity_changed.notify_waiters();
     }
 
     /// Validates one query request against the active Oracle class contract.
@@ -3794,6 +3848,7 @@ impl BifrostResourceGovernor {
             .health
             .poison(BifrostResourcePoisonReason::Accounting);
         self.inner.memory_changed.notify_waiters();
+        self.notify_oracle_capacity();
         BifrostResourceError::Poisoned {
             detail: detail.to_owned(),
         }
@@ -3811,6 +3866,7 @@ impl BifrostResourceGovernor {
             state.poisoned = true;
             state.memory_epoch = state.memory_epoch.wrapping_add(1);
             self.inner.memory_changed.notify_waiters();
+            self.notify_oracle_capacity();
             tracing::error!(detail, "Bifrost resource accounting poisoned");
         } else {
             tracing::error!(detail, "Bifrost resource lock poisoned");
@@ -4364,9 +4420,11 @@ impl OracleSlotCharge {
         self.governor
             .release_oracle_slots(&mut state, self.query_class, self.slot_units)?;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        BifrostResourceGovernor::advance_oracle_capacity(&mut state);
         self.released = true;
         drop(state);
         self.governor.inner.memory_changed.notify_waiters();
+        self.governor.notify_oracle_capacity();
         Ok(())
     }
 }
@@ -5132,6 +5190,7 @@ impl OracleQueryResources {
             .release_oracle_slots(&mut state, self.query_class, self.slot_units)?;
         state.oracle_query_scratch_used_bytes -= self.scratch_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        BifrostResourceGovernor::advance_oracle_capacity(&mut state);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
         record_oracle_capacity(
             &state,
@@ -5142,6 +5201,7 @@ impl OracleQueryResources {
         self.released = true;
         drop(state);
         self.governor.inner.memory_changed.notify_waiters();
+        self.governor.notify_oracle_capacity();
         Ok(())
     }
 }
@@ -7106,6 +7166,42 @@ mod tests {
         assert_eq!(pool.reserved(), 0);
         drop(query);
         assert!(!roles.snapshot().expect("snapshot").oracle_query_active);
+    }
+
+    /// Only a slot or scratch return advances the epoch Oracle admission waits on.
+    ///
+    /// A queued query can be refused only for slots or scratch, so resident
+    /// query-memory churn must leave the epoch alone: every advance wakes the
+    /// whole admission queue to re-run a grant pass that cannot succeed.
+    #[tokio::test]
+    async fn oracle_capacity_epoch_ignores_query_memory_and_advances_on_release() {
+        let roles = BifrostRuntimeResources::from_snapshot(
+            snapshot(1024 * MIB),
+            policy(&[BifrostRole::Scribe, BifrostRole::Oracle]),
+        )
+        .expect("combined plan")
+        .compose_roles()
+        .expect("combined role composition");
+        let oracle = roles.oracle().expect("Oracle capability");
+        let query = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("complete query grant");
+        let observed = oracle.capacity_epoch();
+        let reservation = MemoryConsumer::new("oracle-epoch").register(&query.memory_pool());
+        reservation.try_grow(MIB).expect("query memory growth");
+        reservation.shrink(MIB);
+        assert_eq!(
+            oracle.capacity_epoch(),
+            observed,
+            "query-memory churn is not an admission capacity change"
+        );
+        drop(reservation);
+        drop(query);
+        let advanced = oracle
+            .wait_for_capacity_change(observed)
+            .await
+            .expect("a query release advances the epoch");
+        assert!(advanced > observed);
     }
 
     /// Live detection reaches the same checked constructor as an injection.

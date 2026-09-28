@@ -10441,6 +10441,7 @@ dependencies = [
  "prost",
  "rand 0.8.7",
  "rayon",
+ "rcgen",
  "rustix",
  "secrecy",
  "serde",

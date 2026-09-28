@@ -457,12 +457,35 @@ impl AttemptPhaseTimer {
 /// Pin, listing, provider setup, planning, and admission are each the
 /// duration of that phase alone. First row and terminal are measured from the
 /// end of physical planning, where the query's stream telemetry starts, so they
-/// include audit, source binding, and execution. Only the phase is a label;
-/// the request identity stays on the enclosing trace span.
+/// include audit, source binding, and execution. Snapshot substeps and peer
+/// phases are recorded once per call inside the pin or fragment that owns
+/// them, so a query touching several tables or peers contributes several
+/// samples. Only the phase is a label; the request identity stays on the
+/// enclosing trace span.
 #[derive(Debug, Clone, Copy)]
-enum QueryPhase {
+pub(crate) enum QueryPhase {
     /// Pinning the catalog snapshot and hot-file cut.
     SnapshotPin,
+    /// Looking up one table's registered identity row in Postgres.
+    TableLookup,
+    /// Loading one table's current Iceberg metadata from the catalog.
+    MetadataLoad,
+    /// Acquiring the reader guard that protects the prepared tables.
+    ReaderGuard,
+    /// Re-reading one table's authoritative metadata after protection.
+    Revalidation,
+    /// Listing one pinned Iceberg snapshot's data files.
+    ManifestScan,
+    /// Reading one table's sealed hot-file cut from Postgres.
+    HotCut,
+    /// Establishing a new authenticated channel to one peer.
+    PeerConnect,
+    /// Opening one remote fragment until the peer accepts the stream.
+    PeerOpen,
+    /// Receiving the first frame of one opened remote fragment.
+    PeerFirstFrame,
+    /// Draining one opened remote fragment to its end.
+    PeerTerminal,
     /// Listing live Scribe streams on the frozen roster.
     ScribeListing,
     /// Registering the pinned cut's table providers.
@@ -482,6 +505,16 @@ impl QueryPhase {
     const fn as_str(self) -> &'static str {
         match self {
             Self::SnapshotPin => "snapshot_pin",
+            Self::TableLookup => "table_lookup",
+            Self::MetadataLoad => "metadata_load",
+            Self::ReaderGuard => "reader_guard",
+            Self::Revalidation => "revalidation",
+            Self::ManifestScan => "manifest_scan",
+            Self::HotCut => "hot_cut",
+            Self::PeerConnect => "peer_connect",
+            Self::PeerOpen => "peer_open",
+            Self::PeerFirstFrame => "peer_first_frame",
+            Self::PeerTerminal => "peer_terminal",
             Self::ScribeListing => "scribe_listing",
             Self::ProviderSetup => "provider_setup",
             Self::PhysicalPlanning => "physical_planning",
@@ -495,7 +528,7 @@ impl QueryPhase {
     ///
     /// Emits one histogram sample and one DEBUG event inside the current
     /// span, which carries the request identity.
-    fn record(self, started: Instant) {
+    pub(crate) fn record(self, started: Instant) {
         let elapsed = started.elapsed();
         metrics::histogram!("oracle_query_phase_seconds", "phase" => self.as_str())
             .record(elapsed.as_secs_f64());

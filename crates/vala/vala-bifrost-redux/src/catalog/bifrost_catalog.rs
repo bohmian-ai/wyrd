@@ -391,14 +391,20 @@ impl BifrostCatalog {
         #[cfg(any(test, feature = "test-support"))]
         TEST_PREPARED_IDENTITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let fqn = table.fqn();
-        let Some(row) = self.lookup_table_row(&fqn, tenant).await? else {
+        let started = std::time::Instant::now();
+        let row = self.lookup_table_row(&fqn, tenant).await;
+        crate::oracle::QueryPhase::TableLookup.record(started);
+        let Some(row) = row? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));
         };
         let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let identifier = binding.table_ident();
-        let loaded = self.catalog.load_table(&identifier).await?;
+        let started = std::time::Instant::now();
+        let loaded = self.catalog.load_table(&identifier).await;
+        crate::oracle::QueryPhase::MetadataLoad.record(started);
+        let loaded = loaded?;
         let metadata = loaded.metadata_ref();
         let snapshot = metadata.current_snapshot();
         Ok(PreparedReaderIdentity {
@@ -654,18 +660,28 @@ impl BifrostCatalog {
         ),
         BifrostCatalogError,
     > {
-        let pinned = self.pin_iceberg_snapshot(&gated, binding).await?;
-        let hot_file_catalog = HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
-        let mut conn = self.postgres.tenant_conn(tenant).await?;
-        let cut = hot_file_catalog
-            .unresolved_for_cut(
-                &mut conn,
-                &pinned.file_paths,
-                pinned.forge_publication_operation_id,
-            )
-            .await?;
-        conn.commit().await?;
-        Ok((gated, pinned, cut))
+        let started = std::time::Instant::now();
+        let pinned = self.pin_iceberg_snapshot(&gated, binding).await;
+        crate::oracle::QueryPhase::ManifestScan.record(started);
+        let pinned = pinned?;
+        let started = std::time::Instant::now();
+        let cut = async {
+            let hot_file_catalog =
+                HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
+            let mut conn = self.postgres.tenant_conn(tenant).await?;
+            let cut = hot_file_catalog
+                .unresolved_for_cut(
+                    &mut conn,
+                    &pinned.file_paths,
+                    pinned.forge_publication_operation_id,
+                )
+                .await?;
+            conn.commit().await?;
+            Ok::<_, BifrostCatalogError>(cut)
+        }
+        .await;
+        crate::oracle::QueryPhase::HotCut.record(started);
+        Ok((gated, pinned, cut?))
     }
 
     /// Collects and validates the immutable files of one current Iceberg snapshot.

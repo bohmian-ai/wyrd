@@ -2231,6 +2231,23 @@ pub struct TonicOraclePeerTransport {
     /// case reserving and releasing capacity fail closed rather than travelling
     /// unauthorized.
     reservation_minter: Option<Arc<dyn ReservationTicketMinter>>,
+    /// Established authenticated channel per peer, keyed with what it dialed.
+    ///
+    /// A channel is reused only while the candidate names the same role fence
+    /// and endpoint, so a restarted or relocated peer is dialed and
+    /// authenticated afresh instead of inheriting its predecessor's channel.
+    channels: Mutex<HashMap<NodeId, PeerChannel>>,
+}
+
+/// One established peer channel and the exact identity it was dialed for.
+#[derive(Clone)]
+struct PeerChannel {
+    /// Role fence of the peer incarnation this channel authenticated.
+    fence: FencingToken,
+    /// Endpoint the channel dialed.
+    address: String,
+    /// Multiplexed tonic channel shared by every call to that incarnation.
+    channel: Channel,
 }
 
 /// Membership source used by production and feature-gated transport fixtures.
@@ -2489,6 +2506,7 @@ impl TonicOraclePeerTransport {
             )),
             tls: None,
             reservation_minter: None,
+            channels: Mutex::default(),
         })
     }
 
@@ -2503,6 +2521,7 @@ impl TonicOraclePeerTransport {
             credentials,
             tls: None,
             reservation_minter: None,
+            channels: Mutex::default(),
         }
     }
 
@@ -2518,6 +2537,7 @@ impl TonicOraclePeerTransport {
             credentials,
             tls: Some(tls),
             reservation_minter: None,
+            channels: Mutex::default(),
         }
     }
 
@@ -2545,6 +2565,7 @@ impl TonicOraclePeerTransport {
             credentials,
             tls: Some(tls),
             reservation_minter: None,
+            channels: Mutex::default(),
         }
     }
 
@@ -2554,16 +2575,6 @@ impl TonicOraclePeerTransport {
     /// Returns stale-object when the node is absent or its current role fence
     /// differs, and terminal when a TLS transport is configured with plaintext.
     fn resolve_candidate(&self, candidate: &DispatchCandidate) -> Result<String, DispatchError> {
-        #[cfg(feature = "test-support")]
-        if let OraclePeerTopology::TestAddresses(addresses) = &self.topology {
-            let address = addresses
-                .get(&candidate.node_id)
-                .ok_or(DispatchError::StaleObject)?;
-            if self.tls.is_some() && !address.starts_with("https://") {
-                return Err(DispatchError::Terminal);
-            }
-            return Ok(address.clone());
-        }
         // Prefer the endpoint the immutable cut already authenticated. Trust
         // policy is still enforced here because it is a property of the address
         // itself and needs no membership lookup. A participant that has since
@@ -2574,6 +2585,16 @@ impl TonicOraclePeerTransport {
                 return Err(DispatchError::Terminal);
             }
             return Ok(endpoint.clone());
+        }
+        #[cfg(feature = "test-support")]
+        if let OraclePeerTopology::TestAddresses(addresses) = &self.topology {
+            let address = addresses
+                .get(&candidate.node_id)
+                .ok_or(DispatchError::StaleObject)?;
+            if self.tls.is_some() && !address.starts_with("https://") {
+                return Err(DispatchError::Terminal);
+            }
+            return Ok(address.clone());
         }
         let snapshot = self.snapshot();
         match resolve_snapshot_candidate(&snapshot, candidate, self.tls.is_some(), Utc::now()) {
@@ -2633,7 +2654,14 @@ impl TonicOraclePeerTransport {
         }
     }
 
-    /// Connects to the exact selected worker after live fence resolution.
+    /// Returns a client over the exact selected worker's authenticated channel.
+    ///
+    /// The first call for a peer incarnation connects eagerly, so an
+    /// unreachable peer still fails here as a pre-`do_get` transport failure,
+    /// and caches the channel under that peer's fence and endpoint. Later
+    /// calls for the same fence and endpoint multiplex over it; a different
+    /// fence or endpoint replaces it. Tonic re-establishes a dropped
+    /// connection on the cached channel with the same TLS identity checks.
     ///
     /// The client lifts tonic's 4 MiB default decode cap: one worker frame is
     /// one batch the authenticated worker already materialized under its own
@@ -2641,22 +2669,48 @@ impl TonicOraclePeerTransport {
     /// would refuse acknowledged data after ACK instead of bounding memory.
     ///
     /// # Errors
-    /// Returns retryable failure for absent, invalid, or unreachable endpoints.
+    /// Returns retryable failure for absent, invalid, or unreachable endpoints
+    /// and terminal failure when the channel map lock is poisoned.
     async fn client(
         &self,
         candidate: &DispatchCandidate,
     ) -> Result<OraclePeerServiceClient<Channel>, DispatchError> {
         let address = self.resolve_candidate(candidate)?;
-        let endpoint = self
-            .tls
-            .as_ref()
-            .ok_or(DispatchError::Unavailable)?
-            .endpoint(address)
-            .map_err(|_| DispatchError::Unavailable)?;
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|_| DispatchError::Unavailable)?;
+        let cached = self
+            .channels
+            .lock()
+            .map_err(|_| DispatchError::Terminal)?
+            .get(&candidate.node_id)
+            .filter(|cached| cached.fence == candidate.worker_fence && cached.address == address)
+            .map(|cached| cached.channel.clone());
+        let channel = match cached {
+            Some(channel) => channel,
+            None => {
+                let started = std::time::Instant::now();
+                let channel = self
+                    .tls
+                    .as_ref()
+                    .ok_or(DispatchError::Unavailable)?
+                    .endpoint(address.clone())
+                    .map_err(|_| DispatchError::Unavailable)?
+                    .connect()
+                    .await
+                    .map_err(|_| DispatchError::Unavailable)?;
+                super::QueryPhase::PeerConnect.record(started);
+                self.channels
+                    .lock()
+                    .map_err(|_| DispatchError::Terminal)?
+                    .insert(
+                        candidate.node_id,
+                        PeerChannel {
+                            fence: candidate.worker_fence,
+                            address,
+                            channel: channel.clone(),
+                        },
+                    );
+                channel
+            }
+        };
         Ok(OraclePeerServiceClient::new(channel).max_decoding_message_size(usize::MAX))
     }
 
@@ -2833,9 +2887,11 @@ impl TonicOraclePeerTransport {
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let mut client = self.client(candidate).await?;
         let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
+        let opened = std::time::Instant::now();
         let response = client
             .execute_fragment(self.authenticated(wire, false).await?)
             .await
+            .inspect(|_| super::QueryPhase::PeerOpen.record(opened))
             .map_err(|status| {
                 tracing::warn!(code = ?status.code(), "Oracle peer execute rejected");
                 if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
@@ -2846,7 +2902,12 @@ impl TonicOraclePeerTransport {
             })?;
         let mut stream = response.into_inner();
         let output = async_stream::stream! {
+            let streaming = std::time::Instant::now();
+            let mut first = true;
             while let Some(frame) = stream.next().await {
+                if std::mem::take(&mut first) {
+                    super::QueryPhase::PeerFirstFrame.record(streaming);
+                }
                 yield frame.map_err(|status| {
                     tracing::warn!(code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
                     stream_status_error(&status)
@@ -2855,6 +2916,7 @@ impl TonicOraclePeerTransport {
                     DispatchError::Terminal
                 }));
             }
+            super::QueryPhase::PeerTerminal.record(streaming);
         };
         Ok(Box::pin(output))
     }
@@ -5807,6 +5869,208 @@ mod tests {
                 .finish_physical("plan-fingerprint", WorkerScanStats::default())
                 .expect_err("an unstarted attempt has no footer"),
             AttemptEncodeError::Empty
+        );
+    }
+
+    /// Issues one throwaway CA and the leaf both the peer and dialer present.
+    ///
+    /// Returns the CA PEM, the leaf certificate PEM, and the leaf key PEM, with
+    /// the leaf carrying [`PEER_SERVER_NAME`] as its DNS name.
+    fn peer_pki() -> (String, String, String) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+        };
+        let ca_key = KeyPair::generate().expect("CA key generates");
+        let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params build");
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_pem = ca.self_signed(&ca_key).expect("CA self-signs").pem();
+        let issuer = Issuer::new(ca, ca_key);
+        let leaf_key = KeyPair::generate().expect("leaf key generates");
+        let mut leaf =
+            CertificateParams::new(vec![PEER_SERVER_NAME.to_owned()]).expect("leaf params build");
+        leaf.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let leaf_pem = leaf
+            .signed_by(&leaf_key, &issuer)
+            .expect("leaf is signed")
+            .pem();
+        (ca_pem, leaf_pem, leaf_key.serialize_pem())
+    }
+
+    /// DNS identity every test peer presents and every dial verifies.
+    const PEER_SERVER_NAME: &str = "peer.bifrost.test";
+
+    /// Peer service that answers only slot release, which carries no state.
+    struct ReleasingPeer;
+
+    #[async_trait]
+    impl wyrd_tonic::wyrd::v1::oracle_peer_service_server::OraclePeerService for ReleasingPeer {
+        /// Unused worker stream type.
+        type ExecuteFragmentStream = Pin<
+            Box<dyn Stream<Item = Result<wyrd_tonic::wyrd::v1::WorkerAttemptFrame, Status>> + Send>,
+        >;
+        /// Unused forwarded-query stream type.
+        type ForwardQueryStream = Pin<
+            Box<dyn Stream<Item = Result<wyrd_tonic::wyrd::v1::QueryStreamFrame, Status>> + Send>,
+        >;
+
+        /// Refuses reservation; the proof never reserves.
+        async fn reserve_slots(
+            &self,
+            _: Request<wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest>,
+        ) -> Result<
+            wyrd_tonic::tonic::Response<wyrd_tonic::wyrd::v1::ReserveNodeSlotsResponse>,
+            Status,
+        > {
+            Err(Status::unimplemented("reserve"))
+        }
+
+        /// Acknowledges every release so each call completes one real RPC.
+        async fn release_slots(
+            &self,
+            _: Request<wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest>,
+        ) -> Result<
+            wyrd_tonic::tonic::Response<wyrd_tonic::wyrd::v1::ReleaseNodeSlotsResponse>,
+            Status,
+        > {
+            Ok(wyrd_tonic::tonic::Response::new(
+                wyrd_tonic::wyrd::v1::ReleaseNodeSlotsResponse::default(),
+            ))
+        }
+
+        /// Refuses execution; the proof never opens a fragment.
+        async fn execute_fragment(
+            &self,
+            _: Request<wyrd_tonic::wyrd::v1::ExecuteFragmentRequest>,
+        ) -> Result<wyrd_tonic::tonic::Response<Self::ExecuteFragmentStream>, Status> {
+            Err(Status::unimplemented("execute"))
+        }
+
+        /// Refuses forwarding; the proof never forwards.
+        async fn forward_query(
+            &self,
+            _: Request<wyrd_tonic::wyrd::v1::ForwardQueryRequest>,
+        ) -> Result<wyrd_tonic::tonic::Response<Self::ForwardQueryStream>, Status> {
+            Err(Status::unimplemented("forward"))
+        }
+    }
+
+    /// Serves [`ReleasingPeer`] over mutual TLS and counts accepted connections.
+    ///
+    /// Returns the `https` endpoint and the accepted-connection counter.
+    async fn counting_peer(
+        ca_pem: &str,
+        leaf_pem: &str,
+        key_pem: &str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener binds");
+        let port = listener
+            .local_addr()
+            .expect("listener has an address")
+            .port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let incoming = async_stream::stream! {
+            loop {
+                let accepted = listener.accept().await.map(|(stream, _)| stream);
+                counter.fetch_add(1, Ordering::SeqCst);
+                yield accepted;
+            }
+        };
+        let mut server = wyrd_tonic::server::mutual_tls_server(
+            wyrd_tonic::server::MutualTlsServerConfig::from_pem(
+                leaf_pem.as_bytes(),
+                key_pem.as_bytes(),
+                ca_pem.as_bytes(),
+            ),
+        )
+        .expect("mutual TLS server builds");
+        tokio::spawn(
+            server
+                .add_service(
+                    wyrd_tonic::wyrd::v1::oracle_peer_service_server::OraclePeerServiceServer::new(
+                        ReleasingPeer,
+                    ),
+                )
+                .serve_with_incoming(incoming),
+        );
+        (format!("https://127.0.0.1:{port}"), accepted)
+    }
+
+    /// Repeated calls to one ready peer incarnation share one authenticated
+    /// connection, while a new fence or a new endpoint dials afresh.
+    ///
+    /// Each step completes a real mutually authenticated RPC, so a reused
+    /// channel is proven usable rather than merely cached. The TCP accept
+    /// count on each peer is the connection evidence.
+    #[tokio::test]
+    async fn peer_transport_reuses_tls_channel_for_same_ready_node() {
+        let (ca_pem, leaf_pem, key_pem) = peer_pki();
+        let (first, first_accepts) = counting_peer(&ca_pem, &leaf_pem, &key_pem).await;
+        let (second, second_accepts) = counting_peer(&ca_pem, &leaf_pem, &key_pem).await;
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let transport = TonicOraclePeerTransport::with_test_credentials_and_tls(
+            HashMap::new(),
+            Arc::new(StaticOraclePeerCredentials::new(
+                secrecy::SecretString::from("peer-bearer".to_owned()),
+            )),
+            BifrostPeerTls::new(
+                ca_pem.into_bytes(),
+                PEER_SERVER_NAME.to_owned(),
+                leaf_pem.into_bytes(),
+                secrecy::SecretString::from(key_pem),
+            ),
+        );
+        let candidate = |fence: FencingToken, endpoint: &str| DispatchCandidate {
+            node_id: node,
+            role: wyrd_spec::vala::api::ClusterRole::Oracle,
+            worker_fence: fence,
+            endpoint: Some(endpoint.to_owned()),
+        };
+        let release = |candidate: DispatchCandidate| {
+            let transport = &transport;
+            async move {
+                transport
+                    .client(&candidate)
+                    .await
+                    .expect("peer is reachable")
+                    .release_slots(wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest::default())
+                    .await
+                    .expect("authenticated release completes");
+            }
+        };
+
+        for _ in 0..3 {
+            release(candidate(1, &first)).await;
+        }
+        assert_eq!(
+            first_accepts.load(Ordering::SeqCst),
+            1,
+            "one ready incarnation shares one connection"
+        );
+
+        release(candidate(2, &first)).await;
+        assert_eq!(
+            first_accepts.load(Ordering::SeqCst),
+            2,
+            "a new fence dials a new connection"
+        );
+
+        release(candidate(2, &second)).await;
+        release(candidate(2, &second)).await;
+        assert_eq!(
+            second_accepts.load(Ordering::SeqCst),
+            1,
+            "a new endpoint dials once and reuses"
+        );
+        assert_eq!(
+            first_accepts.load(Ordering::SeqCst),
+            2,
+            "the relocated peer never reuses the old endpoint"
         );
     }
 }

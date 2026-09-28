@@ -265,15 +265,30 @@ optional.
 
 Internal Oracle and Scribe RPCs use mutually authenticated TLS. Certificate
 identity admits the peer transport; a signed peer ticket authorizes one exact
-engine operation.
+remote engine operation that can return rows or reserve resources.
+
+- Scribe live-stream listing returns partition metadata, never rows. It trusts
+  the authenticated internal peer: mTLS plus the shared Bifrost workload
+  credential admit it, with no ticket, replay record, or audit event. Any
+  holder of that credential can read listing metadata; that is the accepted
+  trust boundary. User and table authorization happen at Oracle before any
+  listing is issued.
+- Work that stays in one process — Gate to its local Oracle, and a fragment
+  the leader runs on itself — passes the already-verified context, deadline,
+  and fence directly and mints no ticket.
 
 - Peer tickets are domain-separated from user JWTs and use independently
   managed keys.
 - A ticket binds tenant, query, snapshot digest, fragment or request digest,
   retry epoch, source node, destination node, deadline, and fence.
 - The receiver verifies signature, `kid`, audience, destination, expiry,
-  replay identity, tenant, snapshot, fragment, and fence before decoding a
-  physical plan or touching storage.
+  tenant, snapshot, fragment, and fence before decoding a physical plan or
+  touching storage.
+- Read-only tickets (query forwarding and Oracle or Scribe read fragments)
+  consume no nonce: a repeated, still-valid read is bounded by expiry and
+  ordinary resource admission, not a one-use quota. Slot reservation and stage
+  assignment tickets create state, so they keep single-use replay rejection
+  over an expiry-pruned record with no fixed capacity.
 - Rotation follows publish-before-use and bounded-overlap semantics. A ticket
   never remains valid beyond its query deadline, so retired verification keys
   need only cover the maximum ticket lifetime and clock skew.

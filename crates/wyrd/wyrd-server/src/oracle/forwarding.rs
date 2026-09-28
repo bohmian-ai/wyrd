@@ -341,7 +341,7 @@ impl ReadyOracleForwarder {
     /// Signs a shortened ingress budget and exercises ordinary ticket acceptance.
     ///
     /// Test-only callers supply an already authorized context; verification,
-    /// replay protection, fencing and Oracle preparation remain production code.
+    /// fencing and Oracle preparation remain production code.
     ///
     /// # Errors
     /// Returns role, signing, validation or query errors from normal acceptance.

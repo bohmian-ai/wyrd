@@ -1167,8 +1167,10 @@ impl OraclePeerWorker {
 
     /// Verifies and executes one ticket-bound fragment.
     ///
-    /// Signature, configured key ID, audience, worker fence, and replay are
-    /// validated over raw claims bytes before claims or fragment decoding.
+    /// A remote fragment's signature, configured key ID, audience, and worker
+    /// fence are validated over raw claims bytes before claims or fragment
+    /// decoding; no nonce is consumed because the fragment only reads. An
+    /// in-process fragment uses the leader's verified claims directly.
     /// Reservation ownership is then converted before fragment decoding and IO.
     ///
     /// # Errors

@@ -116,8 +116,11 @@ object publication, Iceberg promotion, or compaction.
 
 Every query pins one published cut: an Iceberg snapshot and committed Scribe
 hot objects not represented by that snapshot. Oracle also discovers active
-streams on ready Scribes and sends live work only to owners of relevant table
-partitions. Scribe scans its own memtable or staged authority and streams
+streams by listing, concurrently and under the query deadline, the Scribes in
+the attempt's frozen roster, and sends live work only to owners of relevant
+table partitions at the same frozen endpoint and fence. A listing that reveals
+a newer writer epoch restarts the whole attempt once on a refrozen roster;
+nodes from different cuts are never mixed. Scribe scans its own memtable or staged authority and streams
 bounded Arrow results to Oracle, producing each batch only when Oracle pulls
 it. The scan's memtable references, staged-run leases, and follower admission
 belong to that stream and are released when it completes, is cancelled, or is

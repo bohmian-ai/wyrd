@@ -165,3 +165,89 @@ Preserve the completed Scenario 1–6 tests and committed benchmark-driver tests
 ## Authority
 
 [Approved spec](../../spec.md), [original task](../../tasks/TASK-001-unified-scribe-live-query.md), [validated findings](findings-validation.md), repository AGENTS.md, architecture/agent-rules.md, architecture/wyrd-design.md, architecture/wyrd-doctrine.mdx, architecture/bifrost-design.md, and the user's subsequent explicit decisions in this conversation.
+
+
+## Implementation evidence
+
+Candidate: branch `vcc/task-005`, commits `46b4c43f8`..`887b978b1`. Postgres-backed commands ran inside `scripts/postgres/with-test-postgres.sh` through their owning `mise` tasks. Lanes ran one at a time.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Every ingest route obeys one wire ceiling and a derived 4× expanded ceiling before WAL/ACK; no 131,072-row or OTLP count caps; typed 413 | `621f37b74`, `a5904c14e` (gRPC typed 413, peer decode cap lift, one `scribe.ingest_request_bytes`) | lib: `native_preflight_refuses_output_above_expanded_ceiling`, `canonical_plan_bounds_output_bytes_not_rows`, `otlp_projectors_refuse_running_output_above_limit`, `protobuf_preflight_refuses_typed_backing_above_expanded_ceiling`, `protobuf_preflight_refuses_projected_fan_out_above_expanded_ceiling`, `json_preflight_refuses_typed_backing_above_expanded_ceiling`, `json_preflight_refuses_projected_fan_out_above_expanded_ceiling`; journeys `scribe::ingest_bounds::native_ingest_bounds_expanded_bytes_not_rows`, `otlp::negative::projected_fan_out_above_expanded_ceiling_is_refused_before_ack` (`mise run test:bifrost:journey:scribe`, `…:otlp`) | PASS |
+| 256 physical leaves (incl. managed) accepted at registration, 257 refused before ACK; default-wire wide table and 48-MiB-wire 40-MiB row stage, publish, read back | `9c1b592bd`, `a5904c14e` | lib `registration_admits_256_physical_leaves_including_managed_columns`; journeys `scribe::ingest_bounds::widest_registrable_table_stages_publishes_and_reads_back`, `scribe::ingest_bounds::forty_mib_row_stages_publishes_and_reads_back_at_48_mib_wire` | PASS |
+| Soft 128 MiB row-group target; Scribe ~512 MiB and Forge ~1 GiB whole-file defaults with env overrides; one resolved Forge policy target | `afedfd3e4`, `bcf8511da`, `0c7d31c18` | lib `row_group_target_is_soft_for_an_oversized_row`, `a_batch_encoding_past_the_object_target_is_one_deterministic_artifact`, `file_target_environment_overrides_win_and_refuse_nonpositive_values`, `bifrost_footer_fingerprint_does_not_alias_utc_spellings`, `missing_or_duplicated_footer_identity_is_refused`; journey `scribe::cross_shard::scribe_cross_shard_generations_publish_packed_objects_once` | PASS |
+| Optional per-table compaction target through Rust, Python, TypeScript registration; idempotent, omitted-on-existing, conflicting refused | `27823640f`, `bc5a9940e`, `fef75836d` | lib `registrable_targets_clear_the_row_group_target_and_ceiling`, `bifrost_tables_register_compaction_target_is_stored_and_fenced`; journey `forge::live_rewrite::compaction_target_registers_describes_and_steers_forge_rewrites`; Python and TypeScript registration journeys in `verify:bifrost` | PASS |
+| Async staged reads: projection/order, zero-match, no empty batch, drop releases grant, runtime not starved | `d0071a287` | lib `a_staged_read_projects_exactly_the_requested_columns_in_caller_order`, `a_staged_read_filters_and_skips_batches_retaining_no_row`, `a_dropped_staged_read_releases_its_grant`, `a_zero_match_staged_read_returns_nothing_and_does_not_starve_the_runtime`, `a_missing_required_column_refuses_and_names_the_run`, `a_corrupt_staged_run_fails_the_read`; early-LIMIT/long-fragment/retirement journeys in `test:bifrost:journey:oracle`/`…:scribe` | PASS |
+| Encoded fetch over grant refused before fetch; compressible >256 MiB group readable in charged batches (staged and published); decoded batch over grant fails; accounted refusal Fails only its query | `d0071a287`, `247506454`, `7cd4a9087` (`drain_children` before admission release) | lib `a_staged_row_group_fetch_above_the_grant_is_refused_before_fetch`, `a_compressible_group_above_the_grant_reads_in_charged_batches`, `a_decoded_staged_batch_above_the_grant_fails_the_read`, `compressible_requests_in_one_group_above_256_mib_read_under_a_small_grant`, `hot_parquet_compressible_group_above_256_mib_streams_under_a_small_pool`; journey `oracle::capacity::memory_refusal_preserves_oracle_health_and_next_query` (live source, terminal Failed) | PASS |
+| Post-ACK IO retry cannot strand ACKed rows; no deterministic post-ACK size refusal remains | `afedfd3e4` (policy refusals deleted), existing WAL/recovery paths | Scribe and Forge recovery journeys in `test:bifrost:journey:scribe`/`…:forge` | PASS |
+| Static source rules (FIND-TASK-001-5/-6/-8) | `46b4c43f8` | `mise run fmt`, `mise run lints` | PASS |
+| Forge namespace checks keep every `BifrostNamespace` | `240e2fbbf` (unshipped migration edited in place) | TypeScript journey lane, zero constraint errors | PASS |
+| Opt-in 4-CPU/8-GiB local benchmark through the public client, four rows, reports rate/latency/refusal/resource evidence without changing admission defaults | `f8725c634` (systemd user scope around the local child, own-cgroup read, slot-count check, four-row order, 15/60 s), `5c2ef091e` (process-cluster Local storage through the cursor-capable fixture handle, `vala.datasets` fixture, 31 s row quiesce, driver tracing), `0c6f84c7f` (reports) | focused: `benchmark_launch_refuses_mismatched_or_absent_limits`, `query_capacity_runs_baselines_before_four_row_live_order`, `cgroup_evidence_parses_flat_and_single_value_files`, `fixed_rate_driver_is_open_loop_bounded_and_window_exact`, `query_capacity_fixture_is_exact`; smoke and full `mise run bench:bifrost:query-capacity` (reports under `benchmark/`) | MEASURED — offered rates not sustained; see below |
+| `architecture/bifrost-design.md` states the new size rules | `d0ceff5b5` | `mise run docs:check` in gate | PASS |
+| Broad verification | — | `mise run verify:bifrost`: 9/9 lanes and 9/9 journey capabilities passed (second run, traced; the first run exposed the Scribe body-limit test fix and the capacity flake noted below); `mise run gate`: exit 0 | PASS |
+
+Exact focused commands (all green on the final candidate):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=bifrost::process_cluster::tests::benchmark_launch_refuses_mismatched_or_absent_limits) | test(=load::capacity::run::tests::query_capacity_runs_baselines_before_four_row_live_order) | test(=load::capacity::run::tests::cgroup_evidence_parses_flat_and_single_value_files) | test(=load::capacity::schedule::tests::fixed_rate_driver_is_open_loop_bounded_and_window_exact) | test(=load::capacity::workload::tests::query_capacity_fixture_is_exact)'
+WYRD_BENCH_WARMUP_SECONDS=2 WYRD_BENCH_MEASURE_SECONDS=5 WYRD_BENCH_OUTPUT_DIR=$PWD/target/bifrost-query-capacity-smoke mise run bench:bifrost:query-capacity
+RUST_LOG=warn mise run bench:bifrost:query-capacity
+```
+
+RED for the corrected Scenario 7 selectors was a compile failure against `240e2fbbf`: `benchmark_scope`, `RUN_ORDER`, and `live_stream_target` did not exist, and the launcher was the Docker `BenchmarkContainer`.
+
+### Scenario 7 benchmark result
+
+Pod: local `bifrost_peer_test_node` child, target `All`, in its own systemd user scope. Its cgroup is `…/app.slice/wyrd-bench-pod-0-<uuid>.scope` with `cpu.max 400000 100000`, `memory.max 8589934592`, and `MemorySwapMax=0`. The injected plan is 4 CPU and 8 GiB; the installed and reported Oracle slot count is 8, with an Interactive floor of 1. The driver, the process-cluster parent, and PostgreSQL ran on the same 32-CPU/92-GiB host, outside that cgroup. Data: 1,048,576 published rows in 8 files and 8 row groups (5,060,096 bytes), plus 32,768 live rows acknowledged after the baselines. Mixed rows held `max(1, floor(8/2)) = 4` streams.
+
+Full run (15 s warmup, 60 s measurement):
+
+| Offered | Held/target | Success/s | p95 / p99 terminal ms | Success | Refused | Transport | Missed | Pod CPU s / 60 s | Peak memory | Boundary |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 500 | 0/0 | 8.5 | 59.1 / 62.9 | 512 | 2,026 | 27,461 | 0 | 18.2 | 462 MiB | query transport |
+| 1,000 | 0/0 | 6.5 | 76.8 / 79.1 | 388 | 3,592 | 54,806 | 242 | 32.0 | 970 MiB | query transport |
+| 500 | 0/4 | 8.1 | 112.5 / 115.9 | 488 | 2,981 | 26,527 | 0 | 35.5 | 1,019 MiB | query transport (invalid mixed row) |
+| 1,000 | 0/4 | 7.8 | 116.8 / 123.3 | 471 | 3,601 | 54,908 | 0 | 34.9 | 1,039 MiB | query transport (invalid mixed row) |
+
+- **Result:** neither 500 nor 1,000 short reads/second is sustained. The pod completes about 8 successful reads/second regardless of the offered rate.
+- **Not the limit:**
+  - CPU: 0.3–0.6 of 4 CPUs used, with no throttling.
+  - Memory: peak about 1 GiB of 8 GiB, with no OOM events.
+  - PostgreSQL: `SELECT 1` stayed at 0.6–1.2 ms.
+  - Driver: largest lag 17 ms.
+- **Mixed rows:** both are invalid workload conditions. Held streams were admitted as Interactive, then failed before their 5-second hold. The report records this rather than claiming a mixed-load number.
+- **Raw samples:** they match the report's success counts (512, 388, 488, 471). The 2/5-second smoke shows the same pattern.
+
+Diagnosis (driver `RUST_LOG=debug` in the smoke run):
+- Client errors: 19,224 `query peer security validation failed` and 2,737 `query admission rejected`.
+- Server errors: 472 `tail ticket replay detected`.
+- Nonces are fresh UUIDs, so these are not real replays. Each short query on a live-capable table consumes single-use signed tickets. Their bounded replay caches then fill:
+  - Tail discovery: `MAX_REPLAY_NONCES = 256`, tickets live up to 30 s (`wyrd-server/src/oracle/tail_authority.rs`).
+  - Peer tickets: `DEFAULT_REPLAY_CAPACITY = 1_024`, 30 s TTL (`wyrd-server/src/oracle/peer_authority.rs`).
+- 256 per 30 s is 8.53/s, which matches the measured 8.5/s ceiling.
+- `ScribeTailAuthority` reports a full cache as `replay detected` and audits it as a `replay` violation. A caller cannot tell a full cache from a real replay.
+- The peer-cache share of the failures is inferred from code; the server does not log each peer `ReplayCapacity` rejection.
+
+Changing either cache bound, or how a full cache is classified, alters tenant and signed-assignment security. That is a material stop condition for this task, so neither was changed. The measured ceiling needs a separate security decision.
+
+### Deviations from the task text
+
+- `systemd-run --scope` rejects `--pipe` ("--pty/--pipe is not compatible in timer or --scope mode"). Scope mode execs the child in place, so it keeps the same PID, stdio control pipes, environment, and working directory without it. `--collect` removes the unit when the child is reaped.
+- The fixture table is `vala.datasets.query_capacity`, not `vala.bifrost.query_capacity`. Public registration refuses every other namespace with `only vala.datasets registrations are caller-owned`, and the task forbids a benchmark-only server path.
+- A 31 s quiesce step precedes each row after the first. Without it, one row's unexpired single-use nonces would fill the next row's replay window, including the live preflight, and the rows would not be independent.
+- `pg_scribe_body_limit_is_route_and_role_local` (`887b978b1`) sized its server from the removed 200 MiB body-limit fallback, so its Scribe server refused to start (`replay envelope requires 2554331136 bytes but the detected root provides 2415919104`). It now uses a 32 MiB route limit and a 16.5 MiB above-default body. It asserts the same route- and role-local property.
+- Process-cluster children opened Local storage without the cursor-listing capability that `WyrdTestServer` declares for Local fixtures, so any child running a Forge worker refused to boot. `crate::server::fixture_storage_handle` is now the one shared opener for both.
+
+Non-goals kept out of scope:
+- No second admission mechanism, `oracle_query_slot_limit`, or tuned production limit.
+- No benchmark-only server query path, container runtime, or new CI threshold in `benches/thresholds.toml`.
+- No change to ACK order, leader deadline, or the public query contract.
+
+Known verification limits:
+- The real-server Drift Failed-to-no-verdict journey and staged corruption/schema journeys are still gaps.
+- The peer-cache attribution above is inferred from code.
+- One `verify:bifrost` run failed `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`: Oracle spill directories stayed at 4 against a baseline of 3 after the 5 s clean-node bound. All other ownership counters were zero.
+  - The directory is a query-owned DataFusion `DiskManager` tempdir, so one query `RuntimeEnv` outlived the bound.
+  - The journey passed on its own, in the full `test:bifrost:journey:oracle` lane (33/33, traced), and in a second traced `verify:bifrost` run.
+  - The likely holder is upstream's follower coordinator-channel task. It keeps `TaskData` until coordinator→worker EOS.
+  - This is not proven, and the flake is not fixed.

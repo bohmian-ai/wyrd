@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 3
+revision: 5
 status: approved
 ---
 
@@ -129,6 +129,72 @@ Rust, Python, TypeScript, HTTP, CLI, MCP, generated schemas, and user docs
 expose one request and terminal contract. Existing tests that select Fused or
 PublishedOnly are updated to exercise the one query behavior.
 
+### REQ-008 — Measured read capacity on one modest node
+
+The one query service must be measured and improved through the public client
+on one locally launched Bifrost node limited by Linux to 4 CPUs and 8 GiB,
+using local NVMe. PostgreSQL and the load driver run outside that limit;
+Docker is used only by the repository-managed PostgreSQL setup. The benchmark
+must distinguish a published-only read from a read with selected live Scribe
+data, including a Scribe on another pod, and must actually hold the stated
+number of live readers throughout a mixed window. It must include concurrent
+acknowledged writes rather than measuring writes only after reads stop.
+
+At minimum, report separate, correctly validated workloads for a trivial
+lookup, a selective point read, a small filtered aggregate, medium analytical
+reads, a large time-window aggregate, a full scan over about 100 million rows,
+and a representative analytical mix. Sweep client concurrency through 1, 4,
+8, 16, 32, 64, and 100, recording sustained successful queries per second,
+client-to-client p50/p95/p99 latency, physical bytes scanned, rows examined
+when the workload makes them knowable, acknowledged write rate, CPU, memory,
+refusals by owning boundary, and the point where latency rises without useful
+throughput gain. Preserve raw samples, server telemetry, process logs, and
+fixture geometry with a short report a human can audit. An invalid workload
+must be reported as invalid rather than assigned a throughput result.
+
+The engineering targets on this envelope are more than 1,000 sustained
+selective reads/second with p95 at most 25 ms; at least 100 small filtered
+aggregates/second with p95 at most 100 ms; medium analytical queries at p95 at
+most 200 ms, including about 10 million examined rows at p95 at most 300 ms;
+a large time-window aggregate at p95 at most 500 ms; and a roughly
+100-million-row full scan under 2 seconds. The representative mixed workload
+must sustain at least 100 analytical queries/second while at least 100,000
+rows/second are durably acknowledged, with client p50 below 50 ms, p95 at most
+200 ms, p99 at most 500 ms, at least 500 MB/second physical scan throughput
+when a scan workload is running, and peak node memory below 7 GiB without an
+OOM event. A 5,000/second selective read rate and the higher class-specific
+targets supplied by the user are stretch goals, reported separately rather
+than treated as proven. CPU utilization is reported; 70–90% at saturation is
+diagnostic, not a minimum utilization requirement.
+
+The existing two-permit snapshot step must not reject ordinary queries before
+Oracle's bounded query admission when the query still has time to wait.
+Query deadlines and bounded waiting remain authoritative. Remote peer reads
+must reuse secure transport connections rather than making a fresh TLS
+connection for each fragment. Preserve the existing authorization, tenant,
+snapshot, query-resource, and terminal rules. Performance claims require valid
+measured results; a passing correctness gate alone is insufficient.
+
+### REQ-009 — Queue saturation until the leader deadline
+
+After authentication, authorization, and request validation, a query that can
+run on this Oracle but finds its execution slots busy waits in Oracle's
+tenant-fair query queue. Ordinary saturation does not produce an immediate
+planning, HTTP edge, or execution-admission refusal. The queue holds at most
+1,000 waiting queries per Oracle node across both classes, separate from
+running queries. Its only time limit is the one absolute leader-owned query
+deadline: 30 seconds by default, or the caller's valid `deadline_ms` when
+provided. That same deadline covers planning, queueing, and execution; it
+does not restart when a query leaves the queue. Remove the independent 250 ms
+queue timer. If a slot opens in time,
+the queued query runs. If its deadline expires first, it receives a query
+timeout and owns no retained queue or snapshot resources. Client cancellation
+also removes it promptly. If all 1,000 waiting places are occupied, the next
+query receives a clear, retryable queue-full overload response. Shutdown,
+role loss, a class the node cannot execute at all, and genuine resource or
+security faults remain distinct from temporary saturation. The same behavior
+is visible through HTTP, gRPC, and the first-class SDKs.
+
 ## Invariants and boundaries
 
 - **INV-001:** Write acknowledgment, WAL durability, publication order, and
@@ -145,6 +211,11 @@ PublishedOnly are updated to exercise the one query behavior.
   client results are accepted only after a valid terminal.
 - **INV-005:** Every retained queue, snapshot, in-flight batch, transport, and
   Scribe or Oracle resource grant remains bounded and query-owned.
+- **INV-006:** A faster path may not skip tenant authorization, snapshot
+  protection, query admission, memory governance, cancellation, or terminal
+  validation. A saturated query waits under its own deadline; a full finite
+  queue or a genuine resource fault fails without taking down the node or
+  corrupting another query's result.
 
 ## Scope and non-goals
 
@@ -199,10 +270,27 @@ Do not add new persisted state or change write ACK timing.
 - **AC-008:** Format, lints, codegen, docs check, `verify:bifrost`, and the broad
   `gate` pass because this change crosses the query contract, execution,
   verification, and first-class client boundaries.
+- **AC-009:** The benchmark and its focused tests prove the deployment,
+  workload, held-stream, result, measurement, and report rules in REQ-008.
+  Every required workload has a valid measured result or an explicit failure;
+  no invalid run can satisfy a performance target.
+- **AC-010:** On the specified 4-CPU/8-GiB node, the measured required
+  workloads meet the numeric targets in REQ-008. A missed target, a refused
+  acknowledged read-back, or an unproven CPU or snapshot diagnosis prevents
+  completion and is reported with its owning boundary and raw evidence.
+- **AC-011:** A real-server burst that fills execution slots enters the queue
+  without a capacity refusal, can wait longer than 250 ms when its leader
+  deadline permits, and either runs or times out at that deadline. The 1,000th
+  waiting query fits; the next receives queue-full overload. Cancellation and
+  timeout free their places. HTTP and gRPC do not shed an otherwise queueable
+  authenticated query before Oracle. A 4-CPU/8-GiB process-cluster run with
+  the full queue remains under the stated memory ceiling without OOM.
 
 ## Open material decisions
 
-None. Revision 3 was explicitly approved by the user on 2026-09-26.
+None. Revision 3 was explicitly approved by the user on 2026-09-26. The user
+explicitly accepted the performance work, supplied its numeric targets, and
+chose a finite 1,000-query queue on 2026-09-28.
 
 ## Revision history and authority
 
@@ -219,6 +307,13 @@ None. Revision 3 was explicitly approved by the user on 2026-09-26.
   Scribe fragment to its footer. Distinguishes owner-initiated early stop from
   unexpected stream truncation without adding a lease, guard, or source mode.
   Approved by the user on 2026-09-26.
+- Revision 4 (2026-09-28): Records the user-approved read-performance and
+  benchmark requirements after the first capacity measurements revealed
+  premature snapshot refusals, invalid held-live rows, and inadequate workload
+  coverage. Approved by the user on 2026-09-28.
+- Revision 5 (2026-09-28): Records the user's queue-until-deadline rule and
+  1,000-waiter limit. A full finite queue returns overload; temporary slot
+  saturation does not. Approved by the user on 2026-09-28.
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

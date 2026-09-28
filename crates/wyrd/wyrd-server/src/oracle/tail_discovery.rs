@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(feature = "test-support")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
@@ -34,6 +34,37 @@ static REJECT_NEXT_LISTING_CREDENTIAL: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "test-support")]
 pub fn arm_tail_listing_credential_rejection_for_test() {
     REJECT_NEXT_LISTING_CREDENTIAL.store(true, Ordering::Release);
+}
+
+/// Count of upcoming listings in this process that answer with a stale identity.
+///
+/// A journey needs Oracle to see a writer-epoch change between roster freeze
+/// and listing, which a real cluster cannot time deterministically, to prove
+/// the attempt restarts once on a refrozen roster and then degrades.
+#[cfg(feature = "test-support")]
+static STALE_LISTINGS: AtomicUsize = AtomicUsize::new(0);
+
+/// One-shot switch that holds the next listing until its deadline expires.
+///
+/// The stall runs inside the real deadline-bounded listing future, so a
+/// journey proves the query deadline cancels in-flight listing RPCs.
+#[cfg(feature = "test-support")]
+static STALL_NEXT_LISTING: AtomicBool = AtomicBool::new(false);
+
+/// Arms the next `count` listings in this process to answer as stale.
+///
+/// Each armed discovery returns [`TailReadError::StaleIdentity`] without
+/// contacting a Scribe, exactly as a listed stream from another writer epoch
+/// would.
+#[cfg(feature = "test-support")]
+pub fn arm_tail_listing_stale_for_test(count: usize) {
+    STALE_LISTINGS.store(count, Ordering::Release);
+}
+
+/// Arms the next listing in this process to stall until its deadline.
+#[cfg(feature = "test-support")]
+pub fn arm_tail_listing_stall_for_test() {
+    STALL_NEXT_LISTING.store(true, Ordering::Release);
 }
 
 /// Production resolver that lists the Scribes one query attempt froze.
@@ -195,6 +226,15 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
                 detail: "injected private Scribe discovery outage".to_owned(),
             });
         }
+        #[cfg(feature = "test-support")]
+        if STALE_LISTINGS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(TailReadError::StaleIdentity);
+        }
         if scribes.is_empty() {
             return Ok(Vec::new());
         }
@@ -209,6 +249,13 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
                 .zip(channels)
                 .map(|(scribe, channel)| Self::list_one(scribe, channel, &bearer, binding)),
         );
+        #[cfg(feature = "test-support")]
+        let listings = async {
+            if STALL_NEXT_LISTING.swap(false, Ordering::AcqRel) {
+                std::future::pending::<()>().await;
+            }
+            listings.await
+        };
         let listed = tokio::time::timeout(remaining, listings)
             .await
             .map_err(|_| TailReadError::DeadlineElapsed)?;

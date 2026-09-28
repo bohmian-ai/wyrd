@@ -37,7 +37,10 @@ pub use peer_service::{ScribeFragmentFault, arm_scribe_fragment_fault_for_test};
 pub use query_audit::OracleQueryAudit;
 pub use tail_discovery::RegistryTailStreamDiscovery;
 #[cfg(feature = "test-support")]
-pub use tail_discovery::arm_tail_listing_credential_rejection_for_test;
+pub use tail_discovery::{
+    arm_tail_listing_credential_rejection_for_test, arm_tail_listing_stale_for_test,
+    arm_tail_listing_stall_for_test,
+};
 
 /// Closes the local serving latch once this Oracle's reader epoch is lost.
 ///

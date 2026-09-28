@@ -14,7 +14,8 @@ use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_server::oracle::{
     ScribeFragmentFault, arm_scribe_fragment_fault_for_test,
-    arm_tail_listing_credential_rejection_for_test,
+    arm_tail_listing_credential_rejection_for_test, arm_tail_listing_stale_for_test,
+    arm_tail_listing_stall_for_test,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -1549,10 +1550,24 @@ struct ObservedQuery {
 /// Returns client or Arrow errors that carry no terminal, and an error when a
 /// cleanly ended stream has no terminal frame.
 async fn observe_query(client: &WyrdClient, sql: &str) -> Result<ObservedQuery, JourneyError> {
+    observe_query_within(client, sql, None).await
+}
+
+/// Runs `sql` under an optional client deadline and records what the client
+/// observed, exactly as [`observe_query`] does.
+///
+/// # Errors
+///
+/// Returns the same errors as [`observe_query`].
+async fn observe_query_within(
+    client: &WyrdClient,
+    sql: &str,
+    deadline_ms: Option<i64>,
+) -> Result<ObservedQuery, JourneyError> {
     let opened = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
-            deadline_ms: None,
+            deadline_ms,
         })
         .await;
     let mut stream = match opened {
@@ -1671,6 +1686,11 @@ fn table_parquet_files(
 /// - a listing the ready Scribe refuses for its unverifiable credential fails
 ///   rather than degrades, because a trust-boundary refusal is not
 ///   availability loss;
+/// - one stale listing restarts the attempt once on a refrozen roster and
+///   returns every row, while a second stale listing on the refrozen roster
+///   degrades rather than mixing cuts;
+/// - a listing held past the query deadline is cancelled with the query, which
+///   fails within the deadline, and the next query succeeds;
 /// - a Scribe lost after its first row, a stream without its footer, a
 ///   rejected peer ticket, a refused follower lease, and a real live snapshot
 ///   over its signed batch ceiling each yield `Failed`, and the client
@@ -1715,6 +1735,44 @@ async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
             "stream listing refused for its credential",
             &observe_query(&reader, &sql).await?,
         )?;
+
+        arm_tail_listing_stale_for_test(1);
+        let restarted = observe_query(&reader, &sql).await?;
+        if restarted.rejected
+            || restarted.outcome != QueryTerminalOutcome::Success
+            || restarted.ids != vec![1, 2, 3, 101, 102, 103]
+        {
+            return Err(format!(
+                "stale listing restart: expected every row, saw {:?} rejected={} {:?}",
+                restarted.outcome, restarted.rejected, restarted.ids
+            )
+            .into());
+        }
+        arm_tail_listing_stale_for_test(2);
+        expect_degraded(
+            "stale listing on the refrozen roster",
+            &observe_query(&reader, &sql).await?,
+        )?;
+
+        arm_tail_listing_stall_for_test();
+        let started = std::time::Instant::now();
+        let stalled = observe_query_within(&reader, &sql, Some(2_000)).await?;
+        expect_failed("listing held past the query deadline", &stalled)?;
+        if started.elapsed() > Duration::from_secs(10) {
+            return Err(format!(
+                "stalled listing outlived its deadline: {:?}",
+                started.elapsed()
+            )
+            .into());
+        }
+        let after_stall = observe_query(&reader, &sql).await?;
+        if after_stall.outcome != QueryTerminalOutcome::Success || after_stall.ids.len() != 6 {
+            return Err(format!(
+                "query after cancelled listing: expected Success, saw {:?} {:?}",
+                after_stall.outcome, after_stall.ids
+            )
+            .into());
+        }
 
         for (case, fault) in [
             (

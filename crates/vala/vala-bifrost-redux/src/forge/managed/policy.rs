@@ -350,6 +350,7 @@ mod tests {
                     record_count: Some(100),
                     first_row_id: None,
                     data_sequence_number: None,
+                    file_sequence_number: None,
                     data_file_path: format!("file:///warehouse/input-{index}.parquet"),
                     data_file_format: DataFileFormat::Parquet,
                     schema: Arc::clone(metadata.current_schema()),

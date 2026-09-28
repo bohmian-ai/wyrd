@@ -2031,3 +2031,102 @@ async fn wait_for_queued(server: &WyrdTestServer, expected: usize) -> Result<(),
     )
     .into())
 }
+
+/// Bound on polls waiting for the burst's snapshot reads to block on the lock.
+const SNAPSHOT_LOCK_POLLS: usize = 300;
+
+/// Interval between polls for blocked snapshot reads.
+const SNAPSHOT_LOCK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Queries in the snapshot burst: one more than any two-slot planning bound.
+const SNAPSHOT_BURST: usize = 3;
+
+/// Three authorized queries whose snapshot preparation is held behind one
+/// catalog lock all wait inside their leader deadline and then complete,
+/// rather than the third receiving an immediate planning refusal.
+///
+/// # Panics
+///
+/// Panics when any burst query is refused or returns the wrong rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn three_concurrent_snapshots_are_not_refused() {
+    prove_concurrent_snapshots_wait()
+        .await
+        .expect("concurrent snapshot preparation journey");
+}
+
+/// Holds the catalog table lock while a burst of public queries reaches
+/// snapshot preparation, then releases it and requires every query to finish.
+///
+/// The lock is test-owned database state: `ACCESS EXCLUSIVE` makes each
+/// query's catalog identity lookup wait in Postgres exactly as a busy
+/// connection pool or slow catalog would. The burst is only released once
+/// every query is provably blocked on that lock, or once any query has already
+/// ended — an early end is the immediate refusal this journey forbids.
+///
+/// # Errors
+///
+/// Returns the first client, Postgres, or result claim that broke.
+async fn prove_concurrent_snapshots_wait() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let table = unique_table("oracle_snapshot_burst");
+    let fqn = format!("vala.bifrost.{table}");
+    register_table(server, cluster.data_tenant_id(), &table).await?;
+    let writer = writer(server, "snapshot-burst").await?;
+    writer
+        .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
+        .await?;
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let superuser = cluster.pg_fixture().superuser_pool().await?;
+    let mut lock = superuser.begin().await?;
+    sqlx::query("LOCK TABLE vala.bifrost_tables IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await?;
+    let burst: Vec<JoinHandle<Result<u64, String>>> = (0..SNAPSHOT_BURST)
+        .map(|_| {
+            let client = writer.client().clone();
+            let table = table.clone();
+            tokio::spawn(async move {
+                query_rows(&client, &table)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .collect();
+    let mut blocked = 0_i64;
+    for _ in 0..SNAPSHOT_LOCK_POLLS {
+        blocked = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks \
+             WHERE relation = 'vala.bifrost_tables'::regclass AND NOT granted",
+        )
+        .fetch_one(&superuser)
+        .await?;
+        if usize::try_from(blocked)? >= SNAPSHOT_BURST || burst.iter().any(JoinHandle::is_finished)
+        {
+            break;
+        }
+        tokio::time::sleep(SNAPSHOT_LOCK_INTERVAL).await;
+    }
+    lock.rollback().await?;
+
+    for (index, query) in burst.into_iter().enumerate() {
+        let rows = query
+            .await?
+            .map_err(|error| format!("burst query {index} was refused: {error}"))?;
+        if rows != 1 {
+            return Err(format!("burst query {index} returned {rows} rows, not 1").into());
+        }
+    }
+    if usize::try_from(blocked)? < SNAPSHOT_BURST {
+        return Err(format!(
+            "only {blocked} snapshot reads ever waited on the catalog lock, not {SNAPSHOT_BURST}"
+        )
+        .into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}

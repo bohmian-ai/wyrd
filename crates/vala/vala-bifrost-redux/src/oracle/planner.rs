@@ -18,22 +18,22 @@ use super::{
 use crate::oracle::reader_pins::OracleReaderAuthority;
 
 /// Query floor and logical-plan preparation owner.
+///
+/// Snapshot preparation has no admission bound of its own: concurrent pins
+/// wait for a connection from the bounded runtime Postgres pool inside their
+/// leader deadline, and execution is bounded later by Oracle's query
+/// admission.
 #[derive(Debug, Clone)]
 pub struct OraclePlanner {
     /// Synchronous floor, deadline, and capacity configuration.
     pub(super) config: OracleConfig,
-    /// Bounded permits covering sealed metadata planning.
-    pub(super) planning: Arc<Semaphore>,
 }
 
 impl OraclePlanner {
     /// Creates a planner with bounded synchronous validation settings.
     #[must_use]
     pub fn new(config: OracleConfig) -> Self {
-        Self {
-            planning: Arc::new(Semaphore::new(config.planning_permits)),
-            config,
-        }
+        Self { config }
     }
 
     /// Validates one non-empty, single-statement `SELECT` request.
@@ -53,17 +53,6 @@ impl OraclePlanner {
         }
         parse_select_tables(&request.sql)?;
         Ok(())
-    }
-
-    /// Tries to reserve one bounded planning slot without queuing unbounded work.
-    ///
-    /// # Errors
-    ///
-    /// Returns admission rejection while the planning bound is saturated.
-    fn try_planning(&self) -> Result<OwnedSemaphorePermit, BifrostError> {
-        Arc::clone(&self.planning)
-            .try_acquire_owned()
-            .map_err(|_| BifrostError::QueryAdmissionRejected)
     }
 }
 
@@ -247,13 +236,17 @@ impl OraclePlanner {
     ///
     /// The planner owns parsing-adjacent metadata work and never executes rows;
     /// provider installation remains an Oracle composition concern after audit.
-    /// The planning permit spans every catalog pin. Cancellation drops that
-    /// permit and any local partial cuts; no admission or audit side effect has
-    /// occurred at this stage. Nothing here derives a class — the class comes
-    /// from the physical root built on top of this cut.
+    /// The whole pin — identity lookup, reader guard, revalidation, and
+    /// materialization — runs under the leader deadline, so a query waiting for
+    /// a Postgres connection or a catalog read ends as a timeout rather than
+    /// holding the request past its deadline. Cancellation or expiry drops the
+    /// pending pool acquisition and any local partial cuts; no admission or
+    /// audit side effect has occurred at this stage. Nothing here derives a
+    /// class — the class comes from the physical root built on top of this cut.
     ///
     /// # Errors
-    /// Returns timeout, authorization, catalog, or byte-accounting failures.
+    /// Returns [`BifrostError::QueryTimeout`] when the deadline passes first,
+    /// and authorization, catalog, or byte-accounting failures otherwise.
     pub(super) async fn pin_cut(
         &self,
         context: &AuthorizedQueryContext,
@@ -262,7 +255,6 @@ impl OraclePlanner {
         catalog: &BifrostCatalog,
         authority: Option<&Arc<OracleReaderAuthority>>,
     ) -> Result<PlannedSqlCut, BifrostError> {
-        let planning = self.try_planning()?;
         // DEBUG, not INFO: one event per catalog pin per query is per-request
         // decision detail, not a lifecycle transition. It is the only way to
         // attribute pre-fragment query latency, which is otherwise invisible
@@ -272,7 +264,12 @@ impl OraclePlanner {
             guard,
             permit,
             cuts,
-        } = Self::protect_and_materialize(tables, context, deadline, catalog, authority).await?;
+        } = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            Self::protect_and_materialize(tables, context, deadline, catalog, authority),
+        )
+        .await
+        .map_err(|_| BifrostError::QueryTimeout)??;
         let hot_files = cuts.iter().map(|cut| cut.hot_files.len()).sum::<usize>();
         let iceberg_files = cuts
             .iter()
@@ -313,7 +310,6 @@ impl OraclePlanner {
                 .map(|(local, total)| local / total)
                 .ok_or(BifrostError::QueryAdmissionRejected)?
         };
-        drop(planning);
         Ok(PlannedSqlCut {
             cuts,
             local_ratio,

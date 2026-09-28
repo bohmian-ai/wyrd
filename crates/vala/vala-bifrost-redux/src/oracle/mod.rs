@@ -1189,8 +1189,6 @@ pub struct OracleConfig {
     pub max_sql_bytes: usize,
     /// Default query deadline.
     pub default_deadline: Duration,
-    /// Maximum concurrent sealed planning operations.
-    pub planning_permits: usize,
     /// Fixed pod-local per-tenant Interactive slot-unit cap.
     pub tenant_interactive_slots: u32,
     /// Fixed pod-local per-tenant Analytical slot-unit cap; zero disables the class.
@@ -1220,7 +1218,6 @@ impl Default for OracleConfig {
         Self {
             max_sql_bytes: DEFAULT_MAX_SQL_BYTES,
             default_deadline: Duration::from_secs(30),
-            planning_permits: 16,
             tenant_interactive_slots: 12,
             tenant_analytical_slots: 4,
             max_workers_per_query: 2,
@@ -1604,7 +1601,7 @@ impl std::fmt::Debug for Oracle {
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::Internal`] when fragment, SQL, planning, or tenant
+/// Returns [`BifrostError::Internal`] when fragment, SQL, or tenant
 /// limits cannot safely admit work.
 fn validate_oracle_config(config: OracleConfig) -> Result<(), BifrostError> {
     if config.max_workers_per_query > 63
@@ -1620,11 +1617,6 @@ fn validate_oracle_config(config: OracleConfig) -> Result<(), BifrostError> {
     if config.max_sql_bytes == 0 {
         return Err(BifrostError::Internal {
             detail: "Oracle SQL byte limit must be positive".to_owned(),
-        });
-    }
-    if config.planning_permits == 0 {
-        return Err(BifrostError::Internal {
-            detail: "Oracle planning permits must be positive".to_owned(),
         });
     }
     validate_oracle_tenant_slots(config)
@@ -2300,18 +2292,16 @@ impl Oracle {
         let snapshot = self.cluster.snapshot();
         let tables = parse_select_tables(&request.sql)?;
         let pin_started = Instant::now();
-        let planned = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            self.planner.pin_cut(
+        let planned = self
+            .planner
+            .pin_cut(
                 context,
                 &tables,
                 deadline,
                 &self.catalog,
                 Some(&self.reader_authority),
-            ),
-        )
-        .await
-        .map_err(|_| BifrostError::QueryTimeout)??;
+            )
+            .await?;
         QueryPhase::SnapshotPin.record(pin_started);
         if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
             return Err(BifrostError::QueryTimeout);

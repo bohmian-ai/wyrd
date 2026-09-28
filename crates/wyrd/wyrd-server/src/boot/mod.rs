@@ -1654,7 +1654,6 @@ impl<'a> OracleRoleBuilder<'a> {
         // never a number an operator has to reconcile by hand.
         let default_split = OracleClassSplit::derive(raw_slots);
         let oracle_config = OracleConfig {
-            planning_permits: config.oracle.planning_permits,
             max_workers_per_query: config.oracle.max_workers_per_query,
             attempt_memory_bytes: config.oracle.max_frame_bytes.min(8 * 1024 * 1024),
             interactive_slots: calibrated

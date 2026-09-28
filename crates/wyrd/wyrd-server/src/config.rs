@@ -484,9 +484,6 @@ impl BifrostRoles {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OracleRuntimeConfig {
-    /// Concurrent planning permits.
-    #[serde(default = "default_oracle_planning_permits")]
-    pub planning_permits: usize,
     /// Admission waiters.
     #[serde(default = "default_oracle_admission_waiters")]
     pub admission_waiters: usize,
@@ -509,9 +506,6 @@ pub struct OracleRuntimeConfig {
     pub allow_unapproved_profile: bool,
 }
 
-fn default_oracle_planning_permits() -> usize {
-    2
-}
 fn default_oracle_admission_waiters() -> usize {
     64
 }
@@ -529,7 +523,6 @@ fn default_oracle_max_frame_bytes() -> usize {
 impl Default for OracleRuntimeConfig {
     fn default() -> Self {
         Self {
-            planning_permits: default_oracle_planning_permits(),
             admission_waiters: default_oracle_admission_waiters(),
             max_queue_wait_ms: default_oracle_max_queue_wait_ms(),
             max_workers_per_query: default_oracle_max_workers_per_query(),
@@ -2849,8 +2842,7 @@ impl WyrdServerConfig {
                     message: "bifrost.oracle.max_workers_per_query must be at most 63".to_owned(),
                 });
             }
-            if self.bifrost.oracle.planning_permits == 0
-                || self.bifrost.oracle.admission_waiters == 0
+            if self.bifrost.oracle.admission_waiters == 0
                 || self.bifrost.oracle.max_queue_wait_ms == 0
                 || self.bifrost.oracle.max_frame_bytes == 0
             {
@@ -3450,7 +3442,7 @@ mod tests {
             ..WyrdServerConfig::default()
         };
         config.bifrost.scribe.coordination_threads = 0;
-        config.bifrost.oracle.planning_permits = 0;
+        config.bifrost.oracle.admission_waiters = 0;
         config.bifrost.oracle.calibration_profile = PathBuf::from("/\0malformed");
         config.grpc.certificate_chain_path = Some(PathBuf::from("certificate.pem"));
         config.http.bind = config.grpc.bind;
@@ -3751,7 +3743,7 @@ maintenance_interval_secs = 45
         config.bifrost.oracle.max_workers_per_query = 64;
         assert!(config.validate().is_err());
         config.bifrost.oracle.max_workers_per_query = 2;
-        config.bifrost.oracle.planning_permits = 0;
+        config.bifrost.oracle.admission_waiters = 0;
         assert!(config.validate().is_err());
     }
 

@@ -457,6 +457,35 @@ struct PreparedWaiter {
     receiver: tokio::sync::oneshot::Receiver<Grant>,
 }
 
+/// Owns one queued place until the waiting future takes its grant.
+///
+/// Dropping the guard while armed removes the waiter from its tenant FIFO and
+/// returns any grant already sent to it. This is what makes a dropped request
+/// future — an HTTP client that disconnected while queued — release its place
+/// immediately instead of holding it until its deadline or its turn.
+struct QueuedWaiter<'a> {
+    /// Admission owner whose queue holds the place.
+    admission: &'a OracleAdmission,
+    /// Queue identity and grant channel of the place.
+    waiter: PreparedWaiter,
+    /// False once the grant was received and ownership moved to the caller.
+    armed: bool,
+}
+
+impl Drop for QueuedWaiter<'_> {
+    /// Removes the unclaimed place and rolls back a grant that raced the exit.
+    fn drop(&mut self) {
+        if self.armed {
+            self.admission.rollback_waiter(
+                self.waiter.class_kind,
+                self.waiter.tenant,
+                self.waiter.waiter_id,
+                &mut self.waiter.receiver,
+            );
+        }
+    }
+}
+
 /// Admission owner for bounded local capacity and refreshed membership state.
 pub struct OracleAdmission {
     /// Existing peer pending/running slot owner.
@@ -889,6 +918,11 @@ impl OracleAdmission {
 
     /// Waits for a grant while preserving absolute deadlines and rollback.
     ///
+    /// The queued place is owned by a [`QueuedWaiter`] guard, so every exit
+    /// that does not take the grant — deadline, cancellation, shutdown, or the
+    /// caller dropping this future when its client disconnects — removes the
+    /// waiter and returns any grant that raced the exit.
+    ///
     /// # Errors
     /// Returns [`BifrostError::QueryTimeout`] when the earlier of the queue
     /// limit and the total deadline passes, and query-admission rejection when
@@ -899,63 +933,46 @@ impl OracleAdmission {
         cancellation: CancellationToken,
         query_class: QueryClass,
     ) -> Result<Grant, BifrostError> {
-        let PreparedWaiter {
-            class_kind,
-            tenant,
-            waiter_id,
-            wait_deadline,
-            mut receiver,
-        } = waiter;
+        let wait_deadline = waiter.wait_deadline;
+        let mut queued = QueuedWaiter {
+            admission: self,
+            waiter,
+            armed: true,
+        };
         loop {
             // Followers release governor slot units outside this queue, so the
             // capacity a queued leader is waiting for can appear without any local
             // release. Re-running the scheduler on the shared resource-change epoch
             // is what turns that into a grant without a polling loop.
             let epoch = self.shared.resources.capacity_epoch();
-            tokio::select! {
+            let refusal = tokio::select! {
                 resource_change = self.shared.resources.wait_for_capacity_change(epoch) => {
-                    if resource_change.is_err() {
-                        self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
-                        OracleTelemetry::record_admission(
-                            query_class,
-                            OracleAdmissionOutcome::Rejected,
-                            OracleAdmissionReason::Shutdown,
-                        );
-                        return Err(BifrostError::QueryAdmissionRejected);
+                    if resource_change.is_ok() {
+                        self.regrant();
+                        continue;
                     }
-                    self.regrant();
+                    (OracleAdmissionReason::Shutdown, BifrostError::QueryAdmissionRejected)
                 }
-                grant = &mut receiver => return grant.map_err(|_| BifrostError::QueryAdmissionRejected),
+                grant = &mut queued.waiter.receiver => {
+                    queued.armed = false;
+                    return grant.map_err(|_| BifrostError::QueryAdmissionRejected);
+                }
                 () = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_deadline)) => {
                     // The earlier of the queue limit and the total deadline has
                     // passed: a timeout, not a capacity refusal to retry.
-                    self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
-                    OracleTelemetry::record_admission(
-                        query_class,
-                        OracleAdmissionOutcome::Rejected,
-                        OracleAdmissionReason::QueueDeadline,
-                    );
-                    return Err(BifrostError::QueryTimeout);
+                    (OracleAdmissionReason::QueueDeadline, BifrostError::QueryTimeout)
                 }
                 () = cancellation.cancelled() => {
-                    self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
-                    OracleTelemetry::record_admission(
-                        query_class,
-                        OracleAdmissionOutcome::Rejected,
-                        OracleAdmissionReason::Shutdown,
-                    );
-                    return Err(BifrostError::QueryAdmissionRejected);
+                    (OracleAdmissionReason::Shutdown, BifrostError::QueryAdmissionRejected)
                 }
                 () = self.shared.root_cancel.cancelled() => {
-                    self.rollback_waiter(class_kind, tenant, waiter_id, &mut receiver);
-                    OracleTelemetry::record_admission(
-                        query_class,
-                        OracleAdmissionOutcome::Rejected,
-                        OracleAdmissionReason::Shutdown,
-                    );
-                    return Err(BifrostError::QueryAdmissionRejected);
+                    (OracleAdmissionReason::Shutdown, BifrostError::QueryAdmissionRejected)
                 }
-            }
+            };
+            drop(queued);
+            let (reason, error) = refusal;
+            OracleTelemetry::record_admission(query_class, OracleAdmissionOutcome::Rejected, reason);
+            return Err(error);
         }
     }
 
@@ -3267,8 +3284,8 @@ pub(in crate::oracle) mod tests {
 
     /// Both query classes share one 1,000-place queue, one queue-wait limit, and
     /// one total deadline; the earlier limit ends a wait as a query timeout,
-    /// the 1,001st waiter is the retryable queue-full overload, and a cancelled
-    /// or expired waiter frees its place.
+    /// the 1,001st waiter is the retryable queue-full overload, and a cancelled,
+    /// dropped, or expired waiter frees its place.
     ///
     /// # Panics
     ///
@@ -3382,16 +3399,19 @@ pub(in crate::oracle) mod tests {
                 .await
         });
         await_queued(&full, 1_000).await;
+        // Dropping the waiting future — what a disconnected HTTP client does —
+        // frees the place without any cancellation token firing.
+        replacement.abort();
+        assert!(replacement.await.is_err(), "the replacement was aborted");
+        await_queued(&full, 999).await;
 
         for cancellation in &cancellations {
             cancellation.cancel();
         }
-        replacement.abort();
         drop(held);
         for waiter in waiters {
             let _ = waiter.await;
         }
-        let _ = replacement.await;
     }
 
     /// Local probe release remains idempotent through its watch state.

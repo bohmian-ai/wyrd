@@ -1249,8 +1249,8 @@ impl ScribeShardRuntime {
     /// Fan out a WAL pressure signal for one victim key to every shard owner.
     ///
     /// Under batch-spread routing the victim key may have buckets on any shard
-    /// lane, so the signal is sent to all shards; each shard flushes its own
-    /// bucket for the key, if any.
+    /// lane, so the signal is sent to all shards; each shard holding the key
+    /// rotates its whole generation, which is the unit that retires WAL.
     pub(crate) fn request_wal_pressure_flush(&self, key: Option<crate::scribe::seal_key::SealKey>) {
         let Some(key) = key else {
             return;
@@ -1454,17 +1454,23 @@ impl ShardOwner {
     /// empty-`keys` short-circuit is removed — so a pressure signal that
     /// selects no victims of its own still reaches `flush_keys` and re-drives
     /// any stranded state-A seals through the entry drain (change 3). An empty
-    /// worked set is a cheap no-op.
+    /// worked set is a cheap no-op. A WAL victim key held by this shard
+    /// rotates the complete shard generation so its closed segments gain a
+    /// retiring cohort; shards without that key ignore the WAL victim.
     fn handle_pressure_signal(&mut self, signal: PressureSignal) {
         if let Err(error) = self.flush_keys(signal.keys, Some(SealTriggerReason::Pressure)) {
             record_seal_failure();
             tracing::warn!(error = %error, shard = self.id, "pressure flush failed");
         }
+        // Sealing only the victim bucket cannot free a segment that other
+        // active buckets still share, so WAL pressure rotates the whole shard
+        // generation: the closed segment gets a cohort that retires it.
         if let Some(key) = signal.wal_key
-            && let Err(error) = self.flush_keys(vec![key], Some(SealTriggerReason::Pressure))
+            && self.wal_segments.contains_key(&key)
+            && let Err(error) = self.rotate_active_generation()
         {
             record_seal_failure();
-            tracing::warn!(error = %error, shard = self.id, "WAL pressure flush failed");
+            tracing::warn!(error = %error, shard = self.id, "WAL pressure rotation failed");
         }
     }
 
@@ -6750,6 +6756,26 @@ mod tests {
         assert!(!owner.wal_segments.contains_key(&key));
         assert!(owner.pending_generations.contains_key(&key));
         assert!(!owner.seal_retry.contains(&key));
+    }
+
+    /// WAL pressure rotates the victim's whole shard generation into a cohort.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the victim is sealed alone as a selective member, which
+    /// leaves the shared segment without a retiring owner.
+    #[test]
+    fn wal_pressure_rotates_the_victim_shard_generation() {
+        let key = owner_key();
+        let seed = 1_usize << 20;
+        let (mut owner, _wal, _root) = owner_for_seal_atomicity_test(&key, seed);
+        owner.handle_pressure_signal(PressureSignal {
+            keys: Vec::new(),
+            wal_key: Some(key.clone()),
+        });
+        assert!(!owner.wal_segments.contains_key(&key));
+        assert_eq!(owner.rotation_cohorts.len(), 1, "rotation owns the WAL");
+        assert!(owner.memory_ownership.immutable_bytes() > 0);
     }
 
     /// A stale retry mark — one whose key is already queued, and one whose key

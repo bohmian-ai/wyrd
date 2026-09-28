@@ -1158,7 +1158,6 @@ mod tests {
             leader_fence: 3,
             query_id: uuid::Uuid::from_u128(4).as_bytes().to_vec(),
             tenant_id: tenant_id.as_uuid().as_bytes().to_vec(),
-            nonce: uuid::Uuid::from_u128(6).as_bytes().to_vec(),
             expires_at_ms: (now + chrono::Duration::seconds(10)).timestamp_millis(),
             execution_deadline_unix_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),
             binding: "binding".to_owned(),

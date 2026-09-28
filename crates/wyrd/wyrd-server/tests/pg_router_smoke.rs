@@ -3260,7 +3260,6 @@ async fn oracle_authority_request(
             leader_fence: fence,
             query_id: query.as_uuid().as_bytes().to_vec(),
             tenant_id: identity.tenant.as_uuid().as_bytes().to_vec(),
-            nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
             expires_at_ms: expires.timestamp_millis(),
             execution_deadline_unix_ms: expires.timestamp_millis(),
             binding: "vala.bifrost.authority_order".to_owned(),

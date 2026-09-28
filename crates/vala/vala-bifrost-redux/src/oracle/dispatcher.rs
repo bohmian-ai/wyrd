@@ -1662,7 +1662,6 @@ fn peer_ticket_claims(
         leader_fence: context.leader_fence,
         query_id: context.query_id.as_uuid().as_bytes().to_vec(),
         tenant_id: context.tenant_id.as_bytes().to_vec(),
-        nonce: uuid::Uuid::new_v4().as_bytes().to_vec(),
         expires_at_ms: pending
             .expires_at
             .timestamp_millis()
@@ -4211,7 +4210,6 @@ mod tests {
             leader_fence: fence,
             query_id: query_id.as_uuid().as_bytes().to_vec(),
             tenant_id: tenant.as_uuid().as_bytes().to_vec(),
-            nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
             expires_at_ms: fragment.deadline_unix_ms,
             execution_deadline_unix_ms: fragment.deadline_unix_ms,
             binding: "vala.bifrost.events".to_owned(),

@@ -165,10 +165,7 @@ pub struct PeerTicketClaims {
     /// Authenticated data-tenant UUID bytes.
     #[prost(bytes, tag = "7")]
     pub tenant_id: Vec<u8>,
-    /// Single-use random nonce.
-    #[prost(bytes, tag = "8")]
-    pub nonce: Vec<u8>,
-    /// Ticket acceptance and replay-cache expiry as Unix milliseconds.
+    /// Ticket acceptance expiry as Unix milliseconds.
     #[prost(int64, tag = "9")]
     pub expires_at_ms: i64,
     /// Tenant-qualified binding.

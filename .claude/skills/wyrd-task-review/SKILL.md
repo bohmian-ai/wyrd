@@ -22,6 +22,7 @@ results. If the candidate changes during review, return `BLOCKED`.
 
 Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
+[maintainer style](../../../architecture/references/languages/maintainer-style.md),
 and only the architecture and testing references applicable to the task. Follow
 CodeGraph instructions. Build a compact navigation map of changed symbols,
 owners, likely callers and consumers, and relevant tests, and select the
@@ -44,9 +45,10 @@ No agent may fill more than one role.
 Run independent discovery, conditional follow-up, and validation:
 
 1. **Independent discovery, in parallel:** always spawn two task implementation
-   reviewers (`behavior-rev` and `invariant-rev`) and a repository-standards
-   reviewer (`repo-rev`). Also spawn one domain reviewer (`domain-rev`) for each
-   materially changed sensitive domain, including security/RBAC, tenancy,
+   reviewers (`behavior-rev` and `invariant-rev`), a repository-standards
+   reviewer (`repo-rev`), and a maintainer specialist (`maintainer-rev`). Also
+   spawn one domain reviewer (`domain-rev`) for each materially changed
+   sensitive domain, including security/RBAC, tenancy,
    concurrency, durability, persistent data, or another boundary whose
    correctness needs domain expertise.
 2. **Compare claims:** after discovery reports are complete, group findings by
@@ -158,6 +160,28 @@ The specialist does not review task acceptance, propose optional improvements,
 or perform the Ponytail audit. Missing authority or incomplete coverage blocks
 the review. Preserve its report as `standards-review.md`.
 
+## Independent maintainer review (`maintainer-rev`)
+
+Give the specialist the immutable subject, complete diff, repository root,
+[maintainer style](../../../architecture/references/languages/maintainer-style.md),
+applicable Wyrd authority, and available verification results. Do not provide
+other reviewers' conclusions or an intended verdict.
+
+The specialist reads each materially changed symbol in its owning module,
+traces its callers and relevant tests, and reviews layout, owner and method
+shape, naming, argument and return types, test clarity, documentation, and
+generated declaration parity. It asks whether a maintainer
+can find, follow, and safely change the behavior. It applies the guide under
+Wyrd's explicit rules and does not require code to imitate a sample.
+
+Return `maintainer-review.md` with changed-surface coverage, material findings,
+and one overall `PASS`, `FAIL`, or `BLOCKED` result. Each finding needs a
+source-local ID, changed location, governing rule or guide principle, concrete
+maintenance cost, and smallest testable correction. Cite a nearby Wyrd pattern
+when available. Personal preference without a concrete cost is not a blocking
+finding; record uncertain preferences separately for calibration. Incomplete
+coverage blocks this review.
+
 ## Independent sensitive domain review (`domain-rev`)
 
 Spawn a separate `domain-rev` for each sensitive domain materially changed by
@@ -191,8 +215,8 @@ predetermined count or obtain agreement.
 Always spawn a fresh `ponytail-rev` after discovery and any follow-up are
 complete, even when their proposed finding union is empty. Give it the
 immutable subject, applicable authorities, complete diff, both task-review
-reports, `standards-review.md`, every `domain-review-<domain>.md`, and any
-`followup-review.md`, but no intended verdict.
+reports, `standards-review.md`, `maintainer-review.md`, every
+`domain-review-<domain>.md`, and any `followup-review.md`, but no intended verdict.
 
 The `ponytail-rev` independently inspects the actual source, validates every
 proposed finding and correction, including claims from only one reviewer. It
@@ -258,8 +282,8 @@ blocks the review. Preserve its final ledger and recommendations as
 ## Verdict and remediation task
 
 In the established review directory, preserve both task-review reports,
-`standards-review.md`, every `domain-review-<domain>.md`, any
-`followup-review.md`, and `findings-validation.md`, then write `verdict.md`
+`standards-review.md`, `maintainer-review.md`, every `domain-review-<domain>.md`,
+any `followup-review.md`, and `findings-validation.md`, then write `verdict.md`
 containing the immutable subject, reconciled acceptance matrix, independent
 review results, the follow-up decision, validated finding ledger, verification
 limits, prior-finding closure, and one verdict:

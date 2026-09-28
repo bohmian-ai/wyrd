@@ -45,6 +45,7 @@ references/
 | `architecture/patterns.md` | Ownership, contract placement, server/client/storage/provider/audit structure |
 | `languages/spec-driven-development.md` | Approved change specs, task decomposition, TDD execution, remediation, or final evidence mapping |
 | `languages/implementation-execution.md` | Execution authority, adaptation, verification recovery, or completion evidence |
+| `languages/maintainer-style.md` | Code layout, owner and method shape, tests, documentation, and maintainer readability |
 | `languages/rust-core.md` | Rust ownership, async, traits, allocation, or API shape |
 | `languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversion, or module registration |
 | `languages/python-api-and-stubs.md` | Python exports, stubs, package layout, or typing |

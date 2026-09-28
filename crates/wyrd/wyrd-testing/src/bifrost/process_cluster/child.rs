@@ -530,15 +530,15 @@ fn arm_execute_pause(
     Ok(pause)
 }
 
-/// Installs this child's log subscriber on stderr when `RUST_LOG` asks for one.
+/// Installs this child's log subscriber on stderr when `WYRD_LOG`, else `RUST_LOG`, asks for one.
 ///
 /// Stderr, never stdout: stdout carries the control protocol, and a log line
 /// written there would be read by the parent as a malformed response. The
-/// subscriber is installed only when `RUST_LOG` is set, so a lane run stays
+/// subscriber is installed only when either variable is set, so a lane run stays
 /// silent and a diagnosing run gets the child's own view of a multi-process
 /// failure, which the parent otherwise cannot see at all.
 fn install_child_tracing() {
-    let Ok(filter) = std::env::var("RUST_LOG") else {
+    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
         return;
     };
     let subscriber = tracing_subscriber::fmt()

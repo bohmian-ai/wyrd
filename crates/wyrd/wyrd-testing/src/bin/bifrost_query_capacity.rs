@@ -27,13 +27,13 @@ async fn benchmark() -> Result<(), CapacityError> {
     }
 }
 
-/// Installs the driver's stderr log subscriber when `RUST_LOG` asks for one.
+/// Installs the driver's stderr log subscriber when `WYRD_LOG`, else `RUST_LOG`, asks for one.
 ///
 /// The pod child logs its own view under the same variable; this makes the
 /// driver's client-side failures, such as each failed query's error, readable
 /// alongside it.
 fn install_tracing() {
-    let Ok(filter) = std::env::var("RUST_LOG") else {
+    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
         return;
     };
     let _ = tracing::subscriber::set_global_default(

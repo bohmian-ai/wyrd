@@ -2223,9 +2223,9 @@ impl ShardOwner {
     /// entry is intact for an identical retry; or (B) the generation is queued,
     /// bytes are Immutable-accounted, and its segments are retained. There is
     /// no state in which bytes are Immutable-accounted with no queued
-    /// generation. Segment references remain discovery/replay facts only; the
-    /// open shard owner, and later its closed cohort, are the sole retirement
-    /// authorities.
+    /// generation. Segment references remain discovery/replay facts while the
+    /// open shard owner or a closed cohort still reaches them; the last
+    /// committed member retires a segment no other owner references.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] when the table binding cannot be
@@ -2243,7 +2243,7 @@ impl ShardOwner {
                 .map_err(|error| ScribeError::Internal {
                     detail: error.to_string(),
                 })?;
-        // These references locate replay bytes but own no deletion authority.
+        // These references locate replay bytes; deletion waits for every owner.
         let segment_refs = self
             .wal_segments
             .get(seal_key)
@@ -2583,11 +2583,51 @@ impl ShardOwner {
                 retained.wal_segments.clear();
             }
         } else {
-            // Selective members only carry replay/discovery references to the
-            // still-open segment. They never acquire deletion authority.
-            retained.wal_segments.clear();
+            // Selective members carry replay/discovery references only while
+            // another owner still reaches the segment. The last member to
+            // commit after every active bucket, pending or retained member,
+            // and cohort has let go is its sole remaining retirement owner.
+            let referenced = self.referenced_wal_paths();
+            retained
+                .wal_segments
+                .retain(|segment| !referenced.contains(&segment.path));
         }
         Ok(Some(retained))
+    }
+
+    /// Collects every WAL path still reachable from this shard's owners.
+    ///
+    /// Active buckets, queued and retained generations, and rotation cohorts
+    /// each keep replay bytes alive. A committed selective member may retire a
+    /// segment only when it is absent from this set; segments still current
+    /// are additionally skipped by the WAL itself.
+    fn referenced_wal_paths(&self) -> HashSet<std::path::PathBuf> {
+        let active = self
+            .wal_segments
+            .values()
+            .flat_map(|segments| segments.keys().cloned());
+        let pending = self.pending_generations.values().flat_map(|queue| {
+            queue.iter().flat_map(|pending| {
+                pending
+                    .generation
+                    .wal_segments
+                    .iter()
+                    .map(|segment| segment.path.clone())
+            })
+        });
+        let retained = self.retained_generations.values().flat_map(|retained| {
+            retained
+                .wal_segments
+                .iter()
+                .map(|segment| segment.path.clone())
+        });
+        let cohorts = self.rotation_cohorts.iter().flat_map(|cohort| {
+            cohort
+                .wal_segments
+                .iter()
+                .map(|segment| segment.path.clone())
+        });
+        active.chain(pending).chain(retained).chain(cohorts).collect()
     }
 
     /// Reconciles one persistence result with this owner's FIFO generation queue.
@@ -7788,6 +7828,51 @@ mod tests {
         assert_eq!(token_after.seal_id, token_before.seal_id);
         assert_eq!(token_after.arrow_bytes, token_before.arrow_bytes);
         assert!(owner.memory_ownership.is_poisoned());
+    }
+
+    /// A segment shared by selective members retires with the last of them.
+    ///
+    /// Selective seals never form a rotation cohort, so once the final active
+    /// bucket leaves a closed segment the last committed member referencing it
+    /// must yield it for deletion; earlier members must not.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the first member yields a segment its sibling still needs or
+    /// the last member leaves the segment without a retirement owner.
+    #[test]
+    fn last_selective_member_yields_its_unowned_segment() {
+        let (mut owner, generation_id, _wal, _root, _budget) =
+            committed_retirement_owner_for_test();
+        let shared = crate::scribe::wal::WalSegmentRef {
+            path: std::path::PathBuf::from("shared.wal"),
+        };
+        owner
+            .retained_generations
+            .get_mut(&generation_id)
+            .expect("fixture generation")
+            .wal_segments = vec![shared.clone()];
+        let sibling = generation_id + 1;
+        owner.retained_generations.insert(
+            sibling,
+            RetainedGeneration {
+                arrow_bytes: 0,
+                memory_released: true,
+                wal_segments: vec![shared.clone()],
+                wal: owner.wal_handle.clone(),
+                replay_identity: Arc::new(Mutex::new(None)),
+            },
+        );
+        let first = owner
+            .retire_committed_generation(generation_id)
+            .expect("first retirement")
+            .expect("first member retained");
+        assert!(first.wal_segments.is_empty(), "sibling still owns the segment");
+        let last = owner
+            .retire_committed_generation(sibling)
+            .expect("last retirement")
+            .expect("last member retained");
+        assert_eq!(last.wal_segments, vec![shared]);
     }
 
     /// Test and periodic retirement callers both retain the generation on an error path.

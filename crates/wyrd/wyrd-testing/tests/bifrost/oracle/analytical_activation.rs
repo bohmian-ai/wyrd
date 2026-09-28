@@ -480,8 +480,23 @@ struct PublicSettlement {
 ///
 /// Returns a transport, protocol, Arrow, or missing-terminal error.
 async fn run_public(client: &WyrdClient, sql: &str) -> Result<PublicSettlement, JourneyError> {
+    run_public_request(client, &request(sql)).await
+}
+
+/// Drives one exact public request, including its own deadline, to settlement.
+///
+/// [`run_public`] fixes the journey's ordinary deadline; a case that must
+/// observe a deadline expire while the query waits supplies its own.
+///
+/// # Errors
+///
+/// Returns a transport, protocol, Arrow, or missing-terminal error.
+async fn run_public_request(
+    client: &WyrdClient,
+    request: &BifrostQueryRequest,
+) -> Result<PublicSettlement, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query(&request(sql))
+        .query(request)
         .await?;
     let deadline_ms = stream.deadline_ms();
     let mut rows = 0_usize;
@@ -1126,7 +1141,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     cluster.nodes_mut()[paused].await_execute_paused()?;
     // The pause proves the graph reached a follower; the leader's own granted
     // unit count is what proves it holds the whole Analytical envelope, which
-    // is the condition the refusal below is a statement about.
+    // is the condition the queued timeout below is a statement about.
     await_admitted(&mut cluster, COORDINATOR, ANALYTICAL_GRAPH_UNITS).await?;
 
     // Served, exactly, while an Analytical graph on the same pod holds its
@@ -1145,11 +1160,15 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     }
 
     // The pod's whole Analytical class is held, so one more Analytical
-    // statement has no capacity of its own. It may wait for a held graph to
-    // release or be refused outright; what it may never do is settle Analytical
-    // while the class is fully owned.
-    match run_public(&client, &analytical_sql).await {
-        Err(error) if error.to_string().contains("query admission rejected") => {}
+    // statement has no capacity of its own. It queues for a held graph to
+    // release, and a short deadline expires while it waits; what it may never
+    // do is settle Analytical while the class is fully owned.
+    let queued = BifrostQueryRequest {
+        sql: analytical_sql.clone(),
+        deadline_ms: Some(2_000),
+    };
+    match run_public_request(&client, &queued).await {
+        Err(error) if error.to_string().contains("query execution timed out") => {}
         Err(error) => {
             return Err(
                 format!("an Analytical query beyond the class capacity failed as {error}").into(),

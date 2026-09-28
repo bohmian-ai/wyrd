@@ -2720,18 +2720,24 @@ impl OracleResources {
     /// [`BifrostResourceError::InvalidPlan`] for zero, overflowing, inactive,
     /// or invalid partition demand, and a poison error for divergent root
     /// accounting. No root counter changes on root-admission refusal.
+    ///
+    /// Physical scratch is leased before the governor charges slots. A
+    /// physical refusal therefore changes no governor state; charging first
+    /// and releasing on refusal would advance the Oracle capacity epoch and
+    /// wake every queued waiter into another pass refused the same way.
     pub fn try_acquire_query(
         &self,
         request: OracleResourceRequest,
     ) -> Result<OracleQueryResources, BifrostResourceError> {
+        let volume_scratch = self
+            .volumes
+            .as_ref()
+            .map(|volumes| volumes.capabilities().oracle.try_acquire(request.scratch_bytes))
+            .transpose()?;
         let mut resources = self
             .governor
             .try_acquire_oracle(request, &self.memory_root)?;
-        if let Some(volumes) = &self.volumes {
-            let capabilities = volumes.capabilities();
-            resources.volume_scratch =
-                Some(capabilities.oracle.try_acquire(resources.scratch_bytes)?);
-        }
+        resources.volume_scratch = volume_scratch;
         #[cfg(feature = "test-support")]
         self.memory_hold.engage(&resources.memory_pool);
         Ok(resources)
@@ -7202,6 +7208,53 @@ mod tests {
             .await
             .expect("a query release advances the epoch");
         assert!(advanced > observed);
+    }
+
+    /// A physical-scratch refusal leaves the Oracle capacity epoch untouched.
+    ///
+    /// Queued admission re-runs its grant pass on every epoch advance, so a
+    /// refusal that charged and returned slots would wake the queue into the
+    /// same refusal in a loop.
+    #[test]
+    fn oracle_physical_scratch_refusal_changes_no_governor_state() {
+        let temp = tempfile::tempdir().expect("temporary volume root");
+        let roots = BifrostVolumeRoots {
+            wal: temp.path().join("wal"),
+            scribe_stage: temp.path().join("scribe-stage"),
+            scribe_output_scratch: temp.path().join("scribe-output-scratch"),
+            oracle_scratch: temp.path().join("oracle"),
+        };
+        for path in [
+            &roots.wal,
+            &roots.scribe_stage,
+            &roots.scribe_output_scratch,
+            &roots.oracle_scratch,
+        ] {
+            fs::create_dir(path).expect("registered volume root");
+        }
+        let mut policy = policy(&[BifrostRole::Scribe, BifrostRole::Oracle]);
+        policy.volume_roots = Some(roots);
+        let roles = BifrostRuntimeResources::from_snapshot(snapshot(1024 * MIB), policy)
+            .expect("combined plan")
+            .compose_roles()
+            .expect("combined role composition");
+        let volume = roles
+            .volume_capabilities()
+            .expect("registered volumes")
+            .oracle;
+        let mut filled = Vec::new();
+        while let Ok(lease) = volume.try_acquire(ORACLE_PARTITION_MEMORY_BYTES as u64) {
+            filled.push(lease);
+        }
+        let oracle = roles.oracle().expect("Oracle capability");
+        let observed = oracle.capacity_epoch();
+        assert!(matches!(
+            oracle.try_acquire_query(interactive_query(0.0)),
+            Err(BifrostResourceError::Occupied { .. })
+        ));
+        assert_eq!(oracle.capacity_epoch(), observed);
+        assert_eq!(oracle.live_slot_units(), 0);
+        drop(filled);
     }
 
     /// Live detection reaches the same checked constructor as an injection.

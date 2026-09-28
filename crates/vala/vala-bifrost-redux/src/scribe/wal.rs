@@ -17,7 +17,7 @@
 //! Version 4 is the only accepted format. Earlier segment versions are rejected
 //! before replay.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -2184,6 +2184,12 @@ pub struct WalWriter {
     states: Arc<Vec<Mutex<WalState>>>,
     disk: Arc<WalDiskState>,
     retirement_refs: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    /// Released segments whose deletion has not yet succeeded.
+    ///
+    /// A path lands here when it was still the current segment or its removal
+    /// failed; every later deletion pass retries it, so releasing the last
+    /// reference never loses the only record that the file must be removed.
+    deferred_deletes: Arc<Mutex<BTreeSet<PathBuf>>>,
     /// Physical WAL growth capability shared only by this writer's handles.
     volume: Option<Arc<crate::resources::WalVolume>>,
 }
@@ -2471,6 +2477,7 @@ impl WalWriter {
             states: Arc::new((0..16).map(|_| Mutex::new(WalState::default())).collect()),
             disk: Arc::new(WalDiskState::new(disk_dir, config.disk_limit_bytes)),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
+            deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
             volume,
         };
         writer.initialize_existing_stream()?;
@@ -2634,6 +2641,7 @@ impl WalWriter {
             states: Arc::clone(&self.states),
             disk: Arc::clone(&self.disk),
             retirement_refs: Arc::clone(&self.retirement_refs),
+            deferred_deletes: Arc::clone(&self.deferred_deletes),
             volume: self.volume.clone(),
         }
     }
@@ -3155,7 +3163,30 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Deletes released segments plus every earlier deferred deletion.
+    ///
+    /// The released paths join the shared deferred set before any file is
+    /// touched. Each pass then removes every deferred path that is no longer a
+    /// current segment; a still-current path or a failed removal stays
+    /// deferred for the next pass, so partial progress never loses a pending
+    /// deletion. Volume and disk accounting shrink only for removed files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a state or deferral lock is
+    /// poisoned, or the first removal or directory-sync failure after every
+    /// other deferred path has been attempted.
     fn delete_closed_segments(&self, segments: &[PathBuf]) -> Result<(), ScribeError> {
+        let pending = {
+            let mut deferred = self
+                .deferred_deletes
+                .lock()
+                .map_err(|_| ScribeError::Internal {
+                    detail: "WAL deferred deletion lock poisoned".to_owned(),
+                })?;
+            deferred.extend(segments.iter().cloned());
+            deferred.iter().cloned().collect::<Vec<_>>()
+        };
         let mut active = Vec::new();
         for state in self.states.iter() {
             let state = state.lock().map_err(|_| ScribeError::Internal {
@@ -3165,28 +3196,23 @@ impl WalWriter {
                 active.push(segment.path().to_path_buf());
             }
         }
-        for path in segments {
-            if active.iter().any(|active_path| active_path == path) {
+        let mut first_error = None;
+        for path in pending {
+            if active.iter().any(|active_path| active_path == &path) {
                 continue;
             }
-            if path.exists() {
-                let file_len = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
-                std::fs::remove_file(path).map_err(|error| ScribeError::Internal {
-                    detail: format!("WAL segment retirement failed: {error}"),
-                })?;
-                self.disk.subtract_bytes(file_len);
-                if let Some(parent) = path.parent() {
-                    let directory = File::open(parent).map_err(|error| ScribeError::Internal {
-                        detail: format!("failed to open retired WAL directory: {error}"),
-                    })?;
-                    directory
-                        .sync_all()
-                        .map_err(|error| ScribeError::Internal {
-                            detail: format!("failed to sync retired WAL directory: {error}"),
-                        })?;
+            match self.delete_segment_file(&path) {
+                Ok(()) => {
+                    self.deferred_deletes
+                        .lock()
+                        .map_err(|_| ScribeError::Internal {
+                            detail: "WAL deferred deletion lock poisoned".to_owned(),
+                        })?
+                        .remove(&path);
                 }
-                if let Some(volume) = &self.volume {
-                    volume.retire(file_len).map_err(resource_volume_error)?;
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "WAL segment deletion deferred for retry");
+                    first_error.get_or_insert(error);
                 }
             }
         }
@@ -3195,6 +3221,42 @@ impl WalWriter {
         // Reclaiming segment bytes is the one event that can end a disk-full
         // condition, so it is the one place the latch is re-evaluated.
         self.disk.recover_if_drained();
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Removes one closed segment file and returns its bytes to both owners.
+    ///
+    /// A missing file is already deleted. The disk ledger and governed WAL
+    /// volume release the file's bytes as soon as it is unlinked, then the
+    /// parent directory is synced; after a sync failure the next pass finds
+    /// the file gone and clears its deferral without releasing bytes twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the file cannot be removed or
+    /// its directory cannot be synced, or the volume release error.
+    fn delete_segment_file(&self, path: &Path) -> Result<(), ScribeError> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let file_len = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        std::fs::remove_file(path).map_err(|error| ScribeError::Internal {
+            detail: format!("WAL segment retirement failed: {error}"),
+        })?;
+        self.disk.subtract_bytes(file_len);
+        if let Some(volume) = &self.volume {
+            volume.retire(file_len).map_err(resource_volume_error)?;
+        }
+        if let Some(parent) = path.parent() {
+            let directory = File::open(parent).map_err(|error| ScribeError::Internal {
+                detail: format!("failed to open retired WAL directory: {error}"),
+            })?;
+            directory
+                .sync_all()
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("failed to sync retired WAL directory: {error}"),
+                })?;
+        }
         Ok(())
     }
 
@@ -5195,6 +5257,49 @@ mod tests {
         writer
             .retire_segments(std::slice::from_ref(&segment))
             .expect("retire");
+        assert_eq!(writer.bytes_on_disk(), directory_bytes(temp_dir.path()));
+    }
+
+    /// A released segment survives a skipped or failed deletion and is
+    /// removed by the next retirement pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if releasing the current segment deletes it, if a failed
+    /// removal forgets the path, or if a later empty pass leaves it on disk.
+    #[test]
+    fn released_segment_deletion_retries_until_it_succeeds() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().expect("temp dir");
+        let key = test_seal_key(crate::test_support::tenant());
+        let writer =
+            WalWriter::new(temp_dir.path(), [23; 16], 1, WalConfig::default()).expect("writer");
+        writer
+            .append_and_fsync_for_test(&key, [3; 16], b"data")
+            .expect("append");
+        let segment = WalReader::open_directory_unfiltered(temp_dir.path())
+            .expect("reader")
+            .segments
+            .first()
+            .expect("segment")
+            .reference();
+        writer
+            .retire_segments(std::slice::from_ref(&segment))
+            .expect("current segment release");
+        assert!(segment.path.exists(), "the current segment is never deleted");
+        writer
+            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
+            .expect("close");
+        let shard_dir = segment.path.parent().expect("shard directory");
+        std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only shard directory");
+        let refused = writer.retire_segments(&[]);
+        std::fs::set_permissions(shard_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("writable shard directory");
+        refused.expect_err("removal from a read-only directory fails");
+        assert!(segment.path.exists());
+        writer.retire_segments(&[]).expect("retry pass");
+        assert!(!segment.path.exists(), "the deferred deletion was retried");
         assert_eq!(writer.bytes_on_disk(), directory_bytes(temp_dir.path()));
     }
 

@@ -1838,6 +1838,9 @@ pub struct ScribeWalIoPool {
     /// Retire operations submitted through the production lane in unit tests.
     #[cfg(test)]
     retire_submissions: Arc<AtomicU64>,
+    /// Sync operations submitted through the production lane in unit tests.
+    #[cfg(test)]
+    sync_submissions: Arc<AtomicU64>,
 }
 
 impl ScribeWalIoPool {
@@ -1896,6 +1899,8 @@ impl ScribeWalIoPool {
             capacity,
             #[cfg(test)]
             retire_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            sync_submissions: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1906,6 +1911,10 @@ impl ScribeWalIoPool {
         #[cfg(test)]
         if matches!(&operation, ScribeWalIoOp::RetireWal { .. }) {
             self.retire_submissions.fetch_add(1, Ordering::AcqRel);
+        }
+        #[cfg(test)]
+        if matches!(&operation, ScribeWalIoOp::SyncWal { .. }) {
+            self.sync_submissions.fetch_add(1, Ordering::AcqRel);
         }
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -2000,6 +2009,12 @@ impl ScribeWalIoPool {
     #[cfg(test)]
     pub(crate) fn retire_submissions_for_test(&self) -> u64 {
         self.retire_submissions.load(Ordering::Acquire)
+    }
+
+    /// Returns sync submissions observed at the production WAL lane boundary.
+    #[cfg(test)]
+    pub(crate) fn sync_submissions_for_test(&self) -> u64 {
+        self.sync_submissions.load(Ordering::Acquire)
     }
 }
 

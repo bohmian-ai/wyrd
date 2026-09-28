@@ -464,6 +464,29 @@ Tenant fairness is owned separately by per-tenant FIFO and weighted
 round-robin admission, scheduled pod-locally: tenant slot caps are local
 scheduling caps rather than cluster quotas. Grants are tenant-blind.
 
+Busy slots are ordinary saturation, not overload. An authorized, executable
+query waits for a slot in the tenant-fair queue, which holds at most 1,000
+waiting queries per Oracle node across both classes; running queries hold no
+waiting place. Both classes share one timeout policy: a one-hour maximum queue
+wait (`WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS`) and a two-hour default total
+deadline (`WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS`) that a valid caller
+`deadline_ms` replaces. A waiter stops at the earlier of queue entry plus the
+queue limit and the leader's total deadline, with `QueryTimeout`; queue wait
+consumes total time and dequeue starts no new timer. Only the 1,001st waiter is
+refused, as a retryable query-admission overload with reason `queue_full`. A
+class with no executable capacity on the pod is refused immediately. Public
+HTTP queries bypass the server's global load-shed and request-concurrency
+layers so they reach this queue; gRPC reaches it directly.
+
+Snapshot preparation has no admission gate of its own. Concurrent table
+lookup, metadata load, reader guard, revalidation, and hot-cut work wait on the
+bounded runtime PostgreSQL pool within the leader deadline, and each substep is
+timed on `oracle_query_phase_seconds` beside the pool's acquire histogram.
+Remote peer work reuses one authenticated channel per ready peer incarnation and
+endpoint; a changed fence or endpoint connects anew and never inherits the
+prior peer's channel. Connect, fragment open, first remote frame, and terminal
+are timed as separate phases.
+
 An Analytical leader selects at most `max_workers_per_query` remote workers from
 the pinned eligible cut, rotating the starting position by the attempt identity
 so selection is deterministic, stable across re-projection of the same roster,

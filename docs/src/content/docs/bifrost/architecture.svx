@@ -168,7 +168,7 @@ Multiple Forge pods race for `(namespace, table)` leases via `vala.maintenance_l
 ### Bounded queues and backpressure
 
 - Scribe seal queue: bounded capacity. New appends return `429_INGEST_BUSY` when queue full (seal stalled).
-- Oracle query admission: bounded concurrency per pod.
+- Oracle query admission: bounded slots per pod. A query that finds every slot busy waits in a tenant-fair queue of up to 1,000 queries per pod, for at most one hour and within its total deadline (two hours unless the request sets `deadline_ms`). Expiry returns a query timeout; only a full queue returns the retryable `429 WYRD_VALA_429_QUERY_ADMISSION_REJECTED`.
 
 ## Durability and failure handling
 

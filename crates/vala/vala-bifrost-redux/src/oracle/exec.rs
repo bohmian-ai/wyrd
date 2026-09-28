@@ -1088,9 +1088,13 @@ impl OracleIcebergScanExec {
             tasks
         };
         let tasks = futures_util::stream::iter(tasks.into_iter().map(Ok));
+        // Row selection turns each task predicate into a page-index selection,
+        // so a point lookup decodes the matching pages instead of every page
+        // of each surviving row group. The reader defaults it off.
         let metrics = self
             .table
             .reader_builder()
+            .with_row_selection_enabled(true)
             .build()
             .read(Box::pin(tasks.map_ok({
                 let metrics = Arc::clone(&self.metrics);

@@ -7,8 +7,6 @@ use axum::error_handling::HandleErrorLayer;
 use axum::extract::Request;
 use axum::middleware;
 use tower::ServiceBuilder;
-use tower::limit::ConcurrencyLimitLayer;
-use tower::load_shed::LoadShedLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing::Span;
@@ -168,8 +166,9 @@ fn request_span(request: &Request) -> Span {
 ///   1. attach_request_id — mints/propagates ID; injects instance into errors
 ///   2. CatchPanic — converts panics to 500 before they escape the stack
 ///   3. HandleErrorLayer — maps BoxError (Elapsed, Overloaded) → HTTP response
-///   4. LoadShed — sheds requests when ConcurrencyLimit is not ready
-///   5. ConcurrencyLimitLayer — caps in-flight requests
+///   4-5. EdgeCapacity — load-sheds requests beyond the in-flight concurrency
+///      cap; `POST /v1/query` bypasses both and waits in Oracle's bounded
+///      query queue instead
 ///   6. EdgeTimeout — enforces the per-request deadline; `POST /v1/query`
 ///      hands its remaining wait to the Oracle query deadline after admission
 ///   7. WyrdBodyLimit — enforces max body size
@@ -182,8 +181,11 @@ where
         .layer(HandleErrorLayer::new(
             crate::http::error::map_tower_error_to_wyrd,
         ))
-        .layer(LoadShedLayer::new())
-        .layer(ConcurrencyLimitLayer::new(state.limits.concurrency))
+        .layer(
+            crate::http::middleware::edge_capacity::EdgeCapacityLayer::new(
+                state.limits.concurrency,
+            ),
+        )
         .layer(crate::http::middleware::edge_timeout::EdgeTimeoutLayer::new(state.limits.timeout))
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,

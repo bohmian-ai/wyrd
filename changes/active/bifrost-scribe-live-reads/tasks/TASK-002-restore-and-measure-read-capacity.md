@@ -4,7 +4,7 @@ title: Restore Bifrost read capacity and prove it with understandable OLAP bench
 kind: implementation
 status: proposed
 spec: SPEC-bifrost-scribe-live-reads
-spec_revision: 5
+spec_revision: 11
 requirements: [REQ-008, REQ-009]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006]
 acceptance: [AC-009, AC-010, AC-011]
@@ -18,8 +18,9 @@ one 4-CPU/8-GiB Bifrost node can actually serve for point reads, aggregates,
 scans, live reads, and concurrent writes. The query path no longer turns away
 ordinary reads because only two catalog snapshots may be opened at once.
 When Oracle's execution slots are busy, up to 1,000 authorized queries wait
-until their leader deadline instead of being rejected after 250 ms. Remote
-peer work no longer opens a TLS connection per fragment. The result is
+up to one hour, bounded by their leader-owned total deadline, instead of being
+rejected after 250 ms. Remote peer work no longer opens a TLS connection per
+fragment. The result is
 complete only when valid measurements meet REQ-008; a passing correctness gate
 or a fast percentile calculated only from the few accepted queries is not a
 performance pass.
@@ -65,6 +66,8 @@ cannot substantiate Q1–Q5 or the requested scan rates. The current benchmark
 implementation is difficult to review: `load/capacity/run.rs` alone is about
 1,875 lines. Rewrite its orchestration for plain, named workloads and reports
 while reusing the working launch, client, rate driver, and metric capture.
+The required report columns and pass criteria are defined below so the
+benchmark cannot silently substitute its old short-query target.
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
@@ -85,16 +88,18 @@ while reusing the working launch, client, rate driver, and metric capture.
   below that bound is never a 429. A class with no executable capacity on
   this pod is unavailable, rather than a query that can gain capacity by
   waiting. Preserve the existing tenant fairness and Interactive floor.
+- Interactive and Analytical share one timeout policy: one-hour maximum queue
+  wait and two-hour default total deadline. A valid caller `deadline_ms`
+  overrides only the total deadline. No execution timer starts at dequeue.
 - The Bifrost child is a **local Linux process** launched by
   `BifrostProcessCluster::start_benchmark` in the existing 4-CPU/8-GiB systemd
   user cgroup. PostgreSQL and the public client driver stay outside it. Docker
   is used only by repository-managed PostgreSQL. Verify the actual child
   cgroup before every full run. A remote-Scribe case uses another ordinary
   process-cluster child; report each child's resources separately.
-- Keep `bench:bifrost:query-capacity` opt-in and outside normal CI. Keep the
-  existing four short-read offers as a comparable diagnostic, but label their
-  published/live placement honestly. Add the class and mixed-workload runs
-  below; do not treat one query shape as an OLAP benchmark.
+- Keep `bench:bifrost:query-capacity` opt-in and outside normal CI. Replace
+  the existing short-query-only run with the named analytical workloads below;
+  keep its old report only as historical evidence.
 - No change to public query request, source-selection semantics, query class,
   write acknowledgement timing, signed peer assignments, TLS verification, or
   security checks. Do not make snapshot protection weaker to buy throughput.
@@ -106,26 +111,36 @@ while reusing the working launch, client, rate driver, and metric capture.
    `planning_permits` config/default/validation/wiring. Let the already bounded
    runtime PostgreSQL pool wait for a connection within the leader's query
    deadline; retain Oracle's existing tenant-fair query admission for
-   execution. A pool wait that reaches the leader deadline is a query
-   timeout. Preserve the prepare/guard/
-   revalidate/materialize order and the existing promotion-race proof.
+   execution. Trace the path from public query entry through snapshot pin and
+   admission, and remove every caller that maps `try_planning` saturation to a
+   public rejection. A pool wait that reaches the leader deadline is a query
+   timeout; cancellation releases the pending pool acquisition. Preserve the
+   prepare/guard/revalidate/materialize order and the existing promotion-race
+   proof. No second semaphore replaces the deleted one.
 2. **Use the queue for ordinary saturation.** Change the existing Oracle
-   queue default from 64 to 1,000 waiting queries per node. Delete the
-   separate `max_queue_wait_ms` 250 ms setting, its translation/wiring, and
-   the `min(enqueue + max_queue_wait, leader_deadline)` cutoff; wait only to
-   the leader deadline. The existing default is 30 seconds, and a valid
-   caller `deadline_ms` replaces it for the whole query. Queue wait consumes
-   that budget; dequeuing does not grant a new execution timer. A full
-   1,000-place queue returns the existing
-   retryable query-admission overload with an explicit queue-full reason.
-   Do not add a second query queue or silently retry inside the SDK. Keep
+   queue default from 64 to 1,000 waiting queries per node. Retain the
+   existing queue-wait cutoff and set `max_queue_wait_ms` to 3,600,000 by
+   default. Make Oracle's default total query deadline 7,200,000 ms; a valid
+   caller `deadline_ms` replaces it for that query. Set both defaults through
+   the server's Oracle runtime configuration, expose them through
+   `WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS` and
+   `WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS`, and reject zero or
+   unrepresentable values at configuration load. Apply the same values to
+   both classes. A waiter stops at the earlier of queue entry plus its queue
+   limit and the leader's total deadline. Queue wait consumes total time;
+   dequeuing does not grant a new execution timer. A full
+   1,000-place queue returns the existing retryable query-admission overload
+   with an explicit queue-full reason. Keep the existing queue, waiter cleanup,
+   tenant fairness, and admission telemetry; change their limits and error
+   classification, not their ownership. Do not add a second query queue or
+   silently retry inside the SDK. Keep
    deadline/cancellation cleanup, fairness, and the class that cannot run on
    this node as distinct paths. Route public HTTP queries around the global
    `LoadShedLayer` and global 1,024-request `ConcurrencyLimitLayer` that can
    shed an otherwise queueable query before Oracle; keep those protections on
    unrelated routes. The query route's long-lived wait is bounded by Oracle's
-   1,000 places and leader deadline. gRPC already reaches Oracle directly;
-   verify its transport and client deadlines do not end a query earlier than
+   1,000 places and the earlier queue/total deadline. gRPC already reaches
+   Oracle directly; verify its transport and client deadlines do not end a query earlier than
    the accepted leader deadline. Capture queue-full separately in telemetry.
 3. **Measure snapshot cost before changing its correctness logic.** Report
    time in table identity lookup, Iceberg metadata load, reader guard,
@@ -135,6 +150,9 @@ while reusing the working launch, client, rate driver, and metric capture.
    proof that any one substep is redundant. Remove duplicate work only when a
    trace and the promotion-race tests prove the same protected cut is kept.
    If none is redundant, retain the ordering and report its cost honestly.
+   Use the same request/trace identity across these spans so one slow client
+   result can be matched to its server phases. Keep metric labels bounded to
+   phase and outcome, never tenant, table, SQL, or query ID.
 4. **Reuse remote peer connections.** Replace `Endpoint::connect().await` in
    `oracle/dispatcher.rs`'s per-fragment client creation with a reusable tonic
    `Channel` for each ready peer, following existing channel reuse in Scribe
@@ -143,17 +161,37 @@ while reusing the working launch, client, rate driver, and metric capture.
    inherit the prior peer's authority. Time connection establishment,
    fragment-open RPC, first remote batch, and final terminal separately.
    Do not attribute the observed 40 ms live difference to TLS until those
-   measurements show it.
+   measurements show it. Delete the old connect-per-fragment path once the
+   reused transport passes the changed-peer and cancellation cases.
 5. **Make the benchmark understandable and valid.** Keep its existing public
    client, `FixedRateDriver`, process-cluster launch, PostgreSQL setup, and
    production recorder. Put a short, readable case list (name, SQL,
    intended rows examined, expected result, target) and one visible run
    sequence at its entry point: start, seed, validate, warm up, measure,
-   validate, report. Remove obsolete and duplicate orchestration from
-   `load/capacity/run.rs`; do not add generic workload infrastructure.
-   Preserve raw samples and add the actual pod logs and fixture geometry.
-6. **Run and diagnose, then optimize only measured costs.** First rerun the
-   four comparable short-read rows; then execute the class and mixed suites.
+   validate, report. Extend the existing `load/capacity/workload.rs` as the
+   single source for fixture rows, SQL, and exact expected answers. Keep
+   `schedule.rs` responsible for client launches and timings; keep
+   `run.rs` responsible for the visible sequence and report. Remove obsolete
+   and duplicate orchestration from `run.rs`; do not add generic workload
+   infrastructure or a second percentile implementation. Generate
+   deterministic rows in bounded batches through the public write API for
+   each fresh process cluster. Treat the standard 10-million-row seed as the
+   ingest benchmark: record acknowledged rows/bytes, batch
+   latency, and completed file shape during the seed. Do not seed a second
+   standalone write fixture. Do not create a cached Parquet seed
+   file: it would still require public ingest, publication, and catalog setup
+   on each run and would make input validation harder. Record setup/seed/
+   publication time separately from measured windows. Preserve raw client
+   samples and add the actual pod logs, metric snapshots, and fixture geometry.
+   The report computes every field in the metric contract below from those
+   saved observations; no hand-entered performance numbers.
+6. **Measure normal OLAP scans.** Run the named aggregates and full scan
+   through the public query path over published Parquet. Use Oracle's existing
+   physical-byte counter and report the actual files and scan time; do not add
+   decoded-byte counters, a forced file layout, or a second read path. Extend
+   the same fixture to 100 million rows for the separate heavy qualification.
+7. **Run and diagnose, then optimize only measured costs.** Execute the
+   standard suite first and the heavy qualification separately.
    Attribute each failure to client scheduling, PostgreSQL wait, catalog
    pinning, Oracle admission, peer open, DataFusion execution, CPU, memory,
    storage, or result correctness using raw evidence. Replace the `any CPU
@@ -162,77 +200,85 @@ while reusing the working launch, client, rate driver, and metric capture.
    insufficient. If the target is missed after steps 1–4, profile the measured
    hot path and fix its root cause in this task; do not raise an unrelated
    permit count, claim a passed benchmark, or add a cache without evidence.
+   After a fix, rerun the affected workload at the same client concurrency,
+   offer rate, fixture geometry, and cgroup; compare both throughput and
+   latency before accepting a claimed gain.
 
 ## Benchmark Contract
 
-Use one registered `vala.datasets` events table with an integer `event_id`,
-tenant, event time, service, numeric duration, and a deterministic 16-byte
-payload that varies by ID so the scan cannot be satisfied by a repeated
-constant; seed deterministically through the public write API. The Q5 query
-must actually read that payload column. Use a second registered table for
-concurrent writes so the fixed read fixture and expected answers remain stable;
-sample read-back from that write table. Full analytical fixture:
-100,000,000 events over ten UTC days starting 2026-01-01, ten million per
-day, with `event_id` from 0 to 99,999,999, `tenant_id = 1`,
-`service_id = event_id % 100`, `duration_ms = event_id % 1000`, and
-`event_time = start_of_its_day + floor((event_id % 10,000,000) * 86,400 /
-10,000,000) seconds`. Generate the 16-byte payload as
-the lower-case hexadecimal representation of a fixed, wrapping 64-bit mix of
-`event_id`; its exact mix and expected digest live beside the SQL in the
-fixture source. Seed in bounded batches, publish before
-read-only windows, and record actual files, row groups, compressed bytes,
-time ranges, and Iceberg snapshot for *each* window. A small smoke fixture uses
-the same SQL and exact-result rules at reduced row count; smoke is never
-performance evidence. If publication/compaction changes file geometry during
-a read-only comparison, invalidate and rerun that comparison. Use private
-fixture roots on local NVMe; check free space before seeding. Do not silently
-shrink the full fixture to avoid a failed target.
+One command, `mise run bench:bifrost:query-capacity`, runs the standard suite
+through `wyrd_client::Bifrost` against a local `BifrostProcessCluster` child
+limited to 4 CPUs and 8 GiB. PostgreSQL and the driver remain outside that
+limit. Use Wyrd's existing object-store configuration, local by default. The
+same benchmark may later be rerun with an existing cloud-storage setting; no
+benchmark-specific storage mode or read path is needed.
 
-| Case | Public SQL shape and data examined | Required result and target |
+Seed one registered `vala.datasets.events` table with 10 million deterministic
+events through the public write API, then publish it before read-only tests.
+Fields are `event_id`, `tenant_id`, `event_time`, `service_id`, `duration_ms`,
+and a varying payload. Keep SQL and exact expected answers together in the
+fixture. Use a second registered table for concurrent writes so read results
+stay stable. Record actual row count, file count, compressed bytes, and setup
+time. The seed itself measures batched durable-acknowledgment throughput.
+
+| Workload | What runs | What it proves |
 | --- | --- | --- |
-| Q0 trivial | `SELECT event_id FROM vala.datasets.events WHERE event_id = 0 LIMIT 1` | Exact row 0; p95 <20 ms; report QPS, no invented scan count. |
-| Q1 selective | `SELECT event_id, service_id, duration_ms FROM vala.datasets.events WHERE tenant_id = 1 AND event_id = ? LIMIT 1`; rotate existing IDs across all ten days | Exact one row; >1,000 successful/s, p95 <=25 ms. Report 5,000/s separately as stretch. |
-| Q2 small aggregate | `SELECT service_id, count(*) FROM vala.datasets.events WHERE tenant_id = 1 AND event_time >= ? AND event_time < ? GROUP BY service_id`; 00:00–00:15 UTC on day one | Exact per-service counts; >=100 successful/s, p95 <=100 ms. |
-| Q3 medium | `SELECT service_id, count(*), avg(duration_ms) FROM vala.datasets.events WHERE event_time >= ? AND event_time < ? GROUP BY service_id`; 00:00–02:24 UTC on day one, exactly one million rows | Exact aggregate; >=20 successful/s, p95 <=200 ms. |
-| Q3b 10M | Same SQL over one complete 10-million-row day | Exact aggregate; p95 <=300 ms; report sustainable QPS. |
-| Q4 large window | `SELECT date_trunc('hour', event_time), count(*), avg(duration_ms) FROM vala.datasets.events WHERE tenant_id = 1 AND event_time >= ? AND event_time < ? GROUP BY 1`; days one through seven | Exact buckets; p95 <=500 ms. |
-| Q5 full scan | `SELECT count(*), sum(duration_ms), sum(length(payload)) FROM vala.datasets.events` over all 100 million events | Exact result `(100000000, 49950000000, 1600000000)`; each completion <2 s; physical scan >=500 MB/s and examined rows/sec reported from the known fixture. |
-| Mixed analytical | Q1 70%, Q2 20%, Q3 9%, Q4 1%, scheduled in a deterministic repeating 100-request cycle; writes to the second table acknowledged concurrently | >=100 successful reads/s, >=100,000 acknowledged rows/s, p50 <50 ms, p95 <=200 ms, p99 <=500 ms, peak pod memory <7 GiB, no OOM; exact read-back of every acknowledged batch after the window. |
+| Selective read | One existing event by ID, rotated across the table | Client round-trip cost and selective-read capacity; report separately from OLAP results. |
+| Small aggregate | Filter about 100,000 events and `GROUP BY service_id` | Common dashboard query latency and QPS. |
+| Medium aggregate | The same `GROUP BY` over about 1 million events at eight clients, then 10 million at one client | Analytical execution at two useful scales without a new query shape. |
+| Broad time window | Group the 10-million-row day into hourly buckets | Time-range aggregation. |
+| Full scan | Aggregate all 10 million events and reference the varying payload | Physical Parquet scan bytes/s and end-to-end scan time. |
+| Batched ingest | The public 10-million-row seed | Durable rows/s, input bytes/s, batch p95, CPU, and memory. |
+| Reads during ingest | Repeat four small aggregates and one 1-million-row aggregate while writing to the second table | Whether sustained writes degrade ordinary analytical reads. |
+| Remote live read | One held-live interval with the Scribe in the second process-cluster child | Whether distributed live reading holds a real Oracle slot and affects other reads. |
 
-For Q1–Q4, do not call returned rows “rows examined.” Use known fixture
-selectivity only where exact, or report the value unavailable. Use the existing
-`oracle_query_bytes_scanned_total` for physical bytes; never infer physical
-scan throughput from logical table size. Q5's >=500 MB/s target applies to a
-scan window, not to a point lookup or idle interval. The report must also
-state the user-supplied good/excellent reference ranges for the other classes
-without converting them into fabricated passes.
+Every query checks its exact result and successful terminal. Failed, wrong,
+rejected, timed-out, or late results never count as successful QPS. Measure
+client-send-to-complete p50/p95/p99, successful QPS with client concurrency,
+physical scan bytes/s for scans, server CPU, peak memory, and rejection counts.
+For ingest, measure acknowledged rows/s, input bytes/s, batch p95, and
+committed file count and average size. Save raw client samples, server logs,
+existing phase telemetry, cgroup CPU/memory samples, and fixture geometry.
+Do not add a new telemetry catalog or duplicate counters just for the report.
+The human report has one row per workload and concurrency, with a plain
+PASS/FAIL/INVALID reason.
 
-Use 5 seconds warmup and 30 seconds measurement for each class/concurrency
-pair, except Q5 uses 60 seconds measurement to obtain useful single-client
-samples. The full sweep is about 40 minutes of timed windows before seeding,
-the four comparison rows, and live/mixed runs; state the total expected time
-before launch. Run each read class at client concurrency 1, 4, 8, 16, 32, 64,
-and 100. For each, record sent,
-completed Success/Degraded/Failed, wrong result, deadline, refusal by source,
-missed launches, client-send-to-first-row and client-send-to-terminal
-p50/p95/p99, actual success QPS, physical scan bytes/second, CPU usage and
-throttle fraction, memory peak/OOM, pool wait, and Oracle slot occupancy.
-State the last useful concurrency before p95 rises sharply without material
-QPS gain; show the raw curve, not just a winner. The fixed-rate 500/1,000/s
-offers remain a 15-second-warmup/60-second-measurement comparison. Add a
-1,500/s Q1 offer to substantiate the >1,000/s target, and attempt 5,000/s
-only if the driver can offer it without missed launches.
+Sweep only the selective read and small aggregate at client concurrency
+1, 4, 8, 16, 32, and 64. Use 2 seconds warmup plus 10 seconds measurement
+for each of those 12 windows (2 minutes 24 seconds total). Run the
+one-million-row aggregate at eight clients and the ten-million-row aggregate
+at one client, each in one 2+10-second window; run the broad-window and full-scan
+queries three times each at one client. Use one 2+10-second remote-live
+window. Run the read-only mixed baseline and concurrent-write mixed case at
+the same read offer and concurrency, each for 2 seconds warmup plus 30 seconds
+measurement. This is about four minutes of fixed windows plus six analytical
+completions; report the actual duration of each setup and measurement phase.
+Aim for about 10–15 minutes for the standard run after the release binary is
+built. A longer run reports its actual time and last completed phase; do not
+hide setup time or pretend a partial result passed.
 
-For live rows, preflight the exact live query and verify that each held stream
-occupies an Interactive slot for the whole 5-second interval; rejected or
-already completed holders invalidate the row. Test both local and remote
-Scribe placement with the same data and query. Separate client time, snapshot
-time, Oracle admission wait, peer connection, stream-open, and first-batch
-time. Run mixed read/write *simultaneously* on the one limited node, with
-staging/publication active and enough local volume capacity to complete the
-window. If WAL fills, query read-back fails, or writes miss their required
-rate, mark the run failed and save the pod logs. Do not retry refusals in the
-driver or turn post-window drain completions into in-window QPS.
+The separate heavy-scan qualification uses the same fixture schema and
+generator in a fresh process cluster, seeds 100 million published rows
+through public ingest, then runs the broad time-window
+aggregate over about 70 million and the full scan over all 100 million.
+It checks the existing <2-second completion and >=500 MB/s physical-scan
+targets through the same public query path. Invoke the existing benchmark
+command with `WYRD_BENCH_HEAVY_SCAN=1` to run this qualification instead of
+the standard suite; the ordinary command runs the standard suite. The heavy
+qualification is required before claiming the heavy-scan targets pass, but
+is not repeated for every quick capacity check. At the minimum passing write
+rate, its 100-million-row seed alone takes at least 16 minutes 40 seconds.
+Report its actual seed, publication, query, and total times separately.
+
+A missed target is a measured failure. Profile that query or write path and
+fix the observed cause; a file-layout experiment, projection/pruning test, or
+extra offer rate belongs in that focused diagnosis, not in every standard
+benchmark run. Do not infer scanned bytes from fixture size or returned rows;
+use the existing Oracle physical-byte counter. Do not call returned rows
+"rows examined." For mixed mode, compare each class's p95 with its matching
+read-only run at the same offer and concurrency. Held live streams must actually
+remain admitted during their stated interval. A refused holder invalidates the
+remote-live result.
 
 ## Ordered Implementation Scenarios
 
@@ -260,40 +306,53 @@ sequence and existing Oracle execution admission.
 **REFACTOR.** Delete dead permit fields, defaults, validations, and config
 docs rather than keeping a second admission knob.
 
-### Scenario 2 — A busy Oracle queues valid work until the leader deadline
+### Scenario 2 — Both query classes share queue and total time limits
 
 **Behavior.** Busy execution slots place authorized, executable queries in
 the existing tenant-fair queue. The queue holds 1,000 waiters. A waiter can
-remain more than 250 ms if its leader deadline allows; at that deadline it
-receives `QueryTimeout` and leaves no retained state. Query 1,001 receives
-the explicit queue-full overload; cancellation also frees a place. HTTP and
-gRPC see the same rule without an earlier HTTP load-shed response.
+remain more than 250 ms. Both classes use the same one-hour queue limit and
+two-hour default total deadline. A caller `deadline_ms` overrides only total
+time. The earlier limit ends queueing with `QueryTimeout` and no retained
+state; dequeue does not restart total time. Query 1,001 receives the explicit
+queue-full overload; cancellation also frees a place. HTTP and gRPC see the
+same rule without an earlier HTTP load-shed response.
 
 **RED.** Add
-`oracle::admission::tests::queued_queries_use_leader_deadline_and_one_thousand_places`
+`oracle::admission::tests::queued_queries_obey_queue_and_total_deadlines_and_one_thousand_places`
 to the existing `vala-bifrost-redux` lib-test owner. The current 64-place
-limit and 250 ms timer must fail its 1,000-place and >250 ms assertions.
+limit and 250 ms timer must fail its 1,000-place and >250 ms assertions. Use
+short injected durations to prove queue expiry before total expiry, total
+expiry before queue expiry, release after cancellation, and both query classes
+without waiting an hour in a test. Also verify the 1-hour/2-hour production
+defaults and both environment overrides in server config tests.
 Focused command:
-`mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::admission::tests::queued_queries_use_leader_deadline_and_one_thousand_places)'`.
+`mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::admission::tests::queued_queries_obey_queue_and_total_deadlines_and_one_thousand_places)'`.
 Add `capacity::saturated_query_waits_on_http_and_grpc` to the existing
 `wyrd-testing` Oracle real-server journey target; occupy all executable
 slots, submit one more valid query through each public transport, then free
-capacity after 250 ms and assert valid terminals. Its no-slot-before-deadline
-variant must time out; neither variant may return an HTTP edge 503 or a
-capacity 429. Focused command:
+capacity after 250 ms and assert valid terminals. With small test-only
+configured limits, separately force queue expiry and total deadline expiry;
+both must time out without an HTTP edge 503 or a capacity 429. Confirm that
+time spent queued reduces the remaining execution time and that both classes
+use the same policy. Focused command:
 `scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -E "test(=capacity::saturated_query_waits_on_http_and_grpc)" --run-ignored=all'`.
 
-**GREEN.** Set the existing Oracle queue bound to 1,000, remove the separate
-queue timer, and make full-queue overload distinct from deadline expiry.
+**GREEN.** Set the existing Oracle queue bound to 1,000, retain its queue-wait
+cutoff, set the default queue and total limits, and make full-queue overload
+distinct from either deadline expiry. Wire both settings through the existing
+server configuration and Oracle boot path.
 Keep other routes' edge protection but let public query requests reach the
-Oracle queue without earlier global HTTP shedding. Check the Rust, Python,
-and TypeScript clients' synchronous query timeouts against the leader
-deadline. Run a full-queue process-cluster case on 4 CPUs/8 GiB; the 1,000
+   Oracle queue without earlier global HTTP shedding. Check the Rust, Python,
+   and TypeScript clients' synchronous query timeouts against the accepted
+   total deadline, including the two-hour default. A transport timeout must
+   not silently end an otherwise valid queued query. Run a full-queue
+   process-cluster case on 4 CPUs/8 GiB; the 1,000
 waiters must remain below 7 GiB and cancel/release promptly.
 
-**REFACTOR.** Delete `max_queue_wait_ms` and its tests/docs/config plumbing;
-keep the one tenant-fair Oracle queue. Do not replace the 250 ms cap with a
-different hidden timer or a second queue.
+**REFACTOR.** Keep the one tenant-fair Oracle queue and the existing
+`min(total deadline, queue entry + max queue wait)` rule. Remove old 250 ms
+and 30-second defaults and descriptions; add no class-specific timer or
+second queue.
 
 ### Scenario 3 — The report names the actual bottleneck
 
@@ -337,47 +396,76 @@ channel setup; reuse the established Scribe-listing pattern where applicable.
 
 ### Scenario 5 — Every benchmark row means what its label says
 
-**Behavior.** Q0–Q5 exact results, fixture size, file geometry, offered rate,
+**Behavior.** Every named workload checks its exact result, fixture size,
+physical scan bytes where relevant, offered rate,
 held-live occupancy, cgroup limits, and simultaneous writes are checked
 before a row can be valid. A wrong result or failed read-back fails the run.
 The top-level driver reads as a short sequence of named cases and stages.
 
 **RED.** Add
 `load::capacity::run::tests::invalid_capacity_rows_never_count_as_success`
-for a rejected live holder, changed file geometry, wrong aggregate, missed
-offer, and failed read-back; each must invalidate its row. The CPU case is
-covered by Scenario 2. Focused command:
+for a rejected live holder, wrong aggregate, missed offer, failed read-back,
+missing p50/p95/p99 or QPS concurrency, missing scan bytes, and mixed p95 at
+least 20% above its matching read-only baseline. Invalid measurements must be
+INVALID; a valid measurement that misses a target must be FAIL. Assert that
+the human report includes the read metrics, W1 rows/s,
+input bytes/s and p95 acknowledgment time, CPU/memory, and the exact PASS/
+FAIL/INVALID reason. The CPU case is covered by Scenario 3. Focused command:
 `mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=load::capacity::run::tests::invalid_capacity_rows_never_count_as_success)'`.
-Exercise a short process-cluster smoke through
-`WYRD_BENCH_WARMUP_SECONDS=2 WYRD_BENCH_MEASURE_SECONDS=5 mise run bench:bifrost:query-capacity`;
-prove it uses the public client and local Linux child.
+Prove the full benchmark uses the public client and local Linux child.
 
 **GREEN.** Reuse the existing harness, driver, recorder, and cgroup capture;
 replace the rejected orchestration with the named workload table and visible
-run order. Run the full concurrency sweep, four comparable fixed-rate rows,
-valid local and remote live cases, and simultaneous read/write window.
+run order. Generate the fixture through public writes in bounded batches;
+record setup time separately. Run the selective and small-aggregate concurrency
+sweeps, the named analytical queries, the public-ingest seed, one remote-live
+case, a matching read-only baseline, and simultaneous reads and writes.
 
 **REFACTOR.** Delete old one-query-only assumptions and duplicate report/
 fixture logic. Keep SQL, expected result, and target together so a reviewer
 can inspect a case without following a generic workload graph.
 
-### Scenario 6 — Meet and substantiate the performance targets
+### Scenario 6 — Heavy scans use the ordinary query path
 
-**Behavior.** The full fixture on the specified hardware meets AC-010 with
-valid results and a bottleneck profile. The report identifies the first
+**Behavior.** The separate 100-million-row qualification reports exact
+broad-window and full-scan answers, measured physical scan bytes, client
+completion time, CPU, memory, and its seed/publication duration. Missing
+scan bytes or a wrong answer cannot pass the scan target.
+
+**RED.** Add
+`load::capacity::run::tests::heavy_scan_requires_exact_result_and_physical_bytes`
+to the existing `wyrd-testing` lib-test owner. A wrong count, missing physical
+byte counter, or missing seed duration must invalidate the heavy result.
+Focused command:
+`mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E 'test(=load::capacity::run::tests::heavy_scan_requires_exact_result_and_physical_bytes)'`.
+
+**GREEN.** Reuse the standard fixture generator for a fresh 100-million-row
+public ingest, then run the two heavy SQL
+queries through the existing client and process cluster, and calculate scan
+rate from Oracle's physical-byte counter and each query's completion time.
+Keep the heavy timing separate from the standard suite.
+
+**REFACTOR.** Reuse the standard report format and remove benchmark-only
+layout and projection machinery.
+
+### Scenario 7 — Meet and substantiate the performance targets
+
+**Behavior.** The standard suite and separate heavy qualification on the
+specified hardware meet AC-010 with valid results. The report identifies the first
 measured limit for every miss and does not claim success from fast accepted
 queries while most offers are refused.
 
 **RED.** The current full report is red: Q1 cannot reach 500/s, held-live
-rows are invalid, Q2–Q5 are absent, concurrent read/write is absent, and
-read-back failed. Retain that baseline alongside the new run. A failure of
-any required target remains red rather than being recast as “benchmark
-implemented.”
+rows are invalid, analytical workloads and heavy scans are absent, concurrent
+read/write is absent, and read-back failed. Retain that baseline alongside
+the new run. A failure of any required target remains red rather than being
+recast as “benchmark implemented.”
 
-**GREEN.** Run the complete opt-in benchmark on this machine, capture raw
-evidence, profile any measured hot path, and make the minimum root-cause
-change needed for every remaining required target. Rerun the affected case
-and full suite after each change. Keep all correctness journeys green.
+**GREEN.** Run the standard suite and heavy qualification on this machine,
+capture raw evidence, profile any measured slow path, and make the minimum root-cause
+change needed for every remaining required target. Rerun affected benchmarks
+after each change and both complete modes before presenting final performance
+evidence. Keep all correctness journeys green.
 
 **REFACTOR.** Delete any temporary probes or optimization bypasses. Retain
 only reusable production telemetry and the readable benchmark evidence.
@@ -388,21 +476,41 @@ only reusable production telemetry and the readable benchmark evidence.
    waiting uses the leader deadline and PostgreSQL's existing bounded pool.
    Snapshot promotion, tenant protection, cancellation, and execution
    admission still pass their journeys.
-2. The default Oracle queue holds 1,000 waiters across classes; its only
-   waiting clock is the leader deadline. Saturation below 1,000 produces no
-   early HTTP, gRPC, planning, or Oracle 429/503. Queue full is retryable
+2. The default Oracle queue holds 1,000 waiters across classes. Both classes
+   use a configurable one-hour maximum queue wait and two-hour default total
+   query deadline. A caller `deadline_ms` overrides total time only. Queue
+   wait and planning consume total time; execution gets what remains.
+   Saturation below 1,000 produces no early HTTP, gRPC, planning, or Oracle
+   429/503. Queue full is retryable
    overload, timeout is `QueryTimeout`, and both release resources. A full
    queue stays below 7 GiB on the specified node.
 3. Remote Oracle transport reuses authenticated channels; changed peer
    identity does not reuse an old authority. Trace evidence assigns connect,
    open, and first-row latency correctly.
-4. The benchmark uses the specified local child and public client; Q0–Q5,
-   concurrency sweep, fixed-rate comparison, remote/local live, and concurrent
-   writes have exact-result and run-validity proof. It saves raw samples,
-   server logs, production metric snapshots, cgroup evidence, geometry,
-   driver placement/lag, and a concise report.
-5. Numeric REQ-008 targets pass on valid full runs, or this task remains
-   incomplete with a named measured bottleneck. Never weaken the target,
+4. The standard benchmark uses the specified local child, public client, and
+   one 10-million-row public-ingest fixture. It reports the selective read,
+   small and medium aggregates, broad time-window aggregate, full scan,
+   batched ingest, concurrent read/write, and one remote-live case with exact
+   results. It sweeps selective and small-aggregate concurrency at 1, 4, 8,
+   16, 32, and 64 clients. Each human-readable row states client p50/p95/p99,
+   successful QPS and concurrency, physical scan bytes/s where relevant,
+   server CPU, peak memory, and rejection or wrong-result counts. Ingest rows
+   also state acknowledged rows/s, input bytes/s, batch p95, and completed
+   file count and average size. Raw samples, server logs, telemetry, cgroup
+   evidence, geometry, and phase durations are saved. The standard run aims
+   for about 10–15 minutes after build; actual duration is reported.
+   No cached Parquet seed or new storage mode is created.
+5. Numeric REQ-008 targets pass on valid full runs, including Q1
+   p50 <2 ms/p95 <5 ms/p99 <10 ms and >1,000 QPS, Q2 >=100 QPS with
+   p95 <100 ms, the one-million-row aggregate >=20 QPS with p95 <300 ms,
+   the ten-million-row aggregate p95 <300 ms, heavy Q4/Q5 <2 s,
+   heavy Q5 physical scan >=500 MB/s,
+   W1 and mixed ingest >=100,000 acknowledged rows/s, mixed analytical reads
+   >=100 QPS, and mixed read p95 degradation <20% with peak memory <7 GiB
+   and no OOM. A separate 100-million-row heavy qualification is
+   required for the heavy targets and reports its actual duration. Otherwise
+   this task remains incomplete with a named
+   measured bottleneck. Never weaken the target,
    drop a query class, move the driver into the pod, use Docker for Wyrd, or
    label invalid results as capacity.
 
@@ -418,28 +526,42 @@ only reusable production telemetry and the readable benchmark evidence.
   `bifrost/process_cluster.rs` only where needed, plus the one existing mise
   benchmark command. Production telemetry is reused; new phase labels are
   low-cardinality.
+- Existing Oracle physical-byte scan accounting and production telemetry;
+  do not add benchmark-only scan counters.
 - `architecture/bifrost-design.md` and performance docs record the removed
   snapshot limit, retained resource boundaries, and measured limits. Do not
   rewrite unrelated SDK contracts or the completed TASK-001 behavior.
 
 ## Verification and Evidence
 
-Use TDD in the scenario order above. The commands above name planned tests
-within existing package/module owners; verify their final selectors with
-`mise exec -- cargo nextest list` before relying on a run. Postgres-backed
-tests use the repository setup wrapper or their owning `mise` lane. Preserve the
-existing `wyrd-testing` tests for the fixed-rate driver, exact fixture,
-process-cluster limits, and prior run order, updating expectations only when
-the behavior intentionally changes. Run `mise run fmt`, `mise run lints`,
-`mise run verify:bifrost`, and `mise run gate` one at a time because this task
-changes shared benchmark infrastructure and Oracle behavior. Run the short
-smoke, then full opt-in benchmark on this Linux machine, one suite at a time;
-attach reports and raw output without checking huge samples into Git.
+1. Implement every scenario above, using TDD and running each named focused
+   test as its behavior is completed. Verify planned selectors with
+   `mise exec -- cargo nextest list` before relying on them. PostgreSQL-backed
+   tests use the repository setup wrapper or their owning `mise` lane. Keep
+   the existing fixed-rate driver and process-cluster tests where their
+   behavior still applies. The existing benchmark report is the baseline;
+   do not rerun it before the remediation is implemented.
+2. After all scenarios are implemented, run the new benchmarks first:
+   `mise run bench:bifrost:query-capacity` for the standard OLAP suite, then
+   `WYRD_BENCH_HEAVY_SCAN=1 mise run bench:bifrost:query-capacity` for the
+   separate 100-million-row qualification. Run them one at a time on this
+   Linux machine. Save reports, raw samples, pod logs, and cgroup evidence.
+   A failed target remains a measured failure; diagnose it, make the smallest
+   justified fix, and rerun the affected benchmark before presenting results.
+3. Present the new benchmark results and bottleneck changes to the user for
+   review. Incorporate requested revisions and rerun affected focused tests
+   and benchmarks. Do not proceed to the broad gate until the user is
+   satisfied with the bottleneck remediation and benchmark evidence.
+4. Then run `mise run fmt`, `mise run lints`, and `mise run gate` one at a time.
+   `mise run gate` already includes `verify:bifrost`; do not run that lane
+   separately. Resolve any failures, complete the evidence table below, and
+   close out the task. Do not check huge raw samples into Git.
 
 The final evidence table has one row per acceptance criterion and workload:
 command, commit, SQL/fixture checksum and geometry, cgroup proof, offered and
-actual QPS, success/refusal/wrong-result counts, latency, scan rates, write
-ACK/read-back, CPU/memory, validity, and PASS/FAIL. Include a separate phase
+actual QPS, success/refusal/wrong-result counts, latency, physical scan rate,
+planning time, write ACK/read-back, files/s and
+average size, CPU/memory, validity, and PASS/FAIL. Include a separate phase
 and CPU profile for any optimized path. Do not report a causal diagnosis from
 one aggregate timing or a single throttled period.
 
@@ -458,7 +580,7 @@ one aggregate timing or a single throttled period.
 
 ## Authority Links
 
-- [Approved revision 5](../spec.md): REQ-008–REQ-009, INV-001–INV-006,
+- [Approved revision 11](../spec.md): REQ-008–REQ-009, INV-001–INV-006,
   AC-009–AC-011.
 - [Repository rules](../../../../AGENTS.md),
   [Bifrost architecture](../../../../architecture/bifrost-design.md),

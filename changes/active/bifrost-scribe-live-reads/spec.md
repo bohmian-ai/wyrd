@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 5
+revision: 11
 status: approved
 ---
 
@@ -140,32 +140,48 @@ data, including a Scribe on another pod, and must actually hold the stated
 number of live readers throughout a mixed window. It must include concurrent
 acknowledged writes rather than measuring writes only after reads stop.
 
-At minimum, report separate, correctly validated workloads for a trivial
-lookup, a selective point read, a small filtered aggregate, medium analytical
-reads, a large time-window aggregate, a full scan over about 100 million rows,
-and a representative analytical mix. Sweep client concurrency through 1, 4,
-8, 16, 32, 64, and 100, recording sustained successful queries per second,
-client-to-client p50/p95/p99 latency, physical bytes scanned, rows examined
-when the workload makes them knowable, acknowledged write rate, CPU, memory,
-refusals by owning boundary, and the point where latency rises without useful
-throughput gain. Preserve raw samples, server telemetry, process logs, and
-fixture geometry with a short report a human can audit. An invalid workload
-must be reported as invalid rather than assigned a throughput result.
+At minimum, report separate, correctly validated workloads for a
+selective point read, a small filtered aggregate over roughly
+100,000–1,000,000 rows, medium analytical reads over roughly 1–10 million
+rows, a large time-window aggregate, a full scan over about 100 million rows,
+and a representative analytical mix. Sweep selective and small aggregate
+queries through client concurrency 1, 4, 8, 16, 32, and 64; measure the
+one-million-row aggregate at eight clients so its QPS target is meaningful,
+and the larger scans at one client. For
+every measured workload and concurrency, record sustained
+successful queries per second, client-send-to-complete p50/p95/p99 latency,
+offered and rejected queries, CPU, and peak memory. Record physical bytes
+scanned and rows examined where measurable, acknowledged write rows and bytes
+per second, p95 write-batch latency, and the point where more concurrency
+raises latency without useful throughput gain. Preserve raw samples, server
+telemetry, process logs, and fixture geometry with a short report a human can
+audit. An invalid workload must be reported as invalid rather than assigned a
+throughput result. These are engineering targets for this machine, not
+universal OLAP standards.
 
-The engineering targets on this envelope are more than 1,000 sustained
-selective reads/second with p95 at most 25 ms; at least 100 small filtered
-aggregates/second with p95 at most 100 ms; medium analytical queries at p95 at
-most 200 ms, including about 10 million examined rows at p95 at most 300 ms;
-a large time-window aggregate at p95 at most 500 ms; and a roughly
-100-million-row full scan under 2 seconds. The representative mixed workload
-must sustain at least 100 analytical queries/second while at least 100,000
-rows/second are durably acknowledged, with client p50 below 50 ms, p95 at most
-200 ms, p99 at most 500 ms, at least 500 MB/second physical scan throughput
-when a scan workload is running, and peak node memory below 7 GiB without an
-OOM event. A 5,000/second selective read rate and the higher class-specific
-targets supplied by the user are stretch goals, reported separately rather
-than treated as proven. CPU utilization is reported; 70–90% at saturation is
-diagnostic, not a minimum utilization requirement.
+On the 4-CPU/8-GiB node, selective reads must reach client p50 <2 ms, p95
+<5 ms, and p99 <10 ms while sustaining more than 1,000 successful reads per
+second at the same stated concurrency. Small filtered aggregates must sustain
+at least 100 successful queries per second with p95 <100 ms. Medium queries must
+sustain at least 20 per second with p95 <300 ms at the same concurrency; the
+roughly 10-million-row case also has p95 <300 ms at one client. The large
+time-window aggregate and a roughly 100-million-row heavy scan must each
+complete in <2 seconds; the heavy scan
+must reach at least 500 MB/second in measured physical scan throughput at
+one client. Higher concurrency points identify saturation; they need not
+meet the single-client heavy-scan latency target. Sustained batched ingest
+must durably acknowledge at least 100,000 rows per
+second and report p95 batch latency, written bytes per second, CPU, and memory.
+
+Under simultaneous sustained ingest of at least 100,000 acknowledged rows
+per second, the representative read mix must sustain at least 100 successful
+analytical queries per second. Small-query p95 remains <100 ms and medium-query
+p95 <300 ms. At the same read offer
+rate and client concurrency, each class's p95 may rise by less than 20%
+against its read-only baseline. Peak node memory stays below 7 GiB with no
+OOM event. A 5,000/second selective rate is reported as a stretch result;
+it does not replace these required targets. CPU utilization is reported, not
+assigned an invented passing floor.
 
 The existing two-permit snapshot step must not reject ordinary queries before
 Oracle's bounded query admission when the query still has time to wait.
@@ -175,21 +191,58 @@ connection for each fragment. Preserve the existing authorization, tenant,
 snapshot, query-resource, and terminal rules. Performance claims require valid
 measured results; a passing correctness gate alone is insufficient.
 
-### REQ-009 — Queue saturation until the leader deadline
+The standard benchmark uses one 10-million-row published table and ordinary
+public queries through the configured object store, which is local by default.
+Its named workloads are a selective read, a small filtered aggregate, a
+one-million-row aggregate, a ten-million-row aggregate, a broad time-window
+aggregate, a full-table scan, batched ingest, and analytical reads during
+concurrent ingest. Include one valid live-reader case with a remote Scribe so
+the common distributed read path is measured. Keep the selective read as a
+serving result, separate from the analytical results. Sweep only selective
+and small-aggregate client concurrency through 1, 4, 8, 16, 32, and 64;
+measure the one-million-row aggregate at eight clients and the larger reads
+at one client. Report client p50/p95/p99, successful
+QPS at stated concurrency, physical scan bytes per second for scans, server
+CPU, peak memory, refusal and wrong-result counts, acknowledged ingest rows
+per second, and write-batch p95. Save raw samples, logs, and fixture geometry.
+Use the existing process-cluster harness, telemetry, public client, and one
+benchmark command. Do not add file-layout, cache-state, projection/predicate,
+or fixed-offer cross-product benchmark suites. Those are focused diagnostics
+if a measured workload needs them. The standard run should give a result in
+about 10–15 minutes, excluding the release build; report actual setup and
+measurement durations rather than claiming an unmeasured time bound.
+
+A separate heavy-scan qualification uses the same schema and generator with
+100 million rows and measures the broad time-window aggregate and full scan
+against the existing <2-second and >=500 MB/second physical-scan targets.
+The 100-million-row seed alone takes at least 16 minutes 40 seconds at the
+minimum passing 100,000-row/second ingest rate, so its duration is reported
+separately and is not counted against the standard benchmark's time goal.
+The heavy qualification is still required to satisfy the heavy-scan targets;
+it is not repeated during every quick capacity run. Both runs use the same
+normal storage and query paths. During batched ingest, report average
+committed Parquet file size and committed files/second alongside acknowledged
+rows/second, bytes/second, and p95 batch latency. Mixed read/write runs report
+the measured read-latency change from a matching read-only baseline.
+
+### REQ-009 — One queue and timeout policy for both query classes
 
 After authentication, authorization, and request validation, a query that can
 run on this Oracle but finds its execution slots busy waits in Oracle's
 tenant-fair query queue. Ordinary saturation does not produce an immediate
 planning, HTTP edge, or execution-admission refusal. The queue holds at most
 1,000 waiting queries per Oracle node across both classes, separate from
-running queries. Its only time limit is the one absolute leader-owned query
-deadline: 30 seconds by default, or the caller's valid `deadline_ms` when
-provided. That same deadline covers planning, queueing, and execution; it
-does not restart when a query leaves the queue. Remove the independent 250 ms
-queue timer. If a slot opens in time,
-the queued query runs. If its deadline expires first, it receives a query
-timeout and owns no retained queue or snapshot resources. Client cancellation
-also removes it promptly. If all 1,000 waiting places are occupied, the next
+running queries. Both Interactive and Analytical use the same two operator-
+configurable time limits: at most one hour in the queue and a two-hour default
+total query deadline. A valid caller `deadline_ms` overrides the total
+deadline for that query. Oracle owns the total deadline from query acceptance
+through planning, queueing, and execution; it does not restart when a query
+leaves the queue. A waiter stops at the earlier of its queue-entry time plus
+the queue limit and its total query deadline. If a slot opens before then, the
+query runs with only the remaining total time. If either limit expires while
+it waits, it receives a query timeout and owns no retained queue or snapshot
+resources. Client cancellation also removes it promptly. If all 1,000 waiting
+places are occupied, the next
 query receives a clear, retryable queue-full overload response. Shutdown,
 role loss, a class the node cannot execute at all, and genuine resource or
 security faults remain distinct from temporary saturation. The same behavior
@@ -271,7 +324,8 @@ Do not add new persisted state or change write ACK timing.
   `gate` pass because this change crosses the query contract, execution,
   verification, and first-class client boundaries.
 - **AC-009:** The benchmark and its focused tests prove the deployment,
-  workload, held-stream, result, measurement, and report rules in REQ-008.
+  workload, held-stream, result, measurement, scan, write file-shape, and
+  report rules in REQ-008.
   Every required workload has a valid measured result or an explicit failure;
   no invalid run can satisfy a performance target.
 - **AC-010:** On the specified 4-CPU/8-GiB node, the measured required
@@ -279,9 +333,12 @@ Do not add new persisted state or change write ACK timing.
   acknowledged read-back, or an unproven CPU or snapshot diagnosis prevents
   completion and is reported with its owning boundary and raw evidence.
 - **AC-011:** A real-server burst that fills execution slots enters the queue
-  without a capacity refusal, can wait longer than 250 ms when its leader
-  deadline permits, and either runs or times out at that deadline. The 1,000th
-  waiting query fits; the next receives queue-full overload. Cancellation and
+  without a capacity refusal and can wait longer than 250 ms. The same
+  one-hour queue limit and two-hour default total deadline apply to both
+  query classes; a caller override changes only the total deadline. A waiter
+  runs if admitted before either limit, otherwise times out at the earlier
+  limit. Execution uses the remaining total time. The 1,000th waiting query
+  fits; the next receives queue-full overload. Cancellation and
   timeout free their places. HTTP and gRPC do not shed an otherwise queueable
   authenticated query before Oracle. A 4-CPU/8-GiB process-cluster run with
   the full queue remains under the stated memory ceiling without OOM.
@@ -290,7 +347,8 @@ Do not add new persisted state or change write ACK timing.
 
 None. Revision 3 was explicitly approved by the user on 2026-09-26. The user
 explicitly accepted the performance work, supplied its numeric targets, and
-chose a finite 1,000-query queue on 2026-09-28.
+chose a finite 1,000-query queue and one timeout policy for both query classes
+on 2026-09-28.
 
 ## Revision history and authority
 
@@ -314,6 +372,28 @@ chose a finite 1,000-query queue on 2026-09-28.
 - Revision 5 (2026-09-28): Records the user's queue-until-deadline rule and
   1,000-waiter limit. A full finite queue returns overload; temporary slot
   saturation does not. Approved by the user on 2026-09-28.
+- Revision 6 (2026-09-28): Sets one policy for Interactive and Analytical:
+  one-hour maximum queue wait, two-hour default total query deadline, and a
+  caller override for total time. Queue and total clocks both apply, with no
+  execution reset. Approved by the user on 2026-09-28.
+- Revision 7 (2026-09-28): Records the user's tighter, explicit point-read,
+  analytical, ingest, mixed-workload, and concurrency benchmark targets.
+  Approved by the user on 2026-09-28.
+- Revision 8 (2026-09-28): Adds the user-requested single-file/many-file
+  cold/hot Parquet scans, decoded throughput and narrow-row-rate targets,
+  projection/predicate and Iceberg pruning evidence, and write file-shape
+  metrics. Approved by the user on 2026-09-28.
+- Revision 9 (2026-09-28): Clarifies cache hot/cold versus Scribe hot data and
+  makes the standard benchmark a 20–30-minute qualification using one public
+  ingest, with broader sweeps reserved for diagnosis. Approved by the user on
+  2026-09-28.
+- Revision 10 (2026-09-28): Removes the hot/cold cache-state benchmark conditions.
+  Scan benchmarks use the configured object store through the ordinary query
+  path; the default remains local. Approved by the user on 2026-09-28.
+- Revision 11 (2026-09-28): Makes common OLAP workloads the standard benchmark,
+  removes the file-layout and projection cross-products, and separates the
+  100-million-row heavy-scan qualification from the quick capacity run.
+  Approved by the user on 2026-09-28.
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

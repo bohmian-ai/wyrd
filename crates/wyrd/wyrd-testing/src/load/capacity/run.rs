@@ -326,7 +326,10 @@ impl ReadRow {
             invalid.push(format!("{wrong} wrong results"));
         }
         if self.missed_launches > 0 {
-            invalid.push(format!("{} arrivals missed the offer", self.missed_launches));
+            invalid.push(format!(
+                "{} arrivals missed the offer",
+                self.missed_launches
+            ));
         }
         if self.abandoned > 0 {
             invalid.push(format!("{} queries abandoned", self.abandoned));
@@ -356,9 +359,8 @@ impl ReadRow {
         }
 
         let mut failed = Vec::new();
-        let unsuccessful = self.outcomes.values().sum::<u64>()
-            - self.count(ShortQueryOutcome::Success)
-            - wrong;
+        let unsuccessful =
+            self.outcomes.values().sum::<u64>() - self.count(ShortQueryOutcome::Success) - wrong;
         if unsuccessful > 0 {
             failed.push(format!("{unsuccessful} queries did not succeed"));
         }
@@ -384,7 +386,11 @@ impl ReadRow {
             (target.min_scan_bytes_per_second, self.scan_bytes_per_second)
             && rate < floor
         {
-            failed.push(format!("scan {:.0} MB/s < {:.0} MB/s", rate / 1e6, floor / 1e6));
+            failed.push(format!(
+                "scan {:.0} MB/s < {:.0} MB/s",
+                rate / 1e6,
+                floor / 1e6
+            ));
         }
         if let Some(baseline) = baseline {
             for (case, base) in &baseline.case_p95_ms {
@@ -429,8 +435,7 @@ impl ReadRow {
     /// `undetermined` when no evidence points anywhere.
     fn classify(&self) -> String {
         let rejected = |reason: &str| self.server.rejected.get(reason).copied().unwrap_or(0.0);
-        if memory_failure(&self.resources).is_some()
-            || rejected("memory") + rejected("spill") > 0.0
+        if memory_failure(&self.resources).is_some() || rejected("memory") + rejected("spill") > 0.0
         {
             return "memory".to_owned();
         }
@@ -458,7 +463,11 @@ impl ReadRow {
         if self.resources.cpu_saturated(self.window_seconds) {
             return "cgroup cpu".to_owned();
         }
-        if self.server.pool_wait_mean_ms.is_some_and(|wait| wait >= 5.0) {
+        if self
+            .server
+            .pool_wait_mean_ms
+            .is_some_and(|wait| wait >= 5.0)
+        {
             return "postgres pool wait".to_owned();
         }
         self.server
@@ -917,7 +926,11 @@ impl Snapshot {
         tokio::task::block_in_place(|| node.capture_resource_evidence(&captured))?;
         create_dir(raw)?;
         let mut snapshot = Self::default();
-        for file in CGROUP_EVIDENCE_FILES.iter().copied().chain(["metrics.prom"]) {
+        for file in CGROUP_EVIDENCE_FILES
+            .iter()
+            .copied()
+            .chain(["metrics.prom"])
+        {
             let Ok(contents) = std::fs::read_to_string(captured.join(file)) else {
                 continue;
             };
@@ -944,11 +957,7 @@ impl Snapshot {
             periods: delta("cpu.stat:nr_periods"),
             throttled_periods: delta("cpu.stat:nr_throttled"),
             throttled_seconds: delta("cpu.stat:throttled_usec") / 1e6,
-            peak_memory_bytes: self
-                .cgroup
-                .get("memory.peak:value")
-                .copied()
-                .unwrap_or(0.0),
+            peak_memory_bytes: self.cgroup.get("memory.peak:value").copied().unwrap_or(0.0),
             oom_kills: delta("memory.events:oom_kill"),
         }
     }
@@ -1146,7 +1155,10 @@ impl IngestRun {
         let mut total = Self::default();
         while let Some(joined) = writers.join_next().await {
             let Ok(run) = joined else {
-                *total.refused.entry("writer panicked".to_owned()).or_default() += 1;
+                *total
+                    .refused
+                    .entry("writer panicked".to_owned())
+                    .or_default() += 1;
                 continue;
             };
             total.acknowledged.extend(run.acknowledged);
@@ -1293,8 +1305,14 @@ impl Bench {
         let writer = self.writer(workload::TABLE).await?;
         let raw = self.output.join("seed");
         let before = Snapshot::capture(pod(&mut self.cluster)?, &raw.join("before"))?;
-        let run = IngestRun::write(&writer, workload::TABLE, self.fixture, self.fixture.rows, None)
-            .await;
+        let run = IngestRun::write(
+            &writer,
+            workload::TABLE,
+            self.fixture,
+            self.fixture.rows,
+            None,
+        )
+        .await;
         let after = Snapshot::capture(pod(&mut self.cluster)?, &raw.join("after"))?;
         self.seed_seconds = Some(run.elapsed.as_secs_f64());
         let mut row = run.row(
@@ -1382,8 +1400,11 @@ impl Bench {
     ) -> Result<ReadRow, CapacityError> {
         let driver = ClosedLoopDriver::new(concurrency);
         let issue = {
-            let (queries, fixture, answers) =
-                (Arc::clone(&self.queries), self.fixture, Arc::clone(&self.answers));
+            let (queries, fixture, answers) = (
+                Arc::clone(&self.queries),
+                self.fixture,
+                Arc::clone(&self.answers),
+            );
             move |sequence| {
                 let (queries, answers) = (Arc::clone(&queries), Arc::clone(&answers));
                 async move { run_case(&queries, fixture, &answers, case, sequence).await }
@@ -1396,7 +1417,9 @@ impl Bench {
         let raw = self.output.join(&name);
         let before = Snapshot::capture(pod(&mut self.cluster)?, &raw.join("before"))?;
         let run = if serial {
-            driver.run(Duration::from_secs(3_600), SERIAL_RUNS, issue).await
+            driver
+                .run(Duration::from_secs(3_600), SERIAL_RUNS, issue)
+                .await
         } else {
             driver.run(WINDOW, u64::MAX, issue).await
         };
@@ -1462,7 +1485,9 @@ impl Bench {
         let mut baseline = self.mixed_window("mixed-read-only", None).await?.0;
         baseline.judge(&mixed_target(), false, None);
         println!("{}", render_read(&baseline).trim_end());
-        let (mut writes, run) = self.mixed_window("mixed-with-writes", Some(&ingest)).await?;
+        let (mut writes, run) = self
+            .mixed_window("mixed-with-writes", Some(&ingest))
+            .await?;
         writes.judge(&mixed_target(), false, Some(&baseline));
         println!("{}", render_read(&writes).trim_end());
         let (run, resources) = run.unwrap_or_default();
@@ -1505,13 +1530,22 @@ impl Bench {
         let writers = writer.map(|writer| {
             let (writer, fixture, stop) = (Arc::clone(writer), self.fixture, stop.clone());
             tokio::spawn(async move {
-                IngestRun::write(&writer, workload::INGEST_TABLE, fixture, i64::MAX, Some(stop))
-                    .await
+                IngestRun::write(
+                    &writer,
+                    workload::INGEST_TABLE,
+                    fixture,
+                    i64::MAX,
+                    Some(stop),
+                )
+                .await
             })
         });
         let issue = {
-            let (queries, fixture, answers) =
-                (Arc::clone(&self.queries), self.fixture, Arc::clone(&self.answers));
+            let (queries, fixture, answers) = (
+                Arc::clone(&self.queries),
+                self.fixture,
+                Arc::clone(&self.answers),
+            );
             move |sequence| {
                 let (queries, answers) = (Arc::clone(&queries), Arc::clone(&answers));
                 async move {
@@ -1530,8 +1564,7 @@ impl Bench {
                 let run = writers
                     .await
                     .map_err(|error| CapacityError::Output(format!("writers: {error}")))?;
-                let resources =
-                    after.resources_since(&writes_before, run.elapsed.as_secs_f64());
+                let resources = after.resources_since(&writes_before, run.elapsed.as_secs_f64());
                 Some((run, resources))
             }
             None => None,
@@ -1571,14 +1604,22 @@ impl Bench {
     async fn full_queue(&mut self) -> Result<QueueRow, CapacityError> {
         let raw = self.output.join("full-queue");
         let before = Snapshot::capture(pod(&mut self.cluster)?, &raw.join("before"))?;
-        let slots = gauge(pod(&mut self.cluster)?, "bifrost_oracle_local_slot_units", "kind", "limit")?;
+        let slots = gauge(
+            pod(&mut self.cluster)?,
+            "bifrost_oracle_local_slot_units",
+            "kind",
+            "limit",
+        )?;
         let holders_count = slots as usize;
         let release = CancellationToken::new();
         let opened = Arc::new(AtomicUsize::new(0));
         let mut holders = JoinSet::new();
         for _ in 0..holders_count {
-            let (queries, release, opened) =
-                (Arc::clone(&self.queries), release.clone(), Arc::clone(&opened));
+            let (queries, release, opened) = (
+                Arc::clone(&self.queries),
+                release.clone(),
+                Arc::clone(&opened),
+            );
             holders.spawn(async move {
                 let request = BifrostQueryRequest {
                     sql: format!("SELECT event_id FROM {}", workload::TABLE),
@@ -1616,7 +1657,13 @@ impl Bench {
         row.queued_peak = queued;
         let overflow = tokio::time::timeout(
             Duration::from_secs(30),
-            run_case(&self.queries, self.fixture, &self.answers, Case::Selective, 0),
+            run_case(
+                &self.queries,
+                self.fixture,
+                &self.answers,
+                Case::Selective,
+                0,
+            ),
         )
         .await;
         row.overflow = overflow.ok().map(|probe| probe.outcome);
@@ -1656,12 +1703,12 @@ impl Bench {
     /// Returns cluster control failures.
     fn queued(&mut self) -> Result<f64, CapacityError> {
         let node = pod(&mut self.cluster)?;
-        Ok(tokio::task::block_in_place(|| {
-            node.metric_totals(&["oracle_queries_queued"])
-        })?
-        .get("oracle_queries_queued")
-        .copied()
-        .unwrap_or(0.0))
+        Ok(
+            tokio::task::block_in_place(|| node.metric_totals(&["oracle_queries_queued"]))?
+                .get("oracle_queries_queued")
+                .copied()
+                .unwrap_or(0.0),
+        )
     }
 
     /// Collects the environment and fixture geometry.
@@ -1770,9 +1817,13 @@ impl QueryCapacityBenchmark {
             Case::BroadWindow,
             Case::FullScan,
         ];
-        let (mut bench, _) =
-            Bench::start(settings, &[ProcessNodeTarget::All], fixture, settings.output.clone())
-                .await?;
+        let (mut bench, _) = Bench::start(
+            settings,
+            &[ProcessNodeTarget::All],
+            fixture,
+            settings.output.clone(),
+        )
+        .await?;
         let mut report = Report::default();
         report.ingest.push(bench.seed(&cases).await?);
         report.metadata = bench.metadata(settings, &cases)?;
@@ -1783,20 +1834,26 @@ impl QueryCapacityBenchmark {
                 rows.push(bench.closed(case, concurrency, false, true).await?);
             }
             let floor = case.target(fixture).min_qps.unwrap_or(0.0);
-            report.sweeps.push(SweepSummary::new(case.name(), &rows, floor));
+            report
+                .sweeps
+                .push(SweepSummary::new(case.name(), &rows, floor));
             report.reads.extend(rows);
         }
         bench.phase("sweeps");
-        report
-            .reads
-            .push(bench.closed(Case::MillionAggregate, EIGHT_CLIENTS, false, false).await?);
+        report.reads.push(
+            bench
+                .closed(Case::MillionAggregate, EIGHT_CLIENTS, false, false)
+                .await?,
+        );
         report
             .reads
             .push(bench.closed(Case::TableAggregate, 1, false, false).await?);
         report
             .reads
             .push(bench.closed(Case::BroadWindow, 1, true, false).await?);
-        report.reads.push(bench.closed(Case::FullScan, 1, true, false).await?);
+        report
+            .reads
+            .push(bench.closed(Case::FullScan, 1, true, false).await?);
         bench.phase("aggregates");
         let (baseline, writes, ingest) = bench.mixed().await?;
         report.reads.extend([baseline, writes]);
@@ -1808,9 +1865,11 @@ impl QueryCapacityBenchmark {
 
         let (remote, phases) = remote_live(settings).await?;
         report.reads.push(remote);
-        report
-            .phases
-            .extend(phases.into_iter().map(|(phase, seconds)| (format!("remote-{phase}"), seconds)));
+        report.phases.extend(
+            phases
+                .into_iter()
+                .map(|(phase, seconds)| (format!("remote-{phase}"), seconds)),
+        );
         publish(&settings.output, &report)
     }
 
@@ -1888,7 +1947,12 @@ async fn remote_live(
     }
     bench.phase("live-ack");
 
-    let slots = gauge(pod(&mut bench.cluster)?, "bifrost_oracle_local_slot_units", "kind", "limit")?;
+    let slots = gauge(
+        pod(&mut bench.cluster)?,
+        "bifrost_oracle_local_slot_units",
+        "kind",
+        "limit",
+    )?;
     let target = ((slots / 2.0).floor() as usize).max(1);
     let streams = LiveStreams::start(Arc::clone(&bench.queries), target, live);
     let opened = Instant::now();
@@ -1900,9 +1964,7 @@ async fn remote_live(
         let (queries, answers) = (Arc::clone(&bench.queries), Arc::clone(&bench.answers));
         move |sequence| {
             let (queries, answers) = (Arc::clone(&queries), Arc::clone(&answers));
-            async move {
-                run_case(&queries, fixture, &answers, Case::SmallAggregate, sequence).await
-            }
+            async move { run_case(&queries, fixture, &answers, Case::SmallAggregate, sequence).await }
         }
     };
     driver.run(WARMUP, u64::MAX, issue.clone()).await;
@@ -2313,12 +2375,12 @@ fn gauge(
     value: &str,
 ) -> Result<f64, ProcessClusterError> {
     let labels = BTreeMap::from([(label.to_owned(), value.to_owned())]);
-    Ok(tokio::task::block_in_place(|| {
-        node.metric_totals_labeled(&[family], &labels)
-    })?
-    .get(family)
-    .copied()
-    .unwrap_or(0.0))
+    Ok(
+        tokio::task::block_in_place(|| node.metric_totals_labeled(&[family], &labels))?
+            .get(family)
+            .copied()
+            .unwrap_or(0.0),
+    )
 }
 
 /// Counts one table's Parquet objects, row groups, and bytes.
@@ -2364,7 +2426,14 @@ fn host_memory_bytes() -> u64 {
             meminfo
                 .lines()
                 .find_map(|line| line.strip_prefix("MemTotal:"))
-                .and_then(|value| value.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                .and_then(|value| {
+                    value
+                        .trim()
+                        .trim_end_matches("kB")
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                })
         })
         .map_or(0, |kib| kib * 1024)
 }
@@ -2436,7 +2505,11 @@ mod tests {
 
     /// Judges `row` against the standard small-aggregate target.
     fn judged(mut row: ReadRow) -> ReadRow {
-        row.judge(&Case::SmallAggregate.target(Fixture::standard()), false, None);
+        row.judge(
+            &Case::SmallAggregate.target(Fixture::standard()),
+            false,
+            None,
+        );
         row
     }
 
@@ -2476,10 +2549,7 @@ mod tests {
             failing(ShortQueryOutcome::Deadline, Some("queue_deadline")),
             "oracle queue deadline"
         );
-        assert_eq!(
-            failing(ShortQueryOutcome::Failed, Some("memory")),
-            "memory"
-        );
+        assert_eq!(failing(ShortQueryOutcome::Failed, Some("memory")), "memory");
 
         let mut saturated = valid_row();
         saturated.latency_ms[1] = Some(150.0);
@@ -2492,8 +2562,12 @@ mod tests {
 
         let mut slow = valid_row();
         slow.latency_ms[1] = Some(150.0);
-        slow.server.phase_mean_ms.insert("metadata_load".to_owned(), 90.0);
-        slow.server.phase_mean_ms.insert("admission".to_owned(), 1.0);
+        slow.server
+            .phase_mean_ms
+            .insert("metadata_load".to_owned(), 90.0);
+        slow.server
+            .phase_mean_ms
+            .insert("admission".to_owned(), 1.0);
         assert_eq!(
             judged(slow).bottleneck,
             "server phase metadata_load (90.0 ms mean)"
@@ -2544,12 +2618,18 @@ mod tests {
         assert!(scan.reason.contains("missing physical scan bytes"));
 
         let mut baseline = valid_row();
-        baseline.case_p95_ms.insert("small-aggregate".to_owned(), 10.0);
+        baseline
+            .case_p95_ms
+            .insert("small-aggregate".to_owned(), 10.0);
         let mut mixed = valid_row();
         mixed.case_p95_ms.insert("small-aggregate".to_owned(), 12.0);
         mixed.judge(&mixed_target(), false, Some(&baseline));
         assert_eq!(mixed.verdict, Verdict::Fail);
-        assert!(mixed.reason.contains("20% above read-only 10.0 ms"), "{}", mixed.reason);
+        assert!(
+            mixed.reason.contains("20% above read-only 10.0 ms"),
+            "{}",
+            mixed.reason
+        );
         mixed.case_p95_ms.insert("small-aggregate".to_owned(), 11.9);
         mixed.judge(&mixed_target(), false, Some(&baseline));
         assert_eq!(mixed.verdict, Verdict::Pass);
@@ -2584,7 +2664,7 @@ mod tests {
             ..valid_row()
         });
         assert_eq!(
-            SweepSummary::new("small-aggregate", &[refused.clone()], 100.0).verdict,
+            SweepSummary::new("small-aggregate", std::slice::from_ref(&refused), 100.0).verdict,
             Verdict::Fail
         );
         let report = Report {
@@ -2605,7 +2685,10 @@ mod tests {
             "INVALID acknowledged rows did not read back",
             "FAIL 7 queries did not succeed | oracle",
         ] {
-            assert!(rendered.contains(expected), "missing {expected}:\n{rendered}");
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}:\n{rendered}"
+            );
         }
         assert_eq!(report.failures().len(), 2);
     }
@@ -2659,7 +2742,11 @@ mod tests {
             ..row()
         });
         assert_eq!(slow.verdict, Verdict::Fail);
-        assert!(slow.reason.contains("scan 300 MB/s < 500 MB/s"), "{}", slow.reason);
+        assert!(
+            slow.reason.contains("scan 300 MB/s < 500 MB/s"),
+            "{}",
+            slow.reason
+        );
     }
 
     /// Exposition, `cpu.max`, and cgroup files parse into the deltas a row
@@ -2697,7 +2784,10 @@ mod tests {
             cpu_limit: cpu_limit("400000 100000\n"),
         };
         let server = after.server_since(&before);
-        assert_eq!(server.rejected, BTreeMap::from([("queue_full".to_owned(), 3.0)]));
+        assert_eq!(
+            server.rejected,
+            BTreeMap::from([("queue_full".to_owned(), 3.0)])
+        );
         assert_eq!(server.scan_bytes, Some(2048.0));
         assert_eq!(server.phase_mean_ms.get("hot_cut"), Some(&2.0));
         assert_eq!(server.pool_wait_mean_ms, Some(2.0));

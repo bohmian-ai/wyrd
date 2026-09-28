@@ -2683,33 +2683,32 @@ impl TonicOraclePeerTransport {
             .get(&candidate.node_id)
             .filter(|cached| cached.fence == candidate.worker_fence && cached.address == address)
             .map(|cached| cached.channel.clone());
-        let channel = match cached {
-            Some(channel) => channel,
-            None => {
-                let started = std::time::Instant::now();
-                let channel = self
-                    .tls
-                    .as_ref()
-                    .ok_or(DispatchError::Unavailable)?
-                    .endpoint(address.clone())
-                    .map_err(|_| DispatchError::Unavailable)?
-                    .connect()
-                    .await
-                    .map_err(|_| DispatchError::Unavailable)?;
-                super::QueryPhase::PeerConnect.record(started);
-                self.channels
-                    .lock()
-                    .map_err(|_| DispatchError::Terminal)?
-                    .insert(
-                        candidate.node_id,
-                        PeerChannel {
-                            fence: candidate.worker_fence,
-                            address,
-                            channel: channel.clone(),
-                        },
-                    );
-                channel
-            }
+        let channel = if let Some(channel) = cached {
+            channel
+        } else {
+            let started = std::time::Instant::now();
+            let channel = self
+                .tls
+                .as_ref()
+                .ok_or(DispatchError::Unavailable)?
+                .endpoint(address.clone())
+                .map_err(|_| DispatchError::Unavailable)?
+                .connect()
+                .await
+                .map_err(|_| DispatchError::Unavailable)?;
+            super::QueryPhase::PeerConnect.record(started);
+            self.channels
+                .lock()
+                .map_err(|_| DispatchError::Terminal)?
+                .insert(
+                    candidate.node_id,
+                    PeerChannel {
+                        fence: candidate.worker_fence,
+                        address,
+                        channel: channel.clone(),
+                    },
+                );
+            channel
         };
         Ok(OraclePeerServiceClient::new(channel).max_decoding_message_size(usize::MAX))
     }

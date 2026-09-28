@@ -19,7 +19,7 @@ pub(crate) const DEFAULT_QUEUE_CAPACITY: u32 = 1_000;
 /// Longest time a query of either class may wait for an execution slot.
 ///
 /// A waiter also stops at its total query deadline when that comes first.
-pub(crate) const DEFAULT_MAX_QUEUE_WAIT: Duration = Duration::from_secs(3_600);
+pub(crate) const DEFAULT_MAX_QUEUE_WAIT: Duration = Duration::from_hours(1);
 
 /// Private pod-local admission limits computed by server boot.
 #[derive(Debug, Clone, Copy)]
@@ -971,7 +971,11 @@ impl OracleAdmission {
             };
             drop(queued);
             let (reason, error) = refusal;
-            OracleTelemetry::record_admission(query_class, OracleAdmissionOutcome::Rejected, reason);
+            OracleTelemetry::record_admission(
+                query_class,
+                OracleAdmissionOutcome::Rejected,
+                reason,
+            );
             return Err(error);
         }
     }
@@ -3249,7 +3253,7 @@ pub(in crate::oracle) mod tests {
                 owner
                     .admit(waiting_request(
                         QueryClass::Interactive,
-                        Duration::from_secs(60),
+                        Duration::from_mins(1),
                         CancellationToken::new(),
                     ))
                     .await
@@ -3282,23 +3286,21 @@ pub(in crate::oracle) mod tests {
         panic!("the queue never reached {expected} waiters");
     }
 
-    /// Both query classes share one 1,000-place queue, one queue-wait limit, and
-    /// one total deadline; the earlier limit ends a wait as a query timeout,
-    /// the 1,001st waiter is the retryable queue-full overload, and a cancelled,
-    /// dropped, or expired waiter frees its place.
+    /// Both query classes share one queue-wait limit and one total deadline;
+    /// the earlier limit ends a wait as a query timeout that frees its place.
     ///
     /// # Panics
     ///
-    /// Panics when a default, bound, timeout, or release claim fails.
+    /// Panics when a default, bound, or timeout claim fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn queued_queries_obey_queue_and_total_deadlines_and_one_thousand_places() {
+    async fn queued_queries_obey_queue_and_total_deadlines() {
         let defaults = OracleAdmissionConfig::default();
         assert_eq!(defaults.queue_capacity, 1_000);
-        assert_eq!(defaults.max_queue_wait, Duration::from_secs(3_600));
+        assert_eq!(defaults.max_queue_wait, Duration::from_hours(1));
         let engine = OracleConfig::default();
         assert_eq!(engine.queue_capacity, 1_000);
-        assert_eq!(engine.max_queue_wait, Duration::from_secs(3_600));
-        assert_eq!(engine.default_deadline, Duration::from_secs(7_200));
+        assert_eq!(engine.max_queue_wait, Duration::from_hours(1));
+        assert_eq!(engine.default_deadline, Duration::from_hours(2));
 
         // A waiter under the production queue limit outlives the old 250 ms
         // timer, then runs once capacity frees.
@@ -3309,7 +3311,7 @@ pub(in crate::oracle) mod tests {
             waiting_owner
                 .admit(waiting_request(
                     QueryClass::Analytical,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                     CancellationToken::new(),
                 ))
                 .await
@@ -3350,7 +3352,18 @@ pub(in crate::oracle) mod tests {
                 drop(held);
             }
         }
+    }
 
+    /// Both query classes share one 1,000-place queue: the 1,001st waiter is
+    /// the retryable queue-full overload, and a cancelled or dropped waiter
+    /// frees its place.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a queue bound or release claim fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_queries_share_one_thousand_places() {
+        let defaults = OracleAdmissionConfig::default();
         // One thousand waiters of both classes fit; the next is the retryable
         // overload, and cancelling one waiter returns its place.
         let full = owner(saturable(defaults.queue_capacity, defaults.max_queue_wait));
@@ -3368,11 +3381,7 @@ pub(in crate::oracle) mod tests {
             let waiting_owner = Arc::clone(&full);
             waiters.push(tokio::spawn(async move {
                 waiting_owner
-                    .admit(waiting_request(
-                        class,
-                        Duration::from_secs(60),
-                        cancellation,
-                    ))
+                    .admit(waiting_request(class, Duration::from_mins(1), cancellation))
                     .await
             }));
         }
@@ -3380,7 +3389,7 @@ pub(in crate::oracle) mod tests {
         assert!(matches!(
             full.admit(waiting_request(
                 QueryClass::Interactive,
-                Duration::from_secs(60),
+                Duration::from_mins(1),
                 CancellationToken::new(),
             ))
             .await,
@@ -3393,7 +3402,7 @@ pub(in crate::oracle) mod tests {
             replacement_owner
                 .admit(waiting_request(
                     QueryClass::Analytical,
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                     CancellationToken::new(),
                 ))
                 .await

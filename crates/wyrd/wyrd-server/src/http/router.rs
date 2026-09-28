@@ -166,8 +166,8 @@ fn request_span(request: &Request) -> Span {
 ///   1. attach_request_id — mints/propagates ID; injects instance into errors
 ///   2. CatchPanic — converts panics to 500 before they escape the stack
 ///   3. HandleErrorLayer — maps BoxError (Elapsed, Overloaded) → HTTP response
-///   4-5. EdgeCapacity — load-sheds requests beyond the in-flight concurrency
-///      cap; `POST /v1/query` bypasses both and waits in Oracle's bounded
+///   4. EdgeCapacity (two layers) — load-sheds requests beyond the in-flight
+///      concurrency cap; `POST /v1/query` bypasses both and waits in Oracle's bounded
 ///      query queue instead
 ///   6. EdgeTimeout — enforces the per-request deadline; `POST /v1/query`
 ///      hands its remaining wait to the Oracle query deadline after admission

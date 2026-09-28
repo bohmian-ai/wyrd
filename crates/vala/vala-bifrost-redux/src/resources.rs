@@ -2741,7 +2741,12 @@ impl OracleResources {
         let volume_scratch = self
             .volumes
             .as_ref()
-            .map(|volumes| volumes.capabilities().oracle.try_acquire(request.scratch_bytes))
+            .map(|volumes| {
+                volumes
+                    .capabilities()
+                    .oracle
+                    .try_acquire(request.scratch_bytes)
+            })
             .transpose()?;
         let mut resources = self
             .governor

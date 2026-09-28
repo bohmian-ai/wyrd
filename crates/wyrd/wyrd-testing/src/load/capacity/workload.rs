@@ -424,7 +424,10 @@ mod tests {
         let batch = Fixture::standard().batch(0, 3).expect("fixture rows");
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema(), schema());
-        assert_eq!(Fixture::standard().event_time(STANDARD_ROWS / 2), DAY_START_MS + 12 * HOUR_MS);
+        assert_eq!(
+            Fixture::standard().event_time(STANDARD_ROWS / 2),
+            DAY_START_MS + 12 * HOUR_MS
+        );
         assert!((16..=64).contains(&payload_len(7)));
         assert_eq!(payload(7, &mut [0; 64]).len(), payload_len(7) as usize);
         assert_ne!(payload(7, &mut [0; 64]), payload(8, &mut [0; 64]));
@@ -438,7 +441,13 @@ mod tests {
         assert_eq!(small.len(), 32);
         assert_eq!(small.iter().map(|row| row[1]).sum::<i64>(), SMALL_ROWS);
         let id = selective_id(fixture, 3);
-        assert_eq!(Case::Selective.expected(fixture, 3), vec![vec![id, service(id), duration(id)]]);
-        assert_eq!(Case::BroadWindow.rows_examined(Fixture::heavy()), 70_833_333);
+        assert_eq!(
+            Case::Selective.expected(fixture, 3),
+            vec![vec![id, service(id), duration(id)]]
+        );
+        assert_eq!(
+            Case::BroadWindow.rows_examined(Fixture::heavy()),
+            70_833_333
+        );
     }
 }

@@ -6650,6 +6650,77 @@ mod tests {
         .expect("prepared append")
     }
 
+    /// Builds one ACK-observed group for exact batch identities under `key`.
+    ///
+    /// Returns the appends and, in the same order, the receivers their durable
+    /// ACKs are delivered on, so a crash/retry test can prove which batches
+    /// acknowledged.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`prepared_append_for_key`].
+    fn acked_group_for_key(
+        owner: &ShardOwner,
+        budget: &crate::resources::ScribeResources,
+        key: &SealKey,
+        batch_ids: &[uuid::Uuid],
+    ) -> (
+        Vec<PreparedAppend>,
+        Vec<tokio::sync::oneshot::Receiver<Result<u64, ScribeError>>>,
+    ) {
+        batch_ids
+            .iter()
+            .map(|batch_id| {
+                let mut append = prepared_append_for_key(owner, budget, key.clone(), *batch_id);
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                append.durable_ack = Some(ack_tx);
+                (append, ack_rx)
+            })
+            .unzip()
+    }
+
+    /// Replays `wal`'s directory into `owner` exactly as startup recovery does.
+    ///
+    /// The production replay lane streams records to shard 0's command sender
+    /// while this test drives the owner's own command loop, so replayed
+    /// generations pass through the real fence and memtable path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if replay fails or finishes without a completed stream.
+    async fn replay_into_owner(
+        owner: &mut ShardOwner,
+        wal: &Arc<WalWriter>,
+        stream: StreamIdentity,
+        command_tx: mpsc::Sender<ShardCommand>,
+        budget: &crate::resources::ScribeResources,
+    ) {
+        let mut shard_senders = vec![command_tx];
+        shard_senders.resize_with(SCRIBE_SHARD_COUNT, || mpsc::channel(1).0);
+        let replay_lane = ScribeWalIoPool::new(1);
+        let replay = replay_lane.submit(ScribeWalIoOp::ReplayDirectoryStream {
+            path: wal.base_dir().to_path_buf(),
+            wal: Arc::clone(wal),
+            recovery_stream: stream,
+            shard_senders,
+            memory: budget.clone(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        tokio::pin!(replay);
+        let replayed = loop {
+            tokio::select! {
+                result = &mut replay => break result,
+                Some(command) = owner.receiver.recv() => {
+                    owner.handle_command(command).await;
+                }
+            }
+        };
+        assert!(matches!(
+            replayed.expect("replay"),
+            ScribeWalIoResult::ReplayStreamCompleted { .. }
+        ));
+    }
+
     /// Lists deterministic relative WAL file paths and lengths beneath one test root.
     ///
     /// # Errors
@@ -7074,11 +7145,7 @@ mod tests {
             TableRef::new(BifrostNamespace::Bifrost, "owner-test"),
             crate::test_support::day_partition(2026, 7, 24),
         );
-        let batch_ids = [
-            uuid::Uuid::now_v7(),
-            uuid::Uuid::now_v7(),
-            uuid::Uuid::now_v7(),
-        ];
+        let batch_ids: [uuid::Uuid; 3] = std::array::from_fn(|_| uuid::Uuid::now_v7());
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
         let open_owner = |epoch: i64| {
@@ -7103,17 +7170,7 @@ mod tests {
         };
 
         let (mut owner, budget, _command_tx, _wal, _stream) = open_owner(1);
-        let mut acks = Vec::new();
-        let group = batch_ids
-            .iter()
-            .map(|batch_id| {
-                let mut append = prepared_append_for_key(&owner, &budget, key.clone(), *batch_id);
-                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                append.durable_ack = Some(ack_tx);
-                acks.push(ack_rx);
-                append
-            })
-            .collect::<Vec<_>>();
+        let (group, acks) = acked_group_for_key(&owner, &budget, &key, &batch_ids);
         let mut blocker = superuser.begin().await.expect("fence blocker");
         sqlx::query(
             "INSERT INTO vala.scribe_batch_commits (data_tenant_id, logical_table_fqn, batch_id, \
@@ -7165,47 +7222,14 @@ mod tests {
         assert_eq!(fenced, batch_ids[..2].to_vec());
 
         let (mut owner, budget, command_tx, wal, stream) = open_owner(2);
-        let mut shard_senders = vec![command_tx];
-        shard_senders.resize_with(SCRIBE_SHARD_COUNT, || mpsc::channel(1).0);
-        let replay_lane = ScribeWalIoPool::new(1);
-        let replay = replay_lane.submit(ScribeWalIoOp::ReplayDirectoryStream {
-            path: wal.base_dir().to_path_buf(),
-            wal: Arc::clone(&wal),
-            recovery_stream: stream,
-            shard_senders,
-            memory: budget.clone(),
-            cancelled: Arc::new(AtomicBool::new(false)),
-        });
-        tokio::pin!(replay);
-        let replayed = loop {
-            tokio::select! {
-                result = &mut replay => break result,
-                Some(command) = owner.receiver.recv() => {
-                    owner.handle_command(command).await;
-                }
-            }
-        };
-        assert!(matches!(
-            replayed.expect("replay"),
-            ScribeWalIoResult::ReplayStreamCompleted { .. }
-        ));
+        replay_into_owner(&mut owner, &wal, stream, command_tx, &budget).await;
         let rows = |owner: &ShardOwner| {
             let stats = owner.memtable.stats().expect("memtable stats");
             stats.writable_rows + stats.immutable_rows
         };
         assert_eq!(rows(&owner), batch_ids.len());
 
-        let mut acks = Vec::new();
-        let retry = batch_ids
-            .iter()
-            .map(|batch_id| {
-                let mut append = prepared_append_for_key(&owner, &budget, key.clone(), *batch_id);
-                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                append.durable_ack = Some(ack_tx);
-                acks.push(ack_rx);
-                append
-            })
-            .collect::<Vec<_>>();
+        let (retry, acks) = acked_group_for_key(&owner, &budget, &key, &batch_ids);
         owner.process_group(retry).await.expect("same-ID retry");
         for ack in acks {
             ack.await.expect("retry ACK").expect("retry succeeds");

@@ -1018,6 +1018,15 @@ impl WalVolume {
         })
     }
 
+    /// Returns the device ceiling that refuses WAL growth.
+    ///
+    /// WAL disk pressure scales its soft and hard thresholds from this limit
+    /// so Scribe flushes and sheds appends before the volume refuses them.
+    #[must_use]
+    pub fn configured_limit_bytes(&self) -> u64 {
+        self.governor.configured_limit_bytes
+    }
+
     /// Releases exact durable occupancy after file removal and directory fsync.
     ///
     /// # Errors

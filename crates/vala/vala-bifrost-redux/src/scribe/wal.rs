@@ -2449,6 +2449,22 @@ impl WalWriter {
         Self::new_with_shard_id_and_volume(base_dir, node_id, writer_epoch, shard_id, config, None)
     }
 
+    /// Chooses the capacity WAL disk pressure is measured against.
+    ///
+    /// A governed volume refuses growth at its configured ceiling, so that
+    /// ceiling bounds any explicit WAL limit; soft pressure then seals the
+    /// oldest buckets before the volume turns appends into disk-full refusals.
+    fn pressure_limit(
+        configured: Option<u64>,
+        volume: Option<&crate::resources::WalVolume>,
+    ) -> Option<u64> {
+        let volume_limit = volume.map(crate::resources::WalVolume::configured_limit_bytes);
+        match (configured, volume_limit) {
+            (Some(configured), Some(volume)) => Some(configured.min(volume)),
+            (configured, volume) => configured.or(volume),
+        }
+    }
+
     /// Constructs one shard stream with an optional live physical-volume owner.
     fn new_with_shard_id_and_volume(
         base_dir: impl AsRef<Path>,
@@ -2475,7 +2491,10 @@ impl WalWriter {
             next_lsn: Arc::new(AtomicU64::new(0)),
             segment_bytes: config.segment_bytes,
             states: Arc::new((0..16).map(|_| Mutex::new(WalState::default())).collect()),
-            disk: Arc::new(WalDiskState::new(disk_dir, config.disk_limit_bytes)),
+            disk: Arc::new(WalDiskState::new(
+                disk_dir,
+                Self::pressure_limit(config.disk_limit_bytes, volume.as_deref()),
+            )),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
             deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
             volume,
@@ -5446,6 +5465,45 @@ mod tests {
                 .get("bifrost_scribe_wal_fsync_total{outcome=\"failed\"}"),
             Some(&1)
         );
+    }
+
+    /// WAL disk pressure is measured against the governed volume ceiling.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a volume-backed writer without an explicit WAL limit keeps
+    /// the unbounded filesystem capacity, which lets the volume refuse appends
+    /// before soft pressure ever seals a bucket.
+    #[test]
+    fn wal_pressure_capacity_is_bounded_by_the_governed_volume() {
+        let directory = TempDir::new().expect("temporary WAL directory");
+        let [stage, scribe, oracle] =
+            ["scribe-stage", "scribe-output-scratch", "oracle"].map(|name| {
+                let path = directory.path().join(name);
+                std::fs::create_dir(&path).expect("registered volume root");
+                path
+            });
+        let limit = 64 * 1024 * 1024;
+        let governor = crate::resources::BifrostVolumeGovernor::register(
+            crate::resources::BifrostVolumeRoots {
+                wal: directory.path().to_owned(),
+                scribe_stage: stage,
+                scribe_output_scratch: scribe,
+                oracle_scratch: oracle,
+            },
+            limit,
+            crate::resources::BifrostResourceHealth::default(),
+        )
+        .expect("volume registration");
+        let writer = WalWriter::new_with_volume(
+            directory.path(),
+            [28; 16],
+            1,
+            WalConfig::default(),
+            governor.capabilities().wal,
+        )
+        .expect("volume-backed writer");
+        assert_eq!(writer.disk_pressure().capacity_bytes, limit);
     }
 
     /// Root volume accounting commits only fsynced WAL bytes and rolls failures back.

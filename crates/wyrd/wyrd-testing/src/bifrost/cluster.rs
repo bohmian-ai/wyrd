@@ -141,6 +141,8 @@ pub struct BifrostClusterSpec {
     /// composes the same owner as its first boot; a cache mode that changed
     /// across a restart would make a parity comparison meaningless.
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
+    /// Oracle runtime bounds every Oracle node boots with, when not the defaults.
+    oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
 }
 
 impl BifrostClusterSpec {
@@ -190,6 +192,20 @@ impl BifrostClusterSpec {
         self
     }
 
+    /// Boots every node with the given Oracle queue and deadline bounds.
+    ///
+    /// The values pass through the ordinary server Oracle configuration, so a
+    /// journey proves expiry with short stated limits rather than the
+    /// hour-scale production defaults.
+    #[must_use]
+    pub fn with_oracle_runtime_for_test(
+        mut self,
+        config: wyrd_server::config::OracleRuntimeConfig,
+    ) -> Self {
+        self.oracle_runtime = Some(config);
+        self
+    }
+
     /// Applies one raw process observation to every Oracle node.
     ///
     /// Restarted nodes retain this observation and rerun the production policy;
@@ -229,6 +245,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -250,6 +267,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -276,6 +294,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -305,6 +324,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -327,6 +347,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -803,6 +824,8 @@ pub struct WyrdTestCluster {
         Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
     /// Storage I/O bounds every node start and restart resolves its owner from.
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
+    /// Oracle runtime bounds every node start and restart boots with.
+    oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
@@ -1559,6 +1582,7 @@ impl WyrdTestCluster {
         let scribe_geometry_for_test = spec.scribe_geometry_for_test;
         let scribe_persistence_faults_for_test = spec.scribe_persistence_faults_for_test.clone();
         let storage_io = spec.storage_io;
+        let oracle_runtime = spec.oracle_runtime.clone();
         let process = process_telemetry()?;
         // `explicit_root` is the storage root to reuse (a shared or a
         // caller-declared dedicated root); `None` selects a temporary root.
@@ -1710,6 +1734,7 @@ impl WyrdTestCluster {
             scribe_geometry_for_test,
             scribe_persistence_faults_for_test,
             storage_io,
+            oracle_runtime,
             faults: OracleFaultController::default(),
             telemetry: process.forge_capture.clone(),
             oracle_peer_credentials,
@@ -1760,6 +1785,9 @@ impl WyrdTestCluster {
         }
         if let Some(bytes) = resources.spec.forge_compaction_memory_limit_bytes {
             builder = builder.with_forge_compaction_memory_limit_for_test(bytes);
+        }
+        if let Some(oracle) = self.oracle_runtime.clone() {
+            builder = builder.with_oracle_runtime_for_test(oracle);
         }
         builder = builder.with_forge_process_role_for_test(resources.process_role);
         builder = builder.with_forge_interval(self.forge_interval);

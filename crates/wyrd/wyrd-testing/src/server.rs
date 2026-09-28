@@ -524,6 +524,11 @@ pub struct WyrdTestServerBuilder {
     /// capacity to be a stated number rather than whatever the injected memory
     /// envelope happens to divide into.
     oracle_query_slot_limit: Option<usize>,
+    /// Oracle queue and deadline bounds replacing the production defaults.
+    ///
+    /// A journey that proves queue or total-deadline expiry states short
+    /// limits rather than waiting out the hour-scale production defaults.
+    oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
     /// Forge compaction budget replacing the harness default on this node.
     forge_compaction_memory_limit_bytes: Option<usize>,
     /// Process-installed production telemetry guard shared by every node.
@@ -634,6 +639,7 @@ impl Default for WyrdTestServerBuilder {
             bifrost_data_path: None,
             system_resources: None,
             oracle_query_slot_limit: None,
+            oracle_runtime: None,
             forge_compaction_memory_limit_bytes: None,
             telemetry: None,
             bind_addrs: None,
@@ -4204,6 +4210,20 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Configure this node's Oracle runtime bounds explicitly.
+    ///
+    /// These are the same values production reads from `bifrost.oracle`, such
+    /// as `WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS`, and server boot applies them
+    /// through the ordinary Oracle configuration path.
+    #[must_use]
+    pub fn with_oracle_runtime_for_test(
+        mut self,
+        config: wyrd_server::config::OracleRuntimeConfig,
+    ) -> Self {
+        self.oracle_runtime = Some(config);
+        self
+    }
+
     /// Names the Forge compaction budget this node admits plans against.
     ///
     /// The harness default is sized for the small tables most fixtures compact.
@@ -4700,6 +4720,9 @@ impl WyrdTestServerBuilder {
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         bifrost_config.storage = self.bifrost_storage_io;
+        if let Some(oracle) = self.oracle_runtime.clone() {
+            bifrost_config.oracle = oracle;
+        }
         let forge_runtime = ForgeRuntimeConfig {
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()

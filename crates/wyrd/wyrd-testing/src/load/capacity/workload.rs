@@ -32,6 +32,10 @@ pub const LIVE_START: i64 = PUBLISHED_ROWS;
 /// One past the last live ID: 32,768 acknowledged, unflushed rows.
 pub const LIVE_END: i64 = 1_081_344;
 
+/// First ID the write measurement acknowledges, well past the live fixture so
+/// no short or live read ever selects it.
+pub const WRITE_START: i64 = 4_194_304;
+
 /// Rows each short query returns.
 pub const SHORT_ROWS: i64 = 20;
 

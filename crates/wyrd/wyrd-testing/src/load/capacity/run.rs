@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arrow::array::{Array as _, Int64Array, RecordBatch};
@@ -32,6 +32,7 @@ use super::schedule::{FixedRateDriver, FixedRateRun, ProbeResult, ShortQueryOutc
 use super::workload;
 use crate::bifrost::process_cluster::{
     BifrostProcessCluster, CGROUP_EVIDENCE_FILES, ProcessClusterError, ProcessNode,
+    ProcessNodeTarget,
 };
 
 /// The four measured combinations, in run order: offered short queries per
@@ -40,6 +41,48 @@ use crate::bifrost::process_cluster::{
 /// Both baselines run before the live fixture is even acknowledged, so the
 /// no-live rows measure published data alone; the mixed rows follow.
 pub const RUN_ORDER: [(u64, bool); 4] = [(500, false), (1_000, false), (500, true), (1_000, true)];
+
+/// The remote-Scribe combinations: both rates with live streams held, their
+/// rows living only on a Scribe in another process.
+pub const REMOTE_RUN_ORDER: [(u64, bool); 2] = [(500, true), (1_000, true)];
+
+/// Where the Scribe holding the live fixture runs relative to the queried pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ScribePlacement {
+    /// One mixed `All` pod: every query lists its own in-process Scribe.
+    Colocated,
+    /// A mixed `All` pod plus a `Scribe` pod holding the live fixture, so every
+    /// query lists and every live read crosses a real process boundary.
+    Remote,
+}
+
+impl ScribePlacement {
+    /// Returns the pods this placement launches; the queried pod is first.
+    #[must_use]
+    pub const fn targets(self) -> &'static [ProcessNodeTarget] {
+        match self {
+            Self::Colocated => &[ProcessNodeTarget::All],
+            Self::Remote => &[ProcessNodeTarget::All, ProcessNodeTarget::Scribe],
+        }
+    }
+
+    /// Returns the combinations this placement runs, in order.
+    #[must_use]
+    pub const fn run_order(self) -> &'static [(u64, bool)] {
+        match self {
+            Self::Colocated => &RUN_ORDER,
+            Self::Remote => &REMOTE_RUN_ORDER,
+        }
+    }
+
+    /// Returns the suffix that keeps this placement's raw rows apart.
+    const fn label_suffix(self) -> &'static str {
+        match self {
+            Self::Colocated => "",
+            Self::Remote => "-remote",
+        }
+    }
+}
 
 /// Live streams a mixed row holds: half the Interactive slot units, at least
 /// one.
@@ -58,6 +101,12 @@ const LIVE_HOLD: Duration = Duration::from_secs(5);
 
 /// Leader deadline every live stream carries; longer than [`LIVE_HOLD`].
 const LIVE_DEADLINE_MS: i64 = 30_000;
+
+/// Concurrent public writers in the write-to-durable-ACK measurement.
+const WRITE_WRITERS: usize = 4;
+
+/// Read-back failures a write report names individually.
+const READ_BACK_REPORTED: usize = 10;
 
 /// Most short queries the driver keeps in flight; arrivals beyond it are
 /// counted as missed launches.
@@ -110,6 +159,9 @@ pub enum CapacityError {
     /// Setup produced data the fixed workload does not describe.
     #[error("benchmark preflight: {0}")]
     Preflight(String),
+    /// A required row or the write read-back failed; the report was written.
+    #[error("benchmark requirement failed: {0}")]
+    Requirement(String),
 }
 
 /// Operator-chosen run settings; everything else is fixed by the workload.
@@ -156,6 +208,8 @@ impl BenchmarkSettings {
 /// Environment, fixture, and statements recorded with every report.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunMetadata {
+    /// Where the Scribe holding the live fixture ran.
+    pub scribe_placement: ScribePlacement,
     /// `git rev-parse HEAD` of the working tree, or `unknown`.
     pub server_commit: String,
     /// Child binary the pod ran.
@@ -220,6 +274,33 @@ pub struct LiveStreamTally {
     pub failed: u64,
 }
 
+/// The write-to-durable-ACK measurement and its read-back.
+#[derive(Debug, Clone, Serialize)]
+pub struct WriteReport {
+    /// Concurrent public writers.
+    pub writers: usize,
+    /// Rows in each `write_batch` request.
+    pub rows_per_request: i64,
+    /// Wall time from the first send to the last acknowledgement, seconds.
+    pub window_seconds: f64,
+    /// Requests that resolved at the durable acknowledgement.
+    pub acknowledged_batches: u64,
+    /// Rows in those requests.
+    pub acknowledged_rows: u64,
+    /// Acknowledged rows per second over the window.
+    pub rows_per_second: f64,
+    /// Acknowledged requests per second over the window.
+    pub batches_per_second: f64,
+    /// p50/p95/p99 send-to-acknowledgement of acknowledged requests, ms.
+    pub ack_ms: [Option<f64>; 3],
+    /// Refused requests by stable error code.
+    pub refused: BTreeMap<String, u64>,
+    /// Acknowledged batches whose IDs did not read back exactly.
+    pub read_back_failed: u64,
+    /// The first read-back failures, by ID range.
+    pub read_back_failures: Vec<String>,
+}
+
 /// One Oracle query phase's server-side timing over one window.
 ///
 /// Derived from the window's `oracle_query_phase_seconds` sum and count
@@ -236,6 +317,8 @@ pub struct PhaseTiming {
 /// One offered-rate / held-live-stream report row.
 #[derive(Debug, Clone, Serialize)]
 pub struct CombinationReport {
+    /// Where the Scribe holding the live fixture ran.
+    pub scribe_placement: ScribePlacement,
     /// Offered short queries per second.
     pub offered_rate: u64,
     /// Live streams the row holds, each one Interactive slot unit.
@@ -276,7 +359,9 @@ pub struct CombinationReport {
     pub postgres_select_ms: [f64; 2],
     /// Held live-stream outcomes.
     pub live: LiveStreamTally,
-    /// Whether the offered rate was sent, drained, and succeeded in full.
+    /// Whether the row met its requirement: every arrival sent and drained, at
+    /// least 99% of sent queries and of the offered rate succeeded, no peer
+    /// security refusal, and valid live holds.
     pub sustained: bool,
     /// First boundary the evidence points at when not sustained.
     pub saturated_boundary: &'static str,
@@ -301,9 +386,14 @@ struct Snapshot {
 pub struct QueryCapacityBenchmark {
     /// The one scoped pod and its shared resources.
     cluster: BifrostProcessCluster,
-    /// Public ingest client that seeded the table and later acknowledges the
-    /// live fixture.
-    writer: Bifrost,
+    /// Public ingest client on the queried pod that seeded the table and runs
+    /// the write measurement.
+    writer: Arc<Bifrost>,
+    /// Public ingest client on the remote Scribe pod that acknowledges the
+    /// live fixture there, or `None` when the live fixture is colocated.
+    live_writer: Option<Bifrost>,
+    /// Where the live fixture's Scribe runs.
+    placement: ScribePlacement,
     /// Public query client every measured and live query uses.
     queries: Arc<Bifrost>,
     /// Operator settings.
@@ -329,18 +419,27 @@ impl QueryCapacityBenchmark {
     /// registration, ingest, or a preflight query fails, and
     /// [`CapacityError::Preflight`] when a result differs from the fixture or
     /// the reported Oracle slot gauge differs from the pod's installed count.
-    pub async fn setup(binary: &Path, settings: BenchmarkSettings) -> Result<Self, CapacityError> {
-        let mut cluster = BifrostProcessCluster::start_benchmark(binary).await?;
+    pub async fn setup(
+        binary: &Path,
+        settings: BenchmarkSettings,
+        placement: ScribePlacement,
+    ) -> Result<Self, CapacityError> {
+        let mut cluster =
+            BifrostProcessCluster::start_benchmark(binary, placement.targets()).await?;
         let api_key = cluster
             .provision_foreign_public_api_key("query-capacity")
             .await?;
         let client = public_client(pod(&mut cluster)?, &api_key)?;
-        let writer = Bifrost::connect_with_table(
-            &client,
-            TableConfig::from_arrow(workload::TABLE, workload::schema())?,
-        )
-        .await?;
+        let table = || TableConfig::from_arrow(workload::TABLE, workload::schema());
+        let writer = Bifrost::connect_with_table(&client, table()?).await?;
         writer.register().await?;
+        let live_writer = match cluster.nodes().get(1) {
+            Some(scribe) => {
+                let remote = public_client(scribe, &api_key)?;
+                Some(Bifrost::connect_with_table(&remote, table()?).await?)
+            }
+            None => None,
+        };
         for batch in 0..workload::PUBLISHED_ROWS / workload::PUBLISHED_BATCH_ROWS {
             let first = batch * workload::PUBLISHED_BATCH_ROWS;
             write_ids(&writer, first, first + workload::PUBLISHED_BATCH_ROWS).await?;
@@ -367,11 +466,19 @@ impl QueryCapacityBenchmark {
         sql.push(workload::live_sql());
         expected_digests.push(workload::id_digest(&live));
 
-        let metadata =
-            RunMetadata::collect(&mut cluster, binary, &settings, sql, expected_digests)?;
+        let metadata = RunMetadata::collect(
+            &mut cluster,
+            binary,
+            &settings,
+            placement,
+            sql,
+            expected_digests,
+        )?;
         Ok(Self {
             cluster,
-            writer,
+            writer: Arc::new(writer),
+            live_writer,
+            placement,
             queries,
             settings,
             metadata,
@@ -392,7 +499,8 @@ impl QueryCapacityBenchmark {
     /// fails and [`CapacityError::Preflight`] when its IDs differ from the
     /// fixture or arrive in one batch.
     async fn load_live(&self) -> Result<(), CapacityError> {
-        write_ids(&self.writer, workload::LIVE_START, workload::LIVE_END).await?;
+        let writer = self.live_writer.as_ref().unwrap_or(&self.writer);
+        write_ids(writer, workload::LIVE_START, workload::LIVE_END).await?;
         let (mut live, batches) = preflight(&self.queries, &workload::live_sql()).await?;
         live.sort_unstable();
         let expected: Vec<i64> = (workload::LIVE_START..workload::LIVE_END).collect();
@@ -405,21 +513,24 @@ impl QueryCapacityBenchmark {
         Ok(())
     }
 
-    /// Runs the four [`RUN_ORDER`] combinations and writes the report.
+    /// Runs this placement's combinations, then, colocated, the write
+    /// measurement, and writes the report.
     ///
     /// Rows run back to back; each drains its own streams before the next. The
-    /// live fixture is acknowledged between the no-live baselines and the first
-    /// mixed row, and every mixed row holds [`live_stream_target`] streams.
+    /// live fixture is acknowledged before the first mixed row, and every
+    /// mixed row holds [`live_stream_target`] streams. The report is written
+    /// and the pods shut down before any requirement is judged.
     ///
     /// # Errors
     ///
-    /// Returns the first cluster, client, or output failure; an invalid
-    /// measurement is a report row, not an error.
+    /// Returns the first cluster, client, or output failure, and
+    /// [`CapacityError::Requirement`] naming every row that missed its
+    /// requirement and any acknowledged write batch that did not read back.
     pub async fn run(mut self) -> Result<Vec<CombinationReport>, CapacityError> {
         write_json(&self.settings.output.join("metadata.json"), &self.metadata)?;
         let mut rows = Vec::new();
         let mut live_loaded = false;
-        for (rate, live) in RUN_ORDER {
+        for &(rate, live) in self.placement.run_order() {
             let target = if live {
                 if !live_loaded {
                     self.load_live().await?;
@@ -433,13 +544,149 @@ impl QueryCapacityBenchmark {
             println!("{}", render_row(&row));
             rows.push(row);
         }
+        let writes = match self.placement {
+            ScribePlacement::Colocated => Some(self.measure_writes().await?),
+            ScribePlacement::Remote => None,
+        };
         write_json(&self.settings.output.join("report.json"), &rows)?;
-        let table = render_table(&self.metadata, &rows);
+        let mut table = render_table(&self.metadata, &rows);
+        if let Some(writes) = &writes {
+            write_json(&self.settings.output.join("writes.json"), writes)?;
+            table.push_str(&render_writes(writes));
+        }
         std::fs::write(self.settings.output.join("report.txt"), &table)
             .map_err(|error| CapacityError::Output(error.to_string()))?;
         println!("{table}");
         self.cluster.shutdown()?;
-        Ok(rows)
+        let mut failed = rows
+            .iter()
+            .filter(|row| !row.sustained)
+            .map(|row| {
+                format!(
+                    "{}qps-{}live{}: {}",
+                    row.offered_rate,
+                    row.target_live_streams,
+                    self.placement.label_suffix(),
+                    row.saturated_boundary
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(writes) = &writes
+            && writes.read_back_failed > 0
+        {
+            failed.push(format!(
+                "{} of {} acknowledged write batches did not read back",
+                writes.read_back_failed, writes.acknowledged_batches
+            ));
+        }
+        if failed.is_empty() {
+            Ok(rows)
+        } else {
+            Err(CapacityError::Requirement(failed.join("; ")))
+        }
+    }
+
+    /// Writes fresh ID ranges from [`WRITE_WRITERS`] concurrent public
+    /// writers for the measurement window, then reads every acknowledged
+    /// batch back.
+    ///
+    /// Each request is one [`workload::INGEST_REQUEST_ROWS`]-row
+    /// `write_batch`, which resolves only at the durable acknowledgement, so
+    /// the acknowledged rate is the durable write rate. A refused request is
+    /// counted by its stable code and its range skipped. Every acknowledged
+    /// range is then read back through the public query client and must
+    /// return exactly its IDs. There is no approved write target, so the rate
+    /// is reported, never judged; only a read-back failure is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapacityError::Output`] when a writer task panics.
+    async fn measure_writes(&self) -> Result<WriteReport, CapacityError> {
+        let next = Arc::new(AtomicI64::new(workload::WRITE_START));
+        let window_end = Instant::now() + self.settings.measurement;
+        let started = Instant::now();
+        let mut writers = JoinSet::new();
+        for _ in 0..WRITE_WRITERS {
+            let writer = Arc::clone(&self.writer);
+            let next = Arc::clone(&next);
+            writers.spawn(async move {
+                let mut acknowledged = Vec::new();
+                let mut refused = BTreeMap::<String, u64>::new();
+                while Instant::now() < window_end {
+                    let first = next.fetch_add(workload::INGEST_REQUEST_ROWS, Ordering::Relaxed);
+                    let sent = Instant::now();
+                    let result = match workload::rows(first, first + workload::INGEST_REQUEST_ROWS)
+                    {
+                        Ok(batch) => {
+                            writer
+                                .write_batch(workload::TABLE, &batch)
+                                .await
+                                .map_err(|error| {
+                                    wyrd_spec::error::WyrdError::from(&error).code().to_owned()
+                                })
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
+                    match result {
+                        Ok(_) => acknowledged.push((first, sent.elapsed())),
+                        Err(code) => *refused.entry(code).or_default() += 1,
+                    }
+                }
+                (acknowledged, refused)
+            });
+        }
+        let mut acknowledged = Vec::new();
+        let mut refused = BTreeMap::<String, u64>::new();
+        while let Some(joined) = writers.join_next().await {
+            let (acked, codes) =
+                joined.map_err(|error| CapacityError::Output(format!("writer task: {error}")))?;
+            acknowledged.extend(acked);
+            for (code, count) in codes {
+                *refused.entry(code).or_default() += count;
+            }
+        }
+        let window = started.elapsed().as_secs_f64();
+        acknowledged.sort_unstable_by_key(|(first, _)| *first);
+        let mut latencies = acknowledged
+            .iter()
+            .map(|(_, latency)| *latency)
+            .collect::<Vec<_>>();
+        latencies.sort_unstable();
+        let mut read_back_failed = 0;
+        let mut read_back_failures = Vec::new();
+        for (first, _) in &acknowledged {
+            let last = first + workload::INGEST_REQUEST_ROWS;
+            let sql = format!(
+                "SELECT id FROM {} WHERE id >= {first} AND id < {last} ORDER BY id",
+                workload::TABLE
+            );
+            let failure = match preflight(&self.queries, &sql).await {
+                Ok((ids, _)) if ids.iter().copied().eq(*first..last) => None,
+                Ok((ids, _)) => Some(format!("{first}..{last} read back {} IDs", ids.len())),
+                Err(error) => Some(format!("{first}..{last}: {error}")),
+            };
+            if let Some(failure) = failure {
+                read_back_failed += 1;
+                if read_back_failures.len() < READ_BACK_REPORTED {
+                    read_back_failures.push(failure);
+                }
+            }
+        }
+        let batches = acknowledged.len() as u64;
+        let rows = batches * workload::INGEST_REQUEST_ROWS.unsigned_abs();
+        Ok(WriteReport {
+            writers: WRITE_WRITERS,
+            rows_per_request: workload::INGEST_REQUEST_ROWS,
+            window_seconds: window,
+            acknowledged_batches: batches,
+            acknowledged_rows: rows,
+            rows_per_second: rows as f64 / window,
+            batches_per_second: batches as f64 / window,
+            ack_ms: [0.50, 0.95, 0.99].map(|quantile| percentile_ms(&latencies, quantile)),
+            refused,
+            read_back_failed,
+            read_back_failures,
+        })
     }
 
     /// Warmup, measurement, and drain for one combination holding `target`
@@ -456,7 +703,7 @@ impl QueryCapacityBenchmark {
         rate: u64,
         target: usize,
     ) -> Result<CombinationReport, CapacityError> {
-        let label = format!("{rate}qps-{target}live");
+        let label = format!("{rate}qps-{target}live{}", self.placement.label_suffix());
         let raw = self.settings.output.join(&label);
         std::fs::create_dir_all(&raw).map_err(|error| CapacityError::Output(error.to_string()))?;
         let mut invalid = Vec::new();
@@ -511,6 +758,7 @@ impl QueryCapacityBenchmark {
             ));
         }
         Ok(MeasuredWindow {
+            placement: self.placement,
             rate,
             target,
             streams,
@@ -676,6 +924,7 @@ impl RunMetadata {
         cluster: &mut BifrostProcessCluster,
         binary: &Path,
         settings: &BenchmarkSettings,
+        scribe_placement: ScribePlacement,
         sql: Vec<String>,
         expected_digests: Vec<String>,
     ) -> Result<Self, CapacityError> {
@@ -690,10 +939,10 @@ impl RunMetadata {
         let oracle_slot_limit = tokio::task::block_in_place(|| slot_units(node, "limit"))?;
         let oracle_interactive_floor =
             tokio::task::block_in_place(|| slot_units(node, "interactive_floor"))?;
-        if (oracle_slot_limit - evidence.oracle_slot_units as f64).abs() > f64::EPSILON {
+        let installed = evidence.oracle_slot_units.unwrap_or(0);
+        if (oracle_slot_limit - installed as f64).abs() > f64::EPSILON {
             return Err(CapacityError::Preflight(format!(
-                "the pod reports {oracle_slot_limit} Oracle slot units but installed {}",
-                evidence.oracle_slot_units
+                "the pod reports {oracle_slot_limit} Oracle slot units but installed {installed}"
             )));
         }
         let postgres = std::env::var("WYRD_DATABASE_URL")
@@ -710,6 +959,7 @@ impl RunMetadata {
                 },
             );
         Ok(Self {
+            scribe_placement,
             server_commit: std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .output()
@@ -746,6 +996,8 @@ impl RunMetadata {
 
 /// Everything one combination's window produced, before it becomes a row.
 struct MeasuredWindow {
+    /// Where the live fixture's Scribe ran.
+    placement: ScribePlacement,
     /// Offered short queries per second.
     rate: u64,
     /// Live streams the row holds.
@@ -777,6 +1029,7 @@ impl MeasuredWindow {
     /// query latency.
     fn report(self) -> CombinationReport {
         let Self {
+            placement,
             rate,
             target,
             streams,
@@ -812,9 +1065,12 @@ impl MeasuredWindow {
             };
             cgroup.insert(key.clone(), reported);
         }
+        let successes = outcomes[&ShortQueryOutcome::Success] as f64;
         let sustained = invalid.is_empty()
             && run.missed_launches == 0
             && run.abandoned == 0
+            && outcomes[&ShortQueryOutcome::SecurityRefused] == 0
+            && successes >= 0.99 * run.sent as f64
             && run.successes_per_second() >= 0.99 * rate as f64;
         let saturated_boundary = if sustained {
             "none"
@@ -825,6 +1081,7 @@ impl MeasuredWindow {
         } else if cgroup.get("cpu.stat:nr_throttled").copied().unwrap_or(0.0) > 0.0 {
             "cgroup cpu"
         } else if let Some((_, boundary)) = [
+            (ShortQueryOutcome::SecurityRefused, "peer security"),
             (ShortQueryOutcome::AdmissionRefused, "oracle admission"),
             (ShortQueryOutcome::TransportError, "query transport"),
             (ShortQueryOutcome::Failed, "query failure"),
@@ -843,6 +1100,7 @@ impl MeasuredWindow {
             "query latency"
         };
         CombinationReport {
+            scribe_placement: placement,
             offered_rate: rate,
             target_live_streams: target,
             live_streams_sampled: if streams[0] == usize::MAX {
@@ -1041,6 +1299,14 @@ async fn short_query(queries: Arc<Bifrost>, bucket: u64) -> ProbeResult {
         }
         Some(QueryTerminalOutcome::Success) => ShortQueryOutcome::WrongResult,
         Some(QueryTerminalOutcome::Degraded) => ShortQueryOutcome::Degraded,
+        Some(QueryTerminalOutcome::Failed)
+            if stream
+                .terminal()
+                .and_then(|terminal| terminal.error.as_ref())
+                .is_some_and(|error| error.code == QueryTerminalErrorCode::QueryPeerSecurity) =>
+        {
+            ShortQueryOutcome::SecurityRefused
+        }
         Some(QueryTerminalOutcome::Failed) => ShortQueryOutcome::Failed,
         None => ShortQueryOutcome::TransportError,
     };
@@ -1057,6 +1323,7 @@ fn classify_error(error: &BifrostClientError) -> ShortQueryOutcome {
     if let Some(terminal) = error.terminal() {
         return match terminal.error.as_ref().map(|error| error.code) {
             Some(QueryTerminalErrorCode::QueryTimeout) => ShortQueryOutcome::Deadline,
+            Some(QueryTerminalErrorCode::QueryPeerSecurity) => ShortQueryOutcome::SecurityRefused,
             _ => ShortQueryOutcome::Failed,
         };
     }
@@ -1065,6 +1332,8 @@ fn classify_error(error: &BifrostClientError) -> ShortQueryOutcome {
         ShortQueryOutcome::AdmissionRefused
     } else if code == "WYRD_VALA_504_QUERY_TIMEOUT" {
         ShortQueryOutcome::Deadline
+    } else if code == "WYRD_VALA_403_QUERY_PEER_SECURITY" {
+        ShortQueryOutcome::SecurityRefused
     } else {
         ShortQueryOutcome::TransportError
     }
@@ -1389,6 +1658,44 @@ fn write_samples(path: &Path, run: &FixedRateRun) -> Result<(), CapacityError> {
     std::fs::write(path, lines).map_err(|error| CapacityError::Output(error.to_string()))
 }
 
+/// Returns the `quantile` of sorted `latencies` in milliseconds, or `None`
+/// when there are none.
+fn percentile_ms(latencies: &[Duration], quantile: f64) -> Option<f64> {
+    let last = latencies.len().checked_sub(1)?;
+    let index = ((last as f64) * quantile).round() as usize;
+    latencies
+        .get(index.min(last))
+        .map(|latency| latency.as_secs_f64() * 1_000.0)
+}
+
+/// Renders the write measurement as report lines.
+fn render_writes(writes: &WriteReport) -> String {
+    let ms = |value: Option<f64>| value.map_or_else(|| "-".to_owned(), |ms| format!("{ms:.1}"));
+    format!(
+        "\nwrites: {} writers x {} rows over {:.1}s: {} batches, {} rows acknowledged durably; \
+         {:.0} rows/s ({:.1} batches/s); ack p50/p95/p99 {}/{}/{} ms; refused {:?}; \
+         read back {} of {} batches exactly{}\n",
+        writes.writers,
+        writes.rows_per_request,
+        writes.window_seconds,
+        writes.acknowledged_batches,
+        writes.acknowledged_rows,
+        writes.rows_per_second,
+        writes.batches_per_second,
+        ms(writes.ack_ms[0]),
+        ms(writes.ack_ms[1]),
+        ms(writes.ack_ms[2]),
+        writes.refused,
+        writes.acknowledged_batches - writes.read_back_failed,
+        writes.acknowledged_batches,
+        if writes.read_back_failures.is_empty() {
+            String::new()
+        } else {
+            format!("; first failures: {}", writes.read_back_failures.join(", "))
+        },
+    )
+}
+
 /// Renders a latency in milliseconds, or `-`.
 fn millis(micros: Option<u64>) -> String {
     micros.map_or_else(
@@ -1401,7 +1708,7 @@ fn millis(micros: Option<u64>) -> String {
 fn render_row(row: &CombinationReport) -> String {
     let count = |outcome| row.outcomes.get(&outcome).copied().unwrap_or(0);
     format!(
-        "{:>5} {:>3}/{:<3} {:>8.1} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>5} {:<16} {}",
+        "{:>5} {:>3}/{:<3} {:>8.1} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>5} {:<16} {}",
         row.offered_rate,
         row.live_streams_sampled[0],
         row.target_live_streams,
@@ -1416,6 +1723,7 @@ fn render_row(row: &CombinationReport) -> String {
         count(ShortQueryOutcome::Deadline),
         count(ShortQueryOutcome::TransportError),
         count(ShortQueryOutcome::WrongResult),
+        count(ShortQueryOutcome::SecurityRefused),
         row.missed_launches,
         row.drain_completions,
         row.sustained,
@@ -1431,12 +1739,13 @@ fn render_row(row: &CombinationReport) -> String {
 /// Renders the metadata and every row as the human-readable report.
 fn render_table(metadata: &RunMetadata, rows: &[CombinationReport]) -> String {
     let mut out = format!(
-        "Bifrost single-pod query capacity\n\
+        "Bifrost single-pod query capacity, Scribe {:?}\n\
          commit {} binary {} ({})\n\
          host {} CPUs {} bytes; pod cgroup {:?} cpu.max {:?} memory.max {:?}; Oracle slots {} (interactive floor {})\n\
          {}\n\
          data: {} published + {} live rows; {} files, {} row groups, {} bytes\n\
          warmup {}s, measurement {}s per row\n",
+        metadata.scribe_placement,
         metadata.server_commit,
         metadata.server_binary.display(),
         metadata.server_binary_sha256,
@@ -1460,7 +1769,7 @@ fn render_table(metadata: &RunMetadata, rows: &[CombinationReport]) -> String {
         out.push_str(&format!("  {digest}  {sql}\n"));
     }
     out.push_str(
-        "\n rate held/tgt  ok/s   p95ms   p99ms  1st99  ok     degr   fail   refuse dline  transp wrong  missed drained sust  boundary         validity\n",
+        "\n rate held/tgt  ok/s   p95ms   p99ms  1st99  ok     degr   fail   refuse dline  transp wrong  secur  missed drained sust  boundary         validity\n",
     );
     for row in rows {
         out.push_str(&render_row(row));

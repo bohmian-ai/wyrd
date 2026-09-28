@@ -1247,8 +1247,9 @@ fn metric_totals(
 /// # Errors
 ///
 /// Returns [`ProcessClusterError::Child`] when this target composed no Bifrost
-/// resources or no Oracle, and [`ProcessClusterError::Resource`] when the plan
-/// derives no Oracle slot count or a file cannot be written.
+/// resources, and [`ProcessClusterError::Resource`] when the plan derives no
+/// Oracle slot count or a file cannot be written. A target without an Oracle
+/// reports no installed slot count.
 fn capture_resource_evidence(
     server: &WyrdTestServer,
     telemetry: &crate::bifrost::BifrostTelemetryCapture,
@@ -1264,8 +1265,7 @@ fn capture_resource_evidence(
         .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
     let oracle_slot_units = resources
         .oracle()
-        .map(|oracle| usize::try_from(oracle.class_split().total_units()).unwrap_or(usize::MAX))
-        .ok_or_else(|| ProcessClusterError::Child("this target composes no Oracle".to_owned()))?;
+        .map(|oracle| usize::try_from(oracle.class_split().total_units()).unwrap_or(usize::MAX));
     std::fs::write(directory.join("metrics.prom"), telemetry.render()).map_err(resource)?;
     let cgroup = std::fs::read_to_string("/proc/self/cgroup")
         .ok()

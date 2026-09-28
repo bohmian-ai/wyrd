@@ -34,11 +34,13 @@ pub enum ShortQueryOutcome {
     TransportError,
     /// Terminal `Success` whose IDs were not the expected ones.
     WrongResult,
+    /// Refused by a peer security check; never expected under ordinary load.
+    SecurityRefused,
 }
 
 impl ShortQueryOutcome {
     /// Every category, in report column order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Success,
         Self::Degraded,
         Self::Failed,
@@ -46,6 +48,7 @@ impl ShortQueryOutcome {
         Self::Deadline,
         Self::TransportError,
         Self::WrongResult,
+        Self::SecurityRefused,
     ];
 }
 

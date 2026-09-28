@@ -702,8 +702,9 @@ pub struct ResourceEvidence {
     /// Oracle slot units the child's resource plan derives.
     pub plan_oracle_slots: usize,
     /// Oracle slot units the child installed and reports through its
-    /// `bifrost_oracle_local_slot_units{kind="limit"}` gauge.
-    pub oracle_slot_units: usize,
+    /// `bifrost_oracle_local_slot_units{kind="limit"}` gauge, or `None` for a
+    /// target that composes no Oracle.
+    pub oracle_slot_units: Option<usize>,
 }
 
 impl ResourceEvidence {
@@ -714,7 +715,7 @@ impl ResourceEvidence {
     /// child whose cgroup is unlimited, differently limited, or whose plan was
     /// resolved from a different snapshot is refused rather than measured.
     /// `cpu.max` must be exactly `effective_cpu` periods of quota,
-    /// `memory.max` exactly `memory_limit_bytes`, and the installed Oracle slot
+    /// `memory.max` exactly `memory_limit_bytes`, and any installed Oracle slot
     /// count the one that plan derives.
     ///
     /// # Errors
@@ -763,10 +764,12 @@ impl ResourceEvidence {
                 self.plan_effective_cpu, self.plan_memory_limit_bytes
             ));
         }
-        if self.oracle_slot_units != self.plan_oracle_slots {
+        if let Some(installed) = self.oracle_slot_units
+            && installed != self.plan_oracle_slots
+        {
             return refuse(format!(
-                "the child installed {} Oracle slot units, but its plan derives {}",
-                self.oracle_slot_units, self.plan_oracle_slots
+                "the child installed {installed} Oracle slot units, but its plan derives {}",
+                self.plan_oracle_slots
             ));
         }
         Ok(())
@@ -2194,15 +2197,16 @@ impl BifrostProcessCluster {
         Self::launch_topology(binary.into(), targets, oracle_query_slot_limit, false).await
     }
 
-    /// Launches one mixed `All` pod as a local child in its own limited
-    /// systemd user scope for the query capacity benchmark.
+    /// Launches one local child per target, each in its own limited systemd
+    /// user scope, for the query capacity benchmark.
     ///
-    /// The child boots with a [`BENCHMARK_EFFECTIVE_CPU`]-CPU,
+    /// The colocated benchmark launches one mixed `All` pod; the remote-Scribe
+    /// run adds a `Scribe` pod beside it. Each child boots with a [`BENCHMARK_EFFECTIVE_CPU`]-CPU,
     /// [`BENCHMARK_MEMORY_LIMIT_BYTES`]-byte injected resource snapshot, and
     /// [`benchmark_scope`] enforces exactly that envelope. Before returning,
     /// the `cpu.max`, `memory.max`, resolved plan, and installed Oracle slot
-    /// count of the child's own cgroup are read back and compared with it; a
-    /// mismatch, an unlimited cgroup, or an unready child is refused and the
+    /// count of each child's own cgroup are read back and compared with it; a
+    /// mismatch, an unlimited cgroup, or an unready child is refused and every
     /// pod torn down. Oracle admission is left on its derived slot count.
     ///
     /// # Errors
@@ -2210,9 +2214,11 @@ impl BifrostProcessCluster {
     /// Returns the same errors as [`Self::start`], and
     /// [`ProcessClusterError::Resource`] when the child's effective limits or
     /// plan differ from the injected envelope.
-    pub async fn start_benchmark(binary: impl Into<PathBuf>) -> Result<Self, ProcessClusterError> {
-        let mut cluster =
-            Self::launch_topology(binary.into(), &[ProcessNodeTarget::All], None, true).await?;
+    pub async fn start_benchmark(
+        binary: impl Into<PathBuf>,
+        targets: &[ProcessNodeTarget],
+    ) -> Result<Self, ProcessClusterError> {
+        let mut cluster = Self::launch_topology(binary.into(), targets, None, true).await?;
         let verified = cluster.verify_benchmark_envelope();
         match verified {
             Ok(()) => Ok(cluster),
@@ -2225,27 +2231,33 @@ impl BifrostProcessCluster {
         }
     }
 
-    /// Refuses a benchmark pod that is unready or not limited to its envelope.
+    /// Refuses a benchmark topology with a pod that is unready or not limited
+    /// to its envelope.
     ///
     /// # Errors
     ///
-    /// Returns [`ProcessClusterError::Resource`] when the pod is missing or
-    /// unready or its evidence fails [`ResourceEvidence::verify_envelope`], and
-    /// the control errors of [`ProcessNode::capture_resource_evidence`].
+    /// Returns [`ProcessClusterError::Resource`] when no pod launched, a pod is
+    /// unready, or its evidence fails [`ResourceEvidence::verify_envelope`],
+    /// and the control errors of [`ProcessNode::capture_resource_evidence`].
     fn verify_benchmark_envelope(&mut self) -> Result<(), ProcessClusterError> {
-        let node = self.nodes.first_mut().ok_or_else(|| {
-            ProcessClusterError::Resource("the benchmark launched no pod".to_owned())
-        })?;
-        if !node.inspect()?.ready {
+        if self.nodes.is_empty() {
             return Err(ProcessClusterError::Resource(
-                "the benchmark pod is not ready".to_owned(),
+                "the benchmark launched no pod".to_owned(),
             ));
         }
-        let directory = node.root().join("launch-evidence");
-        std::fs::create_dir_all(&directory)
-            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-        node.capture_resource_evidence(&directory)?
-            .verify_envelope(BENCHMARK_EFFECTIVE_CPU, BENCHMARK_MEMORY_LIMIT_BYTES)
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            if !node.inspect()?.ready {
+                return Err(ProcessClusterError::Resource(format!(
+                    "benchmark pod {index} is not ready"
+                )));
+            }
+            let directory = node.root().join("launch-evidence");
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
+            node.capture_resource_evidence(&directory)?
+                .verify_envelope(BENCHMARK_EFFECTIVE_CPU, BENCHMARK_MEMORY_LIMIT_BYTES)?;
+        }
+        Ok(())
     }
 
     /// Prepares the shared resources and launches one child per target.
@@ -2949,7 +2961,7 @@ mod tests {
             plan_memory_limit_bytes: bytes,
             plan_effective_cpu: cpus,
             plan_oracle_slots: 8,
-            oracle_slot_units: 8,
+            oracle_slot_units: Some(8),
         };
         exact
             .verify_envelope(cpus, bytes)
@@ -3014,7 +3026,7 @@ mod tests {
             (
                 "installed slots",
                 ResourceEvidence {
-                    oracle_slot_units: 4,
+                    oracle_slot_units: Some(4),
                     ..exact.clone()
                 },
             ),

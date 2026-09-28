@@ -1305,9 +1305,14 @@ impl OraclePeerWorker {
         &self,
         request: ExecuteFragmentRequest,
         capacity: WorkerCapacity,
-        admitted_grant: Option<LeaderAdmittedGrant>,
+        mut admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerExecution, DispatchError> {
-        let (claims, tenant_id) = self.verify_fragment_authority(&request).await?;
+        let local_claims = admitted_grant
+            .as_mut()
+            .map(|grant| std::mem::take(&mut grant.claims));
+        let (claims, tenant_id) = self
+            .verify_fragment_authority(&request, local_claims)
+            .await?;
         let monotonic_now = Instant::now();
         let execution_deadline = claims
             .execution_deadline()
@@ -1481,6 +1486,7 @@ impl OraclePeerWorker {
     async fn verify_fragment_authority(
         &self,
         request: &ExecuteFragmentRequest,
+        local_claims: Option<PeerTicketClaims>,
     ) -> Result<(PeerTicketClaims, DataTenantId), DispatchError> {
         if request.target_fence.role != wyrd_spec::vala::api::ClusterRole::Oracle {
             tracing::error!(role = ?request.target_fence.role, "Oracle peer received a non-Oracle target role");
@@ -1505,6 +1511,28 @@ impl OraclePeerWorker {
                 .await?;
             return Err(DispatchError::Terminal);
         }
+        let claims = match local_claims {
+            Some(claims) => claims,
+            None => self.verify_ticket_claims(request, expected_fence).await?,
+        };
+        let tenant_validation = validated_claim_identifiers(&claims);
+        if let Err(violation) = tenant_validation.as_ref() {
+            self.audit_unverified(*violation).await?;
+        }
+        let tenant_id = tenant_validation.map_err(|_| DispatchError::Terminal)?;
+        Ok((claims, tenant_id))
+    }
+
+    /// Verifies a remote fragment's signed ticket and decodes its claims.
+    ///
+    /// # Errors
+    /// Returns [`DispatchError::Terminal`] for an unverifiable ticket or
+    /// undecodable claims. Audit-append failures propagate unchanged.
+    async fn verify_ticket_claims(
+        &self,
+        request: &ExecuteFragmentRequest,
+        expected_fence: u64,
+    ) -> Result<PeerTicketClaims, DispatchError> {
         let verified = self
             .verifier
             .verify_peer_ticket(
@@ -1524,12 +1552,7 @@ impl OraclePeerWorker {
                 .await?;
             return Err(DispatchError::Terminal);
         };
-        let tenant_validation = validated_claim_identifiers(&claims);
-        if let Err(violation) = tenant_validation.as_ref() {
-            self.audit_unverified(*violation).await?;
-        }
-        let tenant_id = tenant_validation.map_err(|_| DispatchError::Terminal)?;
-        Ok((claims, tenant_id))
+        Ok(claims)
     }
 
     /// Acquires the one remote-worker memory root backing a peer reservation.
@@ -2960,6 +2983,14 @@ impl OraclePeerTransportDirectory {
         node_id == self.local_node_id
     }
 
+    /// Returns whether `candidate` is this process's own Oracle worker, whose
+    /// fragments run in-process without a signed ticket.
+    #[must_use]
+    pub fn runs_in_process(&self, candidate: &DispatchCandidate) -> bool {
+        self.is_local(candidate.node_id)
+            && candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle
+    }
+
     /// Reserves through the identity-selected local or remote adapter.
     ///
     /// # Errors
@@ -3070,9 +3101,7 @@ impl OraclePeerTransportDirectory {
         request: ExecuteFragmentRequest,
         admitted_grant: LeaderAdmittedGrant,
     ) -> Result<WorkerAttemptStream, DispatchError> {
-        if self.is_local(candidate.node_id)
-            && candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle
-        {
+        if self.runs_in_process(candidate) {
             self.local
                 .execute(candidate.node_id, request, Some(admitted_grant))
                 .await
@@ -3187,6 +3216,12 @@ pub struct LeaderAdmittedGrant {
     pub granted_memory_bytes: usize,
     /// Partition ceiling admitted for the leader's query.
     pub admitted_target_partitions: usize,
+    /// Fragment claims the leader built for this attempt.
+    ///
+    /// A leader-local fragment never leaves the process, so the claims are
+    /// handed over directly instead of being signed and verified again. Remote
+    /// transports ignore the grant and keep the signed ticket.
+    pub claims: PeerTicketClaims,
 }
 
 impl std::fmt::Debug for LeaderAdmittedGrant {
@@ -3401,7 +3436,17 @@ impl FragmentDispatcher {
                 leader_fencing_token: context.leader_fence,
             };
             let claims = peer_ticket_claims(candidate, context, &fragment, &pending)?;
-            let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) else {
+            let ticket = if self.transports.runs_in_process(candidate) {
+                // The in-process worker receives `claims` through the grant and
+                // never reads this ticket, so nothing is signed for it.
+                wyrd_spec::vala::api::SignedPeerTicket {
+                    key_id: String::new(),
+                    claims_bytes: Vec::new(),
+                    signature: Vec::new(),
+                }
+            } else if let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) {
+                ticket
+            } else {
                 tracing::error!("Oracle peer ticket mint failed");
                 if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
                     self.release_pending(candidate, release, context).await;
@@ -3413,7 +3458,7 @@ impl FragmentDispatcher {
             };
             let request = fragment_request(ticket, candidate, context, &fragment, &pending);
             let result = self
-                .execute_attempt(candidate, request, context, &fragment)
+                .execute_attempt(candidate, request, claims, context, &fragment)
                 .await;
             if result.is_ok() {
                 return result;
@@ -3494,9 +3539,10 @@ impl FragmentDispatcher {
         &self,
         candidate: &DispatchCandidate,
         request: ExecuteFragmentRequest,
+        claims: PeerTicketClaims,
         context: &DispatchContext,
     ) -> Result<WorkerAttemptStream, DispatchError> {
-        self.open_frames(candidate, request, context)
+        self.open_frames(candidate, request, claims, context)
             .await
             .map_err(open_failure)
     }
@@ -3513,6 +3559,7 @@ impl FragmentDispatcher {
         &self,
         candidate: &DispatchCandidate,
         request: ExecuteFragmentRequest,
+        claims: PeerTicketClaims,
         context: &DispatchContext,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let remaining = context
@@ -3530,6 +3577,7 @@ impl FragmentDispatcher {
                         memory_pool: Arc::clone(&context.query_memory_pool),
                         granted_memory_bytes: context.granted_memory_bytes,
                         admitted_target_partitions: context.admitted_target_partitions,
+                        claims,
                     },
                 ),
             ) =>
@@ -3585,13 +3633,14 @@ impl FragmentDispatcher {
             DispatchError::Terminal
         })?;
         let request = fragment_request(ticket, candidate, context, fragment, &pending);
-        self.open_frames(candidate, request, context).await
+        self.open_frames(candidate, request, claims, context).await
     }
 
     async fn execute_attempt(
         &self,
         candidate: &DispatchCandidate,
         request: ExecuteFragmentRequest,
+        claims: PeerTicketClaims,
         context: &DispatchContext,
         fragment: &PhysicalDispatchFragment,
     ) -> Result<ValidatedAttempt, DispatchError> {
@@ -3607,7 +3656,10 @@ impl FragmentDispatcher {
             &context.query_memory_pool,
         )
         .map_err(attempt_error)?;
-        let mut frames = match self.open_attempt_frames(candidate, request, context).await {
+        let mut frames = match self
+            .open_attempt_frames(candidate, request, claims, context)
+            .await
+        {
             Ok(frames) => frames,
             Err(error) => {
                 telemetry.finish(FragmentOutcome::Failed, 0);
@@ -3842,13 +3894,21 @@ mod tests {
     ///
     /// Mirrors what the leader hands a local fragment: the admitted pool plus
     /// the grant bytes and partition ceiling that admission produced.
-    fn test_admitted_grant(granted_memory_bytes: usize) -> LeaderAdmittedGrant {
+    ///
+    /// The claims are decoded from the fixture ticket, so a test that tampers
+    /// the ticket's claims tampers what the leader hands over in-process.
+    fn test_admitted_grant(
+        request: &ExecuteFragmentRequest,
+        granted_memory_bytes: usize,
+    ) -> LeaderAdmittedGrant {
         LeaderAdmittedGrant {
             memory_pool: Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
                 granted_memory_bytes,
             )),
             granted_memory_bytes,
             admitted_target_partitions: 1,
+            claims: PeerTicketClaims::decode(request.ticket.claims_bytes.as_slice())
+                .unwrap_or_default(),
         }
     }
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4707,9 +4767,8 @@ mod tests {
         // ticket signature itself still verifies cleanly.
         request.assignments[0].required_columns = vec!["tampered_column".to_owned()];
 
-        let result = worker
-            .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
-            .await;
+        let grant = test_admitted_grant(&request, 2 * 1024 * 1024);
+        let result = worker.execute_local(request, grant).await;
         let Err(error) = result else {
             panic!("tampered assignment closure must be rejected before execution");
         };
@@ -4898,8 +4957,9 @@ mod tests {
         {
             let (worker, resolver, request) =
                 counting_worker_request(&oracle, &fragment, tenant, 51);
+            let grant = test_admitted_grant(&request, 2 * 1024 * 1024);
             worker
-                .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
+                .execute_local(request, grant)
                 .await
                 .expect("valid v3 assignment authority digest executes");
             assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
@@ -4923,9 +4983,8 @@ mod tests {
             let (worker, resolver, mut request) =
                 counting_worker_request(&oracle, &fragment, tenant, 52);
             tamper(&mut request);
-            let result = worker
-                .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
-                .await;
+            let grant = test_admitted_grant(&request, 2 * 1024 * 1024);
+            let result = worker.execute_local(request, grant).await;
             assert!(matches!(result, Err(DispatchError::Terminal)));
             assert_eq!(
                 resolver.calls.load(Ordering::SeqCst),
@@ -4949,9 +5008,8 @@ mod tests {
             claims.encode(&mut bytes).expect("encode v2 claims");
             request.ticket.claims_bytes = bytes.clone();
             request.ticket.signature = bytes;
-            let result = worker
-                .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
-                .await;
+            let grant = test_admitted_grant(&request, 2 * 1024 * 1024);
+            let result = worker.execute_local(request, grant).await;
             assert!(matches!(result, Err(DispatchError::Terminal)));
             assert_eq!(
                 resolver.calls.load(Ordering::SeqCst),
@@ -5011,8 +5069,9 @@ mod tests {
             tenant,
         );
 
+        let grant = test_admitted_grant(&request, 2 * 1024 * 1024);
         let mut execution = worker
-            .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
+            .execute_local(request, grant)
             .await
             .expect("leader-admitted execution");
         let frame = execution
@@ -5495,7 +5554,11 @@ mod tests {
         assert_eq!(transport.reserve_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// A post-reserve ticket-mint failure releases pending capacity before returning.
+    /// A post-reserve ticket-mint failure for a remote Oracle peer releases
+    /// pending capacity before returning.
+    ///
+    /// Only remote peers are minted a ticket; the leader-local worker receives
+    /// its claims in-process.
     #[tokio::test]
     async fn oracle_dispatch_releases_pending_when_ticket_mint_fails() {
         let leader = NodeId::new(uuid::Uuid::from_u128(11));
@@ -5534,7 +5597,7 @@ mod tests {
                 &context,
                 fragment,
                 &[DispatchCandidate {
-                    node_id: leader,
+                    node_id: NodeId::new(uuid::Uuid::from_u128(12)),
                     role: ClusterRole::Oracle,
                     worker_fence: 5,
                     endpoint: None,

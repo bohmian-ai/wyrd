@@ -855,9 +855,6 @@ pub enum PeerSecurityError {
     /// Verified claims do not bind all required attempt identities.
     #[error("peer ticket claims do not match the attempt")]
     Claims,
-    /// Replay protection cannot safely retain another unexpired nonce.
-    #[error("peer ticket replay cache is full")]
-    ReplayCapacity,
     /// A required durable security audit could not commit.
     #[error("peer security audit is unavailable")]
     AuditUnavailable,
@@ -958,28 +955,47 @@ pub trait PeerTicketVerifier: Send + Sync {
 /// One key identifier and nonce pair retained until ticket expiry.
 type ReplayIdentity = (String, Vec<u8>);
 
-/// Bounded worker-local nonce cache.
-#[derive(Debug)]
+/// Worker-local single-use nonce record for mutating peer tickets.
+///
+/// Only operations whose repetition would change state — slot reservations and
+/// Analytical stage operations — consume a nonce. Each identity is kept until
+/// its ticket expires, so the record grows with the admitted operation rate
+/// times the bounded ticket lifetime and never refuses for being full.
+#[derive(Debug, Default)]
 pub struct PeerReplayCache {
+    /// Consumed identities and their expiry, pruned in insertion order.
+    state: Mutex<ReplayState>,
+}
+
+/// Consumed identities plus their insertion order for amortized pruning.
+#[derive(Debug, Default)]
+struct ReplayState {
     /// Unexpired key-and-nonce identities consumed by this worker role.
-    entries: Mutex<HashMap<ReplayIdentity, DateTime<Utc>>>,
-    /// Hard maximum number of unexpired identities retained.
-    capacity: usize,
+    entries: HashMap<ReplayIdentity, DateTime<Utc>>,
+    /// The same identities in insertion order with their expiry.
+    ///
+    /// Pruning pops expired identities from the front. Expiries are not
+    /// strictly ordered, so an expired identity may wait behind a longer-lived
+    /// one for at most the bounded ticket lifetime; it can never admit a
+    /// replay, because an expired ticket is refused before consumption.
+    order: std::collections::VecDeque<(DateTime<Utc>, ReplayIdentity)>,
 }
 
 impl PeerReplayCache {
-    /// Creates a bounded replay cache.
+    /// Creates an empty replay record.
     #[must_use]
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-            capacity,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
+
     /// Atomically consumes a nonce until its expiry.
     ///
+    /// Expired identities at the front of the insertion order are pruned
+    /// first, so each call does amortized constant work.
+    ///
     /// # Errors
-    /// Returns [`PeerSecurityError::Replay`] for duplicates or when bounded insertion is full.
+    /// Returns [`PeerSecurityError::Replay`] for a duplicate identity or a
+    /// poisoned record lock.
     pub fn consume(
         &self,
         key_id: &str,
@@ -987,33 +1003,32 @@ impl PeerReplayCache {
         expires_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<(), PeerSecurityError> {
-        let mut entries = self.entries.lock().map_err(|_| PeerSecurityError::Replay)?;
-        entries.retain(|_, expiry| *expiry > now);
+        let mut state = self.state.lock().map_err(|_| PeerSecurityError::Replay)?;
+        let ReplayState { entries, order } = &mut *state;
+        while order.front().is_some_and(|(expiry, _)| *expiry <= now) {
+            if let Some((_, identity)) = order.pop_front() {
+                entries.remove(&identity);
+            }
+        }
         let key = (key_id.to_owned(), nonce.to_vec());
         if entries.contains_key(&key) {
             return Err(PeerSecurityError::Replay);
         }
-        if entries.len() >= self.capacity {
-            return Err(PeerSecurityError::ReplayCapacity);
-        }
-        entries.insert(key, expires_at);
+        entries.insert(key.clone(), expires_at);
+        order.push_back((expires_at, key));
         Ok(())
     }
 
-    /// Returns the number of retained unexpired nonce identities.
+    /// Returns the number of retained nonce identities.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries
-            .lock()
-            .map_or(self.capacity, |entries| entries.len())
+        self.state.lock().map_or(0, |state| state.entries.len())
     }
 
     /// Returns whether no replay identities are currently retained.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries
-            .lock()
-            .map_or(self.capacity == 0, |entries| entries.is_empty())
+        self.len() == 0
     }
 }
 
@@ -1400,7 +1415,7 @@ mod tests {
     /// Concurrent duplicate nonce consumption admits exactly one caller.
     #[test]
     fn oracle_peer_replay_cache_consumes_nonce_atomically() {
-        let cache = Arc::new(PeerReplayCache::new(4));
+        let cache = Arc::new(PeerReplayCache::new());
         let barrier = Arc::new(Barrier::new(3));
         let now = Utc::now();
         let handles = (0..2)
@@ -1433,26 +1448,30 @@ mod tests {
         );
     }
 
-    /// Capacity fails closed while expiry reclaims a consumed nonce.
+    /// Expiry reclaims a consumed nonce and the record never refuses as full.
     #[test]
-    fn oracle_peer_replay_cache_is_bounded_and_expiry_reclaims() {
-        let cache = PeerReplayCache::new(1);
+    fn oracle_peer_replay_cache_is_unbounded_and_expiry_reclaims() {
+        let cache = PeerReplayCache::new();
         let now = Utc::now();
-        cache
-            .consume("kid", b"first", now + chrono::Duration::seconds(1), now)
-            .expect("first nonce");
-        assert_eq!(
-            cache.consume("kid", b"second", now + chrono::Duration::seconds(1), now),
-            Err(PeerSecurityError::ReplayCapacity)
-        );
+        for index in 0_u32..4_096 {
+            cache
+                .consume(
+                    "kid",
+                    &index.to_be_bytes(),
+                    now + chrono::Duration::seconds(1),
+                    now,
+                )
+                .expect("a fresh nonce is consumed at any count");
+        }
+        assert_eq!(cache.len(), 4_096);
         cache
             .consume(
                 "kid",
-                b"second",
+                b"later",
                 now + chrono::Duration::seconds(2),
                 now + chrono::Duration::seconds(1),
             )
-            .expect("expired nonce reclaimed");
+            .expect("expired nonces are reclaimed");
         assert_eq!(cache.len(), 1);
     }
 

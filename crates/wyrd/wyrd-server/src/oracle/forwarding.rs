@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use rand::RngCore as _;
 #[cfg(feature = "test-support")]
 use tokio::sync::watch::{Sender, error::RecvError};
 use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
@@ -260,11 +259,9 @@ impl ReadyOracleForwarder {
                 wall_deadline,
             }
             .into_claims((local.key.node_id, local.fencing_token))?;
-            let ticket = self
-                .authority
-                .mint_forward_query(&claims)
-                .map_err(|_| BifrostError::QueryPeerSecurity)?;
-            return self.accept(ticket).await;
+            // Same process: the context is already verified here, so nothing is
+            // signed only to be verified again.
+            return self.execute_local(claims).await;
         }
         let remote_candidates = candidates
             .drain(..)
@@ -315,6 +312,24 @@ impl ReadyOracleForwarder {
             .verify_forward_query(&ticket, self.local_node_id, fence, chrono::Utc::now())
             .await
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
+        self.execute_local(claims).await
+    }
+
+    /// Runs already-authorized forwarding claims on this replica's local Oracle.
+    ///
+    /// Both entries reach here: a remote envelope after signature verification,
+    /// and a same-process selection whose context this node verified itself.
+    /// The claims are still checked against this Oracle's audience and fence.
+    ///
+    /// # Errors
+    /// Returns a closed role-fence, deadline, or query failure.
+    async fn execute_local(
+        &self,
+        claims: ForwardQueryClaims,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let fence = self
+            .local_fence
+            .ok_or(BifrostError::OracleRoleUnavailable)?;
         Self::validate_claims(&claims, self.local_node_id, fence)?;
         self.local_oracle
             .as_ref()
@@ -641,9 +656,9 @@ pub(crate) struct ForwardingAttempt {
 impl ForwardingAttempt {
     /// Builds the one signed-envelope payload for the elected leader.
     ///
-    /// The envelope binds authorization only: audience, leader fence, replay
-    /// identity, expiry, the authenticated context, the unchanged request body,
-    /// and the absolute deadline. The leader pins its own participant cut.
+    /// The envelope binds authorization only: audience, leader fence, expiry,
+    /// the authenticated context, the unchanged request body, and the absolute
+    /// deadline. The leader pins its own participant cut.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryPeerSecurity`] when the request id is not a
@@ -658,13 +673,10 @@ impl ForwardingAttempt {
         if uuid::Uuid::parse_str(context.request_id.as_str()).is_err() {
             return Err(BifrostError::QueryPeerSecurity);
         }
-        let mut nonce = vec![0_u8; 16];
-        rand::rng().fill_bytes(&mut nonce);
         Ok(ForwardQueryClaims {
             protocol_version: 1,
             audience: leader.0,
             worker_fence: leader.1,
-            nonce,
             expires_at_ms: (now + FORWARD_ENVELOPE_TTL)
                 .min(wall_deadline)
                 .timestamp_millis(),

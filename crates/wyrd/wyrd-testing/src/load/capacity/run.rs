@@ -220,6 +220,19 @@ pub struct LiveStreamTally {
     pub failed: u64,
 }
 
+/// One Oracle query phase's server-side timing over one window.
+///
+/// Derived from the window's `oracle_query_phase_seconds` sum and count
+/// deltas, so it is a mean over every query the server timed in the window,
+/// independent of the client's own round-trip percentiles.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct PhaseTiming {
+    /// Phase samples the server recorded in the window.
+    pub samples: f64,
+    /// Mean phase duration, milliseconds.
+    pub mean_ms: f64,
+}
+
 /// One offered-rate / held-live-stream report row.
 #[derive(Debug, Clone, Serialize)]
 pub struct CombinationReport {
@@ -255,6 +268,8 @@ pub struct CombinationReport {
     pub driver_cpu_seconds: f64,
     /// Server counter deltas across the window.
     pub server_deltas: BTreeMap<String, f64>,
+    /// Oracle query phases measured by the server across the window.
+    pub server_phases: BTreeMap<String, PhaseTiming>,
     /// Pod cgroup deltas and levels across the window.
     pub cgroup: BTreeMap<String, f64>,
     /// PostgreSQL `SELECT 1` latency before and after the window, ms.
@@ -611,6 +626,7 @@ impl QueryCapacityBenchmark {
         tokio::task::block_in_place(|| node.capture_resource_evidence(&captured))?;
         std::fs::create_dir_all(raw).map_err(|error| CapacityError::Output(error.to_string()))?;
         let mut cgroup = BTreeMap::new();
+        let mut phases = Vec::new();
         for file in CGROUP_EVIDENCE_FILES
             .iter()
             .copied()
@@ -621,11 +637,14 @@ impl QueryCapacityBenchmark {
             };
             std::fs::write(raw.join(file), &contents)
                 .map_err(|error| CapacityError::Output(error.to_string()))?;
-            if !matches!(file, "metrics.prom" | "cpu.max") {
+            if file == "metrics.prom" {
+                phases = phase_series(&contents);
+            } else if file != "cpu.max" {
                 cgroup.extend(cgroup_values(file, &contents));
             }
         }
         let mut counters = tokio::task::block_in_place(|| node.metric_totals(&COUNTER_FAMILIES))?;
+        counters.extend(phases);
         for class in ["interactive", "analytical"] {
             for outcome in ["admitted", "rejected"] {
                 let total = tokio::task::block_in_place(|| admission_total(node, class, outcome))?;
@@ -782,6 +801,7 @@ impl MeasuredWindow {
                 )
             })
             .collect();
+        let server_phases = phase_timings(&server_deltas);
         let mut cgroup = BTreeMap::new();
         for (key, value) in &after.cgroup {
             let cumulative = key.starts_with("cpu.stat:") || key.starts_with("memory.events:");
@@ -847,6 +867,7 @@ impl MeasuredWindow {
             max_driver_lag_us: u64::try_from(run.max_launch_lag.as_micros()).unwrap_or(u64::MAX),
             driver_cpu_seconds: after.driver_cpu_seconds - before.driver_cpu_seconds,
             server_deltas,
+            server_phases,
             cgroup,
             postgres_select_ms: [before.postgres_select_ms, after.postgres_select_ms],
             live,
@@ -1192,6 +1213,48 @@ fn admission_total(
         .unwrap_or(0.0))
 }
 
+/// Series prefix of the server's per-phase Oracle query histogram.
+const PHASE_FAMILY: &str = "oracle_query_phase_seconds";
+
+/// Extracts every `oracle_query_phase_seconds` sum and count series from one
+/// Prometheus exposition, keyed by the series text as rendered.
+fn phase_series(exposition: &str) -> Vec<(String, f64)> {
+    exposition
+        .lines()
+        .filter(|line| {
+            line.starts_with(&format!("{PHASE_FAMILY}_sum{{"))
+                || line.starts_with(&format!("{PHASE_FAMILY}_count{{"))
+        })
+        .filter_map(|line| {
+            let (series, value) = line.rsplit_once(' ')?;
+            Some((series.to_owned(), value.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Pairs each phase's sum and count deltas into a mean duration.
+///
+/// A phase with no samples in the window is omitted.
+fn phase_timings(deltas: &BTreeMap<String, f64>) -> BTreeMap<String, PhaseTiming> {
+    let count_prefix = format!("{PHASE_FAMILY}_count{{phase=\"");
+    deltas
+        .iter()
+        .filter_map(|(series, samples)| {
+            let phase = series.strip_prefix(&count_prefix)?.strip_suffix("\"}")?;
+            let sum = deltas.get(&format!("{PHASE_FAMILY}_sum{{phase=\"{phase}\"}}"))?;
+            (*samples > 0.0).then(|| {
+                (
+                    phase.to_owned(),
+                    PhaseTiming {
+                        samples: *samples,
+                        mean_ms: sum / samples * 1_000.0,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 /// Parses one cgroup file into `file:key` readings.
 ///
 /// Flat-keyed files (`cpu.stat`, `memory.events`) yield one reading per line;
@@ -1403,6 +1466,21 @@ fn render_table(metadata: &RunMetadata, rows: &[CombinationReport]) -> String {
         out.push_str(&render_row(row));
         out.push('\n');
     }
+    out.push_str(
+        "\nserver phase means (ms); first_row and terminal count from the end of planning\n",
+    );
+    for row in rows {
+        let phases = row
+            .server_phases
+            .iter()
+            .map(|(phase, timing)| format!("{phase} {:.2}", timing.mean_ms))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        out.push_str(&format!(
+            "{:>5} {:>3}/{:<3} {phases}\n",
+            row.offered_rate, row.live_streams_sampled[0], row.target_live_streams
+        ));
+    }
     out
 }
 
@@ -1432,6 +1510,36 @@ mod tests {
                 .map(|settings| (settings.warmup, settings.measurement))
                 .ok(),
             Some((Duration::from_secs(15), Duration::from_secs(60)))
+        );
+    }
+
+    /// Phase sum and count series pair into a per-phase mean; other series
+    /// and phases with no samples are ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a series is dropped, mis-paired, or a mean is wrong.
+    #[test]
+    fn phase_series_pair_into_means() {
+        let series = phase_series(
+            "oracle_query_phase_seconds_bucket{phase=\"admission\",le=\"0.005\"} 3\n\
+             oracle_query_phase_seconds_sum{phase=\"admission\"} 0.004\n\
+             oracle_query_phase_seconds_count{phase=\"admission\"} 2\n\
+             oracle_query_phase_seconds_sum{phase=\"terminal\"} 0\n\
+             oracle_query_phase_seconds_count{phase=\"terminal\"} 0\n\
+             oracle_query_rows_total 9\n",
+        );
+        assert_eq!(series.len(), 4);
+        let timings = phase_timings(&series.into_iter().collect());
+        assert_eq!(
+            timings,
+            BTreeMap::from([(
+                "admission".to_owned(),
+                PhaseTiming {
+                    samples: 2.0,
+                    mean_ms: 2.0
+                }
+            )])
         );
     }
 

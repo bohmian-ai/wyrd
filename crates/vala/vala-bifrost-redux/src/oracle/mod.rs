@@ -452,6 +452,61 @@ impl AttemptPhaseTimer {
     }
 }
 
+/// Closed set of Oracle query phases timed into `oracle_query_phase_seconds`.
+///
+/// Pin, listing, provider setup, planning, and admission are each the
+/// duration of that phase alone. First row and terminal are measured from the
+/// end of physical planning, where the query's stream telemetry starts, so they
+/// include audit, source binding, and execution. Only the phase is a label;
+/// the request identity stays on the enclosing trace span.
+#[derive(Debug, Clone, Copy)]
+enum QueryPhase {
+    /// Pinning the catalog snapshot and hot-file cut.
+    SnapshotPin,
+    /// Listing live Scribe streams on the frozen roster.
+    ScribeListing,
+    /// Registering the pinned cut's table providers.
+    ProviderSetup,
+    /// Planning the one physical root from SQL.
+    PhysicalPlanning,
+    /// Acquiring query admission.
+    Admission,
+    /// Producing the first client-visible batch.
+    FirstRow,
+    /// Reaching the query's terminal outcome.
+    Terminal,
+}
+
+impl QueryPhase {
+    /// Returns the stable metric label for this phase.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SnapshotPin => "snapshot_pin",
+            Self::ScribeListing => "scribe_listing",
+            Self::ProviderSetup => "provider_setup",
+            Self::PhysicalPlanning => "physical_planning",
+            Self::Admission => "admission",
+            Self::FirstRow => "first_row",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    /// Records the time elapsed since `started` for this phase.
+    ///
+    /// Emits one histogram sample and one DEBUG event inside the current
+    /// span, which carries the request identity.
+    fn record(self, started: Instant) {
+        let elapsed = started.elapsed();
+        metrics::histogram!("oracle_query_phase_seconds", "phase" => self.as_str())
+            .record(elapsed.as_secs_f64());
+        tracing::debug!(
+            phase = self.as_str(),
+            elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            "Oracle query phase"
+        );
+    }
+}
+
 /// Production metric owner for one retained local Oracle.
 ///
 /// The owner keeps the process-local slot and memory accounting needed to
@@ -642,6 +697,7 @@ impl QueryTelemetryGuard {
         }
         self.first_batch_recorded = true;
         self.finish_source_span("success");
+        QueryPhase::FirstRow.record(self.started_at);
         metrics::histogram!(
             "oracle_query_time_to_first_batch_seconds",
             "class" => query_class_label(self.query_class)
@@ -682,6 +738,7 @@ impl QueryTelemetryGuard {
         }
         self.finalization = QueryTelemetryFinalization::Closed;
         self.finish_source_span(outcome);
+        QueryPhase::Terminal.record(self.started_at);
         self.scan_stats.finalize();
         metrics::counter!(
             "oracle_query_logical_bytes_selected_total",
@@ -2242,6 +2299,7 @@ impl Oracle {
             .ok_or(BifrostError::QueryTimeout)?;
         let snapshot = self.cluster.snapshot();
         let tables = parse_select_tables(&request.sql)?;
+        let pin_started = Instant::now();
         let planned = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             self.planner.pin_cut(
@@ -2254,6 +2312,7 @@ impl Oracle {
         )
         .await
         .map_err(|_| BifrostError::QueryTimeout)??;
+        QueryPhase::SnapshotPin.record(pin_started);
         if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
             return Err(BifrostError::QueryTimeout);
         }
@@ -2333,6 +2392,7 @@ impl Oracle {
         name = "bifrost.oracle.query",
         skip_all,
         fields(
+            request_id = %context.request_id,
             query_class = tracing::field::Empty,
             request_node_id = %self.admission.local_role.key.node_id.as_uuid(),
             leader_node_id = %self.admission.local_role.key.node_id.as_uuid(),
@@ -2454,6 +2514,7 @@ impl Oracle {
         deadline: Instant,
         phases: &mut AttemptPhaseTimer,
     ) -> Result<(AdmittedQueryGuard, RunningQueryTerminalOwner), BifrostError> {
+        let admission_started = Instant::now();
         let mut admitted = self
             .admit_sql_query(
                 context,
@@ -2463,6 +2524,7 @@ impl Oracle {
                 participant_cut.attempt_id(),
             )
             .await?;
+        QueryPhase::Admission.record(admission_started);
         phases.admitted();
         // Projected before any later transfer, never after: a selected
         // Analytical attempt moves this query's envelope out of the guard and
@@ -3046,7 +3108,9 @@ impl Oracle {
         tables: &[TableRef],
         deadline: Instant,
     ) -> Result<PlannedSqlCut, BifrostError> {
-        self.planner
+        let started = Instant::now();
+        let planned = self
+            .planner
             .pin_cut(
                 context,
                 tables,
@@ -3054,7 +3118,9 @@ impl Oracle {
                 &self.catalog,
                 Some(&self.reader_authority),
             )
-            .await
+            .await?;
+        QueryPhase::SnapshotPin.record(started);
+        Ok(planned)
     }
 
     /// Borrows this node's process-global reader epoch authority.
@@ -3452,7 +3518,9 @@ impl Oracle {
         work_units: usize,
         deadline: Instant,
     ) -> Result<RetainedPhysicalPlan, BifrostError> {
+        let listing_started = Instant::now();
         let live = self.discover_live_routes(roster, cuts, deadline).await?;
+        QueryPhase::ScribeListing.record(listing_started);
         let oracles = roster.oracles();
         #[cfg(feature = "test-support")]
         record_physical_build(&roster.fingerprint());
@@ -3483,8 +3551,10 @@ impl Oracle {
             Some(handle) => handle.frozen_destinations(oracles)?,
             None => Vec::new(),
         };
+        let providers_started = Instant::now();
         self.register_cut_providers(&planning, context, cuts, &destinations, &live.tables)
             .await?;
+        QueryPhase::ProviderSetup.record(providers_started);
         let planning = match self.analytical.as_ref() {
             Some(handle) => handle.planning_session(&planning, oracles, work_units)?,
             None => planning,
@@ -3492,9 +3562,11 @@ impl Oracle {
         if self.take_analytical_plan_failure() {
             return Err(BifrostError::QueryExecutionFailed);
         }
+        let planning_started = Instant::now();
         let root = Self::plan_physical(&planning, context, sql)
             .await
             .map_err(|OracleExecutionError::Public(error)| error)?;
+        QueryPhase::PhysicalPlanning.record(planning_started);
         Ok(RetainedPhysicalPlan {
             config: planning.copied_config(),
             root,

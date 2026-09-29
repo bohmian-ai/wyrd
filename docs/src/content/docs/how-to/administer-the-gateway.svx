@@ -1,0 +1,116 @@
+---
+pillar: wyrd
+title: Administer the gateway
+description: Configure tenant provider credentials, deployments, and fallback, governance, and capture policies.
+group: How-to
+order: 30
+---
+
+# Administer the gateway
+
+Tenant administrators configure which upstream providers the Wyrd gateway can
+call, with which credentials, and under which policies. Callers never receive
+provider authentication material: every read returns a redacted view.
+
+## Resources and routes
+
+| Resource | Routes | Permission |
+| --- | --- | --- |
+| Provider credential | `PUT/GET/DELETE /v1/admin/gateway/provider-credentials/{name}`, `GET /v1/admin/gateway/provider-credentials`, `POST .../{name}/revoke` | `gateway` read, write (put, revoke), delete |
+| Provider deployment | `PUT/GET/DELETE /v1/admin/gateway/provider-deployments/{name}`, `GET /v1/admin/gateway/provider-deployments` | `gateway` read, write, delete |
+| Fallback policy | `PUT/GET/DELETE /v1/admin/gateway/fallback-policy` | `gateway` read, write (put, reset) |
+| Governance policy | `PUT/GET/DELETE /v1/admin/gateway/governance-policy` | `gateway` read, write (put, reset) |
+| Capture policy | `PUT/GET /v1/admin/gateway/capture-policy` | `gateway` read, write |
+
+Request and response shapes are in the [OpenAPI document](/api/openapi/).
+Invoke-only permission cannot read or list any of these resources.
+
+## Lifecycle rules
+
+- A repeated `PUT` replaces the named resource; concurrent writers resolve by
+  commit order. There are no preconditions or resource versions.
+- A credential `PUT` on an active credential rotates it. Revocation is
+  terminal: a revoked name cannot be replaced.
+- Deleting a credential that a deployment references fails with a conflict.
+  Deleting an absent credential or deployment succeeds.
+- `DELETE` on the fallback or governance policy restores the default. The
+  capture policy defaults to disabled and has no delete.
+- Configuration changes apply to calls admitted afterwards; an admitted call
+  keeps the configuration snapshot it started with.
+
+## Operation support
+
+A deployment declares the operations it serves in `capabilities`. A
+declaration its adapter cannot serve is rejected naming `capabilities`, and a
+call no authorized deployment can serve fails before any provider work.
+`streaming` operations also accept `stream: true`; `buffered` operations answer
+in one response. Batches include the input, output, and error files a batch
+requires.
+
+| Adapter | Chat Completions | Responses | Embeddings | Images | Audio | Batches |
+| --- | --- | --- | --- | --- | --- | --- |
+| `openai` | streaming | streaming | buffered | buffered | buffered | buffered |
+| `openai_compatible` | streaming | streaming | buffered | buffered | buffered | buffered |
+| `anthropic` | streaming | — | — | — | — | — |
+| `gemini` | streaming | — | — | — | — | — |
+| `vertex` | streaming | — | — | — | — | — |
+
+## Credential sources
+
+| Source | Request | Read view |
+| --- | --- | --- |
+| `environment` | `{"environment": {"binding": "<name>"}}` | the binding name |
+| `external_secret` | `{"external_secret": {"backend": "<name>", "reference": "<opaque>"}}` | backend and reference |
+| `managed_secret` | `{"managed_secret": {"secret": "<value>"}}` | `"managed_secret"` — the value is never readable |
+
+Bindings and backends are declared by the operator in the
+[`[gateway]` configuration](/self-hosting/configuration/#gateway); a tenant
+names them and never supplies a variable name, path, or backend address. With
+those two sources Wyrd never accepts or stores a credential value.
+
+A `managed_secret` is the one source a tenant supplies directly: the value is
+sealed with the tenant's own keyring before it is stored, and no read, list,
+log, or error ever returns it. Submit it from the CLI or the scoped MCP tool —
+the SDKs project the redacted view but expose no submission helper — and
+rotate it by submitting the new value under the same name. The operator must
+have configured a keyring for the tenant in
+[`gateway.managed_secret_keys`](/self-hosting/configuration/#gateway); without
+one, submission is refused and existing envelopes stop resolving rather than
+falling back to another key or source.
+
+## From the CLI
+
+```bash
+cat > credential.json <<'EOF'
+{"name": "openai-primary", "provider": "openai",
+ "source": {"environment": {"binding": "openai-prod"}}}
+EOF
+wyrd gateway credential put --file credential.json
+wyrd gateway credential list
+```
+
+Submit a managed secret on stdin so the value never reaches a process argument
+or a file on disk:
+
+```bash
+printf '{"name": "openai-primary", "provider": "openai",
+ "source": {"managed_secret": {"secret": "%s"}}}' "$OPENAI_API_KEY" \
+  | wyrd gateway credential put --file -
+```
+
+The Rust, Python, and TypeScript SDKs keep the redacted credential reads and
+the rest of gateway administration, but none of them exposes credential
+mutation: no submission, rotation, revocation, or deletion, for any source. The
+CLI and the scoped MCP tool are the supported credential lifecycle surfaces in
+every language. The [MCP endpoint](/for-agents/) advertises one tool per
+operation with the same permissions:
+
+| Kind | Tools | Arguments |
+| --- | --- | --- |
+| Read-only | `gateway.list_provider_credentials`, `gateway.list_provider_deployments`, `gateway.get_fallback_policy`, `gateway.get_governance_policy`, `gateway.get_capture_policy` | none |
+| Read-only | `gateway.get_provider_credential`, `gateway.get_provider_deployment` | `{"name"}` |
+| Idempotent replacement | `gateway.put_provider_credential`, `gateway.put_provider_deployment`, `gateway.put_fallback_policy`, `gateway.put_governance_policy`, `gateway.put_capture_policy` | the `PUT` request body |
+| Destructive | `gateway.revoke_provider_credential`, `gateway.delete_provider_credential`, `gateway.delete_provider_deployment` | `{"name"}` |
+| Destructive | `gateway.delete_fallback_policy`, `gateway.delete_governance_policy` | none |
+
+Listings return `{"items": [...]}` and deletions return `{}`.

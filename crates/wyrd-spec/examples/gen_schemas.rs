@@ -7,7 +7,7 @@ use std::path::Path;
 use schemars::schema_for;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKindTag,
+    AbsoluteUrl, CallbackQuery, GatewayAccess, IssuerUrl, LoginInitResponse, PrincipalKindTag,
     RevokePrincipalRequest, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
@@ -38,10 +38,17 @@ use wyrd_spec::card::source::{
     LogConnection, MetricsConnection, SourceAuth, SourceKind, SourceSpec, SqlConnection,
     TraceConnection,
 };
-use wyrd_spec::card::trigger::{TriggerSchedule, TriggerSource, TriggerSpec};
+use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::gateway::{
+    GatewayAccountingEntryV1, GatewayAttemptSpanFieldsV1, GatewayCallPayloadV1,
+    GatewayCapturePolicy, GatewayCapturePolicyWrite, GatewayFallbackOverride,
+    GatewayFallbackPolicy, GatewayGovernancePolicy, ProviderCredentialView,
+    ProviderCredentialWrite, ProviderDeployment,
+};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,
@@ -67,14 +74,17 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
-    EvalPassGate, EvalRecordObservation, EvalRunOpenRequest, EvalRunOpenResponse, EvalSampling,
-    EvalScenarioCollection, EvalSpec, EvalTask, ExecutionPlan, SimulatedUserMode,
-    SimulatedUserTurn, TurnDirective, UserTurnSubmission,
+    EvalPassGate, EvalRecordObservation, EvalSampling, EvalScenarioCollection, EvalSpec, EvalTask,
+    ExecutionPlan, SimulatedUserMode, SimulatedUserTurn, TurnDirective, UserTurnSubmission,
 };
 use wyrd_spec::vala::observation::{ObservationEnvelope, ObservationKind, RecordObservation};
 use wyrd_spec::vala::trace::{
     AttributeValue, GenAiEvalResult, GenAiSpanRecord, InstrumentationScope, Resource, SpanEvent,
     SpanKind, SpanLink, SpanRecord, SpanStatus, TraceSummaryRecord,
+};
+use wyrd_spec::verification::{
+    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
+    VerificationRunStatus,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -117,8 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<CardEvalSpec>(out, golden, "eval_spec")?;
     write::<DriftSpec>(out, golden, "drift_spec")?;
     write::<TriggerSpec>(out, golden, "trigger_spec")?;
-    write::<TriggerSchedule>(out, golden, "trigger_schedule")?;
-    write::<TriggerSource>(out, golden, "trigger_source")?;
+    write::<TriggerActivation>(out, golden, "trigger_activation")?;
+    write::<VerifierSpec>(out, golden, "verifier_spec")?;
+    write::<VerifierImplementation>(out, golden, "verifier_implementation")?;
+    write::<VerificationBinding>(out, golden, "verification_binding")?;
     write::<OperatorSpec>(out, golden, "operator_spec")?;
     write::<OperatorAction>(out, golden, "operator_action")?;
     write::<NotifyChannel>(out, golden, "notify_channel")?;
@@ -196,6 +208,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<SecretRef>(out, golden, "security_secret_ref")?;
     write::<TlsConfig>(out, golden, "security_tls_config")?;
 
+    // Gateway V1 administration, accounting, and capture contracts.
+    write::<GatewayAccess>(out, golden, "auth_gateway_access")?;
+    write::<ProviderCredentialWrite>(out, golden, "gateway_provider_credential_write")?;
+    write::<ProviderCredentialView>(out, golden, "gateway_provider_credential_view")?;
+    write::<ProviderDeployment>(out, golden, "gateway_provider_deployment")?;
+    write::<GatewayFallbackPolicy>(out, golden, "gateway_fallback_policy")?;
+    write::<GatewayFallbackOverride>(out, golden, "gateway_fallback_override")?;
+    write::<GatewayGovernancePolicy>(out, golden, "gateway_governance_policy")?;
+    write::<GatewayCapturePolicyWrite>(out, golden, "gateway_capture_policy_write")?;
+    write::<GatewayCapturePolicy>(out, golden, "gateway_capture_policy")?;
+    write::<GatewayAccountingEntryV1>(out, golden, "gateway_accounting_entry_v1")?;
+    write::<GatewayCallPayloadV1>(out, golden, "gateway_call_payload_v1")?;
+    write::<GatewayAttemptSpanFieldsV1>(out, golden, "gateway_attempt_span_fields_v1")?;
+
     // Stage 3 C2a: Bifrost wire contract (table management + query).
     write::<BifrostTableEntry>(out, golden, "bifrost_table_entry")?;
     write::<BifrostTableDescription>(out, golden, "bifrost_table_description")?;
@@ -222,6 +248,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
     write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
     write::<AuditOutcome>(out, golden, "bifrost_audit_outcome")?;
+    write::<StartVerificationRunRequest>(out, golden, "start_verification_run_request")?;
+    write::<StartVerificationRunResponse>(out, golden, "start_verification_run_response")?;
+    write::<VerificationBindingStatus>(out, golden, "verification_binding_status")?;
+    write::<VerificationRunStatus>(out, golden, "verification_run_status")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;
@@ -234,8 +264,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_fixture::<EvalScenarioCollection>(eval_fixtures, "eval_scenario_collection")?;
     write_fixture::<EvalPassGate>(eval_fixtures, "eval_pass_gate")?;
     write_fixture::<EvalSampling>(eval_fixtures, "eval_sampling")?;
-    write_fixture::<EvalRunOpenRequest>(eval_fixtures, "eval_run_open_request")?;
-    write_fixture::<EvalRunOpenResponse>(eval_fixtures, "eval_run_open_response")?;
     write_fixture::<SimulatedUserMode>(eval_fixtures, "simulated_user_mode")?;
     write_fixture::<TurnDirective>(eval_fixtures, "turn_directive")?;
     write_fixture::<ConversationTurn>(eval_fixtures, "conversation_turn")?;

@@ -277,9 +277,9 @@ mod tests {
     use vala_bifrost_redux::oracle::OracleQueryStream;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame, QuerySource,
-        QueryStreamFrame, QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame,
-        QueryTerminalOutcome, QueryWarning, SourceCompletion, SourceCompletionOutcome,
+        QueryBatchFrame, QueryErrorDetail, QuerySchemaFrame, QuerySource, QueryStreamFrame,
+        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+        QueryWarning, SourceCompletion, SourceCompletionOutcome,
     };
     use wyrd_tonic::frame_codec::FrameDecoder;
     use wyrd_tonic::tonic::Code;
@@ -348,7 +348,7 @@ mod tests {
         assert!(!absent.message().contains(request_id.as_str()));
     }
 
-    /// Builds the exact complete source set for a published-only terminal.
+    /// Builds the complete three-tier source set every successful terminal carries.
     fn complete_sources() -> Vec<SourceCompletion> {
         vec![
             SourceCompletion {
@@ -357,6 +357,10 @@ mod tests {
             },
             SourceCompletion {
                 source: QuerySource::HotSealed,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+            SourceCompletion {
+                source: QuerySource::LiveTail,
                 outcome: SourceCompletionOutcome::Complete,
             },
         ]
@@ -442,8 +446,14 @@ mod tests {
     /// Retry metadata is emitted only for transient query capacity.
     #[test]
     fn grpc_retry_metadata_only_for_retryable_capacity() {
-        let retryable = query_status(BifrostError::QueryAdmissionRejected.into());
-        assert_eq!(retryable.metadata().get("retry-after-ms").unwrap(), "1000");
+        for error in [
+            BifrostError::QueryAdmissionRejected,
+            BifrostError::QueryQueueFull,
+        ] {
+            let retryable = query_status(error.into());
+            assert_eq!(retryable.code(), Code::ResourceExhausted);
+            assert_eq!(retryable.metadata().get("retry-after-ms").unwrap(), "1000");
+        }
         for error in [
             BifrostError::QueryMemoryRequestTooLarge,
             BifrostError::QueryExecutionFailed,
@@ -466,6 +476,7 @@ mod tests {
     fn grpc_query_errors_carry_the_canonical_problem_envelope() {
         for error in [
             BifrostError::QueryAdmissionRejected,
+            BifrostError::QueryQueueFull,
             BifrostError::QueryMemoryRequestTooLarge,
             BifrostError::QueryExecutionFailed,
         ] {
@@ -492,7 +503,6 @@ mod tests {
             schema_frame(),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                freshness: QueryFreshness::Complete,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
@@ -524,10 +534,7 @@ mod tests {
     #[tokio::test]
     async fn http_and_grpc_query_frame_parity_covers_degraded_and_late_failed() {
         let mut degraded_sources = complete_sources();
-        degraded_sources.push(SourceCompletion {
-            source: QuerySource::LiveTail,
-            outcome: SourceCompletionOutcome::Unavailable,
-        });
+        degraded_sources[2].outcome = SourceCompletionOutcome::Unavailable;
         let degraded = vec![
             schema_frame(),
             QueryStreamFrame::Batch(QueryBatchFrame {
@@ -535,7 +542,6 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
-                freshness: QueryFreshness::Degraded,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 1,
                 warnings: vec![QueryWarning::LiveTailUnavailable],
@@ -551,7 +557,6 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Failed,
-                freshness: QueryFreshness::Complete,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),

@@ -101,3 +101,15 @@ provenance = "github-attestations"
 checksum = "sha256:dd9d6d6554bfab265bfa98aa8e8a406c5c3a7b97582f93de1f4d48d9154a0395"
 url = "https://github.com/astral-sh/uv/releases/download/0.11.16/uv-x86_64-pc-windows-msvc.zip"
 provenance = "github-attestations"
+
+[[tools.vault]]
+version = "2.1.1"
+backend = "aqua:hashicorp/vault"
+
+[tools.vault."platforms.linux-x64"]
+checksum = "sha256:8aa90f9cea46f541fc7baa3d0ec692fc06afde9a248cc1f2dcac46a567c6f56b"
+url = "https://releases.hashicorp.com/vault/2.1.1/vault_2.1.1_linux_amd64.zip"
+
+[tools.vault."platforms.macos-arm64"]
+checksum = "sha256:95d100472b726d889ee380c9335191abdf5b3e6f3108cde48f4f962bfea4f009"
+url = "https://releases.hashicorp.com/vault/2.1.1/vault_2.1.1_darwin_arm64.zip"

@@ -1,4 +1,5 @@
-//! Eval primitive types — the typed spec body for the `Eval` card kind.
+//! Eval primitive types — the typed spec body carried by a `kind: Verifier`
+//! card whose `implementation.kind` is `eval`.
 //!
 //! Authors declare evaluations as DAGs of typed tasks. Each task references
 //! the workflow context (or scenario `{response, expected_outcome}`) via
@@ -59,17 +60,16 @@ pub use agent::AgentAssertionTask;
 pub use assertion::AssertionTask;
 pub use condition::{ConditionCombinator, EvalCondition, MAX_CONDITION_DEPTH};
 pub use ids::{
-    EntityUid, JsonPath, LeaseToken, RecordId, RunId, ScenarioId, SessionId, SpanId, TaskId,
-    TraceId, WorkflowUid,
+    EntityUid, JsonPath, RecordId, RunId, ScenarioId, SessionId, SpanId, TaskId, TraceId,
+    WorkflowUid,
 };
 pub use llm_judge::LlmJudgeTask;
 pub use media::MediaRef;
 pub use operator::{ComparisonOperator, DivergenceMetric, JsonValueType};
 pub use plan::{DagError, ExecutionPlan, Stage, validate_dag};
 pub use protocol::{
-    AgentTurnSubmission, ConversationTurn, EvalRunOpenRequest, EvalRunOpenResponse,
-    MAX_HISTORY_TURNS, ProtocolError, SimulatedUserMode, SimulatedUserTurn, TurnDirective,
-    TurnRole, UserTurnSubmission,
+    AgentTurnSubmission, ConversationTurn, MAX_HISTORY_TURNS, ProtocolError, SimulatedUserMode,
+    SimulatedUserTurn, TurnDirective, TurnRole, UserTurnSubmission,
 };
 pub use record::EvalRecordObservation;
 pub use result::{AssertionResult, EvalContextCapture, EvalPassGate};
@@ -1214,69 +1214,11 @@ mod pass_gate_tests {
 
 #[cfg(test)]
 mod protocol_tests {
-    use crate::envelope::CardKind;
-    use crate::ids::{CardName, SpaceName};
-    use crate::reference::CardRef;
     use crate::vala::eval::ids::ScenarioId;
     use crate::vala::eval::protocol::{
-        AgentTurnSubmission, ConversationTurn, EvalRunOpenRequest, EvalRunOpenResponse,
-        MAX_HISTORY_TURNS, SimulatedUserMode, SimulatedUserTurn, TurnDirective, TurnRole,
-        UserTurnSubmission,
+        AgentTurnSubmission, ConversationTurn, MAX_HISTORY_TURNS, SimulatedUserMode,
+        SimulatedUserTurn, TurnDirective, TurnRole, UserTurnSubmission,
     };
-    use crate::vala::ids::{LeaseToken, RunId};
-    use wyrd_semver::VersionBlock;
-
-    fn eval_ref() -> CardRef {
-        CardRef {
-            kind: CardKind::Eval,
-            name: CardName::new("rubric").unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").unwrap()),
-            uid: None,
-        }
-    }
-
-    #[test]
-    fn open_request_round_trips() {
-        let req = EvalRunOpenRequest {
-            eval_ref: eval_ref(),
-            simulated_user: SimulatedUserMode::Server,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let back: EvalRunOpenRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(req, back);
-    }
-
-    #[test]
-    fn open_response_round_trips() {
-        let resp = EvalRunOpenResponse {
-            run_id: RunId::from_string("00000000-0000-7000-8000-000000000000".to_string()),
-            lease_token: LeaseToken::new("abc-123").unwrap(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let back: EvalRunOpenResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(resp, back);
-    }
-
-    #[test]
-    fn open_response_wire_field_is_run_id() {
-        let resp = EvalRunOpenResponse {
-            run_id: RunId::from_string("00000000-0000-7000-8000-000000000000".to_string()),
-            lease_token: LeaseToken::new("abc-123").unwrap(),
-        };
-        let v = serde_json::to_value(&resp).unwrap();
-        assert!(v.get("run_id").is_some());
-        let forbidden_field = ["eval", "run_id"].join("_");
-        assert!(v.get(&forbidden_field).is_none());
-        assert!(v.get("lease_token").is_some());
-    }
-
-    #[test]
-    fn lease_token_rejects_empty_long_and_control() {
-        assert!(LeaseToken::new("").is_err());
-        assert!(LeaseToken::new("a".repeat(257)).is_err());
-        assert!(LeaseToken::new("a\x00b").is_err());
-    }
 
     #[test]
     fn simulated_user_mode_serialises_snake_case() {
@@ -1436,37 +1378,55 @@ mod record_tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use crate::envelope::CardKind;
-    use crate::ids::{CardName, SpaceName};
-    use crate::reference::CardRef;
+    use crate::ids::MediaBindingId;
+    use crate::vala::eval::media::{MediaKind, MediaRef};
     use crate::vala::eval::record::EvalRecordObservation;
-    use crate::vala::ids::{RecordId, RunId, SessionId, SpanId};
+    use crate::vala::ids::{RecordId, SessionId, SpanId};
     use chrono::TimeZone;
     use schemars::schema_for;
     use uuid::Uuid;
-    use wyrd_semver::VersionBlock;
 
-    fn eval_ref(name: &str) -> CardRef {
-        CardRef {
-            kind: CardKind::Eval,
-            name: CardName::new(name).unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
-            space: Some(SpaceName::new("default").unwrap()),
-            uid: None,
-        }
-    }
-
+    /// A fully populated canonical Eval record, including one media binding.
     fn fixture() -> EvalRecordObservation {
         EvalRecordObservation {
             record_id: RecordId(Uuid::nil()),
-            run_id: RunId::from_string("r1".to_owned()),
             session_id: Some(SessionId(Uuid::nil())),
-            eval_ref: Some(eval_ref("retriever-quality")),
             context: serde_json::json!({"response": "ok"}),
             trace_id: None,
             span_id: None,
             created_at: chrono::Utc.with_ymd_and_hms(2026, 6, 10, 0, 0, 0).unwrap(),
-            media: None,
+            media: Some(vec![MediaRef {
+                id: MediaBindingId::new("screenshot").unwrap(),
+                kind: MediaKind::Image,
+                uri: "s3://bucket/screenshot.png".to_owned(),
+                media_type: Some("image/png".to_owned()),
+            }]),
+        }
+    }
+
+    /// The canonical Eval record names neither the invocation nor a Verifier.
+    ///
+    /// Both identities are Bifrost row correlation the server authorizes and
+    /// stamps. Accepting either as a payload field would let a client assert a
+    /// Verifier binding for its own raw input.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `run_id` or `eval_ref` is accepted again.
+    #[test]
+    fn run_id_and_eval_ref_are_not_record_fields() {
+        for field in ["run_id", "eval_ref"] {
+            let mut value = serde_json::to_value(fixture()).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(field.into(), serde_json::json!("x"));
+            let err = serde_json::from_value::<EvalRecordObservation>(value)
+                .expect_err("retired identity field is refused");
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected {field} to be an unknown field, got {err}"
+            );
         }
     }
 

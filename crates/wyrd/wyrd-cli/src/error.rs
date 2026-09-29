@@ -32,70 +32,15 @@ pub enum WyrdCliError {
         detail: String,
     },
 
-    /// Client-delegated simulated-user mode was requested without a script.
-    #[error("--simulated-user client requires --simulated-user-script <PATH>")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_SIMULATED_USER_SCRIPT_REQUIRED",
-        status = 400,
-        title = "Missing simulated-user script",
-        remediation = "Pass --simulated-user-script <PATH> when using --simulated-user client."
-    )]
-    SimulatedUserScriptRequired,
-
-    /// A scripted simulated-user turn was missing.
-    #[error("scripted-user JSONL missing turn {turn} for scenario {scenario_id}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_SCRIPTED_TURN_MISSING",
-        status = 400,
-        title = "Scripted simulated-user turn missing",
-        remediation = "Add a JSONL line with the missing turn and message."
-    )]
-    ScriptedTurnMissing {
-        /// Missing scenario id.
-        scenario_id: String,
-        /// Missing turn cursor.
-        turn: u32,
-    },
-
     /// Registry reference loading is not implemented for this command yet.
     #[error("registry-resolved eval refs are not supported yet; pass a card file path")]
     #[wyrd_error(
         code = "WYRD_CLI_400_REGISTRY_REF_UNSUPPORTED",
         status = 400,
         title = "Registry ref resolution is not implemented",
-        remediation = "Pass a filesystem path to an Eval card YAML or JSON file."
+        remediation = "Pass a filesystem path to a Verifier card YAML or JSON file whose `implementation.kind` is `eval`."
     )]
     RegistryRefUnsupported,
-
-    /// Server mode requires an agent URL.
-    #[error("--server requires --agent-url")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_SERVER_REQUIRES_AGENT_URL",
-        status = 400,
-        title = "Server mode requires an agent URL",
-        remediation = "Pass --agent-url <URL> when using --server."
-    )]
-    ServerRequiresAgentUrl,
-
-    /// Server mode does not accept pre-collected records.
-    #[error("--server is incompatible with --records")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_SERVER_REJECTS_RECORDS",
-        status = 400,
-        title = "Server mode rejects records",
-        remediation = "Use --records without --server, or use --server with --agent-url."
-    )]
-    ServerRejectsRecords,
-
-    /// Local record replay requires the publisher's subject identity.
-    #[error("--records requires --subject <CARD_REF>")]
-    #[wyrd_error(
-        code = "WYRD_CLI_400_RECORDS_REQUIRE_SUBJECT",
-        status = 400,
-        title = "Record replay requires a subject",
-        remediation = "Pass the exact card reference of the publisher that emitted the records."
-    )]
-    RecordsRequireSubject,
 
     /// LLM judge tasks require the deterministic mock until provider wiring lands.
     #[error("LLM judge tasks require --judge-mock")]
@@ -107,26 +52,26 @@ pub enum WyrdCliError {
     )]
     JudgeMockRequired,
 
-    /// Eval card path had an unsupported extension.
-    #[error("eval card file extension is not supported: {path}")]
+    /// Verifier card path had an unsupported extension.
+    #[error("verifier card file extension is not supported: {path}")]
     #[wyrd_error(
         code = "WYRD_CLI_400_CARD_EXTENSION_UNSUPPORTED",
         status = 400,
-        title = "Eval card extension unsupported",
-        remediation = "Use .json, .yaml, or .yml for Eval card files."
+        title = "Verifier card extension unsupported",
+        remediation = "Use .json, .yaml, or .yml for Verifier card files."
     )]
     CardExtensionUnsupported {
         /// Display path.
         path: String,
     },
 
-    /// Eval card file did not contain an Eval card.
-    #[error("card file must contain kind: Eval")]
+    /// Card file did not contain an eval-backed Verifier card.
+    #[error("card file must contain kind: Verifier with implementation.kind: eval")]
     #[wyrd_error(
         code = "WYRD_CLI_400_NOT_EVAL_CARD",
         status = 400,
-        title = "Card file is not an Eval card",
-        remediation = "Pass a Wyrd card envelope with kind: Eval."
+        title = "Card file is not an eval Verifier card",
+        remediation = "Pass a Wyrd card envelope with kind: Verifier and implementation.kind: eval."
     )]
     NotEvalCard,
 
@@ -168,7 +113,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_400_EVAL_SPEC_INVALID",
         status = 400,
         title = "Eval spec invalid",
-        remediation = "Fix the Eval card spec before running the evaluation."
+        remediation = "Fix the eval implementation spec on the Verifier card before running the evaluation."
     )]
     EvalSpecInvalid {
         /// Validation detail.
@@ -187,23 +132,6 @@ pub enum WyrdCliError {
         /// Source error.
         #[source]
         source: std::io::Error,
-    },
-
-    /// The agent endpoint under evaluation failed a turn.
-    ///
-    /// Distinct from [`Self::Server`]: the agent is a third-party URL the
-    /// operator named, not a Wyrd surface, so its failures carry no stable Wyrd
-    /// code and are reported as one CLI-local condition.
-    #[error("agent turn failed: {detail}")]
-    #[wyrd_error(
-        code = "WYRD_CLI_502_AGENT_TURN",
-        status = 502,
-        title = "Agent turn failed",
-        remediation = "Check the --agent-url endpoint, its response shape, and --agent-timeout-secs, then retry."
-    )]
-    AgentTurnFailed {
-        /// What the endpoint did instead of answering.
-        detail: String,
     },
 
     /// Eval engine failed.
@@ -387,12 +315,13 @@ impl WyrdCliError {
 pub enum CliBoundaryError {
     /// A derive-catalogued failure owned by the local CLI.
     Local(WyrdCliError),
-    /// An Oracle query failure already projected onto the shared catalog.
+    /// A server or shared-client failure already projected onto the shared
+    /// catalog, such as an Oracle query or gateway administration error.
     ///
     /// The SDK owns that projection, so the binary boundary reads its stable
     /// metadata straight off the catalog error instead of keeping a second
     /// per-variant table here.
-    Query(wyrd_spec::error::WyrdError),
+    Remote(wyrd_spec::error::WyrdError),
 }
 
 impl From<WyrdCliError> for CliBoundaryError {
@@ -405,7 +334,14 @@ impl From<WyrdCliError> for CliBoundaryError {
 impl From<wyrd_client::bifrost::BifrostClientError> for CliBoundaryError {
     /// Projects an originating query SDK error onto the shared catalog.
     fn from(error: wyrd_client::bifrost::BifrostClientError) -> Self {
-        Self::Query(wyrd_spec::error::WyrdError::from(error))
+        Self::Remote(wyrd_spec::error::WyrdError::from(error))
+    }
+}
+
+impl From<wyrd_spec::error::WyrdError> for CliBoundaryError {
+    /// Preserves an originating shared-catalog error from a client handle.
+    fn from(error: wyrd_spec::error::WyrdError) -> Self {
+        Self::Remote(error)
     }
 }
 
@@ -415,7 +351,7 @@ impl CliBoundaryError {
     pub fn code(&self) -> &str {
         match self {
             Self::Local(error) => error.code(),
-            Self::Query(error) => error.code(),
+            Self::Remote(error) => error.code(),
         }
     }
 
@@ -424,7 +360,7 @@ impl CliBoundaryError {
     pub fn status(&self) -> u16 {
         match self {
             Self::Local(error) => error.status(),
-            Self::Query(error) => error.status(),
+            Self::Remote(error) => error.status(),
         }
     }
 
@@ -433,7 +369,7 @@ impl CliBoundaryError {
     pub fn title(&self) -> &str {
         match self {
             Self::Local(error) => error.title(),
-            Self::Query(error) => error.title(),
+            Self::Remote(error) => error.title(),
         }
     }
 
@@ -442,7 +378,7 @@ impl CliBoundaryError {
     pub fn detail(&self) -> String {
         match self {
             Self::Local(error) => error.to_string(),
-            Self::Query(error) => error
+            Self::Remote(error) => error
                 .as_problem_json()
                 .get("detail")
                 .and_then(serde_json::Value::as_str)
@@ -456,7 +392,7 @@ impl CliBoundaryError {
     pub fn remediation(&self) -> &str {
         match self {
             Self::Local(error) => error.remediation(),
-            Self::Query(error) => error.remediation(),
+            Self::Remote(error) => error.remediation(),
         }
     }
 
@@ -465,7 +401,7 @@ impl CliBoundaryError {
     pub fn details(&self) -> Option<serde_json::Value> {
         match self {
             Self::Local(_) => None,
-            Self::Query(error) => error.as_problem_json().get("details").cloned(),
+            Self::Remote(error) => error.as_problem_json().get("details").cloned(),
         }
     }
 
@@ -474,7 +410,7 @@ impl CliBoundaryError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Local(error) => error.exit_code(),
-            Self::Query(error) => match error.status() {
+            Self::Remote(error) => match error.status() {
                 400 => 64,
                 422 => 65,
                 _ => 1,

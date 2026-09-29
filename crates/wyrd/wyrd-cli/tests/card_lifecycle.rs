@@ -13,6 +13,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use wyrd_client::cards::Cards;
 use wyrd_client::state::WyrdState;
+use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, unresolved_card_ref_paths};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
@@ -186,7 +187,7 @@ impl RuntimeServiceFixture {
     const FILES: &[&str] = &[
         "primary.bin",
         "shadow.bin",
-        "training.bin",
+        "data/data.parquet",
         "triage-prompt.yaml",
         "model-primary.yaml",
         "model-shadow.yaml",
@@ -204,9 +205,9 @@ impl RuntimeServiceFixture {
         "agent_inline",
         "agent_triage",
         "default-Data-training-1.0.0",
-        "default-Drift-model-drift-1.0.0",
-        "default-Eval-quality-1.0.0",
         "default-Prompt-triage-prompt-1.0.0",
+        "default-Verifier-model-drift-1.0.0",
+        "default-Verifier-quality-1.0.0",
         "model_primary",
         "model_shadow",
         "root",
@@ -340,9 +341,9 @@ fn invalid_local_reference_returns_card_load_error_without_credentials() {
     assert_eq!(first_stderr_json(&output)["code"], "WYRD_CLI_400_CARD_LOAD");
 }
 
-/// Reject peer-only Service components during local CLI planning.
+/// Reject a peer-only Verifier listed as a Service component during local CLI planning.
 #[test]
-fn plan_rejects_eval_service_component_with_stable_diagnostic() {
+fn plan_rejects_verifier_service_component_with_stable_diagnostic() {
     let temp = tempfile::tempdir().expect("tempdir creates");
     let path = temp.path().join("service.yaml");
     std::fs::write(
@@ -357,7 +358,7 @@ spec:
   components:
     - alias: quality
       ref:
-        kind: Eval
+        kind: Verifier
         name: quality
         version: 1.0.0
         space: default
@@ -380,9 +381,9 @@ spec:
     );
 }
 
-/// Reject an orphan Eval in a Service-root directory during local CLI planning.
+/// Reject an unbound Verifier in a Service-root directory during local CLI planning.
 #[test]
-fn plan_rejects_unpublished_eval_peer_with_stable_diagnostic() {
+fn plan_rejects_unbound_verifier_peer_with_stable_diagnostic() {
     let temp = tempfile::tempdir().expect("tempdir creates");
     std::fs::write(
         temp.path().join("service.yaml"),
@@ -399,16 +400,19 @@ spec: {}
     std::fs::write(
         temp.path().join("quality.yaml"),
         "apiVersion: wyrd/v1
-kind: Eval
+kind: Verifier
 metadata:
   name: quality
   version: 1.0.0
   space: default
 spec:
-  tasks: {}
+  implementation:
+    kind: eval
+    spec:
+      tasks: {}
 ",
     )
-    .expect("Eval fixture writes");
+    .expect("Verifier fixture writes");
 
     let output = run_cli(&[
         "plan",
@@ -421,7 +425,7 @@ spec:
     let report: Value = serde_json::from_slice(&output.stdout).expect("plan error is JSON");
     assert_eq!(
         report["diagnostics"][0]["code"],
-        "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER"
+        "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER"
     );
 }
 
@@ -558,6 +562,7 @@ mod pg_tests {
     use tokio::task::JoinHandle;
     use wyrd_client::WyrdClient;
     use wyrd_client::auth::AuthMiddleware;
+    use wyrd_client::cards::CardSelector;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::{HttpTransport, ResolvedCredential};
     use wyrd_testing::Bootstrap;
@@ -611,6 +616,41 @@ mod pg_tests {
         shutdown.cancel();
         serve_handle.await.expect("CLI test server joins");
         server.shutdown().await.expect("test server shuts down");
+    }
+
+    /// Poll a Drift Verifier's served Card status until its baseline is fitted.
+    ///
+    /// Proves the fixture baseline Data carries a genuine, fittable Parquet
+    /// artifact: the server's fitter reads it from storage and settles the
+    /// baseline `ready`.
+    ///
+    /// # Panics
+    /// Panics when the Verifier cannot be read, serves no baseline status,
+    /// the fit fails, or the baseline is not ready within 90 seconds.
+    async fn wait_baseline_ready(cards: &Cards, verifier: serde_json::Value) {
+        let verifier: CardRef = serde_json::from_value(verifier).expect("verifier CardRef parses");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let baseline = cards
+                .get(CardSelector::exact(verifier.clone()))
+                .await
+                .expect("drift verifier reads")
+                .status
+                .and_then(|status| status.verification)
+                .and_then(|verification| verification.baseline)
+                .expect("a PSI Verifier serves baseline status");
+            match baseline.state.as_str() {
+                "ready" => return,
+                "failed" => panic!("{} baseline failed to fit: {baseline:?}", verifier.name),
+                _ => {}
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{} baseline never fitted: {baseline:?}",
+                verifier.name
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Build the public registry handle used by the CLI journey's dependency
@@ -703,7 +743,10 @@ mod pg_tests {
         for (alias, expected) in [
             ("model_primary", b"primary-model\n".as_slice()),
             ("model_shadow", b"shadow-model\n".as_slice()),
-            ("default-Data-training-1.0.0", b"training-data\n".as_slice()),
+            (
+                "default-Data-training-1.0.0",
+                include_bytes!("fixtures/card_lifecycle/typed_state/data/data.parquet").as_slice(),
+            ),
         ] {
             let artifact = state.artifacts(alias).expect("artifact list resolves");
             assert_eq!(artifact.len(), 1, "{alias} has one fixture artifact");
@@ -1220,7 +1263,9 @@ mod pg_tests {
     #[tokio::test]
     async fn cli_bundle_loads_typed_wyrdstate_after_server_shutdown() {
         let fixture = RuntimeServiceFixture::new().expect("typed fixture copies");
-        let server = WyrdTestServer::start_bound()
+        let server = WyrdTestServer::builder()
+            .with_verification_runtime_for_test()
+            .start_bound()
             .await
             .expect("bound WyrdTestServer starts");
         let base_url = server
@@ -1257,6 +1302,11 @@ mod pg_tests {
         )
         .await;
         let receipt = apply.expect("CLI apply succeeds");
+        wait_baseline_ready(
+            &cards,
+            json!({"kind": "Verifier", "name": "model-drift", "version": "1.0.0", "space": "default"}),
+        )
+        .await;
         let service_ref = exact_root_ref(&receipt).expect("apply root is an exact CardRef");
         assert_eq!(service_ref.kind, wyrd_spec::envelope::CardKind::Service);
         assert_eq!(service_ref.name.as_str(), "typed-service");
@@ -1339,21 +1389,21 @@ mod pg_tests {
                 .expect("inline prompt serializes")
                 .contains("Inline triage")
         );
-        assert!(
-            state
-                .eval("default-Eval-quality-1.0.0")
-                .expect("eval resolves")
-                .tasks
-                .is_empty()
-        );
-        assert_eq!(
-            state
-                .drift("default-Drift-model-drift-1.0.0")
-                .expect("drift resolves")
-                .description
-                .as_deref(),
-            Some("fixture drift")
-        );
+        assert!(matches!(
+            &state
+                .verifier("default-Verifier-quality-1.0.0")
+                .expect("eval verifier resolves")
+                .implementation,
+            VerifierImplementation::Eval(spec) if spec.tasks.is_empty()
+        ));
+        let drift = state
+            .verifier("default-Verifier-model-drift-1.0.0")
+            .expect("drift verifier resolves");
+        assert_eq!(drift.description.as_deref(), Some("fixture drift"));
+        assert!(matches!(
+            drift.implementation,
+            VerifierImplementation::Drift(_)
+        ));
         assert_eq!(
             state
                 .workflow("runtime_workflow")
@@ -1387,8 +1437,12 @@ mod pg_tests {
     async fn canonical_authored_directory_runs_real_cli_journey() {
         let fixture_root =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/loader/end_to_end");
-        let data_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/loader/end_to_end_prerequisites/churn-classifier-data.yaml");
+        let prerequisites = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/loader/end_to_end_prerequisites");
+        let data_path = prerequisites.join("churn-classifier-data.yaml");
+        let verifier_path = prerequisites.join("retention-guardrail-verifier.yaml");
+        let trigger_path = prerequisites.join("retention-observations-trigger.yaml");
+        let operator_path = prerequisites.join("retention-pager-operator.yaml");
         let model_path = fixture_root.join("model/card.yaml");
         let plan = run_cli_owned(vec![
             "plan".to_owned(),
@@ -1408,7 +1462,15 @@ mod pg_tests {
         let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan output is JSON");
         assert_eq!(plan["cards"].as_array().map(Vec::len), Some(11));
 
-        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let server = WyrdTestServer::builder()
+            .with_verification_runtime_for_test()
+            .start_bound()
+            .await
+            .expect("bound WyrdTestServer starts");
+        let base_url = server
+            .base_url()
+            .expect("bound server exposes base URL")
+            .to_owned();
         let Bootstrap::User { jwt, .. } = server
             .bootstrap_user("canonical-directory-writer", &["writer"])
             .await
@@ -1417,7 +1479,13 @@ mod pg_tests {
             panic!("journey bootstrap returned a non-user principal");
         };
 
-        for path in [&data_path, &model_path] {
+        for path in [
+            &data_path,
+            &verifier_path,
+            &trigger_path,
+            &operator_path,
+            &model_path,
+        ] {
             run_cli_json(
                 vec![
                     "apply".to_owned(),
@@ -1452,6 +1520,16 @@ mod pg_tests {
         .await
         .expect("canonical authored directory applies");
         assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(11));
+        wait_baseline_ready(
+            &public_cards_client(&base_url, &jwt),
+            json!({
+                "kind": "Verifier",
+                "name": "churn-classifier-drift",
+                "version": "1.0.0",
+                "space": "wyrd-team",
+            }),
+        )
+        .await;
         let service_ref = exact_root_ref(&receipt).expect("receipt root is an exact CardRef");
         assert_eq!(service_ref.kind, wyrd_spec::envelope::CardKind::Service);
         assert_eq!(service_ref.name.as_str(), "churn-response-service");
@@ -1465,7 +1543,7 @@ mod pg_tests {
         .await
         .expect("canonical Service graph hydrates");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 9);
+        assert_eq!(summary["card_count"], 15);
 
         let metadata: Value = serde_yaml::from_slice(
             &std::fs::read(bundle.path().join("metadata.yaml"))
@@ -1476,15 +1554,71 @@ mod pg_tests {
             .as_array()
             .expect("bundle metadata lists hydrated cards");
         for (kind, name) in [
-            ("Eval", "churn-triage-eval"),
-            ("Drift", "churn-classifier-drift"),
+            ("Verifier", "churn-triage-eval"),
+            ("Verifier", "churn-classifier-drift"),
+            ("Verifier", "retention-guardrail"),
+            ("Trigger", "retention-observations-ready"),
+            ("Operator", "retention-pager"),
         ] {
-            assert!(cards.iter().any(|card| {
-                card["card_ref"]["kind"] == kind && card["card_ref"]["name"] == name
-            }));
+            assert!(
+                cards.iter().any(|card| {
+                    card["card_ref"]["kind"] == kind && card["card_ref"]["name"] == name
+                }),
+                "hydrated graph reaches {kind} {name}: {cards:?}"
+            );
         }
 
-        stop_cli_server(server, shutdown, serve_handle).await;
+        for (name, binding_owner) in [
+            ("churn-response-service", "Service"),
+            ("retention-runbook", "Agent"),
+        ] {
+            let card = cards
+                .iter()
+                .find(|card| card["card_ref"]["name"] == name)
+                .unwrap_or_else(|| panic!("bundle hydrates the {binding_owner} {name}"));
+            let card_path = bundle.path().join(
+                card["card_path"]
+                    .as_str()
+                    .expect("bundle manifest records a card path"),
+            );
+            let document: Value =
+                serde_yaml::from_slice(&std::fs::read(&card_path).expect("bundle card reads"))
+                    .expect("bundle card is YAML");
+            let bindings = document["spec"]["verified_by"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} persisted its verified_by list"));
+            assert_eq!(bindings.len(), 1, "{bindings:?}");
+            for leg in ["verifier", "runs_on"] {
+                assert!(
+                    bindings[0][leg]["uid"].is_string(),
+                    "{name}.{leg} persisted UID-pinned: {:?}",
+                    bindings[0][leg]
+                );
+            }
+
+            let relationships: Value = serde_yaml::from_slice(
+                &std::fs::read(
+                    bundle.path().join(
+                        card["relationships_path"]
+                            .as_str()
+                            .expect("bundle manifest records a relationships path"),
+                    ),
+                )
+                .expect("bundle relationships read"),
+            )
+            .expect("bundle relationships are YAML");
+            let outbound = relationships["outbound_refs"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} derived outbound relationships"));
+            for kind in ["Verifier", "Trigger"] {
+                assert!(
+                    outbound.iter().any(|edge| edge["ref"]["kind"] == kind),
+                    "{name} derived a {kind} edge: {outbound:?}"
+                );
+            }
+        }
+
+        server.shutdown().await.expect("test server shuts down");
     }
 
     /// Prove real registry output hydrates into runtime state and rejects metadata-only output.

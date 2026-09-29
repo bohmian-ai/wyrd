@@ -19,15 +19,7 @@ use crate::eval::run::{self, EvalRunArgs};
 /// fails.
 pub async fn run_local_records(args: EvalRunArgs) -> Result<ExitCode, WyrdCliError> {
     let (eval_ref, spec) = run::load_eval_card(&args.eval)?;
-    let records_path = args
-        .records
-        .as_deref()
-        .ok_or(WyrdCliError::ServerRejectsRecords)?;
-    let subject_ref = args
-        .subject
-        .as_ref()
-        .ok_or(WyrdCliError::RecordsRequireSubject)?;
-    let records = load_records_jsonl(records_path)?;
+    let records = load_records_jsonl(&args.records)?;
     let judge = run::judge_for_spec(&spec, args.judge_mock)?;
     let scoring =
         vala_eval::orchestrator::ScenarioScoring::with_in_memory_traces(Arc::new(spec), judge)
@@ -41,7 +33,7 @@ pub async fn run_local_records(args: EvalRunArgs) -> Result<ExitCode, WyrdCliErr
                 started_at: now,
                 ended_at: now,
             },
-            Some(subject_ref),
+            Some(&args.subject),
             &records,
         )
         .await

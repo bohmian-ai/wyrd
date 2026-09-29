@@ -162,7 +162,8 @@ pub fn openai_responses(
         .messages
         .into_iter()
         .map(openai_response_user_item)
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
 
     finalize_prompt(skald_spec::Prompt {
         request: ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {

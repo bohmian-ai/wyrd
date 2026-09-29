@@ -1,4 +1,4 @@
-//! In-memory eval engine for Wyrd's Eval card.
+//! In-memory eval engine for Wyrd's eval-backed Verifier Card.
 //!
 //! Consumes the locked `wyrd_spec::vala::eval` contract (`EvalSpec`,
 //! `EvalTask`, `ExecutionPlan`, `AssertionResult`, `ComparisonOperator`,

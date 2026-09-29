@@ -1,0 +1,45 @@
+[package]
+name = "wyrd-gateway"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "In-process governed inference component of wyrd-server: routing, fallback, credential resolution, pricing, and attempt execution."
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_jcs = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "sync", "time"] }
+tokio-util = { workspace = true }
+metrics = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+skald-providers = { workspace = true }
+skald-spec = { workspace = true }
+url = { workspace = true }
+wyrd-crypt = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-tls = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+uuid = { workspace = true, features = ["v7"] }
+workspace-hack.workspace = true
+
+[lints]
+workspace = true

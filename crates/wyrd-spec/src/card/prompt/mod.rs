@@ -120,7 +120,8 @@ pub(crate) mod prompt_support {
                 content: vec![OpenAiResponseContentPart::InputText {
                     text: text.to_owned(),
                 }],
-            }],
+            }]
+            .into(),
             instructions: None,
             text: None,
             tools: None,

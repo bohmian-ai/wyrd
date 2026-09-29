@@ -48,39 +48,91 @@ pub struct GoogleContent {
     pub parts: Vec<GooglePart>,
 }
 
+/// Content of one answer candidate.
+///
+/// Distinct from [`GoogleContent`] because an answer is not a request: Gemini
+/// returns `{}` here when it truncates a candidate before the model speaks —
+/// a `MAX_TOKENS` candidate whose thinking consumed the whole output budget —
+/// so both members are optional. A request still requires its role and parts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct GoogleAnswerContent {
+    /// Turn role, absent in a truncated candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Turn parts, empty in a truncated candidate.
+    #[serde(default)]
+    pub parts: Vec<GooglePart>,
+}
+
+impl From<GoogleAnswerContent> for GoogleContent {
+    /// Carries an answer candidate back into a request turn, naming the role
+    /// `model` when the answer omitted it.
+    fn from(content: GoogleAnswerContent) -> Self {
+        Self {
+            role: content.role.unwrap_or_else(|| "model".to_owned()),
+            parts: content.parts,
+        }
+    }
+}
+
+/// One content part.
+///
+/// Decoding is untagged and tries variants in declaration order, so `Thought`
+/// precedes `Text`: a part carrying both `thought` and `text` is reasoning, not
+/// visible text. Structured variants accept the snake_case names Skald emits and
+/// the camelCase names Gemini and Vertex return.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum GooglePart {
-    Text {
+    /// Model reasoning text.
+    Thought {
+        /// Reasoning marker the provider sets on thought parts.
+        thought: bool,
+        /// Reasoning text.
         text: String,
     },
+    /// Visible text.
+    Text {
+        /// Text content.
+        text: String,
+    },
+    /// Inline base64 media.
     InlineData {
-        #[serde(rename = "inline_data")]
+        /// Media payload; decodes from `inline_data` or `inlineData`.
+        #[serde(rename = "inline_data", alias = "inlineData")]
         inline_data: GoogleInlineData,
     },
+    /// Media referenced by URI.
     FileData {
-        #[serde(rename = "file_data")]
+        /// File reference; decodes from `file_data` or `fileData`.
+        #[serde(rename = "file_data", alias = "fileData")]
         file_data: GoogleFileData,
     },
+    /// Function call the model requested.
     FunctionCall {
-        #[serde(rename = "function_call")]
+        /// Call; decodes from `function_call` or `functionCall`.
+        #[serde(rename = "function_call", alias = "functionCall")]
         function_call: GoogleFunctionCall,
     },
+    /// Function result returned to the model.
     FunctionResponse {
-        #[serde(rename = "function_response")]
+        /// Result; decodes from `function_response` or `functionResponse`.
+        #[serde(rename = "function_response", alias = "functionResponse")]
         function_response: GoogleFunctionResponse,
     },
-    Thought {
-        thought: bool,
-        text: String,
-    },
+    /// Code the model generated for execution.
     ExecutableCode {
-        #[serde(rename = "executable_code")]
+        /// Code; decodes from `executable_code` or `executableCode`.
+        #[serde(rename = "executable_code", alias = "executableCode")]
         executable_code: GoogleExecutableCode,
     },
+    /// Result of executing generated code.
     CodeExecutionResult {
-        #[serde(rename = "code_execution_result")]
+        /// Result; decodes from `code_execution_result` or `codeExecutionResult`.
+        #[serde(rename = "code_execution_result", alias = "codeExecutionResult")]
         code_execution_result: GoogleCodeExecutionResult,
     },
 }
@@ -89,6 +141,8 @@ pub enum GooglePart {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GoogleInlineData {
+    /// Media type; decodes from `mime_type` or `mimeType`.
+    #[serde(alias = "mimeType")]
     pub mime_type: String,
     pub data: String,
 }
@@ -97,13 +151,21 @@ pub struct GoogleInlineData {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct GoogleFileData {
+    /// Media type; decodes from `mime_type` or `mimeType`.
+    #[serde(alias = "mimeType")]
     pub mime_type: String,
+    /// File URI; decodes from `file_uri` or `fileUri`.
+    #[serde(alias = "fileUri")]
     pub file_uri: String,
 }
 
+/// Function call the model requested.
+///
+/// Decoding is deliberately permissive (no `deny_unknown_fields`): Gemini and
+/// Vertex add members such as call identifiers and thought signatures, which are
+/// ignored rather than failing the whole answer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct GoogleFunctionCall {
     pub name: String,
     pub args: Value,
@@ -250,29 +312,47 @@ pub struct GoogleFunctionCallingConfig {
 pub struct GoogleGenerateContentResponse {
     #[serde(default)]
     pub candidates: Vec<GoogleCandidate>,
-    #[serde(default)]
+    /// Token usage; decodes from `usage_metadata` or `usageMetadata`.
+    #[serde(default, alias = "usageMetadata")]
     pub usage_metadata: Option<GoogleUsageMetadata>,
-    #[serde(default)]
+    /// Model version that answered; decodes from `model_version` or `modelVersion`.
+    #[serde(default, alias = "modelVersion")]
     pub model_version: Option<String>,
-    #[serde(default)]
+    /// Prompt safety feedback; decodes from `prompt_feedback` or `promptFeedback`.
+    #[serde(default, alias = "promptFeedback")]
     pub prompt_feedback: Option<Value>,
+    /// Provider-assigned response identifier, echoed so callers can correlate
+    /// the answer with provider-side logs.
+    #[serde(default, alias = "responseId", skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    /// RFC 3339 time the provider created the response.
+    #[serde(default, alias = "createTime", skip_serializing_if = "Option::is_none")]
+    pub create_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GoogleCandidate {
-    pub content: GoogleContent,
+    /// Answer content; `{}` when the candidate was truncated before the model
+    /// spoke.
     #[serde(default)]
+    pub content: GoogleAnswerContent,
+    /// Why generation stopped; decodes from `finish_reason` or `finishReason`.
+    #[serde(default, alias = "finishReason")]
     pub finish_reason: Option<GoogleFinishReason>,
     #[serde(default)]
     pub index: Option<u32>,
-    #[serde(default)]
+    /// Safety ratings; decodes from `safety_ratings` or `safetyRatings`.
+    #[serde(default, alias = "safetyRatings")]
     pub safety_ratings: Vec<GoogleSafetyRating>,
-    #[serde(default)]
+    /// Citation metadata; decodes from `citation_metadata` or `citationMetadata`.
+    #[serde(default, alias = "citationMetadata")]
     pub citation_metadata: Option<Value>,
-    #[serde(default)]
+    /// Grounding metadata; decodes from `grounding_metadata` or `groundingMetadata`.
+    #[serde(default, alias = "groundingMetadata")]
     pub grounding_metadata: Option<Value>,
-    #[serde(default)]
+    /// Average token log probability; decodes from `avg_logprobs` or `avgLogprobs`.
+    #[serde(default, alias = "avgLogprobs")]
     pub avg_logprobs: Option<f64>,
 }
 
@@ -296,15 +376,20 @@ pub enum GoogleFinishReason {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct GoogleUsageMetadata {
-    #[serde(default)]
+    /// Prompt tokens; decodes from `prompt_token_count` or `promptTokenCount`.
+    #[serde(default, alias = "promptTokenCount")]
     pub prompt_token_count: u64,
-    #[serde(default)]
+    /// Candidate output tokens; decodes from `candidates_token_count` or `candidatesTokenCount`.
+    #[serde(default, alias = "candidatesTokenCount")]
     pub candidates_token_count: u64,
-    #[serde(default)]
+    /// Total tokens; decodes from `total_token_count` or `totalTokenCount`.
+    #[serde(default, alias = "totalTokenCount")]
     pub total_token_count: u64,
-    #[serde(default)]
+    /// Cached prompt tokens; decodes from `cached_content_token_count` or `cachedContentTokenCount`.
+    #[serde(default, alias = "cachedContentTokenCount")]
     pub cached_content_token_count: u64,
-    #[serde(default)]
+    /// Reasoning tokens; decodes from `thoughts_token_count` or `thoughtsTokenCount`.
+    #[serde(default, alias = "thoughtsTokenCount")]
     pub thoughts_token_count: u64,
 }
 

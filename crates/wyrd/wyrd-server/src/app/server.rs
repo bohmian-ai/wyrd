@@ -32,6 +32,7 @@ use crate::grpc::{
     serve_grpc_with_listener,
 };
 use crate::state::{AppState, BifrostShutdownReport};
+use crate::verification::{RuntimeLimits, VerificationRuntime};
 
 type BoxWorker = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -504,6 +505,27 @@ impl BoundServer {
         self.http_addr
     }
 
+    /// Compose this process's verification runtime from its configuration.
+    ///
+    /// Results publish through `verification.ingest_endpoint` when set, and
+    /// otherwise through this process's own plaintext gRPC listener when it
+    /// hosts a Scribe. The drain grace is clipped inside the server's shutdown
+    /// budget so released leases settle before teardown aborts the task.
+    fn verification_runtime(&self) -> Option<VerificationRuntime> {
+        let limits = RuntimeLimits::default()
+            .within_server_drain(Duration::from_millis(self.config.shutdown.drain_ms));
+        let mut builder = VerificationRuntime::builder(&self.state).limits(limits);
+        if let Some(endpoint) = &self.config.verification.ingest_endpoint {
+            builder = builder.ingest_endpoint(endpoint.clone());
+        }
+        builder
+            .local_ingest(
+                self.grpc_addr,
+                self.config.grpc.certificate_chain_path.is_some(),
+            )
+            .build()
+    }
+
     /// The bound gRPC address, or `None` when the mode does not serve gRPC.
     #[must_use]
     pub fn grpc_addr(&self) -> Option<SocketAddr> {
@@ -620,8 +642,13 @@ impl BoundServer {
         // Retained audit history: one bounded sweep per interval moves each
         // tenant's oldest contiguous run of audit events out of the
         // transactional staging and retires it only once Scribe has it durably.
-        if let Some(publisher) = crate::audit::publication::AuditPublisher::from_state(&self.state)
-        {
+        #[cfg(feature = "test-support")]
+        let publication = (!self.state.audit_publication_disabled)
+            .then(|| crate::audit::publication::AuditPublisher::from_state(&self.state))
+            .flatten();
+        #[cfg(not(feature = "test-support"))]
+        let publication = crate::audit::publication::AuditPublisher::from_state(&self.state);
+        if let Some(publisher) = publication {
             set.spawn(worker_task(
                 TaskId::Worker("audit_publisher"),
                 publisher.run(shutdown.clone()),
@@ -662,6 +689,18 @@ impl BoundServer {
             set.spawn(worker_task(
                 TaskId::Worker("card_reconciler"),
                 reconciler::run(self.state.clone(), operator, shutdown.clone()),
+            ));
+        }
+
+        // One supervised verification runtime per API-serving process: the
+        // durable queue coordinates every replica, so no leader is elected.
+        if self.config.verification.enabled
+            && self.config.role.serves_api()
+            && let Some(runtime) = self.verification_runtime()
+        {
+            set.spawn(worker_task(
+                TaskId::Worker("verification_runtime"),
+                runtime.run(shutdown.clone()),
             ));
         }
 
@@ -772,12 +811,31 @@ impl BoundServer {
         let mcp_drained = tokio::time::timeout_at(deadline, self.state.mcp_tasks.wait())
             .await
             .is_ok();
+        // Gateway calls refuse admission once shutdown begins; accounting of
+        // the calls already accepted, including streams that settle after
+        // their response, drains within the same deadline.
+        self.state.gateway_tasks.close();
+        let gateway_drained = tokio::time::timeout_at(deadline, self.state.gateway_tasks.wait())
+            .await
+            .is_ok();
+        // Drained calls have enqueued their capture; publish it within the
+        // same deadline. Evidence still buffered at the deadline may be lost,
+        // which capture permits before Scribe acknowledgement.
+        if tokio::time::timeout_at(deadline, self.state.gateway_capture.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("gateway capture did not drain before the shutdown deadline");
+        }
         let terminal = match terminal {
             Some(message) => Some(message),
-            None if mcp_drained => None,
-            None => {
+            None if !mcp_drained => {
                 Some("MCP in-flight work did not drain before the shutdown deadline".to_owned())
             }
+            None if !gateway_drained => Some(
+                "gateway call accounting did not drain before the shutdown deadline".to_owned(),
+            ),
+            None => None,
         };
 
         let deadline = deadline.into_std();

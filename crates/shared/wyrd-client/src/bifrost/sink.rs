@@ -16,7 +16,8 @@ pub trait IngestTransport<G>: Send + Sync + 'static {
     /// durable commit ambiguous, or when stable no-write
     /// `WYRD_VALA_429_INGEST_BUSY` requires retry. In both cases the queue
     /// retains the exact UUID, bytes, allocation guard, and retry permit.
-    /// Terminal failure lets the queue consume that owner.
+    /// Terminal failure lets the queue consume that owner; a transport that
+    /// owns a bounded retry budget returns it once that budget is exhausted.
     async fn insert_batch(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError>;
 }
 

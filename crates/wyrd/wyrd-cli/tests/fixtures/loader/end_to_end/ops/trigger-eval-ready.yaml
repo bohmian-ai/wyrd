@@ -1,0 +1,9 @@
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  space: wyrd-team
+  name: churn-triage-eval-ready
+  version: "1.0.0"
+spec:
+  description: Evaluate each committed observation batch for the bound subject.
+  kind: observations_ready

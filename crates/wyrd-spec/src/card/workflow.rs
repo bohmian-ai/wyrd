@@ -578,7 +578,7 @@ mod workflow_spec_tests {
                 prompt: InlineableRef::from(prompt()),
                 tool_names: vec![],
                 run_config: AgentRunConfigSpec::default(),
-                publishes_to: Vec::new(),
+                verified_by: Vec::new(),
             })),
             depends_on: vec![],
             inputs: BTreeMap::new(),
@@ -674,7 +674,7 @@ mod workflow_spec_tests {
             }),
             tool_names: vec![],
             run_config: AgentRunConfigSpec::default(),
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         };
         let step = WorkflowStep {
             id: "planner".to_owned(),

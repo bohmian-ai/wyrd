@@ -87,7 +87,10 @@ vala-bifrost-redux = { path = ".", features = ["test-support", "bench-support"] 
 # `time` and `test-util` are test-only: the publication retry schedule is proved
 # with paused time rather than a clock abstraction the production path would
 # then have to carry.
-tokio = { workspace = true, features = ["time", "test-util"] }
+tokio = { workspace = true, features = ["time", "test-util", "net"] }
+# Issues the throwaway mutual-TLS peer identity the dispatcher channel-reuse
+# proof dials; the same workspace pin the server and harness already use.
+rcgen = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-bench = { workspace = true }
 wyrd-telemetry = { workspace = true, features = ["test-support"] }

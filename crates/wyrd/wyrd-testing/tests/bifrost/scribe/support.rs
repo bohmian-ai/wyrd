@@ -224,22 +224,20 @@ pub(super) async fn append_values_at(
     append_batch(client, table, batch_id, &batch).await
 }
 
-/// Reads one table's values back through the public strict fused query route.
+/// Reads one table's values back through the public query route.
 ///
-/// Strict freshness and fused visibility are what make the read an authority
-/// check: the answer must come from whichever source currently owns the rows,
+/// Every query reads published and live sources, so a successful terminal is
+/// what makes the read an authority check: the answer must come from whichever source currently owns the rows,
 /// not from whatever happens to be cheapest.
 pub(super) async fn read_values(client: &wyrd_client::WyrdClient, table: &str) -> Vec<i64> {
     read_sql(client, &format!("SELECT value FROM {table}")).await
 }
 
-/// Runs one strict fused public query and collects its `value` column.
+/// Runs one public query and collects its `value` column.
 pub(super) async fn read_sql(client: &wyrd_client::WyrdClient, sql: &str) -> Vec<i64> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
             sql: sql.to_owned(),
-            visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(120_000),
         })
         .await
@@ -258,6 +256,11 @@ pub(super) async fn read_sql(client: &wyrd_client::WyrdClient, sql: &str) -> Vec
             .expect("value column is Int64");
         values.extend(column.values().iter().copied());
     }
+    assert_eq!(
+        stream.terminal().map(|terminal| terminal.outcome),
+        Some(wyrd_spec::vala::api::QueryTerminalOutcome::Success),
+        "an authority read of `{sql}` must see every source"
+    );
     values
 }
 
@@ -492,6 +495,7 @@ pub(super) fn span_batch(values: &[i64]) -> arrow::record_batch::RecordBatch {
             schema_url: "https://wyrd.test/schemas/scribe-journey".to_owned(),
         }],
         None,
+        usize::MAX,
     )
     .expect("span batch");
     assert_eq!(

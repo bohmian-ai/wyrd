@@ -252,7 +252,7 @@ async fn export_traces(
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let owner = bifrost
                 .gate()
-                .reserve_otlp_decode(plan.decode_bytes)
+                .reserve_otlp_decode(plan.reservation_bytes())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let request = decode_trace_protobuf(&body)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
@@ -261,18 +261,9 @@ async fn export_traces(
         OtlpEncoding::Json => {
             let plan = preflight_trace_json(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
-            let total = plan
-                .decode_bytes
-                .checked_add(plan.scratch_bytes)
-                .ok_or_else(|| {
-                    ingest_error_to_response(
-                        IngestError::Decode("OTLP JSON capacity overflow".to_owned()),
-                        OtlpSignal::Traces,
-                    )
-                })?;
             let mut owner = bifrost
                 .gate()
-                .reserve_otlp_decode(total)
+                .reserve_otlp_decode(plan.reservation_bytes())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let scratch = owner
                 .split_scratch(plan.scratch_bytes)
@@ -373,7 +364,7 @@ async fn export_metrics(
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let owner = bifrost
                 .gate()
-                .reserve_otlp_decode(plan.decode_bytes)
+                .reserve_otlp_decode(plan.reservation_bytes())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let request = decode_metrics_protobuf(&body, plan)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
@@ -382,18 +373,9 @@ async fn export_metrics(
         OtlpEncoding::Json => {
             let plan = preflight_metrics_json(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
-            let total = plan
-                .decode_bytes
-                .checked_add(plan.scratch_bytes)
-                .ok_or_else(|| {
-                    ingest_error_to_response(
-                        IngestError::Decode("OTLP JSON capacity overflow".to_owned()),
-                        OtlpSignal::Metrics,
-                    )
-                })?;
             let mut owner = bifrost
                 .gate()
-                .reserve_otlp_decode(total)
+                .reserve_otlp_decode(plan.reservation_bytes())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let scratch = owner
                 .split_scratch(plan.scratch_bytes)
@@ -495,7 +477,7 @@ async fn export_logs(
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let owner = bifrost
                 .gate()
-                .reserve_otlp_decode(plan.decode_bytes)
+                .reserve_otlp_decode(plan.reservation_bytes())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let request = decode_logs_protobuf(&body)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
@@ -504,18 +486,9 @@ async fn export_logs(
         OtlpEncoding::Json => {
             let plan = preflight_logs_json(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
-            let total = plan
-                .decode_bytes
-                .checked_add(plan.scratch_bytes)
-                .ok_or_else(|| {
-                    ingest_error_to_response(
-                        IngestError::Decode("OTLP JSON capacity overflow".to_owned()),
-                        OtlpSignal::Logs,
-                    )
-                })?;
             let mut owner = bifrost
                 .gate()
-                .reserve_otlp_decode(total)
+                .reserve_otlp_decode(plan.reservation_bytes())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let scratch = owner
                 .split_scratch(plan.scratch_bytes)

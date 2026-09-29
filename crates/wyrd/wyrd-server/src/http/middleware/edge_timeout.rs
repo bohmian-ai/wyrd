@@ -21,6 +21,14 @@ use tower::{BoxError, Layer, Service};
 /// Path of the only route whose edge timeout is staged.
 const QUERY_PATH: &str = "/v1/query";
 
+/// Reports whether `request` is the public SQL query, `POST /v1/query`.
+///
+/// This is the one route whose waiting belongs to Oracle rather than to the
+/// generic protected edge.
+pub(crate) fn is_public_query<B>(request: &Request<B>) -> bool {
+    request.method() == Method::POST && request.uri().path() == QUERY_PATH
+}
+
 /// Request extension that ends the generic edge timer for one query.
 ///
 /// Inserted only on `POST /v1/query`. The query handler calls
@@ -117,14 +125,13 @@ where
     /// The returned future resolves to the wrapped stack's failure, boxed, or to
     /// [`Elapsed`] when the edge limit passes before completion or query handoff.
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
-        let handoff = (request.method() == Method::POST && request.uri().path() == QUERY_PATH)
-            .then(|| {
-                let handoff = CancellationToken::new();
-                request.extensions_mut().insert(QueryEdgeTimer {
-                    handoff: handoff.clone(),
-                });
-                handoff
+        let handoff = is_public_query(&request).then(|| {
+            let handoff = CancellationToken::new();
+            request.extensions_mut().insert(QueryEdgeTimer {
+                handoff: handoff.clone(),
             });
+            handoff
+        });
         let response = self.inner.call(request);
         let timeout = self.timeout;
         Box::pin(async move {

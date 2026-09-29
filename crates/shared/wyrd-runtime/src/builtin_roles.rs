@@ -2,8 +2,39 @@
 
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::{BifrostPermissionScope, BifrostTableScope, PermissionScope};
 
-use crate::permission::Permission;
+use crate::permission::{Action, Permission, Resource};
+
+/// Informational Role name carried only by the gateway capture principal's tokens.
+///
+/// It has no `wyrd.auth_roles` row and grants nothing on its own: the token's
+/// authority is its signed `permissions` claim, built per tenant from
+/// [`gateway_capture_permissions`], so it is not listed in [`BUILTIN_ROLES`]
+/// and never appears in a tenant's role listing.
+pub const GATEWAY_CAPTURE_ROLE: &str = "gateway_capture";
+
+/// Builds the exact `gateway_capture` grants for one tenant's capture destinations.
+///
+/// Each grant is `BifrostRecord` `Write` scoped to one resolved table UID, so
+/// the Role reaches `vala.gateway.calls` and `vala.traces.spans` and nothing
+/// else, including a same-named table recreated under a new UID.
+#[must_use]
+pub fn gateway_capture_permissions(calls_uid: Uuid, spans_uid: Uuid) -> [Permission; 2] {
+    let table_write = |schema: &str, table_uid| Permission {
+        resource: Resource::BifrostRecord,
+        action: Action::Write,
+        scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
+            catalog: "vala".to_owned(),
+            schema: schema.to_owned(),
+            table_uid,
+        })),
+    };
+    [
+        table_write("gateway", calls_uid),
+        table_write("traces", spans_uid),
+    ]
+}
 
 /// Fixed namespace for deterministic per-tenant builtin role IDs.
 pub const NS_BUILTIN_ROLE: Uuid = Uuid::from_u128(0x6ad8_2377_3a8f_5f42_9d17_a9f5_5b1c_5c63);

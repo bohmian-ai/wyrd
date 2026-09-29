@@ -1,5 +1,7 @@
 //! Production-default physical object qualification for Scribe publication.
 
+use std::time::Duration;
+
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES;
 use wyrd_spec::DataTenantId;
@@ -72,9 +74,12 @@ async fn scribe_512_mib_physical_object_qualifies() {
         expected.extend_from_slice(&values);
     }
 
-    server
-        .flush_bifrost()
+    // A physical 512 MiB assembly can outlast the harness's general 60s flush
+    // bound; keep this qualification bounded without cancelling a live claim.
+    let scribe = server.bifrost_scribe().expect("the server owns Scribe");
+    tokio::time::timeout(Duration::from_secs(180), scribe.flush_staged())
         .await
+        .expect("the physical assembly settles within 180s")
         .expect("the staged members publish");
 
     let published = server

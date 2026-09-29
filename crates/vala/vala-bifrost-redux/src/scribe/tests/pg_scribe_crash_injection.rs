@@ -73,6 +73,7 @@ fn torn_wal_tail_is_truncated_and_prior_records_replay() {
                 key.tenant,
                 &key.table,
                 uuid::Uuid::from_bytes([1_u8; 16]),
+                crate::scribe::routing::TEST_SHARD_COUNT,
             )
         ))
         .join("0.wal");
@@ -115,6 +116,7 @@ fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
                 key.tenant,
                 &key.table,
                 uuid::Uuid::from_bytes([1_u8; 16]),
+                crate::scribe::routing::TEST_SHARD_COUNT,
             )
         ))
         .join("0.wal");
@@ -182,7 +184,7 @@ fn atomic_manifest_ignores_a_crashed_temporary_replacement() {
 /// `(tenant, table, batch_id)`.  After a crash the WAL segments carry the
 /// original shard lane in their header (`shard_id` field).  Replay must
 /// dispatch each replayed state to `shard_senders[state.shard_id]` — NOT to a
-/// freshly computed `shard_for(tenant, table, ...)` — so that per-shard
+/// freshly computed `shard_for(tenant, table, ..., crate::scribe::routing::TEST_SHARD_COUNT)` — so that per-shard
 /// `synced_not_inserted` and pending-FIFO dedup state rebuilds exactly where
 /// the original writes lived.
 ///
@@ -208,6 +210,7 @@ fn replay_restores_multi_shard_seal_key_to_recorded_lanes() {
             key.tenant,
             &key.table,
             Uuid::from_bytes(batch_id),
+            crate::scribe::routing::TEST_SHARD_COUNT,
         ))
         .expect("shard id fits u8");
         written_shards.insert(shard);

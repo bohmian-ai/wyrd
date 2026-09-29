@@ -278,7 +278,10 @@ impl PromotedRewriteFixture {
         let mut handoffs = Vec::with_capacity(planned.plans.len());
         let mut failure = None;
         for plan in planned.plans {
-            match rewrite.rewrite_plan(plan, &planned.table).await {
+            match rewrite
+                .rewrite_plan(plan, &planned.table, &planned.policy)
+                .await
+            {
                 Ok(handoff) => handoffs.push(handoff),
                 Err(error) => {
                     failure = Some(error);

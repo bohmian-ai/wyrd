@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   BifrostQueryStream,
   IncompleteQueryStreamError,
+  TableConfig,
   WyrdError,
   type TableDescription,
 } from "@wyrd/sdk";
@@ -15,7 +16,6 @@ describe("BifrostQueryStream", () => {
     const ipc = tableToIPC(tableFromArrays({ value: [1, 2] }), "stream");
     const terminal = {
       outcome: "success",
-      freshness: "fresh",
       row_count: 2,
       warnings: [],
       source_completion: [],
@@ -185,6 +185,7 @@ describe("bifrost public typing", () => {
         sort_keys: [{ column: "trace_id", direction: "Ascending", null_order: "Last" }],
         bloom_columns: ["trace_id"],
       },
+      compaction_target_file_size_bytes: 1_073_741_824,
     };
     const nested = description.user_fields[0].data_type;
     const item = typeof nested === "string" || !("List" in nested) ? undefined : nested.List;
@@ -193,5 +194,27 @@ describe("bifrost public typing", () => {
     expect(struct !== undefined && "Struct" in struct ? struct.Struct[0].name : undefined).toBe("inner");
     expect(description.physical_layout.sort_keys[0].column).toBe("trace_id");
     expect(description.canonical_physical_fingerprint).toBe("canonical-fp");
+    expect(description.compaction_target_file_size_bytes).toBe(1_073_741_824);
+  });
+});
+
+describe("TableConfig compaction target", () => {
+  const SCHEMA = {
+    type: "object",
+    properties: { id: { type: "integer" } },
+    required: ["id"],
+  };
+
+  it("defaults to the deployment target and carries an explicit one", () => {
+    expect(TableConfig.fromJsonSchema("unit.rows", SCHEMA).compactionTargetFileSizeBytes).toBeUndefined();
+    const target = 256 * 1024 * 1024;
+    expect(
+      TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, target).compactionTargetFileSizeBytes,
+    ).toBe(target);
+  });
+
+  it("refuses a target that is not a non-negative integer", () => {
+    expect(() => TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, 1.5)).toThrow(/compaction target/);
+    expect(() => TableConfig.fromJsonSchema("unit.rows", SCHEMA, undefined, -1)).toThrow(/compaction target/);
   });
 });

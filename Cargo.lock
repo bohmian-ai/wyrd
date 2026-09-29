@@ -2258,6 +2258,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "croner"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a59ed87528b2ee2b6d2b14d6767f6dbe41867dfc581433fc23a7c0fae847467a"
+dependencies = [
+ "chrono",
+ "derive_builder",
+ "strum",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4684,7 +4695,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe#57772676f85b138648c2f4e7f95e6dc3850d62fe"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a2f7cd2fb53e06c750b782880f6b6b83f6324467#a2f7cd2fb53e06c750b782880f6b6b83f6324467"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4743,7 +4754,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe#57772676f85b138648c2f4e7f95e6dc3850d62fe"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a2f7cd2fb53e06c750b782880f6b6b83f6324467#a2f7cd2fb53e06c750b782880f6b6b83f6324467"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4758,7 +4769,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe#57772676f85b138648c2f4e7f95e6dc3850d62fe"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a2f7cd2fb53e06c750b782880f6b6b83f6324467#a2f7cd2fb53e06c750b782880f6b6b83f6324467"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4779,7 +4790,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe#57772676f85b138648c2f4e7f95e6dc3850d62fe"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a2f7cd2fb53e06c750b782880f6b6b83f6324467#a2f7cd2fb53e06c750b782880f6b6b83f6324467"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4790,7 +4801,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=3709a1d9f7b8b6f2c0ed886c105fb557f1aaadab#3709a1d9f7b8b6f2c0ed886c105fb557f1aaadab"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=74e4937a40a3f09501b253a9e4587e5dd10dfabd#74e4937a40a3f09501b253a9e4587e5dd10dfabd"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4820,7 +4831,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe#57772676f85b138648c2f4e7f95e6dc3850d62fe"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a2f7cd2fb53e06c750b782880f6b6b83f6324467#a2f7cd2fb53e06c750b782880f6b6b83f6324467"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4836,7 +4847,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe#57772676f85b138648c2f4e7f95e6dc3850d62fe"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=a2f7cd2fb53e06c750b782880f6b6b83f6324467#a2f7cd2fb53e06c750b782880f6b6b83f6324467"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7130,7 +7141,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -7151,7 +7162,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -8818,8 +8829,10 @@ dependencies = [
  "serde_yaml",
  "skald-spec",
  "temp-env",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "urlencoding",
@@ -10428,6 +10441,7 @@ dependencies = [
  "prost",
  "rand 0.8.7",
  "rayon",
+ "rcgen",
  "rustix",
  "secrecy",
  "serde",
@@ -10460,24 +10474,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "vala-core"
-version = "0.0.1"
-dependencies = [
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "workspace-hack",
- "wyrd-spec",
-]
-
-[[package]]
 name = "vala-drift"
 version = "0.0.1"
 dependencies = [
  "arrow",
  "arrow-schema",
  "serde",
+ "serde_json",
  "statrs",
  "thiserror 2.0.18",
  "workspace-hack",
@@ -10800,7 +10803,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -11086,6 +11089,7 @@ dependencies = [
  "axum-core",
  "base64 0.22.1",
  "base64 0.23.1",
+ "bigdecimal",
  "bitflags 2.13.0",
  "blake2",
  "block-buffer 0.12.1",
@@ -11211,6 +11215,8 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
  "twox-hash",
  "typenum",
  "url",
@@ -11364,6 +11370,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "wiremock",
  "workspace-hack",
  "wyrd-auth-oidc",
@@ -11472,6 +11479,7 @@ dependencies = [
  "futures-util",
  "hex",
  "indicatif",
+ "opentelemetry",
  "reqwest 0.13.4",
  "schemars 0.8.22",
  "secrecy",
@@ -11490,6 +11498,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-opentelemetry",
  "urlencoding",
  "uuid",
  "vala-bifrost-redux",
@@ -11561,6 +11570,39 @@ dependencies = [
  "quote",
  "syn 2.0.118",
  "workspace-hack",
+]
+
+[[package]]
+name = "wyrd-gateway"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bigdecimal",
+ "chrono",
+ "metrics",
+ "rcgen",
+ "reqwest 0.13.4",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "skald-providers",
+ "skald-spec",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-crypt",
+ "wyrd-spec",
+ "wyrd-tls",
+ "zeroize",
 ]
 
 [[package]]
@@ -11703,6 +11745,8 @@ dependencies = [
  "skald-tool",
  "skald-workflow",
  "tempfile",
+ "tracing",
+ "url",
  "wyrd-cards",
  "wyrd-cli",
  "wyrd-client",
@@ -11721,11 +11765,17 @@ dependencies = [
 name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "base64 0.22.1",
+ "chrono",
+ "parquet",
  "secrecy",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "uuid",
  "workspace-hack",
  "wyrd-client",
  "wyrd-testing",
@@ -11758,8 +11808,10 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "secrecy",
+ "url",
  "vala-bifrost-redux",
  "wyrd-runtime",
+ "wyrd-spec",
  "wyrd-testing",
 ]
 
@@ -11833,6 +11885,7 @@ dependencies = [
  "utoipa-axum",
  "uuid",
  "vala-bifrost-redux",
+ "vala-drift",
  "vala-eval",
  "vala-sql",
  "wiremock",
@@ -11846,7 +11899,9 @@ dependencies = [
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-gateway",
  "wyrd-loader",
+ "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
@@ -11896,6 +11951,8 @@ version = "0.0.1"
 dependencies = [
  "blake3",
  "chrono",
+ "chrono-tz",
+ "croner",
  "metrics",
  "paste",
  "pg-embed",
@@ -12015,7 +12072,6 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "parquet",
- "pyo3",
  "rand 0.9.5",
  "rcgen",
  "reqwest 0.13.4",
@@ -12049,6 +12105,7 @@ dependencies = [
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-gateway",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-semver",
@@ -12059,7 +12116,6 @@ dependencies = [
  "wyrd-telemetry",
  "wyrd-tls",
  "wyrd-tonic",
- "wyrd-utils",
 ]
 
 [[package]]

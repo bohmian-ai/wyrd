@@ -93,7 +93,7 @@ fn graph_diagnostic(
     let path = match error {
         GraphError::Cycle { cycle } => cycle.first(),
         GraphError::InvalidServiceComponentKind { service, .. } => Some(service.as_ref()),
-        GraphError::UnpublishedObservabilityPeer { peer, .. } => Some(peer.as_ref()),
+        GraphError::UnboundVerifierPeer { peer, .. } => Some(peer.as_ref()),
         _ => None,
     }
     .and_then(|card_ref| {
@@ -126,16 +126,14 @@ fn graph_diagnostic(
                 "field": field,
             }),
         },
-        GraphError::UnpublishedObservabilityPeer { root, peer } => {
-            WyrdError::SpecUnpublishedObservabilityPeer {
-                message,
-                details: serde_json::json!({
-                    "root": root,
-                    "peer": peer,
-                    "publisher_kinds": ["Data", "Model", "Agent", "Service"],
-                }),
-            }
-        }
+        GraphError::UnboundVerifierPeer { root, peer } => WyrdError::SpecUnboundVerifierPeer {
+            message,
+            details: serde_json::json!({
+                "root": root,
+                "peer": peer,
+                "binding_owner_kinds": ["Service", "Agent"],
+            }),
+        },
         GraphError::DuplicateIdentity { .. }
         | GraphError::Empty
         | GraphError::MissingSpace
@@ -213,7 +211,7 @@ mod tests {
                             uid: None,
                         },
                     },
-                    publishes_to: Vec::new(),
+                    verified_by: Vec::new(),
                     source: None,
                     config: BTreeMap::new(),
                     credential_refs: Vec::new(),
@@ -260,9 +258,9 @@ mod tests {
         assert_eq!(order, vec![1, 0]);
     }
 
-    /// Surface the stable peer-component diagnostic at the authored Service path.
+    /// Surface the stable peer-component diagnostic when a Verifier is a Service component.
     #[test]
-    fn order_rejects_eval_service_component_with_stable_code() {
+    fn order_rejects_verifier_service_component_with_stable_code() {
         let mut service = service("app", None);
         let Spec::Service(spec) = &mut service.spec else {
             panic!("test Service fixture has a Service spec");
@@ -270,20 +268,21 @@ mod tests {
         spec.components.push(ServiceComponent {
             alias: "quality".to_owned(),
             card_ref: Ref::Sibling {
-                sibling: card_ref(CardKind::Eval, "quality"),
+                sibling: card_ref(CardKind::Verifier, "quality"),
             },
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
             source: None,
             config: BTreeMap::new(),
             credential_refs: Vec::new(),
         });
-        let eval = authored(
+        let verifier = authored(
             "quality",
-            &CardKind::Eval,
-            serde_json::json!({ "tasks": {} }),
+            &CardKind::Verifier,
+            serde_json::json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
         );
 
-        let diagnostics = order_cards(&[service, eval]).expect_err("Eval component is invalid");
+        let diagnostics =
+            order_cards(&[service, verifier]).expect_err("Verifier component is invalid");
 
         assert_eq!(
             diagnostics[0].code,
@@ -292,23 +291,20 @@ mod tests {
         assert_eq!(diagnostics[0].path, PathBuf::from("app.yaml"));
     }
 
-    /// Surface the stable orphan-peer diagnostic at the authored Eval path.
+    /// Surface the stable unbound-peer diagnostic at the authored Verifier path.
     #[test]
-    fn order_rejects_unpublished_eval_peer_with_stable_code() {
+    fn order_rejects_unbound_verifier_peer_with_stable_code() {
         let service = service("app", None);
-        let eval = authored(
+        let verifier = authored(
             "quality",
-            &CardKind::Eval,
-            serde_json::json!({ "tasks": {} }),
+            &CardKind::Verifier,
+            serde_json::json!({ "implementation": { "kind": "eval", "spec": { "tasks": {} } } }),
         );
 
         let diagnostics =
-            order_cards(&[service, eval]).expect_err("Service-root Eval needs a publisher");
+            order_cards(&[service, verifier]).expect_err("Service-root Verifier needs a binding");
 
-        assert_eq!(
-            diagnostics[0].code,
-            "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER"
-        );
+        assert_eq!(diagnostics[0].code, "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER");
         assert_eq!(diagnostics[0].path, PathBuf::from("quality.yaml"));
     }
 }

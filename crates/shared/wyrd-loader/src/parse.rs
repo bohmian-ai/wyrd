@@ -412,6 +412,41 @@ spec:
         assert!(err.diagnostics[0].message.contains("kind"));
     }
 
+    /// Refuse the retired `Drift` and `Eval` Card kinds at the loader boundary.
+    ///
+    /// Both are Verifier implementations now, so a file authored against the
+    /// old model must fail here rather than reaching validation or the wire.
+    ///
+    /// # Panics
+    /// Panics when the temporary fixture file cannot be created or written,
+    /// and when either retired kind parses or its diagnostic does not name the
+    /// offending kind.
+    #[test]
+    fn parse_rejects_retired_drift_and_eval_card_kinds() {
+        for kind in ["Drift", "Eval"] {
+            let mut file = NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                r#"
+apiVersion: wyrd/v1
+kind: {kind}
+metadata:
+  name: quality
+  space: default
+  version: "1.0.0"
+spec: {{}}
+"#
+            )
+            .unwrap();
+            file.flush().unwrap();
+
+            let err =
+                parse_file(file.path()).expect_err("the retired {kind} Card kind must not parse");
+            assert_eq!(err.diagnostics.len(), 1, "{:?}", err.diagnostics);
+            assert_eq!(err.diagnostics[0].code, "WYRD_LOADER_400_INVALID_ENVELOPE");
+        }
+    }
+
     #[test]
     fn parse_accepts_multi_doc_yaml() {
         let mut file = NamedTempFile::new().unwrap();

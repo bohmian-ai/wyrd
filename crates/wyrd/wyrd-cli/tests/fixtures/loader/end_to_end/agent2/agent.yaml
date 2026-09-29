@@ -34,3 +34,23 @@ spec:
   run_config:
     max_iterations: 10
     timeout_ms: 120000
+
+  # Standalone-Agent binding: this Agent carries its own `verified_by`, so it
+  # stays verified wherever it is composed. Both legs name already-registered
+  # Cards by exact identity.
+  verified_by:
+    - verifier:
+        kind: Verifier
+        space: wyrd-team
+        name: retention-guardrail
+        version: "1.0.0"
+      runs_on:
+        kind: Trigger
+        space: wyrd-team
+        name: retention-observations-ready
+        version: "1.0.0"
+      on_failure:
+        - kind: Operator
+          space: wyrd-team
+          name: retention-pager
+          version: "1.0.0"

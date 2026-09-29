@@ -46,6 +46,9 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         key: ${{ inputs.rust-cache-key }}
+        # A red run still compiled the dependency set; saving it keeps the next
+        # run from starting cold.
+        cache-on-failure: true
 
     - name: Use GNU BFD linker on Linux
       if: inputs.bfd-linker == 'true' && runner.os == 'Linux'

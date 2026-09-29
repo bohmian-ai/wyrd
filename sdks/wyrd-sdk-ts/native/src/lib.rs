@@ -1,10 +1,13 @@
 //! Thin napi projection of the Rust-owned `wyrd_client` capabilities:
-//! the shared client, Bifrost, Cards, and offline `WyrdState`.
+//! the shared client, Bifrost, Cards, Verification, Gateway administration,
+//! and offline `WyrdState`.
 
 #![deny(missing_docs)]
 
 pub mod cards;
 pub mod client;
+pub mod gateway;
+pub mod verification;
 
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};
@@ -26,8 +29,8 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
 
@@ -36,10 +39,6 @@ use wyrd_spec::vala::ids::RunId;
 pub struct NativeQueryRequest {
     /// SELECT-only SQL text.
     pub sql: String,
-    /// `published_only` or `fused`.
-    pub visibility: String,
-    /// `strict` or `allow_degraded`.
-    pub freshness: String,
     /// Optional query deadline in milliseconds, valid in `1..=u32::MAX`.
     ///
     /// Accepted as a JavaScript number so every out-of-range, fractional, or
@@ -397,8 +396,9 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 /// # Errors
 ///
 /// Returns a napi error when the table is not `namespace.name`, the document is
-/// not one mappable JSON Schema, a declared column is server-owned, or the
-/// layout is not one physical-layout declaration.
+/// not one mappable JSON Schema, a declared column is server-owned, the
+/// layout is not one physical-layout declaration, or the compaction target is
+/// not a non-negative integer.
 // justification: napi boundary; a JavaScript string is primitive and cannot be
 // passed by reference, so the generated binding requires an owned String
 #[allow(clippy::needless_pass_by_value)]
@@ -407,11 +407,16 @@ pub fn table_config_from_json_schema(
     table: String,
     schema_json: String,
     layout_json: Option<String>,
+    compaction_target_file_size_bytes: Option<f64>,
 ) -> Result<NativeTableConfig> {
     let schema: Value = serde_json::from_str(&schema_json)
         .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
     let config = TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
-    NativeTableConfig::project(&apply_layout(config, layout_json.as_deref())?)
+    let config = apply_layout(config, layout_json.as_deref())?;
+    NativeTableConfig::project(&apply_compaction_target(
+        config,
+        compaction_target_file_size_bytes,
+    )?)
 }
 
 /// Fetches an already-registered table's config by name.
@@ -466,6 +471,30 @@ fn apply_layout(config: TableConfig, layout_json: Option<&str>) -> Result<TableC
                 napi::Error::from_reason(format!("invalid physical layout: {error}"))
             })?;
             Ok(config.with_layout(layout))
+        }
+    }
+}
+
+/// Applies one optional explicit Forge compaction file target to a config.
+///
+/// JavaScript numbers arrive as `f64`; only an exact non-negative integer
+/// survives the lossless decimal round trip into `u64`. The accepted byte
+/// range stays the server's registration check, so every SDK shares one
+/// catalog error for an out-of-range target.
+///
+/// # Errors
+///
+/// Returns a napi error for a non-finite, fractional, or negative number.
+fn apply_compaction_target(config: TableConfig, bytes: Option<f64>) -> Result<TableConfig> {
+    match bytes {
+        None => Ok(config),
+        Some(bytes) => {
+            let bytes: u64 = bytes.to_string().parse().map_err(|_| {
+                napi::Error::from_reason(format!(
+                    "compaction target must be a non-negative integer byte count, got {bytes}"
+                ))
+            })?;
+            Ok(config.with_compaction_target_file_size_bytes(bytes))
         }
     }
 }
@@ -686,14 +715,6 @@ impl NativeBifrost {
     pub async fn query(&self, request: NativeQueryRequest) -> Result<NativeQueryStart> {
         let request = BifrostQueryRequest {
             sql: request.sql,
-            visibility: match parse_visibility(&request.visibility) {
-                Ok(visibility) => visibility,
-                Err(error) => return Ok(NativeQueryStart::failure(&error)),
-            },
-            freshness: match parse_freshness(&request.freshness) {
-                Ok(freshness) => freshness,
-                Err(error) => return Ok(NativeQueryStart::failure(&error)),
-            },
             deadline_ms: match request.deadline_ms.map(parse_deadline_ms).transpose() {
                 Ok(deadline_ms) => deadline_ms,
                 Err(error) => return Ok(NativeQueryStart::failure(&error)),
@@ -989,21 +1010,6 @@ fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> Result<Correla
     })
 }
 
-/// Parses the native visibility spelling.
-///
-/// # Errors
-///
-/// Returns a structured SDK protocol error for an unknown value.
-fn parse_visibility(value: &str) -> StdResult<VisibilityMode, BifrostClientError> {
-    match value {
-        "published_only" => Ok(VisibilityMode::PublishedOnly),
-        "fused" => Ok(VisibilityMode::Fused),
-        _ => Err(BifrostClientError::Protocol(
-            "visibility must be published_only or fused".to_owned(),
-        )),
-    }
-}
-
 /// Converts a JavaScript deadline number into the shared signed request field.
 ///
 /// Only exact integers pass through the lossless decimal round trip; the
@@ -1022,21 +1028,6 @@ fn parse_deadline_ms(value: f64) -> StdResult<i64, BifrostClientError> {
             },
         })
     })
-}
-
-/// Parses the native freshness spelling.
-///
-/// # Errors
-///
-/// Returns a structured SDK protocol error for an unknown value.
-fn parse_freshness(value: &str) -> StdResult<FreshnessPolicy, BifrostClientError> {
-    match value {
-        "strict" => Ok(FreshnessPolicy::Strict),
-        "allow_degraded" => Ok(FreshnessPolicy::AllowDegraded),
-        _ => Err(BifrostClientError::Protocol(
-            "freshness must be strict or allow_degraded".to_owned(),
-        )),
-    }
 }
 
 /// Parses one canonical request ID at the Node boundary.

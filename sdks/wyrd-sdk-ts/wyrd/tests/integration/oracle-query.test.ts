@@ -30,17 +30,19 @@ describe("Oracle query journey", () => {
         credential: server.token,
         grpcUrl: server.grpcUrl,
       });
-      const expected = [11, 22];
-      server.seedBifrostRows(server.tableFqn, expected);
+      server.seedBifrostRows(server.tableFqn, [11, 22]);
       server.waitForBifrostPublication();
+      // The third row stays live in Scribe; one query reads both sources.
+      server.seedBifrostRows(server.tableFqn, [33]);
+      const expected = [11, 22, 33];
       const stream = await client.stream({
-        sql: `SELECT * FROM ${server.tableFqn}`,
+        sql: `SELECT * FROM ${server.tableFqn} ORDER BY value`,
       });
       const batches = [];
       for await (const batch of stream) {
         batches.push(batch);
       }
-      expect(batches.reduce((rows, batch) => rows + batch.numRows, 0)).toBe(2);
+      expect(batches.reduce((rows, batch) => rows + batch.numRows, 0)).toBe(3);
       expect(batches[0]?.schema.fields[0]?.name).toBe("value");
       expect(batches[0]?.schema.fields.length).toBeGreaterThan(1);
       const values = batches.flatMap((batch) =>
@@ -49,7 +51,9 @@ describe("Oracle query journey", () => {
       expect(values).toEqual(expected.map(BigInt));
       expect(stream.terminal).toBeDefined();
       expect(stream.terminal?.outcome).toBe("success");
-      expect(stream.terminal?.row_count).toBe(2);
+      expect(stream.terminal?.row_count).toBe(3);
+      expect(stream.terminal?.warnings).toEqual([]);
+      expect(stream.terminal).not.toHaveProperty("freshness");
     } finally {
       server.shutdown();
     }

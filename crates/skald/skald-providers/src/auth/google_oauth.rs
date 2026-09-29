@@ -11,6 +11,7 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::clients::map_reqwest_error;
 use crate::error::{ProviderError, ProviderResult};
 
 const METADATA_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
@@ -47,9 +48,13 @@ pub struct GoogleOAuth {
 
 #[derive(Clone)]
 enum GoogleOAuthSource {
+    /// A bearer token the caller already obtained and refreshes itself.
+    AccessToken(SecretString),
     InlineJson(String),
     CredentialsFile(PathBuf),
-    Metadata { base_url: String },
+    Metadata {
+        base_url: String,
+    },
 }
 
 struct CachedToken {
@@ -76,6 +81,19 @@ struct JwtClaims {
 }
 
 impl GoogleOAuth {
+    /// Creates an OAuth source that presents an already-issued access token.
+    ///
+    /// The token is never exchanged or refreshed; the caller owns its
+    /// lifetime, so every [`GoogleOAuth::token`] call returns it unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Auth`] when another Rustls provider already
+    /// owns the process or the metadata HTTP client cannot be built.
+    pub fn from_access_token(token: impl Into<String>) -> ProviderResult<Self> {
+        Self::new(GoogleOAuthSource::AccessToken(super::secret(token)))
+    }
+
     /// Creates an OAuth loader from inline account JSON.
     ///
     /// # Errors
@@ -173,7 +191,13 @@ impl GoogleOAuth {
     /// Returns a bearer token, reusing cached tokens until the refresh grace.
     ///
     /// The async mutex is held across the fetch so at most one in-flight token
-    /// refresh happens per `GoogleOAuth` instance.
+    /// refresh happens per `GoogleOAuth` instance. An access-token source returns
+    /// its caller-issued token unchanged without any exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Auth`] when credentials cannot be read or
+    /// exchanged, or the provider error of the token or metadata request.
     pub async fn token(&self) -> ProviderResult<GoogleOAuthToken> {
         let mut cache = self.cache.lock().await;
         if let Some(cached) = cache.as_ref() {
@@ -183,6 +207,10 @@ impl GoogleOAuth {
             }
         }
         let token = match &self.source {
+            GoogleOAuthSource::AccessToken(token) => GoogleOAuthToken {
+                access_token: token.clone(),
+                expires_in: 3600,
+            },
             GoogleOAuthSource::InlineJson(json) => self.token_from_json(json).await?,
             GoogleOAuthSource::CredentialsFile(path) => {
                 let json = std::fs::read_to_string(path)
@@ -350,23 +378,15 @@ pub(crate) async fn oauth_headers(
         "Bearer {}",
         secrecy::ExposeSecret::expose_secret(&token.access_token)
     );
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        HeaderValue::from_str(&value).map_err(|error| ProviderError::decode(provider, error))?,
-    );
+    let mut authorization =
+        HeaderValue::from_str(&value).map_err(|error| ProviderError::decode(provider, error))?;
+    authorization.set_sensitive(true);
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
     headers.insert(
         HeaderName::from_static("x-goog-api-client"),
         HeaderValue::from_static("skald-providers"),
     );
     Ok(headers)
-}
-
-fn map_reqwest_error(provider: &str, error: reqwest::Error) -> ProviderError {
-    if error.is_timeout() {
-        ProviderError::timeout(provider)
-    } else {
-        ProviderError::upstream(provider, 0, error.to_string())
-    }
 }
 
 fn gcloud_adc_path() -> Option<PathBuf> {
@@ -403,6 +423,20 @@ mod google_auth_oauth {
             secrecy::ExposeSecret::expose_secret(&second.access_token),
             secrecy::ExposeSecret::expose_secret(&first.access_token)
         );
+    }
+
+    /// A caller-issued access token is presented unchanged in a sensitive
+    /// bearer header without any exchange.
+    #[tokio::test]
+    async fn access_token_is_presented_as_a_sensitive_bearer() {
+        let oauth = GoogleOAuth::from_access_token("issued").expect("oauth builds");
+
+        let headers = crate::auth::google_oauth::oauth_headers("vertex", &oauth)
+            .await
+            .expect("headers");
+
+        assert_eq!(headers[reqwest::header::AUTHORIZATION], "Bearer issued");
+        assert!(headers[reqwest::header::AUTHORIZATION].is_sensitive());
     }
 
     // Tests that service account JSON without client_email returns a clear auth error

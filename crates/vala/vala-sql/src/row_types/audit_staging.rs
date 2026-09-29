@@ -26,7 +26,7 @@ pub struct AuditStagingRow {
     /// Stable ID of the acting principal.
     pub principal_id: Uuid,
     /// Principal kind tag: `global_admin`, `tenant_admin`, `user`, `service`,
-    /// or `agent`.
+    /// `agent`, or `system`.
     pub principal_kind: String,
     /// Non-secret id of the credential that authenticated the request, when one
     /// was presented.

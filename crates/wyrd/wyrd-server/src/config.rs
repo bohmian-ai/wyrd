@@ -2,19 +2,31 @@
 //!
 //! Load order: env overrides > TOML file > compiled defaults.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use url::Url;
 use vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
-use wyrd_spec::TenantSlug;
+use wyrd_crypt::SecretKey;
+use wyrd_gateway::{
+    CredentialAssignment, CredentialResolver, ManagedSecretKeys, TenantKeyring, VaultBackend,
+    read_secret_file,
+};
 use wyrd_spec::auth::IssuerTokenPolicy;
+use wyrd_spec::gateway::{ExternalSecretReference, ProviderCredentialSourceView};
+use wyrd_spec::ids::{CredentialBindingName, SecretBackendName};
+use wyrd_spec::security::SecretRef;
+use wyrd_spec::{DataTenantId, TenantSlug};
 use wyrd_telemetry::TelemetryConfig;
 
 use crate::boot::data_root::DEFAULT_BIFROST_DATA_DIR;
@@ -260,6 +272,12 @@ pub struct ForgeRuntimeConfig {
     /// positive when set. Default 60.
     #[serde(default)]
     pub maintenance_interval_secs: Option<u64>,
+    /// Soft rewrite file target for every table that declares no
+    /// `write.target-file-size-bytes` property. Overridden by
+    /// `WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`. Must be positive when set.
+    /// Default 1073741824 (1 GiB).
+    #[serde(default)]
+    pub target_file_size_bytes: Option<u64>,
 }
 
 impl ForgeRuntimeConfig {
@@ -304,9 +322,6 @@ pub struct ScribeRuntimeConfig {
     /// WAL IO worker count.
     #[serde(default = "default_scribe_wal_io_threads")]
     pub wal_io_threads: usize,
-    /// Optional Scribe WAL disk budget. When absent, filesystem capacity is authoritative.
-    #[serde(default)]
-    pub wal_disk_limit_bytes: Option<u64>,
     /// Optional past-window bound (seconds) for caller-supplied `wyrd_event_time` validation.
     ///
     /// A caller-supplied `wyrd_event_time` older than this many seconds before server receipt
@@ -328,72 +343,38 @@ pub struct ScribeRuntimeConfig {
     /// capacity decision rather than only a validation bound.
     #[serde(default = "default_ingest_request_bytes")]
     pub ingest_request_bytes: usize,
-    /// Encoded bytes in one non-empty Scribe WAL segment before rotation.
+    /// Number of Scribe shards, each with its own WAL and memtable.
     ///
-    /// This governs WAL segment size only. It does not size a generation, a
-    /// row group, a hot object, or a Forge rewrite output.
-    #[serde(default = "default_scribe_wal_segment_bytes")]
-    pub wal_segment_bytes: u64,
-    /// Pod-wide Arrow budget shared by every active shard generation.
+    /// `WYRD_MEM_TABLE_BUCKET_NUM` overrides the file value. Default 1.
+    #[serde(default = "default_scribe_mem_table_bucket_num")]
+    pub mem_table_bucket_num: usize,
+    /// Megabytes one shard's WAL segment holds before the shard rotates.
     ///
-    /// Divided evenly across the fixed sixteen shards and then capped by
-    /// [`Self::generation_rotation_ceiling_bytes`] to derive the rotation limit
-    /// each shard applies. It is a limit rather than sixteen reservations, so
-    /// lowering it narrows every shard together instead of letting the first
-    /// shards to fill exclude the rest.
-    #[serde(default = "default_scribe_active_generation_budget_bytes")]
-    pub active_generation_budget_bytes: u64,
-    /// Absolute per-shard active-generation rotation ceiling.
+    /// `WYRD_MAX_FILE_SIZE_ON_DISK` overrides the file value. Default 512. It
+    /// also caps the staging hot-object target, which is the smaller of this
+    /// and Forge's rewrite target.
+    #[serde(default = "default_scribe_max_file_size_on_disk")]
+    pub max_file_size_on_disk: u64,
+    /// Megabytes of Arrow one shard's memtable holds before the shard rotates.
     ///
-    /// Applied after the pod-wide budget divides, so a large budget can never
-    /// turn one shard into an unbounded memory owner.
-    #[serde(default = "default_scribe_generation_rotation_ceiling_bytes")]
-    pub generation_rotation_ceiling_bytes: u64,
-    /// Maximum active shard-generation age before rotation.
-    #[serde(default = "default_scribe_generation_max_age_secs")]
-    pub generation_max_age_secs: u64,
+    /// `WYRD_MAX_FILE_SIZE_IN_MEMORY` overrides the file value. Default 512.
+    #[serde(default = "default_scribe_max_file_size_in_memory")]
+    pub max_file_size_in_memory: u64,
+    /// Seconds a shard generation, or a staged member awaiting assembly, may
+    /// age before it rotates or assembles.
+    ///
+    /// `WYRD_MAX_FILE_RETENTION_TIME` overrides the file value. Default 600.
+    #[serde(default = "default_scribe_max_file_retention_time")]
+    pub max_file_retention_time: u64,
     /// Optional per-`SealKey` size that seals one key earlier than its shard.
     ///
     /// A key may seal earlier than the shard it belongs to; it may never seal
-    /// later, so a value above the derived per-shard rotation limit is refused.
+    /// later, so a value above the per-shard memtable limit is refused.
     #[serde(default)]
     pub seal_key_early_seal_bytes: Option<usize>,
     /// Optional per-`SealKey` age that seals one key earlier than its shard.
     #[serde(default)]
     pub seal_key_max_age_secs: Option<u64>,
-    /// Encoded Parquet target for one assembled Scribe hot object.
-    ///
-    /// Independent of every rotation limit: a generation rotates to bound
-    /// memory, while staging assembles across generations toward this size.
-    #[serde(default = "default_scribe_staging_target_file_size_bytes")]
-    pub staging_target_file_size_bytes: u64,
-    /// Maximum field count in one canonical native IPC schema.
-    #[serde(default = "default_ingest_native_fields")]
-    pub ingest_native_fields: usize,
-    /// Maximum record-batch/source count in one canonical native IPC stream.
-    #[serde(default = "default_ingest_native_sources")]
-    pub ingest_native_sources: usize,
-    /// Maximum logical rows or signal records in one request.
-    #[serde(default = "default_ingest_rows")]
-    pub ingest_rows: usize,
-    /// Maximum OTLP resource groups in one request.
-    #[serde(default = "default_ingest_otlp_resources")]
-    pub ingest_otlp_resources: usize,
-    /// Maximum OTLP instrumentation-scope groups in one request.
-    #[serde(default = "default_ingest_otlp_scopes")]
-    pub ingest_otlp_scopes: usize,
-    /// Maximum OTLP signal records in one request.
-    #[serde(default = "default_ingest_otlp_records")]
-    pub ingest_otlp_records: usize,
-    /// Maximum OTLP attribute nodes in one request.
-    #[serde(default = "default_ingest_otlp_attributes")]
-    pub ingest_otlp_attributes: usize,
-    /// Maximum cumulative OTLP key, value, body, and identifier bytes.
-    #[serde(default = "default_ingest_otlp_value_bytes")]
-    pub ingest_otlp_value_bytes: usize,
-    /// Maximum recursive OTLP `AnyValue` nesting depth.
-    #[serde(default = "default_ingest_otlp_value_depth")]
-    pub ingest_otlp_value_depth: usize,
     /// Maximum distinct event-day partitions in one request.
     #[serde(default = "default_ingest_time_partitions")]
     pub ingest_time_partitions: usize,
@@ -491,15 +472,22 @@ impl BifrostRoles {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OracleRuntimeConfig {
-    /// Concurrent planning permits.
-    #[serde(default = "default_oracle_planning_permits")]
-    pub planning_permits: usize,
-    /// Admission waiters.
+    /// Waiting places in this node's query queue, shared by both classes.
     #[serde(default = "default_oracle_admission_waiters")]
     pub admission_waiters: usize,
-    /// Maximum absolute time a query may wait in the local admission queues.
+    /// Longest time a query of either class may wait for an execution slot.
+    ///
+    /// A waiter also stops at its total query deadline when that is earlier.
+    /// `WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS` overrides it.
     #[serde(default = "default_oracle_max_queue_wait_ms")]
     pub max_queue_wait_ms: u64,
+    /// Total query deadline for both classes when a caller sends no `deadline_ms`.
+    ///
+    /// It covers planning, queueing, and execution and does not restart when a
+    /// query leaves the queue. `WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS`
+    /// overrides it.
+    #[serde(default = "default_oracle_default_query_deadline_ms")]
+    pub default_query_deadline_ms: u64,
     /// Maximum remote workers, excluding the leader.
     #[serde(default = "default_oracle_max_workers_per_query")]
     pub max_workers_per_query: usize,
@@ -516,15 +504,17 @@ pub struct OracleRuntimeConfig {
     pub allow_unapproved_profile: bool,
 }
 
-fn default_oracle_planning_permits() -> usize {
-    2
-}
+/// Default waiting places per Oracle node across both query classes.
 fn default_oracle_admission_waiters() -> usize {
-    64
+    1_000
 }
-/// Default maximum absolute Oracle admission queue wait in milliseconds.
+/// Default maximum Oracle queue wait in milliseconds: one hour.
 fn default_oracle_max_queue_wait_ms() -> u64 {
-    250
+    3_600_000
+}
+/// Default total Oracle query deadline in milliseconds: two hours.
+fn default_oracle_default_query_deadline_ms() -> u64 {
+    7_200_000
 }
 fn default_oracle_max_workers_per_query() -> usize {
     2
@@ -536,9 +526,9 @@ fn default_oracle_max_frame_bytes() -> usize {
 impl Default for OracleRuntimeConfig {
     fn default() -> Self {
         Self {
-            planning_permits: default_oracle_planning_permits(),
             admission_waiters: default_oracle_admission_waiters(),
             max_queue_wait_ms: default_oracle_max_queue_wait_ms(),
+            default_query_deadline_ms: default_oracle_default_query_deadline_ms(),
             max_workers_per_query: default_oracle_max_workers_per_query(),
             max_frame_bytes: default_oracle_max_frame_bytes(),
             calibration_profile: PathBuf::new(),
@@ -893,9 +883,6 @@ const ORACLE_CALIBRATION_PROPOSALS: &[&str] = &[
     "placement.jitter_max_millis",
     "reservation.pending_ttl_seconds",
     "membership.expiration_seconds",
-    "tail.fence_ttl_seconds",
-    "tail.page_rows",
-    "tail.page_encoded_bytes",
     "distribution.max_workers_per_query",
     "distribution.fragment_target_rows",
     "distribution.fragment_target_bytes",
@@ -912,7 +899,6 @@ const ORACLE_CALIBRATION_PROPOSALS: &[&str] = &[
     "performance.p99_ttfb_millis",
     "performance.minimum_rows_per_second",
     "performance.last_stable_concurrency",
-    "performance.maximum_tail_page_millis",
     "performance.maximum_object_store_throttle_rate",
 ];
 
@@ -1379,23 +1365,20 @@ pub struct BifrostResourceConfig {
 /// Derives the dedicated Scribe coordination-runtime worker count.
 ///
 /// The coordination runtime hosts one long-lived task per Scribe shard lane
-/// (`SCRIBE_SHARD_COUNT` of them) plus the reconciliation and persistence
-/// loops. Those shard owners are not pure channel-awaiters: each performs
-/// synchronous Arrow memtable insertion inline and awaits a Postgres `COMMIT`,
-/// so a thread count well below the lane count serializes independent lanes.
+/// plus the reconciliation and persistence loops. Those shard owners are not
+/// pure channel-awaiters: each performs synchronous Arrow memtable insertion
+/// inline and awaits a Postgres `COMMIT`, so a thread count well below the
+/// lane count serializes independent lanes.
 ///
 /// The derivation therefore starts from detected parallelism — matching the
 /// sibling ingress and persistence derivations, including their `map_or(4, ..)`
-/// fallback for platforms that cannot report it — then clamps it between two
-/// bounds. The upper bound caps threads at the number of lanes there are to
-/// run, so a large host does not spawn coordination threads that can never own
-/// a lane. The lower bound preserves the historical floor so a single-core box
-/// still gets a second thread to make progress on while one lane blocks in
-/// `COMMIT`. The bounds are constant and ordered, so the clamp cannot panic.
+/// fallback for platforms that cannot report it — floored at two so a
+/// single-core box still gets a second thread to make progress on while one
+/// lane blocks in `COMMIT`.
 fn default_scribe_coordination_threads() -> usize {
     std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
-        .clamp(2, vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
+        .max(2)
 }
 
 fn default_scribe_ingress_cpu_threads() -> usize {
@@ -1420,74 +1403,27 @@ fn default_ingest_request_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::wal_segment_bytes`].
-fn default_scribe_wal_segment_bytes() -> u64 {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_WAL_SEGMENT_BYTES
+/// Bytes in one megabyte of the megabyte-valued Scribe size settings.
+const SCRIBE_MEGABYTE: u64 = 1024 * 1024;
+
+/// Returns the default for [`ScribeRuntimeConfig::mem_table_bucket_num`].
+fn default_scribe_mem_table_bucket_num() -> usize {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::active_generation_budget_bytes`].
-fn default_scribe_active_generation_budget_bytes() -> u64 {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES
+/// Returns the default for [`ScribeRuntimeConfig::max_file_size_on_disk`].
+fn default_scribe_max_file_size_on_disk() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_WAL_SEGMENT_BYTES / SCRIBE_MEGABYTE
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::generation_rotation_ceiling_bytes`].
-fn default_scribe_generation_rotation_ceiling_bytes() -> u64 {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_GENERATION_ROTATION_CEILING_BYTES
+/// Returns the default for [`ScribeRuntimeConfig::max_file_size_in_memory`].
+fn default_scribe_max_file_size_in_memory() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_GENERATION_ROTATION_BYTES / SCRIBE_MEGABYTE
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::generation_max_age_secs`].
-fn default_scribe_generation_max_age_secs() -> u64 {
+/// Returns the default for [`ScribeRuntimeConfig::max_file_retention_time`].
+fn default_scribe_max_file_retention_time() -> u64 {
     vala_bifrost_redux::scribe::geometry::DEFAULT_GENERATION_MAX_AGE.as_secs()
-}
-
-/// Returns the default for [`ScribeRuntimeConfig::staging_target_file_size_bytes`].
-fn default_scribe_staging_target_file_size_bytes() -> u64 {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES
-}
-
-/// Returns the immutable V1 native field hard maximum.
-fn default_ingest_native_fields() -> usize {
-    vala_bifrost_redux::gate::limits::BIFROST_NATIVE_FIELD_LIMIT
-}
-
-/// Returns the immutable V1 native source hard maximum.
-fn default_ingest_native_sources() -> usize {
-    vala_bifrost_redux::gate::limits::BIFROST_NATIVE_SOURCE_LIMIT
-}
-
-/// Returns the immutable V1 logical row hard maximum.
-fn default_ingest_rows() -> usize {
-    vala_bifrost_redux::gate::limits::BIFROST_INGEST_ROW_LIMIT
-}
-
-/// Returns the immutable V1 OTLP resource hard maximum.
-fn default_ingest_otlp_resources() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.resources
-}
-
-/// Returns the immutable V1 OTLP scope hard maximum.
-fn default_ingest_otlp_scopes() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.scopes
-}
-
-/// Returns the immutable V1 OTLP record hard maximum.
-fn default_ingest_otlp_records() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.records
-}
-
-/// Returns the immutable V1 OTLP attribute hard maximum.
-fn default_ingest_otlp_attributes() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.attributes
-}
-
-/// Returns the immutable V1 OTLP cumulative-value-byte hard maximum.
-fn default_ingest_otlp_value_bytes() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.value_bytes
-}
-
-/// Returns the immutable V1 OTLP recursive-value-depth hard maximum.
-fn default_ingest_otlp_value_depth() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.value_depth
 }
 
 /// Returns the immutable V1 event-day hard maximum.
@@ -1507,26 +1443,15 @@ impl Default for ScribeRuntimeConfig {
             ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
             persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
             wal_io_threads: default_scribe_wal_io_threads(),
-            wal_disk_limit_bytes: None,
             event_time_past_window_secs: None,
             event_time_future_window_secs: None,
             ingest_request_bytes: default_ingest_request_bytes(),
-            wal_segment_bytes: default_scribe_wal_segment_bytes(),
-            active_generation_budget_bytes: default_scribe_active_generation_budget_bytes(),
-            generation_rotation_ceiling_bytes: default_scribe_generation_rotation_ceiling_bytes(),
-            generation_max_age_secs: default_scribe_generation_max_age_secs(),
+            mem_table_bucket_num: default_scribe_mem_table_bucket_num(),
+            max_file_size_on_disk: default_scribe_max_file_size_on_disk(),
+            max_file_size_in_memory: default_scribe_max_file_size_in_memory(),
+            max_file_retention_time: default_scribe_max_file_retention_time(),
             seal_key_early_seal_bytes: None,
             seal_key_max_age_secs: None,
-            staging_target_file_size_bytes: default_scribe_staging_target_file_size_bytes(),
-            ingest_native_fields: default_ingest_native_fields(),
-            ingest_native_sources: default_ingest_native_sources(),
-            ingest_rows: default_ingest_rows(),
-            ingest_otlp_resources: default_ingest_otlp_resources(),
-            ingest_otlp_scopes: default_ingest_otlp_scopes(),
-            ingest_otlp_records: default_ingest_otlp_records(),
-            ingest_otlp_attributes: default_ingest_otlp_attributes(),
-            ingest_otlp_value_bytes: default_ingest_otlp_value_bytes(),
-            ingest_otlp_value_depth: default_ingest_otlp_value_depth(),
             ingest_time_partitions: default_ingest_time_partitions(),
             ingest_wal_workspace_bytes: default_ingest_wal_workspace_bytes(),
         }
@@ -1540,8 +1465,9 @@ impl ScribeRuntimeConfig {
     ///
     /// Returns a field-specific boot error when a thread or ingest bound is
     /// zero, a frozen cardinality bound exceeds its immutable V1 maximum, the
-    /// configured request cannot be represented by tonic/WAL v4 framing, or a
-    /// configured WAL disk budget is zero.
+    /// configured request cannot be represented by tonic/WAL v4 framing, a
+    /// shard count, file size, or retention time is zero or a size overflows
+    /// bytes, or the derived Scribe geometry is incoherent.
     pub fn validate(&self) -> Result<(), String> {
         let thread_values = [
             ("coordination_threads", self.coordination_threads),
@@ -1552,13 +1478,25 @@ impl ScribeRuntimeConfig {
         if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
             return Err(format!("scribe.{name} must be at least 1"));
         }
-        if let Some(value) = self.wal_disk_limit_bytes
-            && value == 0
-        {
-            return Err("scribe.wal_disk_limit_bytes must be at least 1".to_owned());
+        let rotation_values = [
+            (
+                "mem_table_bucket_num",
+                u64::try_from(self.mem_table_bucket_num).unwrap_or(u64::MAX),
+            ),
+            ("max_file_size_on_disk", self.max_file_size_on_disk),
+            ("max_file_size_in_memory", self.max_file_size_in_memory),
+            ("max_file_retention_time", self.max_file_retention_time),
+        ];
+        if let Some((name, _value)) = rotation_values.into_iter().find(|(_, value)| *value == 0) {
+            return Err(format!("scribe.{name} must be at least 1"));
         }
-        if self.generation_max_age_secs == 0 {
-            return Err("scribe.generation_max_age_secs must be at least 1".to_owned());
+        for (name, megabytes) in [
+            ("max_file_size_on_disk", self.max_file_size_on_disk),
+            ("max_file_size_in_memory", self.max_file_size_in_memory),
+        ] {
+            if megabytes.checked_mul(SCRIBE_MEGABYTE).is_none() {
+                return Err(format!("scribe.{name} megabytes overflow a byte count"));
+            }
         }
         if self.seal_key_max_age_secs == Some(0) {
             return Err("scribe.seal_key_max_age_secs must be at least 1".to_owned());
@@ -1566,9 +1504,14 @@ impl ScribeRuntimeConfig {
         if self.ingest_request_bytes == 0 {
             return Err("scribe.ingest_request_bytes must be at least 1".to_owned());
         }
-        if self.ingest_request_bytes.checked_add(64 * 1024).is_none() {
+        if self
+            .ingest_request_bytes
+            .checked_mul(vala_bifrost_redux::gate::limits::BIFROST_INGEST_EXPANSION_FACTOR)
+            .is_none()
+        {
             return Err(
-                "scribe.ingest_request_bytes plus tonic framing allowance exceeds usize".to_owned(),
+                "scribe.ingest_request_bytes times the expanded-data factor exceeds usize"
+                    .to_owned(),
             );
         }
         if u32::try_from(self.ingest_request_bytes).is_err() {
@@ -1576,50 +1519,13 @@ impl ScribeRuntimeConfig {
                 "scribe.ingest_request_bytes exceeds WAL v4 payload representability".to_owned(),
             );
         }
-        self.scribe_geometry()
-            .map_err(|error| format!("scribe geometry configuration is invalid: {error}"))?;
+        // The staging target only takes the smaller of two positive sizes, so
+        // Forge's default stands in for its separately validated override.
+        self.scribe_geometry(
+            vala_bifrost_redux::forge::ForgeConfig::default().default_target_file_size_bytes,
+        )
+        .map_err(|error| format!("scribe geometry configuration is invalid: {error}"))?;
         let ingest_values = [
-            (
-                "ingest_native_fields",
-                self.ingest_native_fields,
-                default_ingest_native_fields(),
-            ),
-            (
-                "ingest_native_sources",
-                self.ingest_native_sources,
-                default_ingest_native_sources(),
-            ),
-            ("ingest_rows", self.ingest_rows, default_ingest_rows()),
-            (
-                "ingest_otlp_resources",
-                self.ingest_otlp_resources,
-                default_ingest_otlp_resources(),
-            ),
-            (
-                "ingest_otlp_scopes",
-                self.ingest_otlp_scopes,
-                default_ingest_otlp_scopes(),
-            ),
-            (
-                "ingest_otlp_records",
-                self.ingest_otlp_records,
-                default_ingest_otlp_records(),
-            ),
-            (
-                "ingest_otlp_attributes",
-                self.ingest_otlp_attributes,
-                default_ingest_otlp_attributes(),
-            ),
-            (
-                "ingest_otlp_value_bytes",
-                self.ingest_otlp_value_bytes,
-                default_ingest_otlp_value_bytes(),
-            ),
-            (
-                "ingest_otlp_value_depth",
-                self.ingest_otlp_value_depth,
-                default_ingest_otlp_value_depth(),
-            ),
             (
                 "ingest_time_partitions",
                 self.ingest_time_partitions,
@@ -1647,24 +1553,32 @@ impl ScribeRuntimeConfig {
 
     /// Derives the validated independent Scribe geometry from this configuration.
     ///
-    /// This is the single conversion from operator-facing seconds and byte
-    /// fields into the checked [`ScribeGeometry`] the Scribe runtime owns, so
-    /// no caller can assemble an unvalidated geometry of its own.
+    /// This is the single conversion from operator-facing megabyte and
+    /// second fields into the checked [`ScribeGeometry`] the Scribe runtime
+    /// owns, so no caller can assemble an unvalidated geometry of its own.
+    /// The staging hot-object target is the smaller of
+    /// the on-disk file size and `forge_target_file_size_bytes`, Forge's
+    /// resolved rewrite target.
     ///
     /// # Errors
     ///
     /// Returns the [`ScribeGeometryError`] naming the geometry field that is
-    /// zero, that divides to no per-shard rotation limit at all, or that would
-    /// make a per-`SealKey` control fire after its shard has already rotated.
-    pub fn scribe_geometry(&self) -> Result<ScribeGeometry, ScribeGeometryError> {
+    /// zero or out of range, or that would make a per-`SealKey` control fire
+    /// after its shard has already rotated. [`Self::validate`] refuses a
+    /// megabyte size that overflows bytes; this conversion saturates.
+    pub fn scribe_geometry(
+        &self,
+        forge_target_file_size_bytes: u64,
+    ) -> Result<ScribeGeometry, ScribeGeometryError> {
+        let on_disk_bytes = self.max_file_size_on_disk.saturating_mul(SCRIBE_MEGABYTE);
         ScribeGeometry::new(
-            self.wal_segment_bytes,
-            self.active_generation_budget_bytes,
-            self.generation_rotation_ceiling_bytes,
-            Duration::from_secs(self.generation_max_age_secs),
+            self.mem_table_bucket_num,
+            on_disk_bytes,
+            self.max_file_size_in_memory.saturating_mul(SCRIBE_MEGABYTE),
+            Duration::from_secs(self.max_file_retention_time),
             self.seal_key_early_seal_bytes,
             self.seal_key_max_age_secs.map(Duration::from_secs),
-            self.staging_target_file_size_bytes,
+            on_disk_bytes.min(forge_target_file_size_bytes),
             self.ingest_request_bytes,
             vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
             vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
@@ -1675,31 +1589,18 @@ impl ScribeRuntimeConfig {
 
     /// Freezes the validated operator-selected limits passed to Gate and Scribe.
     ///
-    /// # Panics
-    ///
-    /// Panics only when called before [`Self::validate`] has established that
-    /// the tonic framing allowance can be added without overflow.
+    /// The configured request bytes become the single wire ceiling; the
+    /// expanded-data ceiling is derived from it, and the OTLP value depth is a
+    /// fixed structural rule rather than an operator setting.
     #[must_use]
     pub fn ingest_limits(&self) -> vala_bifrost_redux::gate::limits::IngestLimits {
         vala_bifrost_redux::gate::limits::IngestLimits {
             max_frame_bytes: self.ingest_request_bytes,
-            max_decoding_message_size: self
-                .ingest_request_bytes
-                .checked_add(64 * 1024)
-                .expect("validated request bound plus tonic framing allowance must fit"),
             otlp: vala_bifrost_redux::gate::limits::OtlpWireLimits {
                 request_bytes: self.ingest_request_bytes,
-                resources: self.ingest_otlp_resources,
-                scopes: self.ingest_otlp_scopes,
-                records: self.ingest_otlp_records,
-                attributes: self.ingest_otlp_attributes,
-                value_bytes: self.ingest_otlp_value_bytes,
-                value_depth: self.ingest_otlp_value_depth,
+                value_depth: vala_bifrost_redux::gate::limits::BIFROST_OTLP_VALUE_DEPTH_LIMIT,
                 time_partitions: self.ingest_time_partitions,
             },
-            native_fields: self.ingest_native_fields,
-            native_sources: self.ingest_native_sources,
-            rows: self.ingest_rows,
             wal_workspace_bytes: self.ingest_wal_workspace_bytes,
         }
     }
@@ -1728,6 +1629,40 @@ impl Default for MetricsConfig {
         Self {
             enabled: default_metrics_enabled(),
             bind: None,
+        }
+    }
+}
+
+/// Verification runtime configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationConfig {
+    /// Whether an API-serving process runs the verification runtime.
+    ///
+    /// Defaults to true; the scheduler and runner coordinate through the
+    /// durable queue, so every replica may run them.
+    #[serde(default = "default_verification_enabled")]
+    pub enabled: bool,
+    /// Scribe-bearing gRPC endpoint Verifier results are published through.
+    ///
+    /// When unset, a process that hosts a Scribe and serves plaintext gRPC
+    /// publishes through its own listener; any other process runs no Verifier
+    /// runner until this is set.
+    #[serde(default)]
+    pub ingest_endpoint: Option<String>,
+}
+
+/// Serde default for [`VerificationConfig::enabled`].
+fn default_verification_enabled() -> bool {
+    true
+}
+
+impl Default for VerificationConfig {
+    /// The runtime is enabled and publishes through the local Scribe.
+    fn default() -> Self {
+        Self {
+            enabled: default_verification_enabled(),
+            ingest_endpoint: None,
         }
     }
 }
@@ -1817,6 +1752,12 @@ pub struct WyrdServerConfig {
     /// Workload identity bindings for this deployment.
     #[serde(default)]
     pub workload_bindings: Vec<WorkloadBindingEntry>,
+    /// Verification runtime configuration.
+    #[serde(default)]
+    pub verification: VerificationConfig,
+    /// Operator-owned gateway credential sources.
+    #[serde(default)]
+    pub gateway: GatewayConfig,
 }
 
 impl WyrdServerConfig {
@@ -1881,6 +1822,14 @@ pub struct LimitsConfig {
     /// worst-case process memory is `body_bytes × concurrency`.
     #[serde(default = "default_body_bytes")]
     pub body_bytes: usize,
+    /// Maximum Audio transcription or translation upload in bytes.
+    ///
+    /// These uploads bypass `body_bytes` buffering: file parts spool to
+    /// anonymous temporary files as they arrive, so memory stays bounded by
+    /// one chunk plus small text members while disk holds at most this many
+    /// bytes per upload.
+    #[serde(default = "default_audio_upload_bytes")]
+    pub audio_upload_bytes: usize,
     /// Per-request processing timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -1895,6 +1844,7 @@ impl LimitsConfig {
     pub fn into_state(self) -> crate::state::LimitsConfig {
         crate::state::LimitsConfig {
             body_bytes: self.body_bytes,
+            audio_upload_bytes: self.audio_upload_bytes,
             timeout: Duration::from_millis(self.timeout_ms),
             concurrency: self.concurrency,
         }
@@ -1906,6 +1856,10 @@ impl LimitsConfig {
 #[serde(deny_unknown_fields)]
 pub struct ShutdownConfig {
     /// Time in milliseconds to wait for in-flight requests to drain.
+    ///
+    /// The verification runtime drains inside this budget, one second short
+    /// of it, so a value below 31 seconds shortens its 30-second in-flight
+    /// drain.
     #[serde(default = "default_shutdown_drain_ms")]
     pub drain_ms: u64,
 }
@@ -2072,6 +2026,300 @@ pub struct WorkloadBindingEntry {
     pub version: String,
 }
 
+/// `[gateway]` operator configuration for tenant provider credentials.
+///
+/// Tenants name only what the operator declares here: an `Environment`
+/// credential selects a binding key, never a raw variable or path, and an
+/// `ExternalSecret` credential selects a declared Vault backend and a path
+/// inside one of its assigned prefixes. Every binding and prefix is assigned
+/// to exactly one tenant and provider.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayConfig {
+    /// Named bindings, each an environment variable or mounted secret file.
+    #[serde(default)]
+    pub credential_bindings: BTreeMap<CredentialBindingName, GatewayCredentialBinding>,
+    /// Vault KV v2 backends tenants may reference.
+    #[serde(default)]
+    pub secret_backends: BTreeMap<SecretBackendName, VaultBackendConfig>,
+    /// Independently configured managed-secret keyring of each tenant.
+    ///
+    /// A tenant without an entry cannot submit or resolve a ManagedSecret; it
+    /// can still use the operator-owned Environment and ExternalSecret
+    /// sources.
+    #[serde(default)]
+    pub managed_secret_keys: BTreeMap<DataTenantId, GatewayManagedSecretKeys>,
+}
+
+/// One tenant's versioned managed-secret keyring as the operator declares it.
+///
+/// `active` seals new and replaced values. Every version listed here is
+/// distributed to every replica serving the tenant, so an envelope sealed by
+/// one replica opens on any other. Removing a version is safe only once no
+/// stored envelope still records it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayManagedSecretKeys {
+    /// Version name that seals new and replaced values.
+    pub active: String,
+    /// Every distributed version, each a standard-base64 32-byte key held in
+    /// the existing environment or mounted-file secret reference.
+    pub versions: BTreeMap<String, SecretRef>,
+}
+
+/// One operator Environment binding and its assignment.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayCredentialBinding {
+    /// Environment variable or mounted-file source of the credential.
+    pub secret: SecretRef,
+    /// Tenant, provider, and optional compatible host allowed to use it.
+    pub assignment: CredentialAssignment,
+}
+
+/// One operator-declared Vault KV v2 backend.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultBackendConfig {
+    /// Vault base address; `https` is required in production.
+    pub address: Url,
+    /// KV v2 mount path; never tenant input.
+    pub mount: String,
+    /// Environment or mounted-file token source, re-read on every resolution.
+    pub token: SecretRef,
+    /// Optional Vault namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Optional environment or mounted-file PEM bundle replacing platform
+    /// trust roots.
+    #[serde(default)]
+    pub ca_cert: Option<SecretRef>,
+    /// Assigned path prefixes; a referenced path must fall within one.
+    #[serde(default)]
+    pub paths: BTreeMap<String, CredentialAssignment>,
+}
+
+impl GatewayConfig {
+    /// Rejects invalid bindings and backends so the server fails boot.
+    ///
+    /// Secrets must be non-empty env or file references; backend addresses
+    /// must be base URLs using `https` (or `http` outside production); mounts
+    /// and prefixes must satisfy the Vault path grammar; and no assigned
+    /// prefix may contain another, so each path has one owner.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the first invalid member.
+    fn validate(&self, production: bool) -> Result<(), ConfigError> {
+        let invalid = |field: String, reason: &str| ConfigError::Invalid {
+            message: format!("{field} {reason}"),
+        };
+        for (name, binding) in &self.credential_bindings {
+            if !local_secret(&binding.secret) {
+                return Err(invalid(
+                    format!("gateway.credential_bindings.{name}.secret"),
+                    "must be a non-empty env or file secret reference",
+                ));
+            }
+        }
+        for (tenant, keyring) in &self.managed_secret_keys {
+            let field = |member: &str| format!("gateway.managed_secret_keys.{tenant}.{member}");
+            if !keyring.versions.contains_key(&keyring.active) {
+                return Err(invalid(
+                    field("active"),
+                    "must name a version present in this tenant's versions map",
+                ));
+            }
+            for (version, secret) in &keyring.versions {
+                if version.is_empty() || !local_secret(secret) {
+                    return Err(invalid(
+                        field(&format!("versions.{version}")),
+                        "must be a named, non-empty env or file secret reference",
+                    ));
+                }
+            }
+        }
+        for (name, backend) in &self.secret_backends {
+            let field = |member: &str| format!("gateway.secret_backends.{name}.{member}");
+            let scheme = backend.address.scheme();
+            if backend.address.cannot_be_a_base()
+                || !(scheme == "https" || (scheme == "http" && !production))
+            {
+                return Err(invalid(
+                    field("address"),
+                    "must be an https base URL (http only outside production)",
+                ));
+            }
+            if !ExternalSecretReference::is_valid_path(&backend.mount) {
+                return Err(invalid(field("mount"), "must be a valid Vault path"));
+            }
+            if !local_secret(&backend.token)
+                || backend.ca_cert.as_ref().is_some_and(|ca| !local_secret(ca))
+            {
+                return Err(invalid(
+                    field("token"),
+                    "and ca_cert must be non-empty env or file secret references",
+                ));
+            }
+            for prefix in backend.paths.keys() {
+                let overlaps = backend
+                    .paths
+                    .keys()
+                    .any(|other| other != prefix && within(other, prefix));
+                if !ExternalSecretReference::is_valid_path(prefix) || overlaps {
+                    return Err(invalid(
+                        field(&format!("paths.{prefix}")),
+                        "must be a valid Vault path that contains no other assigned prefix",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads every configured tenant keyring into process memory.
+    ///
+    /// Each version's base64 value is read once from its environment variable
+    /// or mounted file and must decode to exactly 32 key bytes. Key material
+    /// is never persisted and never leaves this process. The load also proves
+    /// tenant isolation: two tenants sharing one key would make one process
+    /// wrapping key out of per-tenant configuration, so that fails boot.
+    ///
+    /// A mounted file carries tenant wrapping authority, so it is read through
+    /// [`read_secret_file`] under the same open-handle, regular-file,
+    /// owner-only, bounded rule the request path applies to an operator
+    /// binding: a `0644` mount is refused here rather than accepted.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] naming the tenant and version whose
+    /// key is unreadable, not a regular owner-only file, larger than one
+    /// secret, not standard base64, not 32 bytes, incomplete, or shared with
+    /// another tenant. The message names no key material and no other tenant.
+    pub fn managed_secret_keys(&self) -> Result<ManagedSecretKeys, ConfigError> {
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut keyrings = BTreeMap::new();
+        for (tenant, configured) in &self.managed_secret_keys {
+            let invalid = |version: &str, reason: &str| ConfigError::Invalid {
+                message: format!(
+                    "gateway.managed_secret_keys.{tenant}.versions.{version} {reason}"
+                ),
+            };
+            let mut versions = BTreeMap::new();
+            for (version, secret) in &configured.versions {
+                let encoded = match secret {
+                    SecretRef::Env { name } => env::var(name)
+                        .map_err(|_| invalid(version, "names an unset environment variable"))?,
+                    SecretRef::File { path } => read_secret_file(Path::new(path))
+                        .map_err(|reason| invalid(version, reason))?,
+                    _ => return Err(invalid(version, "must be an env or file secret reference")),
+                };
+                let bytes: [u8; 32] = BASE64_STANDARD
+                    .decode(encoded.trim())
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        invalid(version, "must be standard base64 of exactly 32 key bytes")
+                    })?;
+                if !seen.insert(bytes) {
+                    return Err(invalid(
+                        version,
+                        "repeats key material already assigned to another tenant or version; \
+                         each tenant needs independent key authority",
+                    ));
+                }
+                versions.insert(version.clone(), SecretKey::from_bytes(bytes));
+            }
+            let keyring = TenantKeyring::new(configured.active.clone(), versions)
+                .map_err(|_| invalid(&configured.active, "is not a distributed version"))?;
+            keyrings.insert(*tenant, keyring);
+        }
+        Ok(ManagedSecretKeys::new(keyrings))
+    }
+
+    /// Operator assignment covering a credential source, if any.
+    ///
+    /// A binding carries its own assignment; a Vault reference is covered by
+    /// the single assigned prefix of its backend that contains its path.
+    #[must_use]
+    pub fn assignment(
+        &self,
+        source: &ProviderCredentialSourceView,
+    ) -> Option<&CredentialAssignment> {
+        match source {
+            ProviderCredentialSourceView::Environment { binding } => self
+                .credential_bindings
+                .get(binding)
+                .map(|binding| &binding.assignment),
+            ProviderCredentialSourceView::ExternalSecret { backend, reference } => self
+                .secret_backends
+                .get(backend)?
+                .paths
+                .iter()
+                .find(|(prefix, _)| within(reference.path(), prefix))
+                .map(|(_, assignment)| assignment),
+            // A managed secret has no operator binding or path: its authority
+            // is the submitting tenant's own keyring.
+            ProviderCredentialSourceView::ManagedSecret => None,
+        }
+    }
+
+    /// Builds the runtime credential resolver over every declared backend and
+    /// the already-loaded tenant keyrings.
+    ///
+    /// Reads each backend's CA bundle once; tokens are read per resolution.
+    /// `keys` is shared with gateway administration so sealing and opening use
+    /// one loaded keyring set.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when a CA bundle is unreadable or does
+    /// not parse, or a backend client cannot be built.
+    pub fn credential_resolver(
+        &self,
+        keys: Arc<ManagedSecretKeys>,
+    ) -> Result<CredentialResolver, ConfigError> {
+        self.secret_backends
+            .iter()
+            .map(|(name, backend)| {
+                let failed = || ConfigError::Invalid {
+                    message: format!(
+                        "gateway.secret_backends.{name}.ca_cert must be a readable PEM bundle"
+                    ),
+                };
+                let ca_cert = match &backend.ca_cert {
+                    Some(SecretRef::Env { name }) => {
+                        Some(env::var(name).map_err(|_| failed())?.into_bytes())
+                    }
+                    Some(SecretRef::File { path }) => {
+                        Some(std::fs::read(path).map_err(|_| failed())?)
+                    }
+                    Some(_) => return Err(failed()),
+                    None => None,
+                };
+                let vault = VaultBackend::new(
+                    backend.address.clone(),
+                    backend.mount.clone(),
+                    backend.token.clone(),
+                    backend.namespace.clone(),
+                    ca_cert.as_deref(),
+                )
+                .map_err(|_| failed())?;
+                Ok((name.clone(), vault))
+            })
+            .collect::<Result<_, _>>()
+            .map(|backends| CredentialResolver::new(backends, keys))
+    }
+}
+
+/// Whether `source` is a structurally valid env or file reference.
+fn local_secret(source: &SecretRef) -> bool {
+    matches!(source, SecretRef::Env { .. } | SecretRef::File { .. }) && source.validate().is_ok()
+}
+
+/// Whether Vault `path` equals `prefix` or lies beneath it segment-wise.
+fn within(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Default helpers (private)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2100,6 +2348,11 @@ fn default_body_bytes() -> usize {
     1_048_576
 }
 
+/// Default Audio upload bound: the `OpenAI` Audio per-file maximum, 25 MiB.
+fn default_audio_upload_bytes() -> usize {
+    26_214_400
+}
+
 fn default_timeout_ms() -> u64 {
     30_000
 }
@@ -2108,8 +2361,13 @@ fn default_concurrency() -> usize {
     1_024
 }
 
+/// Serde default for [`ShutdownConfig::drain_ms`].
+///
+/// Thirty-five seconds: the verification runtime's full 30-second in-flight
+/// drain plus the second it reserves for releasing leases, with headroom for
+/// the rest of teardown.
 fn default_shutdown_drain_ms() -> u64 {
-    15_000
+    35_000
 }
 
 fn default_readiness_tick_ms() -> u64 {
@@ -2156,6 +2414,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             body_bytes: default_body_bytes(),
+            audio_upload_bytes: default_audio_upload_bytes(),
             timeout_ms: default_timeout_ms(),
             concurrency: default_concurrency(),
         }
@@ -2302,6 +2561,41 @@ impl WyrdServerConfig {
             "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
             self.bifrost.resources.forge_compaction_memory_limit_bytes,
         )?;
+        self.forge.target_file_size_bytes = parse_optional_env(
+            "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
+            self.forge.target_file_size_bytes,
+        )?;
+        self.bifrost.oracle.max_queue_wait_ms = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS",
+            Some(self.bifrost.oracle.max_queue_wait_ms),
+        )?
+        .unwrap_or(self.bifrost.oracle.max_queue_wait_ms);
+        self.bifrost.oracle.default_query_deadline_ms = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS",
+            Some(self.bifrost.oracle.default_query_deadline_ms),
+        )?
+        .unwrap_or(self.bifrost.oracle.default_query_deadline_ms);
+        let scribe = &mut self.bifrost.scribe;
+        scribe.mem_table_bucket_num = parse_optional_env(
+            "WYRD_MEM_TABLE_BUCKET_NUM",
+            Some(scribe.mem_table_bucket_num),
+        )?
+        .unwrap_or(scribe.mem_table_bucket_num);
+        scribe.max_file_size_on_disk = parse_optional_env(
+            "WYRD_MAX_FILE_SIZE_ON_DISK",
+            Some(scribe.max_file_size_on_disk),
+        )?
+        .unwrap_or(scribe.max_file_size_on_disk);
+        scribe.max_file_size_in_memory = parse_optional_env(
+            "WYRD_MAX_FILE_SIZE_IN_MEMORY",
+            Some(scribe.max_file_size_in_memory),
+        )?
+        .unwrap_or(scribe.max_file_size_in_memory);
+        scribe.max_file_retention_time = parse_optional_env(
+            "WYRD_MAX_FILE_RETENTION_TIME",
+            Some(scribe.max_file_retention_time),
+        )?
+        .unwrap_or(scribe.max_file_retention_time);
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -2458,6 +2752,15 @@ impl WyrdServerConfig {
             })?;
         }
 
+        // limits.audio_upload_bytes
+        if let Some(val) = env_opt("WYRD_HTTP_AUDIO_UPLOAD_LIMIT_BYTES")? {
+            self.limits.audio_upload_bytes =
+                val.parse::<usize>().map_err(|e| ConfigError::BadEnvVar {
+                    key: "WYRD_HTTP_AUDIO_UPLOAD_LIMIT_BYTES".to_string(),
+                    message: e.to_string(),
+                })?;
+        }
+
         // limits.timeout_ms
         if let Some(val) = env_opt("WYRD_HTTP_REQUEST_TIMEOUT_MS")? {
             self.limits.timeout_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
@@ -2514,6 +2817,16 @@ impl WyrdServerConfig {
                 );
         }
 
+        // verification.enabled
+        if let Some(val) = env_opt("WYRD_VERIFICATION_ENABLED")? {
+            self.verification.enabled = parse_flag(&val, "WYRD_VERIFICATION_ENABLED")?;
+        }
+
+        // verification.ingest_endpoint
+        if let Some(val) = env_opt("WYRD_VERIFICATION_INGEST_ENDPOINT")? {
+            self.verification.ingest_endpoint = Some(val);
+        }
+
         // readiness.tick_ms
         if let Some(val) = env_opt("WYRD_READINESS_TICK_MS")? {
             self.readiness.tick_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
@@ -2558,10 +2871,17 @@ impl WyrdServerConfig {
     /// # Errors
     /// Returns [`ConfigError`] for any violated constraint.
     fn validate(&self) -> Result<(), ConfigError> {
+        self.gateway
+            .validate(self.deployment_profile.is_production())?;
         let serves_api = self.role.serves_api();
         if self.forge.per_tenant_active_cap == Some(0) {
             return Err(ConfigError::Invalid {
                 message: "forge.per_tenant_active_cap must be positive".to_owned(),
+            });
+        }
+        if self.forge.target_file_size_bytes == Some(0) {
+            return Err(ConfigError::Invalid {
+                message: "forge.target_file_size_bytes must be positive".to_owned(),
             });
         }
         if serves_api {
@@ -2570,9 +2890,12 @@ impl WyrdServerConfig {
                     message: "bifrost.oracle.max_workers_per_query must be at most 63".to_owned(),
                 });
             }
-            if self.bifrost.oracle.planning_permits == 0
-                || self.bifrost.oracle.admission_waiters == 0
-                || self.bifrost.oracle.max_queue_wait_ms == 0
+            // Both time limits share the caller `deadline_ms` range, so every
+            // configured value is one a deadline can represent.
+            let representable_ms = 1..=u64::from(u32::MAX);
+            if self.bifrost.oracle.admission_waiters == 0
+                || !representable_ms.contains(&self.bifrost.oracle.max_queue_wait_ms)
+                || !representable_ms.contains(&self.bifrost.oracle.default_query_deadline_ms)
                 || self.bifrost.oracle.max_frame_bytes == 0
             {
                 return Err(ConfigError::Invalid {
@@ -2670,6 +2993,16 @@ impl WyrdServerConfig {
                     message: format!(
                         "limits.body_bytes must be >= 1048576 (1 MiB), got {}",
                         self.limits.body_bytes
+                    ),
+                });
+            }
+
+            // 4a. limits.audio_upload_bytes >= 1 MiB
+            if self.limits.audio_upload_bytes < 1_048_576 {
+                return Err(ConfigError::Invalid {
+                    message: format!(
+                        "limits.audio_upload_bytes must be >= 1048576 (1 MiB), got {}",
+                        self.limits.audio_upload_bytes
                     ),
                 });
             }
@@ -3096,6 +3429,7 @@ fn validate_otlp_endpoint(url_str: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Mutex;
 
     use super::*;
@@ -3160,7 +3494,7 @@ mod tests {
             ..WyrdServerConfig::default()
         };
         config.bifrost.scribe.coordination_threads = 0;
-        config.bifrost.oracle.planning_permits = 0;
+        config.bifrost.oracle.admission_waiters = 0;
         config.bifrost.oracle.calibration_profile = PathBuf::from("/\0malformed");
         config.grpc.certificate_chain_path = Some(PathBuf::from("certificate.pem"));
         config.http.bind = config.grpc.bind;
@@ -3334,6 +3668,81 @@ maintenance_interval_secs = 45
         assert_eq!(capped.resolved_per_tenant_active_cap(), 2);
     }
 
+    /// The Forge target and the Scribe shard and file settings take a
+    /// positive environment override over the file value, and a zero or
+    /// malformed value is refused at boot.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an override does not win, or a zero or malformed value is
+    /// accepted.
+    #[test]
+    fn file_target_environment_overrides_win_and_refuse_nonpositive_values() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let file = from_toml_str_with_dev_oracle_opt_in(
+            "[forge]\ntarget_file_size_bytes = 268435456\n\n[bifrost.scribe]\nmem_table_bucket_num = 2\nmax_file_size_on_disk = 128\nmax_file_size_in_memory = 64\nmax_file_retention_time = 30\n",
+        )
+        .expect("file targets parse");
+        assert_eq!(file.forge.target_file_size_bytes, Some(268_435_456));
+        let scribe = &file.bifrost.scribe;
+        assert_eq!(
+            (
+                scribe.mem_table_bucket_num,
+                scribe.max_file_size_on_disk,
+                scribe.max_file_size_in_memory,
+                scribe.max_file_retention_time,
+            ),
+            (2, 128, 64, 30)
+        );
+        temp_env::with_vars(
+            [
+                (
+                    "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
+                    Some("2147483648"),
+                ),
+                ("WYRD_MEM_TABLE_BUCKET_NUM", Some("8")),
+                ("WYRD_MAX_FILE_SIZE_ON_DISK", Some("256")),
+                ("WYRD_MAX_FILE_SIZE_IN_MEMORY", Some("32")),
+                ("WYRD_MAX_FILE_RETENTION_TIME", Some("60")),
+            ],
+            || {
+                let mut config = file.clone();
+                config.apply_env_overrides().expect("overrides apply");
+                assert_eq!(config.forge.target_file_size_bytes, Some(2_147_483_648));
+                let scribe = &config.bifrost.scribe;
+                assert_eq!(
+                    (
+                        scribe.mem_table_bucket_num,
+                        scribe.max_file_size_on_disk,
+                        scribe.max_file_size_in_memory,
+                        scribe.max_file_retention_time,
+                    ),
+                    (8, 256, 32, 60)
+                );
+                config.validate().expect("positive targets validate");
+            },
+        );
+        for key in [
+            "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
+            "WYRD_MEM_TABLE_BUCKET_NUM",
+            "WYRD_MAX_FILE_SIZE_ON_DISK",
+            "WYRD_MAX_FILE_SIZE_IN_MEMORY",
+            "WYRD_MAX_FILE_RETENTION_TIME",
+        ] {
+            temp_env::with_vars([(key, Some("0"))], || {
+                let mut config = file.clone();
+                config.apply_env_overrides().expect("zero parses as bytes");
+                assert!(config.validate().is_err(), "{key}=0 is refused at boot");
+            });
+            temp_env::with_vars([(key, Some("1GiB"))], || {
+                assert!(
+                    file.clone().apply_env_overrides().is_err(),
+                    "{key} must be a byte count"
+                );
+            });
+        }
+    }
+
     /// A zero `forge.per_tenant_active_cap` fails boot validation fail-closed.
     #[test]
     fn forge_zero_per_tenant_active_cap_is_rejected() {
@@ -3394,6 +3803,60 @@ maintenance_interval_secs = 45
         });
     }
 
+    /// Proves both query classes default to a 1,000-place queue, a one-hour
+    /// queue limit, and a two-hour total deadline; that both limits have
+    /// environment overrides; and that zero or unrepresentable limits fail.
+    #[test]
+    fn oracle_queue_and_deadline_limits_default_override_and_validate() {
+        let defaults = OracleRuntimeConfig::default();
+        assert_eq!(defaults.admission_waiters, 1_000);
+        assert_eq!(defaults.max_queue_wait_ms, 3_600_000);
+        assert_eq!(defaults.default_query_deadline_ms, 7_200_000);
+
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars(
+            [
+                ("WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS", Some("1500")),
+                (
+                    "WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS",
+                    Some("2500"),
+                ),
+            ],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config.apply_env_overrides().expect("valid overrides");
+                assert_eq!(config.bifrost.oracle.max_queue_wait_ms, 1_500);
+                assert_eq!(config.bifrost.oracle.default_query_deadline_ms, 2_500);
+            },
+        );
+        temp_env::with_vars(
+            [("WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS", Some("-1"))],
+            || {
+                assert!(matches!(
+                    WyrdServerConfig::default().apply_env_overrides(),
+                    Err(ConfigError::BadEnvVar { ref key, .. })
+                        if key == "WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS"
+                ));
+            },
+        );
+
+        for (queue_ms, total_ms) in [
+            (0, 7_200_000),
+            (3_600_000, 0),
+            (u64::from(u32::MAX) + 1, 7_200_000),
+            (3_600_000, u64::from(u32::MAX) + 1),
+        ] {
+            let mut config = WyrdServerConfig::default();
+            config.bifrost.oracle.allow_unapproved_profile = true;
+            config.bifrost.oracle.max_queue_wait_ms = queue_ms;
+            config.bifrost.oracle.default_query_deadline_ms = total_ms;
+            assert!(
+                config.validate().is_err(),
+                "queue {queue_ms} ms and total {total_ms} ms must be refused"
+            );
+        }
+    }
+
     /// Proves Oracle's protocol and allocation bounds fail closed.
     #[test]
     fn oracle_numeric_bounds_are_validated() {
@@ -3402,7 +3865,7 @@ maintenance_interval_secs = 45
         config.bifrost.oracle.max_workers_per_query = 64;
         assert!(config.validate().is_err());
         config.bifrost.oracle.max_workers_per_query = 2;
-        config.bifrost.oracle.planning_permits = 0;
+        config.bifrost.oracle.admission_waiters = 0;
         assert!(config.validate().is_err());
     }
 
@@ -3653,29 +4116,21 @@ minimum_slots = 2
     #[test]
     fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();
-        // Asserted as bounds rather than by restating the derivation: an
-        // assertion that recomputes the implementation expression can never
-        // fail, while these bounds are exactly the properties a wrong formula
-        // violates — never below the two-thread floor, never above the number
-        // of shard lanes the runtime has to host.
         assert!(
-            (2..=vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
-                .contains(&cfg.coordination_threads),
-            "coordination threads {} must stay within the shard-lane bounds",
+            cfg.coordination_threads >= 2,
+            "coordination threads {} must keep the two-thread floor",
             cfg.coordination_threads
         );
-        assert_eq!(cfg.wal_disk_limit_bytes, None);
         assert_eq!(
             cfg.ingest_request_bytes,
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
-        assert_eq!(cfg.wal_segment_bytes, 512 * 1024 * 1024);
-        assert_eq!(cfg.active_generation_budget_bytes, 8 * 1024 * 1024 * 1024);
-        assert_eq!(cfg.generation_rotation_ceiling_bytes, 512 * 1024 * 1024);
-        assert_eq!(cfg.generation_max_age_secs, 600);
+        assert_eq!(cfg.mem_table_bucket_num, 1);
+        assert_eq!(cfg.max_file_size_on_disk, 512);
+        assert_eq!(cfg.max_file_size_in_memory, 512);
+        assert_eq!(cfg.max_file_retention_time, 600);
         assert_eq!(cfg.seal_key_early_seal_bytes, None);
         assert_eq!(cfg.seal_key_max_age_secs, None);
-        assert_eq!(cfg.staging_target_file_size_bytes, 512 * 1024 * 1024);
         assert_eq!(
             cfg.ingest_limits(),
             vala_bifrost_redux::gate::limits::IngestLimits::default()
@@ -3683,42 +4138,53 @@ minimum_slots = 2
         cfg.validate().expect("resolved defaults must validate");
     }
 
-    /// One pod-wide budget derives every shard's rotation limit at boot.
+    /// The Scribe shard and file settings derive the geometry at boot.
     ///
     /// # Panics
     ///
-    /// Panics when the derived per-shard limit is not the minimum of the
-    /// ceiling and the evenly divided budget, when a geometry that cannot serve
-    /// is accepted, or when a per-`SealKey` control is allowed to fire after
-    /// its shard would already have rotated.
+    /// Panics when a setting does not reach its geometry field, when the
+    /// staging target is not the smaller of the on-disk size and Forge's
+    /// target, or when a per-`SealKey` control is allowed to fire after its
+    /// shard would already have rotated.
     #[test]
     fn scribe_geometry_is_derived_from_independent_configured_fields() {
+        const MIB: u64 = 1024 * 1024;
         let mut config = ScribeRuntimeConfig::default();
         let geometry = config
-            .scribe_geometry()
+            .scribe_geometry(1024 * MIB)
             .expect("the defaults form a coherent geometry");
-        assert_eq!(
-            geometry.shard_generation_rotation_bytes(),
-            512 * 1024 * 1024
-        );
-        assert_eq!(geometry.wal_segment_bytes(), 512 * 1024 * 1024);
-        assert_eq!(geometry.staging_target_file_size_bytes(), 512 * 1024 * 1024);
+        assert_eq!(geometry.shard_count(), 1);
+        assert_eq!(geometry.shard_generation_rotation_bytes(), 512 * MIB);
+        assert_eq!(geometry.wal_segment_bytes(), 512 * MIB);
+        assert_eq!(geometry.generation_max_age(), Duration::from_secs(600));
+        assert_eq!(geometry.staging_target_file_size_bytes(), 512 * MIB);
 
-        // Lowering only the pod-wide budget narrows every shard together and
-        // leaves the WAL segment and hot-object targets exactly where they were.
-        config.active_generation_budget_bytes = 1024 * 1024 * 1024;
+        // Staging assembles to the smaller of the on-disk size and Forge's
+        // target, whichever side is smaller.
+        assert_eq!(
+            config
+                .scribe_geometry(256 * MIB)
+                .expect("a smaller Forge target is coherent")
+                .staging_target_file_size_bytes(),
+            256 * MIB
+        );
+
+        // Each setting moves only its own geometry field.
+        config.mem_table_bucket_num = 4;
+        config.max_file_size_in_memory = 64;
         let narrowed = config
-            .scribe_geometry()
-            .expect("a smaller budget is still coherent");
-        assert_eq!(narrowed.shard_generation_rotation_bytes(), 64 * 1024 * 1024);
-        assert_eq!(narrowed.wal_segment_bytes(), 512 * 1024 * 1024);
-        assert_eq!(narrowed.staging_target_file_size_bytes(), 512 * 1024 * 1024);
+            .scribe_geometry(1024 * MIB)
+            .expect("a smaller memtable limit is still coherent");
+        assert_eq!(narrowed.shard_count(), 4);
+        assert_eq!(narrowed.shard_generation_rotation_bytes(), 64 * MIB);
+        assert_eq!(narrowed.wal_segment_bytes(), 512 * MIB);
+        assert_eq!(narrowed.staging_target_file_size_bytes(), 512 * MIB);
 
         // A per-key control may only seal earlier than the shard it belongs to.
         config.seal_key_early_seal_bytes = Some(65 * 1024 * 1024);
         let error = config
             .validate()
-            .expect_err("an early seal above the derived shard limit must be refused");
+            .expect_err("an early seal above the shard memtable limit must be refused");
         assert!(error.contains("seal_key_early_seal_bytes"), "{error}");
     }
 
@@ -3744,39 +4210,15 @@ minimum_slots = 2
         assert_rejected!(ingress_cpu_threads, 0);
         assert_rejected!(persistence_cpu_threads, 0);
         assert_rejected!(wal_io_threads, 0);
-        assert_rejected!(wal_disk_limit_bytes, Some(0));
-        assert_rejected!(wal_segment_bytes, 0);
-        assert_rejected!(active_generation_budget_bytes, 0);
-        assert_rejected!(generation_rotation_ceiling_bytes, 0);
-        assert_rejected!(generation_max_age_secs, 0);
-        assert_rejected!(staging_target_file_size_bytes, 0);
+        assert_rejected!(mem_table_bucket_num, 0);
+        assert_rejected!(max_file_size_on_disk, 0);
+        assert_rejected!(max_file_size_in_memory, 0);
+        assert_rejected!(max_file_retention_time, 0);
+        assert_rejected!(max_file_size_on_disk, u64::MAX);
+        assert_rejected!(max_file_size_in_memory, u64::MAX);
         assert_rejected!(ingest_request_bytes, 0);
-        assert_rejected!(ingest_native_fields, 0);
-        assert_rejected!(ingest_native_sources, 0);
-        assert_rejected!(ingest_rows, 0);
-        assert_rejected!(ingest_otlp_resources, 0);
-        assert_rejected!(ingest_otlp_scopes, 0);
-        assert_rejected!(ingest_otlp_records, 0);
-        assert_rejected!(ingest_otlp_attributes, 0);
-        assert_rejected!(ingest_otlp_value_bytes, 0);
-        assert_rejected!(ingest_otlp_value_depth, 0);
         assert_rejected!(ingest_time_partitions, 0);
         assert_rejected!(ingest_wal_workspace_bytes, 0);
-        assert_rejected!(ingest_native_fields, default_ingest_native_fields() + 1);
-        assert_rejected!(ingest_native_sources, default_ingest_native_sources() + 1);
-        assert_rejected!(ingest_rows, default_ingest_rows() + 1);
-        assert_rejected!(ingest_otlp_resources, default_ingest_otlp_resources() + 1);
-        assert_rejected!(ingest_otlp_scopes, default_ingest_otlp_scopes() + 1);
-        assert_rejected!(ingest_otlp_records, default_ingest_otlp_records() + 1);
-        assert_rejected!(ingest_otlp_attributes, default_ingest_otlp_attributes() + 1);
-        assert_rejected!(
-            ingest_otlp_value_bytes,
-            default_ingest_otlp_value_bytes() + 1
-        );
-        assert_rejected!(
-            ingest_otlp_value_depth,
-            default_ingest_otlp_value_depth() + 1
-        );
         assert_rejected!(ingest_time_partitions, default_ingest_time_partitions() + 1);
         assert_rejected!(
             ingest_wal_workspace_bytes,
@@ -3787,7 +4229,14 @@ minimum_slots = 2
         assert_rejected!(ingest_request_bytes, u32::MAX as usize + 1);
     }
 
-    /// Proves the 200 MiB request value is a default rather than a hard cap.
+    /// Proves the request value is a default rather than a hard cap, and that
+    /// it is frozen exactly — with no framing allowance — as the one wire
+    /// ceiling from which the 4x expanded ceiling derives.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a supported value fails validation or is not propagated
+    /// exactly.
     #[test]
     fn scribe_runtime_propagates_supported_request_above_default() {
         let request_bytes = default_ingest_request_bytes() + 1024 * 1024;
@@ -3801,8 +4250,14 @@ minimum_slots = 2
 
         let limits = config.ingest_limits();
         assert_eq!(limits.max_frame_bytes, request_bytes);
-        assert_eq!(limits.max_decoding_message_size, request_bytes + 64 * 1024);
         assert_eq!(limits.otlp.request_bytes, request_bytes);
+        assert_eq!(limits.expanded_bytes(), 4 * request_bytes);
+        assert_eq!(
+            ScribeRuntimeConfig::default()
+                .ingest_limits()
+                .expanded_bytes(),
+            64 * 1024 * 1024
+        );
     }
 
     /// Proves one lower operator limit is frozen into the shared Gate/Scribe snapshot.
@@ -3811,15 +4266,6 @@ minimum_slots = 2
     fn scribe_runtime_freezes_lower_ingest_limits() {
         let config = ScribeRuntimeConfig {
             ingest_request_bytes: 1024,
-            ingest_native_fields: 4,
-            ingest_native_sources: 2,
-            ingest_rows: 8,
-            ingest_otlp_resources: 2,
-            ingest_otlp_scopes: 3,
-            ingest_otlp_records: 8,
-            ingest_otlp_attributes: 16,
-            ingest_otlp_value_bytes: 512,
-            ingest_otlp_value_depth: 3,
             ingest_time_partitions: 2,
             ingest_wal_workspace_bytes: 256,
             ..ScribeRuntimeConfig::default()
@@ -3828,15 +4274,11 @@ minimum_slots = 2
 
         let frozen = config.ingest_limits();
         assert_eq!(frozen.max_frame_bytes, 1024);
-        assert_eq!(frozen.native_fields, 4);
-        assert_eq!(frozen.native_sources, 2);
-        assert_eq!(frozen.rows, 8);
-        assert_eq!(frozen.otlp.resources, 2);
-        assert_eq!(frozen.otlp.scopes, 3);
-        assert_eq!(frozen.otlp.records, 8);
-        assert_eq!(frozen.otlp.attributes, 16);
-        assert_eq!(frozen.otlp.value_bytes, 512);
-        assert_eq!(frozen.otlp.value_depth, 3);
+        assert_eq!(frozen.expanded_bytes(), 4096);
+        assert_eq!(
+            frozen.otlp.value_depth,
+            vala_bifrost_redux::gate::limits::BIFROST_OTLP_VALUE_DEPTH_LIMIT
+        );
         assert_eq!(frozen.otlp.time_partitions, 2);
         assert_eq!(frozen.wal_workspace_bytes, 256);
     }
@@ -4813,5 +5255,161 @@ minimum_slots = 2
                 .expect_err("class allocations exceeding usable slots must fail closed")
                 .contains("exceeds usable slots")
         );
+    }
+    /// Gateway operator config parses binding and Vault prefix assignments,
+    /// rejects production `http` addresses, overlapping prefixes, and
+    /// non-local tokens, and assigns Vault references by whole path segments.
+    #[test]
+    fn gateway_config_validates_backends_and_assigns_vault_prefixes() {
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let parse = |address: &str, second: &str, token: &str| {
+            toml::from_str::<GatewayConfig>(&format!(
+                r#"
+[credential_bindings.openai-env]
+secret = {{ source = "env", name = "OPENAI_KEY" }}
+assignment = {{ tenant = "{tenant}", provider = "openai" }}
+
+[secret_backends.vault]
+address = "{address}"
+mount = "kv/team"
+token = {token}
+
+[secret_backends.vault.paths.openai]
+tenant = "{tenant}"
+provider = "openai"
+
+[secret_backends.vault.paths."{second}"]
+tenant = "{tenant}"
+provider = "anthropic"
+"#
+            ))
+            .expect("gateway config parses")
+        };
+        let file_token = r#"{ source = "file", path = "/run/secrets/vault-token" }"#;
+        let config = parse("https://vault.example", "anthropic", file_token);
+        config.validate(true).expect("https config validates");
+        assert!(
+            parse("http://vault.example", "anthropic", file_token)
+                .validate(true)
+                .is_err()
+        );
+        parse("http://vault.example", "anthropic", file_token)
+            .validate(false)
+            .expect("http allowed outside production");
+        assert!(
+            parse("https://vault.example", "openai/team", file_token)
+                .validate(true)
+                .is_err()
+        );
+        assert!(
+            parse(
+                "https://vault.example",
+                "anthropic",
+                r#"{ source = "env", name = "" }"#
+            )
+            .validate(true)
+            .is_err()
+        );
+
+        let lookup = |reference: &str| {
+            config
+                .assignment(&ProviderCredentialSourceView::ExternalSecret {
+                    backend: SecretBackendName::new("vault").expect("backend"),
+                    reference: ExternalSecretReference::new(reference).expect("reference"),
+                })
+                .map(|assignment| assignment.provider.as_str().to_owned())
+        };
+        assert_eq!(lookup("openai#k").as_deref(), Some("openai"));
+        assert_eq!(lookup("openai/team#k").as_deref(), Some("openai"));
+        assert_eq!(lookup("openai-team#k"), None);
+        assert_eq!(lookup("other#k"), None);
+    }
+
+    /// Build a one-tenant, one-version keyring config reading `path`.
+    ///
+    /// The caller owns the file so it can set the mode, size, or kind each
+    /// case needs; only the `SecretRef::File` wiring lives here.
+    fn file_backed_keyring(path: &Path) -> GatewayConfig {
+        GatewayConfig {
+            managed_secret_keys: BTreeMap::from([(
+                DataTenantId::new_v7(),
+                GatewayManagedSecretKeys {
+                    active: "v1".to_owned(),
+                    versions: BTreeMap::from([(
+                        "v1".to_owned(),
+                        SecretRef::File {
+                            path: path.display().to_string(),
+                        },
+                    )]),
+                },
+            )]),
+            ..GatewayConfig::default()
+        }
+    }
+
+    /// Write `contents` to `path` with Unix mode `mode`.
+    ///
+    /// # Panics
+    /// Panics when the file cannot be created, written, or chmodded.
+    fn write_key_file(path: &Path, contents: &str, mode: u32) {
+        std::fs::write(path, contents).expect("key file writes");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("key file mode applies");
+    }
+
+    /// A mounted tenant wrapping key loads only from an owner-only regular file.
+    ///
+    /// The file carries authority over every stored provider secret for its
+    /// tenant, so boot applies the same open-handle, regular-file, owner-only,
+    /// bounded rule the request path applies to an operator binding. A `0644`
+    /// mount is the common misconfiguration and must be refused, and no
+    /// refusal may quote the key.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the temporary directory or a key file cannot be written,
+    /// when the owner-only mount is refused, when a permissive, non-regular,
+    /// or oversized mount is accepted or refused with anything other than a
+    /// member-naming `ConfigError::Invalid`, or when a refusal quotes the key.
+    #[test]
+    fn mounted_tenant_keys_require_a_restrictive_regular_bounded_file() {
+        const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let directory = tempfile::tempdir().expect("key temp directory");
+
+        let owner_only = directory.path().join("owner-only.key");
+        write_key_file(&owner_only, KEY, 0o600);
+        assert!(
+            file_backed_keyring(&owner_only)
+                .managed_secret_keys()
+                .is_ok(),
+            "an owner-only regular file is the supported mount"
+        );
+
+        let permissive = directory.path().join("permissive.key");
+        write_key_file(&permissive, KEY, 0o644);
+
+        let oversized = directory.path().join("oversized.key");
+        write_key_file(&oversized, &KEY.repeat(4096), 0o600);
+
+        for (case, path) in [
+            ("permissive", permissive.as_path()),
+            ("non-regular", directory.path()),
+            ("oversized", oversized.as_path()),
+        ] {
+            let error = file_backed_keyring(path)
+                .managed_secret_keys()
+                .expect_err(case);
+            let ConfigError::Invalid { message } = error else {
+                panic!("{case} refusal is an invalid-configuration error");
+            };
+            assert!(
+                message.starts_with("gateway.managed_secret_keys."),
+                "{case} refusal names the configuration member: {message}"
+            );
+            assert!(
+                !message.contains(KEY) && !message.contains(&KEY[..8]),
+                "{case} refusal quotes key material: {message}"
+            );
+        }
     }
 }

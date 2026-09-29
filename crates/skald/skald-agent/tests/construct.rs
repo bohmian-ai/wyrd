@@ -314,7 +314,7 @@ fn unknown_runtime_local_tool_uses_wyrd_code() {
             prompt: InlineableRef::Inline(Box::new(prompt())),
             tool_names: vec!["missing_tool".to_owned()],
             run_config: AgentRunConfigSpec::default(),
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         },
         cascade_children: Vec::new(),
         created_at: chrono::Utc::now(),

@@ -1,15 +1,14 @@
-//! Server-hosted eval pull-protocol wire shapes.
+//! Local eval orchestrator turn types.
 //!
-//! All orchestration logic lives in the server-side eval orchestrator. The
-//! client owns one thing: executing the agent under test for one turn, and in
-//! [`SimulatedUserMode::Client`], generating the next user message. Everything
-//! else, including scenario loading, turn cursor, conversation history,
-//! simulated-user generation, judge invocation, scoring, aggregation, and
-//! comparison, stays server-side.
+//! The eval orchestrator in `vala-eval` runs entirely in-process: it owns
+//! scenario loading, the turn cursor, conversation history, simulated-user
+//! generation, judge invocation, scoring, and aggregation. These types are the
+//! shapes it hands to and takes back from the agent under test for one turn.
+//! There is no server-hosted pull protocol and no lease.
 //!
-//! The protocol carries history explicitly on each
-//! [`TurnDirective::AgentTurn`] payload; there is no implicit propagation.
-//! Trace-side correlation does not appear in this module.
+//! History is carried explicitly on each [`TurnDirective::AgentTurn`] payload;
+//! there is no implicit propagation. Trace-side correlation does not appear in
+//! this module.
 //!
 //! Wire-shape examples for [`TurnDirective`]:
 //!
@@ -32,9 +31,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::reference::CardRef;
-
-use super::ids::{LeaseToken, RunId, ScenarioId};
+use super::ids::ScenarioId;
 use super::record::EvalRecordObservation;
 
 /// Maximum conversation history entries carried on a single [`TurnDirective`].
@@ -44,32 +41,6 @@ use super::record::EvalRecordObservation;
 /// submission. The cap is therefore `MAX_TURNS_HARD_CAP * 2` so that a
 /// scenario running the full 256-turn limit never triggers the guard.
 pub const MAX_HISTORY_TURNS: usize = super::scenario::MAX_TURNS_HARD_CAP as usize * 2;
-
-/// Client request to open and lease a new eval run against `eval_ref`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct EvalRunOpenRequest {
-    /// Reference to the Eval card under evaluation.
-    pub eval_ref: CardRef,
-    /// Who generates non-scripted user turns.
-    pub simulated_user: SimulatedUserMode,
-}
-
-/// Server response to a successful [`EvalRunOpenRequest`].
-///
-/// `run_id` is the existing core [`RunId`]. An eval execution is a `Run` of
-/// the referenced Eval card under the Card/Spec/Run/Observation ontology, so no
-/// eval-specific run-id noun is introduced.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct EvalRunOpenResponse {
-    /// Server-generated handle for the leased eval run.
-    pub run_id: RunId,
-    /// Opaque lease the client returns on every subsequent call.
-    pub lease_token: LeaseToken,
-}
 
 /// Selects who supplies the next user message when the next turn is not
 /// already scripted via `EvalScenario.predefined_turns`.
@@ -152,8 +123,12 @@ pub enum TurnRole {
 }
 
 /// Client reply to [`TurnDirective::AgentTurn`].
+///
+/// In-process only, like the rest of this module: the orchestrator hands the
+/// directive to the agent under test and takes this back. It carries
+/// [`EvalRecordObservation`], which is an ingest-path record rather than an
+/// HTTP body, so this type declares no `utoipa` projection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AgentTurnSubmission {
     /// Scenario that produced the directive being answered.

@@ -13,6 +13,7 @@ use wyrd_queue::{
     SealedBatchSender, WyrdQueueError,
 };
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::bifrost::scope::{ClientScope, SinkKind};
@@ -70,6 +71,9 @@ pub struct BifrostMetrics {
     pub retry_entries: usize,
     /// Flush or shutdown controls currently occupying producer command slots.
     pub pending_controls: usize,
+    /// Lifetime rows every pooled producer refused at admission or discarded
+    /// after terminal publication failure, including exhausted retries.
+    pub dropped_rows: u64,
 }
 
 impl WriterPool {
@@ -151,7 +155,17 @@ impl WriterPool {
                 .values()
                 .filter(|producer| producer.has_pending_control())
                 .count(),
+            dropped_rows: producers
+                .values()
+                .map(|producer| producer.metrics().dropped)
+                .sum(),
         }
+    }
+
+    /// Registers the observer told the row count of every loss this handle's
+    /// producers settle; see [`ClientByteBudget::observe_losses`].
+    pub(crate) fn observe_losses(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
+        self.budget.observe_losses(observer);
     }
 
     /// Enqueue one row, **propagating** queue-full.
@@ -183,6 +197,29 @@ impl WriterPool {
     ) -> Result<(), WyrdQueueError> {
         self.producer_for(table, schema)?
             .enqueue(json, card_ref, run_id)
+    }
+
+    /// Enqueue one owned Arrow batch for `table` without awaiting publication.
+    ///
+    /// The batch shares the table's pooled producer, byte budget, and sink with
+    /// JSON rows, but the producer seals it alone under its own stable batch
+    /// identity and the originating `request_id`, if any. Durability follows the producer lifecycle: the batch is
+    /// durable only after the background owner, [`Self::flush`], or
+    /// [`Self::shutdown`] settles it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::QueueFull`] when the pool has closed or the
+    /// producer channel is full, and [`WyrdQueueError::Backpressure`] when the
+    /// producer ceiling or handle byte budget cannot admit the batch.
+    pub(crate) fn enqueue_batch(
+        &self,
+        table: &str,
+        batch: RecordBatch,
+        request_id: Option<RequestId>,
+    ) -> Result<(), WyrdQueueError> {
+        self.producer_for(table, batch.schema_ref())?
+            .enqueue_batch(batch, request_id)
     }
 
     /// Send one caller-built Arrow batch as its own durable batch.

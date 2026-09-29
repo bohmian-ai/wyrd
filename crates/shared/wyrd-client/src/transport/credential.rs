@@ -7,12 +7,48 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_spec::auth::TokenAudience;
+use wyrd_spec::auth::{SecretBearer, TokenAudience};
 use wyrd_utils::config_dir::wyrd_config_dir;
 
 use crate::auth::AuthMiddleware;
 use crate::error::WyrdClientError;
+
+/// One access token minted in-process, with the instant the server stops
+/// accepting it.
+///
+/// `Debug` is redacted through [`SecretBearer`].
+#[derive(Debug)]
+pub struct MintedAccessToken {
+    /// Minted bearer presented on every authenticated request.
+    pub access_token: SecretBearer,
+    /// Expiry the middleware refreshes ahead of by its fixed skew.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// In-process minter of short-lived access tokens for one fixed identity.
+///
+/// An embedding server that signs its own tokens has no durable secret to
+/// exchange, so it supplies this instead. [`AuthMiddleware`] caches,
+/// proactively refreshes, single-flights, and force-refreshes minted tokens
+/// through the same gate as exchanged ones; the source only mints.
+///
+/// [`AuthMiddleware`]: crate::auth::AuthMiddleware
+pub trait AccessTokenSource: Send + Sync {
+    /// Stable, non-secret name of the identity every minted token binds.
+    ///
+    /// Client-side pooling keys on it, so sources minting for different
+    /// principals or tenants never share a producer.
+    fn identity(&self) -> &str;
+
+    /// Mints one fresh access token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WyrdClientError`] when the token cannot be minted.
+    fn mint(&self) -> Result<MintedAccessToken, WyrdClientError>;
+}
 
 /// A resolved credential ready to attach to an outbound request.
 ///
@@ -20,6 +56,9 @@ use crate::error::WyrdClientError;
 /// value to read them.  `Debug` is redacted — no raw key or token leaks.
 #[derive(Clone)]
 pub enum ResolvedCredential {
+    /// An in-process source minting short-lived access tokens, cached and
+    /// refreshed by the middleware and never persisted.
+    Renewable(Arc<dyn AccessTokenSource>),
     /// A Wyrd access token (`Bearer <token>`).
     BearerToken(SecretString),
     /// A platform workload JWT to exchange via the `jwt_bearer` grant.
@@ -55,6 +94,10 @@ impl std::fmt::Debug for ResolvedCredential {
     /// only non-secret routing fields (tenant slug, audience) are shown.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Renewable(source) => f
+                .debug_struct("Renewable")
+                .field("identity", &source.identity())
+                .finish(),
             Self::BearerToken(_) => f.debug_tuple("BearerToken").field(&"[REDACTED]").finish(),
             Self::WorkloadJwt { tenant, .. } => f
                 .debug_struct("WorkloadJwt")

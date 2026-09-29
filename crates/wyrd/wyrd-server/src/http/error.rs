@@ -114,6 +114,9 @@ pub fn wyrd_error_response_from_parts(
                 error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
             }
             | WyrdError::Vala {
+                error: wyrd_spec::vala::error::BifrostError::QueryQueueFull,
+            }
+            | WyrdError::Vala {
                 error: wyrd_spec::vala::error::BifrostError::IngestBusy { .. },
             }
     );
@@ -434,17 +437,19 @@ mod error_mapper_tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1")
         );
-        let capacity = WyrdErrorResponse::from(WyrdError::from(
+        for capacity in [
             wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
-        ))
-        .into_response();
-        assert_eq!(
-            capacity
-                .headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .and_then(|value| value.to_str().ok()),
-            Some("1")
-        );
+            wyrd_spec::vala::error::BifrostError::QueryQueueFull,
+        ] {
+            let capacity = WyrdErrorResponse::from(WyrdError::from(capacity)).into_response();
+            assert_eq!(
+                capacity
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("1")
+            );
+        }
 
         for error in [
             WyrdError::AuditUnavailable {

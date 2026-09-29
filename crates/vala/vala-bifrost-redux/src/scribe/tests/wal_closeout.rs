@@ -379,7 +379,7 @@ async fn scribe_invalid_rejection_emits_exact_owner_reason() {
         DataTenantId::new_v7(),
         "invalid",
         Uuid::now_v7(),
-        crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES + 1,
+        crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES + 1,
     )
     .await
     .expect_err("oversized request rejects append");
@@ -521,7 +521,7 @@ async fn sync_failure_has_no_ack_or_memtable_visibility() {
     let stats = scribe.memtable_stats().expect("memtable stats");
     assert_eq!(stats.writable_rows + stats.immutable_rows, 0);
     assert!(
-        wal.bytes_on_disk() > 0,
+        crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()) > 0,
         "record was written before sync failed"
     );
     assert_ingress_owners_settled(&scribe);
@@ -600,12 +600,15 @@ async fn contradictory_batch_retry_is_rejected_before_second_wal_append() {
     ingest_value(&scribe, tenant, "contradictory_retry", batch_id, 7)
         .await
         .expect("first append");
-    let wal_bytes_before = wal.bytes_on_disk();
+    let wal_bytes_before = crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir());
     let error = ingest_value(&scribe, tenant, "contradictory_retry", batch_id, 8)
         .await
         .expect_err("contradictory retry must not acknowledge");
     assert!(error.to_string().contains("contradictory payload identity"));
-    assert_eq!(wal.bytes_on_disk(), wal_bytes_before);
+    assert_eq!(
+        crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()),
+        wal_bytes_before
+    );
     assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 1);
     assert_ingress_owners_settled(&scribe);
 
@@ -655,8 +658,10 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
 }
 
 #[test]
-/// Root-issued Scribe and WAL hard limits reject before any WAL mutation.
-fn scribe_root_and_wal_hard_limits_reject_before_append() {
+/// The root-issued Scribe memory limit refuses one byte past its ceiling.
+///
+/// WAL volume refusal is proven by `wal::tests::wal_capacity_refusal_is_not_sticky`.
+fn scribe_root_memory_limit_refuses_past_its_ceiling() {
     let resources =
         crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
     let limit = resources.limit_bytes();
@@ -669,18 +674,4 @@ fn scribe_root_and_wal_hard_limits_reject_before_append() {
             .is_err()
     );
     drop(scribe);
-
-    let wal_root = tempfile::tempdir().expect("WAL directory");
-    let writer =
-        WalWriter::new(wal_root.path(), [8_u8; 16], 1, WalConfig::default()).expect("WAL writer");
-    writer.trip_disk_full_for_test();
-    let error = writer
-        .append_and_fsync_for_test(
-            &key(DataTenantId::new_v7(), "hard_limit"),
-            [1_u8; 16],
-            b"data",
-        )
-        .expect_err("WAL hard limit");
-    assert!(matches!(error, ScribeError::WalDiskFull));
-    assert_eq!(writer.bytes_on_disk(), 0);
 }

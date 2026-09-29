@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VerificationBindingStatus",
+  "description": "`GET /v1/verification/bindings/{binding_id}` response.",
+  "type": "object",
+  "required": [
+    "active",
+    "binding_id",
+    "owner_card_uid",
+    "readiness",
+    "subject_card_uid",
+    "verifier_uid"
+  ],
+  "properties": {
+    "active": {
+      "description": "Whether the owner's Card-bound principal is runtime-active, so scheduled or observation work may be admitted now.",
+      "type": "boolean"
+    },
+    "binding_id": {
+      "description": "The binding.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "last_activated_at": {
+      "description": "The owner principal's last qualifying machine exchange.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_run_id": {
+      "description": "Most recently enqueued run of this binding.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "next_run_at": {
+      "description": "Next scheduled occurrence; null before activation and always null for an observation-triggered (Eval) binding.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "owner_card_uid": {
+      "description": "Exact owner Service or standalone Agent Card version.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    },
+    "readiness": {
+      "description": "Whether the Verifier can run, and why not when it cannot.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerifierReadiness"
+        }
+      ]
+    },
+    "subject_card_uid": {
+      "description": "Exact verified subject Card.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    },
+    "verifier_uid": {
+      "description": "Exact bound Verifier Card version.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "VerifierReadiness": {
+      "description": "Whether a Verifier may produce a judgment now.",
+      "oneOf": [
+        {
+          "description": "The Verifier can run.",
+          "type": "string",
+          "enum": [
+            "ready"
+          ]
+        },
+        {
+          "description": "A PSI or SPC Drift Verifier's fitted baseline is not ready yet.",
+          "type": "string",
+          "enum": [
+            "baseline_not_ready"
+          ]
+        },
+        {
+          "description": "The Verifier Card is missing, not a Verifier, or no longer active.",
+          "type": "string",
+          "enum": [
+            "verifier_unavailable"
+          ]
+        }
+      ]
+    }
+  }
+}

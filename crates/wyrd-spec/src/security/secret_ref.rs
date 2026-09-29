@@ -1,7 +1,7 @@
 //! `SecretRef` typed pointer into the runtime secret store.
 //!
 //! `SecretRef` is the canonical secret-indirection type for all Wyrd
-//! transports and the server-internal alert router. It decouples
+//! transports. It decouples
 //! configuration (which lives in serialized form in YAML / env / registry)
 //! from credential values (which live in env vars, mounted files, or an
 //! external secret manager). Resolution is owned by the Wyrd shared auth

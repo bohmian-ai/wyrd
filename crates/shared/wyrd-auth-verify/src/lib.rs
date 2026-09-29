@@ -16,13 +16,14 @@ use serde_json::Value as JsonValue;
 use wyrd_auth_oidc::{
     IssuerConfigResolver, IssuerVerification, JwksCache, OidcError, OidcKid, map_claims,
 };
+use wyrd_runtime::builtin_roles::{GATEWAY_CAPTURE_ROLE, gateway_capture_permissions};
 use wyrd_runtime::{
-    DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind,
-    PrincipalRef as RuntimePrincipalRef, RoleRef,
+    BifrostPermissionScope, DelegationStep, Permission, PermissionScope, PermissionSet, Principal,
+    PrincipalId, PrincipalKind, PrincipalRef as RuntimePrincipalRef, RoleRef,
 };
 use wyrd_spec::DataTenantId;
 pub use wyrd_spec::auth::TokenAudience;
-use wyrd_spec::auth::{IssuerTokenPolicy, IssuerUrl, PrincipalKindTag};
+use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, IssuerTokenPolicy, IssuerUrl, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 
@@ -734,6 +735,9 @@ impl From<&Principal> for TokenPrincipalRef {
                 Some(card_ref.clone()),
                 card_ref_scope.clone(),
             ),
+            PrincipalKind::System { card_ref_scope } => {
+                (PrincipalKindTag::System, None, card_ref_scope.clone())
+            }
         };
         Self {
             id: principal.id,
@@ -752,16 +756,25 @@ impl AccessTokenClaims {
     /// permissions are the `permissions` claim and nothing is read from a
     /// store. `roles` is copied through as informational metadata.
     ///
+    /// A `system` principal takes a separate, closed path through
+    /// [`Self::system_kind`]: its claims must match exactly what the tenant
+    /// issuer mints for the internal verification-result writer.
+    ///
     /// # Errors
-    /// Returns an error when card-bound principal invariants fail, the
-    /// delegation chain is too deep or malformed, or the expiry timestamp is
-    /// out of range.
+    /// Returns an error when the reserved capture identity or `system`
+    /// claim set deviates from the SYSTEM contract, the delegation chain is
+    /// too deep or malformed, or the expiry timestamp is out of range.
     pub fn into_verified(&self) -> Result<VerifiedToken, AuthError> {
-        let kind = wire_kind_into_principal_kind(
-            self.principal.kind,
-            self.principal.card_ref.as_ref(),
-            &self.principal.card_ref_scope,
-        )?;
+        self.enforce_reserved_capture_identity()?;
+        let kind = if self.principal.kind == PrincipalKindTag::System {
+            self.system_kind()?
+        } else {
+            wire_kind_into_principal_kind(
+                self.principal.kind,
+                self.principal.card_ref.as_ref(),
+                &self.principal.card_ref_scope,
+            )?
+        };
         let principal = Principal::new(
             self.principal.id,
             kind,
@@ -780,7 +793,128 @@ impl AccessTokenClaims {
             exp,
         })
     }
+
+    /// Resolve a `system` claim set into the SYSTEM principal kind.
+    ///
+    /// The internal SYSTEM principal is minted with a closed shape, and
+    /// anything else signed under its tag is treated as forged: the id is a
+    /// `UUIDv7` equal to `sub`; there is no root Card, role, credential, or
+    /// delegation chain; the permissions are exactly one fixed purpose —
+    /// `bifrost_record:write` for result publication, or one
+    /// [`Permission::drift_table_read`] for the Drift observation read, never
+    /// both; and the scope is exactly one UID-bearing Verifier Card.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::InvalidToken`] when any of those conditions fails.
+    fn system_kind(&self) -> Result<PrincipalKind, AuthError> {
+        let principal = &self.principal;
+        let scope = principal.card_ref_scope.as_slice();
+        let conforms = principal.id.as_uuid().get_version_num() == 7
+            && self.sub == principal.id.to_string()
+            && principal.card_ref.is_none()
+            && self.roles.is_empty()
+            && self.cid.is_none()
+            && self.act.is_none()
+            && (self.permissions == PermissionSet::from_iter([Permission::bifrost_record_write()])
+                || matches!(
+                    self.permissions.iter().collect::<Vec<_>>().as_slice(),
+                    [permission] if permission.is_drift_table_read()
+                ))
+            && matches!(
+                scope,
+                [member] if member.kind == CardKind::Verifier && member.uid.is_some()
+            );
+        if !conforms {
+            return Err(AuthError::InvalidToken);
+        }
+        Ok(PrincipalKind::System {
+            card_ref_scope: principal.card_ref_scope.clone(),
+        })
+    }
 }
+
+impl AccessTokenClaims {
+    /// Rejects claims that use the reserved capture identity outside its exact shape.
+    ///
+    /// Signing-key possession is the issuance control; this check keeps a
+    /// defect in any other issue path from minting a usable capture token.
+    /// A token naming [`GATEWAY_CAPTURE_PRINCIPAL`] or carrying
+    /// [`GATEWAY_CAPTURE_ROLE`] must be that principal as a card-free
+    /// `Service` with an empty Card-reference scope and no credential id, bind
+    /// a tenant other than `SYSTEM_OWNER`, carry only [`GATEWAY_CAPTURE_ROLE`],
+    /// have no delegation chain, live no longer than
+    /// [`GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS`], and carry exactly the two
+    /// table-scoped capture grants (see [`Self::carries_exact_capture_grants`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::InvalidToken`] when the token names the reserved
+    /// id or role and any part of that shape differs.
+    fn enforce_reserved_capture_identity(&self) -> Result<(), AuthError> {
+        if self.principal.id != GATEWAY_CAPTURE_PRINCIPAL
+            && !self
+                .roles
+                .iter()
+                .any(|role| role.as_str() == GATEWAY_CAPTURE_ROLE)
+        {
+            return Ok(());
+        }
+        let exact = self.principal.id == GATEWAY_CAPTURE_PRINCIPAL
+            && self.principal.kind == PrincipalKindTag::Service
+            && self.principal.card_ref.is_none()
+            && self.principal.card_ref_scope.as_slice().is_empty()
+            && self.cid.is_none()
+            && self.principal.tenant_id != DataTenantId::SYSTEM_OWNER
+            && self.act.is_none()
+            && matches!(self.roles.as_slice(), [role] if role.as_str() == GATEWAY_CAPTURE_ROLE)
+            && self.exp.saturating_sub(self.iat) <= GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS
+            && self.carries_exact_capture_grants();
+        if exact {
+            Ok(())
+        } else {
+            Err(AuthError::InvalidToken)
+        }
+    }
+
+    /// Reports whether `permissions` is exactly the capture grant pair.
+    ///
+    /// The candidate call and span table UIDs are read from the table-scoped
+    /// grants under schemas `gateway` and `traces`; they must be non-nil and
+    /// distinct, and the claim must then equal the two grants
+    /// [`gateway_capture_permissions`] builds from them: `BifrostRecord`
+    /// `Write` on catalog `vala`, table-scoped, and nothing else. A wildcard,
+    /// schema-wide, additional, missing, or unrelated grant fails the check.
+    fn carries_exact_capture_grants(&self) -> bool {
+        let table_uid_under = |schema: &str| {
+            self.permissions
+                .iter()
+                .find_map(|permission| match &permission.scope {
+                    PermissionScope::Bifrost(BifrostPermissionScope::Table(table))
+                        if table.schema == schema =>
+                    {
+                        Some(table.table_uid)
+                    }
+                    _ => None,
+                })
+        };
+        let (Some(calls_uid), Some(spans_uid)) =
+            (table_uid_under("gateway"), table_uid_under("traces"))
+        else {
+            return false;
+        };
+        let expected = gateway_capture_permissions(calls_uid, spans_uid);
+        !calls_uid.is_nil()
+            && !spans_uid.is_nil()
+            && calls_uid != spans_uid
+            && self.permissions.len() == expected.len()
+            && expected
+                .iter()
+                .all(|grant| self.permissions.iter().any(|held| held == grant))
+    }
+}
+
+/// Longest lifetime, in seconds, a gateway capture token may carry.
+pub const GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS: usize = 15 * 60;
 
 /// Resolve the wire principal-kind tag and Card binding into a `PrincipalKind`.
 ///
@@ -804,6 +938,10 @@ fn wire_kind_into_principal_kind(
         // is the type-level half of the control-plane boundary: even a validly
         // signed token cannot smuggle a platform identity into a tenant.
         (PrincipalKindTag::GlobalAdmin, _) => Err(AuthError::InvalidToken),
+        // The internal SYSTEM writer resolves only through
+        // `AccessTokenClaims::system_kind`; it never appears as a delegation
+        // layer, because it takes part in no delegation or impersonation flow.
+        (PrincipalKindTag::System, _) => Err(AuthError::InvalidToken),
         (PrincipalKindTag::TenantAdmin, Some(_)) => Err(AuthError::InvalidCardRef),
         (PrincipalKindTag::TenantAdmin, None) => Ok(PrincipalKind::TenantAdmin),
         (PrincipalKindTag::User, Some(_)) => Err(AuthError::InvalidCardRef),
@@ -873,6 +1011,10 @@ fn flatten_act_chain(mut act: Option<&ActClaim>) -> Result<Vec<DelegationStep>, 
     while let Some(layer) = act {
         if out.len() >= MAX_DELEGATION_DEPTH {
             return Err(AuthError::DelegationDepthExceeded);
+        }
+        // The reserved capture identity acts only as itself, never as a delegator.
+        if layer.principal.id == GATEWAY_CAPTURE_PRINCIPAL {
+            return Err(AuthError::InvalidToken);
         }
         let kind = wire_kind_into_principal_kind(
             layer.principal.kind,
@@ -960,10 +1102,15 @@ mod tests {
         ClaimMapping, ClaimPath, ClientAuth, IssuerConfigResolver, JwksCache, OidcError,
         TrustedIssuer,
     };
-    use wyrd_runtime::{Permission, PermissionSet};
+    use wyrd_runtime::builtin_roles::{GATEWAY_CAPTURE_ROLE, gateway_capture_permissions};
+    use wyrd_runtime::{
+        Action, BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, Permission,
+        PermissionScope, PermissionSet, Resource,
+    };
     use wyrd_runtime::{Principal, PrincipalId, PrincipalKind, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::GATEWAY_CAPTURE_PRINCIPAL;
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::IssuerUrl;
     use wyrd_spec::envelope::CardKind;
@@ -971,9 +1118,10 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
     use super::{
-        AccessTokenClaims, ActClaim, AuthError, ExternalVerifier, Kid, MAX_BEARER_TOKEN_BYTES,
-        MAX_DELEGATION_DEPTH, PrincipalKindTag, TokenAudience, TokenPrincipalRef, TokenVerifier,
-        WyrdAuthVerifySettings, decode_kid, public_key_from_pem, verify_eddsa, verify_eddsa_with,
+        AccessTokenClaims, ActClaim, AuthError, ExternalVerifier,
+        GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS, Kid, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
+        PrincipalKindTag, TokenAudience, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
+        decode_kid, public_key_from_pem, verify_eddsa, verify_eddsa_with,
     };
 
     const PRIVATE_KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -1131,6 +1279,166 @@ mod tests {
             verified.delegation_chain[1].principal.card_ref(),
             current_actor.card_ref.as_ref()
         );
+    }
+
+    /// Proves the reserved capture identity verifies only as a tenant-bound
+    /// card-free Service with an empty Card-reference scope carrying exactly
+    /// the two capture table grants, and cannot be claimed under another kind,
+    /// Card binding, credential, Role set, tenant, lifetime, delegation chain,
+    /// or permission set.
+    #[test]
+    fn reserved_capture_identity_verifies_only_in_its_exact_shape() {
+        let calls_uid = uuid::Uuid::from_u128(1);
+        let spans_uid = uuid::Uuid::from_u128(2);
+        let grants = |calls, spans| -> PermissionSet {
+            gateway_capture_permissions(calls, spans)
+                .into_iter()
+                .collect()
+        };
+        let with_extra = |extra: Permission| -> PermissionSet {
+            gateway_capture_permissions(calls_uid, spans_uid)
+                .into_iter()
+                .chain([extra])
+                .collect()
+        };
+        let system = || AccessTokenClaims {
+            sub: GATEWAY_CAPTURE_PRINCIPAL.to_string(),
+            principal: TokenPrincipalRef {
+                id: GATEWAY_CAPTURE_PRINCIPAL,
+                kind: PrincipalKindTag::Service,
+                ..user_ref()
+            },
+            roles: vec![RoleRef::new(GATEWAY_CAPTURE_ROLE).expect("valid role")],
+            permissions: grants(calls_uid, spans_uid),
+            ..claims_with_times(now() + 300, now())
+        };
+        let verified = system()
+            .into_verified()
+            .expect("exact capture claims verify");
+        assert_eq!(
+            verified.principal.kind,
+            PrincipalKind::Service {
+                card_ref: None,
+                card_ref_scope: CardRefScope::default(),
+            }
+        );
+        assert_eq!(verified.principal.id, GATEWAY_CAPTURE_PRINCIPAL);
+        assert_eq!(verified.principal.credential_id, None);
+
+        let base = system();
+        let rejected = [
+            AccessTokenClaims {
+                principal: TokenPrincipalRef {
+                    id: principal_id(),
+                    ..base.principal.clone()
+                },
+                ..system()
+            },
+            AccessTokenClaims {
+                principal: TokenPrincipalRef {
+                    kind: PrincipalKindTag::User,
+                    ..base.principal.clone()
+                },
+                ..system()
+            },
+            AccessTokenClaims {
+                principal: TokenPrincipalRef {
+                    card_ref: Some(card_ref(CardKind::Service)),
+                    card_ref_scope: CardRefScope::own(&card_ref(CardKind::Service)),
+                    ..base.principal.clone()
+                },
+                ..system()
+            },
+            AccessTokenClaims {
+                cid: Some("00000000-0000-0000-0000-000000000000".to_owned()),
+                ..system()
+            },
+            AccessTokenClaims {
+                roles: vec![role(), base.roles[0].clone()],
+                ..system()
+            },
+            AccessTokenClaims {
+                principal: TokenPrincipalRef {
+                    tenant_id: DataTenantId::SYSTEM_OWNER,
+                    ..base.principal.clone()
+                },
+                ..system()
+            },
+            AccessTokenClaims {
+                act: Some(Box::new(act_chain(1))),
+                ..system()
+            },
+            AccessTokenClaims {
+                exp: base.iat + GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS + 1,
+                ..system()
+            },
+            AccessTokenClaims {
+                permissions: PermissionSet::new(),
+                ..system()
+            },
+            AccessTokenClaims {
+                permissions: grants(calls_uid, spans_uid)
+                    .iter()
+                    .take(1)
+                    .cloned()
+                    .collect(),
+                ..system()
+            },
+            AccessTokenClaims {
+                permissions: PermissionSet::from_iter([Permission::wildcard()]),
+                ..system()
+            },
+            AccessTokenClaims {
+                permissions: with_extra(Permission::card_read()),
+                ..system()
+            },
+            AccessTokenClaims {
+                permissions: with_extra(Permission {
+                    resource: Resource::BifrostRecord,
+                    action: Action::Write,
+                    scope: PermissionScope::Bifrost(BifrostPermissionScope::Schema(
+                        BifrostSchemaScope {
+                            catalog: "vala".to_owned(),
+                            schema: "logs".to_owned(),
+                        },
+                    )),
+                }),
+                ..system()
+            },
+            AccessTokenClaims {
+                permissions: grants(calls_uid, uuid::Uuid::nil()),
+                ..system()
+            },
+            AccessTokenClaims {
+                permissions: grants(calls_uid, calls_uid),
+                ..system()
+            },
+            AccessTokenClaims {
+                permissions: grants(calls_uid, spans_uid)
+                    .iter()
+                    .map(|grant| Permission {
+                        action: Action::Read,
+                        ..grant.clone()
+                    })
+                    .collect(),
+                ..system()
+            },
+            AccessTokenClaims {
+                act: Some(Box::new(ActClaim {
+                    sub: GATEWAY_CAPTURE_PRINCIPAL.to_string(),
+                    principal: base.principal.clone(),
+                    act: None,
+                })),
+                ..claims_with_times(now() + 300, now())
+            },
+        ];
+        for claims in rejected {
+            let result = claims.into_verified();
+            assert!(
+                matches!(result, Err(AuthError::InvalidToken)),
+                "{claims:?} -> {result:?}"
+            );
+        }
     }
 
     /// A Card-free service is a valid machine principal: Card binding is a
@@ -1512,6 +1820,306 @@ mod tests {
         let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &tenant_id());
 
         assert!(matches!(result, Err(AuthError::BadTokenFormat)));
+    }
+
+    /// A signed SYSTEM token scoped to one UID-bearing Verifier resolves to a
+    /// cardless `System` principal whose only authority is that Verifier.
+    ///
+    /// # Panics
+    /// Panics when the conforming token is refused or resolves to anything
+    /// other than the single-Verifier SYSTEM principal.
+    #[test]
+    fn token_verifier_accepts_system_token_scoped_to_one_verifier() {
+        let verifier_ref = uid_card_ref(CardKind::Verifier, "drift");
+        let claims = system_claims(&verifier_ref);
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
+
+        let verified = verifier(WyrdAuthVerifySettings::default())
+            .verify(&token, &tenant_id())
+            .expect("conforming system token verifies");
+
+        assert_eq!(
+            verified.principal.kind,
+            PrincipalKind::System {
+                card_ref_scope: CardRefScope::own(&verifier_ref)
+            }
+        );
+        assert_eq!(verified.principal.card_ref(), None);
+        assert!(verified.principal.roles.is_empty());
+        assert_eq!(verified.principal.credential_id, None);
+        assert!(verified.delegation_chain.is_empty());
+        assert_eq!(
+            verified.principal.effective_permissions,
+            PermissionSet::from_iter([Permission::bifrost_record_write()])
+        );
+    }
+
+    /// The SYSTEM Drift read shape — the same closed claim set carrying only
+    /// one `vala.drift` table-scoped `bifrost_query:read` — resolves to the
+    /// same single-Verifier `System` principal holding exactly that read.
+    ///
+    /// # Panics
+    /// Panics when the conforming read token is refused or gains authority.
+    #[test]
+    fn token_verifier_accepts_system_drift_read_token() {
+        let verifier_ref = uid_card_ref(CardKind::Verifier, "drift");
+        let read = Permission::drift_table_read(uuid::Uuid::now_v7());
+        let claims = AccessTokenClaims {
+            permissions: PermissionSet::from_iter([read.clone()]),
+            ..system_claims(&verifier_ref)
+        };
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
+
+        let verified = verifier(WyrdAuthVerifySettings::default())
+            .verify(&token, &tenant_id())
+            .expect("conforming system read token verifies");
+
+        assert_eq!(
+            verified.principal.kind,
+            PrincipalKind::System {
+                card_ref_scope: CardRefScope::own(&verifier_ref)
+            }
+        );
+        assert_eq!(
+            verified.principal.effective_permissions,
+            PermissionSet::from_iter([read])
+        );
+    }
+
+    /// Every deviation from the SYSTEM token contract is refused as an invalid
+    /// token, so no forged or widened claim set can act as the result writer.
+    ///
+    /// # Panics
+    /// Panics when any violating claim set resolves to a principal.
+    #[test]
+    fn into_verified_rejects_every_system_contract_violation() {
+        let verifier_ref = uid_card_ref(CardKind::Verifier, "drift");
+        let base = system_claims(&verifier_ref);
+        let non_v7: PrincipalId = "01890f28-7c4a-4cc3-98e7-4f4a3c2d1b00"
+            .parse()
+            .expect("static v4 principal id is valid");
+        let uidless = CardRef {
+            uid: None,
+            ..verifier_ref.clone()
+        };
+        let with_scope = |scope: CardRefScope| AccessTokenClaims {
+            principal: TokenPrincipalRef {
+                card_ref_scope: scope,
+                ..base.principal.clone()
+            },
+            ..base.clone()
+        };
+        let cases: Vec<(&str, AccessTokenClaims)> = vec![
+            (
+                "non-UUIDv7 principal",
+                AccessTokenClaims {
+                    sub: non_v7.to_string(),
+                    principal: TokenPrincipalRef {
+                        id: non_v7,
+                        ..base.principal.clone()
+                    },
+                    ..base.clone()
+                },
+            ),
+            (
+                "subject differs from principal",
+                AccessTokenClaims {
+                    sub: "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b0f".to_owned(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "root card",
+                AccessTokenClaims {
+                    principal: TokenPrincipalRef {
+                        card_ref: Some(verifier_ref.clone()),
+                        ..base.principal.clone()
+                    },
+                    ..base.clone()
+                },
+            ),
+            (
+                "role",
+                AccessTokenClaims {
+                    roles: vec![role()],
+                    ..base.clone()
+                },
+            ),
+            ("empty scope", with_scope(CardRefScope::default())),
+            (
+                "multi-member scope",
+                with_scope(CardRefScope::from_root_and_members(
+                    &verifier_ref,
+                    [uid_card_ref(CardKind::Verifier, "other")],
+                )),
+            ),
+            (
+                "non-Verifier scope member",
+                with_scope(CardRefScope::own(&uid_card_ref(
+                    CardKind::Service,
+                    "billing",
+                ))),
+            ),
+            (
+                "scope member without uid",
+                with_scope(CardRefScope::own(&uidless)),
+            ),
+            (
+                "widened permissions",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([
+                        Permission::bifrost_record_write(),
+                        Permission::card_read(),
+                    ]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "both SYSTEM purposes",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([
+                        Permission::bifrost_record_write(),
+                        Permission::drift_table_read(uuid::Uuid::now_v7()),
+                    ]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "unscoped query read",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([Permission::bifrost_query_read()]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "query read of another schema",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([Permission {
+                        scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(
+                            BifrostTableScope {
+                                catalog: "vala".to_owned(),
+                                schema: "traces".to_owned(),
+                                table_uid: uuid::Uuid::now_v7(),
+                            },
+                        )),
+                        ..Permission::bifrost_query_read()
+                    }]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "two drift table reads",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([
+                        Permission::drift_table_read(uuid::Uuid::now_v7()),
+                        Permission::drift_table_read(uuid::Uuid::now_v7()),
+                    ]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "missing permission",
+                AccessTokenClaims {
+                    permissions: PermissionSet::from_iter([Permission::card_read()]),
+                    ..base.clone()
+                },
+            ),
+            (
+                "credential attribution",
+                AccessTokenClaims {
+                    cid: Some("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b0c".to_owned()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "delegation chain",
+                AccessTokenClaims {
+                    act: Some(Box::new(act_chain(1))),
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (label, claims) in cases {
+            let result = claims.into_verified();
+            assert!(
+                matches!(result, Err(AuthError::InvalidToken)),
+                "{label}: {result:?}"
+            );
+        }
+    }
+
+    /// A SYSTEM identity can never appear as a delegation layer: it holds no
+    /// credential and takes part in no delegation or impersonation flow.
+    ///
+    /// # Panics
+    /// Panics when a chain naming a SYSTEM layer resolves.
+    #[test]
+    fn into_verified_rejects_system_delegation_layer() {
+        let verifier_ref = uid_card_ref(CardKind::Verifier, "drift");
+        let claims = AccessTokenClaims {
+            act: Some(Box::new(ActClaim {
+                sub: principal_id().to_string(),
+                principal: system_claims(&verifier_ref).principal,
+                act: None,
+            })),
+            ..claims_with_times(now() + 3_600, now())
+        };
+
+        let result = claims.into_verified();
+
+        assert!(matches!(result, Err(AuthError::InvalidToken)), "{result:?}");
+    }
+
+    /// A SYSTEM token signed for one tenant cannot be replayed in another.
+    ///
+    /// # Panics
+    /// Panics when the verifier admits the token under a foreign tenant.
+    #[test]
+    fn token_verifier_rejects_system_token_for_another_tenant() {
+        let claims = system_claims(&uid_card_ref(CardKind::Verifier, "drift"));
+        let token = SecretString::from(encode_eddsa_with_kid(&claims));
+        let wrong_tenant = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b09"
+            .parse()
+            .expect("static tenant id is valid");
+
+        let result = verifier(WyrdAuthVerifySettings::default()).verify(&token, &wrong_tenant);
+
+        assert!(matches!(result, Err(AuthError::InvalidToken)), "{result:?}");
+    }
+
+    /// Build the conforming claim set the tenant issuer mints for the SYSTEM
+    /// writer: no roles, credential, or delegation; exactly
+    /// `bifrost_record:write`; and a scope of exactly `verifier_ref`.
+    fn system_claims(verifier_ref: &CardRef) -> AccessTokenClaims {
+        AccessTokenClaims {
+            principal: TokenPrincipalRef {
+                kind: PrincipalKindTag::System,
+                card_ref: None,
+                card_ref_scope: CardRefScope::own(verifier_ref),
+                ..user_ref()
+            },
+            roles: Vec::new(),
+            permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
+            ..claims_with_times(now() + 300, now())
+        }
+    }
+
+    /// Build a UID-bearing Card reference of `kind`, as a SYSTEM scope member
+    /// must be; distinct names yield distinct identities and UIDs.
+    ///
+    /// # Panics
+    /// Panics when a static identity component is invalid.
+    fn uid_card_ref(kind: CardKind, name: &str) -> CardRef {
+        let uid = if name == "drift" {
+            "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11"
+        } else {
+            "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b12"
+        };
+        CardRef {
+            uid: Some(wyrd_spec::ids::CardUid::new(uid).expect("static uid is valid")),
+            ..named_card_ref(kind, name)
+        }
     }
 
     /// Validation matching [`TokenVerifier`]'s tenant access-token policy.

@@ -117,7 +117,7 @@ function currentCharts(errorLatest: string, errorEnd: number): ServiceChart[] {
 /** The published model-drift intelligence panel at a given PSI outcome. */
 function driftSignal(breached: boolean, stamp: string): ServiceSignal {
   return {
-    title: 'MODEL-DRIFT (Drift v3)',
+    title: 'MODEL-DRIFT (Verifier v3)',
     stamp,
     verdict: breached ? { label: '✕ BREACHED', tone: 'danger' } : { label: '✓ WITHIN', tone: 'ok' },
     subject: 'subject ranker (model_primary · Model v12) · feature `cart_value_p50`',
@@ -138,7 +138,7 @@ function driftSignal(breached: boolean, stamp: string): ServiceSignal {
 /** The published checkout-agent-eval intelligence panel. */
 function evalSignal(stamp: string): ServiceSignal {
   return {
-    title: 'CHECKOUT-AGENT-EVAL (Eval v4)',
+    title: 'CHECKOUT-AGENT-EVAL (Verifier v4)',
     stamp,
     verdict: { label: '✓ PASSING', tone: 'ok' },
     subject: 'subject checkout-agent (agent_triage · Agent v6)',
@@ -283,7 +283,7 @@ const partial: ServiceOverviewState = {
   channelNote: 'unauthorized is never rendered as zero or healthy',
   signals: [
     {
-      title: 'MODEL-DRIFT (Drift v3)',
+      title: 'MODEL-DRIFT (Verifier v3)',
       stamp: 'publication binding · server-projected',
       state: 'unauthorized',
       body: [
@@ -373,14 +373,14 @@ const composition: ServiceComposition = {
       nodes: [
         {
           uid: 'card_drift_01',
-          kind: 'Drift',
+          kind: 'Verifier',
           name: 'model-drift',
           version: 'v3',
           status: '✕ alerting',
-          note: 'publishes to · by ranker',
+          note: 'verified by · on ranker',
           drawer: {
             headline: '✕ alerting — PSI 0.27 > threshold 0.20',
-            in: 'in: ranker publishes to · via checkout-api v12 · baseline txns-2026q3',
+            in: 'in: ranker verified by · via checkout-api v12 · baseline txns-2026q3',
             out: 'out: fires ranking-drift-response (Trigger)',
             observe: {
               label: 'View in Observe →',
@@ -388,7 +388,7 @@ const composition: ServiceComposition = {
             }
           }
         },
-        { uid: 'card_eval_02', kind: 'Eval', name: 'checkout-agent-eval', version: 'v4', status: '✓ active', note: 'publishes to · by checkout-agent' }
+        { uid: 'card_eval_02', kind: 'Verifier', name: 'checkout-agent-eval', version: 'v4', status: '✓ active', note: 'verified by · on checkout-agent' }
       ]
     },
     {
@@ -402,15 +402,15 @@ const composition: ServiceComposition = {
   ],
   edges: [
     { from: 'card_prompt_02', to: 'card_agent_01', label: 'prompt' },
-    { from: 'card_agent_01', to: 'card_eval_02', label: 'publishes to' },
-    { from: 'card_model_01', to: 'card_drift_01', label: 'publishes to' },
+    { from: 'card_agent_01', to: 'card_eval_02', label: 'verified by' },
+    { from: 'card_model_01', to: 'card_drift_01', label: 'verified by' },
     { from: 'card_drift_01', to: 'card_trigger_01', label: 'fires' },
     { from: 'card_trigger_01', to: 'card_operator_01', label: 'invokes', route: 'down' },
     { from: 'card_data_01', to: 'card_drift_01', label: 'baseline', route: 'under' },
     { from: 'card_operator_01', to: 'card_workflow_02', label: 'dispatches workflow', route: 'under' }
   ],
   aliasNote:
-    'capture_prompt and shared_prompt are two authored aliases resolving to capture-review — one Card, one node. Publication reads as “publishes to · through checkout-api v12”, not global ownership. A declared edge never proves a runtime execution or observation occurred.',
+    'capture_prompt and shared_prompt are two authored aliases resolving to capture-review — one Card, one node. Binding reads as “verified by · through checkout-api v12”, not global ownership. A declared edge never proves a runtime execution or observation occurred.',
   foot: 'Every node keeps its independent uid, version, status and direct Card route — the Service is how you read the system, not a container that owns it.'
 };
 
@@ -429,12 +429,14 @@ spec:
   components:
     - alias: model_primary
       ref: { kind: Model, name: ranker, version: v12 }
-      publishes_to:
-        - { kind: Drift, name: model-drift }
+      verified_by:
+        - verifier: { kind: Verifier, name: model-drift, version: v3 }
+          runs_on: { kind: schedule, cron: "0 * * * *" }
     - alias: agent_triage
       ref: { kind: Agent, name: checkout-agent, version: v6 }
-      publishes_to:
-        - { kind: Eval, name: checkout-agent-eval }
+      verified_by:
+        - verifier: { kind: Verifier, name: checkout-agent-eval, version: v4 }
+          runs_on: { kind: observations_ready }
     - alias: agent_inline
       ref: { kind: Agent, name: fraud-review, version: v2 }
     - alias: model_shadow
@@ -461,8 +463,8 @@ const definition: ServiceDefinition = {
   components: {
     note: 'aliases are runtime names; each ref keeps its own Card',
     rows: [
-      { alias: 'model_primary', ref: 'ranker · v12', href: '/cards/card_model_01', kind: 'Model', publishes: 'model-drift (Drift)', publishesHref: '/cards/card_drift_01' },
-      { alias: 'agent_triage', ref: 'checkout-agent · v6', href: '/cards/card_agent_01', kind: 'Agent', publishes: 'checkout-agent-eval (Eval)', publishesHref: '/cards/card_eval_02' },
+      { alias: 'model_primary', ref: 'ranker · v12', href: '/cards/card_model_01', kind: 'Model', publishes: 'model-drift (Verifier)', publishesHref: '/cards/card_drift_01' },
+      { alias: 'agent_triage', ref: 'checkout-agent · v6', href: '/cards/card_agent_01', kind: 'Agent', publishes: 'checkout-agent-eval (Verifier)', publishesHref: '/cards/card_eval_02' },
       { alias: 'agent_inline', ref: 'fraud-review · v2', href: '/cards/card_agent_02', kind: 'Agent', publishes: '—' },
       { alias: 'model_shadow', ref: 'ranker-shadow · v11', href: '/cards/card_model_02', kind: 'Model', publishes: '—' },
       { alias: 'runtime_workflow', ref: 'runtime · v1', href: '/cards/card_workflow_02', kind: 'Workflow', publishes: '—' },
@@ -472,22 +474,22 @@ const definition: ServiceDefinition = {
     aliasNote: 'capture_prompt and shared_prompt are two authored aliases resolving to one Card — distinct occurrences, one identity.'
   },
   publications: {
-    note: 'publishes_to targets resolve to Eval or Drift only',
+    note: 'verified_by bindings resolve to Verifier Cards only',
     component: {
-      label: "component-level — components[].publishes_to · subject is the component's Card, observed through checkout-api v12",
+      label: "component-level — components[].verified_by · subject is the component's Card, observed through checkout-api v12",
       flows: [
         {
           from: { label: 'ranker (Model v12)', href: '/cards/card_model_01' },
-          to: { label: 'model-drift (Drift v3)', href: '/cards/card_drift_01' }
+          to: { label: 'model-drift (Verifier v3)', href: '/cards/card_drift_01' }
         },
         {
           from: { label: 'checkout-agent (Agent v6)', href: '/cards/card_agent_01' },
-          to: { label: 'checkout-agent-eval (Eval v4)', href: '/cards/card_eval_02' }
+          to: { label: 'checkout-agent-eval (Verifier v4)', href: '/cards/card_eval_02' }
         }
       ]
     },
     service: {
-      label: 'service-level — publishes_to · subject is the Service Card itself',
+      label: 'service-level — verified_by · subject is the Service Card itself',
       value: 'NONE DECLARED',
       note: 'v12 declares no Service-subject publication — stated as absent, not hidden.'
     }
@@ -635,7 +637,7 @@ const v11Presentation: ServicePresentation = {
       summary: 'spec.yaml — v11 declaration · validated wyrd/v1',
       yaml: specYaml
         .split('\n')
-        .filter((line) => !/model-drift|checkout-agent-eval|publishes_to|model_shadow|ranker-shadow|shared_prompt/.test(line))
+        .filter((line) => !/model-drift|checkout-agent-eval|verified_by|runs_on|model_shadow|ranker-shadow|shared_prompt/.test(line))
         .join('\n')
         .replace('version: v12 }', 'version: v11 }')
     }
@@ -678,8 +680,8 @@ export const serviceDetail: CardDetailFixture = {
   ],
   relationships: [
     { relation: 'components', label: '7 refs → 6 Cards (aliases)' },
-    { relation: 'publication', label: 'model-drift (Drift)', href: '/cards/card_drift_01' },
-    { relation: 'publication', label: 'checkout-agent-eval (Eval)', href: '/cards/card_eval_02' },
+    { relation: 'publication', label: 'model-drift (Verifier)', href: '/cards/card_drift_01' },
+    { relation: 'publication', label: 'checkout-agent-eval (Verifier)', href: '/cards/card_eval_02' },
     { relation: 'governed by', label: 'checkout-guardrails (Policy)', href: '/cards/card_policy_01' },
     { relation: 'reaction', label: 'ranking-drift-response (Trigger)', href: '/cards/card_trigger_01' }
   ]

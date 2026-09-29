@@ -18,13 +18,16 @@ use wyrd_auth_verify::{
     AccessTokenClaims, ActClaim, Kid, PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims,
     RefreshTokenClaims, TokenAudience, TokenPrincipalRef,
 };
+use wyrd_runtime::builtin_roles::{GATEWAY_CAPTURE_ROLE, gateway_capture_permissions};
 use wyrd_runtime::{PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalKindTag;
+use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::reference::CardRefScope;
 
-pub use wyrd_auth_verify::{MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH};
+pub use wyrd_auth_verify::{
+    GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS, MAX_BEARER_TOKEN_BYTES, MAX_DELEGATION_DEPTH,
+};
 
 /// OWASP-recommended Argon2id memory cost in KiB.
 pub const ARGON2_M_COST_KIB: u32 = 19_456;
@@ -91,6 +94,9 @@ pub enum IssueError {
     /// Principal card reference was missing or mismatched.
     #[error("principal card_ref is missing or mismatched")]
     InvalidCardRef,
+    /// A gateway capture token was requested for the reserved platform tenant.
+    #[error("gateway capture tokens cannot bind the reserved SYSTEM_OWNER tenant")]
+    ReservedTenant,
     /// Encoded token would exceed the verifier bearer-token size limit.
     #[error("token too large: encoded length {encoded_len} exceeds limit {limit}")]
     CardScopeTooLarge {
@@ -189,7 +195,83 @@ impl IssuingKey {
 
     /// Mint a tenant access token for one resolved grant.
     ///
-    /// The only tenant access-token signing path. It validates that the
+    /// The public tenant access-token path. It refuses the reserved
+    /// [`GATEWAY_CAPTURE_PRINCIPAL`], which only
+    /// [`Self::issue_gateway_capture_access_token`] mints, then signs through
+    /// [`Self::sign_access_token`].
+    ///
+    /// # Errors
+    /// Returns [`IssueError::InvalidPrincipalKind`] for the reserved capture
+    /// identity, and otherwise every error of [`Self::sign_access_token`].
+    pub fn issue_access_token(
+        &self,
+        grant: AccessGrant,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        if grant.principal.id == GATEWAY_CAPTURE_PRINCIPAL {
+            return Err(IssueError::InvalidPrincipalKind);
+        }
+        self.sign_access_token(grant, ttl)
+    }
+
+    /// Mint a short-lived access token for the reserved gateway capture principal.
+    ///
+    /// This is the only issue path for [`GATEWAY_CAPTURE_PRINCIPAL`]. The token
+    /// names that id as a card-free [`PrincipalKindTag::Service`] with an empty
+    /// Card-reference scope, binds exactly `tenant_id`, carries only the
+    /// [`GATEWAY_CAPTURE_ROLE`] and its two table-scoped record writes derived
+    /// here from `calls_uid` and `spans_uid` by [`gateway_capture_permissions`],
+    /// has no delegation chain, and is not attributed to any stored credential.
+    /// Only `wyrd-server`'s internal capture credential source calls it; no
+    /// public exchange, refresh, or delegation route does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IssueError::ReservedTenant`] for `SYSTEM_OWNER`,
+    /// [`IssueError::InvalidTtl`] when `ttl` is not positive or exceeds
+    /// [`GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS`], or a signing error.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the constant capture role name is a valid [`RoleRef`].
+    pub fn issue_gateway_capture_access_token(
+        &self,
+        tenant_id: DataTenantId,
+        calls_uid: Uuid,
+        spans_uid: Uuid,
+        ttl: Duration,
+    ) -> Result<String, IssueError> {
+        if tenant_id == DataTenantId::SYSTEM_OWNER {
+            return Err(IssueError::ReservedTenant);
+        }
+        if ttl.num_seconds() > GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS as i64 {
+            return Err(IssueError::InvalidTtl);
+        }
+        let role = RoleRef::new(GATEWAY_CAPTURE_ROLE).expect("the capture role name is valid");
+        self.sign_access_token(
+            AccessGrant {
+                principal: TokenPrincipalRef {
+                    id: GATEWAY_CAPTURE_PRINCIPAL,
+                    kind: PrincipalKindTag::Service,
+                    tenant_id,
+                    card_ref: None,
+                    card_ref_scope: CardRefScope::default(),
+                },
+                roles: vec![role],
+                permissions: gateway_capture_permissions(calls_uid, spans_uid)
+                    .into_iter()
+                    .collect(),
+                credential_id: None,
+                act: None,
+                audience: TokenAudience::Wyrd,
+            },
+            ttl,
+        )
+    }
+
+    /// Sign one tenant access token for a resolved grant.
+    ///
+    /// The single tenant access-token signing tail. It validates that the
     /// principal's kind and Card binding agree, re-derives a Card-bound
     /// principal's scope from its root so a caller cannot widen it with extra
     /// members, bounds a delegated grant's RFC 8693 `act` chain, and stamps
@@ -199,6 +281,8 @@ impl IssuingKey {
     ///
     /// # Errors
     /// Returns [`IssueError::InvalidPrincipalKind`] for a platform-scope kind,
+    /// or when the internal SYSTEM writer would carry a role, a credential, or
+    /// take part in delegation on either side,
     /// [`IssueError::InvalidCardRef`] when kind and Card binding disagree,
     /// [`IssueError::DelegationDepthExceeded`] when the resulting chain would
     /// exceed [`MAX_DELEGATION_DEPTH`], [`IssueError::InvalidTtl`] for a
@@ -218,11 +302,7 @@ impl IssuingKey {
         ),
         err,
     )]
-    pub fn issue_access_token(
-        &self,
-        grant: AccessGrant,
-        ttl: Duration,
-    ) -> Result<String, IssueError> {
+    fn sign_access_token(&self, grant: AccessGrant, ttl: Duration) -> Result<String, IssueError> {
         let AccessGrant {
             mut principal,
             roles,
@@ -232,6 +312,12 @@ impl IssuingKey {
             audience,
         } = grant;
         validate_principal_ref(&principal)?;
+        let system_involved = principal.kind == PrincipalKindTag::System
+            || std::iter::successors(act.as_deref(), |claim| claim.act.as_deref())
+                .any(|claim| claim.principal.kind == PrincipalKindTag::System);
+        if system_involved && (!roles.is_empty() || credential_id.is_some() || act.is_some()) {
+            return Err(IssueError::InvalidPrincipalKind);
+        }
         if let Some(card_ref) = &principal.card_ref {
             principal.card_ref_scope = CardRefScope::from_root_and_members(
                 card_ref,
@@ -272,15 +358,22 @@ impl IssuingKey {
         Ok(token)
     }
 
-    /// Mint a refresh token for any principal kind from an explicit instant.
+    /// Mint a refresh token for a principal that holds a session, from an
+    /// explicit instant.
+    ///
+    /// The internal SYSTEM writer never holds a session: it is re-minted per
+    /// verification run, so a refresh token for it is refused.
     ///
     /// `issued_at` is supplied by the caller rather than sampled here so that
     /// the signed `exp` and the durable refresh row that records it are derived
     /// from one clock. Callers that persist the token pass the `PostgreSQL`
-    /// issuance instant of their own transaction.
+    /// issuance instant of their own transaction. The reserved capture
+    /// identity is refused before signing: it only ever holds the short-lived
+    /// access token minted by [`Self::issue_gateway_capture_access_token`].
     ///
     /// # Errors
-    /// Returns an error when TTL is invalid or signing fails.
+    /// Returns [`IssueError::InvalidPrincipalKind`] for the SYSTEM kind or
+    /// [`GATEWAY_CAPTURE_PRINCIPAL`], and an error when TTL is invalid or signing fails.
     #[tracing::instrument(
         level = "debug",
         skip(self),
@@ -301,6 +394,9 @@ impl IssuingKey {
         issued_at: DateTime<Utc>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
+        if principal_kind == PrincipalKindTag::System || principal_id == GATEWAY_CAPTURE_PRINCIPAL {
+            return Err(IssueError::InvalidPrincipalKind);
+        }
         let (iat, exp) = timestamps(issued_at, ttl)?;
         let jti = new_jti();
         tracing::Span::current().record("jti", &jti);
@@ -332,14 +428,19 @@ impl IssuingKey {
     /// principal's grant at verification time rather than frozen here.
     ///
     /// # Errors
-    /// Returns [`IssueError::Signing`] when the token cannot be signed, and a
-    /// timestamp error when the issued-at or expiry cannot be computed.
+    /// Returns [`IssueError::InvalidPrincipalKind`] for the reserved
+    /// [`GATEWAY_CAPTURE_PRINCIPAL`], [`IssueError::Signing`] when the token
+    /// cannot be signed, and a timestamp error when the issued-at or expiry
+    /// cannot be computed.
     pub fn issue_platform_access_token(
         &self,
         principal_id: PrincipalId,
         credential_id: Option<Uuid>,
         ttl: Duration,
     ) -> Result<String, IssueError> {
+        if principal_id == GATEWAY_CAPTURE_PRINCIPAL {
+            return Err(IssueError::InvalidPrincipalKind);
+        }
         let (iat, exp) = timestamps(Utc::now(), ttl)?;
         let claims = PlatformAccessTokenClaims {
             sub: principal_id.to_string(),
@@ -425,8 +526,10 @@ fn act_depth(act: Option<&ActClaim>) -> usize {
 ///
 /// Card binding is a property of a machine principal: an agent must carry an
 /// Agent card, a service may carry a Service card or none at all, and an
-/// administrative or human principal must carry none. A platform-scope kind is
-/// rejected outright because tenant-scope tokens are not issued for it.
+/// administrative or human principal must carry none. The internal SYSTEM
+/// writer carries no root Card; its authority is its signed Verifier scope. A
+/// platform-scope kind is rejected outright because tenant-scope tokens are not
+/// issued for it.
 ///
 /// # Errors
 /// Returns [`IssueError::InvalidCardRef`] when the kind and Card binding
@@ -440,10 +543,14 @@ fn validate_principal_ref(principal: &TokenPrincipalRef) -> Result<(), IssueErro
         // platform plane has its own credential path, so a token request
         // carrying this kind is malformed rather than merely unauthorized.
         (PrincipalKindTag::GlobalAdmin, _) => Err(IssueError::InvalidPrincipalKind),
-        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, None) => Ok(()),
-        (PrincipalKindTag::TenantAdmin | PrincipalKindTag::User, Some(_)) => {
-            Err(IssueError::InvalidCardRef)
-        }
+        (
+            PrincipalKindTag::TenantAdmin | PrincipalKindTag::User | PrincipalKindTag::System,
+            None,
+        ) => Ok(()),
+        (
+            PrincipalKindTag::TenantAdmin | PrincipalKindTag::User | PrincipalKindTag::System,
+            Some(_),
+        ) => Err(IssueError::InvalidCardRef),
         (PrincipalKindTag::Service, Some(CardKind::Service) | None) => Ok(()),
         (PrincipalKindTag::Agent, Some(CardKind::Agent)) => Ok(()),
         (PrincipalKindTag::Service | PrincipalKindTag::Agent, _) => Err(IssueError::InvalidCardRef),
@@ -460,10 +567,11 @@ mod tests {
         RefreshTokenClaims, TokenAudience, TokenPrincipalRef, decode_kid, public_key_from_pem,
         verify_eddsa,
     };
+    use wyrd_runtime::builtin_roles::{GATEWAY_CAPTURE_ROLE, gateway_capture_permissions};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalKindTag};
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -508,6 +616,88 @@ mod tests {
         assert_eq!(claims.act, None);
         assert_eq!(claims.iss, "wyrd");
         assert_eq!(claims.jti.len(), 26);
+    }
+
+    /// Proves the capture token is a tenant-bound card-free Service holding
+    /// only the capture Role and its two table-scoped writes, and that the
+    /// public issue paths cannot mint the reserved identity.
+    #[test]
+    fn issue_gateway_capture_access_token_is_a_card_free_service_with_only_the_capture_role() {
+        let key = issuing_key();
+        let (calls_uid, spans_uid) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let claims = verify_access_token(
+            &key.issue_gateway_capture_access_token(
+                tenant_id(),
+                calls_uid,
+                spans_uid,
+                Duration::minutes(5),
+            )
+            .expect("capture token issues"),
+        );
+        assert_eq!(claims.principal.kind, PrincipalKindTag::Service);
+        assert_eq!(claims.principal.id, GATEWAY_CAPTURE_PRINCIPAL);
+        assert_eq!(claims.principal.tenant_id, tenant_id());
+        assert_eq!(claims.principal.card_ref, None);
+        assert!(claims.principal.card_ref_scope.as_slice().is_empty());
+        assert_eq!(claims.cid, None);
+        assert_eq!(claims.roles, vec![role(GATEWAY_CAPTURE_ROLE)]);
+        assert_eq!(
+            claims.permissions,
+            gateway_capture_permissions(calls_uid, spans_uid)
+                .into_iter()
+                .collect::<PermissionSet>()
+        );
+        assert_eq!(claims.act, None);
+        assert_eq!(claims.sub, GATEWAY_CAPTURE_PRINCIPAL.to_string());
+        assert!(matches!(
+            key.issue_gateway_capture_access_token(
+                DataTenantId::SYSTEM_OWNER,
+                calls_uid,
+                spans_uid,
+                Duration::minutes(5)
+            ),
+            Err(IssueError::ReservedTenant)
+        ));
+        assert!(matches!(
+            key.issue_gateway_capture_access_token(
+                tenant_id(),
+                calls_uid,
+                spans_uid,
+                Duration::minutes(16)
+            ),
+            Err(IssueError::InvalidTtl)
+        ));
+
+        let caller = ActClaim {
+            sub: user_principal().id.to_string(),
+            principal: user_principal(),
+            act: None,
+        };
+        for (kind, act) in [
+            (PrincipalKindTag::User, None),
+            (PrincipalKindTag::Service, None),
+            (PrincipalKindTag::Service, Some(Box::new(caller))),
+        ] {
+            let reserved = TokenPrincipalRef {
+                id: GATEWAY_CAPTURE_PRINCIPAL,
+                kind,
+                ..user_principal()
+            };
+            assert!(matches!(
+                key.issue_access_token(
+                    AccessGrant {
+                        act,
+                        ..grant(reserved, vec![role(GATEWAY_CAPTURE_ROLE)])
+                    },
+                    Duration::minutes(5),
+                ),
+                Err(IssueError::InvalidPrincipalKind)
+            ));
+        }
+        assert!(matches!(
+            key.issue_platform_access_token(GATEWAY_CAPTURE_PRINCIPAL, None, Duration::minutes(5)),
+            Err(IssueError::InvalidPrincipalKind)
+        ));
     }
 
     /// Build a Card-bound principal reference for the issuance tests.
@@ -822,6 +1012,133 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// A SYSTEM grant signs as a cardless, role-free, direct token carrying
+    /// exactly its Verifier scope.
+    ///
+    /// # Panics
+    /// Panics when the conforming SYSTEM grant is refused or its claims are
+    /// reshaped by signing.
+    #[test]
+    fn issue_access_token_signs_a_direct_system_grant() {
+        let principal = system_principal();
+        let token = issuing_key()
+            .issue_access_token(
+                AccessGrant {
+                    permissions: PermissionSet::from_iter([Permission::bifrost_record_write()]),
+                    ..grant(principal.clone(), Vec::new())
+                },
+                Duration::minutes(5),
+            )
+            .expect("system token issues");
+        let claims = verify_access_token(&token);
+
+        assert_eq!(claims.principal, principal);
+        assert!(claims.roles.is_empty());
+        assert_eq!(claims.cid, None);
+        assert_eq!(claims.act, None);
+    }
+
+    /// The SYSTEM writer holds no role, credential, Card binding, or
+    /// delegation, so the only signing path refuses any grant that would give
+    /// it one — and refuses it as a delegation caller or refresh subject.
+    ///
+    /// # Panics
+    /// Panics when any SYSTEM grant outside that closed shape is signed.
+    #[test]
+    fn issue_access_token_refuses_widened_system_grants() {
+        let system = system_principal();
+        let system_actor = || ActClaim {
+            sub: system.id.to_string(),
+            principal: system.clone(),
+            act: None,
+        };
+        let cases: Vec<(&str, AccessGrant)> = vec![
+            ("role", grant(system.clone(), vec![role("runtime_admin")])),
+            (
+                "credential",
+                AccessGrant {
+                    credential_id: Some(uuid::Uuid::now_v7()),
+                    ..grant(system.clone(), Vec::new())
+                },
+            ),
+            (
+                "delegated system token",
+                AccessGrant {
+                    act: Some(Box::new(ActClaim {
+                        sub: user_principal().id.to_string(),
+                        principal: user_principal(),
+                        act: None,
+                    })),
+                    ..grant(system.clone(), Vec::new())
+                },
+            ),
+            (
+                "system as delegation actor",
+                AccessGrant {
+                    act: Some(Box::new(system_actor())),
+                    ..grant(agent_principal(), Vec::new())
+                },
+            ),
+        ];
+
+        for (label, grant) in cases {
+            let result = issuing_key().issue_access_token(grant, Duration::minutes(5));
+            assert!(
+                matches!(result, Err(IssueError::InvalidPrincipalKind)),
+                "{label}: {result:?}"
+            );
+        }
+
+        let bound = issuing_key().issue_access_token(
+            grant(
+                TokenPrincipalRef {
+                    card_ref: Some(card_ref(CardKind::Verifier)),
+                    ..system.clone()
+                },
+                Vec::new(),
+            ),
+            Duration::minutes(5),
+        );
+        assert!(
+            matches!(bound, Err(IssueError::InvalidCardRef)),
+            "{bound:?}"
+        );
+
+        let refresh = issuing_key().issue_refresh_token(
+            PrincipalKindTag::System,
+            system.id,
+            tenant_id(),
+            Utc::now(),
+            Duration::days(30),
+        );
+        assert!(
+            matches!(refresh, Err(IssueError::InvalidPrincipalKind)),
+            "{refresh:?}"
+        );
+    }
+
+    /// The internal SYSTEM writer projection scoped to one UID-bearing
+    /// Verifier, as the tenant issuer builds it.
+    ///
+    /// # Panics
+    /// Panics when a static identity component is invalid.
+    fn system_principal() -> TokenPrincipalRef {
+        let verifier = CardRef {
+            uid: Some(
+                wyrd_spec::ids::CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11")
+                    .expect("static uid is valid"),
+            ),
+            ..card_ref(CardKind::Verifier)
+        };
+        TokenPrincipalRef {
+            id: principal_id("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b04"),
+            kind: PrincipalKindTag::System,
+            tenant_id: tenant_id(),
+            card_ref: None,
+            card_ref_scope: CardRefScope::own(&verifier),
+        }
+    }
+
     #[test]
     fn issue_refresh_token_is_principal_generic() {
         let token = issuing_key()
@@ -840,6 +1157,26 @@ mod tests {
         assert_eq!(claims.sub, claims.principal_id.to_string());
         assert_eq!(claims.tenant_id, tenant_id());
         assert_eq!(claims.jti.len(), 26);
+    }
+
+    /// Refresh issuance refuses the reserved capture identity under every
+    /// kind, so no long-lived credential can ever be minted for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any reserved shape yields a token or a different error.
+    #[test]
+    fn issue_refresh_token_refuses_the_reserved_capture_identity() {
+        for kind in [PrincipalKindTag::Service, PrincipalKindTag::User] {
+            let result = issuing_key().issue_refresh_token(
+                kind,
+                GATEWAY_CAPTURE_PRINCIPAL,
+                tenant_id(),
+                Utc::now(),
+                Duration::days(30),
+            );
+            assert!(matches!(result, Err(IssueError::InvalidPrincipalKind)));
+        }
     }
 
     #[test]

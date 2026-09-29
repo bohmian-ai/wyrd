@@ -533,7 +533,7 @@ fn parse_upload_id(value: &str) -> Result<UploadId, WyrdErrorResponse> {
 ///
 /// Storage initialization permits the header to be omitted, while a supplied
 /// value must be valid UTF-8 and satisfy the shared `IdempotencyKey` contract.
-fn extract_idempotency_key(
+pub(crate) fn extract_idempotency_key(
     headers: &HeaderMap,
 ) -> Result<Option<IdempotencyKey>, WyrdErrorResponse> {
     headers

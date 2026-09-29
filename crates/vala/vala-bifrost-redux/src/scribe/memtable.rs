@@ -759,26 +759,6 @@ impl Memtable {
             .is_some_and(|entries| entries.iter().any(ImmutableEntry::is_pending)))
     }
 
-    /// Snapshot every active seal-key currently held by the memtable whose
-    /// tenant equals `tenant`. Used by `ScribeImpl::force_seal` to drive a
-    /// per-tenant seal loop without exposing the private `MemtableBucket` type.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
-    pub fn active_seal_keys_for_tenant(
-        &self,
-        tenant: DataTenantId,
-    ) -> Result<Vec<SealKey>, ScribeError> {
-        let buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
-            detail: format!("memtable bucket lock poisoned: {e}"),
-        })?;
-        Ok(buckets
-            .keys()
-            .filter(|k| k.tenant == tenant)
-            .cloned()
-            .collect())
-    }
-
     /// Snapshot all active seal-keys held by this shard's memtable.
     ///
     /// Under batch-spread routing a shard may hold buckets for any (tenant,
@@ -797,23 +777,41 @@ impl Memtable {
         Ok(buckets.keys().cloned().collect())
     }
 
-    /// Snapshot writable and pending immutable seal keys for one tenant.
-    pub fn seal_keys_for_tenant(&self, tenant: DataTenantId) -> Result<Vec<SealKey>, ScribeError> {
-        let writable = self.active_seal_keys_for_tenant(tenant)?;
+    /// Snapshot writable and pending immutable seal keys for one tenant table.
+    ///
+    /// Only keys of `table` are collected, so a listing never copies the
+    /// tenant's other tables. The result may repeat a key held both writable
+    /// and pending; the caller deduplicates.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if either memtable lock is poisoned.
+    pub fn seal_keys_for_table(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<SealKey>, ScribeError> {
+        let matches = |key: &SealKey| key.tenant == tenant && key.table == *table;
+        let mut keys = self
+            .writable
+            .lock()
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("memtable bucket lock poisoned: {e}"),
+            })?
+            .keys()
+            .filter(|key| matches(key))
+            .cloned()
+            .collect::<Vec<_>>();
         let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
-        let mut keys = writable;
         keys.extend(
             immutable
                 .iter()
                 .filter(|(key, entries)| {
-                    key.tenant == tenant && entries.iter().any(ImmutableEntry::is_pending)
+                    matches(key) && entries.iter().any(ImmutableEntry::is_pending)
                 })
                 .map(|(key, _)| key.clone()),
         );
-        keys.sort_by_key(ToString::to_string);
-        keys.dedup();
         Ok(keys)
     }
 
@@ -888,29 +886,6 @@ impl Memtable {
             }
         }
         selected
-    }
-
-    /// Select exactly one globally oldest writable WAL victim.
-    pub(crate) fn select_oldest_wal_victim(candidates: &[PressureCandidate]) -> Option<SealKey> {
-        candidates
-            .iter()
-            .filter_map(|candidate| {
-                candidate.oldest_wal_lsn.map(|lsn| {
-                    (
-                        lsn,
-                        candidate.first_insert_at,
-                        candidate.seal_key.to_string(),
-                        candidate.seal_key.clone(),
-                    )
-                })
-            })
-            .min_by(|left, right| {
-                left.0
-                    .cmp(&right.0)
-                    .then_with(|| left.1.cmp(&right.1))
-                    .then_with(|| left.2.cmp(&right.2))
-            })
-            .map(|(_, _, _, seal_key)| seal_key)
     }
 
     /// Return writable and immutable append batches for one exact partition range.
@@ -1002,9 +977,11 @@ impl Memtable {
                     if matches!(entry.state, ImmutableState::Durable { .. }) {
                         continue;
                     }
-                    entry
-                        .frozen
-                        .append_readable_batches(required_columns, &mut batches)?;
+                    entry.frozen.append_readable_batches(
+                        required_columns,
+                        self.ordinal(entry.seal_id),
+                        &mut batches,
+                    )?;
                 }
             }
         }
@@ -1017,10 +994,11 @@ impl Memtable {
     /// one consistent moment rather than two.
     ///
     /// Publication is not decided here and is not inferred from WAL positions.
-    /// A generation whose rows a durable member already serves is marked
-    /// [`ImmutableState::Durable`] before that member becomes readable, and the
-    /// collector skips exactly those; every generation this cut still returns is
-    /// one nothing else serves. WAL records are numbered from one node-global
+    /// The collector skips a generation already marked
+    /// [`ImmutableState::Durable`], and tags every other immutable batch with
+    /// its generation. A member's runs become readable before the shard marks
+    /// its generation durable, so the live-tail reader resolves staged runs
+    /// after this cut and skips the generations it tagged. WAL records are numbered from one node-global
     /// counter while generations are sealed per tenant, table, partition, and
     /// shard, so a published member's bounds routinely enclose positions a live
     /// generation owns, and treating that containment as ownership would drop
@@ -1507,6 +1485,7 @@ impl MemtableBucket {
             &self.batches,
             &self.metas,
             self.seal_key.partition,
+            None,
             &projection,
             output,
         )
@@ -1637,6 +1616,13 @@ pub struct ReadableBatch {
     pub meta: ScribeAppendMeta,
     /// Arrow rows for the append.
     pub batch: RecordBatch,
+    /// Registry identity of the immutable generation serving the rows, or
+    /// `None` for rows still in a writable bucket.
+    ///
+    /// A generation's staged runs become readable before the shard learns its
+    /// member is durable, so for a moment both sources hold the same rows. The
+    /// reader uses this to take such a generation from exactly one of them.
+    pub generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
 }
 
 /// Immutable count and byte ceilings for one shallow live-tail snapshot.
@@ -1726,12 +1712,17 @@ impl FrozenMemtable {
 
     /// Appends this immutable generation through the bounded shallow collector.
     ///
+    /// Every batch is tagged with `generation`, the registry identity of this
+    /// generation, so a caller can tell which generations the cut served and
+    /// must not also read from their staged runs.
+    ///
     /// # Errors
     ///
     /// Returns the collector capacity or Arrow projection error unchanged.
     fn append_readable_batches(
         &self,
         required_columns: &[String],
+        generation: crate::scribe::hot_source::GenerationOrdinal,
         output: &mut ReadableBatchCollector,
     ) -> Result<(), ScribeError> {
         let projection = projection_indices(&self.schema, required_columns)?;
@@ -1739,6 +1730,7 @@ impl FrozenMemtable {
             &self.batches,
             &self.metas,
             self.seal_key.partition,
+            Some(generation),
             &projection,
             output,
         )
@@ -1751,11 +1743,13 @@ impl FrozenMemtable {
 ///
 /// Returns [`ScribeError::IngestBusy`] before projection when the configured
 /// batch or retained-byte ceiling would be exceeded, or an internal error when
-/// byte arithmetic or Arrow projection fails.
+/// byte arithmetic or Arrow projection fails. Each batch carries `generation`,
+/// the serving immutable generation or `None` for a writable bucket.
 fn append_projected_batches(
     batches: &[RecordBatch],
     metas: &[ScribeAppendMeta],
     partition_day: crate::catalog::layout::TimePartition,
+    generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
     projection: &[usize],
     output: &mut ReadableBatchCollector,
 ) -> Result<(), ScribeError> {
@@ -1770,6 +1764,7 @@ fn append_projected_batches(
             partition_day,
             meta: meta.clone(),
             batch,
+            generation,
         });
     }
     Ok(())
@@ -2783,35 +2778,8 @@ mod tests {
     }
 
     #[test]
-    fn wal_pressure_flushes_exactly_one_global_oldest_bucket() {
-        let first = make_test_seal_key();
-        let second = SealKey::new(
-            first.tenant,
-            first.table.clone(),
-            crate::test_support::day_partition(2026, 7, 15),
-        );
-        let now = Instant::now();
-        let selected = Memtable::select_oldest_wal_victim(&[
-            PressureCandidate {
-                seal_key: first,
-                writable_bytes: 200,
-                first_insert_at: now,
-                oldest_wal_lsn: Some(crate::scribe::wal::WalLsn::new(11)),
-            },
-            PressureCandidate {
-                seal_key: second.clone(),
-                writable_bytes: 100,
-                first_insert_at: now,
-                oldest_wal_lsn: Some(crate::scribe::wal::WalLsn::new(10)),
-            },
-        ]);
-        assert_eq!(selected, Some(second));
-    }
-
-    #[test]
     fn stale_pressure_key_is_a_noop() {
         assert!(Memtable::select_pressure_victims(Vec::new(), 1).is_empty());
-        assert!(Memtable::select_oldest_wal_victim(&[]).is_none());
     }
 
     #[test]

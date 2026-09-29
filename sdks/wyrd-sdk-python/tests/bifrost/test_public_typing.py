@@ -41,6 +41,7 @@ def test_described_field_types_are_recursive_without_any() -> None:
         "correlation_fields": [],
         "managed_candidates": [],
         "canonical_physical_fingerprint": "canonical-fp",
+        "compaction_target_file_size_bytes": 1_073_741_824,
         "physical_layout": {
             "partition_granularity": "Hour",
             "sort_keys": [{"column": "trace_id", "direction": "Ascending", "null_order": "Last"}],
@@ -55,6 +56,7 @@ def test_described_field_types_are_recursive_without_any() -> None:
     assert inner["Struct"][0]["name"] == "inner"
     assert description["user_fields"][0]["metadata"]["PARQUET:field_id"] == "7"
     assert description["canonical_physical_fingerprint"] == "canonical-fp"
+    assert description["compaction_target_file_size_bytes"] == 1_073_741_824
     assert description["physical_layout"]["sort_keys"][0]["column"] == "trace_id"
 
 

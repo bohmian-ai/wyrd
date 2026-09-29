@@ -1,6 +1,6 @@
 ---
 title: Card kinds
-description: The 16 native card kinds plus External, grouped by domain, with what each declares and its shipping status.
+description: The 15 native card kinds plus External, grouped by domain, with what each declares and its shipping status.
 pillar: wyrd
 group: Concepts
 order: 3
@@ -9,7 +9,7 @@ order: 3
 # Card kinds
 
 A `kind` selects the spec schema a card carries. The envelope is always the same;
-the kind changes the payload, not the ontology. The v1 doctrine defines 16 native
+the kind changes the payload, not the ontology. The v1 doctrine defines 15 native
 kinds plus `External` for forward compatibility.
 
 <Aside title="Three kinds run end-to-end" data-variant="wyrd">
@@ -97,8 +97,7 @@ kinds** — declaring one as a registered, versioned card — are spec-only for 
     { header: 'Status' }
   ]}
   rows={[
-    ['Drift', 'A drift monitor over a model or prompt.', { text: 'Spec-only', badge: 'warn' }],
-    ['Eval', 'An evaluation definition.', { text: 'Spec-only', badge: 'warn' }],
+    ['Verifier', { text: 'One reusable judgment with a <code>drift</code> or <code>eval</code> implementation, bound to a Service, component, or Agent through <code>verified_by</code>.', html: true }, { text: 'Spec-only', badge: 'warn' }],
     ['Source', 'A reference to external data Wyrd reads.', { text: 'Spec-only', badge: 'warn' }]
   ]}
 />
@@ -112,8 +111,8 @@ kinds** — declaring one as a registered, versioned card — are spec-only for 
     { header: 'Status' }
   ]}
   rows={[
-    ['Trigger', 'An event that starts declared work.', { text: 'Spec-only', badge: 'warn' }],
-    ['Operator', 'A reactive operator within a workflow.', { text: 'Spec-only', badge: 'warn' }]
+    ['Trigger', { text: 'When a bound Verifier runs: <code>schedule</code> (drift) or <code>observations_ready</code> (eval).', html: true }, { text: 'Spec-only', badge: 'warn' }],
+    ['Operator', { text: 'One <code>notify</code> or <code>http</code> reaction to a failed verification.', html: true }, { text: 'Spec-only', badge: 'warn' }]
   ]}
 />
 
@@ -121,7 +120,7 @@ kinds** — declaring one as a registered, versioned card — are spec-only for 
 
 `External` is the forward-compatibility escape hatch: a typed placeholder for a
 component Wyrd does not natively model as a kind. It exists so a card graph can
-reference something outside the 16 native kinds without inventing a private shape.
+reference something outside the 15 native kinds without inventing a private shape.
 Spec-only.
 
 ## Not card kinds

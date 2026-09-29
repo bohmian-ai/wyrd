@@ -5,7 +5,9 @@
 //! module owns is [`build_app_grpc`]: the single code path that mounts the
 //! Gate-served ingest service, shared by `main.rs` and the `wyrd-testing`
 //! harness. The ingest service itself is `vala_bifrost_redux::gate::Gate`; this
-//! module binds the socket and wraps it in transport admission, nothing more.
+//! module binds the socket and wraps the ingest services in transport
+//! admission, nothing more. The public query service keeps tonic's default
+//! decoded-message ceiling and is not charged against ingest admission.
 pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
@@ -29,6 +31,7 @@ use std::task::{Context, Poll};
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use tower::Service;
+use vala_bifrost_redux::gate::IngestError;
 use wyrd_tonic::tonic::Status;
 use wyrd_tonic::tonic::body::Body;
 use wyrd_tonic::tonic::codegen::http::{Request, Response};
@@ -264,6 +267,19 @@ where
                     );
                 }
             };
+            // A message above the one wire ceiling is the caller's payload,
+            // not occupied capacity: refuse it with the typed ingest 413
+            // before tonic decodes a byte of it.
+            if let Some(bytes) = declared
+                && bytes > admission.message_limit_bytes()
+            {
+                return Ok(IngestError::PayloadTooLarge {
+                    bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                    limit: u64::try_from(admission.message_limit_bytes()).unwrap_or(u64::MAX),
+                }
+                .into_status()
+                .into_http());
+            }
             let lease = declared.map_or_else(
                 || admission.try_acquire_unknown(),
                 |bytes| admission.try_acquire(bytes),
@@ -334,11 +350,8 @@ where
             metrics,
             transport.clone(),
         ))
-        .add_service(GrpcTransportAdmissionService::new(logs, transport.clone()))
-        .add_service(GrpcTransportAdmissionService::new(
-            bifrost_query.into_server(),
-            transport,
-        )))
+        .add_service(GrpcTransportAdmissionService::new(logs, transport))
+        .add_service(bifrost_query.into_server()))
 }
 
 /// Selects the role-owned peer security audit for this process.
@@ -409,21 +422,10 @@ pub fn build_peer_grpc(
         ),
     ));
     let router = match state.bifrost_ingest() {
-        Some(scribe) => router.add_service(
-            auth.wrap(GrpcTransportAdmissionService::new_peer(
-                match scribe.tail_authority() {
-                    Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
-                        state.clone(),
-                        scribe.tail_reader(),
-                        authority,
-                    )
-                    .into_server(),
-                    None => scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_reader())
-                        .into_server(),
-                },
-                transport.clone(),
-            )),
-        ),
+        Some(scribe) => router.add_service(auth.wrap(GrpcTransportAdmissionService::new_peer(
+            scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_service()).into_server(),
+            transport.clone(),
+        ))),
         None => router,
     };
     let router = match state
@@ -481,7 +483,7 @@ mod tests {
     use wyrd_tonic::tonic::codegen::Bytes;
 
     use vala_bifrost_redux::gate::limits::{
-        BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES, BifrostTransportAdmission,
+        BIFROST_INGEST_REQUEST_LIMIT_BYTES, BifrostTransportAdmission,
     };
 
     /// Minimal tonic-shaped service recording admission state before body decode.
@@ -711,7 +713,8 @@ mod tests {
         assert_eq!(head.declared(), Ok(None));
     }
 
-    /// Actual gRPC frame length admits the exact cap and refuses one byte over.
+    /// Actual gRPC frame length admits the exact cap and refuses one byte over
+    /// with the typed payload-too-large refusal.
     ///
     /// # Panics
     ///
@@ -727,7 +730,7 @@ mod tests {
             admission: admission.clone(),
         };
         let service = GrpcTransportAdmissionService::new(probe.clone(), admission.clone());
-        let request = Request::new(framed_body(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES));
+        let request = Request::new(framed_body(BIFROST_INGEST_REQUEST_LIMIT_BYTES));
         service
             .oneshot(request)
             .await
@@ -735,13 +738,13 @@ mod tests {
         assert!(invoked.load(Ordering::Acquire));
         assert_eq!(
             observed_bytes.load(Ordering::Acquire),
-            BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
+            BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
         assert_eq!(admission.used_bytes(), 0);
 
         invoked.store(false, Ordering::Release);
         let service = GrpcTransportAdmissionService::new(probe, admission.clone());
-        let request = Request::new(framed_body(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES + 1));
+        let request = Request::new(framed_body(BIFROST_INGEST_REQUEST_LIMIT_BYTES + 1));
         let response = service
             .oneshot(request)
             .await
@@ -752,6 +755,14 @@ mod tests {
                 .get("grpc-status")
                 .and_then(|value| value.to_str().ok()),
             Some("8")
+        );
+        let refusal = Status::from_header_map(response.headers()).expect("a gRPC refusal status");
+        assert_eq!(
+            wyrd_tonic::tonic_types::StatusExt::get_error_details(&refusal)
+                .error_info()
+                .map(|info| info.reason.as_str()),
+            Some("WYRD_VALA_413_PAYLOAD_TOO_LARGE"),
+            "an over-ceiling message is the typed payload refusal"
         );
         assert!(!invoked.load(Ordering::Acquire));
         assert_eq!(admission.used_bytes(), 0);

@@ -24,14 +24,10 @@ use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryExecutionPath};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::process_cluster::BifrostProcessCluster;
-use wyrd_testing::bifrost::process_cluster::{
-    OracleOwnershipSnapshot, ProcessNode, ProcessNodeTarget,
-};
+use wyrd_testing::bifrost::process_cluster::{OracleOwnershipSnapshot, ProcessNodeTarget};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_tonic::query_conversion::QueryStreamConverter;
 use wyrd_tonic::wyrd::v1 as proto;
@@ -71,8 +67,6 @@ const SELF_JOIN_RESULT: [(i64, i64, i32); 8] = [
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
         sql: sql.to_owned(),
-        visibility: VisibilityMode::PublishedOnly,
-        freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(30_000),
     }
 }
@@ -468,32 +462,6 @@ const PEER_SCRIBE: usize = 3;
 /// remaining unit stays available to the Interactive floor.
 const ANALYTICAL_GRAPH_UNITS: u32 = 2;
 
-/// Builds one public client against one pod's public HTTP and gRPC listeners.
-///
-/// # Errors
-///
-/// Returns the client configuration error.
-fn public_client(
-    node: &ProcessNode,
-    api_key: &secrecy::SecretString,
-) -> Result<WyrdClient, JourneyError> {
-    Ok(WyrdClient::with_config(
-        wyrd_client::config::ClientConfig {
-            grpc: wyrd_client::transport::GrpcConfig {
-                endpoint: format!("http://{}", node.grpc_addr()),
-                connect_retries: 0,
-                ..wyrd_client::transport::GrpcConfig::default()
-            },
-            http: wyrd_client::transport::HttpConfig {
-                base_url: format!("http://{}", node.http_addr()),
-                ..wyrd_client::transport::HttpConfig::default()
-            },
-            credential: Some(api_key.clone()),
-            ..wyrd_client::config::ClientConfig::default()
-        },
-    )?)
-}
-
 /// What one public query settled to over the real public HTTP surface.
 struct PublicSettlement {
     /// Rows the caller decoded.
@@ -512,8 +480,23 @@ struct PublicSettlement {
 ///
 /// Returns a transport, protocol, Arrow, or missing-terminal error.
 async fn run_public(client: &WyrdClient, sql: &str) -> Result<PublicSettlement, JourneyError> {
+    run_public_request(client, &request(sql)).await
+}
+
+/// Drives one exact public request, including its own deadline, to settlement.
+///
+/// [`run_public`] fixes the journey's ordinary deadline; a case that must
+/// observe a deadline expire while the query waits supplies its own.
+///
+/// # Errors
+///
+/// Returns a transport, protocol, Arrow, or missing-terminal error.
+async fn run_public_request(
+    client: &WyrdClient,
+    request: &BifrostQueryRequest,
+) -> Result<PublicSettlement, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
-        .query(&request(sql))
+        .query(request)
         .await?;
     let deadline_ms = stream.deadline_ms();
     let mut rows = 0_usize;
@@ -938,7 +921,7 @@ async fn prove_preparation_deadline(
         .parse()?;
     let mut frames = response.into_inner();
     let mut ipc = QueryIpcDecoder::new();
-    let mut converter = QueryStreamConverter::new(VisibilityMode::PublishedOnly);
+    let mut converter = QueryStreamConverter::new();
     let mut terminal = None;
     while let Some(frame) = frames.next().await {
         let frame = frame?;
@@ -1158,7 +1141,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     cluster.nodes_mut()[paused].await_execute_paused()?;
     // The pause proves the graph reached a follower; the leader's own granted
     // unit count is what proves it holds the whole Analytical envelope, which
-    // is the condition the refusal below is a statement about.
+    // is the condition the queued timeout below is a statement about.
     await_admitted(&mut cluster, COORDINATOR, ANALYTICAL_GRAPH_UNITS).await?;
 
     // Served, exactly, while an Analytical graph on the same pod holds its
@@ -1177,11 +1160,15 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     }
 
     // The pod's whole Analytical class is held, so one more Analytical
-    // statement has no capacity of its own. It may wait for a held graph to
-    // release or be refused outright; what it may never do is settle Analytical
-    // while the class is fully owned.
-    match run_public(&client, &analytical_sql).await {
-        Err(error) if error.to_string().contains("query admission rejected") => {}
+    // statement has no capacity of its own. It queues for a held graph to
+    // release, and a short deadline expires while it waits; what it may never
+    // do is settle Analytical while the class is fully owned.
+    let queued = BifrostQueryRequest {
+        sql: analytical_sql.clone(),
+        deadline_ms: Some(2_000),
+    };
+    match run_public_request(&client, &queued).await {
+        Err(error) if error.to_string().contains("query execution timed out") => {}
         Err(error) => {
             return Err(
                 format!("an Analytical query beyond the class capacity failed as {error}").into(),
@@ -1489,14 +1476,12 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         active_queries: 0,
         queued_queries: 0,
         reserved_memory_bytes: 0,
-        reserved_spill_bytes: 0,
         peer_pending: 0,
         peer_running: 0,
         root_active_queries: 0,
         root_analytical_queries: 0,
         root_query_slot_units: 0,
         root_query_memory_used_bytes: 0,
-        root_query_scratch_used_bytes: 0,
         root_query_active: false,
         scratch: wyrd_testing::bifrost::process_cluster::ScratchUsage {
             entries: 0,

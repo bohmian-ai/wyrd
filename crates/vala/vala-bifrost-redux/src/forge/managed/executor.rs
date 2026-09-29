@@ -72,6 +72,9 @@ pub struct ForgePlannedAttempt {
     pub evidence: ForgeRewriteEvidence,
     /// Every real plan the core produced, in planner order.
     pub plans: Vec<ForgePlannedRewrite>,
+    /// Geometry resolved once for this attempt; every plan's execution,
+    /// publication, and audit read it rather than re-resolving the table.
+    pub policy: ForgeTablePolicy,
 }
 
 impl Forge {
@@ -255,6 +258,7 @@ impl ForgeManagedRewrite {
             table,
             evidence,
             plans: planned,
+            policy,
         })
     }
 
@@ -264,7 +268,9 @@ impl ForgeManagedRewrite {
     /// no snapshot, derived from this plan's own inputs and this rewrite's own
     /// outputs. Sibling plans contribute nothing to it: each plan is published
     /// independently, so a combined handoff would ask publication to remove
-    /// inputs a different plan is still rewriting.
+    /// inputs a different plan is still rewriting. `policy` is the geometry
+    /// [`Self::plan`] resolved for this attempt, so every plan writes under
+    /// the same file target its publication and audit record.
     ///
     /// # Errors
     ///
@@ -279,6 +285,7 @@ impl ForgeManagedRewrite {
         &self,
         planned: ForgePlannedRewrite,
         table: &Table,
+        policy: &ForgeTablePolicy,
     ) -> Result<RewriteHandoff, ForgeError> {
         let table_ident = self.binding.table_ident();
         let bloom_columns = crate::catalog::layout::PhysicalLayout::bloom_columns_from_property(
@@ -288,7 +295,6 @@ impl ForgeManagedRewrite {
                 .get(crate::catalog::layout::BLOOM_COLUMNS_PROPERTY),
         )
         .map_err(|detail| ForgeError::InvalidConfig { detail })?;
-        let policy = ForgeTablePolicy::extract(table.metadata(), &self.core.config)?;
         let config = policy.to_core_config(
             self.attempt_id.to_string(),
             &bloom_columns,

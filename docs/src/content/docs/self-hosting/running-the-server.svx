@@ -220,7 +220,7 @@ See [Configuration](/self-hosting/configuration/) for every field these steps re
 
 ## Graceful shutdown
 
-Send `SIGINT` or `SIGTERM`. The server stops accepting new connections, lets in-flight requests finish within `shutdown.drain_ms` (default 15s), flushes telemetry, and exits `0`. Requests still running when the drain deadline passes are aborted.
+Send `SIGINT` or `SIGTERM`. The server stops accepting new connections, lets in-flight requests finish within `shutdown.drain_ms` (default 35s, which includes the verification runtime's 30-second drain), flushes telemetry, and exits `0`. Requests still running when the drain deadline passes are aborted.
 
 In Kubernetes, set `terminationGracePeriodSeconds` above `shutdown.drain_ms` so the drain completes before the pod is killed.
 

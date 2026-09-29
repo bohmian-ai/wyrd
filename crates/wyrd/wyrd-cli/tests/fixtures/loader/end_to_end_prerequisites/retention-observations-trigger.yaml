@@ -1,0 +1,9 @@
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  space: wyrd-team
+  name: retention-observations-ready
+  version: "1.0.0"
+spec:
+  description: Run the guardrail on every committed observation batch.
+  kind: observations_ready

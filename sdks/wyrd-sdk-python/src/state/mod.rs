@@ -11,6 +11,7 @@ use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 use wyrd_cards::card_ref::{CardRefPy, Kind};
 use wyrd_cards::{agent::PyAgentCard, data::DataCard, model::ModelCard, prompt::PromptCard};
+use wyrd_client::bifrost::client_from_options;
 use wyrd_client::cards::{CardSelector, Cards};
 use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
 use wyrd_loader::{LoadError, RegistrationInput};
@@ -27,6 +28,9 @@ use wyrd_spec::registry::{
 };
 
 use wyrd_client::state::WyrdState;
+
+use crate::bifrost::PyTableConfig;
+use crate::observe::PyRun;
 
 /// Python state hydration boundary and all-or-nothing holder owner.
 mod hydrator;
@@ -137,6 +141,73 @@ impl PyWyrdState {
             models: hydrated.models,
             data: hydrated.data,
         })
+    }
+
+    /// Connect this state's one Bifrost writer and describe both fixed tables.
+    ///
+    /// The four arguments are `Bifrost(...)`'s and pass straight through to it,
+    /// including its environment and default resolution. Synchronous because a
+    /// caller starts Bifrost once at application start, not on a hot path.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SDK_409_BIFROST_ALREADY_STARTED` when this state already
+    /// started Bifrost, `WYRD_SDK_409_BIFROST_CLOSED` after a successful
+    /// shutdown, and the catalog error for a missing credential, an undialable
+    /// ingest channel, or a missing, unauthorized, or incompatible fixed
+    /// observation table.
+    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None))]
+    fn start_bifrost(
+        &self,
+        py: Python<'_>,
+        table: Option<PyTableConfig>,
+        server_url: Option<&str>,
+        credential: Option<&str>,
+        grpc_url: Option<&str>,
+    ) -> CardPyResult<()> {
+        let client = client_from_options(server_url, credential, grpc_url)
+            .map_err(|error| WyrdPyError::from(WyrdError::from(error)))?;
+        let table = table.map(PyTableConfig::into_native);
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(self.inner.start_bifrost_with(&client, table))
+        })
+        .map_err(WyrdPyError::from)
+    }
+
+    /// Open one invocation over this state, targeting the root Service Card.
+    ///
+    /// Local only: no network IO, no server-side Run resource, and no Verifier
+    /// execution.
+    fn run(&self) -> PyRun {
+        PyRun::new(self.inner.run())
+    }
+
+    /// Drain every producer of this state's writer without closing it.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the first producer or
+    /// sink failure from the drain.
+    fn flush(&self, py: Python<'_>) -> CardPyResult<()> {
+        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.flush()))
+            .map_err(WyrdPyError::from)
+    }
+
+    /// Drain every producer of this state's writer and close it to writes.
+    ///
+    /// Call this once at graceful application shutdown, not after each
+    /// observation: queue admission is not a durable acknowledgement, so an
+    /// abrupt exit before this returns can lose pending rows. After an ambiguous
+    /// failure, retry `shutdown()` on the same state rather than replacing the
+    /// writer.
+    ///
+    /// # Errors
+    ///
+    /// Raises the first producer or sink failure from the drain.
+    fn shutdown(&self, py: Python<'_>) -> CardPyResult<()> {
+        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.shutdown()))
+            .map_err(WyrdPyError::from)
     }
 
     /// Return the persistent root Service envelope without reading payloads.
@@ -254,32 +325,21 @@ impl PyWyrdState {
     fn prompt(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PromptCard>> {
         typed_prompt(py, &self.inner, alias, &self.prompts)
     }
-    /// Return the persistent kind-checked Eval envelope without payload reads.
+    /// Return the persistent kind-checked Verifier envelope without payload reads.
+    ///
+    /// Mirrors `WyrdState::verifier`: one accessor covers every Verifier
+    /// implementation, whose typed body lives under `spec.implementation`.
     ///
     /// # Errors
     ///
     /// Returns unknown-alias, kind-mismatch, or invalid-state errors.
-    fn eval(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PyCardEnvelope>> {
+    fn verifier(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PyCardEnvelope>> {
         envelope_inner(
             &self.inner,
             &self.envelopes,
             py,
             alias,
-            Some(CardKind::Eval),
-        )
-    }
-    /// Return the persistent kind-checked Drift envelope without payload reads.
-    ///
-    /// # Errors
-    ///
-    /// Returns unknown-alias, kind-mismatch, or invalid-state errors.
-    fn drift(&self, py: Python<'_>, alias: &str) -> CardPyResult<Py<PyCardEnvelope>> {
-        envelope_inner(
-            &self.inner,
-            &self.envelopes,
-            py,
-            alias,
-            Some(CardKind::Drift),
+            Some(CardKind::Verifier),
         )
     }
     /// Return the persistent kind-checked Workflow envelope without payload reads.
@@ -2955,8 +3015,7 @@ fn kind_from_card_kind(kind: &CardKind) -> Kind {
         CardKind::Prompt => Kind::Prompt,
         CardKind::Agent => Kind::Agent,
         CardKind::Workflow => Kind::Workflow,
-        CardKind::Eval => Kind::Eval,
-        CardKind::Drift => Kind::Drift,
+        CardKind::Verifier => Kind::Verifier,
         CardKind::Service => Kind::Service,
         CardKind::Policy => Kind::Policy,
         CardKind::Mcp => Kind::Mcp,

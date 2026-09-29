@@ -4,9 +4,7 @@
 //! existing `wyrd_spec::vala::eval::ids::*` imports continue to resolve.
 
 pub use crate::ids::DataTenantId;
-pub use crate::vala::ids::{
-    EntityUid, LeaseToken, RecordId, RunId, SessionId, SpanId, TraceId, WorkflowUid,
-};
+pub use crate::vala::ids::{EntityUid, RecordId, RunId, SessionId, SpanId, TraceId, WorkflowUid};
 
 use std::str::FromStr;
 use std::sync::OnceLock;

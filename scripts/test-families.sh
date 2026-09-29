@@ -10,6 +10,7 @@ FAMILY_WYRD=(
   wyrd-cards
   wyrd-cli
   wyrd-config
+  wyrd-gateway
   wyrd-interfaces
   wyrd-mcp
   wyrd-server
@@ -34,7 +35,6 @@ FAMILY_SKALD=(
 
 FAMILY_VALA=(
   vala-bifrost-redux
-  vala-core
   vala-drift
   vala-eval
   vala-ingest

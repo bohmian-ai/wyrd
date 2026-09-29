@@ -276,7 +276,7 @@ impl QueryClient {
                 )
             })?;
         Ok(QueryResultStream::new(
-            RawQueryStream::new(response.bytes_stream(), request.visibility),
+            RawQueryStream::new(response.bytes_stream()),
             request_id,
             self.clone(),
             deadline_ms,
@@ -421,7 +421,7 @@ pub struct RawQueryStream {
 
 impl RawQueryStream {
     /// Creates a raw stream over arbitrary response chunks.
-    fn new<S>(body: S, visibility: wyrd_spec::vala::api::VisibilityMode) -> Self
+    fn new<S>(body: S) -> Self
     where
         S: Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     {
@@ -429,7 +429,7 @@ impl RawQueryStream {
             body: Box::pin(body),
             decoder: FrameDecoder::new(MAX_FRAME_BYTES),
             pending: VecDeque::new(),
-            converter: QueryStreamConverter::new(visibility),
+            converter: QueryStreamConverter::new(),
             ipc: QueryIpcDecoder::new(),
             terminal: None,
             received_bytes: 0,
@@ -1291,9 +1291,8 @@ mod tests {
     use tokio::net::TcpListener;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame, QuerySource,
-        QueryTerminalError, QueryTerminalErrorCode, QueryWarning, SourceCompletion,
-        SourceCompletionOutcome, VisibilityMode,
+        QueryBatchFrame, QueryErrorDetail, QuerySchemaFrame, QuerySource, QueryTerminalError,
+        QueryTerminalErrorCode, QueryWarning, SourceCompletion, SourceCompletionOutcome,
     };
     use wyrd_tonic::frame_codec::FrameEncoder;
     use wyrd_tonic::wyrd::v1 as proto;
@@ -1374,7 +1373,7 @@ mod tests {
     ) -> QueryResultStream {
         let body = stream::iter(chunks.into_iter().map(|chunk| Ok(Bytes::from(chunk))));
         QueryResultStream::new(
-            RawQueryStream::new(body, VisibilityMode::PublishedOnly),
+            RawQueryStream::new(body),
             RequestId::now_v7(),
             client_for(base_url),
             deadline_ms,
@@ -1456,11 +1455,7 @@ mod tests {
             encoded(QueryStreamFrame::Batch(QueryBatchFrame {
                 arrow_ipc_batch: batch.clone(),
             })),
-            encoded(QueryStreamFrame::Terminal(success_terminal(
-                VisibilityMode::PublishedOnly,
-                3,
-                eos,
-            ))),
+            encoded(QueryStreamFrame::Terminal(success_terminal(3, eos))),
         ];
 
         // A stream that reached its terminal owes the server nothing.
@@ -1517,11 +1512,7 @@ mod tests {
                 encoded(QueryStreamFrame::Batch(QueryBatchFrame {
                     arrow_ipc_batch: wide,
                 })),
-                encoded(QueryStreamFrame::Terminal(success_terminal(
-                    VisibilityMode::PublishedOnly,
-                    5,
-                    eos,
-                ))),
+                encoded(QueryStreamFrame::Terminal(success_terminal(5, eos))),
             ],
             &base_url,
             deadline_in(30_000),
@@ -1642,7 +1633,7 @@ mod tests {
         let counts = Arc::new(LifecycleCounts::default());
         let base_url = lifecycle_server(Arc::clone(&counts));
         let mut truncated = QueryResultStream::new(
-            RawQueryStream::new(truncated_body().await, VisibilityMode::PublishedOnly),
+            RawQueryStream::new(truncated_body().await),
             RequestId::now_v7(),
             client_for(&base_url),
             deadline_in(30_000),
@@ -1670,20 +1661,12 @@ mod tests {
             encoded(QueryStreamFrame::Batch(QueryBatchFrame {
                 arrow_ipc_batch: batch.clone(),
             })),
-            encoded(QueryStreamFrame::Terminal(success_terminal(
-                VisibilityMode::PublishedOnly,
-                3,
-                eos.clone(),
-            ))),
+            encoded(QueryStreamFrame::Terminal(success_terminal(3, eos.clone()))),
         ];
         for (label, trailing) in [
             (
                 "a duplicate terminal",
-                encoded(QueryStreamFrame::Terminal(success_terminal(
-                    VisibilityMode::PublishedOnly,
-                    3,
-                    eos.clone(),
-                ))),
+                encoded(QueryStreamFrame::Terminal(success_terminal(3, eos.clone()))),
             ),
             (
                 "a late schema",
@@ -1963,7 +1946,7 @@ mod tests {
             },
         );
         QueryResultStream::new(
-            RawQueryStream::new(body, VisibilityMode::PublishedOnly),
+            RawQueryStream::new(body),
             RequestId::now_v7(),
             client_for(base_url),
             deadline_ms,
@@ -2023,8 +2006,7 @@ mod tests {
             .send()
             .await
             .expect("response headers arrive");
-        let mut stream =
-            RawQueryStream::new(response.bytes_stream(), VisibilityMode::PublishedOnly);
+        let mut stream = RawQueryStream::new(response.bytes_stream());
 
         let error = stream
             .next_frame()
@@ -2254,9 +2236,9 @@ mod tests {
         (prefix, eos)
     }
 
-    /// Builds the exact complete source set required by the visibility mode.
-    fn sources(visibility: VisibilityMode) -> Vec<SourceCompletion> {
-        let mut values = vec![
+    /// Builds the complete three-tier source set every terminal carries.
+    fn sources() -> Vec<SourceCompletion> {
+        vec![
             SourceCompletion {
                 source: QuerySource::Iceberg,
                 outcome: SourceCompletionOutcome::Complete,
@@ -2265,29 +2247,21 @@ mod tests {
                 source: QuerySource::HotSealed,
                 outcome: SourceCompletionOutcome::Complete,
             },
-        ];
-        if visibility == VisibilityMode::Fused {
-            values.push(SourceCompletion {
+            SourceCompletion {
                 source: QuerySource::LiveTail,
                 outcome: SourceCompletionOutcome::Complete,
-            });
-        }
-        values
+            },
+        ]
     }
 
-    /// Builds a successful terminal for the supplied visibility, rows, and EOS.
-    fn success_terminal(
-        visibility: VisibilityMode,
-        rows: u64,
-        arrow_ipc_eos: Vec<u8>,
-    ) -> QueryTerminalFrame {
+    /// Builds a successful terminal for the supplied rows and EOS.
+    fn success_terminal(rows: u64, arrow_ipc_eos: Vec<u8>) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            freshness: QueryFreshness::Complete,
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: rows,
             warnings: Vec::new(),
-            source_completion: sources(visibility),
+            source_completion: sources(),
             error: None,
             arrow_ipc_eos,
         }
@@ -2297,7 +2271,6 @@ mod tests {
     fn degraded_terminal(rows: u64, arrow_ipc_eos: Vec<u8>) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Degraded,
-            freshness: QueryFreshness::Degraded,
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: rows,
             warnings: vec![QueryWarning::LiveTailUnavailable],
@@ -2324,11 +2297,10 @@ mod tests {
     fn failed_terminal(rows: u64) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            freshness: QueryFreshness::Complete,
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: rows,
             warnings: Vec::new(),
-            source_completion: sources(VisibilityMode::PublishedOnly),
+            source_completion: sources(),
             error: Some(QueryTerminalError {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
                 detail: None,
@@ -2344,10 +2316,10 @@ mod tests {
     }
 
     /// Builds a result stream over arbitrary already-encoded response chunks.
-    fn result_stream(chunks: Vec<Vec<u8>>, visibility: VisibilityMode) -> QueryResultStream {
+    fn result_stream(chunks: Vec<Vec<u8>>) -> QueryResultStream {
         let body = stream::iter(chunks.into_iter().map(|chunk| Ok(Bytes::from(chunk))));
         QueryResultStream::new(
-            RawQueryStream::new(body, visibility),
+            RawQueryStream::new(body),
             RequestId::now_v7(),
             offline_client(),
             0,
@@ -2386,7 +2358,7 @@ mod tests {
             arrow_ipc_schema: prefix,
         });
         let proto = proto::QueryStreamFrame::from(schema);
-        let mut converter = QueryStreamConverter::new(VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         converter
             .convert(proto.clone(), None)
             .expect("schema accepted");
@@ -2419,7 +2391,7 @@ mod tests {
     #[tokio::test]
     async fn bifrost_query_eof_before_terminal_is_rejected() {
         let body = stream::empty::<Result<Bytes, reqwest::Error>>();
-        let mut stream = RawQueryStream::new(body, VisibilityMode::PublishedOnly);
+        let mut stream = RawQueryStream::new(body);
         assert!(matches!(
             stream.next_frame().await,
             Err(BifrostClientError::IncompleteQueryStream)
@@ -2437,7 +2409,7 @@ mod tests {
             let schema = test_schema();
             let (mut ipc, prefix) = TestQueryIpc::open(&schema);
             let batch = ipc.batch(&schema, &[1, 2]);
-            let terminal = success_terminal(VisibilityMode::PublishedOnly, 2, ipc.close());
+            let terminal = success_terminal(2, ipc.close());
             let (sender, mut receiver) = tokio::sync::mpsc::channel(3);
             for frame in [
                 QueryStreamFrame::Schema(QuerySchemaFrame {
@@ -2463,7 +2435,7 @@ mod tests {
                 polled
             });
             let mut result = QueryResultStream::new(
-                RawQueryStream::new(body, VisibilityMode::PublishedOnly),
+                RawQueryStream::new(body),
                 RequestId::now_v7(),
                 offline_client(),
                 deadline_in(if case == "expired" { 200 } else { 30_000 }),
@@ -2551,13 +2523,9 @@ mod tests {
             encoded(QueryStreamFrame::Batch(QueryBatchFrame {
                 arrow_ipc_batch: batch,
             })),
-            encoded(QueryStreamFrame::Terminal(success_terminal(
-                VisibilityMode::PublishedOnly,
-                2,
-                eos,
-            ))),
+            encoded(QueryStreamFrame::Terminal(success_terminal(2, eos))),
         ];
-        let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
+        let mut result = result_stream(chunks);
         let batch = result
             .next_batch()
             .await
@@ -2585,7 +2553,7 @@ mod tests {
             })),
             encoded(QueryStreamFrame::Terminal(degraded_terminal(0, eos))),
         ];
-        let mut result = result_stream(chunks, VisibilityMode::Fused);
+        let mut result = result_stream(chunks);
         assert!(
             result
                 .next_batch()
@@ -2612,14 +2580,10 @@ mod tests {
                 schema_fingerprint: "zero-row-fingerprint".to_owned(),
                 arrow_ipc_schema: prefix,
             })),
-            encoded(QueryStreamFrame::Terminal(success_terminal(
-                VisibilityMode::PublishedOnly,
-                0,
-                eos,
-            ))),
+            encoded(QueryStreamFrame::Terminal(success_terminal(0, eos))),
         ];
 
-        let result = result_stream(chunks, VisibilityMode::PublishedOnly)
+        let result = result_stream(chunks)
             .collect_bounded(CollectedQueryLimits {
                 max_rows: 1,
                 max_encoded_bytes: usize::MAX,
@@ -2644,13 +2608,11 @@ mod tests {
     async fn bifrost_query_collection_rejects_missing_schema() {
         let (_prefix, eos) = empty_ipc(&test_schema());
         let chunks = vec![encoded(QueryStreamFrame::Terminal(success_terminal(
-            VisibilityMode::PublishedOnly,
-            0,
-            eos,
+            0, eos,
         )))];
 
         assert!(
-            result_stream(chunks, VisibilityMode::PublishedOnly)
+            result_stream(chunks)
                 .collect_bounded(CollectedQueryLimits {
                     max_rows: 1,
                     max_encoded_bytes: usize::MAX,
@@ -2671,7 +2633,7 @@ mod tests {
             })),
             encoded(QueryStreamFrame::Terminal(failed_terminal(0))),
         ];
-        let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
+        let mut result = result_stream(chunks);
         let error = result
             .next_batch()
             .await
@@ -2719,7 +2681,7 @@ mod tests {
                 encoded(QueryStreamFrame::Terminal(failed_terminal(0))),
                 encoded(follower),
             ];
-            let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
+            let mut result = result_stream(chunks);
             let error = result
                 .next_batch()
                 .await
@@ -2770,12 +2732,10 @@ mod tests {
             })));
         }
         body.extend(encoded(QueryStreamFrame::Terminal(success_terminal(
-            VisibilityMode::PublishedOnly,
-            16,
-            eos,
+            16, eos,
         ))));
 
-        let mut result = result_stream(vec![body], VisibilityMode::PublishedOnly);
+        let mut result = result_stream(vec![body]);
         let mut rows = Vec::new();
         let mut consumed = prefix.len();
         for fragment in &fragments {
@@ -2853,7 +2813,7 @@ mod tests {
                 arrow_ipc_batch: standalone,
             })),
         ];
-        let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
+        let mut result = result_stream(chunks);
         assert!(matches!(
             result.next_batch().await,
             Err(BifrostClientError::Arrow(_))
@@ -2906,12 +2866,11 @@ mod tests {
             }))
         }));
         chunks.push(encoded(QueryStreamFrame::Terminal(success_terminal(
-            VisibilityMode::PublishedOnly,
             6,
             eos.clone(),
         ))));
 
-        let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
+        let mut result = result_stream(chunks);
         let mut rows = Vec::new();
         while let Some(batch) = result.next_batch().await.expect("split stream decodes") {
             assert_eq!(batch.schema().as_ref(), schema.as_ref());
@@ -2946,13 +2905,11 @@ mod tests {
             })),
             encoded(QueryStreamFrame::Terminal(QueryTerminalFrame {
                 arrow_ipc_eos: Vec::new(),
-                ..success_terminal(VisibilityMode::PublishedOnly, 0, eos.clone())
+                ..success_terminal(0, eos.clone())
             })),
         ];
         assert!(matches!(
-            result_stream(missing_eos, VisibilityMode::PublishedOnly)
-                .next_batch()
-                .await,
+            result_stream(missing_eos).next_batch().await,
             Err(BifrostClientError::Protocol(_)),
         ));
 
@@ -2960,9 +2917,7 @@ mod tests {
             arrow_ipc_batch: batches[0].clone(),
         }))];
         assert!(matches!(
-            result_stream(orphan_batch, VisibilityMode::PublishedOnly)
-                .next_batch()
-                .await,
+            result_stream(orphan_batch).next_batch().await,
             Err(BifrostClientError::Protocol(_))
         ));
 
@@ -3002,13 +2957,9 @@ mod tests {
             encoded(QueryStreamFrame::Batch(QueryBatchFrame {
                 arrow_ipc_batch: batch.clone(),
             })),
-            encoded(QueryStreamFrame::Terminal(success_terminal(
-                VisibilityMode::PublishedOnly,
-                2,
-                eos,
-            ))),
+            encoded(QueryStreamFrame::Terminal(success_terminal(2, eos))),
         ];
-        let rows = result_stream(chunks.clone(), VisibilityMode::PublishedOnly)
+        let rows = result_stream(chunks.clone())
             .collect_bounded(CollectedQueryLimits {
                 max_rows: 1,
                 max_encoded_bytes: usize::MAX,
@@ -3016,7 +2967,7 @@ mod tests {
             .await;
         assert!(matches!(rows, Err(BifrostClientError::ResultTooLarge)));
 
-        let bytes = result_stream(chunks, VisibilityMode::PublishedOnly)
+        let bytes = result_stream(chunks)
             .collect_bounded(CollectedQueryLimits {
                 max_rows: usize::MAX,
                 max_encoded_bytes: batch.len().saturating_sub(1),
@@ -3043,18 +2994,14 @@ mod tests {
             schema_fingerprint: "wide-schema".to_owned(),
             arrow_ipc_schema: prefix,
         }));
-        let terminal_frame = encoded(QueryStreamFrame::Terminal(success_terminal(
-            VisibilityMode::PublishedOnly,
-            0,
-            eos,
-        )));
+        let terminal_frame = encoded(QueryStreamFrame::Terminal(success_terminal(0, eos)));
         let encoded_bytes = schema_frame
             .len()
             .checked_add(terminal_frame.len())
             .expect("test response byte count fits usize");
         let chunks = vec![schema_frame, terminal_frame];
 
-        let rejected = result_stream(chunks.clone(), VisibilityMode::PublishedOnly)
+        let rejected = result_stream(chunks.clone())
             .collect_bounded(CollectedQueryLimits {
                 max_rows: 0,
                 max_encoded_bytes: encoded_bytes.saturating_sub(1),
@@ -3062,7 +3009,7 @@ mod tests {
             .await;
         assert!(matches!(rejected, Err(BifrostClientError::ResultTooLarge)));
 
-        let accepted = result_stream(chunks, VisibilityMode::PublishedOnly)
+        let accepted = result_stream(chunks)
             .collect_bounded(CollectedQueryLimits {
                 max_rows: 0,
                 max_encoded_bytes: encoded_bytes,
@@ -3099,12 +3046,9 @@ mod tests {
     #[test]
     fn bifrost_query_drop_releases_response_stream() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let raw = RawQueryStream::new(
-            DropTrackedStream {
-                dropped: Arc::clone(&dropped),
-            },
-            VisibilityMode::PublishedOnly,
-        );
+        let raw = RawQueryStream::new(DropTrackedStream {
+            dropped: Arc::clone(&dropped),
+        });
         drop(raw);
         assert!(dropped.load(Ordering::SeqCst));
     }

@@ -45,12 +45,18 @@ use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 /// 256 MiB unmanaged reserve is the budget the query grant is derived from. A
 /// Scribe or Forge pod is sized to complete one table lifecycle instead, which
 /// its own boot-time capacity check refuses to do inside the Oracle envelope.
-const fn pod_system_resources(
+///
+/// `memory_limit_bytes` replaces that per-target envelope only for the
+/// benchmark launch, whose container enforces the same bytes; every journey
+/// topology passes `None`.
+pub(super) const fn pod_system_resources(
     target: ProcessNodeTarget,
+    memory_limit_bytes: Option<usize>,
 ) -> vala_bifrost_redux::resources::SystemResourceSnapshot {
-    let memory_limit_bytes = match target {
-        ProcessNodeTarget::Oracle => 512 * 1024 * 1024,
-        _ => 2 * 1024 * 1024 * 1024,
+    let memory_limit_bytes = match (memory_limit_bytes, target) {
+        (Some(bytes), _) => bytes,
+        (None, ProcessNodeTarget::Oracle) => 512 * 1024 * 1024,
+        (None, _) => 2 * 1024 * 1024 * 1024,
     };
     vala_bifrost_redux::resources::SystemResourceSnapshot {
         memory_limit_bytes,
@@ -182,8 +188,9 @@ async fn serve() -> Result<(), ProcessClusterError> {
                 start_id,
                 rows,
                 groups,
+                publish,
             } => match config
-                .ingest_rows(&server, &table, start_id, rows, groups)
+                .ingest_rows(&server, &table, start_id, rows, groups, publish)
                 .await
             {
                 Ok(()) => emit(&ControlResponse::Ingested)?,
@@ -283,6 +290,14 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     count: wyrd_server::grpc::peer_body_polls(),
                 })?;
             }
+            ControlRequest::ScribeFragments => match server.state().bifrost_ingest() {
+                Some(scribe) => emit(&ControlResponse::ScribeFragments {
+                    executions: scribe.fragment_inspection().0,
+                })?,
+                None => emit(&ControlResponse::Failed {
+                    detail: "this target composes no Scribe".to_owned(),
+                })?,
+            },
             ControlRequest::ExecuteInactiveSql { sql } => {
                 match config.execute_inactive_sql(&server, &sql).await {
                     Ok(rows) => emit(&ControlResponse::Executed { rows })?,
@@ -415,6 +430,14 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: "the inactive-query slot is empty".to_owned(),
                 })?,
             },
+            ControlRequest::CaptureResourceEvidence { directory } => {
+                match capture_resource_evidence(&server, &telemetry, &directory) {
+                    Ok(evidence) => emit(&ControlResponse::ResourceEvidence(evidence))?,
+                    Err(error) => emit(&ControlResponse::Failed {
+                        detail: error.to_string(),
+                    })?,
+                }
+            }
             ControlRequest::Shutdown => {
                 emit(&ControlResponse::ShuttingDown)?;
                 break;
@@ -507,15 +530,15 @@ fn arm_execute_pause(
     Ok(pause)
 }
 
-/// Installs this child's log subscriber on stderr when `RUST_LOG` asks for one.
+/// Installs this child's log subscriber on stderr when `WYRD_LOG`, else `RUST_LOG`, asks for one.
 ///
 /// Stderr, never stdout: stdout carries the control protocol, and a log line
 /// written there would be read by the parent as a malformed response. The
-/// subscriber is installed only when `RUST_LOG` is set, so a lane run stays
+/// subscriber is installed only when either variable is set, so a lane run stays
 /// silent and a diagnosing run gets the child's own view of a multi-process
 /// failure, which the parent otherwise cannot see at all.
 fn install_child_tracing() {
-    let Ok(filter) = std::env::var("RUST_LOG") else {
+    let Ok(filter) = std::env::var("WYRD_LOG").or_else(|_| std::env::var("RUST_LOG")) else {
         return;
     };
     let subscriber = tracing_subscriber::fmt()
@@ -579,6 +602,9 @@ struct ChildConfig {
     /// one. `None` keeps the memory-derived count every pod ran on before a
     /// journey needed to saturate an admission class deterministically.
     oracle_query_slot_limit: Option<usize>,
+    /// Memory envelope this child's plan is resolved from, when the benchmark
+    /// launch states one. `None` keeps the per-target journey envelope.
+    memory_limit_bytes: Option<usize>,
 }
 
 /// Accepts one query's rows only behind a fully validated success terminal.
@@ -597,19 +623,18 @@ struct ChildConfig {
 ///
 /// # Errors
 ///
-/// Returns [`ProcessClusterError::Child`] when the terminal is malformed for
-/// the requested visibility, disagrees with the rows emitted before it, is not
+/// Returns [`ProcessClusterError::Child`] when the terminal is malformed,
+/// disagrees with the rows emitted before it, is not
 /// [`wyrd_spec::vala::api::QueryTerminalOutcome::Success`], or does not close
 /// the decoder with its own explicit Arrow IPC end-of-stream.
 fn accept_query_terminal(
     terminal: &wyrd_spec::vala::api::QueryTerminalFrame,
-    visibility: wyrd_spec::vala::api::VisibilityMode,
     emitted_rows: usize,
     decoder: &mut vala_bifrost_redux::oracle::QueryIpcDecoder,
 ) -> Result<usize, ProcessClusterError> {
     let child = |detail: String| ProcessClusterError::Child(detail);
     terminal
-        .validate(visibility)
+        .validate()
         .map_err(|error| child(error.to_string()))?;
     terminal
         .validate_emitted_rows(u64::try_from(emitted_rows).unwrap_or(u64::MAX))
@@ -684,6 +709,15 @@ impl ChildConfig {
                     ProcessClusterError::Resource(format!(
                         "{} is not a slot count: {error}",
                         env::ORACLE_QUERY_SLOT_LIMIT
+                    ))
+                })?),
+                Err(_) => None,
+            },
+            memory_limit_bytes: match std::env::var(env::MEMORY_LIMIT_BYTES) {
+                Ok(value) => Some(value.parse().map_err(|error| {
+                    ProcessClusterError::Resource(format!(
+                        "{} is not a byte count: {error}",
+                        env::MEMORY_LIMIT_BYTES
                     ))
                 })?),
                 Err(_) => None,
@@ -771,7 +805,7 @@ impl ChildConfig {
             crate::server::oracle_peer_credentials_from_key(Arc::clone(&fixture), api_key)
                 .await
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-        let storage = wyrd_storage::StorageHandle::from_settings(wyrd_storage::StorageSettings {
+        let storage = crate::server::fixture_storage_handle(wyrd_storage::StorageSettings {
             backend: wyrd_storage::BackendConfig::Local {
                 root: self.storage_root.clone(),
             },
@@ -791,7 +825,10 @@ impl ChildConfig {
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_data_root(self.data_root.clone())
-            .with_system_resources_for_test(pod_system_resources(self.target));
+            .with_system_resources_for_test(pod_system_resources(
+                self.target,
+                self.memory_limit_bytes,
+            ));
         let server = match self.oracle_query_slot_limit {
             Some(slots) => server.with_oracle_query_slot_limit_for_test(slots),
             None => server,
@@ -849,11 +886,12 @@ impl ChildConfig {
             .map_err(|error| ProcessClusterError::Child(error.to_string()))
     }
 
-    /// Writes and publishes deterministic fixture rows through this Scribe.
+    /// Writes deterministic fixture rows through this Scribe, optionally publishing them.
     ///
     /// The batch is admitted through the same logical ingress seam the public
-    /// write surface uses and then frozen and published, so the rows a later
-    /// query reads are files this pod's own Scribe encoded.
+    /// write surface uses. With `publish` it is then frozen and published, so
+    /// the rows a later query reads are files this pod's own Scribe encoded;
+    /// without it the rows stay live on this Scribe.
     ///
     /// # Errors
     ///
@@ -867,6 +905,7 @@ impl ChildConfig {
         start_id: i64,
         rows: i64,
         groups: i64,
+        publish: bool,
     ) -> Result<(), ProcessClusterError> {
         let child = ProcessClusterError::Child;
         let scribe = server
@@ -903,10 +942,12 @@ impl ChildConfig {
             })
             .await
             .map_err(|error| child(error.to_string()))?;
-        server
-            .flush_bifrost()
-            .await
-            .map_err(|error| child(error.to_string()))?;
+        if publish {
+            server
+                .flush_bifrost()
+                .await
+                .map_err(|error| child(error.to_string()))?;
+        }
         Ok(())
     }
 
@@ -1193,6 +1234,67 @@ fn metric_totals(
     Ok(totals)
 }
 
+/// Writes this process's raw metrics exposition and cgroup files into
+/// `directory` and reports its effective limits, resource plan, and Oracle
+/// slot counts.
+///
+/// The cgroup files are read from this process's own cgroup-v2 directory:
+/// the `0::` entry of `/proc/self/cgroup`, joined under `/sys/fs/cgroup`. On a
+/// host that is the systemd scope the benchmark launched the child in, not the
+/// cgroup root. A file that does not exist — no unified cgroup, or no limit
+/// there — is simply not written and, for the two limits, reported absent.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when this target composed no Bifrost
+/// resources, and [`ProcessClusterError::Resource`] when the plan derives no
+/// Oracle slot count or a file cannot be written. A target without an Oracle
+/// reports no installed slot count.
+fn capture_resource_evidence(
+    server: &WyrdTestServer,
+    telemetry: &crate::bifrost::BifrostTelemetryCapture,
+    directory: &std::path::Path,
+) -> Result<super::ResourceEvidence, ProcessClusterError> {
+    let resource = |error: std::io::Error| ProcessClusterError::Resource(error.to_string());
+    let resources = server
+        .state()
+        .bifrost_resources()
+        .ok_or_else(|| ProcessClusterError::Child("no Bifrost resources composed".to_owned()))?;
+    let plan = resources.plan();
+    let plan_oracle_slots = vala_bifrost_redux::resources::oracle_worker_slots(plan)
+        .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
+    let oracle_slot_units = resources
+        .oracle()
+        .map(|oracle| usize::try_from(oracle.class_split().total_units()).unwrap_or(usize::MAX));
+    std::fs::write(directory.join("metrics.prom"), telemetry.render()).map_err(resource)?;
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|entries| {
+            entries
+                .lines()
+                .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+        });
+    let mut limits = std::collections::BTreeMap::new();
+    if let Some(cgroup) = &cgroup {
+        let path = std::path::Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/'));
+        for file in super::CGROUP_EVIDENCE_FILES {
+            if let Ok(contents) = std::fs::read_to_string(path.join(file)) {
+                std::fs::write(directory.join(file), &contents).map_err(resource)?;
+                limits.insert(file, contents.trim().to_owned());
+            }
+        }
+    }
+    Ok(super::ResourceEvidence {
+        cgroup,
+        cpu_max: limits.remove("cpu.max"),
+        memory_max: limits.remove("memory.max"),
+        plan_memory_limit_bytes: plan.memory_limit_bytes,
+        plan_effective_cpu: plan.effective_cpu,
+        plan_oracle_slots,
+        oracle_slot_units,
+    })
+}
+
 /// Resolves this child's own Oracle engine.
 ///
 /// # Errors
@@ -1262,8 +1364,6 @@ async fn drive_inactive_sql(
                 context,
                 wyrd_spec::vala::api::BifrostQueryRequest {
                     sql: sql.to_owned(),
-                    visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
-                    freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                     deadline_ms: Some(STATEMENT_DEADLINE_MS.cast_signed()),
                 },
                 attempt,
@@ -1292,12 +1392,7 @@ async fn drive_inactive_sql(
         }
         let terminal = terminal
             .ok_or_else(|| child("the inactive attempt emitted no terminal frame".to_owned()))?;
-        accept_query_terminal(
-            &terminal,
-            wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
-            rows,
-            &mut decoder,
-        )
+        accept_query_terminal(&terminal, rows, &mut decoder)
     }
 }
 
@@ -1647,7 +1742,6 @@ fn ownership_snapshot(
         active_queries: runtime.active_queries,
         queued_queries: runtime.queued_queries,
         reserved_memory_bytes: runtime.reserved_memory_bytes,
-        reserved_spill_bytes: runtime.reserved_spill_bytes,
         peer_pending: runtime.peer_pending,
         peer_running: runtime.peer_running,
         root_active_queries: root.oracle_active_queries,
@@ -1655,7 +1749,6 @@ fn ownership_snapshot(
         root_query_slot_units: root.oracle_query_slot_units,
         root_query_memory_used_bytes: u64::try_from(root.oracle_query_memory_used_bytes)
             .unwrap_or(u64::MAX),
-        root_query_scratch_used_bytes: root.oracle_query_scratch_used_bytes,
         root_query_active: root.oracle_query_active,
         scratch,
         attempts_active: gauge("bifrost_oracle_analytical_attempts_active"),
@@ -1746,9 +1839,8 @@ mod tests {
     use std::sync::Arc;
 
     use wyrd_spec::vala::api::{
-        QueryFreshness, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
-        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
-        VisibilityMode,
+        QuerySource, QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame,
+        QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
     };
 
     use super::{ProcessClusterError, accept_query_terminal, settled_analytical_evidence};
@@ -1799,7 +1891,6 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            freshness: QueryFreshness::Complete,
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: u64::try_from(emitted).expect("a fixture row count fits a u64"),
             warnings: Vec::new(),
@@ -1812,6 +1903,10 @@ mod tests {
                     source: QuerySource::HotSealed,
                     outcome: SourceCompletionOutcome::Complete,
                 },
+                SourceCompletion {
+                    source: QuerySource::LiveTail,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
             ],
             error: Some(QueryTerminalError {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
@@ -1820,15 +1915,10 @@ mod tests {
             arrow_ipc_eos: Vec::new(),
         };
         failed
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .expect("the fixture terminal is structurally valid on its own");
 
-        let refused = accept_query_terminal(
-            &failed,
-            VisibilityMode::PublishedOnly,
-            emitted,
-            &mut decoder,
-        );
+        let refused = accept_query_terminal(&failed, emitted, &mut decoder);
         assert!(
             matches!(refused, Err(ProcessClusterError::Child(_))),
             "rows preceding a failed terminal are not a result: {refused:?}"

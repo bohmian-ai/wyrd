@@ -27,7 +27,7 @@ use wyrd_spec::auth::{
 };
 use wyrd_sql::queries::auth::{
     grant_role_to_service_account, insert_api_key, insert_service_account, list_api_key_metadata,
-    revoke_api_key, role_by_name, tenant_admin_principal_id,
+    provision_system_principal, revoke_api_key, role_by_name, tenant_admin_principal_id,
 };
 use wyrd_sql::queries::platform::provisioning::{
     insert_provisioning_tenant, mark_tenant_active, mark_tenant_failed, set_tenant_suspended,
@@ -420,11 +420,14 @@ impl TenantProvisioning {
             .map_err(|e| ProvisionError::Store(e.to_string()))
     }
 
-    /// Create the tenant's administrative principal, roles, and credential.
+    /// Create the tenant's administrative principal, roles, and credential,
+    /// and its internal verification-result writer.
     ///
     /// One tenant-scoped transaction: the principal, its builtin roles, its
-    /// administrative grant, and its credential all commit together, so the
-    /// tenant either has a complete way in or none at all.
+    /// administrative grant, its credential, and the credentialless SYSTEM
+    /// writer all commit together, so the tenant either has a complete way in
+    /// or none at all. SYSTEM provisioning is idempotent, so a resumed attempt
+    /// keeps the writer a failed one already created.
     ///
     /// # Errors
     /// Returns [`ProvisionError::Store`] when any write fails.
@@ -435,6 +438,9 @@ impl TenantProvisioning {
         created_by: Uuid,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
         seed_builtin_roles_for_tenant(&mut conn, data_tenant_id)
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        provision_system_principal(&mut conn)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 

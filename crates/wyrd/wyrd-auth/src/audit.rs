@@ -73,8 +73,8 @@ pub fn auth_event(
 /// Map a stored `principal_kind` column value onto its audit tag.
 ///
 /// One owner for both planes: `platform.principals` stores `global_admin` or
-/// `user`, `wyrd.auth_service_accounts` stores `tenant_admin`, `service`, or
-/// `agent`, and `wyrd.auth_users` stores `user`. Unknown values are recorded as
+/// `user`, `wyrd.auth_service_accounts` stores `tenant_admin`, `service`,
+/// `agent`, or `system`, and `wyrd.auth_users` stores `user`. Unknown values are recorded as
 /// `Service`, the non-human default; the grant paths reject unknown kinds
 /// before any event is built.
 #[must_use]
@@ -84,6 +84,7 @@ pub fn principal_kind_tag(value: &str) -> PrincipalKindTag {
         "tenant_admin" => PrincipalKindTag::TenantAdmin,
         "user" => PrincipalKindTag::User,
         "agent" => PrincipalKindTag::Agent,
+        "system" => PrincipalKindTag::System,
         _ => PrincipalKindTag::Service,
     }
 }

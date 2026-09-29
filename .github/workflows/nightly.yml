@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
+  # release.yml calls this as its qualification gate on the release commit.
+  workflow_call:
 
 permissions:
   contents: read

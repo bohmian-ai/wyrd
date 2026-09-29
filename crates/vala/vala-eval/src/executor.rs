@@ -83,9 +83,11 @@ pub struct EvalReport {
     pub outcomes: Vec<TaskRunOutcome>,
 }
 
-/// Rollup summary of an [`EvalReport`] for populating `vala.eval.runs`
-/// workflow-summary columns (B6).
-#[derive(Debug, Clone, PartialEq)]
+/// Rollup summary of an [`EvalReport`]'s workflow-level pass/fail counts.
+///
+/// Serializes with its field names so a verification result persists it
+/// verbatim as the canonical Eval `details` JSON.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct EvalWorkflowSummary {
     /// Total tasks that ran (skipped tasks excluded).
     pub total_tasks: i32,
@@ -116,7 +118,7 @@ impl EvalReport {
         })
     }
 
-    /// Compute the workflow-level summary for populating `vala.eval.runs` columns.
+    /// Compute the workflow-level pass/fail rollup across every task that ran.
     pub fn workflow_summary(&self) -> EvalWorkflowSummary {
         let mut total = 0i32;
         let mut passed = 0i32;
@@ -724,7 +726,7 @@ mod end_to_end {
     }
 
     fn eval_ref() -> CardRef {
-        card_ref(CardKind::Eval, "end-to-end-rubric")
+        card_ref(CardKind::Verifier, "end-to-end-rubric")
     }
 
     fn subject_ref() -> CardRef {

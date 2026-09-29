@@ -146,7 +146,7 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
                             "agent '{agent}' received Google response with no candidates"
                         ),
                     })?;
-            Ok(MessageNum::Gemini(candidate.content.clone()))
+            Ok(MessageNum::Gemini(candidate.content.clone().into()))
         }
         ProviderResponse::OpenAiResponses(_)
         | ProviderResponse::OpenAiEmbeddings(_)

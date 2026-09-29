@@ -7,10 +7,9 @@ use axum::error_handling::HandleErrorLayer;
 use axum::extract::Request;
 use axum::middleware;
 use tower::ServiceBuilder;
-use tower::limit::ConcurrencyLimitLayer;
-use tower::load_shed::LoadShedLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
+use tracing::Span;
 use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use wyrd_spec::error::WyrdError;
@@ -21,7 +20,7 @@ use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
 use crate::components::authz::authz_router;
 use crate::components::cards::cards_router;
-use crate::components::eval::eval_router;
+use crate::components::gateway::{gateway_ingress_router, gateway_router};
 use crate::components::health::health_router;
 use crate::components::platform::{
     platform_auth_router, platform_credentials_router, platform_identity_router,
@@ -29,6 +28,7 @@ use crate::components::platform::{
 };
 use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
+use crate::components::verification::verification_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::{require_authenticated, require_bifrost_authenticated};
 use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
@@ -64,11 +64,12 @@ pub fn build_router(state: AppState) -> Router {
         ));
     let v1_group = OpenApiRouter::new()
         .merge(storage_router(&state))
-        .merge(eval_router())
         .merge(authz_router())
         .merge(cards_router())
         .merge(principals_router())
+        .merge(verification_router())
         .merge(admin_router())
+        .merge(gateway_router())
         .merge(otlp_router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -95,7 +96,9 @@ pub fn build_router(state: AppState) -> Router {
     // Routing and documentation come out of the same composition: every handler
     // is registered once, through `routes!`, and the served document is
     // whatever that registration produced. There is no second list of paths to
-    // keep in step with this one.
+    // keep in step with this one. Gateway inference sits outside `/v1`'s
+    // default-deny layer because each protocol authenticates its own SDK
+    // credential carrier, but it is documented by the same composition.
     let (routed, mut document) = OpenApiRouter::with_openapi(WyrdApiDoc::openapi())
         .merge(auth_routes)
         .merge(platform_auth_router())
@@ -103,6 +106,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(platform_router())
         .merge(platform_identity_router())
         .merge(platform_credentials_router())
+        .merge(gateway_ingress_router(&state))
         .nest("/v1", v1_group)
         .split_for_parts();
     // The document-wide modifiers run after composition because both of them
@@ -127,7 +131,22 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::http::middleware::metrics::track_metrics,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
+}
+
+/// Opens the root span of one HTTP request.
+///
+/// It records the method, path, and version but never the query: a URL-borne
+/// credential, such as a provider SDK's `?key=` that ingress refuses, is
+/// already in the request when this span opens, before any authentication
+/// runs, and must not reach logs or exported traces.
+fn request_span(request: &Request) -> Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        path = request.uri().path(),
+        version = ?request.version(),
+    )
 }
 
 /// Apply the core protective edge stack to `router`: request-id propagation,
@@ -147,8 +166,9 @@ pub fn build_router(state: AppState) -> Router {
 ///   1. attach_request_id — mints/propagates ID; injects instance into errors
 ///   2. CatchPanic — converts panics to 500 before they escape the stack
 ///   3. HandleErrorLayer — maps BoxError (Elapsed, Overloaded) → HTTP response
-///   4. LoadShed — sheds requests when ConcurrencyLimit is not ready
-///   5. ConcurrencyLimitLayer — caps in-flight requests
+///   4. EdgeCapacity (two layers) — load-sheds requests beyond the in-flight
+///      concurrency cap; `POST /v1/query` bypasses both and waits in Oracle's bounded
+///      query queue instead
 ///   6. EdgeTimeout — enforces the per-request deadline; `POST /v1/query`
 ///      hands its remaining wait to the Oracle query deadline after admission
 ///   7. WyrdBodyLimit — enforces max body size
@@ -161,8 +181,11 @@ where
         .layer(HandleErrorLayer::new(
             crate::http::error::map_tower_error_to_wyrd,
         ))
-        .layer(LoadShedLayer::new())
-        .layer(ConcurrencyLimitLayer::new(state.limits.concurrency))
+        .layer(
+            crate::http::middleware::edge_capacity::EdgeCapacityLayer::new(
+                state.limits.concurrency,
+            ),
+        )
         .layer(crate::http::middleware::edge_timeout::EdgeTimeoutLayer::new(state.limits.timeout))
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,

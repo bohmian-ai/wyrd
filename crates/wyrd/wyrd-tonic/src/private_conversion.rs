@@ -117,35 +117,6 @@ impl From<domain::TimePartitionWire> for proto::TimePartition {
     }
 }
 
-impl TryFrom<proto::TailCursor> for domain::TailCursor {
-    type Error = PrivateConversionError;
-
-    /// Decodes a tail cursor and validates its batch UUID.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] when `batch_id` is not a UUID.
-    fn try_from(value: proto::TailCursor) -> Result<Self, Self::Error> {
-        Ok(Self {
-            writer_epoch: value.writer_epoch,
-            wal_lsn: value.wal_lsn,
-            batch_id: uuid_bytes(&value.batch_id, "batch_id")?,
-            row_ordinal: value.row_ordinal,
-        })
-    }
-}
-
-impl From<domain::TailCursor> for proto::TailCursor {
-    /// Encodes a validated tail cursor for the private peer wire.
-    fn from(value: domain::TailCursor) -> Self {
-        Self {
-            writer_epoch: value.writer_epoch,
-            wal_lsn: value.wal_lsn,
-            batch_id: value.batch_id.as_bytes().to_vec(),
-            row_ordinal: value.row_ordinal,
-        }
-    }
-}
-
 impl TryFrom<proto::TenantTableBinding> for domain::TenantTableBinding {
     type Error = PrivateConversionError;
 
@@ -198,238 +169,6 @@ impl From<domain::TailStreamIdentity> for proto::TailStreamIdentity {
         Self {
             node_id: value.node_id.as_uuid().to_string(),
             writer_epoch: value.writer_epoch,
-        }
-    }
-}
-
-impl TryFrom<proto::AcquireTailFenceRequest> for domain::AcquireTailFenceRequest {
-    type Error = PrivateConversionError;
-
-    /// Decodes and validates all bounds of a tail-fence acquisition request.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] for missing nested values, invalid
-    /// identifiers, dates, timestamps, fingerprints, or protocol versions.
-    fn try_from(value: proto::AcquireTailFenceRequest) -> Result<Self, Self::Error> {
-        let version = u16::try_from(value.tail_protocol_version).map_err(|_| {
-            PrivateConversionError::Invalid {
-                field: "tail_protocol_version",
-            }
-        })?;
-        protocol_v1(version, "tail_protocol_version")?;
-        Ok(Self {
-            query_id: uuid_bytes(&value.query_id, "query_id")?,
-            binding: value
-                .binding
-                .ok_or(PrivateConversionError::Missing("binding"))?
-                .try_into()?,
-            time_partition: time_partition(value.time_partition, "time_partition")?,
-            exclusive_sealed: value
-                .exclusive_sealed
-                .ok_or(PrivateConversionError::Missing("exclusive_sealed"))?
-                .try_into()?,
-            deadline: datetime(value.deadline_unix_ms, "deadline_unix_ms")?,
-            schema_fingerprint: domain::SchemaFingerprint::new(value.schema_fingerprint).map_err(
-                |_| PrivateConversionError::Invalid {
-                    field: "schema_fingerprint",
-                },
-            )?,
-            tail_protocol_version: version,
-        })
-    }
-}
-
-impl From<domain::AcquireTailFenceRequest> for proto::AcquireTailFenceRequest {
-    /// Encodes a validated tail-fence acquisition request.
-    fn from(value: domain::AcquireTailFenceRequest) -> Self {
-        Self {
-            query_id: value.query_id.as_bytes().to_vec(),
-            binding: Some(value.binding.into()),
-            time_partition: Some(time_partition_proto(value.time_partition)),
-            exclusive_sealed: Some(value.exclusive_sealed.into()),
-            deadline_unix_ms: unix_millis(value.deadline),
-            schema_fingerprint: value.schema_fingerprint.as_str().to_owned(),
-            tail_protocol_version: u32::from(value.tail_protocol_version),
-            tail_ticket: Vec::new(),
-        }
-    }
-}
-
-impl TryFrom<proto::TailReadFence> for domain::TailReadFence {
-    type Error = PrivateConversionError;
-
-    /// Decodes a read fence and verifies its stream interval and protocol.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] for malformed or missing fields, an
-    /// unsupported protocol, or cursors inconsistent with the fenced stream.
-    fn try_from(value: proto::TailReadFence) -> Result<Self, Self::Error> {
-        let version = u16::try_from(value.tail_protocol_version).map_err(|_| {
-            PrivateConversionError::Invalid {
-                field: "tail_protocol_version",
-            }
-        })?;
-        protocol_v1(version, "tail_protocol_version")?;
-        let stream: domain::TailStreamIdentity = value
-            .stream
-            .ok_or(PrivateConversionError::Missing("stream"))?
-            .try_into()?;
-        let exclusive_sealed: domain::TailCursor = value
-            .exclusive_sealed
-            .ok_or(PrivateConversionError::Missing("exclusive_sealed"))?
-            .try_into()?;
-        let inclusive_live: domain::TailCursor = value
-            .inclusive_live
-            .ok_or(PrivateConversionError::Missing("inclusive_live"))?
-            .try_into()?;
-        if exclusive_sealed.writer_epoch != stream.writer_epoch
-            || inclusive_live.writer_epoch != stream.writer_epoch
-            || inclusive_live.wal_lsn < exclusive_sealed.wal_lsn
-        {
-            return Err(PrivateConversionError::Invalid {
-                field: "tail_interval",
-            });
-        }
-        Ok(Self {
-            fence_id: domain::TailFenceId::new(uuid_bytes(&value.fence_id, "fence_id")?),
-            binding: value
-                .binding
-                .ok_or(PrivateConversionError::Missing("binding"))?
-                .try_into()?,
-            time_partition: time_partition(value.time_partition, "time_partition")?,
-            stream,
-            exclusive_sealed,
-            inclusive_live,
-            schema_fingerprint: domain::SchemaFingerprint::new(value.schema_fingerprint).map_err(
-                |_| PrivateConversionError::Invalid {
-                    field: "schema_fingerprint",
-                },
-            )?,
-            tail_protocol_version: version,
-            expires_at: datetime(value.expires_at_unix_ms, "expires_at_unix_ms")?,
-        })
-    }
-}
-
-impl From<domain::TailReadFence> for proto::TailReadFence {
-    /// Encodes a validated immutable tail-read fence.
-    fn from(value: domain::TailReadFence) -> Self {
-        Self {
-            fence_id: value.fence_id.as_uuid().as_bytes().to_vec(),
-            binding: Some(value.binding.into()),
-            time_partition: Some(time_partition_proto(value.time_partition)),
-            stream: Some(value.stream.into()),
-            exclusive_sealed: Some(value.exclusive_sealed.into()),
-            inclusive_live: Some(value.inclusive_live.into()),
-            schema_fingerprint: value.schema_fingerprint.as_str().to_owned(),
-            tail_protocol_version: u32::from(value.tail_protocol_version),
-            expires_at_unix_ms: unix_millis(value.expires_at),
-            capability: Vec::new(),
-        }
-    }
-}
-
-impl TryFrom<proto::TailPageRequest> for domain::TailPageRequest {
-    type Error = PrivateConversionError;
-
-    /// Decodes one bounded page request against an acquired fence.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] for a malformed fence or cursor UUID,
-    /// or for non-positive row and encoded-byte limits.
-    fn try_from(value: proto::TailPageRequest) -> Result<Self, Self::Error> {
-        positive(value.max_rows, "max_rows")?;
-        positive(value.max_encoded_bytes, "max_encoded_bytes")?;
-        Ok(Self {
-            query_id: uuid_bytes(&value.query_id, "query_id")?,
-            fence_id: domain::TailFenceId::new(uuid_bytes(&value.fence_id, "fence_id")?),
-            after: value
-                .after_cursor
-                .map(|cursor| match cursor {
-                    proto::tail_page_request::AfterCursor::After(value) => value.try_into(),
-                })
-                .transpose()?,
-            max_rows: value.max_rows,
-            max_encoded_bytes: value.max_encoded_bytes,
-        })
-    }
-}
-
-impl From<domain::TailPageRequest> for proto::TailPageRequest {
-    /// Encodes one validated bounded tail-page request.
-    fn from(value: domain::TailPageRequest) -> Self {
-        Self {
-            query_id: value.query_id.as_bytes().to_vec(),
-            fence_id: value.fence_id.as_uuid().as_bytes().to_vec(),
-            after_cursor: value
-                .after
-                .map(Into::into)
-                .map(proto::tail_page_request::AfterCursor::After),
-            max_rows: value.max_rows,
-            max_encoded_bytes: value.max_encoded_bytes,
-            tail_capability: Vec::new(),
-        }
-    }
-}
-
-impl TryFrom<proto::TailPage> for domain::TailPage {
-    type Error = PrivateConversionError;
-
-    /// Decodes a tail page and its optional continuation cursor.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] when the continuation cursor carries
-    /// a malformed batch UUID.
-    fn try_from(value: proto::TailPage) -> Result<Self, Self::Error> {
-        Ok(Self {
-            batches: value.arrow_ipc_batches,
-            next: value
-                .next_cursor
-                .map(|cursor| match cursor {
-                    proto::tail_page::NextCursor::Next(value) => value.try_into(),
-                })
-                .transpose()?,
-            complete: value.complete,
-        })
-    }
-}
-
-impl From<domain::TailPage> for proto::TailPage {
-    /// Encodes tail batches and their optional continuation cursor.
-    fn from(value: domain::TailPage) -> Self {
-        Self {
-            arrow_ipc_batches: value.batches,
-            next_cursor: value
-                .next
-                .map(Into::into)
-                .map(proto::tail_page::NextCursor::Next),
-            complete: value.complete,
-        }
-    }
-}
-
-impl TryFrom<proto::ReleaseTailFenceRequest> for domain::ReleaseTailFenceRequest {
-    type Error = PrivateConversionError;
-
-    /// Decodes the exact fence identity to release.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] when the fence identifier is not a UUID.
-    fn try_from(value: proto::ReleaseTailFenceRequest) -> Result<Self, Self::Error> {
-        Ok(Self {
-            query_id: uuid_bytes(&value.query_id, "query_id")?,
-            fence_id: domain::TailFenceId::new(uuid_bytes(&value.fence_id, "fence_id")?),
-        })
-    }
-}
-
-impl From<domain::ReleaseTailFenceRequest> for proto::ReleaseTailFenceRequest {
-    /// Encodes the exact fence identity to release.
-    fn from(value: domain::ReleaseTailFenceRequest) -> Self {
-        Self {
-            query_id: value.query_id.as_bytes().to_vec(),
-            fence_id: value.fence_id.as_uuid().as_bytes().to_vec(),
-            tail_capability: Vec::new(),
         }
     }
 }
@@ -1556,18 +1295,6 @@ where
     }
 }
 
-/// Requires the exact private protocol version supported in v1.
-///
-/// # Errors
-/// Returns [`PrivateConversionError::Invalid`] for any version other than one.
-fn protocol_v1(value: u16, field: &'static str) -> Result<(), PrivateConversionError> {
-    if value == 1 {
-        Ok(())
-    } else {
-        Err(PrivateConversionError::Invalid { field })
-    }
-}
-
 /// Enforces one hard byte-slice protocol ceiling.
 ///
 /// # Errors
@@ -1941,108 +1668,27 @@ mod tests {
         ));
     }
 
-    /// A valid private tail cursor round-trips its exact row identity.
+    /// Tail discovery bindings and stream identities preserve exact identities.
     #[test]
-    fn tail_cursor_round_trips() {
-        let expected = domain::TailCursor {
-            writer_epoch: 4,
-            wal_lsn: 8,
-            batch_id: uuid::Uuid::now_v7(),
-            row_ordinal: 12,
-        };
-        let actual = domain::TailCursor::try_from(proto::TailCursor::from(expected.clone()))
-            .expect("valid cursor round-trips");
-        assert_eq!(actual, expected);
-    }
-
-    /// Tail acquire, fence, page, and release messages preserve exact identities.
-    #[test]
-    fn private_tail_messages_round_trip() {
+    fn private_tail_discovery_messages_round_trip() {
         let binding = domain::TenantTableBinding {
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
             namespace: "vala".into(),
             table: "traces".into(),
         };
-        let cursor = domain::TailCursor {
+        assert_eq!(
+            domain::TenantTableBinding::try_from(proto::TenantTableBinding::from(binding.clone()))
+                .expect("binding round-trips"),
+            binding
+        );
+        let stream = domain::TailStreamIdentity {
+            node_id: domain::NodeId::new(uuid::Uuid::now_v7()),
             writer_epoch: 4,
-            wal_lsn: 8,
-            batch_id: uuid::Uuid::now_v7(),
-            row_ordinal: 12,
-        };
-        let acquire = domain::AcquireTailFenceRequest {
-            query_id: uuid::Uuid::now_v7(),
-            binding: binding.clone(),
-            time_partition: hour_partition(1_787_493_600_000_000),
-            exclusive_sealed: cursor.clone(),
-            deadline: chrono::DateTime::from_timestamp_millis(50).expect("valid timestamp"),
-            schema_fingerprint: domain::SchemaFingerprint::new("schema-1")
-                .expect("valid schema fingerprint"),
-            tail_protocol_version: 1,
         };
         assert_eq!(
-            domain::AcquireTailFenceRequest::try_from(proto::AcquireTailFenceRequest::from(
-                acquire.clone()
-            ))
-            .expect("acquire round-trips"),
-            acquire
-        );
-
-        let fence = domain::TailReadFence {
-            fence_id: domain::TailFenceId::new(uuid::Uuid::now_v7()),
-            binding,
-            time_partition: hour_partition(1_787_493_600_000_000),
-            stream: domain::TailStreamIdentity {
-                node_id: domain::NodeId::new(uuid::Uuid::now_v7()),
-                writer_epoch: 4,
-            },
-            exclusive_sealed: cursor.clone(),
-            inclusive_live: domain::TailCursor {
-                wal_lsn: 10,
-                ..cursor.clone()
-            },
-            schema_fingerprint: domain::SchemaFingerprint::new("schema-1")
-                .expect("valid schema fingerprint"),
-            tail_protocol_version: 1,
-            expires_at: chrono::DateTime::from_timestamp_millis(100).expect("valid timestamp"),
-        };
-        assert_eq!(
-            domain::TailReadFence::try_from(proto::TailReadFence::from(fence.clone()))
-                .expect("fence round-trips"),
-            fence
-        );
-
-        let page_request = domain::TailPageRequest {
-            query_id: uuid::Uuid::nil(),
-            fence_id: fence.fence_id,
-            after: Some(cursor.clone()),
-            max_rows: 10,
-            max_encoded_bytes: 1024,
-        };
-        assert_eq!(
-            domain::TailPageRequest::try_from(proto::TailPageRequest::from(page_request.clone()))
-                .expect("page request round-trips"),
-            page_request
-        );
-        let page = domain::TailPage {
-            batches: vec![vec![1, 2, 3]],
-            next: Some(cursor),
-            complete: false,
-        };
-        assert_eq!(
-            domain::TailPage::try_from(proto::TailPage::from(page.clone()))
-                .expect("page round-trips"),
-            page
-        );
-        let release = domain::ReleaseTailFenceRequest {
-            query_id: uuid::Uuid::nil(),
-            fence_id: fence.fence_id,
-        };
-        assert_eq!(
-            domain::ReleaseTailFenceRequest::try_from(proto::ReleaseTailFenceRequest::from(
-                release.clone()
-            ))
-            .expect("release round-trips"),
-            release
+            domain::TailStreamIdentity::try_from(proto::TailStreamIdentity::from(stream.clone()))
+                .expect("stream identity round-trips"),
+            stream
         );
     }
 

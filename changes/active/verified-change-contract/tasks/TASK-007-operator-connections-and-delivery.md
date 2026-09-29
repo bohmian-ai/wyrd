@@ -1,11 +1,11 @@
 ---
 id: TASK-007
 kind: implementation
-status: proposed
+status: ready
 spec: SPEC-verified-change-contract
-spec_revision: 32
-requirements: [REQ-097, REQ-098, REQ-099, REQ-138, REQ-139, REQ-140, REQ-141, REQ-142, REQ-143, REQ-145, REQ-146, REQ-147, REQ-148, REQ-149, REQ-150, INV-006, INV-007, INV-011, INV-013, AC-029, AC-030, AC-031]
-depends_on: [TASK-004]
+spec_revision: 35
+requirements: [REQ-097, REQ-098, REQ-099, REQ-138, REQ-139, REQ-140, REQ-141, REQ-142, REQ-143, REQ-145, REQ-146, REQ-147, REQ-148, REQ-149, REQ-150, REQ-152, INV-006, INV-007, INV-011, INV-013, INV-015, AC-029, AC-030, AC-031, AC-033]
+depends_on: [TASK-004, TASK-010]
 ---
 
 ## Outcome and Value
@@ -26,6 +26,12 @@ registration compatibility checks, the supervised Operator worker, SSRF
 screen/pin, provider adapters, limits, and status. `wyrd-client`, SDKs, CLI, and
 MCP project the same contract.
 
+Reuse the current administration patterns: typed path identifiers at the wire
+boundary, one shared-client capability, ambient/file/environment secret input
+that never enters CLI argv or derived `Debug`, and runtime OpenAPI assembled
+from the mounted typed routes. Do not restore a checked-in OpenAPI document or
+generator.
+
 Do not add environment selectors, plaintext persistence/read-secret, a new
 cipher/dependency, credential cache, replica watcher, broker, Alert table,
 provider upload lifecycle, or executable Workflow action. Security validation,
@@ -37,8 +43,9 @@ SSRF pinning, RLS, and auditing may not be simplified away.
    then forced-RLS SQL storage with UUIDv7 identities and audit composition.
 2. Extend `wyrd-crypt` authenticated associated data and envelope operations;
    wire the approved external tenant/version KEK resolver and rotation model.
-3. Expose HTTP/shared-client/SDK/CLI/MCP management operations with write-only
-   secrets and normal permissions.
+3. Expose HTTP/shared-client/SDK/CLI/MCP management operations with typed IDs,
+   write-only secret handling outside CLI argv/debug, normal permissions, and
+   route-owned runtime OpenAPI.
 4. Validate connection/provider/HTTP authority during registration without
    decrypting and freeze bounded failure context/destination per dispatch.
 5. Implement independent leased delivery with approved provider protocols,
@@ -103,15 +110,20 @@ crates.
 **Behavior.** HTTP CRUD, Rust/Python/TypeScript, CLI, and MCP expose identical
 closed operations. Reads require `operators:read`; mutations require
 `operators:write`; MCP writes require explicit write scope. Responses/errors,
-logs, traces, and audit never expose secret bytes or secret selectors.
+logs, traces, audit, CLI argv, and parsed-argument `Debug` never expose secret
+bytes or secret selectors. Typed IDs reach handlers without stringly reparsing,
+and the served OpenAPI document describes the mounted routes and typed IDs.
 
 **RED.** Add real tenant-admin journeys through each surface including
-under-privileged and cross-tenant attempts.
+under-privileged and cross-tenant attempts, CLI secret-argument refusal/debug
+redaction, malformed typed path IDs, and served OpenAPI contract coverage.
 
-**GREEN.** Add shared-client capability and thin language/CLI/MCP projections,
-then regenerate contracts.
+**GREEN.** Add one shared-client capability and thin language/CLI/MCP
+projections, register typed routes in the runtime OpenAPI assembly, and
+regenerate only repository-owned schema/stub artifacts.
 
-**REFACTOR.** Delete surface-specific transports and serializers.
+**REFACTOR.** Delete surface-specific transports and serializers; add no
+checked-in OpenAPI snapshot or generator.
 
 ### Scenario 5 — Registration binds exact credential authority
 
@@ -136,7 +148,8 @@ delivery attempt.
 distinct effective Operator in the same transaction. Passed/inconclusive/
 noncompleted/direct runs create none. Workers acquire global/per-tenant permits
 before short leased claims; sibling success/failure is independent and never
-rewrites result or reruns Verifier.
+rewrites result or reruns Verifier. PostgreSQL assigns and evaluates dispatch
+availability, leases, retry/backoff eligibility, and the five-minute deadline.
 
 **RED.** Add settlement concurrency/idempotency, duplicate Operator, lease
 expiry, retry exhaustion, sibling, restart, fairness, and status cases.
@@ -174,6 +187,8 @@ capability.
 - `AC-029` and `AC-031` pass, including multi-replica rotation and live-smoke
   release evidence outside credential-free fast lanes.
 - No plaintext or key material reaches Postgres/public/diagnostic surfaces.
+- CLI secret inputs never enter argv or parsed-argument `Debug`; runtime
+  OpenAPI and MCP catalogs match their mounted typed operations.
 - HTTP authority/SSRF checks occur before secret attachment on every attempt.
 - Delivery status is durable and independent; no Alert resource exists.
 
@@ -190,7 +205,10 @@ three SDKs, CLI, MCP, OpenAPI/schemas, and local/live provider journeys.
 mise run test:sql
 mise run test:shared
 mise run test:wyrd
-mise run test:e2e
+mise run test:wyrdstate:journey
+mise run test:platform:journey
+mise run test:cli:journey
+mise run test:principals:integration
 mise run test:bifrost:journey:server
 mise run test:bifrost:journey:mcp
 mise run py:test:integration
@@ -217,7 +235,8 @@ credentialed Slack/PagerDuty smoke is gated release evidence, not a fast lane.
 Stop for a different key provider/derivation/rotation contract, new crypto
 dependency, plaintext export, env selectors in Cards, widened HTTP authority,
 new provider, changed retry ceilings, executable Workflow action, exactly-once
-delivery claim, or weaker SSRF/audit/tenancy behavior.
+delivery claim, a checked-in OpenAPI snapshot/generator, secrets accepted in
+CLI argv/debug, or weaker SSRF/audit/tenancy behavior.
 
 ## Authority Links
 

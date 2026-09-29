@@ -242,7 +242,7 @@ fn task_build_rejects_openai_responses_prompt_upfront() {
     let mut prompt = fixture_prompt(false);
     prompt.request = ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
         model: "gpt-4o".to_owned(),
-        input: Vec::new(),
+        input: Vec::new().into(),
         instructions: None,
         text: None,
         tools: None,
@@ -365,7 +365,7 @@ fn workflow_def_validate_graph_rejects_unsupported_prompt_shapes() {
     let mut responses_prompt = fixture_prompt(false);
     responses_prompt.request = ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
         model: "gpt-4o".to_owned(),
-        input: Vec::new(),
+        input: Vec::new().into(),
         instructions: None,
         text: None,
         tools: None,

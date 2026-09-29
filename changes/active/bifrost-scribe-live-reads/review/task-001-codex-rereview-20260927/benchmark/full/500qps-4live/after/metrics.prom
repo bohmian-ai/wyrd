@@ -1,0 +1,1463 @@
+# TYPE bifrost_forge_output_files_total counter
+bifrost_forge_output_files_total{task_type="small_files"} 6
+bifrost_forge_output_files_total{task_type="scribe_promotion"} 10
+
+# HELP bifrost_gate_query_streams_total Total Bifrost Gate query streams by terminal outcome.
+# TYPE bifrost_gate_query_streams_total counter
+bifrost_gate_query_streams_total{outcome="cancelled"} 0
+bifrost_gate_query_streams_total{outcome="rejected"} 10742
+bifrost_gate_query_streams_total{outcome="failed"} 162738
+bifrost_gate_query_streams_total{outcome="success"} 2135
+
+# TYPE bifrost_gate_rows_total counter
+bifrost_gate_rows_total{status="accepted"} 1081344
+bifrost_gate_rows_total{status="rejected"} 0
+
+# TYPE bifrost_storage_requests_total counter
+bifrost_storage_requests_total{operation="writer_write"} 118
+bifrost_storage_requests_total{operation="read_range"} 5847
+bifrost_storage_requests_total{operation="read"} 54208
+bifrost_storage_requests_total{operation="writer_close"} 118
+bifrost_storage_requests_total{operation="open_writer"} 118
+bifrost_storage_requests_total{operation="write"} 19
+
+# TYPE bifrost_scribe_rejections_total counter
+bifrost_scribe_rejections_total{reason="closed"} 0
+bifrost_scribe_rejections_total{reason="invalid"} 0
+bifrost_scribe_rejections_total{reason="memory"} 0
+bifrost_scribe_rejections_total{reason="wal"} 0
+bifrost_scribe_rejections_total{reason="in_flight"} 0
+bifrost_scribe_rejections_total{reason="queue"} 0
+
+# TYPE vala_postgres_pool_acquire_total counter
+vala_postgres_pool_acquire_total{pool="runtime"} 17854
+
+# TYPE bifrost_forge_task_attempts_total counter
+bifrost_forge_task_attempts_total{task_type="small_files",result="retry"} 2
+bifrost_forge_task_attempts_total{task_type="orphan_cleanup",result="succeeded"} 8
+bifrost_forge_task_attempts_total{task_type="small_files",result="succeeded"} 1
+bifrost_forge_task_attempts_total{task_type="scribe_promotion",result="succeeded"} 3
+
+# TYPE bifrost_scribe_rows_total counter
+bifrost_scribe_rows_total{status="accepted"} 1093695
+
+# TYPE bifrost_scribe_wal_fsync_total counter
+bifrost_scribe_wal_fsync_total{outcome="success"} 240
+
+# TYPE bifrost_storage_request_terminals_total counter
+bifrost_storage_request_terminals_total{operation="write",outcome="success"} 19
+bifrost_storage_request_terminals_total{operation="writer_close",outcome="success"} 118
+bifrost_storage_request_terminals_total{operation="open_writer",outcome="success"} 118
+bifrost_storage_request_terminals_total{operation="read_range",outcome="success"} 5847
+bifrost_storage_request_terminals_total{operation="read",outcome="success"} 54208
+bifrost_storage_request_terminals_total{operation="writer_write",outcome="success"} 118
+
+# TYPE bifrost_forge_task_failures_total counter
+bifrost_forge_task_failures_total{task_type="small_files",reason="transient_coordination"} 2
+
+# TYPE bifrost_gate_events_total counter
+bifrost_gate_events_total{stage="native_frame"} 66
+bifrost_gate_events_total{stage="auth_attempt"} 66
+
+# TYPE wyrd_storage_operations_total counter
+wyrd_storage_operations_total{backend="local",operation="get",outcome="success"} 60078
+wyrd_storage_operations_total{backend="local",operation="put",outcome="success"} 147
+wyrd_storage_operations_total{backend="local",operation="list",outcome="success"} 8
+wyrd_storage_operations_total{backend="local",operation="head",outcome="success"} 10
+
+# TYPE bifrost_oracle_analytical_output_sort_spilled_bytes_total counter
+bifrost_oracle_analytical_output_sort_spilled_bytes_total 0
+
+# HELP bifrost_gate_requests_total Total Bifrost Gate requests by operation and terminal outcome.
+# TYPE bifrost_gate_requests_total counter
+bifrost_gate_requests_total{operation="write",outcome="success"} 66
+bifrost_gate_requests_total{operation="query",outcome="failed"} 162738
+bifrost_gate_requests_total{operation="query",outcome="rejected"} 10742
+bifrost_gate_requests_total{operation="write",outcome="rejected"} 0
+bifrost_gate_requests_total{operation="query",outcome="success"} 2135
+bifrost_gate_requests_total{operation="write",outcome="failed"} 0
+bifrost_gate_requests_total{operation="query",outcome="cancelled"} 0
+bifrost_gate_requests_total{operation="write",outcome="cancelled"} 0
+
+# TYPE wyrd_postgres_pool_acquire_total counter
+wyrd_postgres_pool_acquire_total{pool="app"} 162811
+
+# TYPE bifrost_oracle_analytical_exchange_batches_total counter
+bifrost_oracle_analytical_exchange_batches_total 0
+
+# TYPE oracle_query_bytes_returned_total counter
+oracle_query_bytes_returned_total{class="analytical"} 0
+oracle_query_bytes_returned_total{class="interactive"} 8423616
+
+# TYPE bifrost_forge_input_bytes_total counter
+bifrost_forge_input_bytes_total{task_type="scribe_promotion"} 5112003
+bifrost_forge_input_bytes_total{task_type="small_files"} 3820551
+
+# TYPE bifrost_scribe_retired_bytes_total counter
+bifrost_scribe_retired_bytes_total 332174556
+
+# TYPE bifrost_resource_acquisitions_total counter
+bifrost_resource_acquisitions_total{role="scribe",resource="memory",result="acquired"} 909
+bifrost_resource_acquisitions_total{role="scribe",resource="volume",result="released",volume_class="scribe_stage"} 65
+bifrost_resource_acquisitions_total{role="oracle",resource="volume",result="acquired",volume_class="oracle"} 2135
+bifrost_resource_acquisitions_total{role="scribe",resource="volume",result="committed",volume_class="wal"} 273
+bifrost_resource_acquisitions_total{role="scribe",resource="volume",result="committed",volume_class="scribe_stage"} 56
+bifrost_resource_acquisitions_total{role="oracle",resource="memory",result="released"} 2143
+bifrost_resource_acquisitions_total{role="transport",resource="memory",result="released"} 5448
+bifrost_resource_acquisitions_total{role="scribe",resource="volume",result="acquired",volume_class="wal"} 273
+bifrost_resource_acquisitions_total{role="scribe",resource="volume",result="released",volume_class="wal"} 40
+bifrost_resource_acquisitions_total{role="scribe",resource="volume",result="acquired",volume_class="scribe_output"} 10
+bifrost_resource_acquisitions_total{role="scribe",resource="volume",result="acquired",volume_class="scribe_stage"} 57
+bifrost_resource_acquisitions_total{role="oracle",resource="memory",result="acquired"} 2151
+bifrost_resource_acquisitions_total{role="transport",resource="memory",result="acquired"} 5448
+bifrost_resource_acquisitions_total{role="oracle",resource="volume",result="released",volume_class="oracle"} 2135
+bifrost_resource_acquisitions_total{role="scribe",resource="volume",result="released",volume_class="scribe_output"} 10
+bifrost_resource_acquisitions_total{role="scribe",resource="memory",result="released"} 973
+
+# TYPE bifrost_forge_output_bytes_total counter
+bifrost_forge_output_bytes_total{task_type="scribe_promotion"} 5112003
+bifrost_forge_output_bytes_total{task_type="small_files"} 3834925
+
+# TYPE wyrd_http_requests_total counter
+wyrd_http_requests_total{method="POST",path="/v1/bifrost/tables",status="200"} 1
+wyrd_http_requests_total{method="GET",path="/healthz",status="200"} 1
+wyrd_http_requests_total{method="POST",path="/auth/token",status="200"} 2
+wyrd_http_requests_total{method="POST",path="/v1/query",status="403"} 162738
+wyrd_http_requests_total{method="POST",path="/v1/query",status="429"} 10742
+wyrd_http_requests_total{method="POST",path="/v1/query",status="200"} 2135
+
+# TYPE oracle_query_bytes_scanned_total counter
+oracle_query_bytes_scanned_total{class="analytical"} 0
+oracle_query_bytes_scanned_total{class="interactive"} 1663936124
+
+# TYPE bifrost_gate_frame_bytes_total counter
+bifrost_gate_frame_bytes_total 82486800
+
+# TYPE bifrost_parquet_upload_outcomes_total counter
+bifrost_parquet_upload_outcomes_total{role="scribe",outcome="verified"} 10
+
+# TYPE bifrost_oracle_analytical_output_sort_spilled_rows_total counter
+bifrost_oracle_analytical_output_sort_spilled_rows_total 0
+
+# TYPE bifrost_scribe_staging_claims_published_total counter
+bifrost_scribe_staging_claims_published_total 0
+
+# TYPE wyrd_storage_bytes_total counter
+wyrd_storage_bytes_total{backend="local",operation="get",direction="read"} 1980656361
+wyrd_storage_bytes_total{backend="local",operation="put",direction="write"} 10947320
+
+# TYPE bifrost_oracle_analytical_attempts_total counter
+bifrost_oracle_analytical_attempts_total{outcome="cancelled"} 0
+bifrost_oracle_analytical_attempts_total{outcome="success"} 0
+bifrost_oracle_analytical_attempts_total{outcome="failed"} 0
+
+# TYPE oracle_query_partitions_scanned_total counter
+oracle_query_partitions_scanned_total{class="interactive"} 2109
+oracle_query_partitions_scanned_total{class="analytical"} 0
+
+# TYPE oracle_query_cancellations_total counter
+oracle_query_cancellations_total{reason="shutdown"} 0
+oracle_query_cancellations_total{reason="peer_failure"} 0
+oracle_query_cancellations_total{reason="deadline"} 0
+oracle_query_cancellations_total{reason="client_drop"} 0
+
+# TYPE bifrost_parquet_upload_bytes counter
+bifrost_parquet_upload_bytes{role="scribe"} 5112003
+
+# TYPE bifrost_scribe_frames_total counter
+bifrost_scribe_frames_total{status="accepted"} 93
+
+# TYPE bifrost_scribe_wal_append_total counter
+bifrost_scribe_wal_append_total{outcome="success"} 186
+
+# TYPE bifrost_oracle_analytical_stage_authority_total counter
+bifrost_oracle_analytical_stage_authority_total{operation="execute_task",outcome="signature"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="set_plan",outcome="binding"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="set_plan",outcome="signature"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="execute_task",outcome="expired"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="execute_task",outcome="authorized"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="set_plan",outcome="body"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="set_plan",outcome="replay"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="set_plan",outcome="expired"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="execute_task",outcome="body"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="set_plan",outcome="authorized"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="execute_task",outcome="binding"} 0
+bifrost_oracle_analytical_stage_authority_total{operation="execute_task",outcome="replay"} 0
+
+# TYPE bifrost_scribe_contention_demand_transitions_total counter
+bifrost_scribe_contention_demand_transitions_total{decision="served"} 93
+
+# TYPE bifrost_scribe_lane_jobs_total counter
+bifrost_scribe_lane_jobs_total{lane="persistence",status="completed"} 159
+bifrost_scribe_lane_jobs_total{lane="wal_io",status="completed"} 485
+bifrost_scribe_lane_jobs_total{lane="ingress",status="completed"} 27
+
+# TYPE bifrost_oracle_analytical_output_sort_spills_total counter
+bifrost_oracle_analytical_output_sort_spills_total 0
+
+# TYPE bifrost_forge_input_files_total counter
+bifrost_forge_input_files_total{task_type="small_files"} 6
+bifrost_forge_input_files_total{task_type="scribe_promotion"} 10
+
+# TYPE oracle_admission_total counter
+oracle_admission_total{class="interactive",outcome="admitted",reason="memory"} 0
+oracle_admission_total{class="interactive",outcome="admitted",reason="queue_full"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="membership"} 0
+oracle_admission_total{class="interactive",outcome="admitted",reason="class_capacity"} 2135
+oracle_admission_total{class="interactive",outcome="rejected",reason="class_capacity"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="tenant_budget"} 0
+oracle_admission_total{class="interactive",outcome="admitted",reason="queue_deadline"} 0
+oracle_admission_total{class="interactive",outcome="rejected",reason="membership"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="spill"} 0
+oracle_admission_total{class="interactive",outcome="admitted",reason="tenant_budget"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="shutdown"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="queue_full"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="class_capacity"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="queue_deadline"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="queue_deadline"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="queue_full"} 0
+oracle_admission_total{class="interactive",outcome="rejected",reason="memory"} 0
+oracle_admission_total{class="interactive",outcome="admitted",reason="audit_unavailable"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="class_capacity"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="memory"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="memory"} 0
+oracle_admission_total{class="interactive",outcome="rejected",reason="queue_full"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="tenant_budget"} 0
+oracle_admission_total{class="interactive",outcome="rejected",reason="audit_unavailable"} 0
+oracle_admission_total{class="interactive",outcome="rejected",reason="spill"} 0
+oracle_admission_total{class="interactive",outcome="rejected",reason="shutdown"} 0
+oracle_admission_total{class="interactive",outcome="admitted",reason="spill"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="spill"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="audit_unavailable"} 0
+oracle_admission_total{class="interactive",outcome="admitted",reason="shutdown"} 0
+oracle_admission_total{class="interactive",outcome="rejected",reason="tenant_budget"} 0
+oracle_admission_total{class="analytical",outcome="admitted",reason="audit_unavailable"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="membership"} 0
+oracle_admission_total{class="analytical",outcome="rejected",reason="shutdown"} 0
+oracle_admission_total{class="interactive",outcome="admitted",reason="membership"} 0
+oracle_admission_total{class="interactive",outcome="rejected",reason="queue_deadline"} 0
+
+# TYPE bifrost_oracle_analytical_exchange_bytes_total counter
+bifrost_oracle_analytical_exchange_bytes_total 0
+
+# TYPE oracle_query_spill_bytes_total counter
+oracle_query_spill_bytes_total{class="analytical"} 0
+oracle_query_spill_bytes_total{class="interactive"} 0
+
+# TYPE bifrost_scribe_contention_vectors_installed_total counter
+bifrost_scribe_contention_vectors_installed_total 93
+
+# TYPE oracle_query_row_groups_pruned_total counter
+oracle_query_row_groups_pruned_total{class="interactive"} 3584
+oracle_query_row_groups_pruned_total{class="analytical"} 0
+
+# TYPE oracle_query_rows_total counter
+oracle_query_rows_total{class="analytical"} 0
+oracle_query_rows_total{class="interactive"} 894148
+
+# TYPE bifrost_oracle_analytical_stage_operations_total counter
+bifrost_oracle_analytical_stage_operations_total{operation="set_plan"} 0
+bifrost_oracle_analytical_stage_operations_total{operation="execute_task"} 0
+
+# TYPE bifrost_oracle_files_pruned_total counter
+bifrost_oracle_files_pruned_total{source="hot_sealed",reason="snapshot_overlap"} 19816
+
+# TYPE bifrost_storage_metadata_cache_effects_total counter
+bifrost_storage_metadata_cache_effects_total{effect="miss",reason="none"} 8
+bifrost_storage_metadata_cache_effects_total{effect="hit",reason="none"} 4088
+
+# TYPE oracle_query_spill_files_total counter
+oracle_query_spill_files_total{class="interactive"} 0
+oracle_query_spill_files_total{class="analytical"} 0
+
+# TYPE oracle_query_spill_queries_total counter
+oracle_query_spill_queries_total{class="interactive",outcome="cancelled"} 0
+oracle_query_spill_queries_total{class="analytical",outcome="error"} 0
+oracle_query_spill_queries_total{class="interactive",outcome="error"} 0
+oracle_query_spill_queries_total{class="interactive",outcome="success"} 0
+oracle_query_spill_queries_total{class="analytical",outcome="success"} 0
+oracle_query_spill_queries_total{class="analytical",outcome="cancelled"} 0
+
+# TYPE bifrost_scribe_persistence_encoded_bytes_total counter
+bifrost_scribe_persistence_encoded_bytes_total 7176530
+
+# HELP bifrost_gate_rejections_total Total rejected Bifrost Gate requests by operation and closed reason.
+# TYPE bifrost_gate_rejections_total counter
+bifrost_gate_rejections_total{operation="write",reason="oracle_admission"} 0
+bifrost_gate_rejections_total{operation="write",reason="audit_unavailable"} 0
+bifrost_gate_rejections_total{operation="query",reason="catalog"} 0
+bifrost_gate_rejections_total{operation="query",reason="payload_limit"} 0
+bifrost_gate_rejections_total{operation="write",reason="scribe_admission"} 0
+bifrost_gate_rejections_total{operation="write",reason="role_unavailable"} 0
+bifrost_gate_rejections_total{operation="write",reason="payload_limit"} 0
+bifrost_gate_rejections_total{operation="query",reason="oracle_admission"} 10742
+bifrost_gate_rejections_total{operation="write",reason="permission"} 0
+bifrost_gate_rejections_total{operation="query",reason="permission"} 0
+bifrost_gate_rejections_total{operation="write",reason="catalog"} 0
+bifrost_gate_rejections_total{operation="write",reason="auth"} 0
+bifrost_gate_rejections_total{operation="query",reason="auth"} 0
+bifrost_gate_rejections_total{operation="write",reason="validation"} 0
+bifrost_gate_rejections_total{operation="query",reason="role_unavailable"} 0
+bifrost_gate_rejections_total{operation="query",reason="audit_unavailable"} 0
+bifrost_gate_rejections_total{operation="query",reason="validation"} 0
+bifrost_gate_rejections_total{operation="query",reason="scribe_admission"} 0
+
+# TYPE bifrost_gate_frames_total counter
+bifrost_gate_frames_total{status="accepted"} 66
+
+# TYPE bifrost_scribe_contention_effects_total counter
+bifrost_scribe_contention_effects_total{stage="settlement",decision="tenant_retired",severity="info",category="all"} 93
+bifrost_scribe_contention_effects_total{stage="charge",decision="released",severity="info",category="admission_bytes"} 93
+bifrost_scribe_contention_effects_total{stage="admission",decision="settled",severity="info",category="admission_bytes"} 93
+bifrost_scribe_contention_effects_total{stage="admission",decision="attempted",severity="info",category="admission_bytes"} 93
+bifrost_scribe_contention_effects_total{stage="demand",decision="served",severity="info",category="admission_items"} 93
+bifrost_scribe_contention_effects_total{stage="settlement",decision="resources_returned",severity="info",category="admission_bytes"} 93
+bifrost_scribe_contention_effects_total{stage="charge",decision="released",severity="info",category="admission_items"} 93
+bifrost_scribe_contention_effects_total{stage="activation",decision="installed",severity="info",category="admission_bytes"} 93
+bifrost_scribe_contention_effects_total{stage="charge",decision="committed",severity="info",category="admission_bytes"} 93
+bifrost_scribe_contention_effects_total{stage="charge",decision="committed",severity="info",category="admission_items"} 93
+
+# TYPE bifrost_scribe_retirements_total counter
+bifrost_scribe_retirements_total 56
+
+# TYPE bifrost_storage_metadata_cache_loads_total counter
+bifrost_storage_metadata_cache_loads_total{outcome="success"} 8
+
+# TYPE oracle_query_row_groups_scanned_total counter
+oracle_query_row_groups_scanned_total{class="analytical"} 0
+oracle_query_row_groups_scanned_total{class="interactive"} 512
+
+# TYPE bifrost_scribe_contention_vectors_released_total counter
+bifrost_scribe_contention_vectors_released_total 93
+
+# TYPE bifrost_scribe_persistence_jobs_total counter
+bifrost_scribe_persistence_jobs_total{status="published"} 56
+
+# TYPE bifrost_scribe_staging_effects_total counter
+bifrost_scribe_staging_effects_total{stage="assembly",decision="claimed",severity="info",cause="drain"} 10
+bifrost_scribe_staging_effects_total{stage="staged_source",decision="durable",severity="info",cause="none"} 56
+bifrost_scribe_staging_effects_total{stage="publication",decision="committed",severity="info",cause="drain"} 10
+bifrost_scribe_staging_effects_total{stage="staged_source",decision="authority_moved",severity="info",cause="none"} 56
+bifrost_scribe_staging_effects_total{stage="settlement",decision="runs_removed",severity="info",cause="drain"} 10
+bifrost_scribe_staging_effects_total{stage="settlement",decision="bytes_released",severity="info",cause="none"} 10
+
+# TYPE oracle_query_files_scanned_total counter
+oracle_query_files_scanned_total{class="interactive"} 5693
+oracle_query_files_scanned_total{class="analytical"} 0
+
+# TYPE bifrost_scribe_wal_append_bytes_total counter
+bifrost_scribe_wal_append_bytes_total 266671202
+
+# TYPE bifrost_forge_tasks_created_total counter
+bifrost_forge_tasks_created_total{task_type="orphan_cleanup"} 8
+bifrost_forge_tasks_created_total{task_type="scribe_promotion"} 3
+bifrost_forge_tasks_created_total{task_type="small_files"} 2
+
+# TYPE oracle_query_logical_bytes_selected_total counter
+oracle_query_logical_bytes_selected_total{class="analytical"} 0
+oracle_query_logical_bytes_selected_total{class="interactive"} 10880219290
+
+# TYPE bifrost_scribe_contention_committed gauge
+bifrost_scribe_contention_committed{category="admission_items"} 0
+bifrost_scribe_contention_committed{category="admission_bytes"} 0
+
+# TYPE bifrost_scribe_active_memtable_bytes gauge
+bifrost_scribe_active_memtable_bytes 18882016
+
+# TYPE wyrd_postgres_pool_idle gauge
+wyrd_postgres_pool_idle{pool="app"} 4
+
+# TYPE wyrd_postgres_pool_size gauge
+wyrd_postgres_pool_size{pool="app"} 8
+
+# TYPE bifrost_resource_scratch_bytes gauge
+bifrost_resource_scratch_bytes{kind="used"} 0
+bifrost_resource_scratch_bytes{kind="total"} 4026531840
+
+# TYPE bifrost_oracle_local_slot_units gauge
+bifrost_oracle_local_slot_units{kind="limit"} 8
+bifrost_oracle_local_slot_units{kind="analytical_used"} 0
+bifrost_oracle_local_slot_units{kind="interactive_floor"} 1
+bifrost_oracle_local_slot_units{kind="used"} 0
+
+# TYPE vala_postgres_pool_idle gauge
+vala_postgres_pool_idle{pool="runtime"} 6
+
+# TYPE bifrost_forge_compaction_debt_bytes gauge
+bifrost_forge_compaction_debt_bytes 5102854
+
+# TYPE bifrost_scribe_wal_disk_bytes gauge
+bifrost_scribe_wal_disk_bytes 268840200
+
+# TYPE bifrost_scribe_persistence_compression_ratio gauge
+bifrost_scribe_persistence_compression_ratio 3.33082497212932
+
+# TYPE bifrost_resource_current_bytes gauge
+bifrost_resource_current_bytes{role="oracle",resource="memory"} 87900
+bifrost_resource_current_bytes{role="scribe",resource="volume",volume_class="scribe_output"} 0
+bifrost_resource_current_bytes{role="scribe",resource="memory"} 18882016
+bifrost_resource_current_bytes{role="transport",resource="memory"} 0
+bifrost_resource_current_bytes{role="scribe",resource="volume",volume_class="scribe_stage"} 0
+bifrost_resource_current_bytes{role="oracle",resource="volume",volume_class="oracle"} 0
+bifrost_resource_current_bytes{role="scribe",resource="volume",volume_class="wal"} 266675490
+
+# TYPE bifrost_storage_metadata_cache_resident_entries gauge
+bifrost_storage_metadata_cache_resident_entries 8
+
+# TYPE bifrost_forge_oldest_pending_task_timestamp_seconds gauge
+bifrost_forge_oldest_pending_task_timestamp_seconds{task_type="scribe_promotion"} 0
+bifrost_forge_oldest_pending_task_timestamp_seconds{task_type="small_files"} 1790547804
+bifrost_forge_oldest_pending_task_timestamp_seconds{task_type="snapshot_expiry"} 0
+bifrost_forge_oldest_pending_task_timestamp_seconds{task_type="expired_cleanup"} 0
+bifrost_forge_oldest_pending_task_timestamp_seconds{task_type="orphan_cleanup"} 1790547743
+
+# TYPE wyrd_storage_operations_active gauge
+wyrd_storage_operations_active{backend="local",operation="delete"} 0
+wyrd_storage_operations_active{backend="local",operation="get"} 0
+wyrd_storage_operations_active{backend="local",operation="head"} 0
+wyrd_storage_operations_active{backend="local",operation="put"} 0
+wyrd_storage_operations_active{backend="local",operation="list"} 0
+
+# TYPE bifrost_scribe_lane_queued gauge
+bifrost_scribe_lane_queued{lane="wal_io"} 0
+bifrost_scribe_lane_queued{lane="persistence"} 0
+bifrost_scribe_lane_queued{lane="ingress"} 0
+
+# TYPE bifrost_forge_planning_demands gauge
+bifrost_forge_planning_demands 0
+
+# TYPE bifrost_resource_memory_bytes gauge
+bifrost_resource_memory_bytes{kind="scribe_floor"} 268435456
+bifrost_resource_memory_bytes{kind="forge_compaction_budget"} 268435456
+bifrost_resource_memory_bytes{kind="elastic_total"} 7516192768
+bifrost_resource_memory_bytes{kind="elastic_used"} 0
+bifrost_resource_memory_bytes{kind="managed"} 8321499136
+bifrost_resource_memory_bytes{kind="oracle_used"} 87900
+bifrost_resource_memory_bytes{kind="oracle_floor"} 268435456
+bifrost_resource_memory_bytes{kind="scribe_used"} 18882016
+
+# TYPE bifrost_scribe_contention_demand_records gauge
+bifrost_scribe_contention_demand_records 0
+
+# TYPE bifrost_scribe_lane_active gauge
+bifrost_scribe_lane_active{lane="ingress"} 0
+bifrost_scribe_lane_active{lane="wal_io"} 0
+bifrost_scribe_lane_active{lane="persistence"} 0
+
+# TYPE bifrost_oracle_analytical_attempts_active gauge
+bifrost_oracle_analytical_attempts_active 0
+
+# TYPE bifrost_scribe_immutable_memtable_bytes gauge
+bifrost_scribe_immutable_memtable_bytes 0
+
+# TYPE bifrost_forge_oldest_planning_demand_timestamp_seconds gauge
+bifrost_forge_oldest_planning_demand_timestamp_seconds 0
+
+# TYPE bifrost_scribe_contention_admissions_closed gauge
+bifrost_scribe_contention_admissions_closed 93
+
+# HELP bifrost_gate_active_requests Current Bifrost Gate requests by closed operation.
+# TYPE bifrost_gate_active_requests gauge
+bifrost_gate_active_requests{operation="query"} 5
+bifrost_gate_active_requests{operation="write"} 0
+
+# TYPE bifrost_resource_planned_bytes gauge
+bifrost_resource_planned_bytes{role="shared",resource="scratch"} 4026531840
+bifrost_resource_planned_bytes{role="forge_compaction",resource="memory"} 268435456
+bifrost_resource_planned_bytes{role="scribe",resource="memory"} 268435456
+bifrost_resource_planned_bytes{role="elastic",resource="memory"} 7516192768
+bifrost_resource_planned_bytes{role="transport",resource="memory"} 268435456
+bifrost_resource_planned_bytes{role="scribe",resource="volume",volume_class="scribe_output"} 4294967296
+bifrost_resource_planned_bytes{role="oracle",resource="memory"} 268435456
+bifrost_resource_planned_bytes{role="unmanaged",resource="memory"} 268435456
+bifrost_resource_planned_bytes{role="oracle",resource="volume",volume_class="oracle"} 4294967296
+bifrost_resource_planned_bytes{role="scribe",resource="volume",volume_class="wal"} 4294967296
+bifrost_resource_planned_bytes{role="scribe",resource="volume",volume_class="scribe_stage"} 4294967296
+
+# TYPE bifrost_scribe_staging_outstanding_claims gauge
+bifrost_scribe_staging_outstanding_claims 0
+
+# TYPE bifrost_scribe_contention_active_tables gauge
+bifrost_scribe_contention_active_tables 0
+
+# HELP bifrost_gate_active_streams Current authorized and admitted Bifrost Gate query streams.
+# TYPE bifrost_gate_active_streams gauge
+bifrost_gate_active_streams{operation="query"} 5
+
+# TYPE bifrost_scribe_persistence_queue_bytes gauge
+bifrost_scribe_persistence_queue_bytes 0
+
+# TYPE bifrost_role_ready gauge
+bifrost_role_ready{role="forge_coordinator"} 1
+bifrost_role_ready{role="scribe"} 1
+bifrost_role_ready{role="oracle"} 1
+bifrost_role_ready{role="forge_worker"} 1
+bifrost_role_ready{role="peer"} 1
+
+# TYPE bifrost_storage_metadata_cache_resident_bytes gauge
+bifrost_storage_metadata_cache_resident_bytes 87900
+
+# TYPE bifrost_scribe_contention_active_tenants gauge
+bifrost_scribe_contention_active_tenants 0
+
+# TYPE bifrost_oracle_local_bytes gauge
+bifrost_oracle_local_bytes{kind="memory_limit"} 7784628224
+bifrost_oracle_local_bytes{kind="memory_used"} 0
+bifrost_oracle_local_bytes{kind="memory_headroom"} 0
+bifrost_oracle_local_bytes{kind="scratch_used"} 0
+
+# TYPE oracle_tenant_budget_pressure gauge
+oracle_tenant_budget_pressure{class="analytical"} 0
+oracle_tenant_budget_pressure{class="interactive"} 0
+
+# TYPE bifrost_scribe_staging_live_members gauge
+bifrost_scribe_staging_live_members 0
+
+# TYPE bifrost_scribe_contention_active_transitions gauge
+bifrost_scribe_contention_active_transitions 0
+
+# TYPE bifrost_scribe_ingress_watermark_bytes gauge
+bifrost_scribe_ingress_watermark_bytes{mark="occupancy"} 18882016
+bifrost_scribe_ingress_watermark_bytes{mark="limit"} 7784628224
+bifrost_scribe_ingress_watermark_bytes{mark="high_water"} 5838471168
+bifrost_scribe_ingress_watermark_bytes{mark="low_water"} 3892314112
+
+# TYPE oracle_queries_active gauge
+oracle_queries_active{class="analytical"} 0
+oracle_queries_active{class="interactive"} 0
+
+# TYPE bifrost_forge_active_tasks gauge
+bifrost_forge_active_tasks{task_type="orphan_cleanup"} 0
+bifrost_forge_active_tasks{task_type="scribe_promotion"} 0
+bifrost_forge_active_tasks{task_type="small_files"} 0
+bifrost_forge_active_tasks{task_type="snapshot_expiry"} 0
+bifrost_forge_active_tasks{task_type="expired_cleanup"} 0
+
+# TYPE bifrost_forge_compaction_debt_files gauge
+bifrost_forge_compaction_debt_files 8
+
+# TYPE bifrost_storage_metadata_cache_inflight_loads gauge
+bifrost_storage_metadata_cache_inflight_loads 0
+
+# TYPE bifrost_storage_metadata_cache_waiters gauge
+bifrost_storage_metadata_cache_waiters 0
+
+# TYPE bifrost_oracle_analytical_exchanges_active gauge
+bifrost_oracle_analytical_exchanges_active 0
+
+# TYPE bifrost_scribe_contention_admissions_opened gauge
+bifrost_scribe_contention_admissions_opened 93
+
+# TYPE bifrost_storage_active_requests gauge
+bifrost_storage_active_requests 0
+
+# TYPE bifrost_scribe_immutable_generation_count gauge
+bifrost_scribe_immutable_generation_count 0
+
+# TYPE bifrost_cluster_roles_live gauge
+bifrost_cluster_roles_live{role="scribe"} 1
+bifrost_cluster_roles_live{role="oracle"} 1
+
+# TYPE vala_postgres_pool_size gauge
+vala_postgres_pool_size{pool="runtime"} 7
+
+# TYPE bifrost_scribe_contention_live_vectors gauge
+bifrost_scribe_contention_live_vectors 0
+
+# TYPE bifrost_scribe_persistence_queue_depth gauge
+bifrost_scribe_persistence_queue_depth 0
+
+# TYPE bifrost_forge_pending_tasks gauge
+bifrost_forge_pending_tasks{task_type="small_files"} 1
+bifrost_forge_pending_tasks{task_type="scribe_promotion"} 0
+bifrost_forge_pending_tasks{task_type="snapshot_expiry"} 0
+bifrost_forge_pending_tasks{task_type="expired_cleanup"} 0
+bifrost_forge_pending_tasks{task_type="orphan_cleanup"} 2
+
+# TYPE bifrost_scribe_ingress_active gauge
+bifrost_scribe_ingress_active 0
+
+# TYPE oracle_queries_queued gauge
+oracle_queries_queued{class="interactive"} 0
+oracle_queries_queued{class="analytical"} 0
+
+# TYPE wyrd_postgres_pool_acquire_seconds histogram
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="0.001"} 66004
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="0.005"} 93643
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="0.01"} 94621
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="0.025"} 95348
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="0.05"} 99100
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="0.1"} 101842
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="0.25"} 104209
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="0.5"} 122213
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="1"} 155992
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="2.5"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="5"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="10"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="30"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="60"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="120"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="300"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="600"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="1800"} 162811
+wyrd_postgres_pool_acquire_seconds_bucket{pool="app",outcome="success",le="+Inf"} 162811
+wyrd_postgres_pool_acquire_seconds_sum{pool="app",outcome="success"} 41417.71471966895
+wyrd_postgres_pool_acquire_seconds_count{pool="app",outcome="success"} 162811
+
+# TYPE bifrost_scribe_queue_wait_seconds histogram
+bifrost_scribe_queue_wait_seconds_bucket{le="0.001"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="0.005"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="0.01"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="0.025"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="0.05"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="0.1"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="0.25"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="0.5"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="1"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="2.5"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="5"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="10"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="30"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="60"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="120"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="300"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="600"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="1800"} 93
+bifrost_scribe_queue_wait_seconds_bucket{le="+Inf"} 93
+bifrost_scribe_queue_wait_seconds_sum 0.0014038759999999996
+bifrost_scribe_queue_wait_seconds_count 93
+
+# TYPE wyrd_http_request_duration_seconds histogram
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="0.005"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="0.01"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="0.025"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="0.05"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="0.1"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="0.25"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="0.5"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="1"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="2.5"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="5"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="10"} 1
+wyrd_http_request_duration_seconds_bucket{method="GET",path="/healthz",status="200",le="+Inf"} 1
+wyrd_http_request_duration_seconds_sum{method="GET",path="/healthz",status="200"} 0.00003126
+wyrd_http_request_duration_seconds_count{method="GET",path="/healthz",status="200"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="0.005"} 0
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="0.01"} 0
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="0.025"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="0.05"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="0.1"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="0.25"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="0.5"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="1"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="2.5"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="5"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="10"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/auth/token",status="200",le="+Inf"} 2
+wyrd_http_request_duration_seconds_sum{method="POST",path="/auth/token",status="200"} 0.053544969
+wyrd_http_request_duration_seconds_count{method="POST",path="/auth/token",status="200"} 2
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="0.005"} 0
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="0.01"} 0
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="0.025"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="0.05"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="0.1"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="0.25"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="0.5"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="1"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="2.5"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="5"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="10"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/bifrost/tables",status="200",le="+Inf"} 1
+wyrd_http_request_duration_seconds_sum{method="POST",path="/v1/bifrost/tables",status="200"} 0.024618945
+wyrd_http_request_duration_seconds_count{method="POST",path="/v1/bifrost/tables",status="200"} 1
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="0.005"} 0
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="0.01"} 0
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="0.025"} 25
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="0.05"} 47
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="0.1"} 1466
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="0.25"} 2135
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="0.5"} 2135
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="1"} 2135
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="2.5"} 2135
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="5"} 2135
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="10"} 2135
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="200",le="+Inf"} 2135
+wyrd_http_request_duration_seconds_sum{method="POST",path="/v1/query",status="200"} 158.37621296399996
+wyrd_http_request_duration_seconds_count{method="POST",path="/v1/query",status="200"} 2135
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="0.005"} 57255
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="0.01"} 82140
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="0.025"} 92300
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="0.05"} 96186
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="0.1"} 101660
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="0.25"} 104028
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="0.5"} 121927
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="1"} 155395
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="2.5"} 162738
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="5"} 162738
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="10"} 162738
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="403",le="+Inf"} 162738
+wyrd_http_request_duration_seconds_sum{method="POST",path="/v1/query",status="403"} 42437.27183930705
+wyrd_http_request_duration_seconds_count{method="POST",path="/v1/query",status="403"} 162738
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="0.005"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="0.01"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="0.025"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="0.05"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="0.1"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="0.25"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="0.5"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="1"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="2.5"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="5"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="10"} 10742
+wyrd_http_request_duration_seconds_bucket{method="POST",path="/v1/query",status="429",le="+Inf"} 10742
+wyrd_http_request_duration_seconds_sum{method="POST",path="/v1/query",status="429"} 2.631887441
+wyrd_http_request_duration_seconds_count{method="POST",path="/v1/query",status="429"} 10742
+
+# TYPE wyrd_storage_operation_duration_seconds histogram
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="0.001"} 0
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="0.005"} 32
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="0.01"} 110
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="0.025"} 113
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="0.05"} 138
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="0.1"} 143
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="0.25"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="0.5"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="1"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="2.5"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="5"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="10"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="30"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="60"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="120"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="300"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="600"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="1800"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="put",outcome="success",le="+Inf"} 147
+wyrd_storage_operation_duration_seconds_sum{backend="local",operation="put",outcome="success"} 2.433196296
+wyrd_storage_operation_duration_seconds_count{backend="local",operation="put",outcome="success"} 147
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="0.001"} 52749
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="0.005"} 60074
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="0.01"} 60075
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="0.025"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="0.05"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="0.1"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="0.25"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="0.5"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="1"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="2.5"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="5"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="10"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="30"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="60"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="120"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="300"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="600"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="1800"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="get",outcome="success",le="+Inf"} 60079
+wyrd_storage_operation_duration_seconds_sum{backend="local",operation="get",outcome="success"} 18.241547133000008
+wyrd_storage_operation_duration_seconds_count{backend="local",operation="get",outcome="success"} 60079
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="0.001"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="0.005"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="0.01"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="0.025"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="0.05"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="0.1"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="0.25"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="0.5"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="1"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="2.5"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="5"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="10"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="30"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="60"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="120"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="300"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="600"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="1800"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="head",outcome="success",le="+Inf"} 10
+wyrd_storage_operation_duration_seconds_sum{backend="local",operation="head",outcome="success"} 0.00031142400000000003
+wyrd_storage_operation_duration_seconds_count{backend="local",operation="head",outcome="success"} 10
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="0.001"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="0.005"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="0.01"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="0.025"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="0.05"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="0.1"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="0.25"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="0.5"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="1"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="2.5"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="5"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="10"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="30"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="60"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="120"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="300"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="600"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="1800"} 8
+wyrd_storage_operation_duration_seconds_bucket{backend="local",operation="list",outcome="success",le="+Inf"} 8
+wyrd_storage_operation_duration_seconds_sum{backend="local",operation="list",outcome="success"} 0.000316733
+wyrd_storage_operation_duration_seconds_count{backend="local",operation="list",outcome="success"} 8
+
+# TYPE bifrost_scribe_ack_seconds histogram
+bifrost_scribe_ack_seconds_bucket{le="0.001"} 0
+bifrost_scribe_ack_seconds_bucket{le="0.005"} 0
+bifrost_scribe_ack_seconds_bucket{le="0.01"} 0
+bifrost_scribe_ack_seconds_bucket{le="0.025"} 50
+bifrost_scribe_ack_seconds_bucket{le="0.05"} 93
+bifrost_scribe_ack_seconds_bucket{le="0.1"} 93
+bifrost_scribe_ack_seconds_bucket{le="0.25"} 93
+bifrost_scribe_ack_seconds_bucket{le="0.5"} 93
+bifrost_scribe_ack_seconds_bucket{le="1"} 93
+bifrost_scribe_ack_seconds_bucket{le="2.5"} 93
+bifrost_scribe_ack_seconds_bucket{le="5"} 93
+bifrost_scribe_ack_seconds_bucket{le="10"} 93
+bifrost_scribe_ack_seconds_bucket{le="30"} 93
+bifrost_scribe_ack_seconds_bucket{le="60"} 93
+bifrost_scribe_ack_seconds_bucket{le="120"} 93
+bifrost_scribe_ack_seconds_bucket{le="300"} 93
+bifrost_scribe_ack_seconds_bucket{le="600"} 93
+bifrost_scribe_ack_seconds_bucket{le="1800"} 93
+bifrost_scribe_ack_seconds_bucket{le="+Inf"} 93
+bifrost_scribe_ack_seconds_sum 2.243402203
+bifrost_scribe_ack_seconds_count 93
+
+# TYPE bifrost_scribe_wal_fsync_seconds histogram
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="0.001"} 54
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="0.005"} 208
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="0.01"} 239
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="0.025"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="0.05"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="0.1"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="0.25"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="0.5"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="1"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="2.5"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="5"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="10"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="30"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="60"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="120"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="300"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="600"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="1800"} 240
+bifrost_scribe_wal_fsync_seconds_bucket{outcome="success",le="+Inf"} 240
+bifrost_scribe_wal_fsync_seconds_sum{outcome="success"} 0.7995743359999999
+bifrost_scribe_wal_fsync_seconds_count{outcome="success"} 240
+
+# TYPE bifrost_oracle_selected_workers summary
+bifrost_oracle_selected_workers{quantile="0"} 0
+bifrost_oracle_selected_workers{quantile="0.5"} 0
+bifrost_oracle_selected_workers{quantile="0.9"} 0
+bifrost_oracle_selected_workers{quantile="0.95"} 0
+bifrost_oracle_selected_workers{quantile="0.99"} 0
+bifrost_oracle_selected_workers{quantile="0.999"} 0
+bifrost_oracle_selected_workers{quantile="1"} 0
+bifrost_oracle_selected_workers_sum 0
+bifrost_oracle_selected_workers_count 2135
+
+# TYPE bifrost_parquet_upload_duration_seconds summary
+bifrost_parquet_upload_duration_seconds{role="scribe",outcome="verified",quantile="0"} 0
+bifrost_parquet_upload_duration_seconds{role="scribe",outcome="verified",quantile="0.5"} 0
+bifrost_parquet_upload_duration_seconds{role="scribe",outcome="verified",quantile="0.9"} 0
+bifrost_parquet_upload_duration_seconds{role="scribe",outcome="verified",quantile="0.95"} 0
+bifrost_parquet_upload_duration_seconds{role="scribe",outcome="verified",quantile="0.99"} 0
+bifrost_parquet_upload_duration_seconds{role="scribe",outcome="verified",quantile="0.999"} 0
+bifrost_parquet_upload_duration_seconds{role="scribe",outcome="verified",quantile="1"} 0
+bifrost_parquet_upload_duration_seconds_sum{role="scribe",outcome="verified"} 0.044957291999999996
+bifrost_parquet_upload_duration_seconds_count{role="scribe",outcome="verified"} 10
+
+# TYPE bifrost_scribe_lane_job_seconds histogram
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="0.001"} 162
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="0.005"} 329
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="0.01"} 448
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="0.025"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="0.05"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="0.1"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="0.25"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="0.5"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="1"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="2.5"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="5"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="10"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="30"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="60"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="120"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="300"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="600"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="1800"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="wal_io",le="+Inf"} 485
+bifrost_scribe_lane_job_seconds_sum{lane="wal_io"} 1.9753517060000003
+bifrost_scribe_lane_job_seconds_count{lane="wal_io"} 485
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="0.001"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="0.005"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="0.01"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="0.025"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="0.05"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="0.1"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="0.25"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="0.5"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="1"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="2.5"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="5"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="10"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="30"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="60"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="120"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="300"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="600"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="1800"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="ingress",le="+Inf"} 27
+bifrost_scribe_lane_job_seconds_sum{lane="ingress"} 0.004219107999999999
+bifrost_scribe_lane_job_seconds_count{lane="ingress"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="0.001"} 27
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="0.005"} 93
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="0.01"} 104
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="0.025"} 151
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="0.05"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="0.1"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="0.25"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="0.5"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="1"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="2.5"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="5"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="10"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="30"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="60"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="120"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="300"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="600"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="1800"} 159
+bifrost_scribe_lane_job_seconds_bucket{lane="persistence",le="+Inf"} 159
+bifrost_scribe_lane_job_seconds_sum{lane="persistence"} 1.2453006049999995
+bifrost_scribe_lane_job_seconds_count{lane="persistence"} 159
+
+# TYPE oracle_query_time_to_first_batch_seconds histogram
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="0.001"} 0
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="0.005"} 992
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="0.01"} 1164
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="0.025"} 1414
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="0.05"} 2116
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="0.1"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="0.25"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="0.5"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="1"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="2.5"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="5"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="10"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="30"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="60"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="120"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="300"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="600"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="1800"} 2135
+oracle_query_time_to_first_batch_seconds_bucket{class="interactive",le="+Inf"} 2135
+oracle_query_time_to_first_batch_seconds_sum{class="interactive"} 39.425609884
+oracle_query_time_to_first_batch_seconds_count{class="interactive"} 2135
+
+# TYPE bifrost_storage_metadata_wait_seconds summary
+bifrost_storage_metadata_wait_seconds{outcome="success",quantile="0"} 0
+bifrost_storage_metadata_wait_seconds{outcome="success",quantile="0.5"} 0
+bifrost_storage_metadata_wait_seconds{outcome="success",quantile="0.9"} 0
+bifrost_storage_metadata_wait_seconds{outcome="success",quantile="0.95"} 0
+bifrost_storage_metadata_wait_seconds{outcome="success",quantile="0.99"} 0
+bifrost_storage_metadata_wait_seconds{outcome="success",quantile="0.999"} 0
+bifrost_storage_metadata_wait_seconds{outcome="success",quantile="1"} 0
+bifrost_storage_metadata_wait_seconds_sum{outcome="success"} 0.000861993
+bifrost_storage_metadata_wait_seconds_count{outcome="success"} 8
+
+# TYPE bifrost_storage_metadata_load_seconds summary
+bifrost_storage_metadata_load_seconds{outcome="success",quantile="0"} 0
+bifrost_storage_metadata_load_seconds{outcome="success",quantile="0.5"} 0
+bifrost_storage_metadata_load_seconds{outcome="success",quantile="0.9"} 0
+bifrost_storage_metadata_load_seconds{outcome="success",quantile="0.95"} 0
+bifrost_storage_metadata_load_seconds{outcome="success",quantile="0.99"} 0
+bifrost_storage_metadata_load_seconds{outcome="success",quantile="0.999"} 0
+bifrost_storage_metadata_load_seconds{outcome="success",quantile="1"} 0
+bifrost_storage_metadata_load_seconds_sum{outcome="success"} 0.000804986
+bifrost_storage_metadata_load_seconds_count{outcome="success"} 8
+
+# HELP bifrost_gate_query_stream_duration_seconds Bifrost Gate query-stream duration by terminal outcome.
+# TYPE bifrost_gate_query_stream_duration_seconds histogram
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="0.001"} 0
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="0.005"} 0
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="0.01"} 0
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="0.025"} 25
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="0.05"} 47
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="0.1"} 1467
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="0.25"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="0.5"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="1"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="2.5"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="5"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="10"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="30"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="60"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="120"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="300"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="600"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="1800"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="success",le="+Inf"} 2135
+bifrost_gate_query_stream_duration_seconds_sum{outcome="success"} 158.31608649200004
+bifrost_gate_query_stream_duration_seconds_count{outcome="success"} 2135
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="0.001"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="0.005"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="0.01"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="0.025"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="0.05"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="0.1"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="0.25"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="0.5"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="1"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="2.5"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="5"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="10"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="30"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="60"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="120"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="300"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="600"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="1800"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="rejected",le="+Inf"} 10742
+bifrost_gate_query_stream_duration_seconds_sum{outcome="rejected"} 1.4756722060000003
+bifrost_gate_query_stream_duration_seconds_count{outcome="rejected"} 10742
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="0.001"} 0
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="0.005"} 58041
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="0.01"} 82368
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="0.025"} 92314
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="0.05"} 96246
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="0.1"} 101663
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="0.25"} 104030
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="0.5"} 121928
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="1"} 155401
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="2.5"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="5"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="10"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="30"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="60"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="120"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="300"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="600"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="1800"} 162738
+bifrost_gate_query_stream_duration_seconds_bucket{outcome="failed",le="+Inf"} 162738
+bifrost_gate_query_stream_duration_seconds_sum{outcome="failed"} 42421.642824274066
+bifrost_gate_query_stream_duration_seconds_count{outcome="failed"} 162738
+
+# TYPE bifrost_scribe_replay_seconds summary
+bifrost_scribe_replay_seconds{quantile="0"} 0
+bifrost_scribe_replay_seconds{quantile="0.5"} 0
+bifrost_scribe_replay_seconds{quantile="0.9"} 0
+bifrost_scribe_replay_seconds{quantile="0.95"} 0
+bifrost_scribe_replay_seconds{quantile="0.99"} 0
+bifrost_scribe_replay_seconds{quantile="0.999"} 0
+bifrost_scribe_replay_seconds{quantile="1"} 0
+bifrost_scribe_replay_seconds_sum 0.000146159
+bifrost_scribe_replay_seconds_count 1
+
+# TYPE oracle_query_duration_seconds histogram
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="0.001"} 0
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="0.005"} 991
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="0.01"} 1154
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="0.025"} 1414
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="0.05"} 2116
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="0.1"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="0.25"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="0.5"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="1"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="2.5"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="5"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="10"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="30"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="60"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="120"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="300"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="600"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="1800"} 2135
+oracle_query_duration_seconds_bucket{class="interactive",outcome="success",le="+Inf"} 2135
+oracle_query_duration_seconds_sum{class="interactive",outcome="success"} 39.50014300199999
+oracle_query_duration_seconds_count{class="interactive",outcome="success"} 2135
+
+# TYPE bifrost_gate_resolution_seconds summary
+bifrost_gate_resolution_seconds{quantile="0"} 0
+bifrost_gate_resolution_seconds{quantile="0.5"} 0
+bifrost_gate_resolution_seconds{quantile="0.9"} 0
+bifrost_gate_resolution_seconds{quantile="0.95"} 0
+bifrost_gate_resolution_seconds{quantile="0.99"} 0
+bifrost_gate_resolution_seconds{quantile="0.999"} 0
+bifrost_gate_resolution_seconds{quantile="1"} 0
+bifrost_gate_resolution_seconds_sum 1.8699526140000007
+bifrost_gate_resolution_seconds_count 66
+bifrost_gate_resolution_seconds{stage="auth",quantile="0"} 0
+bifrost_gate_resolution_seconds{stage="auth",quantile="0.5"} 0
+bifrost_gate_resolution_seconds{stage="auth",quantile="0.9"} 0
+bifrost_gate_resolution_seconds{stage="auth",quantile="0.95"} 0
+bifrost_gate_resolution_seconds{stage="auth",quantile="0.99"} 0
+bifrost_gate_resolution_seconds{stage="auth",quantile="0.999"} 0
+bifrost_gate_resolution_seconds{stage="auth",quantile="1"} 0
+bifrost_gate_resolution_seconds_sum{stage="auth"} 0.0074984050000000005
+bifrost_gate_resolution_seconds_count{stage="auth"} 66
+
+# TYPE bifrost_storage_request_seconds summary
+bifrost_storage_request_seconds{operation="write",outcome="success",quantile="0"} 0
+bifrost_storage_request_seconds{operation="write",outcome="success",quantile="0.5"} 0
+bifrost_storage_request_seconds{operation="write",outcome="success",quantile="0.9"} 0
+bifrost_storage_request_seconds{operation="write",outcome="success",quantile="0.95"} 0
+bifrost_storage_request_seconds{operation="write",outcome="success",quantile="0.99"} 0
+bifrost_storage_request_seconds{operation="write",outcome="success",quantile="0.999"} 0
+bifrost_storage_request_seconds{operation="write",outcome="success",quantile="1"} 0
+bifrost_storage_request_seconds_sum{operation="write",outcome="success"} 0.11363005899999999
+bifrost_storage_request_seconds_count{operation="write",outcome="success"} 19
+bifrost_storage_request_seconds{operation="read_range",outcome="success",quantile="0"} 0.000032141
+bifrost_storage_request_seconds{operation="read_range",outcome="success",quantile="0.5"} 0.0001155855007976476
+bifrost_storage_request_seconds{operation="read_range",outcome="success",quantile="0.9"} 0.0002629096732546838
+bifrost_storage_request_seconds{operation="read_range",outcome="success",quantile="0.95"} 0.0004271821602686547
+bifrost_storage_request_seconds{operation="read_range",outcome="success",quantile="0.99"} 0.0007041634684940256
+bifrost_storage_request_seconds{operation="read_range",outcome="success",quantile="0.999"} 0.0013066351590189057
+bifrost_storage_request_seconds{operation="read_range",outcome="success",quantile="1"} 0.002183266
+bifrost_storage_request_seconds_sum{operation="read_range",outcome="success"} 0.7538803310000018
+bifrost_storage_request_seconds_count{operation="read_range",outcome="success"} 5847
+bifrost_storage_request_seconds{operation="read",outcome="success",quantile="0"} 0.000021
+bifrost_storage_request_seconds{operation="read",outcome="success",quantile="0.5"} 0.0000729234689890102
+bifrost_storage_request_seconds{operation="read",outcome="success",quantile="0.9"} 0.0012892430353023466
+bifrost_storage_request_seconds{operation="read",outcome="success",quantile="0.95"} 0.0015226545899461005
+bifrost_storage_request_seconds{operation="read",outcome="success",quantile="0.99"} 0.0019799176505953795
+bifrost_storage_request_seconds{operation="read",outcome="success",quantile="0.999"} 0.002478008600593357
+bifrost_storage_request_seconds{operation="read",outcome="success",quantile="1"} 0.004385117
+bifrost_storage_request_seconds_sum{operation="read",outcome="success"} 17.921184949000086
+bifrost_storage_request_seconds_count{operation="read",outcome="success"} 54208
+bifrost_storage_request_seconds{operation="writer_write",outcome="success",quantile="0"} 0
+bifrost_storage_request_seconds{operation="writer_write",outcome="success",quantile="0.5"} 0
+bifrost_storage_request_seconds{operation="writer_write",outcome="success",quantile="0.9"} 0
+bifrost_storage_request_seconds{operation="writer_write",outcome="success",quantile="0.95"} 0
+bifrost_storage_request_seconds{operation="writer_write",outcome="success",quantile="0.99"} 0
+bifrost_storage_request_seconds{operation="writer_write",outcome="success",quantile="0.999"} 0
+bifrost_storage_request_seconds{operation="writer_write",outcome="success",quantile="1"} 0
+bifrost_storage_request_seconds_sum{operation="writer_write",outcome="success"} 0.00036705500000000014
+bifrost_storage_request_seconds_count{operation="writer_write",outcome="success"} 118
+bifrost_storage_request_seconds{operation="open_writer",outcome="success",quantile="0"} 0
+bifrost_storage_request_seconds{operation="open_writer",outcome="success",quantile="0.5"} 0
+bifrost_storage_request_seconds{operation="open_writer",outcome="success",quantile="0.9"} 0
+bifrost_storage_request_seconds{operation="open_writer",outcome="success",quantile="0.95"} 0
+bifrost_storage_request_seconds{operation="open_writer",outcome="success",quantile="0.99"} 0
+bifrost_storage_request_seconds{operation="open_writer",outcome="success",quantile="0.999"} 0
+bifrost_storage_request_seconds{operation="open_writer",outcome="success",quantile="1"} 0
+bifrost_storage_request_seconds_sum{operation="open_writer",outcome="success"} 0.034697745999999995
+bifrost_storage_request_seconds_count{operation="open_writer",outcome="success"} 118
+bifrost_storage_request_seconds{operation="writer_close",outcome="success",quantile="0"} 0
+bifrost_storage_request_seconds{operation="writer_close",outcome="success",quantile="0.5"} 0
+bifrost_storage_request_seconds{operation="writer_close",outcome="success",quantile="0.9"} 0
+bifrost_storage_request_seconds{operation="writer_close",outcome="success",quantile="0.95"} 0
+bifrost_storage_request_seconds{operation="writer_close",outcome="success",quantile="0.99"} 0
+bifrost_storage_request_seconds{operation="writer_close",outcome="success",quantile="0.999"} 0
+bifrost_storage_request_seconds{operation="writer_close",outcome="success",quantile="1"} 0
+bifrost_storage_request_seconds_sum{operation="writer_close",outcome="success"} 0.724259408
+bifrost_storage_request_seconds_count{operation="writer_close",outcome="success"} 118
+
+# TYPE oracle_admission_queue_duration_seconds histogram
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="0.001"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="0.005"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="0.01"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="0.025"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="0.05"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="0.1"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="0.25"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="0.5"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="1"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="2.5"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="5"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="10"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="30"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="60"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="120"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="300"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="600"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="1800"} 2135
+oracle_admission_queue_duration_seconds_bucket{class="interactive",le="+Inf"} 2135
+oracle_admission_queue_duration_seconds_sum{class="interactive"} 0.03690668599999999
+oracle_admission_queue_duration_seconds_count{class="interactive"} 2135
+
+# TYPE vala_postgres_pool_acquire_seconds histogram
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="0.001"} 8056
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="0.005"} 17807
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="0.01"} 17853
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="0.025"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="0.05"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="0.1"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="0.25"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="0.5"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="1"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="2.5"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="5"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="10"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="30"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="60"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="120"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="300"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="600"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="1800"} 17854
+vala_postgres_pool_acquire_seconds_bucket{pool="runtime",outcome="success",le="+Inf"} 17854
+vala_postgres_pool_acquire_seconds_sum{pool="runtime",outcome="success"} 20.183338292999995
+vala_postgres_pool_acquire_seconds_count{pool="runtime",outcome="success"} 17854
+
+# TYPE bifrost_scribe_wal_append_seconds histogram
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="0.001"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="0.005"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="0.01"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="0.025"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="0.05"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="0.1"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="0.25"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="0.5"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="1"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="2.5"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="5"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="10"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="30"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="60"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="120"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="300"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="600"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="1800"} 186
+bifrost_scribe_wal_append_seconds_bucket{outcome="success",le="+Inf"} 186
+bifrost_scribe_wal_append_seconds_sum{outcome="success"} 0.036535452
+bifrost_scribe_wal_append_seconds_count{outcome="success"} 186
+
+# HELP bifrost_gate_request_duration_seconds Bifrost Gate request duration by operation and terminal outcome.
+# TYPE bifrost_gate_request_duration_seconds histogram
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="0.001"} 0
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="0.005"} 0
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="0.01"} 0
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="0.025"} 11
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="0.05"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="0.1"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="0.25"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="0.5"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="1"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="2.5"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="5"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="10"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="30"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="60"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="120"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="300"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="600"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="1800"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="write",outcome="success",le="+Inf"} 66
+bifrost_gate_request_duration_seconds_sum{operation="write",outcome="success"} 1.8780220479999994
+bifrost_gate_request_duration_seconds_count{operation="write",outcome="success"} 66
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="0.001"} 0
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="0.005"} 0
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="0.01"} 0
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="0.025"} 25
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="0.05"} 47
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="0.1"} 1467
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="0.25"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="0.5"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="1"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="2.5"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="5"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="10"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="30"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="60"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="120"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="300"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="600"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="1800"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="success",le="+Inf"} 2135
+bifrost_gate_request_duration_seconds_sum{operation="query",outcome="success"} 158.14133479
+bifrost_gate_request_duration_seconds_count{operation="query",outcome="success"} 2135
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="0.001"} 0
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="0.005"} 58030
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="0.01"} 82362
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="0.025"} 92314
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="0.05"} 96245
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="0.1"} 101663
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="0.25"} 104030
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="0.5"} 121928
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="1"} 155401
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="2.5"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="5"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="10"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="30"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="60"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="120"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="300"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="600"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="1800"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="failed",le="+Inf"} 162738
+bifrost_gate_request_duration_seconds_sum{operation="query",outcome="failed"} 42421.892962870945
+bifrost_gate_request_duration_seconds_count{operation="query",outcome="failed"} 162738
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="0.001"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="0.005"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="0.01"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="0.025"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="0.05"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="0.1"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="0.25"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="0.5"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="1"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="2.5"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="5"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="10"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="30"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="60"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="120"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="300"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="600"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="1800"} 10742
+bifrost_gate_request_duration_seconds_bucket{operation="query",outcome="rejected",le="+Inf"} 10742
+bifrost_gate_request_duration_seconds_sum{operation="query",outcome="rejected"} 1.492896621
+bifrost_gate_request_duration_seconds_count{operation="query",outcome="rejected"} 10742
+
+# TYPE bifrost_query_duration_seconds histogram
+bifrost_query_duration_seconds_bucket{result="success",le="0.001"} 0
+bifrost_query_duration_seconds_bucket{result="success",le="0.005"} 991
+bifrost_query_duration_seconds_bucket{result="success",le="0.01"} 1154
+bifrost_query_duration_seconds_bucket{result="success",le="0.025"} 1414
+bifrost_query_duration_seconds_bucket{result="success",le="0.05"} 2116
+bifrost_query_duration_seconds_bucket{result="success",le="0.1"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="0.25"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="0.5"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="1"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="2.5"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="5"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="10"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="30"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="60"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="120"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="300"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="600"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="1800"} 2135
+bifrost_query_duration_seconds_bucket{result="success",le="+Inf"} 2135
+bifrost_query_duration_seconds_sum{result="success"} 39.501214016
+bifrost_query_duration_seconds_count{result="success"} 2135
+
+# TYPE bifrost_scribe_persistence_publication_seconds histogram
+bifrost_scribe_persistence_publication_seconds_bucket{le="0.001"} 0
+bifrost_scribe_persistence_publication_seconds_bucket{le="0.005"} 0
+bifrost_scribe_persistence_publication_seconds_bucket{le="0.01"} 0
+bifrost_scribe_persistence_publication_seconds_bucket{le="0.025"} 4
+bifrost_scribe_persistence_publication_seconds_bucket{le="0.05"} 15
+bifrost_scribe_persistence_publication_seconds_bucket{le="0.1"} 45
+bifrost_scribe_persistence_publication_seconds_bucket{le="0.25"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="0.5"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="1"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="2.5"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="5"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="10"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="30"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="60"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="120"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="300"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="600"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="1800"} 56
+bifrost_scribe_persistence_publication_seconds_bucket{le="+Inf"} 56
+bifrost_scribe_persistence_publication_seconds_sum 4.106524016000001
+bifrost_scribe_persistence_publication_seconds_count 56
+
+# TYPE bifrost_forge_task_duration_seconds histogram
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="0.001"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="0.005"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="0.01"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="0.025"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="0.05"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="0.1"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="0.25"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="0.5"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="1"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="2.5"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="5"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="10"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="30"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="60"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="120"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="300"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="600"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="1800"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="scribe_promotion",result="succeeded",le="+Inf"} 3
+bifrost_forge_task_duration_seconds_sum{task_type="scribe_promotion",result="succeeded"} 0.18314412100000002
+bifrost_forge_task_duration_seconds_count{task_type="scribe_promotion",result="succeeded"} 3
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="0.001"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="0.005"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="0.01"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="0.025"} 6
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="0.05"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="0.1"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="0.25"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="0.5"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="1"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="2.5"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="5"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="10"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="30"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="60"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="120"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="300"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="600"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="1800"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="orphan_cleanup",result="succeeded",le="+Inf"} 8
+bifrost_forge_task_duration_seconds_sum{task_type="orphan_cleanup",result="succeeded"} 0.190026835
+bifrost_forge_task_duration_seconds_count{task_type="orphan_cleanup",result="succeeded"} 8
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="0.001"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="0.005"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="0.01"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="0.025"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="0.05"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="0.1"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="0.25"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="0.5"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="1"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="2.5"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="5"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="10"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="30"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="60"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="120"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="300"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="600"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="1800"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="succeeded",le="+Inf"} 1
+bifrost_forge_task_duration_seconds_sum{task_type="small_files",result="succeeded"} 1.983372573
+bifrost_forge_task_duration_seconds_count{task_type="small_files",result="succeeded"} 1
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="0.001"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="0.005"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="0.01"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="0.025"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="0.05"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="0.1"} 0
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="0.25"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="0.5"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="1"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="2.5"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="5"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="10"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="30"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="60"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="120"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="300"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="600"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="1800"} 2
+bifrost_forge_task_duration_seconds_bucket{task_type="small_files",result="retry",le="+Inf"} 2
+bifrost_forge_task_duration_seconds_sum{task_type="small_files",result="retry"} 0.25876237700000004
+bifrost_forge_task_duration_seconds_count{task_type="small_files",result="retry"} 2
+
+# TYPE bifrost_scribe_persist_stage_seconds summary
+bifrost_scribe_persist_stage_seconds{stage="assemble_claim",quantile="0"} 0
+bifrost_scribe_persist_stage_seconds{stage="assemble_claim",quantile="0.5"} 0
+bifrost_scribe_persist_stage_seconds{stage="assemble_claim",quantile="0.9"} 0
+bifrost_scribe_persist_stage_seconds{stage="assemble_claim",quantile="0.95"} 0
+bifrost_scribe_persist_stage_seconds{stage="assemble_claim",quantile="0.99"} 0
+bifrost_scribe_persist_stage_seconds{stage="assemble_claim",quantile="0.999"} 0
+bifrost_scribe_persist_stage_seconds{stage="assemble_claim",quantile="1"} 0
+bifrost_scribe_persist_stage_seconds_sum{stage="assemble_claim"} 0.24526585499999998
+bifrost_scribe_persist_stage_seconds_count{stage="assemble_claim"} 10
+bifrost_scribe_persist_stage_seconds{stage="stage_member",quantile="0"} 0
+bifrost_scribe_persist_stage_seconds{stage="stage_member",quantile="0.5"} 0
+bifrost_scribe_persist_stage_seconds{stage="stage_member",quantile="0.9"} 0
+bifrost_scribe_persist_stage_seconds{stage="stage_member",quantile="0.95"} 0
+bifrost_scribe_persist_stage_seconds{stage="stage_member",quantile="0.99"} 0
+bifrost_scribe_persist_stage_seconds{stage="stage_member",quantile="0.999"} 0
+bifrost_scribe_persist_stage_seconds{stage="stage_member",quantile="1"} 0
+bifrost_scribe_persist_stage_seconds_sum{stage="stage_member"} 1.7607253320000003
+bifrost_scribe_persist_stage_seconds_count{stage="stage_member"} 56
+

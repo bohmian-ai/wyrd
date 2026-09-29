@@ -17,8 +17,6 @@ mod peer_credentials;
 mod peer_keyring;
 mod peer_service;
 mod query_audit;
-mod tail_audit;
-mod tail_authority;
 mod tail_discovery;
 
 #[cfg(feature = "test-support")]
@@ -34,10 +32,15 @@ pub use peer_authority::OraclePeerAuthority;
 pub use peer_credentials::ServerBifrostPeerCredentials;
 pub use peer_keyring::{PeerKeyringError, PeerTicketKeyring};
 pub use peer_service::OraclePeerGrpc;
+#[cfg(feature = "test-support")]
+pub use peer_service::{ScribeFragmentFault, arm_scribe_fragment_fault_for_test};
 pub use query_audit::OracleQueryAudit;
-pub use tail_audit::PostgresTailSecurityAudit;
-pub use tail_authority::ScribeTailAuthority;
 pub use tail_discovery::RegistryTailStreamDiscovery;
+#[cfg(feature = "test-support")]
+pub use tail_discovery::{
+    arm_tail_listing_credential_rejection_for_test, arm_tail_listing_stale_for_test,
+    arm_tail_listing_stall_for_test,
+};
 
 /// Closes the local serving latch once this Oracle's reader epoch is lost.
 ///

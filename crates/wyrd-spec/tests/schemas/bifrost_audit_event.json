@@ -188,7 +188,7 @@
           }
         },
         {
-          "description": "Immutable, scrubbed Bifrost visibility-cut read decision.",
+          "description": "Immutable, scrubbed Bifrost query read decision.",
           "type": "object",
           "required": [
             "binding_digests",
@@ -204,7 +204,6 @@
             "selected_node_count",
             "slot_units",
             "snapshot_digest",
-            "visibility",
             "worker_count"
           ],
           "properties": {
@@ -287,14 +286,6 @@
             "snapshot_digest": {
               "description": "Pinned snapshot summary digest.",
               "type": "string"
-            },
-            "visibility": {
-              "description": "Visibility mode committed by the cut.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/VisibilityMode"
-                }
-              ]
             },
             "worker_count": {
               "description": "Selected workers excluding leader.",
@@ -1394,34 +1385,6 @@
           "enum": [
             "peer_stage_binding"
           ]
-        },
-        {
-          "description": "Invalid Scribe-tail ticket audience.",
-          "type": "string",
-          "enum": [
-            "tail_audience"
-          ]
-        },
-        {
-          "description": "Scribe-tail tenant or table binding mismatch.",
-          "type": "string",
-          "enum": [
-            "tail_binding"
-          ]
-        },
-        {
-          "description": "Scribe-tail fence or writer epoch mismatch.",
-          "type": "string",
-          "enum": [
-            "tail_fence"
-          ]
-        },
-        {
-          "description": "Replayed Scribe-tail ticket or capability.",
-          "type": "string",
-          "enum": [
-            "tail_replay"
-          ]
         }
       ]
     },
@@ -1436,8 +1399,7 @@
         "Prompt",
         "Agent",
         "Workflow",
-        "Eval",
-        "Drift",
+        "Verifier",
         "Service",
         "Policy",
         "Mcp",
@@ -1789,7 +1751,7 @@
       }
     },
     "PrincipalKindTag": {
-      "description": "Principal-kind discriminator without a bound card.\n\nSerializes as a bare snake_case string (`\"global_admin\"`, `\"tenant_admin\"`, `\"user\"`, `\"service\"`, `\"agent\"`); this is a stable wire contract for the revoke request body, token claims, and the durable `principal_kind` columns.",
+      "description": "Principal-kind discriminator without a bound card.\n\nSerializes as a bare snake_case string (`\"global_admin\"`, `\"tenant_admin\"`, `\"user\"`, `\"service\"`, `\"agent\"`, `\"system\"`); this is a stable wire contract for the revoke request body, token claims, and the durable `principal_kind` columns.",
       "oneOf": [
         {
           "description": "Platform-scope administrative principal. Carries no tenant and operates the platform control plane: tenant lifecycle and tenant-administration recovery. It is never implicitly authorized over a tenant's resources.",
@@ -1824,6 +1786,13 @@
           "type": "string",
           "enum": [
             "agent"
+          ]
+        },
+        {
+          "description": "Internal tenant verification-result writer.\n\nExactly one credentialless principal of this kind exists per tenant, created by tenant provisioning. It binds no Card, holds no role, and is absent from every public principal-management and credential path; the server alone mints its short-lived token, scoped to one exact Verifier Card, to publish canonical verification results. It stays representable here so token claims and audit records can attribute those writes.",
+          "type": "string",
+          "enum": [
+            "system"
           ]
         }
       ]
@@ -2006,25 +1975,6 @@
     "VersionBlock": {
       "description": "Semver-compatible version string.",
       "type": "string"
-    },
-    "VisibilityMode": {
-      "description": "Visibility tiers included in one immutable Oracle query cut.",
-      "oneOf": [
-        {
-          "description": "Read pinned Iceberg and hot sealed files.",
-          "type": "string",
-          "enum": [
-            "published_only"
-          ]
-        },
-        {
-          "description": "Also read the exact fenced live-tail interval.",
-          "type": "string",
-          "enum": [
-            "fused"
-          ]
-        }
-      ]
     }
   }
 }

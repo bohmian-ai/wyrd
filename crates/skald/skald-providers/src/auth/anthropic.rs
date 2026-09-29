@@ -70,13 +70,20 @@ impl AnthropicAuth {
     }
 
     /// Builds Anthropic request headers with secrets redacted from errors.
+    ///
+    /// The API key header is marked sensitive so it never appears in debug
+    /// output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Decode`] when the key, version, or beta value is
+    /// not a valid header value.
     pub fn headers(&self) -> ProviderResult<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_static("x-api-key"),
-            HeaderValue::from_str(self.api_key.expose_secret())
-                .map_err(|error| ProviderError::decode("anthropic", error))?,
-        );
+        let mut key = HeaderValue::from_str(self.api_key.expose_secret())
+            .map_err(|error| ProviderError::decode("anthropic", error))?;
+        key.set_sensitive(true);
+        headers.insert(HeaderName::from_static("x-api-key"), key);
         headers.insert(
             HeaderName::from_static("anthropic-version"),
             HeaderValue::from_str(&self.version)

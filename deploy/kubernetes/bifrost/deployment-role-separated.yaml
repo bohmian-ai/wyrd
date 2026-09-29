@@ -11,6 +11,9 @@ spec:
     metadata:
       labels: {app: wyrd-bifrost-ingest, wyrd.ai/bifrost-scribe: "true", wyrd.ai/bifrost-private: "true"}
     spec:
+      # Above the server's 35-second shutdown drain, which holds the
+      # verification runtime's 30-second in-flight drain.
+      terminationGracePeriodSeconds: 45
       containers:
         - name: wyrd-server
           image: wyrd/server:latest
@@ -37,6 +40,9 @@ spec:
     metadata:
       labels: {app: wyrd-bifrost-query, wyrd.ai/bifrost-oracle: "true", wyrd.ai/bifrost-private: "true"}
     spec:
+      # Above the server's 35-second shutdown drain, which holds the
+      # verification runtime's 30-second in-flight drain.
+      terminationGracePeriodSeconds: 45
       volumes:
         - name: bifrost-data
           emptyDir: {}

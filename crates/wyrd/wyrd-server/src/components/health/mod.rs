@@ -57,6 +57,8 @@ pub enum ProbeReason {
     ForgeCoordinatorUnavailable,
     /// The selected Forge worker has not finished durable recovery.
     ForgeWorkerUnavailable,
+    /// A composed verification runtime capability is not running.
+    VerificationRuntimeDegraded,
 }
 
 /// Snapshot published by the background readiness_loop task.
@@ -76,6 +78,8 @@ pub struct ReadinessSnapshot {
     pub forge_coordinator: Option<ProbeOutcome>,
     /// Forge worker readiness, present only when that role is selected.
     pub forge_worker: Option<ProbeOutcome>,
+    /// Verification runtime readiness, present only when it was composed.
+    pub verification: Option<ProbeOutcome>,
 }
 
 /// Per-dependency probe result.
@@ -122,6 +126,7 @@ impl ReadinessSnapshot {
             // can never satisfy.
             forge_coordinator: None,
             forge_worker: None,
+            verification: None,
         }
     }
 
@@ -135,6 +140,7 @@ impl ReadinessSnapshot {
             && self.peer.ok
             && self.forge_coordinator.as_ref().is_none_or(|probe| probe.ok)
             && self.forge_worker.as_ref().is_none_or(|probe| probe.ok)
+            && self.verification.as_ref().is_none_or(|probe| probe.ok)
     }
 }
 
@@ -169,7 +175,21 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
         peer: probe_peer(state),
         forge_coordinator: probe_forge_coordinator(state),
         forge_worker: probe_forge_worker(state),
+        verification: probe_verification(state),
     }
+}
+
+/// Reads the verification runtime's capability bits.
+///
+/// Returns `None` when this process composed no verification capability, so
+/// a process that intentionally runs none never grows an unsatisfiable check.
+fn probe_verification(state: &AppState) -> Option<ProbeOutcome> {
+    state.verification.is_composed().then(|| {
+        role_outcome(
+            !state.verification.is_degraded(),
+            ProbeReason::VerificationRuntimeDegraded,
+        )
+    })
 }
 
 /// Reads the Forge coordinator bit the supervised planning loop publishes.
@@ -437,6 +457,8 @@ struct PublicChecks {
     forge_coordinator: Option<PublicProbeOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     forge_worker: Option<PublicProbeOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<PublicProbeOutcome>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -468,6 +490,12 @@ impl PublicReadinessReport {
                 }),
                 forge_worker: snapshot
                     .forge_worker
+                    .as_ref()
+                    .map(|probe| PublicProbeOutcome {
+                        reason: probe.reason,
+                    }),
+                verification: snapshot
+                    .verification
                     .as_ref()
                     .map(|probe| PublicProbeOutcome {
                         reason: probe.reason,
@@ -532,6 +560,7 @@ mod tests {
             },
             forge_coordinator: None,
             forge_worker: None,
+            verification: None,
         }
     }
 
@@ -564,6 +593,7 @@ mod tests {
             },
             forge_coordinator: None,
             forge_worker: None,
+            verification: None,
         }
     }
 

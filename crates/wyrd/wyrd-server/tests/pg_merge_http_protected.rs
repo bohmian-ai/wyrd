@@ -186,9 +186,20 @@ async fn extension_panic_maps_to_500() {
 /// active: on a Scribe-composed server an oversized OTLP request reaches the
 /// decoder, while the same request against an Oracle-only server — one with no
 /// Scribe role at all — is refused by the global body limit.
+///
+/// The configured 32 MiB Scribe request is above the 16 MiB default yet still
+/// fits the test node's replay envelope at its derived 4× expanded ceiling, so
+/// the request below exceeds the default without exceeding the selected cap.
+///
+/// # Panics
+///
+/// Panics when either server fails to start, the frozen transport cap differs
+/// from the configured request, the global limit does not refuse the probe, the
+/// Scribe route does not reach its decoder, or the role-absent route is not
+/// refused by the global limit.
 #[tokio::test]
 async fn pg_scribe_body_limit_is_route_and_role_local() {
-    let request_bytes = 201 * 1024 * 1024;
+    let request_bytes = 32 * 1024 * 1024;
     let scribe_config = ScribeRuntimeConfig {
         ingest_request_bytes: request_bytes,
         ..ScribeRuntimeConfig::default()
@@ -243,7 +254,7 @@ async fn pg_scribe_body_limit_is_route_and_role_local() {
         "body exceeding the limit must return 413"
     );
 
-    let above_default = 200 * 1024 * 1024 + 512 * 1024;
+    let above_default = 16 * 1024 * 1024 + 512 * 1024;
     let scribe_response = router
         .oneshot(
             Request::builder()

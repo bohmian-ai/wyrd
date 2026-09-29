@@ -1,6 +1,7 @@
 //! Anthropic Messages client.
 
 use async_trait::async_trait;
+use serde_json::value::RawValue;
 use skald_spec::{ProviderRequest, ProviderResponse};
 
 use crate::auth::AnthropicAuth;
@@ -22,11 +23,11 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     /// Creates an Anthropic client from explicit auth.
     pub fn new(auth: AnthropicAuth) -> ProviderResult<Self> {
-        Ok(Self {
+        Ok(Self::with_transport(
             auth,
-            transport: HttpTransport::new(TransportConfig::default())?,
-            retry: RetryPolicy::default(),
-        })
+            HttpTransport::new(TransportConfig::default())?,
+            RetryPolicy::default(),
+        ))
     }
 
     /// Creates an Anthropic client from environment variables.
@@ -34,15 +35,17 @@ impl AnthropicClient {
         Self::new(AnthropicAuth::from_env()?)
     }
 
-    /// Overrides transport and retry policy, primarily for tests.
-    pub fn with_transport_and_retry(
-        mut self,
+    /// Creates an Anthropic client over a shared transport and retry policy.
+    pub const fn with_transport(
+        auth: AnthropicAuth,
         transport: HttpTransport,
         retry: RetryPolicy,
     ) -> Self {
-        self.transport = transport;
-        self.retry = retry;
-        self
+        Self {
+            auth,
+            transport,
+            retry,
+        }
     }
 
     /// Returns the required unsupported-embeddings error.
@@ -50,11 +53,63 @@ impl AnthropicClient {
         ProviderError::bad_request("anthropic", "anthropic does not support embeddings")
     }
 
+    /// URL of the Messages route; every Messages request builds its URL here.
+    fn messages_url(&self) -> String {
+        format!("{}/v1/messages", self.auth.base_url())
+    }
+
+    /// Posts a caller-built Messages `body` and returns the provider's answer
+    /// bytes unchanged.
+    ///
+    /// Uses the same URL, auth headers, transport, retry policy, bounded read,
+    /// and status errors as typed requests, but skips (de)serialization, so
+    /// provider members the Skald wire types do not model survive unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Status`] for a non-success answer,
+    /// [`ProviderError::Decode`] when the answer is not JSON or the auth
+    /// headers are invalid, and [`ProviderError::Connect`],
+    /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
+    /// exchange fails.
+    pub async fn send_raw(&self, body: &RawValue) -> ProviderResult<Box<RawValue>> {
+        raw::send_raw(
+            &self.transport,
+            "anthropic",
+            &self.messages_url(),
+            self.auth.headers()?,
+            body,
+            &self.retry,
+        )
+        .await
+    }
+
+    /// Posts a caller-built streaming Messages `body` and returns the answer
+    /// for incremental reading, its bytes unchanged.
+    ///
+    /// Uses the same URL and auth headers as [`Self::send_raw`] but never
+    /// retries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`super::open_stream`], or
+    /// [`ProviderError::Decode`] when the auth headers are invalid.
+    pub async fn stream_raw(&self, body: &RawValue) -> ProviderResult<super::ProviderByteStream> {
+        super::open_stream(
+            &self.transport,
+            "anthropic",
+            &self.messages_url(),
+            self.auth.headers()?,
+            body,
+        )
+        .await
+    }
+
     /// Sends a native Anthropic request.
     pub async fn send_native(&self, request: ProviderRequest) -> ProviderResult<ProviderResponse> {
         match request {
             ProviderRequest::AnthropicMessage(request) => {
-                let url = format!("{}/v1/messages", self.auth.base_url());
+                let url = self.messages_url();
                 let response = super::send_json_with_retry(
                     &self.transport,
                     "anthropic",
@@ -96,7 +151,7 @@ impl ProviderClient for AnthropicClient {
     async fn stream(&self, request: ProviderRequest) -> ProviderResult<ProviderStream> {
         match request {
             ProviderRequest::AnthropicMessage(request) => {
-                let url = format!("{}/v1/messages", self.auth.base_url());
+                let url = self.messages_url();
                 let body = serde_json::to_vec(&request)
                     .map_err(|error| ProviderError::decode("anthropic", error))?;
                 let text = super::send_bytes_with_retry(

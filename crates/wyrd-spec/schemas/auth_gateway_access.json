@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayAccess",
+  "description": "The gateway provider objects one invoke grant reaches.\n\nA provider grant covers every tenant-enabled model of that provider; a model grant covers only the exact provider/model pair. Identities are the same typed values deployment resolution uses.",
+  "oneOf": [
+    {
+      "description": "Every model served by one provider.",
+      "type": "object",
+      "required": [
+        "provider"
+      ],
+      "properties": {
+        "provider": {
+          "type": "object",
+          "required": [
+            "provider"
+          ],
+          "properties": {
+            "provider": {
+              "description": "Covered provider.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ProviderId"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "One exact provider-native model.",
+      "type": "object",
+      "required": [
+        "model"
+      ],
+      "properties": {
+        "model": {
+          "type": "object",
+          "required": [
+            "model",
+            "provider"
+          ],
+          "properties": {
+            "model": {
+              "description": "Provider-native model identifier.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ModelId"
+                }
+              ]
+            },
+            "provider": {
+              "description": "Provider serving the model.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ProviderId"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
+    }
+  }
+}

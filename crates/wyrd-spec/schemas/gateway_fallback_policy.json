@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayFallbackPolicy",
+  "description": "Tenant fallback policy; at most one rule per scope, rules never merge.",
+  "type": "object",
+  "required": [
+    "rules"
+  ],
+  "properties": {
+    "rules": {
+      "description": "Scoped rules.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/FallbackRule"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "FallbackRule": {
+      "description": "Ordered fallback candidates for one scope.",
+      "type": "object",
+      "required": [
+        "candidates",
+        "scope"
+      ],
+      "properties": {
+        "candidates": {
+          "description": "Non-empty, ordered, duplicate-free candidates.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ModelRef"
+          }
+        },
+        "scope": {
+          "description": "Scope the rule applies to.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FallbackScope"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "FallbackScope": {
+      "description": "Where one fallback rule applies.",
+      "oneOf": [
+        {
+          "description": "Every call without a more specific rule.",
+          "type": "string",
+          "enum": [
+            "global"
+          ]
+        },
+        {
+          "description": "Calls for one operation.",
+          "type": "object",
+          "required": [
+            "operation"
+          ],
+          "properties": {
+            "operation": {
+              "type": "object",
+              "required": [
+                "operation"
+              ],
+              "properties": {
+                "operation": {
+                  "description": "Operation the rule applies to.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/GatewayOperation"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Calls for one exact requested model.",
+          "type": "object",
+          "required": [
+            "model"
+          ],
+          "properties": {
+            "model": {
+              "type": "object",
+              "required": [
+                "model"
+              ],
+              "properties": {
+                "model": {
+                  "description": "Requested model the rule applies to.",
+                  "allOf": [
+                    {
+                      "$ref": "#/definitions/ModelRef"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "GatewayOperation": {
+      "description": "Typed capability a caller requests from the gateway.",
+      "oneOf": [
+        {
+          "description": "Chat Completions.",
+          "type": "string",
+          "enum": [
+            "chat_completions"
+          ]
+        },
+        {
+          "description": "Responses.",
+          "type": "string",
+          "enum": [
+            "responses"
+          ]
+        },
+        {
+          "description": "Embeddings.",
+          "type": "string",
+          "enum": [
+            "embeddings"
+          ]
+        },
+        {
+          "description": "Image generation, editing, and variations.",
+          "type": "string",
+          "enum": [
+            "images"
+          ]
+        },
+        {
+          "description": "Speech, transcription, and translation.",
+          "type": "string",
+          "enum": [
+            "audio"
+          ]
+        },
+        {
+          "description": "Batches, including the file operations batches require.",
+          "type": "string",
+          "enum": [
+            "batches"
+          ]
+        }
+      ]
+    },
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "One exact provider-native model selected by a caller.\n\nTyped surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "description": "Provider-native model identifier.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelId"
+            }
+          ]
+        },
+        "provider": {
+          "description": "Provider that serves the model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
+    }
+  }
+}

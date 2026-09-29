@@ -38,12 +38,10 @@ const MAX_RESERVATION_CLAIMS_BYTES: usize = 8 * 1024;
 const MAX_STAGE_CLAIMS_BYTES: usize = 32 * 1024;
 /// Query envelopes include the bounded public SQL request and its authenticated context.
 const MAX_FORWARD_QUERY_BYTES: usize = 128 * 1024;
-/// Default bound on unexpired single-use ticket identities.
-const DEFAULT_REPLAY_CAPACITY: usize = 1_024;
 /// Maximum lifetime accepted for a newly presented ticket.
 const DEFAULT_MAX_TICKET_TTL: chrono::Duration = chrono::Duration::seconds(30);
 
-/// Signed authenticated ingress state consumed exactly once by a selected ready Oracle.
+/// Signed authenticated ingress state accepted by one selected ready Oracle.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ForwardQueryClaims {
     /// Closed forwarding-envelope protocol version.
@@ -52,8 +50,6 @@ pub struct ForwardQueryClaims {
     pub audience: NodeId,
     /// Exact selected Oracle role-incarnation fence.
     pub worker_fence: u64,
-    /// Single-use replay identity.
-    pub nonce: Vec<u8>,
     /// Short envelope acceptance expiry, distinct from the query deadline.
     pub expires_at_ms: i64,
     /// Original verified public caller context without bearer credentials.
@@ -73,7 +69,10 @@ pub struct OraclePeerAuthority {
     /// to publish a new key before switching issuance without refusing tickets
     /// a peer minted moments earlier under the retiring key.
     keyring: Arc<PeerTicketKeyring>,
-    /// Role-local bounded single-use nonce owner.
+    /// Role-local single-use nonce owner for reservation and stage tickets.
+    ///
+    /// Entries live until their ticket expires; read-only forwarding and
+    /// fragment tickets never enter it.
     replay: Arc<PeerReplayCache>,
     /// Upper ticket lifetime bound checked after signature verification.
     max_ticket_ttl: chrono::Duration,
@@ -117,7 +116,10 @@ impl OraclePeerAuthority {
         })
     }
 
-    /// Verifies signature, audience, fence, expiry, replay, and tenant before decoding work.
+    /// Verifies signature, audience, fence, expiry, and tenant before decoding work.
+    ///
+    /// Forwarding is read-only, so no single-use record is kept: a repeated,
+    /// still-valid envelope runs again under ordinary query admission.
     ///
     /// # Errors
     /// Returns a durably audited closed security error for every invalid envelope.
@@ -192,27 +194,12 @@ impl OraclePeerAuthority {
             .ok_or(PeerSecurityError::Expired)?;
         if claims.expires_at_ms <= now.timestamp_millis()
             || claims.expires_at_ms > max_expiry.timestamp_millis()
-            || claims.nonce.len() < 16
         {
             return Err(self
                 .forwarding_rejection(
                     Some(tenant),
                     BifrostSecurityViolationKind::PeerReplay,
                     PeerSecurityError::Expired,
-                )
-                .await);
-        }
-        let expires = DateTime::from_timestamp_millis(claims.expires_at_ms)
-            .ok_or(PeerSecurityError::Expired)?;
-        if let Err(error) = self
-            .replay
-            .consume(&ticket.key_id, &claims.nonce, expires, now)
-        {
-            return Err(self
-                .forwarding_rejection(
-                    Some(tenant),
-                    BifrostSecurityViolationKind::PeerReplay,
-                    error,
                 )
                 .await);
         }
@@ -253,32 +240,21 @@ impl OraclePeerAuthority {
         pem: &SecretString,
         security_audit: Arc<dyn PeerSecurityAudit>,
     ) -> Result<Self, PeerSecurityError> {
-        Self::from_pem_with_limits(
-            pem,
-            DEFAULT_REPLAY_CAPACITY,
-            DEFAULT_MAX_TICKET_TTL,
-            security_audit,
-        )
+        Self::from_pem_with_limits(pem, DEFAULT_MAX_TICKET_TTL, security_audit)
     }
 
-    /// Parses the configured Wyrd key with explicit replay and ticket bounds.
+    /// Parses the configured Wyrd key with an explicit ticket lifetime bound.
     ///
     /// # Errors
     /// Returns a closed security failure for malformed key material or invalid bounds.
     pub fn from_pem_with_limits(
         pem: &SecretString,
-        replay_capacity: usize,
         max_ticket_ttl: chrono::Duration,
         security_audit: Arc<dyn PeerSecurityAudit>,
     ) -> Result<Self, PeerSecurityError> {
         let keyring = PeerTicketKeyring::from_signing_key_pem(pem)
             .map_err(|_| PeerSecurityError::InvalidSignature)?;
-        Self::from_keyring_with_limits(
-            Arc::new(keyring),
-            replay_capacity,
-            max_ticket_ttl,
-            security_audit,
-        )
+        Self::from_keyring_with_limits(Arc::new(keyring), max_ticket_ttl, security_audit)
     }
 
     /// Composes the authority over this plane's independent ticket keyring.
@@ -289,38 +265,32 @@ impl OraclePeerAuthority {
     ///
     /// # Errors
     ///
-    /// Returns [`PeerSecurityError::Claims`] when the replay or lifetime bound
-    /// is not positive.
+    /// Returns [`PeerSecurityError::Claims`] when the lifetime bound is not
+    /// positive.
     pub fn from_keyring(
         keyring: Arc<PeerTicketKeyring>,
         security_audit: Arc<dyn PeerSecurityAudit>,
     ) -> Result<Self, PeerSecurityError> {
-        Self::from_keyring_with_limits(
-            keyring,
-            DEFAULT_REPLAY_CAPACITY,
-            DEFAULT_MAX_TICKET_TTL,
-            security_audit,
-        )
+        Self::from_keyring_with_limits(keyring, DEFAULT_MAX_TICKET_TTL, security_audit)
     }
 
     /// Composes the authority over a keyring with explicit bounds.
     ///
     /// # Errors
     ///
-    /// Returns [`PeerSecurityError::Claims`] when the replay capacity is zero
-    /// or the maximum ticket lifetime is not positive.
+    /// Returns [`PeerSecurityError::Claims`] when the maximum ticket lifetime
+    /// is not positive.
     pub fn from_keyring_with_limits(
         keyring: Arc<PeerTicketKeyring>,
-        replay_capacity: usize,
         max_ticket_ttl: chrono::Duration,
         security_audit: Arc<dyn PeerSecurityAudit>,
     ) -> Result<Self, PeerSecurityError> {
-        if replay_capacity == 0 || max_ticket_ttl <= chrono::Duration::zero() {
+        if max_ticket_ttl <= chrono::Duration::zero() {
             return Err(PeerSecurityError::Claims);
         }
         Ok(Self {
             keyring,
-            replay: Arc::new(PeerReplayCache::new(replay_capacity)),
+            replay: Arc::new(PeerReplayCache::new()),
             max_ticket_ttl,
             security_audit,
         })
@@ -350,6 +320,11 @@ impl OraclePeerAuthority {
     }
 
     /// Verifies raw bytes before claims decoding or storage access.
+    ///
+    /// A fragment ticket authorizes a read-only row fragment, so its nonce is
+    /// not consumed: a repeated, still-valid ticket reads again under the
+    /// follower's ordinary admission. Signature, key, audience, fence, tenant,
+    /// and expiry are still enforced.
     ///
     /// # Errors
     /// Returns a closed security error for key, signature, audience, fence, or expiry violations.
@@ -436,7 +411,6 @@ impl OraclePeerAuthority {
             .ok_or(PeerSecurityError::Expired)?;
         if claims.expires_at_ms <= now.timestamp_millis()
             || claims.expires_at_ms > max_expiry.timestamp_millis()
-            || claims.nonce.len() < 16
         {
             return self
                 .reject_verified(
@@ -444,16 +418,6 @@ impl OraclePeerAuthority {
                     BifrostSecurityViolationKind::PeerReplay,
                     PeerSecurityError::Expired,
                 )
-                .await;
-        }
-        let expires = chrono::DateTime::from_timestamp_millis(claims.expires_at_ms)
-            .ok_or(PeerSecurityError::Expired)?;
-        if let Err(error) = self
-            .replay
-            .consume(&ticket.key_id, &claims.nonce, expires, now)
-        {
-            return self
-                .reject_verified(tenant_id, BifrostSecurityViolationKind::PeerReplay, error)
                 .await;
         }
         Ok(VerifiedClaimsBytes(ticket.claims_bytes.clone()))
@@ -790,8 +754,8 @@ impl OraclePeerAuthority {
     /// # Errors
     ///
     /// Returns [`PeerSecurityError::UnknownKey`], `InvalidSignature`, `Body`,
-    /// `Operation`, `Audience`, `Fence`, `Claims`, `Expired`, `Replay`,
-    /// `ReplayCapacity`, or [`PeerSecurityError::AuditUnavailable`] when the
+    /// `Operation`, `Audience`, `Fence`, `Claims`, `Expired`, `Replay`, or
+    /// [`PeerSecurityError::AuditUnavailable`] when the
     /// required audit row cannot commit. A rejection never returns claims.
     async fn authorize_stage_inner(
         &self,
@@ -1194,7 +1158,6 @@ mod tests {
             leader_fence: 3,
             query_id: uuid::Uuid::from_u128(4).as_bytes().to_vec(),
             tenant_id: tenant_id.as_uuid().as_bytes().to_vec(),
-            nonce: uuid::Uuid::from_u128(6).as_bytes().to_vec(),
             expires_at_ms: (now + chrono::Duration::seconds(10)).timestamp_millis(),
             execution_deadline_unix_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),
             binding: "binding".to_owned(),
@@ -1556,7 +1519,8 @@ mod tests {
         );
     }
 
-    /// Audience, worker fence, and replay audit to the signed tenant chain.
+    /// Audience, worker fence, and expiry audit to the signed tenant chain, and
+    /// a valid read-only fragment ticket verifies on every repeated use.
     #[tokio::test]
     async fn oracle_peer_authority_audits_verified_violations_to_signed_tenant() {
         let (authority, audit) = authority();
@@ -1578,16 +1542,14 @@ mod tests {
                 .await,
             Err(PeerSecurityError::Fence)
         );
-        authority
-            .verify_before_decode(&ticket, worker, 7, now)
-            .await
-            .expect("first consume");
-        assert_eq!(
+        for use_index in 0..2 {
             authority
                 .verify_before_decode(&ticket, worker, 7, now)
-                .await,
-            Err(PeerSecurityError::Replay)
-        );
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("read-only use {use_index} of a valid ticket verifies: {error}")
+                });
+        }
 
         let restarted =
             OraclePeerAuthority::from_pem(&SecretString::from(PRIVATE_KEY_PEM), audit.clone())
@@ -1618,7 +1580,6 @@ mod tests {
             vec![
                 (Some(tenant_id), BifrostSecurityViolationKind::PeerAudience,),
                 (Some(tenant_id), BifrostSecurityViolationKind::PeerFence),
-                (Some(tenant_id), BifrostSecurityViolationKind::PeerReplay),
                 (Some(tenant_id), BifrostSecurityViolationKind::PeerFence),
                 (Some(tenant_id), BifrostSecurityViolationKind::PeerReplay),
             ]
@@ -1649,9 +1610,10 @@ mod tests {
         );
     }
 
-    /// Tamper, malformed bytes, expiry, replay, and restart fencing all fail closed.
+    /// Tamper, malformed bytes, expiry, and restart fencing all fail closed,
+    /// while a repeated valid read-only ticket still verifies.
     #[tokio::test]
-    async fn oracle_peer_authority_rejects_tamper_replay_and_restart_fence() {
+    async fn oracle_peer_authority_rejects_tamper_expiry_and_restart_fence() {
         let (primary, _audit) = authority();
         let worker = NodeId::new(uuid::Uuid::from_u128(70));
         let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("tenant");
@@ -1716,14 +1678,12 @@ mod tests {
         let valid = primary
             .mint(&claims(worker, 9, tenant, now))
             .expect("ticket");
-        primary
-            .verify_before_decode(&valid, worker, 9, now)
-            .await
-            .expect("first use");
-        assert_eq!(
-            primary.verify_before_decode(&valid, worker, 9, now).await,
-            Err(PeerSecurityError::Replay),
-        );
+        for _ in 0..2 {
+            primary
+                .verify_before_decode(&valid, worker, 9, now)
+                .await
+                .expect("a valid read-only ticket verifies on every use");
+        }
 
         let (restarted, _audit) = authority();
         assert_eq!(
@@ -1740,7 +1700,7 @@ mod tests {
     ///
     /// Every field the envelope signs is set to a distinguishable value so a
     /// per-field mutation test can prove the signature covers it: the audience
-    /// and fence the verifier checks directly, the replay identity and expiry,
+    /// and fence the verifier checks directly, the acceptance expiry,
     /// the authenticated caller context including its request id, the complete
     /// unchanged request body, and the absolute query deadline.
     fn forward_claims(
@@ -1753,7 +1713,6 @@ mod tests {
         use wyrd_runtime::{Permission, Principal, PrincipalKind};
         use wyrd_spec::auth::PrincipalId;
         use wyrd_spec::request_id::RequestId;
-        use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
 
         // The route admits on the coarse capability while the principal holds
         // only a schema-scoped grant, which is exactly the shape a worker would
@@ -1779,13 +1738,10 @@ mod tests {
             protocol_version: 1,
             audience: worker,
             worker_fence,
-            nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
             expires_at_ms: (now + chrono::Duration::seconds(5)).timestamp_millis(),
             context,
             request: BifrostQueryRequest {
                 sql: "SELECT value FROM vala.bifrost.events".to_owned(),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(5_000),
             },
             absolute_deadline_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),
@@ -1827,7 +1783,7 @@ mod tests {
     /// Proves the final v1 forwarding envelope round-trips and binds every
     /// signed field it carries.
     ///
-    /// This is a phase of the authority's tamper, replay, and fence test rather
+    /// This is a phase of the authority's tamper, expiry, and fence test rather
     /// than a test of its own: forwarding envelopes are authorized by the same
     /// authority and the same closed rejections, so the two proofs share one
     /// entry point instead of drifting apart under separate names.
@@ -1846,7 +1802,6 @@ mod tests {
         assert_eq!(verified.protocol_version, 1);
         assert_eq!(verified.audience, claims.audience);
         assert_eq!(verified.worker_fence, claims.worker_fence);
-        assert_eq!(verified.nonce, claims.nonce);
         assert_eq!(verified.expires_at_ms, claims.expires_at_ms);
         assert_eq!(verified.context.data_tenant_id, tenant);
         assert_eq!(verified.context.request_id, claims.context.request_id);
@@ -1854,13 +1809,10 @@ mod tests {
         assert_eq!(verified.request, claims.request);
         assert_eq!(verified.absolute_deadline_ms, claims.absolute_deadline_ms);
 
-        assert_eq!(
-            authority
-                .verify_forward_query(&ticket, worker, 11, now)
-                .await
-                .expect_err("a replayed forwarding envelope is refused"),
-            PeerSecurityError::Replay
-        );
+        authority
+            .verify_forward_query(&ticket, worker, 11, now)
+            .await
+            .expect("a repeated valid read-only forwarding envelope is authorized");
 
         let wrong_audience = authority
             .mint_forward_query(&forward_claims(
@@ -1935,10 +1887,6 @@ mod tests {
             },
             ForwardQueryClaims {
                 absolute_deadline_ms: base.absolute_deadline_ms + 1,
-                ..base.clone()
-            },
-            ForwardQueryClaims {
-                nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
                 ..base.clone()
             },
             // Widening the signed principal's object authority is the exact

@@ -127,13 +127,12 @@ impl ScribeStagingRuntime {
     #[must_use]
     pub fn new(
         stage: Arc<ScribeHotStage>,
-        volume: crate::resources::StageVolume,
         publisher: ClaimPublisher,
         config: StagingAssemblerConfig,
     ) -> Self {
         Self {
             stage: Arc::clone(&stage),
-            stager: ScribeMemberStager::new(Arc::clone(&stage), volume),
+            stager: ScribeMemberStager::new(Arc::clone(&stage)),
             claims: ClaimAssembler::new(stage),
             publisher,
             assembly: Mutex::new(StagingAssembler::new(config)),
@@ -454,6 +453,10 @@ impl ScribeStagingRuntime {
     /// restored as that claim, and published members restore nothing because a
     /// hot object already serves their rows.
     ///
+    /// The volume governor's registration scan is the one charge for staged
+    /// files that survived; restore never charges them again and only releases
+    /// the members it retires.
+    ///
     /// Each key's encoding context is reconstructed from the same two
     /// authorities the members were staged under: the physical schema is read
     /// from the members' own Parquet runs, and the write recipe is re-resolved
@@ -470,8 +473,7 @@ impl ScribeStagingRuntime {
     /// Returns [`ScribeError::Internal`] when the staged namespace cannot be
     /// recovered or validated, a member's binding, schema, or recipe cannot be
     /// reconstructed, the recovered layout contradicts the key, the ready index
-    /// refuses a duplicate member, or the governed volume cannot re-admit the
-    /// bytes already on it.
+    /// refuses a duplicate member.
     pub async fn restore(&self, pool: &sqlx::PgPool) -> Result<usize, ScribeError> {
         let recovered = self
             .stage
@@ -486,12 +488,10 @@ impl ScribeStagingRuntime {
                 total.saturating_add(member.record().encoded_bytes())
             });
             self.restore_authorities(&key, &members)?;
-            self.stager.readmit_staged_bytes(staged_bytes)?;
             let terminal = self
                 .publisher
                 .recover_terminal_members(&key, &members)
                 .await?;
-            self.stager.release_staged_bytes(terminal.released_bytes)?;
             let mut members_to_restore = Vec::with_capacity(members.len());
             for member in &members {
                 if member
@@ -631,7 +631,7 @@ impl ScribeStagingRuntime {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
             })?;
         let schema = run_schema(&run)?;
-        if crate::parquet::memory::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
+        if crate::parquet::footer::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
             return Err(ScribeError::Internal {
                 detail: "a recovered staged run's schema is not the schema its key names"
                     .to_owned(),
@@ -822,13 +822,12 @@ impl ScribeStagingRuntime {
             .clone()
     }
 
-    /// Returns the claim slot and the staged bytes a settled claim released.
+    /// Returns the claim slot and records the staged bytes a settled claim released.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the ready index is unavailable,
-    /// the claim is unknown, or reconciled staged ownership cannot cover the
-    /// released length.
+    /// Returns [`ScribeError::Internal`] when the ready index is unavailable
+    /// or the claim is unknown.
     fn settle(&self, claim: StagingClaimId, released_bytes: u64) -> Result<(), ScribeError> {
         self.assembly
             .lock()
@@ -837,7 +836,6 @@ impl ScribeStagingRuntime {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("settle a published staging claim: {error}"),
             })?;
-        self.stager.release_staged_bytes(released_bytes)?;
         self.observe(
             crate::scribe::telemetry::StagingEffect::ClaimSettled,
             crate::scribe::telemetry::StagingFacts {
@@ -954,7 +952,6 @@ mod tests {
     };
     use crate::scribe::seal_key::SealKey;
     use crate::scribe::stream_identity::{NodeId, WriterEpoch};
-    use crate::scribe::wal::{WalConfig, WalWriter};
 
     /// Physical schema the fixture member is staged and merged under.
     fn runtime_schema() -> SchemaRef {
@@ -1022,46 +1019,18 @@ mod tests {
         .expect("fixture schema carries the built-in hourly layout")
     }
 
-    /// Registers a governed staging volume rooted at the stage's own root.
-    fn staging_volume(base: &Path, stage_root: &Path) -> crate::resources::StageVolume {
-        let wal = base.join("wal");
-        let scribe_output = base.join("scribe-output-scratch");
-        let forge = base.join("forge");
-        let oracle = base.join("oracle");
-        for path in [&wal, &scribe_output, &forge, &oracle] {
-            std::fs::create_dir_all(path).expect("registered volume root");
-        }
-        crate::resources::BifrostVolumeGovernor::register(
-            crate::resources::BifrostVolumeRoots {
-                wal,
-                scribe_stage: stage_root.to_owned(),
-                scribe_output_scratch: scribe_output,
-                oracle_scratch: oracle,
-            },
-            1024 * 1024 * 1024,
-            crate::resources::BifrostResourceHealth::default(),
-        )
-        .expect("staging volume registration")
-        .capabilities()
-        .scribe_stage
-    }
-
     /// Builds the publisher the runtime owns, over lazy and in-memory owners.
     ///
     /// The fixture never reaches the fenced transaction, so the pool is opened
     /// lazily and never connected: what the test exercises is the lifecycle up
     /// to assembly, which is exactly the part that owns no durable catalog.
     fn publisher(stage: Arc<ScribeHotStage>, wal_root: &Path, node: NodeId) -> ClaimPublisher {
-        let wal = Arc::new(
-            WalWriter::new(wal_root, *node.as_bytes(), 1, WalConfig::default())
-                .expect("fixture WAL writer"),
-        );
         let operator = opendal::Operator::new(opendal::services::Memory::default())
             .expect("memory operator")
             .finish();
         ClaimPublisher::new(
             stage,
-            ScribeStageMover::new(wal, operator),
+            ScribeStageMover::new(wal_root, operator),
             ScribePublicationReconciler::new(
                 sqlx::PgPool::connect_lazy("postgres://unused/unused")
                     .expect("lazy pool")
@@ -1089,7 +1058,6 @@ mod tests {
         let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
         let runtime = ScribeStagingRuntime::new(
             Arc::clone(&stage),
-            staging_volume(root.path(), &stage_root),
             publisher(stage, &wal_root, node_id),
             StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
                 .expect("assembler controls"),
@@ -1185,7 +1153,6 @@ mod tests {
         let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
         let runtime = ScribeStagingRuntime::new(
             Arc::clone(&stage),
-            staging_volume(root.path(), &stage_root),
             publisher(Arc::clone(&stage), &wal_root, node_id),
             StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
                 .expect("assembler controls"),
@@ -1248,7 +1215,7 @@ mod tests {
             .expect("the member names a run");
         let on_disk = run_schema(&run).expect("the run carries its schema");
         assert_eq!(
-            crate::parquet::memory::schema_fingerprint(on_disk.as_ref()),
+            crate::parquet::footer::schema_fingerprint(on_disk.as_ref()),
             key.schema_fingerprint(),
             "the schema restore reads back is the schema the key names"
         );
@@ -1270,7 +1237,6 @@ mod tests {
         let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
         let runtime = ScribeStagingRuntime::new(
             Arc::clone(&stage),
-            staging_volume(root.path(), &stage_root),
             publisher(stage, &wal_root, node_id),
             StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
                 .expect("assembler controls"),
@@ -1389,7 +1355,6 @@ mod tests {
         let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
         let runtime = ScribeStagingRuntime::new(
             Arc::clone(&stage),
-            staging_volume(root.path(), &stage_root),
             publisher(stage, &wal_root, node_id),
             StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
                 .expect("assembler controls"),
@@ -1632,7 +1597,6 @@ mod tests {
         let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
         let runtime = ScribeStagingRuntime::new(
             Arc::clone(&stage),
-            staging_volume(root.path(), &stage_root),
             publisher(Arc::clone(&stage), &wal_root, node_id),
             StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
                 .expect("assembler controls"),
@@ -1658,7 +1622,6 @@ mod tests {
         let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
         let recovered = ScribeStagingRuntime::new(
             Arc::clone(&stage),
-            staging_volume(root.path(), &stage_root),
             publisher(Arc::clone(&stage), &wal_root, node_id),
             StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
                 .expect("assembler controls"),

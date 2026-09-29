@@ -22,8 +22,8 @@ engine and its three cohesive subsystems:
 - **Scribe** owns pod-local ingestion, WAL durability, active and immutable
   rows, durable local staging, hot-object publication, and bounded live-tail
   service behavior.
-- **Oracle** owns immutable query cuts, admission, interactive and distributed
-  execution, live-tail fusion, terminal-safe streaming, and read-audit
+- **Oracle** owns pinned published query cuts, admission, interactive and distributed
+  execution, live Scribe routing, terminal-safe streaming, and read-audit
   acceptance.
 - **Forge** owns Scribe-hot promotion, Iceberg maintenance scheduling,
   resource and lease fencing, compaction publication, reconciliation,
@@ -87,7 +87,14 @@ plan-root `TenantTripwireExec` enforce the same tenant. A mismatched row fails
 closed with `WYRD_VALA_500_TENANT_TRIPWIRE`.
 
 Built-in and user-defined tables share this physical model. "Built-in" names
-definition ownership, not a weaker tenant scope or a separate storage mode.
+definition ownership, not a weaker tenant scope or a separate storage mode. A
+built-in's per-tenant row is materialized on first use from its owning
+definition rather than seeded at tenant provisioning, and describing one
+materializes it exactly as ingesting into it does. A client that must confirm a
+fixed table before it writes — an SDK describing `vala.drift.observations` and
+`vala.eval.observations` at startup — therefore sees the same table a first
+ingest would create, instead of a missing-table error in a tenant that has not
+written yet.
 
 ## Durability and visibility
 
@@ -107,28 +114,59 @@ An append acknowledgement means the WAL append and batch fence are durable and
 the exact rows are authoritative in Scribe. It does not wait for local Parquet,
 object publication, Iceberg promotion, or compaction.
 
-Oracle binds every query to one immutable cut. The cut combines its pinned
-Iceberg snapshot, committed Scribe hot objects not represented by that
-snapshot, and a versioned Scribe live-tail lease. When the same row identity is
-visible through more than one source, the most advanced authority in the list
-above wins. A source is suppressed only when the cut contains exact publication
-evidence for the complete corresponding WAL range or object identity. No query
-uses mutable catalog state after pinning.
+Every query pins one published cut: an Iceberg snapshot and committed Scribe
+hot objects not represented by that snapshot. Oracle also discovers active
+streams by listing, concurrently and under the query deadline, the Scribes in
+the attempt's frozen roster, and sends live work only to owners of relevant
+table partitions at the same frozen endpoint and fence. A listing that reveals
+a newer writer epoch restarts the whole attempt once on a refrozen roster;
+nodes from different cuts are never mixed. Scribe scans its own memtable or staged authority and streams
+bounded Arrow results to Oracle, producing each batch only when Oracle pulls
+it. The scan's memtable references, staged-run leases, and follower admission
+belong to that stream and are released when it completes, is cancelled, or is
+dropped; the query deadline is its only timeout. An unavailable Scribe missing before
+discovery is outside the known live set. A known live source lost before rows
+degrades the result; loss after rows fails the query. Published-source,
+security, tenant, schema, resource, cancellation, and deadline failures fail.
+
+All callers, including Verifiers, use this same query service and source
+behavior. The request has no visibility, freshness, or query-class selector.
+Oracle alone classifies the one DataFusion plan as Interactive or Analytical
+from its physical root. A successful terminal means the published cut completed
+and each selected online Scribe supplied the rows required by the completed
+DataFusion plan. A plan that stops consuming a live child (for example, at
+`LIMIT`) cancels and drops it without draining to a footer; unexpected EOF of
+a still-needed stream fails. Success does not prove every acknowledged write
+was included. Publication between cut pinning and live scan opening can omit
+or duplicate rows. This best-effort tradeoff also applies to verification
+judgments. The terminal distinguishes success, known live-source degradation,
+and failure; clients accept rows only after a valid terminal.
 
 ## Ingest: Scribe
 
-### Fixed lanes and hierarchical ownership
+### Shards and hierarchical ownership
 
-Each Scribe pod owns exactly sixteen shard lanes. The routing key is:
+Each Scribe pod runs a configured number of shards (`WYRD_MEM_TABLE_BUCKET_NUM`,
+default 1, at most 256). The routing key is:
 
 ```text
 hash(data_tenant_id, canonical_table, wyrd_batch_id)
 ```
 
-Distinct batches for one table use all lanes; retries use the recorded lane.
-Each lane owns a bounded mailbox, WAL generation, memtable buckets, and cohort
-state. Shards are a pod-local concurrency topology, not tenant partitions or
-table reservations.
+reduced modulo the shard count. Distinct batches for one table use all shards;
+retries use the recorded shard. Each shard owns a bounded mailbox, its own WAL
+stream, memtable buckets, and cohort state. Shards are a pod-local concurrency
+topology, not tenant partitions or table reservations. Replay maps a recorded
+shard onto the running count, so the count may change across restarts.
+
+Each shard rotates its WAL and memtable together when the WAL reaches
+`WYRD_MAX_FILE_SIZE_ON_DISK` (MiB), the memtable reaches
+`WYRD_MAX_FILE_SIZE_IN_MEMORY` (MiB), or the generation reaches
+`WYRD_MAX_FILE_RETENTION_TIME` (seconds). Each trigger reads its own counter;
+no byte is charged to two triggers. WAL disk is provisioned rather than
+tracked: there is no global disk ledger, and an out-of-space write surfaces as
+retryable `507` pressure. Memory stays under the global admission governor
+because it competes with queries.
 
 Shard owners, reconciliation, staging, assembly, and persistence run on one
 dedicated Scribe Tokio runtime separated from request serving. One non-cloneable
@@ -159,11 +197,19 @@ The principal size boundaries are independent:
 
 | Boundary | Rule |
 |---|---|
-| WAL segment | 512 MiB encoded default per shard WAL file |
-| Active shard generation | `min(512 MiB, floor(active_generation_budget / 16))`, plus age and pressure |
-| Parquet row group | 32 MiB logical or 131,072 rows |
-| Scribe hot object | approximately 512 MiB encoded, with bounded residue |
-| Forge rewrite output | approximately 1 GiB according to the table property |
+| WAL segment | `WYRD_MAX_FILE_SIZE_ON_DISK`, 512 MiB default per shard WAL file |
+| Active shard generation | `WYRD_MAX_FILE_SIZE_IN_MEMORY`, 512 MiB default per shard, plus age and pressure |
+| Ingest request | one `scribe.ingest_request_bytes` wire ceiling, 16 MiB default |
+| Ingest expanded data | derived 4x the wire ceiling (64 MiB default), enforced before WAL; no row cap |
+| Parquet row group | soft 128 MiB encoded target; a single large accepted row fits a group of its own |
+| Scribe hot object | `min(WYRD_MAX_FILE_SIZE_ON_DISK, Forge target)` encoded whole-file target, drained by size or dwell, with bounded residue |
+| Forge rewrite output | the table's optional registered compaction target, else the deployment default of approximately 1 GiB (`WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`) |
+
+Ingest has exactly one size setting. The wire ceiling bounds encoded request
+bytes; the expanded ceiling is derived, never configured, and bounds decoded
+Arrow memory plus managed columns (and, for OTLP, the projected output) before
+anything is appended to the WAL. A request above either ceiling is refused
+with `PayloadTooLarge`. Row count is not a limit.
 
 The generation maximum age and staging maximum dwell are each 600 seconds by
 default. Configuration validates checked arithmetic and proves that one maximum
@@ -178,7 +224,7 @@ The Scribe write path is:
 ```text
 validate and split by canonical physical partition
   -> global, tenant, and table admission
-  -> route to one of sixteen shard mailboxes
+  -> route to one shard mailbox
   -> tenant/table/FIFO scheduling
   -> WAL append, fsync, and durable batch fence
   -> tenant/table/partition memtable insertion
@@ -232,8 +278,8 @@ be split across claims and a later member cannot join an existing claim.
 
 `ParquetBatchEncoder` performs a bounded external merge in canonical
 `PhysicalLayout` order with `(wyrd_batch_id, wyrd_row_ordinal)` as the stable
-tie-breaker. It writes 32 MiB logical or 131,072-row Parquet row groups and
-closes immutable hot objects around 512 MiB encoded. A completed row group is
+tie-breaker. It writes Parquet row groups toward a soft 128 MiB target and
+closes immutable hot objects around the 512 MiB whole-file target. A completed row group is
 indivisible, and a smaller object is valid for dwell, partition close,
 pressure, drain, or final residue. The 512 MiB target is independent of WAL,
 active-memory, row-group, and Forge output geometry.
@@ -249,10 +295,12 @@ existing staged-reader leases finish before local deletion.
 Every local path a node owns derives from its one exclusively locked
 `WYRD_BIFROST_DATA_DIR` root, so no two live processes share a WAL identity.
 Oracle never opens another node's local path and does not use WAL as its normal
-query source. `FetchLiveTailService` serves a leased versioned cut of active,
-immutable, or staged rows through bounded internal RPC. Projection, signed
-predicate, physical partition, retained bytes, batch count, deadline, and
-cancellation are enforced before returning Arrow batches.
+query source. Scribe executes authenticated local DataFusion scan fragments
+over active, immutable, or staged rows and streams Arrow batches through the
+existing peer protocol. Projection, signed predicate, physical partition,
+retained bytes, batch count, deadline, and cancellation are enforced. Open
+fragment streams own their source references until completion or drop; no
+independent tail timeout can end an otherwise active query.
 
 Startup replays WAL using the recorded shard ID, validates staged files and
 manifests, rebuilds source and claim indexes, and reconciles publishing
@@ -269,11 +317,12 @@ never deletes WAL or staged files merely to meet a deadline.
 ### Immutable planning and source authority
 
 Oracle authenticates and authorizes the request, validates read-only SQL,
-acquires the read-audit durability boundary, pins one source cut, builds an
-optimized logical plan, selects an execution path, admits resources, and
-streams one terminal-safe result. DataFusion providers receive only the pinned
-files and leased live-tail sources. Tenant authority is installed before plan
-decode or source IO.
+acquires the read-audit durability boundary, pins the published cut, discovers
+relevant online Scribe routes, builds one optimized logical and physical plan,
+admits resources, and streams one terminal-safe result. DataFusion providers
+receive the pinned files and selected Scribe live sources. Tenant authority is
+installed before plan decode or source IO. There is no caller-selected source
+mode, freshness policy, or query class.
 
 Oracle plans every query once through the pinned `datafusion-distributed`
 planner and derives its admission and terminal path from the returned physical
@@ -329,8 +378,9 @@ the remaining graph stays observable to the owning supervisor, the node does
 not claim a clean terminal state, and readiness or shutdown evidence surfaces
 the failure.
 
-One immutable cut, deadline, cancellation tree, and execution attempt bound
-the complete stage graph. Head cancellation stops and joins every descendant.
+One pinned published cut, one discovered live route set, one deadline,
+cancellation tree, and execution attempt bound the complete stage graph. Head
+cancellation stops and joins every descendant.
 Analytical selection binds the logical query to exactly one distributed
 attempt: after selection, peer transport close, reset, availability timeout,
 authentication, authorization, tenant, digest, protocol, resource, corruption,
@@ -342,12 +392,13 @@ unrelated Scribe, catalog, and Forge protocols, not of a selected Analytical
 query.
 
 Result frames carry query and attempt identity and are followed by one explicit
-success or failure terminal. Bounded transport buffers provide backpressure but
-never spool the complete result. A caller may process frames incrementally, but
-the result is successful only after the success terminal; frames preceding a
-failure terminal are invalid as a complete query result. Frames that do not
-match the owning attempt identity are rejected before egress, so a successful
-stream cannot contain partial or duplicated rows.
+success, degraded, or failure terminal. Bounded transport buffers provide
+backpressure but never spool the complete result. A caller may process frames
+incrementally, but the result is usable only after a valid terminal; frames
+preceding a failure terminal are invalid as a complete query result. Frames
+that do not match the owning attempt identity are rejected before egress.
+Protocol duplication is forbidden; publication overlap may still duplicate a
+row across published and live sources under the accepted best-effort contract.
 
 ### Admission and memory
 
@@ -424,6 +475,31 @@ Tenant fairness is owned separately by per-tenant FIFO and weighted
 round-robin admission, scheduled pod-locally: tenant slot caps are local
 scheduling caps rather than cluster quotas. Grants are tenant-blind.
 
+Busy slots are ordinary saturation, not overload. An authorized, executable
+query waits for a slot in the tenant-fair queue, which holds at most 1,000
+waiting queries per Oracle node across both classes; running queries hold no
+waiting place. Both classes share one timeout policy: a one-hour maximum queue
+wait (`WYRD_BIFROST_ORACLE_MAX_QUEUE_WAIT_MS`) and a two-hour default total
+deadline (`WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS`) that a valid caller
+`deadline_ms` replaces. A waiter stops at the earlier of queue entry plus the
+queue limit and the leader's total deadline, with `QueryTimeout`; queue wait
+consumes total time and dequeue starts no new timer. Only the 1,001st waiter is
+refused, immediately, with the retryable `QueryQueueFull`
+(`WYRD_VALA_429_QUERY_QUEUE_FULL`, reason `queue_full`); nothing ahead of the
+queue reserves or waits for a place. A
+class with no executable capacity on the pod is refused immediately. Public
+HTTP queries bypass the server's global load-shed and request-concurrency
+layers so they reach this queue; gRPC reaches it directly.
+
+Snapshot preparation has no admission gate of its own. Concurrent table
+lookup, metadata load, reader guard, revalidation, and hot-cut work wait on the
+bounded runtime PostgreSQL pool within the leader deadline, and each substep is
+timed on `oracle_query_phase_seconds` beside the pool's acquire histogram.
+Remote peer work reuses one authenticated channel per ready peer incarnation and
+endpoint; a changed fence or endpoint connects anew and never inherits the
+prior peer's channel. Connect, fragment open, first remote frame, and terminal
+are timed as separate phases.
+
 An Analytical leader selects at most `max_workers_per_query` remote workers from
 the pinned eligible cut, rotating the starting position by the attempt identity
 so selection is deterministic, stable across re-projection of the same roster,
@@ -442,8 +518,9 @@ through `oracle_audit_commit_failures_total`, and shutdown waits for pending
 commits. One logical query produces one read-audit event; distributed stages
 produce none.
 
-Query streams are length-delimited, terminal-safe frames. Slot/queue refusal
-before framing is `QueryAdmissionRejected`; governed memory, scratch, or
+Query streams are length-delimited, terminal-safe frames. A full queue before
+framing is `QueryQueueFull`; any other admission refusal before framing is
+`QueryAdmissionRejected`; governed memory, scratch, or
 exchange exhaustion after framing is `QueryResourcesExhausted`. Cancellation,
 deadline, peer loss, and execution failure have typed terminal outcomes. A
 stream never represents partial rows as success.
@@ -490,13 +567,21 @@ they emit no audit event. The publication path therefore evaluates no new
 permission and appends nothing, so retained audit history cannot feed itself.
 
 `vala.system.audit_log` partitions daily, deviating from the hourly granularity
-every other built-in table uses. Forge cannot bin-pack across partition
+of the high-rate telemetry tables. Forge cannot bin-pack across partition
 boundaries, so hourly partitions would permanently cap every audit object at one
 hour of a tenant's audit traffic regardless of compaction settings. Audit also
 differs from the telemetry tables on every axis partition granularity responds
 to: one row per authorized request rather than continuous high-rate ingest,
 date-range rather than recent-window queries, and retention measured in years
 rather than days.
+
+The five verification tables — `vala.drift.observations`,
+`vala.eval.observations`, `vala.verification.results`,
+`vala.drift.result_features`, and `vala.eval.result_items` — also partition by
+UTC day on `wyrd_event_time`, never by Verifier, subject, binding, or tenant
+ID. Every row of one Verification Result carries the same server-chosen event
+time, so a result and its detail rows never split across day partitions. A
+Drift schedule window does not determine partition size.
 
 ## Maintenance: Forge
 
@@ -546,7 +631,9 @@ checksum, and operation evidence.
 ### Managed compaction and publication
 
 Iceberg maintenance rewrites eligible live files toward the table's
-`write.target-file-size-bytes`, normally approximately 1 GiB. Row-group size is
+`write.target-file-size-bytes`: the table's optional registered compaction
+target when one is set, otherwise the deployment default resolved once per
+attempt (approximately 1 GiB, overridable by environment). Row-group size is
 independent and normally 128 MiB. A physical file rolls from the managed
 writer's encoded estimate after a completed write; partition and end-of-stream
 residue are valid. Neither target is a universal physical object-size
@@ -664,7 +751,9 @@ objects proven unreferenced and outside every active or uncertain attempt.
 Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
 and objects retained by a pinned Oracle cut, are hard GC roots even when no
 Iceberg snapshot references them.
-A v1 live-tail lease retains Scribe-local Arrow batches and staged resources for its lifetime but names no Forge-collectable object, so it contributes no independent Forge GC root.
+An open Scribe fragment retains its local Arrow batches and staged resources
+until its stream completes or drops. It names no Forge-collectable object and
+contributes no independent Forge GC root.
 No cleanup infers safety from age or path shape alone.
 
 ## Resource and failure invariants
@@ -761,14 +850,18 @@ The surface includes:
 - agent-facing read and write operations governed by explicit permissions.
 
 Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.eval`, `vala.drift`, `vala.dev`, and `vala.system` remain
-tenant-qualified Bifrost tables. Canonical SQL is their only read contract;
+`vala.eval`, `vala.drift`, `vala.verification`, `vala.dev`, `vala.gateway`, and
+`vala.system` remain tenant-qualified Bifrost tables. Canonical SQL is their
+only read contract;
 the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
-`BifrostQuery`. Generic writes cannot target reserved or system-managed tables.
-Sensitive-column metadata remains descriptive; table query permission governs
-every column, including GenAI fields stored on trace spans.
+`BifrostQuery`. Generic writes cannot target reserved or system-managed tables;
+`vala.gateway.calls` accepts writes only from the reserved gateway capture
+principal. Sensitive-column metadata remains descriptive; table query
+permission governs every column, including GenAI fields stored on trace spans,
+except that a projection reaching the `vala.gateway.calls` request or response
+payload columns also requires the tenant-wide gateway payload-read permission.
 
 Bifrost query permissions carry an object axis. A `bifrost_query:read` grant is
 scoped either to every object (`all`) or to a named Bifrost object: a

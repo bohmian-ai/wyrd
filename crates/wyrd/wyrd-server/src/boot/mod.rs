@@ -27,7 +27,7 @@ use vala_bifrost_redux::oracle::dispatcher::{
 use vala_bifrost_redux::oracle::peer::ReservationTicketMinter;
 use vala_bifrost_redux::oracle::{
     Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
-    OracleSlotManager, OracleSpillRuntime, TailTransportDirectory,
+    OracleSlotManager, OracleSpillRuntime,
 };
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,
@@ -270,6 +270,11 @@ pub enum ServerBootError {
     /// verify Wyrd JWTs.
     #[error("WYRD_SIGNING_KEY is invalid: {0}")]
     SigningKey(String),
+    /// The gateway's policy-enforcing provider transport could not be built,
+    /// so no provider could be reached; boot fails instead of serving a
+    /// gateway that fails every call.
+    #[error("gateway provider transport could not be built: {0}")]
+    GatewayTransport(String),
     /// OIDC discovery for a configured trusted issuer was unavailable after the
     /// bounded retry schedule. Boot fails closed rather than starting with a
     /// silently empty registry; the message surfaces the stable
@@ -385,6 +390,9 @@ fn resolve_forge_config(
             .orphan_gc_run_budget_secs
             .map(std::time::Duration::from_secs)
             .unwrap_or(base.orphan_gc_run_budget),
+        default_target_file_size_bytes: forge_runtime
+            .target_file_size_bytes
+            .unwrap_or(base.default_target_file_size_bytes),
         ..base
     };
     let maintenance_interval = forge_runtime
@@ -619,16 +627,20 @@ pub async fn compose_bifrost(
                 ServerBootError::Scribe("Scribe role fence exceeds the WAL epoch range".to_owned())
             })?),
         );
-        let (wal_volume, scribe_output_volume) = bifrost_resources
+        let scribe_output_volume = bifrost_resources
             .scribe()
-            .and_then(|resources| resources.volume_capabilities())
+            .and_then(|resources| resources.output_scratch())
             .ok_or_else(|| {
                 ServerBootError::Scribe(
-                    "live Scribe role requires registered WAL volume capabilities".to_owned(),
+                    "live Scribe role requires a registered output scratch root".to_owned(),
                 )
             })?;
         let configured_geometry = scribe_config
-            .scribe_geometry()
+            .scribe_geometry(
+                resolve_forge_config(&forge_runtime)
+                    .0
+                    .default_target_file_size_bytes,
+            )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
         #[cfg(feature = "test-support")]
         let geometry = test_controls
@@ -639,25 +651,23 @@ pub async fn compose_bifrost(
         let geometry = configured_geometry;
         let wal_segment_bytes = geometry.wal_segment_bytes();
         let wal = Arc::new(
-            WalWriter::new_with_volume(
+            WalWriter::new_with_health(
                 data_root.wal(),
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
                 WalConfig::new(wal_segment_bytes)
-                    .map_err(|error| ServerBootError::Scribe(error.to_string()))?
-                    .with_disk_limit(scribe_config.wal_disk_limit_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-                wal_volume,
+                bifrost_resources.health(),
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
         // The dedicated coordination runtime hosts every long-lived Scribe
-        // coordination task: the `SCRIBE_SHARD_COUNT` shard-owner lanes plus the
+        // coordination task: the configured shard-owner lanes plus the
         // reconciliation and persistence loops. It is deliberately separate from
         // the request runtime so a saturated ingest path cannot starve shard
         // progress, and its thread count derives from
-        // `default_scribe_coordination_threads` (available parallelism, capped at
-        // the lane count, floored at two). Only the `Handle` is handed to
+        // `default_scribe_coordination_threads` (available parallelism,
+        // floored at two). Only the `Handle` is handed to
         // consumers; the `Runtime` value itself is moved into the single
         // non-`Clone` `ScribeCoordinationRuntime` owner returned below, which must
         // outlive Scribe role drain and releases the executor without blocking.
@@ -795,12 +805,12 @@ pub async fn compose_bifrost(
                 "WAL recovery failed before role activation: {error}"
             )));
         }
-        if let Err(error) = scribe.tail_reader() {
+        if let Err(error) = scribe.tail_service() {
             if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
                 tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after tail failure");
             }
             return Err(ServerBootError::Scribe(format!(
-                "tail reader failed before role activation: {error}"
+                "tail service failed before role activation: {error}"
             )));
         }
         if let Err(error) = cluster_registry.activate(&scribe_role).await {
@@ -950,11 +960,6 @@ pub async fn compose_bifrost(
         None
     };
     let scribe = if let Some(parts) = scribe {
-        let tail_audit = Arc::new(
-            crate::oracle::PostgresTailSecurityAudit::try_new(&postgres)
-                .await
-                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-        );
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres)
                 .await
@@ -967,34 +972,26 @@ pub async fn compose_bifrost(
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
-        Some(Arc::new(
-            Scribe::new(crate::state::ScribeBuildInputs {
-                ingest: parts.scribe,
-                catalog: Arc::clone(&bifrost),
-                resources: bifrost_resources.scribe().ok_or_else(|| {
-                    ServerBootError::Scribe(
-                        "selected Scribe role has no root-derived resource capability".to_owned(),
-                    )
-                })?,
-                cluster: Arc::clone(&cluster_registry),
-                registered_role: parts.scribe_role,
-                fragment_verifier: fragment_authority,
-                fragment_security_audit,
-                fragment_query_audit: query_audit.clone().ok_or_else(|| {
-                    ServerBootError::Scribe(
-                        "selected Scribe role has no tenant-tripwire audit owner".to_owned(),
-                    )
-                })?,
-                owns_fragment_query_audit: !roles.contains(&BifrostRuntimeRole::Oracle),
-                role_shutdown: shutdown.clone(),
-            })
-            .with_tail_authority(Arc::new(
-                crate::oracle::ScribeTailAuthority::from_keyring(
-                    Arc::clone(&peer_keyring),
-                    tail_audit,
-                ),
-            )),
-        ))
+        Some(Arc::new(Scribe::new(crate::state::ScribeBuildInputs {
+            ingest: parts.scribe,
+            catalog: Arc::clone(&bifrost),
+            resources: bifrost_resources.scribe().ok_or_else(|| {
+                ServerBootError::Scribe(
+                    "selected Scribe role has no root-derived resource capability".to_owned(),
+                )
+            })?,
+            cluster: Arc::clone(&cluster_registry),
+            registered_role: parts.scribe_role,
+            fragment_verifier: fragment_authority,
+            fragment_security_audit,
+            fragment_query_audit: query_audit.clone().ok_or_else(|| {
+                ServerBootError::Scribe(
+                    "selected Scribe role has no tenant-tripwire audit owner".to_owned(),
+                )
+            })?,
+            owns_fragment_query_audit: !roles.contains(&BifrostRuntimeRole::Oracle),
+            role_shutdown: shutdown.clone(),
+        })))
     } else {
         None
     };
@@ -1441,17 +1438,40 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
     state
 }
 
-/// Attach config-derived fields to core state: shutdown token, telemetry, and
-/// limits. Pure/sync (no I/O).
+/// Attach config-derived fields to core state: shutdown token, telemetry,
+/// limits, gateway configuration, and the gateway engine whose HTTP provider
+/// dispatch screens endpoints under the deployment profile. Pure/sync (no I/O).
 fn attach_config_fields(
     state: AppState,
     config: &crate::config::WyrdServerConfig,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
 ) -> Result<AppState, ServerBootError> {
+    let gateway_secret_keys = Arc::new(
+        config
+            .gateway
+            .managed_secret_keys()
+            .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
+    );
     Ok(state
         .with_deployment_profile(config.deployment_profile)
         .with_telemetry(telemetry)
-        .with_limits(config.limits.into_state()))
+        .with_limits(config.limits.into_state())
+        .with_gateway(config.gateway.clone())
+        .with_gateway_secret_keys(Arc::clone(&gateway_secret_keys))
+        .with_gateway_engine(wyrd_gateway::GatewayEngine::new(
+            config
+                .gateway
+                .credential_resolver(gateway_secret_keys)
+                .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
+            wyrd_gateway::DeploymentHealth::default(),
+            Arc::new(
+                wyrd_gateway::HttpProviderDispatch::new(
+                    wyrd_gateway::EndpointPolicy::new(config.deployment_profile.is_production()),
+                    wyrd_gateway::BuiltinEndpoints::default(),
+                )
+                .map_err(|error| ServerBootError::GatewayTransport(error.to_string()))?,
+            ),
+        )))
 }
 
 /// Install Wyrd's own auth handles: build resolvers, construct issuing key +
@@ -1636,7 +1656,6 @@ impl<'a> OracleRoleBuilder<'a> {
         // never a number an operator has to reconcile by hand.
         let default_split = OracleClassSplit::derive(raw_slots);
         let oracle_config = OracleConfig {
-            planning_permits: config.oracle.planning_permits,
             max_workers_per_query: config.oracle.max_workers_per_query,
             attempt_memory_bytes: config.oracle.max_frame_bytes.min(8 * 1024 * 1024),
             interactive_slots: calibrated
@@ -1668,6 +1687,9 @@ impl<'a> OracleRoleBuilder<'a> {
             max_queue_wait: calibrated.as_ref().map_or(
                 std::time::Duration::from_millis(config.oracle.max_queue_wait_ms),
                 |value| value.max_queue_wait,
+            ),
+            default_deadline: std::time::Duration::from_millis(
+                config.oracle.default_query_deadline_ms,
             ),
             ..OracleConfig::default()
         };
@@ -1789,23 +1811,9 @@ impl<'a> OracleRoleBuilder<'a> {
             .ok_or_else(|| {
                 ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
             })?;
-        let tail_audit = Arc::new(
-            crate::oracle::PostgresTailSecurityAudit::try_new(&postgres)
-                .await
-                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-        );
-        let tail_authority = Arc::new(crate::oracle::ScribeTailAuthority::from_keyring(
-            Arc::clone(&peer_keyring),
-            tail_audit,
-        ));
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
-            Arc::clone(&cluster),
             Arc::clone(&peer_credentials),
             tail_tls,
-            Arc::clone(&tail_authority)
-                as Arc<dyn vala_bifrost_redux::scribe::tail_rpc::TailTicketMinter>,
-            node_id,
-            None,
         ));
         let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
             authority.clone();
@@ -1870,14 +1878,12 @@ impl<'a> OracleRoleBuilder<'a> {
                 reconciliation_limit_bytes,
             },
             spill_runtime: Arc::new(spill_runtime),
-            tails: Arc::new(TailTransportDirectory::default()),
             audit: audit.clone(),
             peer_ticket_minter,
             reservations,
             stage_authority: Some(stage_authority),
             peer_tls,
             peer_credentials: Some(Arc::clone(&peer_credentials)),
-            tail_ticket_minter: Some(tail_authority),
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
             config: oracle_config,
@@ -2639,6 +2645,11 @@ mod tests {
         let (config, maintenance_interval) =
             resolve_forge_config(&crate::config::ForgeRuntimeConfig::default());
         assert_eq!(config, ForgeConfig::default());
+        assert_eq!(
+            config.default_target_file_size_bytes,
+            1024 * 1024 * 1024,
+            "an unset deployment file target is 1 GiB, not Iceberg's 512 MiB"
+        );
         assert_eq!(maintenance_interval, DEFAULT_MAINTENANCE_INTERVAL);
     }
 
@@ -2655,9 +2666,11 @@ mod tests {
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
+            target_file_size_bytes: Some(2_147_483_648),
             ..crate::config::ForgeRuntimeConfig::default()
         };
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
+        assert_eq!(config.default_target_file_size_bytes, 2_147_483_648);
         assert_eq!(
             config.snapshot_retention,
             std::time::Duration::from_secs(7_200)

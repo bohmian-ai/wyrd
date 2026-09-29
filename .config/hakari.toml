@@ -1,6 +1,7 @@
 # Configuration for `cargo hakari`: one third-party feature set for Rust test
 # and Clippy builds. Regenerate with `cargo hakari generate`; `mise run
-# check:workspace-hack` fails when the generated crate drifts.
+# check:workspace-hack` fails when the generated crate drifts or a member
+# does not depend on it.
 
 hakari-package = "workspace-hack"
 
@@ -8,6 +9,10 @@ hakari-package = "workspace-hack"
 dep-format-version = "4"
 
 resolver = "2"
+
+# Members depend on the hack as `workspace-hack.workspace = true`, the line
+# `cargo hakari manage-deps` writes and checks.
+workspace-hack-line-style = "workspace-dotted"
 
 # Release targets from .github/workflows/release.yml.
 platforms = [

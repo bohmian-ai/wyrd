@@ -1,4 +1,4 @@
-//! Typed side-effect templates fired by Trigger cards.
+//! Typed side-effect templates dispatched after a failed verification.
 
 use std::collections::BTreeMap;
 
@@ -9,12 +9,15 @@ use crate::reference::Ref;
 /// A server-owned side-effect template.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
 pub struct OperatorSpec {
     /// Optional human-readable purpose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// The single action performed when this operator fires.
+    ///
+    /// Flattened so that an inline `on_failure` mapping and a referenced
+    /// Operator Card's `spec` share one wire shape.
+    #[serde(flatten)]
     pub action: OperatorAction,
     /// Optional execution limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]

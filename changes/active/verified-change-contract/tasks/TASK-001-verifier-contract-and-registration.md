@@ -1,7 +1,7 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: approved
 spec: SPEC-verified-change-contract
 spec_revision: 32
 requirements: [REQ-045, REQ-046, REQ-047, REQ-056, REQ-090, REQ-091, REQ-092, REQ-093, REQ-094, REQ-102, REQ-103, REQ-109, REQ-110, REQ-111, REQ-113, REQ-114, REQ-116, REQ-120, REQ-143, REQ-144, INV-001, INV-006, INV-012, INV-013, INV-014, AC-004, AC-018, AC-021, AC-022]
@@ -177,3 +177,19 @@ reference model, a new permission, or changes to approved Drift/Eval semantics.
 - `architecture/wyrd-security-posture.md`
 - `architecture/references/languages/spec-driven-development.md`
 - `AGENTS.md`
+
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-004 | `wyrd-spec/src/card/{verifier,drift}.rs`; `card::verifier_card_tests`, `drift_validation_tests::rejects_spc_with_metric_signal`; server `components/cards/resolve.rs::validate_effective_bindings` (referenced Workflow Operator, Trigger/implementation pairing) | `cargo nextest -p wyrd-spec --all-features --lib`; `codegen:check`; `test:cards:integration` | PASS |
+| AC-018 | `binding_validation_errors`; `resolve.rs` UID-pins Verifier/Trigger/Operator slots via `ReferenceSlotVisitor`; CLI end-to-end fixture binds path, CardRef, inline forms | `loader::end_to_end::load_end_to_end_reference_tree`; `test:cards:integration`; `test:cli:journey` | PASS |
+| AC-021 | `CardKind`/`Spec` expose Verifier only; `WyrdState::verifier`; Python `verifier`; UI mock; generated schemas/OpenAPI/stubs; authorities updated | `test:shared`; `py:test:unit`; `test:wyrdstate:journey`; `codegen:check` | PASS |
+| AC-022 (retirement) | `vala-core` deleted; `vala.drift_alerts` dropped (`20260910000028`); bifrost `eval.runs`/`eval.assertions` removed; `/v1/eval/runs`, client `eval`, CLI `--server` removed | `test:sql`; `check:client-tier`; `lints` | PASS |
+| Canonical visitor covers new slots | `refs/mod.rs` `InlineableTrigger`/`InlineableOperator` | `refs::completeness_tests::visitor_covers_every_slot_in_the_migration_table` | PASS |
+| No old routing alias | `publishes_to` removed everywhere | `graph::composition::tests::publication_validation_rejects_duplicate_targets`; `validate::tests::validate_rejects_duplicate_component_publication_targets` | PASS |
+
+Also ran: `fmt`, `lints`, `check:pyo3-scope`, `git diff --check`: all exit 0. `test:wyrd`: 1974/1975; the one failure (`pg_grpc_ingest_smoke::ingest_valid_token_is_not_rejected_as_unauthenticated`, "credential revoked") fails identically on base `528cd576f`, so this task did not cause it.
+
+Remaining: the `WYRD_EVAL_404_RUN_NOT_FOUND`/`WYRD_EVAL_403_INVALID_LEASE` catalog codes, the `docs/scripts/generate_api_docs.py` rows that list them, and the `wyrd_spec::vala::eval::protocol` wire types all outlive the retired `/v1/eval/runs` route. Operator connection prose (REQ-114) is deferred to TASK-007.

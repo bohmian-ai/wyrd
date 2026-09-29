@@ -299,6 +299,9 @@ struct ForgeRewriteAttempt {
     table: Table,
     /// Planning evidence every plan of this attempt records under its operation.
     evidence: super::managed::ForgeRewriteEvidence,
+    /// Geometry planning resolved once; every plan executes, publishes, and
+    /// audits under its file target.
+    policy: super::managed::policy::ForgeTablePolicy,
     /// One absolute publication budget every plan of this attempt shares.
     ///
     /// Attempt-scoped, not plan-scoped: the budget bounds how long this claim
@@ -5205,6 +5208,7 @@ impl ForgeWorker {
             table,
             evidence,
             plans,
+            policy,
         } = rewrite.plan().await?;
         if plans.is_empty() {
             self.acknowledge_compact_table(claim, attempt, &table, lease)
@@ -5216,6 +5220,7 @@ impl ForgeWorker {
                 rewrite: Arc::new(rewrite),
                 table,
                 evidence,
+                policy,
                 deadline: super::publication::RewritePublicationDeadline::new(
                     self.forge.core.clock.now()?,
                     self.forge.core.config.iceberg_total_retry_timeout,
@@ -5881,7 +5886,7 @@ impl ForgeCompactionPlanRunner {
         let handoff = self
             .shared
             .rewrite
-            .rewrite_plan(plan, &self.shared.table)
+            .rewrite_plan(plan, &self.shared.table, &self.shared.policy)
             .await?;
         let metadata = self.shared.table.metadata();
         let context = RewritePublication {
@@ -5907,9 +5912,7 @@ impl ForgeCompactionPlanRunner {
                 )?,
             },
             partition_spec_id: metadata.default_partition_spec_id(),
-            target_file_size_bytes: super::managed::policy::declared_target_file_size_bytes(
-                metadata,
-            )?,
+            target_file_size_bytes: self.shared.policy.target_file_size_bytes,
             planned_schema_id: metadata.current_schema_id(),
             deadline: self.shared.deadline,
         };

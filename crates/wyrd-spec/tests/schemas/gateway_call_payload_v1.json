@@ -1,0 +1,364 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayCallPayloadV1",
+  "description": "Exact version-1 payload of one `vala.gateway.calls` row.\n\nBifrost appends its canonical managed envelope; the payload never duplicates managed identity and never substitutes zero for unknowns.",
+  "type": "object",
+  "required": [
+    "attempt_count",
+    "call_id",
+    "caller_principal_id",
+    "capture_policy_version",
+    "ingress_dialect",
+    "operation",
+    "outcome",
+    "pricing_versions",
+    "requested_model",
+    "schema_version",
+    "started_at",
+    "streaming",
+    "terminal_at"
+  ],
+  "properties": {
+    "attempt_count": {
+      "description": "Upstream attempts made.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "call_id": {
+      "description": "Logical call.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "caller_principal_id": {
+      "description": "Verified caller whose invocation caused the call.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "capture_policy_version": {
+      "description": "Capture policy version admitted for the call.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1.0
+    },
+    "cost": {
+      "description": "Cost, or null when unknown.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "currency": {
+      "description": "Currency, present exactly when cost is.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error_code": {
+      "description": "Stable Wyrd error code on failure.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^WYRD_[A-Z0-9_]+$"
+    },
+    "ingress_dialect": {
+      "description": "Ingress dialect, such as `openai_chat_completions`.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
+    },
+    "operation": {
+      "description": "Requested operation.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GatewayOperation"
+        }
+      ]
+    },
+    "outcome": {
+      "description": "Terminal outcome.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GatewayCallOutcome"
+        }
+      ]
+    },
+    "payload_object_refs": {
+      "description": "Every captured binary payload object the row still names, sorted and duplicate-free. Metadata-only and disabled capture produce an empty list. The same serialized reference shape stands in place of each selected binary value inside the payload JSON above, so no bytes, base64, storage path, or backend locator ever reaches Bifrost.\n\nThe field is additive, so an absent list decodes as empty and a payload serialized before captured objects existed still round-trips.",
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GatewayPayloadObjectRefV1"
+      }
+    },
+    "pricing_versions": {
+      "description": "Pricing versions used by billed attempts; empty when unpriced.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "maxLength": 128,
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "request_payload_json": {
+      "description": "Canonical redacted request JSON when selected. Bounded by the fixed ceiling of 1,048,576 serialized UTF-8 bytes. `maxLength` counts characters, so a multibyte value within it can still exceed the byte ceiling and is rejected.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1048576
+    },
+    "requested_model": {
+      "description": "Requested model.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelRef"
+        }
+      ]
+    },
+    "resolved_deployment": {
+      "description": "Resolved deployment, if resolved.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProviderDeploymentName"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "resolved_model": {
+      "description": "Resolved model after fallback, if resolved.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ModelRef"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "response_payload_json": {
+      "description": "Canonical redacted response JSON when selected. Bounded by the fixed ceiling of 1,048,576 serialized UTF-8 bytes. `maxLength` counts characters, so a multibyte value within it can still exceed the byte ceiling and is rejected.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1048576
+    },
+    "schema_version": {
+      "description": "Always `1`.",
+      "type": "integer",
+      "format": "uint8",
+      "minimum": 0.0
+    },
+    "started_at": {
+      "description": "Admission time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "streaming": {
+      "description": "Whether the call streamed.",
+      "type": "boolean"
+    },
+    "terminal_at": {
+      "description": "Terminal time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "usage": {
+      "description": "Normalized usage, or null when unknown.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/definitions/GatewayUsageAmount"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "GatewayCallOutcome": {
+      "description": "Terminal outcome of a logical call or attempt.",
+      "oneOf": [
+        {
+          "description": "Completed successfully.",
+          "type": "string",
+          "enum": [
+            "succeeded"
+          ]
+        },
+        {
+          "description": "Failed.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "Cancelled by the caller or shutdown.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        },
+        {
+          "description": "Exceeded its deadline.",
+          "type": "string",
+          "enum": [
+            "timed_out"
+          ]
+        }
+      ]
+    },
+    "GatewayOperation": {
+      "description": "Typed capability a caller requests from the gateway.",
+      "oneOf": [
+        {
+          "description": "Chat Completions.",
+          "type": "string",
+          "enum": [
+            "chat_completions"
+          ]
+        },
+        {
+          "description": "Responses.",
+          "type": "string",
+          "enum": [
+            "responses"
+          ]
+        },
+        {
+          "description": "Embeddings.",
+          "type": "string",
+          "enum": [
+            "embeddings"
+          ]
+        },
+        {
+          "description": "Image generation, editing, and variations.",
+          "type": "string",
+          "enum": [
+            "images"
+          ]
+        },
+        {
+          "description": "Speech, transcription, and translation.",
+          "type": "string",
+          "enum": [
+            "audio"
+          ]
+        },
+        {
+          "description": "Batches, including the file operations batches require.",
+          "type": "string",
+          "enum": [
+            "batches"
+          ]
+        }
+      ]
+    },
+    "GatewayPayloadObjectRefV1": {
+      "description": "Typed reference standing in for one captured binary payload object.\n\nLarge or binary request and response content never enters Bifrost. The bytes live in Wyrd's existing object storage under a server-derived, tenant-qualified key, and this reference is what the call row and the selected payload JSON carry in their place. Within one verified tenant the digest is both the object identity and the idempotency key, so identical bytes converge on one stored object; the storage key itself is never exposed or persisted. Field order is the sort key of [`GatewayCallPayloadV1::payload_object_refs`], so the derived ordering is the contract's ordering.\n\nThe configured storage bucket lifecycle owns expiration, so a retained reference may outlive its object; retrieval then reports the object as absent.",
+      "type": "object",
+      "required": [
+        "content_type",
+        "digest",
+        "size_bytes"
+      ],
+      "properties": {
+        "content_type": {
+          "description": "Media type the caller or provider gave the content, kept as descriptive metadata rather than a retrieval contract.",
+          "type": "string",
+          "maxLength": 255,
+          "minLength": 1
+        },
+        "digest": {
+          "description": "Canonical `sha256:` digest of the exact stored bytes.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "description": "Exact stored byte length.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "GatewayUsageAmount": {
+      "description": "One normalized usage quantity.",
+      "type": "object",
+      "required": [
+        "dimension",
+        "quantity",
+        "unit"
+      ],
+      "properties": {
+        "dimension": {
+          "description": "Open usage dimension, such as `output_tokens`.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "quantity": {
+          "description": "Non-negative quantity.",
+          "type": "string"
+        },
+        "unit": {
+          "description": "Usage unit, such as `tokens`.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "One exact provider-native model selected by a caller.\n\nTyped surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "description": "Provider-native model identifier.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelId"
+            }
+          ]
+        },
+        "provider": {
+          "description": "Provider that serves the model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderDeploymentName": {
+      "description": "Tenant-unique gateway provider deployment name.",
+      "type": "string"
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
+    }
+  }
+}

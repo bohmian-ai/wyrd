@@ -589,8 +589,8 @@ pub struct ScribeInspectionSnapshot {
     pub immutable_bucket_count: usize,
     /// Category totals in [`MemoryCategory`](crate::scribe::memory::MemoryCategory) order.
     pub memory_by_category: [usize; MEMORY_CATEGORY_COUNT],
-    /// Memory totals distributed across the fixed shard owners.
-    pub memory_by_shard: [usize; crate::scribe::routing::SCRIBE_SHARD_COUNT],
+    /// Memory totals distributed across the shard owners, indexed by shard.
+    pub memory_by_shard: Vec<usize>,
     /// Exact bucket-level memory ownership.
     pub memory_by_bucket: Vec<ScribeBucketMemorySnapshot>,
     /// Sum of all governor category totals.
@@ -617,8 +617,6 @@ pub struct ScribeInspectionSnapshot {
     pub ingress_high_water_memory: usize,
     /// Low-water byte target that pressure sealing drains toward.
     pub ingress_low_water_memory: usize,
-    /// WAL bytes retained on disk.
-    pub wal_disk_bytes: u64,
     /// Bounded pod-global ingress ownership lifecycle observations.
     pub ingress_lifecycle: ScribeIngressLifecycleSnapshot,
     /// Bounded generation, replay, persistence-transfer, and retirement observations.
@@ -1197,6 +1195,16 @@ impl ScribeTelemetrySnapshot {
     /// Returns how many times one registry entry was emitted.
     pub(crate) const fn count(&self, effect: ContentionEffect) -> u64 {
         self.counts[effect.index()]
+    }
+
+    /// Returns table activations refused at the pod's derived ceiling since startup.
+    ///
+    /// This is the pod's own count of real capacity pressure. A public client
+    /// may never observe it: the gRPC ingest transport retries a busy refusal
+    /// within its frame budget, so only refusals outlasting that budget reach
+    /// the caller.
+    pub const fn activation_refusals(&self) -> u64 {
+        self.count(ContentionEffect::ActivationRefused)
     }
 
     /// Returns admission transitions opened since startup.

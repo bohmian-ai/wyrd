@@ -49,10 +49,11 @@ principals live under `wyrd.*` behind RLS and can never reach the platform
 plane. Neither plane's credential or token is accepted by the other.
 
 `PrincipalKindTag` is the closed wire set shared by both planes:
-`global_admin`, `tenant_admin`, `user`, `service`, and `agent`. A platform
-principal is `global_admin` or `user`; a tenant principal is `tenant_admin`,
-`user`, `service`, or `agent`. The runtime `Principal { id, kind, tenant_id,
-roles, effective_permissions, credential_id }` carries the tenant-plane
+`global_admin`, `tenant_admin`, `user`, `service`, `agent`, and `system`. A
+platform principal is `global_admin` or `user`; a tenant principal is
+`tenant_admin`, `user`, `service`, `agent`, or the internal-only `system`. The
+runtime `Principal { id, kind, tenant_id, roles, effective_permissions,
+credential_id }` carries the tenant-plane
 `PrincipalKind`, and `PlatformPrincipal { id, kind, effective_permissions,
 credential_id }` the tenantless platform identity.
 
@@ -64,9 +65,26 @@ Card-free machine principal therefore carries no emit scope. `tenant_admin`,
 `global_admin`, and `user` never bind a Card — an administrative or human
 identity is not a registered AI-system component.
 
+Gateway capture runs as the reserved `GATEWAY_CAPTURE_PRINCIPAL`, a
+tenant-bound, card-free `service` principal. Only the server's signing key
+issues it, as a token of at most 900 seconds carrying an empty Card-reference
+scope, only the informational `gateway_capture` Role, and exactly the two
+table-scoped record-write grants for `vala.gateway.calls` and
+`vala.traces.spans`, which the verifier requires. Public credential,
+workload, refresh, delegation, and impersonation flows refuse it; it never
+appears in a delegation chain, holds no persisted credential, and never
+replaces the invocation caller in audit.
+
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
 Credential issuance is a separate privileged operation and is policy-gated.
+The verification runtime also provisions one UUIDv7 `system` principal per
+tenant for canonical result publication and the fixed Drift observation read.
+It is not Card-bound or publicly manageable, has no credential, role grant,
+refresh, workload, or delegation path, and can receive only server-minted
+access tokens scoped to one exact Verifier Card: one for the reserved
+verification result tables, or one for reading the tenant's
+`vala.drift.observations` table.
 
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
@@ -133,6 +151,17 @@ credential.
   exchange, OIDC login, human refresh, workload `jwt-bearer`, and delegation.
   Verification is local and synchronous — signature, issuer, audience, expiry —
   and reads no store, holds no cache, and resolves no roles.
+- Internal verification-result tokens use that same issuer and token format,
+  but load the tenant's persisted `system` principal and carry no roles,
+  credential, delegation chain, or bound root Card. Their Card scope contains
+  exactly one UID-bearing Verifier, and their permissions are exactly one
+  fixed purpose: `bifrost_record:write` for result publication, or
+  `bifrost_query:read` scoped to the tenant's registered
+  `vala.drift.observations` table UID for Drift reads. No token carries both.
+  The read token's Verifier scope is attribution only; Oracle's table
+  authorization enforces the read, and the server-built SQL, not the token,
+  limits subject, series, and window. These fixed server capabilities are not
+  public grants.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute
@@ -236,15 +265,30 @@ optional.
 
 Internal Oracle and Scribe RPCs use mutually authenticated TLS. Certificate
 identity admits the peer transport; a signed peer ticket authorizes one exact
-engine operation.
+remote engine operation that can return rows or reserve resources.
+
+- Scribe live-stream listing returns partition metadata, never rows. It trusts
+  the authenticated internal peer: mTLS plus the shared Bifrost workload
+  credential admit it, with no ticket, replay record, or audit event. Any
+  holder of that credential can read listing metadata; that is the accepted
+  trust boundary. User and table authorization happen at Oracle before any
+  listing is issued.
+- Work that stays in one process — Gate to its local Oracle, and a fragment
+  the leader runs on itself — passes the already-verified context, deadline,
+  and fence directly and mints no ticket.
 
 - Peer tickets are domain-separated from user JWTs and use independently
   managed keys.
 - A ticket binds tenant, query, snapshot digest, fragment or request digest,
   retry epoch, source node, destination node, deadline, and fence.
 - The receiver verifies signature, `kid`, audience, destination, expiry,
-  replay identity, tenant, snapshot, fragment, and fence before decoding a
-  physical plan or touching storage.
+  tenant, snapshot, fragment, and fence before decoding a physical plan or
+  touching storage.
+- Read-only tickets (query forwarding and Oracle or Scribe read fragments)
+  consume no nonce: a repeated, still-valid read is bounded by expiry and
+  ordinary resource admission, not a one-use quota. Slot reservation and stage
+  assignment tickets create state, so they keep single-use replay rejection
+  over an expiry-pruned record with no fixed capacity.
 - Rotation follows publish-before-use and bounded-overlap semantics. A ticket
   never remains valid beyond its query deadline, so retired verification keys
   need only cover the maximum ticket lifetime and clock skew.
@@ -304,16 +348,26 @@ is not an SSRF control.
 ## Audit integrity and privacy
 
 Audit cardinality follows authorization decisions, not HTTP requests and not
-engine mechanics. Every decision that evaluates a principal's permission
-appends its audit row in the same transaction that made it. Scribe batch
-commits and Forge maintenance transitions evaluate no permission: they are
-recorded as lineage in `vala.scribe_batch_commits` and `vala.forge_operations`
-and emit no audit event.
+engine mechanics. Except for the explicitly non-blocking Oracle read and
+gateway invocation paths below, every decision that evaluates a principal's
+permission appends its audit row in the same transaction that made it. Scribe
+batch commits and Forge maintenance transitions evaluate no permission: they
+are recorded as lineage in `vala.scribe_batch_commits` and
+`vala.forge_operations` and emit no audit event.
 
-Oracle query admission is the single durability exception: the serving process
-fsyncs a versioned, CRC-framed local acceptance record before returning rows,
-then a bounded at-least-once relay appends the canonical tenant
+Oracle query admission uses a stronger local durability handoff: the serving
+process fsyncs a versioned, CRC-framed local acceptance record before returning
+rows, then a bounded at-least-once relay appends the canonical tenant
 `vala.audit_staging` entry. Relay identity makes replay safe and observable.
+
+Gateway invocation authorization is evaluated synchronously before protected
+work, but its audit event is committed to the same canonical
+`vala.audit_staging` path by tracked non-blocking server work. Slow or failed
+audit persistence does not delay or reverse the authorization verdict; failure
+is metered and logged, and shutdown drains tracked work. Gateway administration
+decisions remain transactional with their mutations. No gateway-specific audit
+WAL, disk spool, durable queue, relay, table, publisher, or sink exists; abrupt
+process loss may therefore lose an invocation event that has not committed.
 
 `vala.audit_staging` is transient transactional write-ahead state with no
 external consumer. Retained audit history lives in the

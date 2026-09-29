@@ -1,7 +1,12 @@
 name: release
 
-# push to main = dry-run builds (catches drift before a real release)
-# release published = build + publish all artifacts
+# push to main = dry-run builds of the deliverables the change affects, chosen
+# by the same selector as lints-test (unknown impact builds every deliverable).
+# release published = the complete nightly gate plus every deliverable on every
+# supported platform. Each build job records the SHA-256 of its outputs after
+# its package checks pass; publication verifies those exact bytes, attests
+# their provenance for this commit, and fails closed on a missing record,
+# unrecorded file, or changed byte.
 on:
   push:
     branches: [main]
@@ -9,7 +14,7 @@ on:
     types: [published]
 
 permissions:
-  contents: write   # gh release upload, release-plz
+  contents: read
 
 env:
   RUSTFLAGS: "-C debuginfo=0"
@@ -20,10 +25,62 @@ env:
   MISE_LOCKED: "true"
 
 jobs:
+  changes:
+    name: detect changes
+    if: github.event_name != 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      package_python: ${{ steps.filter.outputs.package_python }}
+      package_typescript: ${{ steps.filter.outputs.package_typescript }}
+      package_server: ${{ steps.filter.outputs.package_server }}
+      package_crates: ${{ steps.filter.outputs.package_crates }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect affected deliverables
+        id: filter
+        shell: bash
+        env:
+          WYRD_CHANGE_BASE: ${{ github.event.before }}
+          WYRD_CHANGE_HEAD: ${{ github.sha }}
+        run: .github/scripts/detect-changes.sh
+
+  # ── Release qualification ──────────────────────────────────────────────────
+
+  qualify:
+    name: qualify
+    if: github.event_name == 'release'
+    uses: ./.github/workflows/nightly.yml
+
+  release-commit:
+    name: release commit
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Every artifact in this run is built from GITHUB_SHA; the tag must still
+      # name that commit, or the tested bytes are not the release's bytes.
+      - name: Verify the release tag names the built commit
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag_commit="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          echo "tag $TAG -> $tag_commit, built $GITHUB_SHA"
+          test "$tag_commit" = "$GITHUB_SHA"
+
   # ── Python SDK ─────────────────────────────────────────────────────────────
 
   build-sdist:
     name: python sdist
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +106,12 @@ jobs:
           rust-toolchain: stable
           working-directory: sdks/wyrd-sdk-python
 
+      - name: Check and record sdist digest
+        working-directory: sdks/wyrd-sdk-python/dist
+        run: |
+          twine check --strict ./*
+          shasum -a 256 ./* | sed 's|  \./|  |' | sudo tee SHA256SUMS.pypi_sdist
+
       - uses: actions/upload-artifact@v4
         with:
           name: pypi_sdist
@@ -57,6 +120,8 @@ jobs:
 
   build-linux:
     name: python - ${{ matrix.target }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +176,10 @@ jobs:
 
       - run: twine check --strict sdks/wyrd-sdk-python/dist/*
 
+      - name: Record wheel digests
+        working-directory: sdks/wyrd-sdk-python/dist
+        run: shasum -a 256 ./*.whl | sed 's|  \./|  |' | sudo tee SHA256SUMS.pypi_ubuntu_${{ matrix.target }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: pypi_ubuntu_${{ matrix.target }}
@@ -119,6 +188,8 @@ jobs:
 
   build-macos:
     name: python - ${{ matrix.target }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_python == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -155,6 +226,10 @@ jobs:
           working-directory: sdks/wyrd-sdk-python
 
       - run: twine check --strict sdks/wyrd-sdk-python/dist/*
+
+      - name: Record wheel digests
+        working-directory: sdks/wyrd-sdk-python/dist
+        run: shasum -a 256 ./*.whl | sed 's|  \./|  |' > SHA256SUMS.pypi_macos_${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -195,6 +270,10 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Verify recorded wheel digests
+        if: runner.os == 'Linux'
+        run: bash .github/scripts/verify-release-artifacts.sh dist
+
       - name: Install and smoke-test
         shell: bash
         run: |
@@ -204,9 +283,13 @@ jobs:
   publish-pypi:
     name: publish python
     if: github.event_name == 'release'
-    needs: [test-wheels]
+    needs: [qualify, release-commit, test-wheels]
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -231,9 +314,16 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - run: twine check --strict dist/*
+      - name: Verify the tested package bytes
+        run: bash .github/scripts/verify-release-artifacts.sh dist
 
-      - run: twine upload dist/*
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.whl, dist/*.tar.gz
+
+      - run: twine check --strict dist/*.whl dist/*.tar.gz
+
+      - run: twine upload dist/*.whl dist/*.tar.gz
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
@@ -242,6 +332,8 @@ jobs:
 
   build-typescript:
     name: typescript - ${{ matrix.target }}
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_typescript == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -337,6 +429,8 @@ jobs:
 
   build-ui:
     name: ui build
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_server == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -359,7 +453,8 @@ jobs:
 
   build-server:
     name: server - ${{ matrix.target_name }}
-    needs: [build-ui]
+    needs: [changes, build-ui]
+    if: ${{ !cancelled() && needs.build-ui.result == 'success' && (github.event_name == 'release' || needs.changes.outputs.package_server == 'true') }}
     strategy:
       fail-fast: false
       matrix:
@@ -401,18 +496,29 @@ jobs:
           cp crates/wyrd/wyrd-server/wyrd-ui/package.json release/ui/package.json
           tar -czf wyrd-server-${{ matrix.target_name }}.tar.gz -C release .
 
+      - name: Smoke-test and record the server bundle
+        run: |
+          release/wyrd-server --version
+          shasum -a 256 wyrd-server-${{ matrix.target_name }}.tar.gz > SHA256SUMS.wyrd-server-${{ matrix.target_name }}
+
       - uses: actions/upload-artifact@v4
         with:
           name: wyrd-server-${{ matrix.target_name }}
-          path: wyrd-server-${{ matrix.target_name }}.tar.gz
+          path: |
+            wyrd-server-${{ matrix.target_name }}.tar.gz
+            SHA256SUMS.wyrd-server-${{ matrix.target_name }}
           retention-days: 1
 
   publish-docker:
     name: docker - ${{ matrix.image }} - ${{ matrix.arch }}
     if: github.event_name == 'release'
-    needs: [build-server]
+    needs: [qualify, release-commit, build-server]
     runs-on: ubuntu-24.04
     environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -442,6 +548,9 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ./artifacts
 
+      - name: Verify the tested server bundle
+        run: bash .github/scripts/verify-release-artifacts.sh artifacts
+
       - name: Extract server artifact
         run: |
           mkdir -p binary
@@ -452,12 +561,14 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build and push
+      # The image is new bytes built from the verified bundle, so it is
+      # smoke-tested locally and published as that exact digest.
+      - name: Build image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: docker/official/${{ matrix.image }}/Dockerfile
-          push: true
+          load: true
           platforms: linux/${{ matrix.arch }}
           build-args: WYRD_SERVER_BINARY=./binary
           tags: |
@@ -466,44 +577,101 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Smoke-test and push the image
+        id: push
+        env:
+          IMAGE: wyrdai/wyrd:${{ matrix.image }}-${{ matrix.arch }}-${{ github.event.release.tag_name }}
+          LATEST: wyrdai/wyrd:${{ matrix.image }}-${{ matrix.arch }}-latest
+        run: |
+          docker run --rm --platform linux/${{ matrix.arch }} --entrypoint /usr/local/bin/wyrd-server "$IMAGE" --version
+          docker push "$IMAGE"
+          docker push "$LATEST"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE" | cut -d@ -f2)"
+          test -n "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "$IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: index.docker.io/wyrdai/wyrd
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
   publish-binaries:
     name: publish binaries
     if: github.event_name == 'release'
-    needs: [build-server]
+    needs: [qualify, release-commit, build-server]
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: write   # gh release upload
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
           pattern: wyrd-server-*
+          merge-multiple: true
           path: dist
 
-      - name: Generate checksums
+      - name: Verify the tested server bundles
         run: |
-          find dist -type f | while read f; do
-            sha256sum "$f" | awk -v name="$(basename "$f")" '{print $1, name}' >> checksums.txt
-          done
-          cat checksums.txt
+          bash .github/scripts/verify-release-artifacts.sh dist
+          cat dist/SHA256SUMS.* > checksums.txt
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
 
       - name: Upload to GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          find dist -type f | while read f; do
+          for f in dist/*.tar.gz checksums.txt; do
             gh release upload ${{ github.event.release.tag_name }} "$f" --clobber
           done
-          gh release upload ${{ github.event.release.tag_name }} checksums.txt --clobber
 
   # ── Rust crates ────────────────────────────────────────────────────────────
+
+  package-crates:
+    name: rust crate package
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name == 'release' || needs.changes.outputs.package_crates == 'true') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      # release-plz publishes the crates named in release-plz.toml.
+      - name: Package and record published crates
+        run: |
+          cargo package --locked --no-verify -p wyrd-spec
+          mkdir -p dist
+          cp target/package/*.crate dist/
+          (cd dist && shasum -a 256 ./*.crate | sed 's|  \./|  |' > SHA256SUMS.rust-crates)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-crates
+          path: dist
+          retention-days: 1
 
   publish-crates:
     name: publish rust crates
     if: github.event_name == 'release'
-    needs: [test-wheels, build-server]
+    needs: [qualify, release-commit, package-crates, test-wheels, build-server]
     runs-on: ubuntu-24.04
     environment: release
+    permissions:
+      contents: write   # release-plz
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -520,6 +688,23 @@ jobs:
         with:
           install: true
           cache: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-crates
+          path: dist
+
+      # release-plz packages again at publish time; cargo's .crate archives
+      # are reproducible, so the repackaged bytes must equal the tested ones.
+      - name: Verify the tested crate bytes
+        run: |
+          bash .github/scripts/verify-release-artifacts.sh dist
+          cargo package --locked --no-verify -p wyrd-spec
+          (cd target/package && sha256sum --check --strict ../../dist/SHA256SUMS.rust-crates)
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.crate
 
       - name: Publish crates via release-plz
         uses: MarcoIeni/release-plz-action@v0.5

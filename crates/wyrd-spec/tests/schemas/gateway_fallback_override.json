@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayFallbackOverride",
+  "description": "Per-request or per-workflow-step ordered fallback override.",
+  "type": "object",
+  "required": [
+    "candidates"
+  ],
+  "properties": {
+    "candidates": {
+      "description": "Non-empty, ordered, duplicate-free candidates.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ModelRef"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "ModelId": {
+      "description": "Provider-native gateway model identifier: 1..=255 UTF-8 bytes without control characters.",
+      "type": "string"
+    },
+    "ModelRef": {
+      "description": "One exact provider-native model selected by a caller.\n\nTyped surfaces carry the pair; the OpenAI-compatible `model` string is the canonical `<provider>/<model>` projection, split on the first `/` so a native model identifier may itself contain slashes.",
+      "type": "object",
+      "required": [
+        "model",
+        "provider"
+      ],
+      "properties": {
+        "model": {
+          "description": "Provider-native model identifier.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ModelId"
+            }
+          ]
+        },
+        "provider": {
+          "description": "Provider that serves the model.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderId"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderId": {
+      "description": "Tenant-visible gateway provider identifier using the canonical Wyrd name grammar.",
+      "type": "string"
+    }
+  }
+}

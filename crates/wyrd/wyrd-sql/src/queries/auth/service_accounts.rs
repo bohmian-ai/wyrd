@@ -16,28 +16,22 @@ use crate::TenantConn;
 /// Containment, not equality: registering a Card-bound principal stores a
 /// `uid`-bearing `card_ref` — the projection at `queries::cards::auth_projection`
 /// writes `space: Some(..)` and `uid: Some(..)` — while a caller can only name
-/// `space/Kind/name@version`, so `card_ref = $3` matched no registered principal
+/// `space/Kind/name@version`, so `card_ref = $2` matched no registered principal
 /// at all.
 ///
 /// Containment relaxes *every* optional `CardRef` field, `space` included: a ref
-/// with no space matches a row in any space. What bounds this to one intended
-/// row is not the predicate but two facts outside it — the table's
-/// `UNIQUE (data_tenant_id, name)` and `auth_projection` keeping the `name`
-/// column equal to `card_ref->>'name'`. `ORDER BY created_at, id LIMIT 1` exists
-/// because none of that chain is enforced here: relax the unique constraint or
-/// decouple the name projection, and this predicate starts matching more rows on
-/// a credential-issuing path. The stable oldest-first pick is then the
-/// difference between a bounded anomaly and an arbitrary one — narrow the
-/// predicate rather than lean on that fallback.
+/// with no space matches a row in any space, and Card-bound principals are not
+/// name-unique (two exact Card versions, or one name in two spaces, are distinct
+/// principals). The predicate can therefore match several rows, so it fetches at
+/// most two and [`service_account_by_card_ref`] accepts only a single match; an
+/// ambiguous reference resolves no principal rather than an arbitrary one.
 const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r#"
         SELECT id, principal_kind, card_ref, status
           FROM wyrd.auth_service_accounts
-         WHERE data_tenant_id = $1
-           AND principal_kind = $2
-           AND card_ref @> $3
+         WHERE principal_kind = $1
+           AND card_ref @> $2
            AND status = 'active'
-         ORDER BY created_at, id
-         LIMIT 1
+         LIMIT 2
         "#;
 
 const INSERT_REFRESH_TOKEN_SQL: &str = r#"
@@ -55,7 +49,8 @@ const INSERT_REFRESH_TOKEN_SQL: &str = r#"
 pub struct ServiceAccountPrincipalRow {
     /// Principal id.
     pub id: Uuid,
-    /// Principal kind label: `tenant_admin`, `service`, or `agent`.
+    /// Principal kind label: `tenant_admin`, `service`, `agent`, or the
+    /// internal `system` writer.
     pub principal_kind: String,
     /// Structured card reference, absent for a principal that binds no Card.
     pub card_ref: Option<Json<CardRef>>,
@@ -155,6 +150,7 @@ pub async fn insert_service_account(
 /// Soft-delete a service account by marking `status = 'deleted'`.
 ///
 /// Returns `Ok(true)` when a row was updated, `Ok(false)` when no row matched.
+/// The internal SYSTEM writer has no lifecycle and never matches.
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the update.
@@ -166,7 +162,8 @@ pub async fn delete_service_account(
         "UPDATE wyrd.auth_service_accounts
             SET status = 'deleted', updated_at = now()
           WHERE data_tenant_id = wyrd.current_tenant()
-            AND id = $1",
+            AND id = $1
+            AND principal_kind <> 'system'",
     )
     .bind(id)
     .execute(&mut **conn.transaction())
@@ -174,17 +171,19 @@ pub async fn delete_service_account(
     Ok(result.rows_affected() > 0)
 }
 
-/// Find an active Service/Agent principal by card ref.
+/// Find the one active Service/Agent principal a card ref names.
 ///
-/// Binds the caller's ref as JSONB for a `card_ref @> $3` containment
+/// Binds the caller's ref as JSONB for a `card_ref @> $2` containment
 /// predicate, so a ref carrying no `uid` matches a stored ref that has one and
-/// a ref carrying no space matches a row in any space. The containment
-/// predicate alone does not bound the match to one row: the table's
-/// `UNIQUE (data_tenant_id, name)` and the `auth_projection` trigger keeping
-/// `name` equal to `card_ref->>'name'` do, and `ORDER BY created_at, id
-/// LIMIT 1` is the stable fallback if either is relaxed. The durable key
-/// remains `(card_kind, card_uid)`; this is the lookup for the identity a
-/// client can express, and the GIN index on `card_ref` serves it.
+/// a ref carrying no space matches a row in any space. A credential, workload
+/// assertion, or delegation must target exactly one principal, so the lookup
+/// returns a row only when the predicate matches exactly one: an explicit-space
+/// or `uid`-bearing ref stays exact, while a partial ref matching principals in
+/// several spaces returns `None` and the caller's not-found refusal applies.
+/// The durable key remains `(card_kind, card_uid)`; this is the lookup for the
+/// identity a client can express, and the GIN index on `card_ref` serves it.
+/// Tenant scope comes solely from the forced RLS policy `conn` activates, so
+/// the query carries no tenant predicate of its own.
 ///
 /// # Errors
 /// Returns the database error when the read fails.
@@ -193,15 +192,28 @@ pub async fn service_account_by_card_ref(
     principal_kind: &str,
     card_ref: &CardRef,
 ) -> Result<Option<ServiceAccountPrincipalRow>, sqlx::Error> {
-    sqlx::query_as::<_, ServiceAccountPrincipalRow>(SERVICE_ACCOUNT_BY_CARD_REF_SQL)
-        .bind(conn.data_tenant_id().as_uuid())
-        .bind(principal_kind)
-        .bind(Json(card_ref))
-        .fetch_optional(&mut **conn.transaction())
-        .await
+    let mut matches =
+        sqlx::query_as::<_, ServiceAccountPrincipalRow>(SERVICE_ACCOUNT_BY_CARD_REF_SQL)
+            .bind(principal_kind)
+            .bind(Json(card_ref))
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+    Ok(if matches.len() == 1 {
+        matches.pop()
+    } else {
+        None
+    })
 }
 
-/// Find an active Service/Agent principal by id.
+/// Find an active public tenant machine principal by id.
+///
+/// Every public surface that names a principal by id — credential issuance,
+/// listing, and revocation, principal revocation, and token exchange — resolves
+/// it here, so the internal SYSTEM writer is excluded at this one owner and is
+/// indistinguishable from an absent principal on all of them.
+///
+/// # Errors
+/// Returns the database error when the read fails.
 pub async fn service_account_by_id(
     conn: &mut TenantConn<'_>,
     id: Uuid,
@@ -213,10 +225,45 @@ pub async fn service_account_by_id(
          WHERE data_tenant_id = $1
            AND id = $2
            AND status = 'active'
+           AND principal_kind <> 'system'
         "#,
     )
     .bind(conn.data_tenant_id().as_uuid())
     .bind(id)
+    .fetch_optional(&mut **conn.transaction())
+    .await
+}
+
+/// Create the tenant's internal SYSTEM writer when absent and return its id.
+///
+/// Delegates to `wyrd.provision_system_principal()`, the single owner the
+/// upgrade migration's backfill also uses, so provisioning and backfill cannot
+/// diverge. Idempotent: every call in a tenant returns the same stable UUIDv7.
+/// The row joins the caller's transaction and commits with it.
+///
+/// # Errors
+/// Returns the database error when the insert or read fails.
+pub async fn provision_system_principal(conn: &mut TenantConn<'_>) -> Result<Uuid, SqlxError> {
+    sqlx::query_scalar("SELECT wyrd.provision_system_principal()")
+        .fetch_one(&mut **conn.transaction())
+        .await
+}
+
+/// Load the id of the tenant's internal SYSTEM writer, when provisioned.
+///
+/// Tenant scope comes solely from the forced RLS policy `conn` activates.
+///
+/// # Errors
+/// Returns the database error when the read fails.
+pub async fn system_principal_id(conn: &mut TenantConn<'_>) -> Result<Option<Uuid>, SqlxError> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+          FROM wyrd.auth_service_accounts
+         WHERE principal_kind = 'system'
+           AND status = 'active'
+        "#,
+    )
     .fetch_optional(&mut **conn.transaction())
     .await
 }
@@ -451,11 +498,17 @@ mod tests {
         assert!(sql.contains("sa.data_tenant_id = k.data_tenant_id"));
     }
 
-    /// The shipped predicate matches a Card identity and returns one row.
+    /// The shipped predicate matches a Card identity and can detect ambiguity.
     ///
     /// Pinned as text because the widening this guards is invisible at the call
-    /// site: `=` would match no registered principal, and dropping the ordered
-    /// `LIMIT 1` would make a multi-row match arbitrary rather than bounded.
+    /// site: `=` would match no registered principal, and restoring an ordered
+    /// `LIMIT 1` would silently pick one of several matching principals instead
+    /// of fetching two so [`service_account_by_card_ref`] fails closed. A manual
+    /// tenant predicate would duplicate the forced RLS authority `TenantConn`
+    /// already applies.
+    ///
+    /// # Panics
+    /// Panics when the fixture ref is invalid or the query text drifts.
     #[test]
     fn service_account_by_card_ref_uses_jsonb_card_ref_binding() {
         let card_ref = CardRef {
@@ -468,10 +521,12 @@ mod tests {
         let Json(bound) = Json(card_ref.clone());
 
         assert_eq!(bound, card_ref);
-        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref @> $3"));
-        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("principal_kind = $2"));
-        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("ORDER BY created_at, id"));
-        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("LIMIT 1"));
+        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("principal_kind = $1"));
+        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref @> $2"));
+        assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("data_tenant_id"));
+        assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("$3"));
+        assert!(SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("LIMIT 2"));
+        assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("ORDER BY"));
         assert!(!SERVICE_ACCOUNT_BY_CARD_REF_SQL.contains("card_ref::text"));
     }
 

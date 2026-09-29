@@ -35,3 +35,29 @@ def test_producer_key_and_client_scope_are_not_importable():
         from wyrd._wyrd.bifrost import ProducerKey  # noqa: F401
     with pytest.raises(ImportError):
         from wyrd._wyrd.bifrost import ClientScope  # noqa: F401
+
+
+def test_table_config_carries_an_optional_compaction_target():
+    """The explicit Forge file target reaches the native config from both doors.
+
+    Omitted, it stays ``None`` so the register request carries no target and the
+    table follows the server's deployment default.
+    """
+
+    import pyarrow
+    from pydantic import BaseModel
+    from wyrd.bifrost import TableConfig
+
+    class Row(BaseModel):
+        id: int
+
+    target = 256 * 1024 * 1024
+    assert TableConfig(Row, "vala.datasets.t").compaction_target_file_size_bytes is None
+    declared = TableConfig(Row, "vala.datasets.t", compaction_target_file_size_bytes=target)
+    assert declared.compaction_target_file_size_bytes == target
+    arrow = TableConfig.from_arrow(
+        pyarrow.schema([("id", pyarrow.int64())]),
+        "vala.datasets.t",
+        compaction_target_file_size_bytes=target,
+    )
+    assert arrow.compaction_target_file_size_bytes == target

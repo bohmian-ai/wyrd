@@ -156,8 +156,12 @@ remediates: []
 - mapped requirement, invariant, and acceptance IDs;
 - outcome, owners, scope, non-goals, and direct dependencies;
 - material implementation decisions and seams that belong below the spec;
-- an ordered behavioral test-scenario list;
-- the required Red-Green-Refactor execution discipline;
+- for new or changed executable behavior, scenarios, or logic, an ordered
+  behavioral test-scenario list and the required Red-Green-Refactor execution
+  discipline;
+- for documentation, generated artifacts, configuration, static obligations,
+  or already-correct behavior that does not require TDD, the reason and a
+  credible static, verification-only, regression, or no-op proof instead;
 - exact focused commands for every specifically named test;
 - broader crate, module, family, integration, codegen, and journey verification;
 - completion evidence and material stop conditions; and

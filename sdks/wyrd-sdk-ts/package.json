@@ -16,6 +16,7 @@
     "@opentelemetry/sdk-trace-base": "^2.11.0",
     "@types/node": "24.10.0",
     "@wyrd/testing": "workspace:*",
+    "openai": "^7.17.0",
     "typescript": "5.9.3",
     "vitest": "4.0.16",
     "zod": "^4.5.4"

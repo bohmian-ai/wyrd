@@ -178,7 +178,8 @@ fn build_openai_responses(
             role: "user".to_owned(),
             content: vec![OpenAiResponseContentPart::InputText { text }],
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
     Ok(ProviderRequest::OpenAiResponses(OpenAiResponsesRequest {
         model,
         input,

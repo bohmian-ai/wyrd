@@ -47,6 +47,9 @@ dev = [
     "ty>=0.0.35,<0.1.0",
     "xgboost>=2.1.0",
     "pytorch-lightning>=2.4.0",
+    "anthropic>=1.6.0",
+    "google-genai>=2.24.0",
+    "openai>=3.14.1",
 ]
 
 [tool.maturin]
@@ -62,6 +65,7 @@ markers = [
     "tensorflow: marks TensorFlow tests that run in the dedicated TensorFlow task",
     "wyrd_covers(contract): declares that a Python test covers a tagged Wyrd Rust contract",
     "integration: marks tests that require a live WyrdTestServer and run in the gated integration lane",
+    "smoke: marks opt-in live provider smoke tests that need operator credentials and real upstreams",
 ]
 
 [tool.ruff]

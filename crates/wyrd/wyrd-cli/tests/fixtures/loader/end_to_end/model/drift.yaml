@@ -1,33 +1,35 @@
 apiVersion: wyrd/v1
-kind: Drift
+kind: Verifier
 metadata:
   space: wyrd-team
   name: churn-classifier-drift
   version: "1.0.0"
 spec:
   description: PSI population stability on inference features vs the v1.4.2 training set.
-  method: Psi
-
-  # NO subject_ref. Subject is supplied by whichever publisher(s) point at
-  # this Drift via their `publishes_to`. Any Model producing observations
-  # over the same feature set can publish here without reversioning this card.
-
-  signal:
-    kind: Distribution
-    # Baseline Data card was registered by a data pipeline. External `ref:`.
-    baseline_ref:
-      kind: Data
-      space: wyrd-team
-      name: churn-classifier-data
-      version: "1.4.2"
-    features: [tenure_months, monthly_charges, contract_type]
-  condition:
-    kind: Statistical
-  profile:
-    kind: Psi
-    binning_strategy:
-      kind: Quantile
-      n_bins: 10
-    threshold:
-      kind: Fixed
-      value: 0.2
+  # NO subject. Subjects attach this Verifier through their own `verified_by`
+  # bindings, so any Model over the same feature set can reuse it without
+  # reversioning this card.
+  implementation:
+    kind: drift
+    spec:
+      method: Psi
+      signal:
+        kind: Distribution
+        # Baseline Data card was registered by a data pipeline. External `ref:`.
+        baseline_ref:
+          kind: Data
+          space: wyrd-team
+          name: churn-classifier-data
+          version: "1.4.2"
+        features: [tenure_months, monthly_charges, contract_type]
+      condition:
+        kind: Statistical
+      profile:
+        kind: Psi
+        binning_strategy:
+          kind: Quantile
+          n_bins: 10
+        categorical_features: [contract_type]
+        threshold:
+          kind: Fixed
+          value: 0.2

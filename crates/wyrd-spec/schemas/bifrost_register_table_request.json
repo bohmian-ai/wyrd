@@ -9,6 +9,15 @@
     "namespace"
   ],
   "properties": {
+    "compaction_target_file_size_bytes": {
+      "description": "Optional soft file target Forge compacts this table toward, in bytes.\n\nOmitted, the table stores no explicit target and follows the Forge deployment default (1 GiB unless the operator moved it). Supplied, it must be at least 134217728 (the 128 MiB row-group target) and is stored as the table's `write.target-file-size-bytes` Iceberg property. A re-register may omit it or repeat the stored value; a different value is `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
     "fields": {
       "description": "User fields only; `wyrd_*`/`card_ref`/`run_id` reserved names are rejected.",
       "type": "array",

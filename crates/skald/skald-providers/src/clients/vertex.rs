@@ -1,6 +1,7 @@
 //! Vertex GenerateContent and Predict client.
 
 use async_trait::async_trait;
+use serde_json::value::RawValue;
 use skald_spec::{ProviderRequest, ProviderResponse};
 
 use crate::auth::VertexAuth;
@@ -23,12 +24,12 @@ pub struct VertexClient {
 impl VertexClient {
     /// Creates a Vertex client from explicit auth and model path component.
     pub fn new(auth: VertexAuth, model: impl Into<String>) -> ProviderResult<Self> {
-        Ok(Self {
+        Ok(Self::with_transport(
             auth,
-            transport: HttpTransport::new(TransportConfig::default())?,
-            retry: RetryPolicy::default(),
-            model: model.into(),
-        })
+            model,
+            HttpTransport::new(TransportConfig::default())?,
+            RetryPolicy::default(),
+        ))
     }
 
     /// Creates a Vertex client from environment variables.
@@ -36,15 +37,69 @@ impl VertexClient {
         Self::new(VertexAuth::from_env()?, model)
     }
 
-    /// Overrides transport and retry policy, primarily for tests.
-    pub fn with_transport_and_retry(
-        mut self,
+    /// Creates a Vertex client over a shared transport and retry policy.
+    pub fn with_transport(
+        auth: VertexAuth,
+        model: impl Into<String>,
         transport: HttpTransport,
         retry: RetryPolicy,
     ) -> Self {
-        self.transport = transport;
-        self.retry = retry;
-        self
+        Self {
+            auth,
+            transport,
+            retry,
+            model: model.into(),
+        }
+    }
+
+    /// Posts a caller-built `GenerateContent` `body` for the client's model and
+    /// returns the provider's answer bytes unchanged.
+    ///
+    /// Uses the same URL, auth headers, transport, retry policy, bounded read,
+    /// and status errors as typed requests, but skips (de)serialization, so
+    /// provider members the Skald wire types do not model survive unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Status`] for a non-success answer,
+    /// [`ProviderError::Decode`] when the answer is not JSON or the auth
+    /// headers are invalid, and [`ProviderError::Connect`],
+    /// [`ProviderError::Timeout`], or [`ProviderError::Upstream`] when the
+    /// exchange fails.
+    pub async fn send_raw(&self, body: &RawValue) -> ProviderResult<Box<RawValue>> {
+        raw::send_raw(
+            &self.transport,
+            "vertex",
+            &self.auth.model_url(&self.model, "generateContent"),
+            self.auth.headers().await?,
+            body,
+            &self.retry,
+        )
+        .await
+    }
+
+    /// Posts a caller-built `GenerateContent` `body` to the client's model as
+    /// a server-sent event stream and returns the answer for incremental
+    /// reading, its bytes unchanged.
+    ///
+    /// Uses `streamGenerateContent?alt=sse` with the same auth headers as
+    /// [`Self::send_raw`] but never retries.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`super::open_stream`], or
+    /// [`ProviderError::Decode`] when the auth headers are invalid.
+    pub async fn stream_raw(&self, body: &RawValue) -> ProviderResult<super::ProviderByteStream> {
+        super::open_stream(
+            &self.transport,
+            "vertex",
+            &self
+                .auth
+                .model_url(&self.model, "streamGenerateContent?alt=sse"),
+            self.auth.headers().await?,
+            body,
+        )
+        .await
     }
 
     /// Sends a native Vertex request.

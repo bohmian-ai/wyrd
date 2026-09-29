@@ -13,7 +13,10 @@ pub mod stream;
 pub mod trait_;
 pub mod transport;
 
-pub use clients::{AnthropicClient, GoogleClient, OpenAiClient, VertexClient};
+pub use clients::{
+    AnthropicClient, GoogleClient, MediaAnswer, OpenAiBatchRoute, OpenAiClient, OpenAiMediaRoute,
+    OpenAiRoute, ProviderByteStream, UploadContent, UploadFile, VertexClient,
+};
 pub use error::{ProviderError, ProviderResult};
 pub use retry::RetryPolicy;
 pub use trait_::{ProviderClient, ProviderStream};
@@ -57,29 +60,34 @@ pub(crate) mod common {
             connect_timeout: Duration::from_secs(1),
             pool_max_idle_per_host: 2,
             user_agent: "skald-providers-test".to_owned(),
+            ..TransportConfig::default()
         })
         .expect("test transport builds")
     }
 
     pub fn openai_client(base_url: &str) -> OpenAiClient {
-        OpenAiClient::new(OpenAiAuth::new("sk-test").with_base_url(base_url))
-            .expect("client builds")
-            .with_transport_and_retry(transport(), retry_policy())
+        OpenAiClient::with_transport(
+            OpenAiAuth::new("sk-test").with_base_url(base_url),
+            transport(),
+            retry_policy(),
+        )
     }
 
     pub fn anthropic_client(base_url: &str) -> AnthropicClient {
-        AnthropicClient::new(AnthropicAuth::new("sk-ant-test").with_base_url(base_url))
-            .expect("client builds")
-            .with_transport_and_retry(transport(), retry_policy())
+        AnthropicClient::with_transport(
+            AnthropicAuth::new("sk-ant-test").with_base_url(base_url),
+            transport(),
+            retry_policy(),
+        )
     }
 
     pub fn google_client(base_url: &str, model: &str) -> GoogleClient {
-        GoogleClient::new(
+        GoogleClient::with_transport(
             GoogleApiKeyAuth::new("google-test").with_base_url(base_url),
             model,
+            transport(),
+            retry_policy(),
         )
-        .expect("client builds")
-        .with_transport_and_retry(transport(), retry_policy())
     }
 
     pub fn vertex_client(base_url: &str, model: &str) -> VertexClient {
@@ -87,12 +95,12 @@ pub(crate) mod common {
             r#"{"access_token":"vertex-test-token","expires_in":3600}"#,
         )
         .expect("oauth builds");
-        VertexClient::new(
+        VertexClient::with_transport(
             VertexAuth::new("project-a", "us-central1", oauth).with_base_url(base_url),
             model,
+            transport(),
+            retry_policy(),
         )
-        .expect("client builds")
-        .with_transport_and_retry(transport(), retry_policy())
     }
 
     pub async fn assert_received_body(server: &MockServer, expected: &str) {

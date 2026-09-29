@@ -1,27 +1,30 @@
 apiVersion: wyrd/v1
-kind: Drift
+kind: Verifier
 metadata:
   name: model-drift
   version: 1.0.0
   space: default
 spec:
   description: fixture drift
-  method: Psi
-  signal:
-    kind: Distribution
-    baseline_ref:
-      kind: Data
-      name: training
-      version: 1.0.0
-      space: default
-    features: [feature]
-  condition:
-    kind: Statistical
-  profile:
-    kind: Psi
-    binning_strategy:
-      kind: Quantile
-      n_bins: 10
-    threshold:
-      kind: Fixed
-      value: 0.2
+  implementation:
+    kind: drift
+    spec:
+      method: Psi
+      signal:
+        kind: Distribution
+        baseline_ref:
+          kind: Data
+          name: training
+          version: 1.0.0
+          space: default
+        features: [feature]
+      condition:
+        kind: Statistical
+      profile:
+        kind: Psi
+        binning_strategy:
+          kind: Quantile
+          n_bins: 10
+        threshold:
+          kind: Fixed
+          value: 0.2

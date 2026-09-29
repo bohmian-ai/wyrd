@@ -15,11 +15,8 @@ service BifrostQueryService {
   rpc CancelRunningQuery(CancelRunningQueryRequest) returns (CancelRunningQueryResponse);
 }
 
-enum VisibilityMode { VISIBILITY_MODE_UNSPECIFIED = 0; VISIBILITY_MODE_PUBLISHED_ONLY = 1; VISIBILITY_MODE_FUSED = 2; }
-enum FreshnessPolicy { FRESHNESS_POLICY_UNSPECIFIED = 0; FRESHNESS_POLICY_STRICT = 1; FRESHNESS_POLICY_ALLOW_DEGRADED = 2; }
 enum QueryTerminalOutcome { QUERY_TERMINAL_OUTCOME_UNSPECIFIED = 0; QUERY_TERMINAL_OUTCOME_SUCCESS = 1; QUERY_TERMINAL_OUTCOME_DEGRADED = 2; QUERY_TERMINAL_OUTCOME_FAILED = 3; }
 enum RunningQueryLifecycleState { RUNNING_QUERY_LIFECYCLE_STATE_UNSPECIFIED = 0; RUNNING_QUERY_LIFECYCLE_STATE_ADMITTED = 1; RUNNING_QUERY_LIFECYCLE_STATE_RUNNING = 2; RUNNING_QUERY_LIFECYCLE_STATE_CANCELLING = 3; }
-enum QueryFreshness { QUERY_FRESHNESS_UNSPECIFIED = 0; QUERY_FRESHNESS_COMPLETE = 1; QUERY_FRESHNESS_DEGRADED = 2; }
 enum QueryExecutionPath { QUERY_EXECUTION_PATH_UNSPECIFIED = 0; QUERY_EXECUTION_PATH_INTERACTIVE = 1; QUERY_EXECUTION_PATH_ANALYTICAL = 2; }
 enum QuerySource { QUERY_SOURCE_UNSPECIFIED = 0; QUERY_SOURCE_ICEBERG = 1; QUERY_SOURCE_HOT_SEALED = 2; QUERY_SOURCE_LIVE_TAIL = 3; }
 enum SourceCompletionOutcome { SOURCE_COMPLETION_OUTCOME_UNSPECIFIED = 0; SOURCE_COMPLETION_OUTCOME_COMPLETE = 1; SOURCE_COMPLETION_OUTCOME_UNAVAILABLE = 2; }
@@ -36,13 +33,19 @@ enum QueryTerminalErrorCode {
   QUERY_TERMINAL_ERROR_CODE_STORAGE_UNREACHABLE = 8;
   QUERY_TERMINAL_ERROR_CODE_QUERY_EXECUTION_FAILED = 9;
 }
-message BifrostQueryRequest { string sql = 1; VisibilityMode visibility = 2; FreshnessPolicy freshness = 3; optional uint64 deadline_ms = 4; }
+message BifrostQueryRequest {
+  string sql = 1; optional uint64 deadline_ms = 4;
+  reserved 2, 3;
+  reserved "visibility", "freshness";
+}
 message QuerySchemaFrame { string schema_fingerprint = 1; bytes arrow_ipc_schema = 2; }
 message QueryBatchFrame { bytes arrow_ipc_batch = 1; }
 message SourceCompletion { QuerySource source = 1; SourceCompletionOutcome outcome = 2; }
 message QueryTerminalError { QueryTerminalErrorCode code = 1; optional string detail = 2; }
 message QueryTerminalFrame {
-  QueryTerminalOutcome outcome = 1; QueryFreshness freshness = 2;
+  QueryTerminalOutcome outcome = 1;
+  reserved 2;
+  reserved "freshness";
   uint64 row_count = 3; repeated QueryWarning warnings = 4;
   repeated SourceCompletion source_completion = 5; optional QueryTerminalError error = 6;
   // Arrow IPC end-of-stream delta closing the query's single IPC stream.
@@ -68,9 +71,6 @@ message CancelRunningQueryResponse { string request_id = 1; bool cancellation_st
 
 service ScribeTailService {
   rpc ListActiveStreams(ListActiveStreamsRequest) returns (ListActiveStreamsResponse);
-  rpc AcquireFence(AcquireTailFenceRequest) returns (TailReadFence);
-  rpc ReadFencePage(TailPageRequest) returns (TailPage);
-  rpc ReleaseFence(ReleaseTailFenceRequest) returns (ReleaseTailFenceResponse);
 }
 service OraclePeerService {
   rpc ReserveSlots(ReserveNodeSlotsRequest) returns (ReserveNodeSlotsResponse);
@@ -90,26 +90,8 @@ enum TimeGranularity { TIME_GRANULARITY_UNSPECIFIED = 0; TIME_GRANULARITY_HOUR =
 // One exact partition. start_unix_micros must be the exact UTC boundary of
 // granularity; a noncanonical start fails conversion.
 message TimePartition { TimeGranularity granularity = 1; sint64 start_unix_micros = 2; }
-message TailCursor { uint64 writer_epoch = 1; uint64 wal_lsn = 2; bytes batch_id = 3; uint32 row_ordinal = 4; }
 message TailStreamIdentity { string node_id = 1; uint64 writer_epoch = 2; }
-message AcquireTailFenceRequest {
-  TenantTableBinding binding = 1; TimePartition time_partition = 2; TailCursor exclusive_sealed = 3;
-  uint64 deadline_unix_ms = 4; string schema_fingerprint = 5; uint32 tail_protocol_version = 6;
-  // Private server-to-server authorization envelope.  The field is intentionally
-  // opaque to public SDKs and is verified by the Scribe tail authority.
-  bytes tail_ticket = 7; bytes query_id = 8;
-}
-message TailReadFence {
-  bytes fence_id = 1; TenantTableBinding binding = 2; TimePartition time_partition = 3;
-  TailStreamIdentity stream = 4; TailCursor exclusive_sealed = 5;
-  TailCursor inclusive_live = 6; string schema_fingerprint = 7;
-  uint32 tail_protocol_version = 8; uint64 expires_at_unix_ms = 9; bytes capability = 10;
-}
-message TailPageRequest { bytes fence_id = 1; oneof after_cursor { TailCursor after = 2; } uint32 max_rows = 3; uint32 max_encoded_bytes = 4; bytes tail_capability = 5; bytes query_id = 6; }
-message TailPage { repeated bytes arrow_ipc_batches = 1; oneof next_cursor { TailCursor next = 2; } bool complete = 3; }
-message ReleaseTailFenceRequest { bytes fence_id = 1; bytes tail_capability = 2; bytes query_id = 3; }
-message ReleaseTailFenceResponse {}
-message ListActiveStreamsRequest { bytes tail_ticket = 1; TenantTableBinding binding = 2; bytes query_id = 3; }
+message ListActiveStreamsRequest { TenantTableBinding binding = 1; }
 message ActiveTailStream { TimePartition time_partition = 1; TailStreamIdentity stream = 2; }
 message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }

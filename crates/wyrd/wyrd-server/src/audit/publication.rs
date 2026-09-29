@@ -345,8 +345,10 @@ impl AuditPublisher {
     ///
     /// # Errors
     /// Returns [`AuditPublicationError::Staging`] when the tenant transaction
-    /// cannot be acquired, the locked chain-head read or bound update fails, or
-    /// the commit fails. Nothing is frozen unless the commit succeeds.
+    /// cannot be acquired, the locked chain-head read times out or fails, the
+    /// bound update fails, or the commit fails. Nothing is frozen unless the
+    /// commit succeeds; a failed transaction rolls back on drop and the next
+    /// sweep retries the unchanged range.
     async fn freeze(
         &self,
         tenant: DataTenantId,

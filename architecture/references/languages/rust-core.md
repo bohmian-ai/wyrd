@@ -601,11 +601,13 @@ atomically.
 Audit follows evaluated permission decisions. Append exactly one allowed or
 denied event for every verdict a receiving boundary reaches, inside the
 transaction that commits the authorized operation when one exists, and fail
-closed when the append fails. Oracle read decisions commit the same staging
-event from a tracked, non-blocking task. A transition that evaluates no permission — a
-Scribe batch commit, Forge maintenance, audit publication, a reconciliation or
-storage lifecycle step — records lineage in its own operational table and
-structured tracing, never canonical audit. Forge operator lineage remains behind
+closed when the append fails. Oracle read decisions and gateway invocation
+decisions commit that same staging event from a tracked, non-blocking task:
+authorization still completes before protected work, but a failed append is
+counted and logged instead of reversing the verdict. A transition that
+evaluates no permission — a Scribe batch commit, Forge maintenance, audit
+publication, a reconciliation or storage lifecycle step — records lineage in
+its own operational table and structured tracing, never canonical audit. Forge operator lineage remains behind
 its fenced, tenant-bound capability.
 
 ## External URL Safety

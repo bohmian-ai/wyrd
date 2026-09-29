@@ -2,11 +2,10 @@
 
 use std::collections::HashMap;
 
-use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::graph::publication_validation_errors;
-use wyrd_spec::reference::Ref;
-use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
+use wyrd_spec::graph::spec_binding_errors;
+use wyrd_spec::refs::ReferenceSlotVisitor;
 
 use super::error::{Diagnostic, Severity};
 use super::parse::AuthoredCard;
@@ -62,94 +61,13 @@ fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diag
 /// Run the kind-specific local validation that is not covered by envelope
 /// parsing or reference resolution.
 fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
-    match &card.spec {
-        Spec::Agent(spec) => {
-            validate_publications(&spec.publishes_to, "spec.publishes_to", card, diagnostics);
-        }
-        Spec::Service(spec) => {
-            validate_publications(&spec.publishes_to, "spec.publishes_to", card, diagnostics);
-            for (index, component) in spec.components.iter().enumerate() {
-                validate_publications(
-                    &component.publishes_to,
-                    &format!("spec.components[{index}].publishes_to"),
-                    card,
-                    diagnostics,
-                );
-            }
-        }
-        Spec::Eval(spec) => {
-            if let Err(error) = spec.validate() {
-                diagnostics.push(catalog_error(card, &error.into()));
-            }
-        }
-        Spec::Drift(spec) => {
-            if let Err(error) = spec.validate() {
-                diagnostics.push(catalog_error(card, &error.into()));
-            }
-        }
-        Spec::Trigger(spec) => validate_trigger(spec, card, diagnostics),
-        Spec::Prompt(_)
-        | Spec::Workflow(_)
-        | Spec::Mcp(_)
-        | Spec::Policy(_)
-        | Spec::Audit(_)
-        | Spec::Source(_)
-        | Spec::Data(_)
-        | Spec::Model(_)
-        | Spec::Artifact(_)
-        | Spec::Experiment(_)
-        | Spec::Operator(_) => {}
-    }
-}
-
-/// Validate publication target kinds and reject duplicate publication targets.
-fn validate_publications(
-    publications: &[Ref],
-    field: &str,
-    card: &AuthoredCard,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    for error in publication_validation_errors(publications, field) {
+    for error in spec_binding_errors(&card.spec) {
         diagnostics.push(catalog_error(card, &error));
     }
-}
-
-/// Validate the card kinds referenced by a trigger's operator and source.
-fn validate_trigger(
-    trigger: &wyrd_spec::card::trigger::TriggerSpec,
-    card: &AuthoredCard,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if trigger
-        .operator_ref
-        .as_card_ref()
-        .is_some_and(|reference| reference.kind != CardKind::Operator)
+    if let Spec::Verifier(spec) = &card.spec
+        && let Err(error) = spec.validate()
     {
-        diagnostics.push(Diagnostic::invalid_envelope(
-            card.source_path.clone(),
-            "Trigger operator_ref must reference an Operator".to_owned(),
-        ));
-    }
-    let source_ref = trigger.source.as_ref().map(|source| match source {
-        wyrd_spec::card::trigger::TriggerSource::DriftObservation { drift_ref, .. } => {
-            (drift_ref, CardKind::Drift)
-        }
-        wyrd_spec::card::trigger::TriggerSource::EvalObservation { eval_ref, .. } => {
-            (eval_ref, CardKind::Eval)
-        }
-    });
-    if let Some((reference, expected)) = source_ref
-        && reference
-            .as_card_ref()
-            .is_some_and(|reference| reference.kind != expected)
-    {
-        diagnostics.push(Diagnostic::invalid_envelope(
-            card.source_path.clone(),
-            format!(
-                "Trigger source must reference a {} card",
-                expected.wire_name()
-            ),
-        ));
+        diagnostics.push(catalog_error(card, &error.into()));
     }
 }
 
@@ -158,59 +76,18 @@ fn validate_trigger(
 fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
     let mut spec = card.spec.clone();
     ReferenceSlotVisitor::visit(&mut spec, |slot| {
-        let diagnostic = match slot.value {
-            SlotValue::Durable(reference) => match reference {
-                Ref::Path(_) => Some(unresolved_path_diagnostic(card, &slot.path)),
-                _ if reference
-                    .as_card_ref()
-                    .is_some_and(|reference| reference.uid.is_some()) =>
-                {
-                    Some(authored_uid_diagnostic(card, &slot.path))
-                }
-                _ if reference
-                    .as_card_ref()
-                    .is_some_and(|reference| reference.space.is_none()) =>
-                {
-                    Some(missing_space_diagnostic(card, &slot.path))
-                }
-                _ => None,
-            },
-            SlotValue::InlineablePrompt(reference) => match reference {
-                wyrd_spec::reference::InlineableRef::Path(_) => {
-                    Some(unresolved_path_diagnostic(card, &slot.path))
-                }
-                _ if reference
-                    .as_card_ref()
-                    .is_some_and(|reference| reference.uid.is_some()) =>
-                {
-                    Some(authored_uid_diagnostic(card, &slot.path))
-                }
-                _ if reference
-                    .as_card_ref()
-                    .is_some_and(|reference| reference.space.is_none()) =>
-                {
-                    Some(missing_space_diagnostic(card, &slot.path))
-                }
-                _ => None,
-            },
-            SlotValue::InlineableAgent(reference) => match reference {
-                wyrd_spec::reference::InlineableRef::Path(_) => {
-                    Some(unresolved_path_diagnostic(card, &slot.path))
-                }
-                _ if reference
-                    .as_card_ref()
-                    .is_some_and(|reference| reference.uid.is_some()) =>
-                {
-                    Some(authored_uid_diagnostic(card, &slot.path))
-                }
-                _ if reference
-                    .as_card_ref()
-                    .is_some_and(|reference| reference.space.is_none()) =>
-                {
-                    Some(missing_space_diagnostic(card, &slot.path))
-                }
-                _ => None,
-            },
+        let diagnostic = if slot.value.as_path().is_some() {
+            Some(unresolved_path_diagnostic(card, &slot.path))
+        } else if let Some(reference) = slot.value.as_card_ref() {
+            if reference.uid.is_some() {
+                Some(authored_uid_diagnostic(card, &slot.path))
+            } else if reference.space.is_none() {
+                Some(missing_space_diagnostic(card, &slot.path))
+            } else {
+                None
+            }
+        } else {
+            None
         };
         if let Some(diagnostic) = diagnostic {
             diagnostics.push(diagnostic);
@@ -326,9 +203,11 @@ mod tests {
     use wyrd_semver::VersionBlock;
     use wyrd_spec::api_version::ApiVersion;
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
+    use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
+    use wyrd_spec::card::verifier::VerificationBinding;
     use wyrd_spec::envelope::{CardKind, Metadata, Spec};
     use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::{CardRef, Ref};
+    use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 
     #[test]
     fn validate_rejects_reference_without_resolved_space() {
@@ -362,7 +241,7 @@ mod tests {
                         space: None,
                         uid: None,
                     }),
-                    publishes_to: Vec::new(),
+                    verified_by: Vec::new(),
                     source: None,
                     config: BTreeMap::new(),
                     credential_refs: Vec::new(),
@@ -380,11 +259,12 @@ mod tests {
         );
     }
 
-    /// Reject duplicate publication targets within one Service component binding.
+    /// Reject two `verified_by` bindings to the same Verifier version on one
+    /// Service component occurrence before anything is submitted.
     #[test]
     fn validate_rejects_duplicate_component_publication_targets() {
-        let eval_ref = CardRef {
-            kind: CardKind::Eval,
+        let verifier_ref = CardRef {
+            kind: CardKind::Verifier,
             name: CardName::new("quality").expect("test card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
             space: Some(SpaceName::new("default").expect("test space is valid")),
@@ -420,7 +300,7 @@ mod tests {
                         space: Some(SpaceName::new("default").expect("test space is valid")),
                         uid: None,
                     }),
-                    publishes_to: vec![Ref::Ref(eval_ref.clone()), Ref::Ref(eval_ref)],
+                    verified_by: vec![binding(&verifier_ref), binding(&verifier_ref)],
                     source: None,
                     config: BTreeMap::new(),
                     credential_refs: Vec::new(),
@@ -432,10 +312,25 @@ mod tests {
 
         let diagnostics = validate_tree(&[card]);
         assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET"
+            diagnostic.code == "WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING"
                 && diagnostic
                     .message
-                    .contains("spec.components[0].publishes_to")
+                    .contains("spec.components[0].verified_by")
         }));
+    }
+
+    /// Build one binding to `verifier` that runs on an inline schedule.
+    fn binding(verifier: &CardRef) -> VerificationBinding {
+        VerificationBinding {
+            verifier: Ref::Ref(verifier.clone()),
+            runs_on: InlineableRef::Inline(Box::new(TriggerSpec {
+                description: None,
+                activation: TriggerActivation::Schedule {
+                    cron: "0 * * * *".to_owned(),
+                    tz: None,
+                },
+            })),
+            on_failure: Vec::new(),
+        }
     }
 }

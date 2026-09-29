@@ -77,22 +77,40 @@ async fn get_card_http(
 ) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
     let kind = parse_card_kind(&kind)?;
     let card_uid = parse_card_uid(&card_uid)?;
-    authorize_card_read(
-        &state,
-        &caller,
+    Ok(Json(get_card_for(&state, &caller, &kind, &card_uid).await?))
+}
+
+/// Authorize, audit, and read one Card by its exact kind-qualified UID.
+///
+/// Shared by HTTP and the MCP `cards.get` tool so both audit `cards:read`
+/// standalone and refuse a UID outside the requested kind identically.
+///
+/// # Errors
+/// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
+/// [`WyrdError::RegistryCardNotFound`] when the UID is absent or of another
+/// kind, [`WyrdError::AuditUnavailable`] when the decision cannot be recorded,
+/// and the registry errors of [`service::get_card_by_uid`].
+pub(crate) async fn get_card_for(
+    state: &AppState,
+    caller: &Caller,
+    kind: &CardKind,
+    card_uid: &CardUid,
+) -> Result<GetCardResponse, WyrdError> {
+    audit::authorize(
+        state,
+        caller,
+        &Permission::card_read(),
         "card.read.uid",
         &format!("card:{card_uid}"),
     )
     .await?;
-    let response = service::get_card_by_uid(&state, &caller, &card_uid)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
-    if response.card.kind != kind {
-        return Err(WyrdErrorResponse::from(WyrdError::registry_card_not_found(
+    let response = service::get_card_by_uid(state, caller, card_uid).await?;
+    if &response.card.kind != kind {
+        return Err(WyrdError::registry_card_not_found(
             "card UID is not in the requested kind namespace",
-        )));
+        ));
     }
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// Fetch one Card by its exact kind/space/name/version identity.
@@ -344,7 +362,8 @@ async fn list_artifacts_http(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal may not register Cards \
+        (status = 403, description = "The principal may not register Cards, or may not \
+          invoke the Operators a binding's `on_failure` names \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
         (status = 409, description = "The idempotency key was reused with a different \
@@ -372,13 +391,21 @@ async fn list_artifacts_http(
 /// canonical request content, so an exact replay is safe while reuse for a
 /// different request is rejected.
 ///
-/// The `card:write` verdict is recorded exactly once: inside the service's
+/// A request whose verification bindings name any `on_failure` Operator,
+/// inline or referenced, also needs `operators:invoke`: the frozen Operator is
+/// later dispatched by the system without another end-user decision, so the
+/// registering caller is the one authorized to create that outbound action.
+/// Operator-free registration evaluates `card:write` alone.
+///
+/// Every allowed verdict is recorded exactly once: inside the service's
 /// registration transaction when that transaction commits the Card, and
 /// standalone otherwise — a missing or invalid `Idempotency-Key`, an exact
-/// replay, a lost idempotency race, or any failure before commit.
+/// replay, a lost idempotency race, a later permission denial, or any failure
+/// before commit. A denial is recorded standalone by the evaluation itself.
 ///
 /// # Errors
-/// Returns `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, the
+/// Returns `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, or without
+/// `operators:invoke` for an Operator-bearing request, the
 /// audit-unavailable error when the verdict cannot be recorded, a validation
 /// error for a missing or invalid `Idempotency-Key` or Card body, an
 /// idempotency or version conflict, and registry or storage unavailability.
@@ -392,12 +419,29 @@ pub(crate) async fn register_card_http(
     // access token and the `Caller` extractor has materialized its principal.
     // This check is intentionally route-local: authentication answers "who is
     // calling?" while this capability check answers "may they register cards?".
-    let allowed = allow_card_write(&state, &caller, "card.registration.create", "cards").await?;
+    let mut allowed =
+        vec![allow_card_write(&state, &caller, "card.registration.create", "cards").await?];
+    if service::dispatches_operators(&body) {
+        match audit::authorize_recording_denial(
+            &state,
+            &caller,
+            &Permission::operator_invoke(),
+            "card.registration.create",
+            "operators",
+        )
+        .await
+        {
+            Ok(invoke) => allowed.push(invoke),
+            Err(error) => {
+                service::record_allowed(&state, &caller, &allowed).await?;
+                return Err(error.into());
+            }
+        }
+    }
     let idempotency_key = match extract_required_idempotency_key(&headers) {
         Ok(key) => key,
         Err(error) => {
-            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &allowed)
-                .await?;
+            service::record_allowed(&state, &caller, &allowed).await?;
             return Err(error);
         }
     };

@@ -321,7 +321,7 @@ impl Decoder for TraceRequestDecoder {
         let owner = self
             .gate
             .gate()
-            .reserve_otlp_decode(plan.decode_bytes)
+            .reserve_otlp_decode(plan.reservation_bytes())
             .map_err(Status::from)?;
         record_codec_activity("decode");
         let request = decode_trace_protobuf(bytes).map_err(Status::from)?;
@@ -492,7 +492,7 @@ impl Decoder for MetricsRequestDecoder {
         let owner = self
             .gate
             .gate()
-            .reserve_otlp_decode(plan.decode_bytes)
+            .reserve_otlp_decode(plan.reservation_bytes())
             .map_err(Status::from)?;
         record_codec_activity("decode");
         let request = decode_metrics_protobuf(bytes, plan).map_err(Status::from)?;
@@ -663,7 +663,7 @@ impl Decoder for LogsRequestDecoder {
         let owner = self
             .gate
             .gate()
-            .reserve_otlp_decode(plan.decode_bytes)
+            .reserve_otlp_decode(plan.reservation_bytes())
             .map_err(Status::from)?;
         record_codec_activity("decode");
         let request = decode_logs_protobuf(bytes).map_err(Status::from)?;

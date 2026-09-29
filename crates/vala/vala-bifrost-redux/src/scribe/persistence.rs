@@ -682,7 +682,7 @@ impl PersistenceRuntime {
         operator_pool: Option<&vala_sql::OperatorPool>,
         workers: usize,
     ) -> Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>> {
-        let volume = context.memory.stage_volume()?;
+        let stage_root = context.memory.stage_root()?.to_path_buf();
         let operator_pool = operator_pool?.clone();
         let config = crate::scribe::assembly::StagingAssemblerConfig::new(
             context.geometry.staging_target_file_size_bytes(),
@@ -690,12 +690,10 @@ impl PersistenceRuntime {
             workers.max(1),
         )
         .ok()?;
-        let stage = Arc::new(crate::scribe::hot_stage::ScribeHotStage::new(
-            volume.root().ok()?.to_path_buf(),
-        ));
+        let stage = Arc::new(crate::scribe::hot_stage::ScribeHotStage::new(stage_root));
         let publisher = crate::scribe::claim_publication::ClaimPublisher::new(
             Arc::clone(&stage),
-            ScribeStageMover::new(Arc::clone(&context.wal), (*context.operator).clone()),
+            ScribeStageMover::new(context.wal.base_dir(), (*context.operator).clone()),
             ScribePublicationReconciler::new(
                 operator_pool,
                 context.actor_stream,
@@ -704,11 +702,9 @@ impl PersistenceRuntime {
             ),
         );
         Some(Arc::new(
-            crate::scribe::staging_runtime::ScribeStagingRuntime::new(
-                stage, volume, publisher, config,
-            )
-            .with_hot_sources(Arc::clone(&context.hot_sources))
-            .with_telemetry(Arc::clone(&context.telemetry)),
+            crate::scribe::staging_runtime::ScribeStagingRuntime::new(stage, publisher, config)
+                .with_hot_sources(Arc::clone(&context.hot_sources))
+                .with_telemetry(Arc::clone(&context.telemetry)),
         ))
     }
 
@@ -1127,7 +1123,7 @@ impl PersistenceRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "Scribe staged recovery has no root memory owner".to_owned(),
             })?;
-        ScribeStageMover::new(Arc::clone(wal), operator.clone())
+        ScribeStageMover::new(wal.base_dir(), operator.clone())
             .recover_publications(reconciler, memory)
             .await
     }
@@ -1222,16 +1218,33 @@ pub(crate) struct StagedGenerationOutcome {
 ///
 /// The merge decodes one bounded batch per member rather than a whole member,
 /// so the footprint is derived from what the members measured: their encoded
-/// bytes per row, scaled by the bounded row window each member contributes.
+/// bytes per row, scaled by the rows the merge can hold at once.
 /// [`parquet_candidate_incremental_bytes`] then adds the writer's own footer
 /// and transfer children on top of it.
 fn claim_merge_bytes(claim: &crate::scribe::assembly::StagingClaim) -> usize {
-    let rows = claim.rows().max(1);
-    let bytes_per_row = claim.encoded_bytes().div_ceil(rows);
+    merge_window_bytes(
+        claim.encoded_bytes(),
+        claim.rows(),
+        claim.members().len() as u64,
+    )
+}
+
+/// Bytes a merge of `members` holds at once, given their total `encoded_bytes`
+/// over `rows`.
+///
+/// Each member contributes one batch of at most
+/// [`MERGE_BATCH_ROWS`](crate::scribe::claim_assembly::MERGE_BATCH_ROWS) rows,
+/// and no batch holds more rows than its member has, so the rows held at once
+/// are the lesser of the claim's rows and one full window per member. Bounding
+/// by the claim's own rows keeps a claim of many small, wide members from
+/// requesting a window it can never fill — a request that exceeds the pod's
+/// Scribe memory ceiling would otherwise wait for admission forever.
+fn merge_window_bytes(encoded_bytes: u64, rows: u64, members: u64) -> usize {
+    let rows = rows.max(1);
+    let bytes_per_row = encoded_bytes.div_ceil(rows);
     let window = crate::scribe::claim_assembly::MERGE_BATCH_ROWS as u64;
-    let members = claim.members().len() as u64;
-    usize::try_from(bytes_per_row.saturating_mul(window).saturating_mul(members))
-        .unwrap_or(usize::MAX)
+    let held_rows = rows.min(window.saturating_mul(members));
+    usize::try_from(bytes_per_row.saturating_mul(held_rows)).unwrap_or(usize::MAX)
 }
 
 /// Separate Scribe mover that uploads finalized stages but owns no catalog decision.
@@ -1245,9 +1258,9 @@ pub struct ScribeStageMover {
 impl ScribeStageMover {
     /// Builds the mover over the WAL-root stage namespace and durable object store.
     #[must_use]
-    pub fn new(wal: Arc<WalWriter>, operator: opendal::Operator) -> Self {
+    pub fn new(wal_root: &std::path::Path, operator: opendal::Operator) -> Self {
         Self {
-            staging: ScribeStaging::new(wal),
+            staging: ScribeStaging::new(wal_root),
             uploader: BifrostParquetUploader::new(operator),
         }
     }
@@ -2689,13 +2702,9 @@ impl PersistenceWorker {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "Scribe output scratch is unavailable before claim assembly".to_owned(),
             })?
-            .create_scribe_claim(
-                &claim.key().node_id().to_string(),
-                &claim.id().to_string(),
-                claim.encoded_bytes(),
-            )
+            .create_scribe_claim(&claim.key().node_id().to_string(), &claim.id().to_string())
             .map_err(|error| ScribeError::Internal {
-                detail: format!("Scribe claim scratch admission failed: {error}"),
+                detail: format!("Scribe claim scratch creation failed: {error}"),
             })?;
         #[cfg(any(test, feature = "test-support"))]
         let _object_write_guard = self.faults.begin_object_write().await;
@@ -2706,11 +2715,9 @@ impl PersistenceWorker {
             Ok(assembled) => assembled,
             Err(error) => {
                 // Assembly never reached the fenced publication, so nothing this
-                // claim produced can be authoritative. The scratch directory must
-                // be removed on its owning blocking boundary: dropping it here
-                // would retain the charge and poison shared volume health, which
-                // the resource-health worker escalates into terminating the pod
-                // for what is a retryable flush.
+                // claim produced can be authoritative. Remove the scratch
+                // directory now, on a blocking boundary, rather than leaving it
+                // for restart reconciliation.
                 discard_claim_scratch(scratch).await;
                 return Err(error);
             }
@@ -2934,6 +2941,26 @@ mod tests {
             cohort_id: Some(std::path::PathBuf::from("wal/shard-3/segment-9001")),
             member_generation: 77,
         }
+    }
+
+    /// A claim of many one-row, wide members sizes its merge to the rows it
+    /// holds, not to one full window per member, while a claim larger than
+    /// its members' windows stays bounded by those windows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either estimate differs from the held rows times bytes per
+    /// row.
+    #[test]
+    fn merge_window_bytes_is_bounded_by_the_rows_a_claim_holds() {
+        let window = crate::scribe::claim_assembly::MERGE_BATCH_ROWS as u64;
+        let row = 27_000_u64;
+        assert_eq!(merge_window_bytes(7 * row, 7, 7), 7 * 27_000);
+        assert_eq!(
+            merge_window_bytes(10 * window * 100, 10 * window, 2),
+            usize::try_from(2 * window * 100).expect("fits usize")
+        );
+        assert_eq!(merge_window_bytes(0, 0, 0), 0);
     }
 
     /// A production producer refusal retains identity and cannot fall through as cancellation.
@@ -3265,7 +3292,6 @@ mod tests {
             wal_root: &std::path::Path,
             scribe_stage: std::path::PathBuf,
             scribe_output: std::path::PathBuf,
-            oracle_scratch: std::path::PathBuf,
         ) -> crate::resources::BifrostRuntimeResources {
             crate::resources::BifrostRuntimeResources::from_snapshot(
                 crate::resources::SystemResourceSnapshot {
@@ -3291,7 +3317,6 @@ mod tests {
                         wal: wal_root.to_owned(),
                         scribe_stage,
                         scribe_output_scratch: scribe_output,
-                        oracle_scratch,
                     }),
                 },
             )
@@ -3308,8 +3333,7 @@ mod tests {
             let scratch_root = tempfile::tempdir().expect("scratch directory");
             let scribe_stage = wal_root.path().join("scribe-stage");
             let scribe_output = scratch_root.path().join("scribe-output");
-            let oracle_scratch = scratch_root.path().join("oracle");
-            for root in [&scribe_stage, &scribe_output, &oracle_scratch] {
+            for root in [&scribe_stage, &scribe_output] {
                 std::fs::create_dir(root).expect("test volume root");
             }
             let node_id = crate::scribe::stream_identity::NodeId::generate();
@@ -3344,13 +3368,12 @@ mod tests {
                 wal_root.path(),
                 scribe_stage,
                 scribe_output,
-                oracle_scratch,
             );
             let roles = runtime_resources
                 .compose_roles()
                 .expect("test role resources");
             let memory = roles.scribe().expect("test Scribe resources");
-            let (_, output_scratch) = memory.volume_capabilities().expect("test Scribe volumes");
+            let output_scratch = memory.output_scratch().expect("test Scribe output scratch");
             let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
             let runtime = PersistenceRuntime::start(
                 ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 1, 1)

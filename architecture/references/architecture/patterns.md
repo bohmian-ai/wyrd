@@ -250,16 +250,21 @@ transitions that evaluate no permission (Scribe batch commits, Forge
 maintenance, Oracle reader protection) are lineage in their own operational
 tables and are never audit.
 
-Every audited decision appends through the canonical audit writer in the same
-transaction as the decision, before the operation proceeds or refuses, so both
-commit or roll back together. A decision that cannot be recorded fails closed.
-A workflow that evaluates permission more than once records each evaluation at
+Except for the explicitly non-blocking paths named below, every audited
+decision appends through the canonical audit writer in the same transaction as
+the decision, before the operation proceeds or refuses, so both commit or roll
+back together. A decision that cannot be recorded that way fails closed. A
+workflow that evaluates permission more than once records each evaluation at
 its own commit boundary. Do not create parallel audit writers.
 
-The one narrow exception is Oracle query reads: they first fsync a versioned
-CRC-framed local WAL record, then a single bounded background relay calls the
-same `append_audit` writer at least once. This exception does not apply to
-Postgres decisions.
+Oracle read decisions, tenant tripwires, and gateway invocation decisions are
+the named exceptions. They use that same canonical append from a tracked,
+non-blocking task, so the decision's own latency does not depend on the write
+and an otherwise authorized call is not refused when it is slow. Abrupt
+process loss can lose an uncommitted event on those paths; no other audit
+table, WAL, relay, or log sink exists to prevent it. Gateway *administration*
+is not in this set: submitting, rotating, revoking, and deleting a credential
+stay transactional and fail closed.
 
 `vala.audit_staging` is transient write-ahead state with no external consumer.
 Contiguous, tenant-scoped ranges are projected idempotently into retained

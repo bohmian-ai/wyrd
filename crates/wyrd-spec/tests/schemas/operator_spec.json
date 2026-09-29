@@ -3,18 +3,128 @@
   "title": "OperatorSpec",
   "description": "A server-owned side-effect template.",
   "type": "object",
-  "required": [
-    "action"
+  "oneOf": [
+    {
+      "description": "Dispatch a registered Workflow.",
+      "type": "object",
+      "required": [
+        "kind",
+        "workflow_ref"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "workflow"
+          ]
+        },
+        "workflow_ref": {
+          "description": "Workflow to dispatch with the trigger context.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Ref"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Send a typed notification.",
+      "type": "object",
+      "required": [
+        "channel",
+        "kind"
+      ],
+      "properties": {
+        "channel": {
+          "description": "Notification destination and payload.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/NotifyChannel"
+            }
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "notify"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Perform an HTTP request.",
+      "type": "object",
+      "required": [
+        "kind",
+        "method",
+        "url"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Optional server-side authentication binding.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HttpAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "body": {
+          "description": "Optional structured JSON body."
+        },
+        "expect_status": {
+          "description": "Optional expected response status.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0.0
+        },
+        "headers": {
+          "description": "Optional request headers.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        },
+        "method": {
+          "description": "HTTP method.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HttpMethod"
+            }
+          ]
+        },
+        "timeout_seconds": {
+          "description": "Optional request timeout.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "url": {
+          "description": "URL template.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
   ],
   "properties": {
-    "action": {
-      "description": "The single action performed when this operator fires.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/OperatorAction"
-        }
-      ]
-    },
     "budget": {
       "description": "Optional execution limits.",
       "anyOf": [
@@ -34,7 +144,6 @@
       ]
     }
   },
-  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "title": "CardKind",
@@ -47,8 +156,7 @@
         "Prompt",
         "Agent",
         "Workflow",
-        "Eval",
-        "Drift",
+        "Verifier",
         "Service",
         "Policy",
         "Mcp",
@@ -305,130 +413,6 @@
             },
             "text": {
               "description": "Message text.",
-              "type": "string"
-            }
-          },
-          "additionalProperties": false
-        }
-      ]
-    },
-    "OperatorAction": {
-      "description": "The closed set of actions an Operator can perform.",
-      "oneOf": [
-        {
-          "description": "Dispatch a registered Workflow.",
-          "type": "object",
-          "required": [
-            "kind",
-            "workflow_ref"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "workflow"
-              ]
-            },
-            "workflow_ref": {
-              "description": "Workflow to dispatch with the trigger context.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                }
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "Send a typed notification.",
-          "type": "object",
-          "required": [
-            "channel",
-            "kind"
-          ],
-          "properties": {
-            "channel": {
-              "description": "Notification destination and payload.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/NotifyChannel"
-                }
-              ]
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "notify"
-              ]
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "description": "Perform an HTTP request.",
-          "type": "object",
-          "required": [
-            "kind",
-            "method",
-            "url"
-          ],
-          "properties": {
-            "auth": {
-              "description": "Optional server-side authentication binding.",
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/HttpAuth"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "body": {
-              "description": "Optional structured JSON body."
-            },
-            "expect_status": {
-              "description": "Optional expected response status.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint16",
-              "minimum": 0.0
-            },
-            "headers": {
-              "description": "Optional request headers.",
-              "type": "object",
-              "additionalProperties": {
-                "type": "string"
-              }
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "http"
-              ]
-            },
-            "method": {
-              "description": "HTTP method.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/HttpMethod"
-                }
-              ]
-            },
-            "timeout_seconds": {
-              "description": "Optional request timeout.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "uint32",
-              "minimum": 0.0
-            },
-            "url": {
-              "description": "URL template.",
               "type": "string"
             }
           },

@@ -230,8 +230,10 @@ impl ForgeTaskTableIdentity {
             "vala.logs",
             "vala.eval",
             "vala.drift",
+            "vala.verification",
             "vala.dev",
             "vala.datasets",
+            "vala.gateway",
         ];
         if value.catalog != "wyrd-redux"
             || !NAMESPACES.contains(&value.namespace.as_str())

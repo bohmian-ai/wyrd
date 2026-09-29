@@ -133,6 +133,13 @@ pub struct BifrostTableDescription {
     pub canonical_physical_fingerprint: Option<String>,
     /// The server-resolved canonical physical layout, fully populated.
     pub physical_layout: PhysicalLayoutWire,
+    /// The table's explicit Forge compaction file target, in bytes.
+    ///
+    /// Present only when the table stores its own
+    /// `write.target-file-size-bytes`; omitted means Forge compacts it toward
+    /// the deployment default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_target_file_size_bytes: Option<u64>,
 }
 
 // ── Arrow-free schema / field wire types ────────────────────────────────────
@@ -365,6 +372,16 @@ pub struct RegisterTableRequest {
     /// an explicit empty `bloom_columns` means "managed floor only".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_layout: Option<PhysicalLayoutWire>,
+    /// Optional soft file target Forge compacts this table toward, in bytes.
+    ///
+    /// Omitted, the table stores no explicit target and follows the Forge
+    /// deployment default (1 GiB unless the operator moved it). Supplied, it
+    /// must be at least 134217728 (the 128 MiB row-group target) and is stored
+    /// as the table's `write.target-file-size-bytes` Iceberg property. A
+    /// re-register may omit it or repeat the stored value; a different value
+    /// is `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_target_file_size_bytes: Option<u64>,
 }
 
 /// Whether a register call created a new table or matched an existing one.
@@ -427,46 +444,19 @@ pub enum QueryContractError {
     },
 }
 
-/// Visibility tiers included in one immutable Oracle query cut.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum VisibilityMode {
-    /// Read pinned Iceberg and hot sealed files.
-    PublishedOnly,
-    /// Also read the exact fenced live-tail interval.
-    Fused,
-}
-
-/// Behavior when a requested live source cannot complete.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum FreshnessPolicy {
-    /// Fail when every requested source cannot complete.
-    Strict,
-    /// Retain a bounded degraded result when live data is unavailable.
-    AllowDegraded,
-}
-
-impl Default for FreshnessPolicy {
-    /// Uses strict freshness so omitted client policy never hides an
-    /// unavailable live source.
-    fn default() -> Self {
-        Self::Strict
-    }
-}
-
 /// Public synchronous Oracle query request.
+///
+/// Every query reads the same sources: its pinned published cut plus
+/// best-effort live rows from selected online Scribes. There is no caller
+/// source, freshness, or class selector, and unknown fields are rejected so a
+/// client that still sends one learns the contract changed instead of silently
+/// receiving different semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct BifrostQueryRequest {
     /// SELECT-only SQL text.
     pub sql: String,
-    /// Visibility tiers requested by the caller.
-    pub visibility: VisibilityMode,
-    /// Required freshness behavior.
-    pub freshness: FreshnessPolicy,
     /// Optional caller deadline in milliseconds, valid in `1..=u32::MAX`.
     ///
     /// The field is a wide signed integer so ordinary below- and above-range
@@ -695,9 +685,12 @@ pub struct QueryBatchFrame {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum QueryTerminalOutcome {
-    /// Query completed with its full cut.
+    /// The published cut completed and every selected live source finished
+    /// the work the completed plan required. Live coverage is best effort:
+    /// success never proves every acknowledged write was included.
     Success,
-    /// Query completed with an explicitly degraded cut.
+    /// A known live source was unavailable before yielding rows; the result
+    /// carries [`QueryWarning::LiveTailUnavailable`].
     Degraded,
     /// Query failed after framing began.
     Failed,
@@ -729,17 +722,6 @@ impl Default for QueryExecutionPath {
     }
 }
 
-/// Freshness achieved by the admitted visibility cut.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum QueryFreshness {
-    /// Every selected source was available.
-    Complete,
-    /// The admitted cut omitted an unavailable live source.
-    Degraded,
-}
-
 /// Closed source tiers represented in terminal metadata.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
@@ -751,7 +733,7 @@ pub enum QuerySource {
     Iceberg,
     /// Sealed files not yet published into Iceberg.
     HotSealed,
-    /// Fenced Scribe live-tail interval.
+    /// Live rows streamed from the selected online Scribes.
     LiveTail,
 }
 
@@ -760,7 +742,7 @@ pub enum QuerySource {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum QueryWarning {
-    /// A Fused query omitted unavailable live-tail data.
+    /// A known live Scribe source was unavailable before yielding rows.
     LiveTailUnavailable,
     /// A stale sealed cut was replaced once before output.
     StaleCutReplanned,
@@ -773,7 +755,7 @@ pub enum QueryWarning {
 pub enum SourceCompletionOutcome {
     /// The source completed.
     Complete,
-    /// The live source was unavailable under degraded freshness.
+    /// A known live source was unavailable before yielding rows.
     Unavailable,
 }
 
@@ -879,8 +861,6 @@ pub struct QueryTerminalError {
 pub struct QueryTerminalFrame {
     /// Stream outcome.
     pub outcome: QueryTerminalOutcome,
-    /// Admitted-cut freshness.
-    pub freshness: QueryFreshness,
     /// Execution path Oracle selected for this query.
     ///
     /// Present on every terminal, successful or failed, so a caller always
@@ -912,7 +892,13 @@ pub struct QueryTerminalFrame {
 }
 
 impl QueryTerminalFrame {
-    /// Validates closed terminal combinations for the selected visibility.
+    /// Validates closed terminal combinations.
+    ///
+    /// Every terminal names all three source tiers exactly once. Published
+    /// tiers are always complete on a non-failed terminal path because a
+    /// published-source failure fails the query; only the live tier may be
+    /// unavailable, and that fact, the degraded outcome of a non-failed
+    /// terminal, and the live-tail warning must agree.
     ///
     /// The end-of-stream rule is part of this matrix rather than a separate
     /// check: a terminal that claims success without closing its Arrow IPC
@@ -921,23 +907,18 @@ impl QueryTerminalFrame {
     ///
     /// # Errors
     /// Returns [`QueryContractError`] for invalid cardinality, duplicate or
-    /// missing sources, inconsistent outcome/freshness/error fields, or an
+    /// missing sources, inconsistent outcome/warning/error fields, or an
     /// Arrow IPC end-of-stream whose presence contradicts the outcome.
-    pub fn validate(&self, visibility: VisibilityMode) -> Result<(), QueryContractError> {
+    pub fn validate(&self) -> Result<(), QueryContractError> {
         if self.warnings.len() > MAX_QUERY_TERMINAL_WARNINGS {
             return Err(QueryContractError::TooMany {
                 field: "warnings",
                 maximum: MAX_QUERY_TERMINAL_WARNINGS,
             });
         }
-        let expected = if visibility == VisibilityMode::Fused {
-            3
-        } else {
-            2
-        };
-        if self.source_completion.len() != expected {
+        if self.source_completion.len() != MAX_QUERY_SOURCE_COMPLETIONS {
             return Err(QueryContractError::InvalidTerminal {
-                reason: "source completion does not match visibility",
+                reason: "source completion must name every source tier",
             });
         }
         let mut seen = std::collections::BTreeSet::new();
@@ -969,23 +950,9 @@ impl QueryTerminalFrame {
                 reason: "error presence must match failed outcome",
             });
         }
-        if self.outcome == QueryTerminalOutcome::Success
-            && self.freshness != QueryFreshness::Complete
-        {
+        if !failed && degraded_live != (self.outcome == QueryTerminalOutcome::Degraded) {
             return Err(QueryContractError::InvalidTerminal {
-                reason: "success must be complete",
-            });
-        }
-        if self.outcome == QueryTerminalOutcome::Degraded
-            && (!degraded_live || self.freshness != QueryFreshness::Degraded)
-        {
-            return Err(QueryContractError::InvalidTerminal {
-                reason: "degraded requires unavailable live source",
-            });
-        }
-        if degraded_live != (self.freshness == QueryFreshness::Degraded) {
-            return Err(QueryContractError::InvalidTerminal {
-                reason: "freshness must match live-tail source completion",
+                reason: "degraded outcome must match unavailable live source",
             });
         }
         if self.warnings.contains(&QueryWarning::LiveTailUnavailable) != degraded_live {
@@ -1023,14 +990,16 @@ impl QueryTerminalFrame {
 #[cfg(test)]
 mod query_terminal_tests {
     use super::*;
+    use QueryTerminalOutcome::{Degraded, Failed, Success};
+    use SourceCompletionOutcome::{Complete, Unavailable};
 
     /// Exact Arrow IPC end-of-stream marker: one continuation token followed by
     /// a zero-length message, which is what `StreamWriter::finish` appends.
     const EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
 
-    /// Builds the required closed source set for one visibility mode.
-    fn complete_sources(visibility: VisibilityMode) -> Vec<SourceCompletion> {
-        let mut sources = vec![
+    /// Builds the closed three-tier source set with the given live outcome.
+    fn sources(live: SourceCompletionOutcome) -> Vec<SourceCompletion> {
+        vec![
             SourceCompletion {
                 source: QuerySource::Iceberg,
                 outcome: SourceCompletionOutcome::Complete,
@@ -1039,136 +1008,134 @@ mod query_terminal_tests {
                 source: QuerySource::HotSealed,
                 outcome: SourceCompletionOutcome::Complete,
             },
-        ];
-        if visibility == VisibilityMode::Fused {
-            sources.push(SourceCompletion {
+            SourceCompletion {
                 source: QuerySource::LiveTail,
-                outcome: SourceCompletionOutcome::Complete,
-            });
-        }
-        sources
+                outcome: live,
+            },
+        ]
     }
 
-    /// Success, degraded, and partial-row failed terminals preserve their cut.
-    #[test]
-    fn closed_terminal_matrix_validates() {
-        let success = QueryTerminalFrame {
-            outcome: QueryTerminalOutcome::Success,
-            freshness: QueryFreshness::Complete,
-            execution_path: QueryExecutionPath::Interactive,
-            row_count: 2,
-            warnings: vec![],
-            source_completion: complete_sources(VisibilityMode::PublishedOnly),
-            error: None,
-            arrow_ipc_eos: EOS.to_vec(),
-        };
-        success
-            .validate(VisibilityMode::PublishedOnly)
-            .expect("success terminal validates");
-        success
-            .validate_emitted_rows(2)
-            .expect("success row count validates");
-
-        let mut degraded_sources = complete_sources(VisibilityMode::Fused);
-        degraded_sources[2].outcome = SourceCompletionOutcome::Unavailable;
-        let degraded = QueryTerminalFrame {
-            outcome: QueryTerminalOutcome::Degraded,
-            freshness: QueryFreshness::Degraded,
+    /// Builds one terminal from its independently varied fields.
+    fn terminal(
+        outcome: QueryTerminalOutcome,
+        live: SourceCompletionOutcome,
+        warnings: Vec<QueryWarning>,
+    ) -> QueryTerminalFrame {
+        let failed = outcome == QueryTerminalOutcome::Failed;
+        QueryTerminalFrame {
+            outcome,
             execution_path: QueryExecutionPath::Interactive,
             row_count: 1,
-            warnings: vec![QueryWarning::LiveTailUnavailable],
-            source_completion: degraded_sources.clone(),
-            error: None,
-            arrow_ipc_eos: EOS.to_vec(),
-        };
-        degraded
-            .validate(VisibilityMode::Fused)
-            .expect("degraded terminal validates");
-
-        let failed = QueryTerminalFrame {
-            outcome: QueryTerminalOutcome::Failed,
-            freshness: QueryFreshness::Degraded,
-            execution_path: QueryExecutionPath::Interactive,
-            row_count: 1,
-            warnings: vec![QueryWarning::LiveTailUnavailable],
-            source_completion: degraded_sources,
-            error: Some(QueryTerminalError {
+            warnings,
+            source_completion: sources(live),
+            error: failed.then_some(QueryTerminalError {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
                 detail: None,
             }),
-            arrow_ipc_eos: Vec::new(),
-        };
-        failed
-            .validate(VisibilityMode::Fused)
-            .expect("partial-row failure validates");
-        failed
+            arrow_ipc_eos: if failed { Vec::new() } else { EOS.to_vec() },
+        }
+    }
+
+    /// Success, degraded, and failed terminals each carry every source tier
+    /// and no freshness field; only consistent combinations validate.
+    #[test]
+    fn closed_terminal_matrix_validates() {
+        let warn = || vec![QueryWarning::LiveTailUnavailable];
+
+        let success = terminal(Success, Complete, vec![]);
+        success.validate().expect("success terminal validates");
+        success
             .validate_emitted_rows(1)
-            .expect("partial-row count validates");
+            .expect("success row count validates");
+        let encoded = serde_json::to_value(&success).expect("terminal serializes");
+        assert!(encoded.get("freshness").is_none(), "no freshness field");
+        assert_eq!(
+            encoded["source_completion"].as_array().map(Vec::len),
+            Some(3)
+        );
+
+        terminal(Degraded, Unavailable, warn())
+            .validate()
+            .expect("degraded terminal validates");
+        terminal(Failed, Unavailable, warn())
+            .validate()
+            .expect("failure after known live loss validates");
+        terminal(Failed, Complete, vec![])
+            .validate()
+            .expect("failure with complete live validates");
+
+        for invalid in [
+            terminal(Success, Unavailable, warn()),
+            terminal(Success, Complete, warn()),
+            terminal(Degraded, Complete, vec![]),
+            terminal(Degraded, Unavailable, vec![]),
+            terminal(Failed, Unavailable, vec![]),
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?} must be rejected");
+        }
+
+        let mut two_tiers = terminal(Success, Complete, vec![]);
+        two_tiers.source_completion.pop();
+        assert!(two_tiers.validate().is_err(), "every tier is required");
+
+        let mut unavailable_published = terminal(Failed, Complete, vec![]);
+        unavailable_published.source_completion[0].outcome = Unavailable;
+        assert!(
+            unavailable_published.validate().is_err(),
+            "published tiers are never degraded"
+        );
     }
 
     /// Failed terminals require an error and exact emitted-row count.
     #[test]
     fn invalid_failed_terminal_is_rejected() {
-        let failed_without_error = QueryTerminalFrame {
-            outcome: QueryTerminalOutcome::Failed,
-            freshness: QueryFreshness::Complete,
-            execution_path: QueryExecutionPath::Interactive,
-            row_count: 3,
-            warnings: vec![],
-            source_completion: complete_sources(VisibilityMode::PublishedOnly),
-            error: None,
-            arrow_ipc_eos: Vec::new(),
-        };
-        assert!(
-            failed_without_error
-                .validate(VisibilityMode::PublishedOnly)
-                .is_err()
+        let mut failed_without_error = terminal(
+            QueryTerminalOutcome::Failed,
+            SourceCompletionOutcome::Complete,
+            vec![],
         );
+        failed_without_error.error = None;
+        assert!(failed_without_error.validate().is_err());
 
-        let failed = QueryTerminalFrame {
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: None,
-            }),
-            ..failed_without_error
-        };
+        let failed = terminal(
+            QueryTerminalOutcome::Failed,
+            SourceCompletionOutcome::Complete,
+            vec![],
+        );
         assert!(failed.validate_emitted_rows(2).is_err());
     }
 
-    /// Query requests require both policies and reject empty or zero-valued input.
+    /// The request carries only SQL and an optional deadline: a source or
+    /// freshness selector is rejected rather than silently ignored, and empty
+    /// SQL or a zero deadline fails validation.
     #[test]
-    fn query_request_requires_policies_and_validation_is_closed() {
-        for omitted in ["visibility", "freshness"] {
-            let mut value = serde_json::json!({
-                "sql": "SELECT 1",
-                "visibility": "published_only",
-                "freshness": "strict",
-                "deadline_ms": null
-            });
-            value
-                .as_object_mut()
-                .expect("request fixture is an object")
-                .remove(omitted);
-            assert!(
-                serde_json::from_value::<BifrostQueryRequest>(value).is_err(),
-                "omitting {omitted} must fail closed"
-            );
-        }
-
+    fn query_request_has_no_source_selectors_and_validation_is_closed() {
         let request: BifrostQueryRequest = serde_json::from_value(serde_json::json!({
             "sql": "SELECT 1",
-            "visibility": "published_only",
-            "freshness": "strict",
             "deadline_ms": null
         }))
         .expect("request deserializes");
-        assert_eq!(request.freshness, FreshnessPolicy::Strict);
-        request.validate().expect("explicit request validates");
+        request.validate().expect("minimal request validates");
+        assert_eq!(
+            serde_json::to_value(&request).expect("request serializes"),
+            serde_json::json!({"sql": "SELECT 1", "deadline_ms": null})
+        );
+
+        for (field, value) in [
+            ("visibility", "published_only"),
+            ("freshness", "allow_degraded"),
+            ("query_class", "analytical"),
+        ] {
+            let mut body = serde_json::json!({"sql": "SELECT 1", "deadline_ms": null});
+            body[field] = serde_json::Value::from(value);
+            assert!(
+                serde_json::from_value::<BifrostQueryRequest>(body).is_err(),
+                "{field} must be rejected"
+            );
+        }
 
         let invalid = BifrostQueryRequest {
             sql: " ".into(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(0),
         };
         assert!(invalid.validate().is_err());
@@ -1184,8 +1151,6 @@ mod query_terminal_tests {
     fn query_request_deadline_range_is_closed_and_published() {
         let request = |deadline_ms| BifrostQueryRequest {
             sql: "SELECT 1".into(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(deadline_ms),
         };
         let max = i64::from(u32::MAX);
@@ -1202,8 +1167,6 @@ mod query_terminal_tests {
         }
         let decoded: BifrostQueryRequest = serde_json::from_value(serde_json::json!({
             "sql": "SELECT 1",
-            "visibility": "published_only",
-            "freshness": "strict",
             "deadline_ms": max + 1
         }))
         .expect("an above-range deadline deserializes for validation");
@@ -1214,75 +1177,9 @@ mod query_terminal_tests {
         let deadline = &schema["properties"]["deadline_ms"];
         assert_eq!(deadline["minimum"].as_f64(), Some(1.0));
         assert_eq!(deadline["maximum"].as_f64(), Some(f64::from(u32::MAX)));
-    }
-
-    /// Every explicit safe or opt-in policy pair round-trips without inference.
-    #[test]
-    fn query_request_explicit_policy_pairs_round_trip() {
-        let cases = [
-            (
-                VisibilityMode::PublishedOnly,
-                FreshnessPolicy::Strict,
-                "published_only",
-                "strict",
-            ),
-            (
-                VisibilityMode::Fused,
-                FreshnessPolicy::AllowDegraded,
-                "fused",
-                "allow_degraded",
-            ),
-        ];
-
-        for (visibility, freshness, wire_visibility, wire_freshness) in cases {
-            let request = BifrostQueryRequest {
-                sql: "SELECT 1".into(),
-                visibility,
-                freshness,
-                deadline_ms: None,
-            };
-            let encoded = serde_json::to_value(&request).expect("request serializes");
-            assert_eq!(encoded["visibility"], wire_visibility);
-            assert_eq!(encoded["freshness"], wire_freshness);
-            let decoded: BifrostQueryRequest =
-                serde_json::from_value(encoded).expect("serialized request deserializes");
-            assert_eq!(decoded, request);
-        }
-    }
-
-    /// Failed terminals still obey settled freshness and source consistency.
-    #[test]
-    fn failed_terminal_rejects_inconsistent_freshness() {
-        let failed = |freshness, source_completion| QueryTerminalFrame {
-            outcome: QueryTerminalOutcome::Failed,
-            freshness,
-            execution_path: QueryExecutionPath::Interactive,
-            row_count: 0,
-            warnings: vec![],
-            source_completion,
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: None,
-            }),
-            arrow_ipc_eos: Vec::new(),
-        };
-        let degraded_without_live = failed(
-            QueryFreshness::Degraded,
-            complete_sources(VisibilityMode::Fused),
-        );
-        assert!(
-            degraded_without_live
-                .validate(VisibilityMode::Fused)
-                .is_err()
-        );
-
-        let mut unavailable_live = complete_sources(VisibilityMode::Fused);
-        unavailable_live[2].outcome = SourceCompletionOutcome::Unavailable;
-        let complete_with_unavailable_live = failed(QueryFreshness::Complete, unavailable_live);
-        assert!(
-            complete_with_unavailable_live
-                .validate(VisibilityMode::Fused)
-                .is_err()
+        assert_eq!(
+            schema["additionalProperties"],
+            serde_json::Value::Bool(false)
         );
     }
 }
@@ -1543,7 +1440,6 @@ macro_rules! private_uuid_id {
     };
 }
 
-private_uuid_id!(TailFenceId, "Opaque identity for one Scribe tail fence.");
 private_uuid_id!(
     ReservationId,
     "Opaque identity for one pending Oracle worker reservation."
@@ -1769,21 +1665,7 @@ pub struct TenantTableBinding {
     pub table: String,
 }
 
-/// Stable position within one Scribe writer stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TailCursor {
-    /// Writer boot epoch.
-    pub writer_epoch: WriterEpoch,
-    /// WAL sequence within the epoch.
-    pub wal_lsn: WalLsn,
-    /// Exact UUID batch identity.
-    pub batch_id: uuid::Uuid,
-    /// Stable row ordinal within the batch.
-    pub row_ordinal: u32,
-}
-
-/// Identity of the fenced stream; cursors intentionally carry no node ID.
+/// Identity of one Scribe writer stream serving a live partition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct TailStreamIdentity {
@@ -1791,91 +1673,6 @@ pub struct TailStreamIdentity {
     pub node_id: NodeId,
     /// Writer boot epoch.
     pub writer_epoch: WriterEpoch,
-}
-
-/// Request to acquire one immutable Scribe tail fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct AcquireTailFenceRequest {
-    /// Query identity bound into the private signed tail ticket.
-    pub query_id: uuid::Uuid,
-    /// Tenant/table binding.
-    pub binding: TenantTableBinding,
-    /// Exact time partition the fence is bound to.
-    pub time_partition: TimePartitionWire,
-    /// Exclusive sealed cursor.
-    pub exclusive_sealed: TailCursor,
-    /// Absolute execution deadline.
-    pub deadline: DateTime<Utc>,
-    /// Expected schema fingerprint.
-    pub schema_fingerprint: SchemaFingerprint,
-    /// Required tail protocol version.
-    pub tail_protocol_version: u16,
-}
-
-/// Immutable interval and stream identity returned by Scribe.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TailReadFence {
-    /// Fence identity.
-    pub fence_id: TailFenceId,
-    /// Tenant/table binding.
-    pub binding: TenantTableBinding,
-    /// Exact time partition the fence is bound to.
-    pub time_partition: TimePartitionWire,
-    /// Fenced stream identity.
-    pub stream: TailStreamIdentity,
-    /// Exclusive sealed cursor.
-    pub exclusive_sealed: TailCursor,
-    /// Inclusive live cursor.
-    pub inclusive_live: TailCursor,
-    /// Exact schema fingerprint.
-    pub schema_fingerprint: SchemaFingerprint,
-    /// Tail protocol version.
-    pub tail_protocol_version: u16,
-    /// Fence expiry.
-    pub expires_at: DateTime<Utc>,
-}
-
-/// Request for one bounded page inside a tail fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TailPageRequest {
-    /// Query identity authorized to read the fence.
-    pub query_id: uuid::Uuid,
-    /// Fence identity.
-    pub fence_id: TailFenceId,
-    /// Cursor after which reading resumes.
-    pub after: Option<TailCursor>,
-    /// Maximum returned rows.
-    pub max_rows: u32,
-    /// Maximum encoded response bytes.
-    pub max_encoded_bytes: u32,
-}
-
-/// One transport-owned Arrow IPC batch in a tail page.
-pub type TailBatch = Vec<u8>;
-
-/// One bounded page from an immutable tail fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TailPage {
-    /// Owned Arrow IPC batches.
-    pub batches: Vec<TailBatch>,
-    /// Last included cursor when more data may follow.
-    pub next: Option<TailCursor>,
-    /// Whether the fence interval is exhausted.
-    pub complete: bool,
-}
-
-/// Idempotent request to release one tail fence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct ReleaseTailFenceRequest {
-    /// Query identity authorized to release the fence.
-    pub query_id: uuid::Uuid,
-    /// Fence identity.
-    pub fence_id: TailFenceId,
 }
 
 /// Fenced request to reserve worker slots.
@@ -2419,10 +2216,13 @@ mod tests {
                 source: QuerySource::HotSealed,
                 outcome: SourceCompletionOutcome::Complete,
             },
+            SourceCompletion {
+                source: QuerySource::LiveTail,
+                outcome: SourceCompletionOutcome::Complete,
+            },
         ];
         let base = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            freshness: QueryFreshness::Complete,
             execution_path: QueryExecutionPath::Interactive,
             row_count: 0,
             warnings: vec![],
@@ -2433,7 +2233,7 @@ mod tests {
 
         // Empty success is the case the previous byteless terminal could not
         // express: no batch frame ever carried an EOS, so the terminal must.
-        base.validate(VisibilityMode::PublishedOnly)
+        base.validate()
             .expect("empty success carries its end-of-stream");
         base.validate_emitted_rows(0)
             .expect("empty success emitted no rows");
@@ -2442,32 +2242,28 @@ mod tests {
                 arrow_ipc_eos: Vec::new(),
                 ..base.clone()
             }
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .is_err(),
             "success without an end-of-stream must be rejected"
         );
 
         let mut degraded_sources = base.source_completion.clone();
-        degraded_sources.push(SourceCompletion {
-            source: QuerySource::LiveTail,
-            outcome: SourceCompletionOutcome::Unavailable,
-        });
+        degraded_sources[2].outcome = SourceCompletionOutcome::Unavailable;
         let degraded = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Degraded,
-            freshness: QueryFreshness::Degraded,
             warnings: vec![QueryWarning::LiveTailUnavailable],
             source_completion: degraded_sources,
             ..base.clone()
         };
         degraded
-            .validate(VisibilityMode::Fused)
+            .validate()
             .expect("degraded still finishes its Arrow stream");
         assert!(
             QueryTerminalFrame {
                 arrow_ipc_eos: Vec::new(),
                 ..degraded
             }
-            .validate(VisibilityMode::Fused)
+            .validate()
             .is_err(),
             "degraded without an end-of-stream must be rejected"
         );
@@ -2481,15 +2277,13 @@ mod tests {
             arrow_ipc_eos: Vec::new(),
             ..base.clone()
         };
-        failed
-            .validate(VisibilityMode::PublishedOnly)
-            .expect("a failed terminal closes nothing");
+        failed.validate().expect("a failed terminal closes nothing");
         assert!(
             QueryTerminalFrame {
                 arrow_ipc_eos: EOS.to_vec(),
                 ..failed
             }
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .is_err(),
             "a failed terminal must not claim an end-of-stream"
         );
@@ -2520,8 +2314,8 @@ mod tests {
         request_properties.sort_unstable();
         assert_eq!(
             request_properties,
-            ["deadline_ms", "freshness", "sql", "visibility"],
-            "the request must not accept a path, class, worker, or plan selector"
+            ["deadline_ms", "sql"],
+            "the request must not accept a source, freshness, path, class, worker, or plan selector"
         );
 
         let path = serde_json::to_value(schemars::schema_for!(QueryExecutionPath).schema)
@@ -2545,7 +2339,6 @@ mod tests {
 
         let terminal = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            freshness: QueryFreshness::Complete,
             execution_path: QueryExecutionPath::Analytical,
             row_count: 0,
             warnings: vec![],
@@ -2558,12 +2351,16 @@ mod tests {
                     source: QuerySource::HotSealed,
                     outcome: SourceCompletionOutcome::Complete,
                 },
+                SourceCompletion {
+                    source: QuerySource::LiveTail,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
             ],
             error: None,
             arrow_ipc_eos: vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
         };
         terminal
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .expect("an Analytical terminal is valid");
         let encoded = serde_json::to_value(&terminal).expect("terminal serializes");
         assert_eq!(
@@ -3025,6 +2822,7 @@ mod bifrost_wire_tests {
                 }],
                 bloom_columns: vec!["run_id".to_string()],
             },
+            compaction_target_file_size_bytes: Some(1_073_741_824),
         };
         bifrost_wire_round_trip(&entry);
         bifrost_wire_round_trip(&desc);
@@ -3061,10 +2859,6 @@ mod bifrost_wire_tests {
     /// Private tail and peer DTOs remain schema-generatable pure contracts.
     #[test]
     fn private_query_schema_types_do_not_panic() {
-        let _ = schema_for!(super::AcquireTailFenceRequest);
-        let _ = schema_for!(super::TailReadFence);
-        let _ = schema_for!(super::TailPageRequest);
-        let _ = schema_for!(super::TailPage);
         let _ = schema_for!(super::ReserveNodeSlotsRequest);
         let _ = schema_for!(super::ReserveNodeSlotsResponse);
         let _ = schema_for!(super::ReleaseNodeSlotsRequest);

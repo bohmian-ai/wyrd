@@ -42,7 +42,6 @@ skald-agent = { path = "crates/skald/skald-agent", version = "0.0.1" }
 skald-workflow = { path = "crates/skald/skald-workflow", version = "0.0.1" }
 vala-bifrost-redux = { path = "crates/vala/vala-bifrost-redux", version = "0.0.1" }
 vala-sql = { path = "crates/vala/vala-sql", version = "0.0.1" }
-vala-core = { path = "crates/vala/vala-core", version = "0.0.1" }
 vala-ingest = { path = "crates/vala/vala-ingest", version = "0.0.1" }
 vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
 vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
@@ -52,6 +51,7 @@ wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
 wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
 wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.0.1" }
 wyrd-config = { path = "crates/wyrd/wyrd-config", version = "0.0.1" }
+wyrd-crypt = { path = "crates/shared/wyrd-crypt", version = "0.0.1" }
 wyrd-interfaces = { path = "crates/wyrd/wyrd-interfaces", version = "0.0.1" }
 wyrd-cards = { path = "crates/wyrd/wyrd-cards", version = "0.0.1" }
 wyrd-runtime = { path = "crates/shared/wyrd-runtime", version = "0.0.1" }
@@ -64,6 +64,7 @@ wyrd-auth = { path = "crates/wyrd/wyrd-auth", version = "0.0.1" }
 wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures", version = "0.0.1" }
 wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.0.1" }
 wyrd-sql = { path = "crates/wyrd/wyrd-sql", version = "0.0.1" }
+wyrd-gateway = { path = "crates/wyrd/wyrd-gateway", version = "0.0.1" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
 wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
 wyrd-testing = { path = "crates/wyrd/wyrd-testing", version = "0.0.1" }
@@ -112,12 +113,15 @@ futures-util = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 hdrhistogram = "7.5"
 num-traits = "0.2"
+bigdecimal = "0.4"
 blake3 = "1"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"
 temp-env = "0.3"
 tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+chrono-tz = "0.10"
+croner = { version = "4", default-features = false, features = ["chrono"] }
 dashmap = "6.1"
 crossbeam-queue = "0.3"
 flate2 = "1.*"
@@ -222,17 +226,17 @@ lru = "=0.12.5"
 datafusion = "=55.0.0"
 datafusion-proto = "=55.0.0"
 parquet = "59.2"
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a2f7cd2fb53e06c750b782880f6b6b83f6324467" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a2f7cd2fb53e06c750b782880f6b6b83f6324467" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a2f7cd2fb53e06c750b782880f6b6b83f6324467" }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 59 line as the workspace, so embedding it adds no second native
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "3709a1d9f7b8b6f2c0ed886c105fb557f1aaadab" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "74e4937a40a3f09501b253a9e4587e5dd10dfabd" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.

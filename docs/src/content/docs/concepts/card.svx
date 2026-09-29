@@ -43,7 +43,7 @@ fields. The author supplies four; the server owns two.
   rows={[
     ['apiVersion', 'string', 'author', { text: 'Always <code>wyrd/v1</code>.', html: true }],
     ['metadata', 'Metadata', 'author', { text: '<code>space</code>, <code>name</code>, <code>version</code>, <code>labels</code>, <code>annotations</code>.', html: true }],
-    ['kind', 'string', 'author', 'Selects the spec schema — 16 native kinds (Data, Model, Prompt, and 13 spec-only) plus External.'],
+    ['kind', 'string', 'author', 'Selects the spec schema — 15 native kinds (Data, Model, Prompt, and 12 spec-only) plus External.'],
     ['spec', 'object', 'author', 'Kind-specific payload. Content-hashed for idempotency.'],
     ['relationships', 'Edge[]', { text: 'server', badge: 'warn' }, { text: 'Derived from the <code>CardRef</code>s in <code>spec</code>. Never authored.', html: true }],
     ['status', 'Status', { text: 'server', badge: 'warn' }, { text: 'Managed lifecycle state (<code>phase</code>).', html: true }]
@@ -59,9 +59,9 @@ a spec, bump the version.
 ## The spec
 
 `spec` is the typed payload for the card's `kind`. The `kind` field selects
-which JSON Schema applies. The doctrine defines 16 native kinds plus `External`.
+which JSON Schema applies. The doctrine defines 15 native kinds plus `External`.
 Only the three shipped kinds (Data, Model, Prompt) have a runnable implementation
-today; the other thirteen native kinds and `External` have authored specs and
+today; the other twelve native kinds and `External` have authored specs and
 schemas but no runtime.
 
 ## Lifecycle

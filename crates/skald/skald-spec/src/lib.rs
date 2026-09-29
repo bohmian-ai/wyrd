@@ -33,9 +33,9 @@ pub use wire::google_embeddings::{
     GoogleEmbedRequest, GoogleEmbedding,
 };
 pub use wire::google_generate::{
-    GoogleCandidate, GoogleContent, GoogleFinishReason, GoogleGenerateContentRequest,
-    GoogleGenerateContentResponse, GoogleGenerateSettings, GooglePart, GoogleSafetyRating,
-    GoogleUsageMetadata,
+    GoogleAnswerContent, GoogleCandidate, GoogleContent, GoogleFinishReason,
+    GoogleGenerateContentRequest, GoogleGenerateContentResponse, GoogleGenerateSettings,
+    GooglePart, GoogleSafetyRating, GoogleUsageMetadata,
 };
 pub use wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatChoiceDelta, OpenAiChatLogprobs, OpenAiChatMessage,
@@ -46,8 +46,8 @@ pub use wire::openai_embeddings::{
     OpenAiEmbeddingVector, OpenAiEmbeddingsInput, OpenAiEmbeddingsRequest, OpenAiEmbeddingsResponse,
 };
 pub use wire::openai_responses::{
-    OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesResponse, OpenAiResponsesSettings,
-    OpenAiResponsesStreamEvent,
+    OpenAiResponseItem, OpenAiResponsesInput, OpenAiResponsesRequest, OpenAiResponsesResponse,
+    OpenAiResponsesSettings, OpenAiResponsesStreamEvent,
 };
 pub use wire::vertex_generate::VertexGenerateContentRequest;
 pub use wire::vertex_predict::{VertexPredictRequest, VertexPredictResponse, VertexPrediction};
@@ -260,8 +260,8 @@ pub(crate) mod common {
     ) -> GoogleGenerateContentResponse {
         GoogleGenerateContentResponse {
             candidates: vec![GoogleCandidate {
-                content: GoogleContent {
-                    role: "model".to_string(),
+                content: GoogleAnswerContent {
+                    role: Some("model".to_string()),
                     parts: vec![
                         GooglePart::Text {
                             text: "{\"answer\":\"hello\"}".to_string(),
@@ -294,6 +294,8 @@ pub(crate) mod common {
             }),
             model_version: Some("gemini-2.5-pro".to_string()),
             prompt_feedback: None,
+            response_id: None,
+            create_time: None,
         }
     }
 

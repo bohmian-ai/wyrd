@@ -1,12 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "BifrostQueryRequest",
-  "description": "Public synchronous Oracle query request.",
+  "description": "Public synchronous Oracle query request.\n\nEvery query reads the same sources: its pinned published cut plus best-effort live rows from selected online Scribes. There is no caller source, freshness, or class selector, and unknown fields are rejected so a client that still sends one learns the contract changed instead of silently receiving different semantics.",
   "type": "object",
   "required": [
-    "freshness",
-    "sql",
-    "visibility"
+    "sql"
   ],
   "properties": {
     "deadline_ms": {
@@ -19,65 +17,10 @@
       "maximum": 4294967295.0,
       "minimum": 1.0
     },
-    "freshness": {
-      "description": "Required freshness behavior.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/FreshnessPolicy"
-        }
-      ]
-    },
     "sql": {
       "description": "SELECT-only SQL text.",
       "type": "string"
-    },
-    "visibility": {
-      "description": "Visibility tiers requested by the caller.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/VisibilityMode"
-        }
-      ]
     }
   },
-  "definitions": {
-    "FreshnessPolicy": {
-      "description": "Behavior when a requested live source cannot complete.",
-      "oneOf": [
-        {
-          "description": "Fail when every requested source cannot complete.",
-          "type": "string",
-          "enum": [
-            "strict"
-          ]
-        },
-        {
-          "description": "Retain a bounded degraded result when live data is unavailable.",
-          "type": "string",
-          "enum": [
-            "allow_degraded"
-          ]
-        }
-      ]
-    },
-    "VisibilityMode": {
-      "description": "Visibility tiers included in one immutable Oracle query cut.",
-      "oneOf": [
-        {
-          "description": "Read pinned Iceberg and hot sealed files.",
-          "type": "string",
-          "enum": [
-            "published_only"
-          ]
-        },
-        {
-          "description": "Also read the exact fenced live-tail interval.",
-          "type": "string",
-          "enum": [
-            "fused"
-          ]
-        }
-      ]
-    }
-  }
+  "additionalProperties": false
 }

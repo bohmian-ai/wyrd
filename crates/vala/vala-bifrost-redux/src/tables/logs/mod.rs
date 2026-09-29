@@ -3,7 +3,7 @@
 pub mod projection;
 pub mod records;
 
-pub use projection::{canonical_log_schema, project_resource_logs};
+pub use projection::{canonical_log_schema, log_row_output_bytes, project_resource_logs};
 pub use records::RecordsTable;
 
 #[cfg(test)]
@@ -155,7 +155,8 @@ mod tests {
     #[test]
     fn maximal_log_projection_preserves_body_context_and_presence() {
         let request = maximal_resource_logs();
-        let (batch, outcome) = project_resource_logs(&request, None).expect("maximal logs project");
+        let (batch, outcome) =
+            project_resource_logs(&request, None, usize::MAX).expect("maximal logs project");
 
         let forms = body_forms();
         let correlated = forms.len();
@@ -469,8 +470,9 @@ mod tests {
             out_of_scope,
             without_uid,
         ]);
-        let (batch, outcome) = project_resource_logs(&request, Some(&correlation_fixture::scope()))
-            .expect("projection completes");
+        let (batch, outcome) =
+            project_resource_logs(&request, Some(&correlation_fixture::scope()), usize::MAX)
+                .expect("projection completes");
 
         assert_eq!(outcome.accepted_records, 3);
         assert_eq!(

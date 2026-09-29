@@ -15,6 +15,8 @@ set -uo pipefail
 
 capabilities=(
   sdk
+  observe
+  drift
   forge
   scribe
   oracle

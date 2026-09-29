@@ -22,7 +22,6 @@ use wyrd_spec::vala::eval::{
     AssertionTask, ComparisonOperator, EvalScenario, EvalSpec, EvalTask, JsonPath, LlmJudgeTask,
     RecordId, ScenarioId, ScenarioTask, TaskId,
 };
-use wyrd_spec::vala::ids::RunId;
 
 pub fn tid(value: &str) -> TaskId {
     TaskId::new(value).expect("static task id is valid")
@@ -43,7 +42,7 @@ pub fn card_ref(kind: CardKind, name: &str) -> CardRef {
 }
 
 pub fn eval_ref() -> CardRef {
-    card_ref(CardKind::Eval, "orchestrator-rubric")
+    card_ref(CardKind::Verifier, "orchestrator-rubric")
 }
 
 pub fn subject_ref() -> CardRef {
@@ -117,14 +116,14 @@ pub fn spec(tasks: Vec<EvalTask>) -> EvalSpec {
     }
 }
 
-pub fn record(run_id: &RunId, ok: bool) -> EvalRecordObservation {
+/// A canonical Eval record whose context is `{"ok": ok}`, with a fresh record
+/// id per call and no session, trace, or media.
+pub fn record(ok: bool) -> EvalRecordObservation {
     static NEXT_RECORD: AtomicU64 = AtomicU64::new(1);
     let record_id = u128::from(NEXT_RECORD.fetch_add(1, Ordering::Relaxed));
     EvalRecordObservation {
         record_id: RecordId(Uuid::from_u128(record_id)),
-        run_id: run_id.clone(),
         session_id: None,
-        eval_ref: Some(eval_ref()),
         context: json!({ "ok": ok }),
         trace_id: None,
         span_id: None,

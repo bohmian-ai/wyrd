@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayCapturePolicy",
+  "description": "Persisted capture policy with its server-assigned version.",
+  "type": "object",
+  "required": [
+    "mode",
+    "payload_fields",
+    "version"
+  ],
+  "properties": {
+    "mode": {
+      "description": "Capture mode.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GatewayCaptureMode"
+        }
+      ]
+    },
+    "payload_fields": {
+      "description": "Selected payload fields.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GatewayPayloadField"
+      },
+      "uniqueItems": true
+    },
+    "version": {
+      "description": "Version that increases only when effective content changes.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "GatewayCaptureMode": {
+      "description": "Gateway-call capture mode.",
+      "oneOf": [
+        {
+          "description": "Publish nothing to Bifrost.",
+          "type": "string",
+          "enum": [
+            "disabled"
+          ]
+        },
+        {
+          "description": "Publish call metadata without request or response content.",
+          "type": "string",
+          "enum": [
+            "metadata"
+          ]
+        },
+        {
+          "description": "Publish metadata plus the selected redacted payload fields.",
+          "type": "string",
+          "enum": [
+            "payload"
+          ]
+        }
+      ]
+    },
+    "GatewayPayloadField": {
+      "description": "Payload column selected for capture.",
+      "oneOf": [
+        {
+          "description": "Redacted request payload.",
+          "type": "string",
+          "enum": [
+            "request"
+          ]
+        },
+        {
+          "description": "Redacted response payload.",
+          "type": "string",
+          "enum": [
+            "response"
+          ]
+        }
+      ]
+    }
+  }
+}

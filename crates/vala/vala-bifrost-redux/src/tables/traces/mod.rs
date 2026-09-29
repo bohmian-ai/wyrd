@@ -3,7 +3,7 @@
 pub mod projection;
 pub mod spans;
 
-pub use projection::{canonical_span_schema, project_resource_spans};
+pub use projection::{SpanOutputWidths, canonical_span_schema, project_resource_spans};
 pub use spans::SpansTable;
 
 #[cfg(test)]
@@ -186,7 +186,7 @@ mod tests {
         let attributes = maximal_span_attributes();
         let request = maximal_resource_spans(attributes.clone());
         let (batch, outcome) =
-            project_resource_spans(&request, None).expect("maximal span projects");
+            project_resource_spans(&request, None, usize::MAX).expect("maximal span projects");
 
         assert_eq!(outcome.accepted_spans, 1);
         assert_eq!(outcome.rejected_spans, 0);
@@ -502,7 +502,7 @@ mod tests {
             without_uid,
         ]);
         let (batch, outcome) =
-            project_resource_spans(&request, Some(&correlation_fixture::scope()))
+            project_resource_spans(&request, Some(&correlation_fixture::scope()), usize::MAX)
                 .expect("projection completes");
 
         assert_eq!(outcome.accepted_spans, 3);
@@ -558,7 +558,7 @@ mod tests {
         ));
         let request = maximal_resource_spans(attributes);
         let (batch, outcome) =
-            project_resource_spans(&request, None).expect("projection completes");
+            project_resource_spans(&request, None, usize::MAX).expect("projection completes");
 
         assert_eq!(outcome.accepted_spans, 0);
         assert_eq!(outcome.rejected_spans, 1);

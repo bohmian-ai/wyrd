@@ -1,7 +1,9 @@
 //! Wyrd-owned request body size limiter.
 //!
 //! Returns `WyrdError::PayloadTooLarge` rendered as `application/problem+json`
-//! when the body exceeds `max_bytes`. Uses bounded buffering: `to_bytes` reads
+//! when the body exceeds `max_bytes`. Audio transcription and translation
+//! uploads pass through unbuffered: their handlers stream them under
+//! `limits.audio_upload_bytes`. Uses bounded buffering: `to_bytes` reads
 //! the full body into memory up to `max_bytes + 1`; the worst-case process
 //! footprint is `max_bytes * concurrency`.
 
@@ -88,6 +90,13 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
+        if matches!(
+            request.uri().path(),
+            "/v1/audio/transcriptions" | "/v1/audio/translations"
+        ) {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move { inner.call(request).await.map_err(Into::into) });
+        }
         let scribe_route = matches!(
             request.uri().path(),
             "/v1/traces" | "/v1/metrics" | "/v1/logs"
@@ -203,7 +212,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tower::{ServiceBuilder, ServiceExt, service_fn};
     use vala_bifrost_redux::gate::limits::{
-        BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES, BifrostTransportAdmission,
+        BIFROST_INGEST_REQUEST_LIMIT_BYTES, BifrostTransportAdmission,
     };
 
     /// Server edge and tonic peers can share the same exact transport owner.
@@ -216,12 +225,12 @@ mod tests {
         let admission = BifrostTransportAdmission::for_tests();
         let layer = wyrd_body_limit(
             1024,
-            Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+            Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
             Some(admission.clone()),
         );
         assert_eq!(layer.max_bytes, 1024);
         let first = admission
-            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("first maximum message");
         let second = admission
             .try_acquire_unknown()
@@ -240,17 +249,17 @@ mod tests {
     async fn bifrost_transport_admission_pessimistically_rejects_unknown_http2_body() {
         let admission = BifrostTransportAdmission::for_tests();
         let first = admission
-            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("first maximum message");
         let second = admission
-            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("exact aggregate boundary");
         let invoked = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&invoked);
         let service = ServiceBuilder::new()
             .layer(wyrd_body_limit(
                 1024,
-                Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+                Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
                 Some(admission.clone()),
             ))
             .service(service_fn(move |_request: Request<Body>| {
@@ -270,7 +279,7 @@ mod tests {
         assert!(!invoked.load(Ordering::Acquire));
         assert_eq!(
             admission.used_bytes(),
-            2 * BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
+            2 * BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
         drop((first, second));
     }
@@ -285,7 +294,7 @@ mod tests {
         let service = ServiceBuilder::new()
             .layer(wyrd_body_limit(
                 16,
-                Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+                Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
                 Some(admission),
             ))
             .service(service_fn(move |_request: Request<Body>| {
@@ -316,5 +325,37 @@ mod tests {
             axum::http::StatusCode::PAYLOAD_TOO_LARGE
         );
         assert!(invoked.load(Ordering::Acquire));
+    }
+
+    /// Audio transcription and translation uploads reach their handler
+    /// unbuffered past the general limit, which still refuses every other
+    /// route, including Audio speech.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a request is refused or admitted differently.
+    #[tokio::test]
+    async fn audio_uploads_pass_the_body_limit_unbuffered() {
+        let service = ServiceBuilder::new()
+            .layer(wyrd_body_limit(16, None, None))
+            .service(service_fn(|_request: Request<Body>| async {
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }));
+        for (path, status) in [
+            ("/v1/audio/transcriptions", axum::http::StatusCode::OK),
+            ("/v1/audio/translations", axum::http::StatusCode::OK),
+            (
+                "/v1/audio/speech",
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let request = Request::builder()
+                .uri(path)
+                .header(axum::http::header::CONTENT_LENGTH, "17")
+                .body(Body::from(vec![0_u8; 17]))
+                .expect("request");
+            let response = service.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), status, "{path}");
+        }
     }
 }

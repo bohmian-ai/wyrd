@@ -236,6 +236,27 @@ fn bifrost_error_from_code(
         "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH" => BifrostError::FingerprintMismatch {
             table: table_from_message("schema fingerprint mismatch: "),
         },
+        "WYRD_VALA_400_SCHEMA_PARSE" => BifrostError::SchemaParse {
+            detail: message
+                .strip_prefix("schema parse failed: ")
+                .unwrap_or(message)
+                .to_owned(),
+        },
+        "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH" => {
+            BifrostError::CompactionTargetMismatch {
+                table: table_from_message("compaction target mismatch for table: "),
+            }
+        }
+        "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET" => {
+            let (bytes, table) = message
+                .strip_prefix("invalid compaction target file size ")
+                .and_then(|rest| rest.split_once(" for table "))
+                .unwrap_or_default();
+            BifrostError::InvalidCompactionTarget {
+                table: table.to_owned(),
+                bytes: bytes.parse().unwrap_or_default(),
+            }
+        }
         "WYRD_VALA_400_QUERY_INVALID_SQL" => BifrostError::QueryInvalidSql {
             detail: message
                 .strip_prefix("invalid or unsupported query SQL: ")
@@ -260,6 +281,7 @@ fn bifrost_error_from_code(
                 .to_owned(),
         },
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
+        "WYRD_VALA_429_QUERY_QUEUE_FULL" => BifrostError::QueryQueueFull,
         "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE" => BifrostError::QueryMemoryRequestTooLarge,
         "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => BifrostError::QueryExecutionFailed,
         // Every remaining closed query terminal. Without these a caller cannot
@@ -418,6 +440,37 @@ mod tests {
             "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
         );
 
+        let target_conflict = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH",
+            "detail": "compaction target mismatch for table: vala.datasets.events",
+            "details": {},
+        }));
+        assert_eq!(target_conflict.status(), 409);
+        assert_eq!(
+            target_conflict.code(),
+            "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH"
+        );
+
+        let schema = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_400_SCHEMA_PARSE",
+            "detail": "schema parse failed: too many leaves",
+            "details": {},
+        }));
+        assert_eq!(schema.status(), 400);
+        assert_eq!(schema.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+        assert_eq!(schema.to_string(), "schema parse failed: too many leaves");
+
+        let invalid_target = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET",
+            "detail": "invalid compaction target file size 1 for table vala.datasets.events",
+            "details": {},
+        }));
+        assert_eq!(invalid_target.status(), 400);
+        assert_eq!(
+            invalid_target.to_string(),
+            "invalid compaction target file size 1 for table vala.datasets.events"
+        );
+
         let invalid_sql = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_400_QUERY_INVALID_SQL",
             "detail": "invalid or unsupported query SQL: parser rejected SELECT FROM",
@@ -433,6 +486,14 @@ mod tests {
         }));
         assert_eq!(admission.status(), 429);
         assert_eq!(admission.code(), "WYRD_VALA_429_QUERY_ADMISSION_REJECTED");
+
+        let queue_full = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_429_QUERY_QUEUE_FULL",
+            "detail": "query queue full",
+            "details": {},
+        }));
+        assert_eq!(queue_full.status(), 429);
+        assert_eq!(queue_full.code(), "WYRD_VALA_429_QUERY_QUEUE_FULL");
 
         let oversized = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
@@ -602,6 +663,11 @@ mod tests {
             for (code, status, grpc_code) in [
                 (
                     "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+                    429,
+                    Code::ResourceExhausted,
+                ),
+                (
+                    "WYRD_VALA_429_QUERY_QUEUE_FULL",
                     429,
                     Code::ResourceExhausted,
                 ),

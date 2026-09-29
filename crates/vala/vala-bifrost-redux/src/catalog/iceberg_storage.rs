@@ -924,7 +924,7 @@ const READ_ONLY_QUERY_STORAGE: &str =
 /// is well formed, but this process no longer holds the authority that made
 /// reading it safe, and Iceberg must not retry that at its own layer the way it
 /// retries `Unexpected`.
-fn permit_error(error: &wyrd_spec::vala::BifrostError) -> IcebergError {
+pub(crate) fn permit_error(error: &wyrd_spec::vala::BifrostError) -> IcebergError {
     IcebergError::new(IcebergErrorKind::FeatureUnsupported, error.to_string())
 }
 

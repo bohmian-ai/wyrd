@@ -38,9 +38,15 @@ impl OraclePlanner {
 
     /// Validates one non-empty, single-statement `SELECT` request.
     ///
+    /// Validation already parses the statement, so it returns the distinct
+    /// canonical table references that parse produced.
+    ///
     /// # Errors
     /// Returns [`BifrostError::QueryInvalidSql`] for floor violations.
-    pub fn validate_query(&self, request: &BifrostQueryRequest) -> Result<(), BifrostError> {
+    pub fn validate_query(
+        &self,
+        request: &BifrostQueryRequest,
+    ) -> Result<Vec<TableRef>, BifrostError> {
         request
             .validate()
             .map_err(|error| BifrostError::QueryInvalidSql {
@@ -51,8 +57,7 @@ impl OraclePlanner {
                 detail: "query exceeds configured SQL byte limit".to_owned(),
             });
         }
-        parse_select_tables(&request.sql)?;
-        Ok(())
+        parse_select_tables(&request.sql)
     }
 }
 

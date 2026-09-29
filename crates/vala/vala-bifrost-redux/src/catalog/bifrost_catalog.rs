@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema};
-use iceberg::TableCreation;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
+use iceberg::{Catalog as _, TableCreation};
+use iceberg_catalog_sql::SqlCatalog;
 use sha2::{Digest as _, Sha256};
 use vala_sql::queries::file_list::HotFileCatalog;
 use vala_sql::{TenantConn, ValaPostgres};
@@ -245,8 +246,11 @@ pub struct PreparedReaderIdentity {
     pub identifier: iceberg::TableIdent,
     /// Immutable metadata document naming this cut.
     pub metadata: iceberg::spec::TableMetadataRef,
-    /// Location the metadata document was loaded from, when the catalog has one.
-    pub metadata_location: Option<String>,
+    /// Immutable location the metadata document was read from.
+    ///
+    /// Every catalog commit writes a new `<version>-<uuid>.metadata.json` and
+    /// swaps the pointer to it, so this location names exactly one document.
+    pub metadata_location: String,
     /// Current snapshot, or `None` for a table that has never committed.
     pub snapshot_id: Option<i64>,
     /// That snapshot's own recorded commit timestamp in milliseconds.
@@ -288,7 +292,9 @@ fn ancestry_path(
 /// Redux catalog shared by Gate, Forge, Oracle, and server catalog routes.
 #[derive(Clone)]
 pub struct BifrostCatalog {
-    catalog: Arc<dyn iceberg::Catalog>,
+    /// The one Iceberg SQL catalog, held concretely so a reader can recheck
+    /// its authoritative metadata pointer without reloading the document.
+    catalog: Arc<SqlCatalog>,
     postgres: ValaPostgres,
     warehouse: String,
     file_io: FileIO,
@@ -328,6 +334,16 @@ pub fn sealed_pin_count_for_test() -> usize {
 /// from a partial one.
 #[cfg(any(test, feature = "test-support"))]
 static TEST_PREPARED_IDENTITY_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Authoritative metadata-pointer reads observed by one catalog test.
+#[cfg(test)]
+static TEST_METADATA_POINTER_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Reader-identity metadata documents read by one catalog test.
+#[cfg(test)]
+static TEST_METADATA_DOCUMENT_READS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Revalidations still to be failed before the next one is allowed to succeed.
@@ -370,8 +386,9 @@ impl BifrostCatalog {
     /// Resolves only the identity of the cut a reader is about to protect.
     ///
     /// This is deliberately the whole of what may happen before protection: a
-    /// registration lookup, one `load_table`, and the facts derived from the
-    /// metadata document it returns. Reading that document is the allowed
+    /// registration lookup, one authoritative metadata-pointer read, one read of
+    /// the immutable metadata document it names, and the facts derived from
+    /// that document. Reading that document is the allowed
     /// identity step because there is no other way to name the snapshot that
     /// protection has to cover. Nothing here loads a manifest list, enumerates
     /// data files, queries the hot manifest, builds a provider, or opens any
@@ -380,9 +397,9 @@ impl BifrostCatalog {
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the table is not
-    /// registered for this tenant, an invalid-binding error when the tenant and
-    /// table cannot be bound, and a catalog error when the Iceberg metadata
-    /// cannot be loaded.
+    /// registered for this tenant or has no catalog pointer, an invalid-binding
+    /// error when the tenant and table cannot be bound, and a catalog error when
+    /// the pointer or the Iceberg metadata document cannot be read.
     pub async fn prepare_reader_identity(
         &self,
         table: &TableRef,
@@ -402,17 +419,22 @@ impl BifrostCatalog {
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let identifier = binding.table_ident();
         let started = std::time::Instant::now();
-        let loaded = self.catalog.load_table(&identifier).await;
+        let metadata_location = self.metadata_pointer(&identifier).await;
+        crate::oracle::QueryPhase::MetadataPointer.record(started);
+        let metadata_location = metadata_location?;
+        let started = std::time::Instant::now();
+        #[cfg(test)]
+        TEST_METADATA_DOCUMENT_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await;
         crate::oracle::QueryPhase::MetadataLoad.record(started);
-        let loaded = loaded?;
-        let metadata = loaded.metadata_ref();
+        let metadata = Arc::new(metadata?);
         let snapshot = metadata.current_snapshot();
         Ok(PreparedReaderIdentity {
             tenant,
             binding,
             table_uid,
             identifier,
-            metadata_location: loaded.metadata_location().map(ToOwned::to_owned),
+            metadata_location,
             snapshot_id: snapshot.map(|snapshot| snapshot.snapshot_id()),
             snapshot_timestamp_ms: snapshot.map(|snapshot| snapshot.timestamp_ms()),
             ancestry_path: snapshot
@@ -428,19 +450,18 @@ impl BifrostCatalog {
     /// Protection is taken against the metadata document preparation read, and
     /// that document is then reused for the whole cut, so nothing downstream
     /// can notice that the table was promoted in between. This is the one place
-    /// that asks the catalog again: one authoritative `load_table` per prepared
-    /// identifier, compared on both the metadata location and the metadata
-    /// document itself, because a promotion that reuses a location still
-    /// changes the document.
-    ///
-    /// The reloaded table is discarded. It carries the catalog's own ungated
-    /// `FileIO`, and retaining it would put an unpermitted route to this cut's
-    /// objects back into a path that exists to keep them out.
+    /// that asks the catalog again: one authoritative pointer read per prepared
+    /// identifier. The pointer alone is sufficient because the Iceberg SQL
+    /// catalog, the only publication path Wyrd uses, commits by writing a new
+    /// `<version>-<uuid>.metadata.json` and compare-and-swapping the pointer to
+    /// it; no supported writer changes a document in place. An unchanged
+    /// pointer therefore names the same immutable document preparation read.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::MetadataMismatch`] when the authoritative
-    /// metadata location or document differs from the prepared one, and a
-    /// catalog error when the table cannot be loaded at all.
+    /// pointer differs from the prepared one,
+    /// [`BifrostCatalogError::TableNotFound`] when the table's pointer is gone,
+    /// and a catalog error when the pointer cannot be read.
     pub async fn revalidate_reader_identity(
         &self,
         prepared: &PreparedReaderIdentity,
@@ -458,19 +479,35 @@ impl BifrostCatalog {
                 "injected authoritative reader-identity drift".to_owned(),
             ));
         }
-        let loaded = self.catalog.load_table(&prepared.identifier).await?;
-        if loaded.metadata_location() != prepared.metadata_location.as_deref() {
+        if self.metadata_pointer(&prepared.identifier).await? != prepared.metadata_location {
             return Err(BifrostCatalogError::MetadataMismatch(
-                "the authoritative table metadata location moved under the prepared identity"
+                "the authoritative table metadata pointer moved under the prepared identity"
                     .to_owned(),
             ));
         }
-        if *loaded.metadata_ref() != *prepared.metadata {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "the authoritative table metadata changed under the prepared identity".to_owned(),
-            ));
-        }
         Ok(())
+    }
+
+    /// Reads one table's authoritative metadata pointer and nothing else.
+    ///
+    /// The read runs through the Iceberg SQL catalog's own primary connection
+    /// and catalog-owner credential, with the exact catalog, namespace, and
+    /// table predicates. The request role is deliberately denied the catalog
+    /// schema, so this is never issued from a tenant connection.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::TableNotFound`] when the catalog has no
+    /// row for the identifier, and a catalog error when the read fails.
+    async fn metadata_pointer(
+        &self,
+        identifier: &iceberg::TableIdent,
+    ) -> Result<String, BifrostCatalogError> {
+        #[cfg(test)]
+        TEST_METADATA_POINTER_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.catalog
+            .load_metadata_location(identifier)
+            .await?
+            .ok_or_else(|| BifrostCatalogError::TableNotFound(identifier.to_string()))
     }
 
     /// Materializes the pinned cut through storage gated by one reader permit.
@@ -506,7 +543,7 @@ impl BifrostCatalog {
         let gated = self.permit_scoped_table(
             &prepared.identifier,
             prepared.metadata.clone(),
-            prepared.metadata_location.clone(),
+            Some(prepared.metadata_location.clone()),
             permit,
         )?;
         let (iceberg_table, pinned, cut) = self
@@ -849,7 +886,7 @@ impl BifrostCatalog {
     /// Borrow the exact Iceberg catalog used by Redux physical table registration.
     #[must_use]
     pub fn iceberg_catalog(&self) -> Arc<dyn iceberg::Catalog> {
-        Arc::clone(&self.catalog)
+        Arc::clone(&self.catalog) as Arc<dyn iceberg::Catalog>
     }
 
     /// Clones the exact storage adapter used by Redux Iceberg tables.
@@ -2116,6 +2153,82 @@ mod production_pin_tests {
                 .expect("fixture data file builds")
         });
         data_files.collect()
+    }
+
+    /// One stable protected cut reads the immutable metadata document once.
+    ///
+    /// Preparation reads the authoritative pointer and the document it names;
+    /// the post-protection recheck reads only the pointer again; and
+    /// materialization reuses the prepared document. The pointer is read
+    /// through the catalog-owner credential, while the request role's tenant
+    /// connection is still refused the catalog schema outright.
+    ///
+    /// # Panics
+    /// Panics when the fixture, registration, or cut fails, when the cut reads
+    /// the document or the pointer a different number of times, or when the
+    /// request role can read the catalog table.
+    #[test]
+    fn protected_cut_reuses_immutable_metadata() {
+        use std::sync::atomic::Ordering::SeqCst;
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                local_storage_owner(warehouse.path()),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+            let tenant = fixture.data_tenant_id();
+            let table = TableRef::new(BifrostNamespace::Datasets, "immutable_metadata");
+            catalog
+                .register_dataset(
+                    tenant,
+                    table.clone(),
+                    vec![arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("dataset registers");
+
+            super::TEST_METADATA_POINTER_READS.store(0, SeqCst);
+            super::TEST_METADATA_DOCUMENT_READS.store(0, SeqCst);
+            let permit = crate::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
+            let prepared = catalog
+                .prepare_reader_identity(&table, tenant)
+                .await
+                .expect("the registered table prepares");
+            catalog
+                .revalidate_reader_identity(&prepared)
+                .await
+                .expect("an unchanged pointer revalidates");
+            catalog
+                .materialize_reader_cut(prepared, &permit)
+                .await
+                .expect("the cut materializes");
+            assert_eq!(super::TEST_METADATA_POINTER_READS.load(SeqCst), 2);
+            assert_eq!(super::TEST_METADATA_DOCUMENT_READS.load(SeqCst), 1);
+
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            let denied =
+                sqlx::query("SELECT metadata_location FROM iceberg_catalog.iceberg_tables")
+                    .execute(&mut **conn.transaction())
+                    .await
+                    .expect_err("the request role cannot read the catalog pointer");
+            assert!(
+                denied.to_string().contains("permission denied"),
+                "the request role is refused by privilege, not by absence: {denied}"
+            );
+        });
     }
 
     /// A pinned provider resolves only against the snapshot it names.

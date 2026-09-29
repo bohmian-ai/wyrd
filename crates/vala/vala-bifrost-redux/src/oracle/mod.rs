@@ -468,11 +468,13 @@ pub(crate) enum QueryPhase {
     SnapshotPin,
     /// Looking up one table's registered identity row in Postgres.
     TableLookup,
-    /// Loading one table's current Iceberg metadata from the catalog.
+    /// Reading one table's authoritative metadata pointer from the catalog.
+    MetadataPointer,
+    /// Reading one table's immutable Iceberg metadata document from storage.
     MetadataLoad,
     /// Acquiring the reader guard that protects the prepared tables.
     ReaderGuard,
-    /// Re-reading one table's authoritative metadata after protection.
+    /// Re-reading one table's authoritative metadata pointer after protection.
     Revalidation,
     /// Listing one pinned Iceberg snapshot's data files.
     ManifestScan,
@@ -506,6 +508,7 @@ impl QueryPhase {
         match self {
             Self::SnapshotPin => "snapshot_pin",
             Self::TableLookup => "table_lookup",
+            Self::MetadataPointer => "metadata_pointer",
             Self::MetadataLoad => "metadata_load",
             Self::ReaderGuard => "reader_guard",
             Self::Revalidation => "revalidation",
@@ -1218,7 +1221,7 @@ pub struct OracleBuildConfig {
 /// Total query deadline when a caller supplies no `deadline_ms`.
 ///
 /// It covers planning, queueing, and execution for both query classes.
-pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(7_200);
+pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_hours(2);
 
 /// Local Oracle limits and bounded lifecycle settings.
 #[derive(Debug, Clone, Copy)]
@@ -1407,8 +1410,6 @@ struct SqlAttemptInput<'a> {
     context: &'a AuthorizedQueryContext,
     /// Original validated query request.
     request: &'a BifrostQueryRequest,
-    /// Tables parsed from the validated SQL statement.
-    tables: &'a [TableRef],
     /// Absolute whole-query deadline.
     deadline: Instant,
     /// Class-neutral membership frozen before any class existed.
@@ -1418,7 +1419,7 @@ struct SqlAttemptInput<'a> {
     /// refresh can occur between the class and the cut it is signed into.
     roster: participant_cut::OracleQueryAttemptRoster,
     /// Catalog snapshot already pinned in this process for this attempt.
-    prepared: Option<PlannedSqlCut>,
+    prepared: PlannedSqlCut,
     /// Inactive Analytical attempt identity, present only on the harness entry.
     analytical: Option<&'a analytical::AnalyticalAttemptContext>,
 }
@@ -1429,14 +1430,12 @@ struct ClassifyInput<'a> {
     context: &'a AuthorizedQueryContext,
     /// Original validated query request.
     request: &'a BifrostQueryRequest,
-    /// Tables parsed from the validated SQL statement.
-    tables: &'a [TableRef],
     /// Absolute whole-query deadline.
     deadline: Instant,
     /// Class-neutral membership frozen before any class existed.
     roster: participant_cut::OracleQueryAttemptRoster,
     /// Catalog snapshot already pinned in this process for this attempt.
-    prepared: Option<PlannedSqlCut>,
+    prepared: PlannedSqlCut,
     /// Inactive Analytical attempt identity, present only on the harness entry.
     analytical: Option<&'a analytical::AnalyticalAttemptContext>,
     /// Telemetry slot opened once the class is known.
@@ -2046,10 +2045,16 @@ impl Oracle {
 
     /// Validates the query floor before any asynchronous metadata operation.
     ///
+    /// Returns the statement's distinct canonical table references, parsed
+    /// once here so no later step of the attempt parses the SQL again.
+    ///
     /// # Errors
     /// Returns a stable public query error when the SQL is empty, oversized, or
     /// contains more than one statement or a non-`SELECT` leading keyword.
-    pub fn validate_query(&self, request: &BifrostQueryRequest) -> Result<(), BifrostError> {
+    pub fn validate_query(
+        &self,
+        request: &BifrostQueryRequest,
+    ) -> Result<Vec<TableRef>, BifrostError> {
         self.planner.validate_query(request)
     }
 
@@ -2108,7 +2113,7 @@ impl Oracle {
         let (roster, planned) = self
             .prepare_query_attempt(&context, &request, absolute_deadline_ms)
             .await?;
-        self.run_sql_query(context, request, roster, Some(planned), None)
+        self.run_sql_query(context, request, roster, planned, None)
             .await
     }
 
@@ -2156,7 +2161,7 @@ impl Oracle {
         let (roster, planned) = self
             .prepare_query_attempt(&context, &request, deadline_ms)
             .await?;
-        self.run_sql_query(context, request, roster, Some(planned), Some(attempt))
+        self.run_sql_query(context, request, roster, planned, Some(attempt))
             .await
     }
 
@@ -2311,7 +2316,7 @@ impl Oracle {
         request: &BifrostQueryRequest,
         absolute_deadline_ms: i64,
     ) -> Result<(participant_cut::OracleQueryAttemptRoster, PlannedSqlCut), BifrostError> {
-        self.validate_query(request)?;
+        let tables = self.validate_query(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
@@ -2328,7 +2333,6 @@ impl Oracle {
             .checked_add(duration)
             .ok_or(BifrostError::QueryTimeout)?;
         let snapshot = self.cluster.snapshot();
-        let tables = parse_select_tables(&request.sql)?;
         let pin_started = Instant::now();
         let planned = self
             .planner
@@ -2432,10 +2436,9 @@ impl Oracle {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
         roster: participant_cut::OracleQueryAttemptRoster,
-        prepared: Option<PlannedSqlCut>,
+        prepared: PlannedSqlCut,
         analytical: Option<analytical::AnalyticalAttemptContext>,
     ) -> Result<OracleQueryStream, BifrostError> {
-        self.validate_query(&request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
@@ -2453,7 +2456,6 @@ impl Oracle {
         let deadline = Instant::now()
             .checked_add(remaining)
             .ok_or(BifrostError::QueryTimeout)?;
-        let tables = parse_select_tables(&request.sql)?;
         // Phase timing at DEBUG: `oracle_query_duration_seconds` reports only a
         // total, which cannot separate a slow catalog pin from a slow fan-out.
         // This is the leader entry every public query passes through, so it is
@@ -2465,7 +2467,6 @@ impl Oracle {
                 SqlAttemptInput {
                     context: &context,
                     request: &request,
-                    tables: &tables,
                     deadline,
                     roster,
                     prepared,
@@ -2617,17 +2618,12 @@ impl Oracle {
         let ClassifyInput {
             context,
             request,
-            tables,
             deadline,
             mut roster,
-            prepared,
+            prepared: planned,
             analytical,
             query_telemetry,
         } = input;
-        let planned = match prepared {
-            Some(planned) => planned,
-            None => self.plan_sql_attempt(context, tables, deadline).await?,
-        };
         let work_units = Self::scannable_work_units(&planned.cuts);
         let retained = self
             .build_physical_root(
@@ -2716,7 +2712,6 @@ impl Oracle {
         let SqlAttemptInput {
             context,
             request,
-            tables,
             deadline,
             roster,
             prepared,
@@ -2733,7 +2728,6 @@ impl Oracle {
             .classify_one_build(ClassifyInput {
                 context,
                 request,
-                tables,
                 deadline,
                 roster,
                 prepared,
@@ -3128,27 +3122,6 @@ impl Oracle {
             )
             .await?;
         Ok(admitted)
-    }
-
-    async fn plan_sql_attempt(
-        &self,
-        context: &AuthorizedQueryContext,
-        tables: &[TableRef],
-        deadline: Instant,
-    ) -> Result<PlannedSqlCut, BifrostError> {
-        let started = Instant::now();
-        let planned = self
-            .planner
-            .pin_cut(
-                context,
-                tables,
-                deadline,
-                &self.catalog,
-                Some(&self.reader_authority),
-            )
-            .await?;
-        QueryPhase::SnapshotPin.record(started);
-        Ok(planned)
     }
 
     /// Borrows this node's process-global reader epoch authority.

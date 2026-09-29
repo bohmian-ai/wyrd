@@ -1940,21 +1940,163 @@ async fn object_denial_precedes_reader_guard_and_materialization() {
         .expect("the epoch retires");
 }
 
-/// Proves catalog promotion under a prepared reader identity is detected and
-/// restarts the complete admission rather than materializing a stale cut.
+/// Waits until one backend is queued on a held maintenance-authority row.
 ///
-/// Protection is taken against the metadata document preparation read, so a
-/// promotion in between leaves a guard that covers a snapshot the query is no
-/// longer going to read. The authoritative reload is what notices, and the
-/// answer is a complete restart: the guard is dropped and every table is
-/// prepared, protected, revalidated, and materialized again. A second drift is
-/// reported rather than chased.
+/// Reader protection locks this row before it widens, so a waiter here is
+/// direct evidence that a prepared attempt is parked before its guard exists.
+/// The waiter is paired with its own granted relation lock, as in
+/// [`AuthorityFixture::settle_blocked_epoch_delete`], so it names this
+/// relation rather than any blocked statement in the cluster.
 ///
 /// # Panics
 ///
-/// Panics when a real promotion is not detected, when the restart does not
-/// re-prepare and materialize the complete set, or when a second drift does not
-/// surface as a typed metadata mismatch.
+/// Panics when no waiter appears within [`SETTLE_BUDGET`].
+async fn await_maintenance_authority_waiter(pool: &sqlx::PgPool) {
+    let deadline = tokio::time::Instant::now() + SETTLE_BUDGET;
+    loop {
+        let waiters: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks AS waiting \
+               JOIN pg_locks AS held ON held.pid = waiting.pid \
+              WHERE NOT waiting.granted \
+                AND waiting.locktype IN ('tuple', 'transactionid') \
+                AND held.granted \
+                AND held.locktype = 'relation' \
+                AND held.database = (SELECT oid FROM pg_database \
+                                      WHERE datname = current_database()) \
+                AND held.relation = 'vala.bifrost_table_maintenance_authority'::regclass",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("maintenance-authority waiters counted");
+        if waiters > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reader protection never waited on the maintenance-authority row"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Proves a real promotion between preparation and protection restarts the
+/// complete cut.
+///
+/// Reader protection must lock the table's maintenance-authority row to widen,
+/// so holding that row parks the production attempt after preparation and
+/// before its guard exists. A real catalog commit moves the metadata pointer in
+/// that window; once the row is released, the attempt's pointer recheck must
+/// drop the guard and prepare, protect, recheck, and materialize every table
+/// again.
+///
+/// # Panics
+///
+/// Panics when the attempt never parks at protection, when the promotion is
+/// not detected, or when the restart does not re-prepare and materialize the
+/// complete set exactly once.
+#[tokio::test]
+async fn promotion_between_prepare_and_guard_restarts_whole_cut() {
+    let fixture = forge_support::PromotionIntegrationFixture::start("reader_prepare_race").await;
+    // A committed snapshot is what protection has to cover.
+    commit_one_snapshot(&fixture).await;
+    let (authority, _node, _fence) = oracle_epoch(&fixture, "http://oracle-race:5002", 1).await;
+    let pool = fixture
+        .database
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let mut blocker = pool.begin().await.expect("blocker opens");
+    sqlx::query(
+        "SELECT 1 FROM vala.bifrost_table_maintenance_authority \
+          WHERE data_tenant_id = $1 FOR UPDATE",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .execute(&mut *blocker)
+    .await
+    .expect("maintenance-authority row locks");
+
+    let tables = vec![fixture.binding.table_ref.clone()];
+    vala_bifrost_redux::catalog::reset_prepared_identity_count_for_test();
+    vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
+    let attempt = {
+        let catalog = Arc::clone(&fixture.catalog);
+        let authority = Arc::clone(&authority);
+        let tables = tables.clone();
+        let context = granted_context(fixture.tenant);
+        tokio::spawn(async move {
+            vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
+                &tables,
+                &context,
+                std::time::Instant::now() + Duration::from_secs(30),
+                &catalog,
+                &authority,
+            )
+            .await
+        })
+    };
+    await_maintenance_authority_waiter(&pool).await;
+    assert_eq!(
+        vala_bifrost_redux::catalog::prepared_identity_count_for_test(),
+        tables.len(),
+        "the attempt is parked after exactly one preparation"
+    );
+
+    // A real catalog commit writes a new metadata document and moves the
+    // pointer while the prepared attempt waits for its guard.
+    let physical = fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("physical table loads");
+    let transaction = iceberg::transaction::Transaction::new(&physical);
+    let action = transaction
+        .update_table_properties()
+        .set("wyrd.test.promotion".to_owned(), "moved".to_owned());
+    iceberg::transaction::ApplyTransactionAction::apply(action, transaction)
+        .expect("property update applies")
+        .commit(fixture.catalog.iceberg_catalog().as_ref())
+        .await
+        .expect("the pointer-moving commit lands");
+    blocker.rollback().await.expect("blocker releases");
+
+    let materialized = attempt
+        .await
+        .expect("attempt task joins")
+        .expect("the restarted attempt materializes the complete set");
+    assert_eq!(materialized, tables.len());
+    assert_eq!(
+        vala_bifrost_redux::catalog::prepared_identity_count_for_test(),
+        tables.len() * 2,
+        "the restart re-prepares every table, not only the one that drifted"
+    );
+    assert_eq!(
+        vala_bifrost_redux::catalog::sealed_pin_count_for_test(),
+        tables.len(),
+        "nothing is materialized under the guard the promotion discarded"
+    );
+
+    authority
+        .retire(retirement_deadline())
+        .await
+        .expect("the epoch retires");
+}
+
+/// Proves catalog promotion under a prepared reader identity is detected, and
+/// that a second drift under one query is reported rather than chased.
+///
+/// Protection is taken against the metadata document preparation read, so a
+/// promotion in between leaves a guard that covers a snapshot the query is no
+/// longer going to read. The authoritative pointer recheck is what notices.
+/// [`promotion_between_prepare_and_guard_restarts_whole_cut`] proves the
+/// single restart against a real promotion; two promotions inside one query's
+/// two attempts are not schedulable from outside, so the refusal case injects
+/// its drift.
+///
+/// # Panics
+///
+/// Panics when a real promotion is not detected, or when a second drift does
+/// not surface as a typed metadata mismatch after exactly one restart.
 #[tokio::test]
 async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables() {
     let fixture = forge_support::PromotionIntegrationFixture::start("reader_revalidate").await;
@@ -1997,41 +2139,8 @@ async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables()
         .await
         .expect("a freshly prepared identity revalidates");
 
-    // Driving the production sequence with one drift must restart it whole:
-    // every table prepared again, and none materialized under the guard that
-    // was dropped.
-    let tables = vec![fixture.binding.table_ref.clone()];
-    vala_bifrost_redux::catalog::reset_prepared_identity_count_for_test();
-    vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
-    vala_bifrost_redux::catalog::inject_revalidation_faults_for_test(1);
-    let materialized =
-        vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
-            &tables,
-            &granted_context(fixture.tenant),
-            std::time::Instant::now() + Duration::from_secs(30),
-            &fixture.catalog,
-            &authority,
-        )
-        .await
-        .expect("the restarted attempt materializes the complete set");
-    assert_eq!(materialized, tables.len());
-    assert_eq!(
-        vala_bifrost_redux::catalog::pending_revalidation_faults_for_test(),
-        0,
-        "the first attempt consumed the injected drift"
-    );
-    assert_eq!(
-        vala_bifrost_redux::catalog::prepared_identity_count_for_test(),
-        tables.len() * 2,
-        "the restart re-prepares every table, not only the one that drifted"
-    );
-    assert_eq!(
-        vala_bifrost_redux::catalog::sealed_pin_count_for_test(),
-        tables.len(),
-        "nothing is materialized under the guard the drift discarded"
-    );
-
     // A second drift is a typed failure, not a third attempt.
+    let tables = vec![fixture.binding.table_ref.clone()];
     vala_bifrost_redux::catalog::reset_prepared_identity_count_for_test();
     vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
     vala_bifrost_redux::catalog::inject_revalidation_faults_for_test(2);

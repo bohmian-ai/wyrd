@@ -246,6 +246,17 @@ pub enum ControlRequest {
     AwaitExecutePaused,
     /// Release the held `ExecuteTask` so its graph may finish or fail.
     ReleaseExecutePause,
+    /// Arm this child's one-shot Scribe live-production pause.
+    ///
+    /// The pause is process-global inside the Scribe, so a journey whose live
+    /// source runs on another process can only hold it through this request.
+    ArmLiveProductionPause,
+    /// Block until a live producer on this child is stopped at that pause.
+    AwaitLiveProductionPaused,
+    /// Release the paused live producer and disarm the pause.
+    ReleaseLiveProductionPause,
+    /// Report what this child's Scribe still holds for open live reads.
+    LiveScribeHolds,
     /// Arm one exact public request at the Oracle post-pin preparation seam.
     ArmPreparationPause {
         /// Public request whose verified deadline is observed by the child.
@@ -503,6 +514,13 @@ pub enum ControlResponse {
     BodyPolls {
         /// Request bodies this child's peer plane has polled since start.
         count: u64,
+    },
+    /// Answer to [`ControlRequest::LiveScribeHolds`].
+    LiveScribeHolds {
+        /// Live producers, with their snapshot references, still open here.
+        open_producers: usize,
+        /// Bytes the Scribe role holds at the shared root, follower leases included.
+        memory_used_bytes: usize,
     },
     /// Answer to [`ControlRequest::ScribeFragments`].
     ScribeFragments {
@@ -1808,6 +1826,64 @@ impl ProcessNode {
         self.require(&ControlRequest::ReleaseExecutePause, |response| {
             matches!(response, ControlResponse::PauseReleased)
         })
+    }
+
+    /// Arms this child's one-shot Scribe live-production pause.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`].
+    pub fn arm_live_production_pause(&mut self) -> Result<(), ProcessClusterError> {
+        self.require(&ControlRequest::ArmLiveProductionPause, |response| {
+            matches!(response, ControlResponse::PauseArmed)
+        })
+    }
+
+    /// Blocks until a live producer on this child is stopped at that pause.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when no producer pauses within the
+    /// child's statement deadline.
+    pub fn await_live_production_paused(&mut self) -> Result<(), ProcessClusterError> {
+        self.require(&ControlRequest::AwaitLiveProductionPaused, |response| {
+            matches!(response, ControlResponse::ExecutePaused)
+        })
+    }
+
+    /// Releases the paused live producer and disarms the pause.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`].
+    pub fn release_live_production_pause(&mut self) -> Result<(), ProcessClusterError> {
+        self.require(&ControlRequest::ReleaseLiveProductionPause, |response| {
+            matches!(response, ControlResponse::PauseReleased)
+        })
+    }
+
+    /// Reads this child's open live producers and Scribe root memory.
+    ///
+    /// A remote live read holds one producer and one follower lease on the
+    /// Scribe that serves it; both returning to their baseline is the only
+    /// proof, from outside that process, that the read was released.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when this target composes no Scribe.
+    pub fn live_scribe_holds(&mut self) -> Result<(usize, usize), ProcessClusterError> {
+        match self.request(&ControlRequest::LiveScribeHolds)? {
+            ControlResponse::LiveScribeHolds {
+                open_producers,
+                memory_used_bytes,
+            } => Ok((open_producers, memory_used_bytes)),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected live Scribe holds, received {other:?}"
+            ))),
+        }
     }
 
     /// Starts one statement in this child's single active inactive-query slot.

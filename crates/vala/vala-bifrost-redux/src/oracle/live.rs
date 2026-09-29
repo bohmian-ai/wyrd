@@ -518,8 +518,13 @@ impl LiveFragmentRead {
                     () = grant.cancellation.cancelled() => Err(DataFusionError::Execution(
                         "Oracle query was cancelled during a live Scribe read".to_owned(),
                     )),
-                    () = tokio::time::sleep(remaining(grant.deadline)) => Err(DataFusionError::Execution(
+                    // Typed, so the terminal reports a timeout whichever of
+                    // this timer and the leader's own deadline fires first.
+                    () = tokio::time::sleep(remaining(grant.deadline)) => Err(DataFusionError::Context(
                         "Oracle query deadline elapsed during a live Scribe read".to_owned(),
+                        Box::new(DataFusionError::External(Box::new(
+                            wyrd_spec::vala::error::BifrostError::QueryTimeout,
+                        ))),
                     )),
                     frame = frames.next() => Ok(frame),
                 };

@@ -1217,3 +1217,238 @@ async fn public_query(
         .ok_or("the canonical readback produced no terminal frame")?;
     Ok(rows)
 }
+
+/// Oracle pods of the remote live-read journey.
+const LIVE_ORACLES: [usize; 3] = [0, 1, 2];
+
+/// Deadline of the live reads that must outlive their pause.
+const LIVE_OPEN_DEADLINE_MS: i64 = 120_000;
+
+/// Deadline of the live read the leader must end while Scribe is paused.
+const LIVE_SHORT_DEADLINE_MS: i64 = 5_000;
+
+/// Stable code of a query the leader ended at its deadline.
+const QUERY_TIMEOUT_CODE: &str = "WYRD_VALA_504_QUERY_TIMEOUT";
+
+/// Bound on waiting for a remote live read to release every hold.
+const LIVE_RELEASE_POLLS: usize = 300;
+
+/// A live read served by a Scribe on another process is owned by its query.
+///
+/// Rows are left live on the Scribe pod, so the only source is a remote live
+/// fragment over the peer plane. With that Scribe's producer paused after its
+/// first batch, three endings are driven in turn: the client drops its
+/// stream, the leader's deadline expires, and the Scribe process dies after
+/// rows reached the client. Each ending must release the remote producer and
+/// follower lease and every Oracle admission; the deadline ending carries the
+/// typed timeout, and the lost Scribe yields one failed terminal, never a
+/// successful partial result.
+///
+/// # Panics
+///
+/// Panics when any ending leaves a hold behind or reports the wrong terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn remote_live_scribe_drop_releases_query() {
+    prove_remote_live_scribe_release()
+        .await
+        .expect("remote live Scribe journey");
+}
+
+/// Drives the three remote live-read endings over one process topology.
+///
+/// # Errors
+///
+/// Returns the first ending whose release or terminal broke the contract.
+async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
+    let mut cluster = BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+    let api_key = cluster
+        .provision_public_api_key("remote-live-reader")
+        .await?;
+    let table = format!("remote_live_{}", uuid::Uuid::now_v7().simple());
+    cluster.nodes_mut()[SCRIBE].register_table(&table)?;
+    // One row per ingest, so the paused producer has a later batch to withhold.
+    for id in 1..=3 {
+        cluster.nodes_mut()[SCRIBE].ingest_live_rows(&table, id, 1, 1)?;
+    }
+    for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+    let (_, baseline) = cluster.nodes_mut()[SCRIBE].live_scribe_holds()?;
+    let client = public_client(&cluster.nodes()[LEADER], &api_key)?;
+    let query = wyrd_client::Bifrost::query_only(&client);
+    let sql = format!("SELECT id FROM vala.bifrost.{table}");
+
+    let case = "client dropped";
+    let stream = open_paused_remote_live(&mut cluster, &query, &sql, LIVE_OPEN_DEADLINE_MS).await?;
+    await_remote_live_held(&mut cluster, baseline, case)?;
+    drop(stream);
+    await_remote_live_released(&mut cluster, baseline, case).await?;
+    cluster.nodes_mut()[SCRIBE].release_live_production_pause()?;
+
+    let case = "leader deadline";
+    let mut stream =
+        open_paused_remote_live(&mut cluster, &query, &sql, LIVE_SHORT_DEADLINE_MS).await?;
+    await_remote_live_held(&mut cluster, baseline, case)?;
+    let failure = loop {
+        match stream.next_batch().await {
+            Ok(Some(_)) => {}
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    let failure =
+        failure.ok_or_else(|| format!("{case}: the read ended {:?}", stream.terminal()))?;
+    let code = wyrd_spec::error::WyrdError::from(&failure).code();
+    if code != QUERY_TIMEOUT_CODE {
+        return Err(format!(
+            "{case}: the read failed with {code}: {failure}; terminal {:?}",
+            stream.terminal()
+        )
+        .into());
+    }
+    await_remote_live_released(&mut cluster, baseline, case).await?;
+    cluster.nodes_mut()[SCRIBE].release_live_production_pause()?;
+
+    let case = "remote Scribe lost";
+    let mut stream =
+        open_paused_remote_live(&mut cluster, &query, &sql, LIVE_OPEN_DEADLINE_MS).await?;
+    await_remote_live_held(&mut cluster, baseline, case)?;
+    let first = tokio::time::timeout(CLEAN_LEASE_INTERVAL * 100, stream.next_batch())
+        .await
+        .map_err(|_| format!("{case}: the first live batch never reached the client"))?
+        .map_err(|error| format!("{case}: the first live batch failed: {error}"))?
+        .ok_or_else(|| format!("{case}: the read ended before its first batch"))?;
+    let mut rows = first.num_rows();
+    let killed = cluster.nodes()[SCRIBE].label().to_owned();
+    cluster.nodes_mut()[SCRIBE].kill()?;
+    let failure = loop {
+        match stream.next_batch().await {
+            Ok(Some(batch)) => rows += batch.num_rows(),
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    if failure.is_none() || rows >= 3 {
+        return Err(format!(
+            "{case}: a lost Scribe must end the read failed after {rows} rows, ended {:?}",
+            stream.terminal()
+        )
+        .into());
+    }
+    await_oracles_released(&mut cluster, case).await?;
+    match cluster.shutdown() {
+        Err(reported) if reported.to_string().contains(&killed) => Ok(()),
+        other => Err(format!("shutdown after killing {killed} reported {other:?}").into()),
+    }
+}
+
+/// Arms the Scribe pause, then opens one public live read on the leader.
+///
+/// # Errors
+///
+/// Returns the Scribe control failure or the query's open refusal.
+async fn open_paused_remote_live(
+    cluster: &mut BifrostProcessCluster,
+    query: &wyrd_client::Bifrost,
+    sql: &str,
+    deadline_ms: i64,
+) -> Result<wyrd_client::bifrost::QueryResultStream, PeerJourneyError> {
+    cluster.nodes_mut()[SCRIBE].arm_live_production_pause()?;
+    query
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(deadline_ms),
+        })
+        .await
+        .map_err(|error| PeerJourneyError::from(error.to_string()))
+}
+
+/// Proves the remote Scribe is holding one paused producer and its lease.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when the producer never paused or the
+/// Scribe holds anything other than one producer and a follower lease.
+fn await_remote_live_held(
+    cluster: &mut BifrostProcessCluster,
+    baseline: usize,
+    case: &str,
+) -> Result<(), PeerJourneyError> {
+    cluster.nodes_mut()[SCRIBE].await_live_production_paused()?;
+    let (producers, used) = cluster.nodes_mut()[SCRIBE].live_scribe_holds()?;
+    if producers != 1 || !lease_held(used, baseline) {
+        return Err(format!(
+            "{case}: the paused remote read must hold one producer and its lease, \
+             held {producers} producers and {used} bytes over a {baseline}-byte baseline"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Reports whether Scribe root memory still carries a follower lease.
+///
+/// A lease charges a whole partition grant, far above the memtable drift a
+/// few rows cause, so half a grant separates held from released.
+fn lease_held(used: usize, baseline: usize) -> bool {
+    used >= baseline + vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES / 2
+}
+
+/// Waits until the remote Scribe and every Oracle hold nothing for the read.
+///
+/// # Errors
+///
+/// Returns an error naming `case` with the last holds when release never lands.
+async fn await_remote_live_released(
+    cluster: &mut BifrostProcessCluster,
+    baseline: usize,
+    case: &str,
+) -> Result<(), PeerJourneyError> {
+    let mut last = (0, 0);
+    for _ in 0..LIVE_RELEASE_POLLS {
+        last = cluster.nodes_mut()[SCRIBE].live_scribe_holds()?;
+        if last.0 == 0 && !lease_held(last.1, baseline) {
+            return await_oracles_released(cluster, case).await;
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+    }
+    Err(format!("{case}: the remote Scribe still holds (producers, bytes) {last:?}").into())
+}
+
+/// Waits until no Oracle pod admits a query or reserves query memory.
+///
+/// # Errors
+///
+/// Returns an error naming `case` and the pod that still holds admission.
+async fn await_oracles_released(
+    cluster: &mut BifrostProcessCluster,
+    case: &str,
+) -> Result<(), PeerJourneyError> {
+    for index in LIVE_ORACLES {
+        let mut held = (0, 0);
+        for _ in 0..LIVE_RELEASE_POLLS {
+            let snapshot = cluster.nodes_mut()[index].ownership_snapshot()?;
+            held = (snapshot.active_queries, snapshot.reserved_memory_bytes);
+            if held == (0, 0) {
+                break;
+            }
+            tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        }
+        if held != (0, 0) {
+            return Err(
+                format!("{case}: Oracle {index} still holds (queries, bytes) {held:?}").into(),
+            );
+        }
+    }
+    Ok(())
+}

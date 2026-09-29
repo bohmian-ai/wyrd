@@ -1268,11 +1268,16 @@ impl QueryIpcDecoder {
 
 /// Maps a late `DataFusion` failure to the closed terminal-code catalog.
 ///
-/// A typed resource refusal anywhere in the chain is selected structurally
-/// before any message classification.
+/// A typed resource refusal or query deadline anywhere in the chain is
+/// selected structurally before any message classification. The deadline is
+/// typed because a live source enforces the same query deadline as the leader
+/// on its own timer, and whichever fires first must report the same timeout.
 fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTerminalErrorCode {
     if super::datafusion_resources_exhausted(error) {
         return QueryTerminalErrorCode::QueryResourcesExhausted;
+    }
+    if datafusion_query_timeout(error) {
+        return QueryTerminalErrorCode::QueryTimeout;
     }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("tenant invariant") {
@@ -1284,6 +1289,22 @@ fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTermi
     } else {
         QueryTerminalErrorCode::QueryExecutionFailed
     }
+}
+
+/// Reports whether a typed [`BifrostError::QueryTimeout`] sits anywhere in an
+/// execution error chain, including contextual wrappers added by plans.
+fn datafusion_query_timeout(error: &datafusion::error::DataFusionError) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if matches!(
+            current.downcast_ref::<BifrostError>(),
+            Some(BifrostError::QueryTimeout)
+        ) {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 /// Selects the terminal outcome for a stream that observed a failed step.
@@ -1637,6 +1658,27 @@ mod tests {
         assert_eq!(
             super::terminal_error_code(&DataFusionError::Internal("private".to_owned())),
             QueryTerminalErrorCode::QueryExecutionFailed
+        );
+    }
+
+    /// A typed query deadline raised by a live source, under its context
+    /// wrapper, ends the stream as `QueryTimeout` rather than a generic failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the typed deadline is not selected.
+    #[test]
+    fn late_query_deadline_is_typed_terminal() {
+        use datafusion::error::DataFusionError;
+        let wrapped = DataFusionError::Context(
+            "Oracle query deadline elapsed during a live Scribe read".to_owned(),
+            Box::new(DataFusionError::External(Box::new(
+                BifrostError::QueryTimeout,
+            ))),
+        );
+        assert_eq!(
+            super::terminal_error_code(&wrapped),
+            QueryTerminalErrorCode::QueryTimeout
         );
     }
 

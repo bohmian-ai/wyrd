@@ -126,8 +126,9 @@ impl OracleExecutionGrant {
     ///
     /// # Errors
     ///
-    /// Returns a `DataFusion` execution error when the query was cancelled or
-    /// its absolute deadline has elapsed.
+    /// Returns a `DataFusion` execution error when the query was cancelled, and
+    /// a typed [`BifrostError::QueryTimeout`] chain when its absolute deadline
+    /// has elapsed.
     pub(super) fn ensure_live(&self) -> datafusion::error::Result<()> {
         if self.cancellation.is_cancelled() {
             return Err(datafusion::error::DataFusionError::Execution(
@@ -135,8 +136,11 @@ impl OracleExecutionGrant {
             ));
         }
         if self.deadline <= Utc::now() {
-            return Err(datafusion::error::DataFusionError::Execution(
+            return Err(DataFusionError::Context(
                 "Oracle query deadline elapsed before row IO".to_owned(),
+                Box::new(DataFusionError::External(Box::new(
+                    BifrostError::QueryTimeout,
+                ))),
             ));
         }
         Ok(())

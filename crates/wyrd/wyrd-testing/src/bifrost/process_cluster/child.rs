@@ -387,6 +387,36 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: "no execute pause is armed".to_owned(),
                 })?,
             },
+            ControlRequest::ArmLiveProductionPause => {
+                vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test().arm();
+                emit(&ControlResponse::PauseArmed)?;
+            }
+            ControlRequest::AwaitLiveProductionPaused => {
+                let pause =
+                    vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test();
+                match tokio::time::timeout(STATEMENT_DEADLINE, pause.wait_entered()).await {
+                    Ok(()) => emit(&ControlResponse::ExecutePaused)?,
+                    Err(_) => emit(&ControlResponse::Failed {
+                        detail: "no live producer reached the pause".to_owned(),
+                    })?,
+                }
+            }
+            ControlRequest::ReleaseLiveProductionPause => {
+                vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test()
+                    .release();
+                emit(&ControlResponse::PauseReleased)?;
+            }
+            ControlRequest::LiveScribeHolds => match live_scribe_holds(&server) {
+                Ok((open_producers, memory_used_bytes)) => {
+                    emit(&ControlResponse::LiveScribeHolds {
+                        open_producers,
+                        memory_used_bytes,
+                    })?
+                }
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
             ControlRequest::StartInactiveSql { sql } => {
                 if active.is_some() {
                     emit(&ControlResponse::Failed {
@@ -520,6 +550,27 @@ fn arm_execute_pause(
         .worker()
         .bind_execute_pause_for_test(Arc::clone(&pause));
     Ok(pause)
+}
+
+/// Reads this child's open live producers and Scribe root memory.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when this target composes no Scribe
+/// or its resource snapshot cannot be read.
+fn live_scribe_holds(server: &WyrdTestServer) -> Result<(usize, usize), ProcessClusterError> {
+    let scribe = server
+        .state()
+        .bifrost_ingest()
+        .ok_or_else(|| ProcessClusterError::Child("this target composes no Scribe".to_owned()))?;
+    let snapshot = scribe
+        .resources()
+        .snapshot()
+        .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
+    Ok((
+        vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test(),
+        snapshot.scribe_memory_used_bytes,
+    ))
 }
 
 /// Installs this child's log subscriber on stderr when `WYRD_LOG`, else `RUST_LOG`, asks for one.

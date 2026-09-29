@@ -24,9 +24,11 @@ idle share but executes with an unbounded DataFusion pool; transport admission
 uses the supposed non-Bifrost reserve; Scribe and Oracle keep fixed floors;
 and admitted-query memory exhaustion is mislabeled as admission refusal.
 It does not reimplement Eval or replace TASK-003.
-TASK-003 code on the merged PR is the starting state; TASK-004 owns the
-remaining integrated benchmark and gate evidence, so a separate TASK-003
-PASS verdict is not a prerequisite.
+TASK-003 code on the merged PR is the starting state, except that its
+role-local WAL failure requirement remains unimplemented. TASK-004 completes
+that specific requirement on the integrated branch and owns the remaining
+benchmark and gate evidence; a separate TASK-003 PASS verdict is not a
+prerequisite.
 
 INT-001 is the incompatible Eval/server/Bifrost branch overlap. MEM-001 is
 the fixed Scribe/Oracle floor split in resources.rs; MEM-002 is Forge's
@@ -51,7 +53,8 @@ redefine its behavior here.
   a56ab7569aa702dddec0b36d097d38abe8918e8c, the PR #94 merge whose
   second parent is vcc/task-005 commit
   5ae8125156add44e549ac090a82a4fcb20e9cce7. The dedicated
-  `vcc/task-004` worktree contains Bifrost spec revision 12 and this task,
+  `wyrd-verfication-t006-merge` worktree on branch `vcc/task-004` contains
+  Bifrost spec revision 12 and this task,
   ported from packet commit 310765353361c0da7d3b906fedea04ddd3f53126.
   PR #94's CI override does not certify TASK-003 or this task. Replay Eval
   and peer behavior from pinned vcc/task-006 commit
@@ -106,7 +109,7 @@ estimate, query ceiling, queued query, or planned compaction charges zero.
 | --- | --- |
 | Scribe | Existing ingress, memtable, and staged-memory leases charge their actual held bytes through this root; release only when their owning data/work drops. Remove floor and elastic partitions. |
 | Oracle | Reuse `OracleMemoryRoot`'s DataFusion `MemoryPool` view. `try_grow` checks the query ceiling then charges the shared governor and pool atomically; on refusal roll back completed charges. `shrink` returns the same consumer's bytes. `grow` remains DataFusion's infallible path: record its overshoot as headroom and release it on shrink/drop, without a watchdog. Query-owned runtime and child graph retain the pool view until they drain; only then return slot and memory. |
-| Forge | Feed the managed rewrite context a DataFusion `MemoryPool` backed by the **same** governor, using its existing `with_memory_pool` and `with_spill_lease` builder inputs. Let that dependency create the normal DataFusion disk manager. Use actual reservation growth/shrink and the same accounted-headroom rule for infallible `grow`, not the estimator or an independent finite cap. Keep existing parallelism. A failed attempt drops/join its context before retry; its durable task remains unsettled and publishes no partial snapshot. No extra Forge heap estimate is charged. |
+| Forge | Feed the managed rewrite context a DataFusion `MemoryPool` backed by the **same** governor, using its existing `with_memory_pool` and `with_spill_lease` builder inputs. Use actual reservation growth/shrink and the same accounted-headroom rule for infallible `grow`, not the estimator or an independent finite memory cap. Keep existing parallelism. A failed attempt drops/joins its context before retry; its durable task remains unsettled and publishes no partial snapshot. No extra Forge heap estimate is charged. |
 | Transport | Keep the current per-message byte ceiling and the existing body-admission lifetime. Validate the declared/decoded message against that ceiling before retaining it; charge the actual encoded bytes held, not a maximum-message precharge, to the shared root. HTTP and gRPC body owners return that charge when the body is consumed or dropped, including cancellation and decode error. Delete transport's independent aggregate counter and unmanaged-reserve coupling. |
 
 DataFusion spill bytes remain disk use managed by its normal disk manager,
@@ -115,11 +118,25 @@ still stops the process through its existing health watcher; an ordinary role
 capacity refusal does not. This is one owner with existing role-local handles,
 not a second accounting service or a new public resource interface.
 
+Forge spill uses a `forge-spill` child of TASK-006's existing locked
+`BifrostDataRoot`; do not create another data root, disk ledger, or
+Forge-specific scratch cap. Use DataFusion's ordinary disk manager to spill
+temporary operator data as needed; the 1-GiB output-file target is independent
+of spill use. A full disk fails the Forge attempt without partial publication.
+DataFusion removes its temporary files when an attempt ends. After acquiring
+the data-root lock on restart, remove only stale Forge spill files left by a
+crashed process before admitting Forge work; do not add a normal-attempt
+cleanup service.
+
 ### Scribe failure boundary
 
-TASK-003 already decided this boundary. WAL integrity/ambiguous mutation
-marks **Scribe** unready immediately. Its owner stops admitting writes before
-ACK, withdraws Scribe readiness/heartbeat and cluster role fence, and
+TASK-003 decided this boundary, but the cited PR #94 merge still routes failed
+WAL rollback through process-wide `BifrostResourceHealth::Volume` poison and
+requires Scribe health for combined-target `/readyz`. Complete this missing
+TASK-003 handling here; do not replay the rest of TASK-003. WAL
+integrity/ambiguous mutation marks **Scribe** unready immediately. Its owner
+stops admitting writes before ACK, withdraws Scribe readiness/heartbeat and
+cluster role fence, and
 drains accepted work without deleting WAL or staged files. It does not ask
 the process supervisor to exit or replay in process. On a later restart,
 stage recovery and WAL replay finish before Scribe advertises ready; failed
@@ -130,6 +147,10 @@ dependency failure. A Scribe-only target is unready. The existing
 process-wide resource-health watcher retains fail-stop authority for a
 poisoned shared governor or runtime invariant. Do not turn every supervised
 task exit into a recoverable role failure or add a recovery supervisor.
+Keep Scribe unready in the readiness response body even when a combined
+target remains ready. Use a test-only fault at the WAL mutation/sync boundary
+for the named real-server journey; the existing disk-full-before-write hook
+does not exercise ambiguous mutation.
 
 ### Public query resource failure
 
@@ -159,12 +180,13 @@ alias is needed because nothing shipped.
    already present, or superseded with a reason for every material Eval,
    startup, peer, Bifrost, contract, SDK, and journey change.
 2. Replay Eval and simplified boot/peer behavior through current Bifrost
-   seams; run focused and real-server regressions before resource changes.
+   seams; complete TASK-003's missing role-local WAL failure handling and run
+   focused and real-server regressions before resource changes.
 3. Resolve the default 1-GiB server minimum and one shared Bifrost cap from
    the detected process limit; remove idle role memory partitions.
-4. Give Forge bounded DataFusion execution and normal spill; retain its
-   parallelism and durable retry. Preserve Oracle's queue, per-query ceiling,
-   spill, and child-owned cleanup.
+4. Give Forge bounded DataFusion memory and ordinary spill under the shared
+   data root; retain its parallelism and durable retry. Preserve
+   Oracle's queue, per-query ceiling, spill, and child-owned cleanup.
 5. Run standard and heavy benchmarks, review measured misses, then run the
    broad repository gate once after benchmark acceptance.
 
@@ -203,13 +225,16 @@ need the unavailable Scribe surface their actual dependency failure.
 
 **RED.** Replay TASK-006's local boot and two-replica journeys onto the
 merged base. Add an integrated remote-live and Scribe-role-failure case
-where the source journeys do not cover current Bifrost. Confirm the unported
-boot, routing, or source seam fails. The source peer lane is replayed with
-its `mise.toml` entry; the exact integrated selectors are below.
+where the source journeys do not cover current Bifrost. Show that failed WAL
+rollback still poisons the process and combined-target `/readyz` still counts
+Scribe as required. The source peer lane is replayed with its `mise.toml`
+entry; the exact integrated selectors are below.
 
 **GREEN.** Adapt TASK-006 startup, public routing, readiness, peer mTLS,
-and typed contexts to current Bifrost services. Run server, peer, Oracle,
-and Scribe journeys.
+and typed contexts to current Bifrost services. Move uncertain WAL health to
+Scribe alone, withdraw its role without shutting down the process, and make
+combined-target readiness conditional on the other required healthy roles.
+Run server, peer, Oracle, and Scribe journeys.
 
 **REFACTOR.** Remove superseded startup, routing, ticket, and replay-state
 paths. Keep one local call and one authenticated remote call per operation.
@@ -245,8 +270,9 @@ held.
 **Behavior.** Scribe, Oracle, Forge, and in-flight Bifrost transport charge
 one governed cap while they hold memory and return charges on completion,
 failure, or cancellation. Per-message size and Forge parallelism remain
-separate bounds. Forge uses a bounded DataFusion pool and spill; an exhausted
-attempt publishes nothing partial and follows durable retry. An estimate
+separate bounds. Forge uses a bounded DataFusion memory pool and ordinary
+disk spill in the existing Bifrost data root; an exhausted attempt publishes
+nothing partial and follows durable retry. An estimate
 does not reserve future heap use in advance.
 
 **RED.** Add focused concurrent-charge/release cases and a Forge
@@ -255,8 +281,10 @@ and unbounded pool do not prove the shared cap. Use the named resource and
 Forge selectors below.
 
 **GREEN.** Route governed allocations through the shared Bifrost authority.
-Use the compaction dependency's existing bounded-pool and spill capability.
-Charge transport body ownership to Bifrost rather than server headroom.
+Use the compaction dependency's existing bounded-pool and spill capability,
+prepare `forge-spill` through `BifrostDataRoot`, and clear its crash leftovers
+under the root lock before Forge starts. Charge transport body ownership to
+Bifrost rather than server headroom.
 Preserve Forge's durable settlement.
 
 **REFACTOR.** Delete Forge estimated-memory admission and its fixed 80%
@@ -295,14 +323,19 @@ an actually full waiting queue.
    each material TASK-006 Eval, boot, peer, Bifrost, contract, SDK, and journey
    change as replayed, already present, or superseded by current Bifrost with
    the named owning seam. One startup and peer path remains; integrated local
-   and cross-pod journeys satisfy both specs. A Scribe WAL failure is role-local;
+   and cross-pod journeys satisfy both specs. The missing TASK-003 WAL boundary
+   is completed: uncertain WAL stops only Scribe, combined-target readiness
+   reports Scribe unready while healthy independent roles keep serving, and
    shared-governor poison remains process-terminal.
 2. Default 8-GiB detection yields 1-GiB server headroom and a 7-GiB
    governed Bifrost cap. Overrides and invalid boot are proven. Server
    work has no application cap. Idle roles reserve nothing; concurrent
    fallible governed charges respect one total.
-3. Forge failure cannot partially publish. Query memory exhaustion fails
-   only its requesting query with a distinct public reason before and after
+3. Forge spill is confined to the existing data root, with no Forge-specific
+   scratch cap, and crash leftovers are removed before Forge restarts. Its normal
+   temporary files are released by DataFusion. Forge failure cannot partially
+   publish. Query memory exhaustion fails only its requesting query with a
+   distinct public reason before and after
    stream opening, without retry metadata. Infallible and untracked
    allocations are documented honestly, not claimed OOM-proof.
 4. Every approved standard and heavy workload has valid measured evidence
@@ -328,7 +361,10 @@ For the public error, the concrete closure is
 `crates/shared/wyrd-client/src/{error.rs,bifrost/query.rs}`, and the Rust,
 Python, and TypeScript client error projections. For memory, modify the
 existing root in `resources.rs`, encoded-body owner in `gate/limits.rs`, and
-Forge context in `forge/managed/executor.rs`; do not create a second root.
+Forge context in `forge/managed/executor.rs`, and the existing
+`boot/data_root.rs` for its spill child; do not create a second root. Complete
+the Scribe WAL boundary through `scribe/wal.rs`, the Scribe role lifecycle,
+and the existing server readiness snapshot.
 
 ## Verification and Evidence
 
@@ -344,10 +380,11 @@ journey must use a real client and server; a unit case cannot replace it.
 | New `server::eval_verification::integrated_enqueue_failure_preserves_ack` journey | Real Gate/Scribe/Eval; force post-ACK enqueue failure, read the acknowledged observation, and prove no run/result was invented. Also retry same batch ID and prove no second enqueue. | 1 |
 | Existing source `peer_network::join::peer_join_and_remote_query` and `peer_network::security::peer_context_refusals` journeys | Two real server processes: peer joins over mTLS, remote query succeeds; bad peer identity and wrong tenant/context/fence fail without result. | 1 |
 | New `peer_network::analytical::remote_live_scribe_drop_releases_query` journey | Remote Scribe on another process, leader opens a live fragment then client disconnects; prove remote stream/lease release and leader deadline behavior, including one failed terminal after rows if remote Scribe fails. | 1 |
-| New `server::owner_inspection::scribe_wal_fault_is_role_local` journey | Combined target with Eval worker: force an ambiguous WAL mutation through the existing Scribe test-fault seam after a durable write; new write gets no ACK, Scribe is unready and withdrawn, Oracle published read and Eval worker remain healthy; restart recovers WAL before Scribe ready. A separate shared-governor poison still shuts down the process. | 1 |
+| New `server::owner_inspection::scribe_wal_fault_is_role_local` journey | Combined target with Eval worker: expose a narrow test-only WAL fault that leaves mutation/sync uncertain after a durable write; new write gets no ACK, Scribe is unready and withdrawn, combined `/readyz` stays ready while its body reports Scribe unready, Oracle published read and Eval worker remain healthy; restart recovers WAL before Scribe ready. A separate shared-governor poison still shuts down the process. The disk-full-before-write hook cannot substitute for this fault. | 1 |
 | New `resources::tests::shared_cap_defaults_overrides_and_concurrent_charges` unit | Inject 8-GiB observation, exercise default and operator limits, idle roles, simultaneous Scribe/Oracle/Forge/transport charges, failed charge, release, and re-admission; assert 1-GiB headroom, 7-GiB cap, no partition or precharge, and aggregate invariant. | 2 |
 | New `config::tests::server_memory_minimum_rejects_impossible_plan` unit | Parse env/config combinations including impossible minimum/cap and removed unmanaged setting; assert one resolved boot plan or boot error, no alias. | 2 |
-| New `forge::managed::executor::tests::rewrite_pool_charges_root_and_releases_on_cancel` unit plus `forge::live_rewrite::failed_memory_attempt_retries_without_partial_publication` journey | Hold Oracle/Scribe charges; run Forge bounded DataFusion growth and spill, force exhaustion/cancel, prove root returns bytes only after work ends; real Forge task retries and publishes one complete snapshot, never a partial one. | 2, 3 |
+| New `forge::managed::executor::tests::rewrite_pool_charges_root_and_releases_on_cancel` unit plus `forge::live_rewrite::failed_memory_attempt_retries_without_partial_publication` journey | Hold Oracle/Scribe charges; run Forge bounded DataFusion growth and spill, force exhaustion/cancel, prove root returns bytes only after work ends; assert normal temporary-file release under `forge-spill`. Real Forge task retries and publishes one complete snapshot, never a partial one. | 2, 3 |
+| New `boot::data_root::tests::prepare_clears_stale_forge_spill` unit | Start from a stale file in `forge-spill`; prepare the shared root and prove its lock is held, the file is removed, and WAL, staging, and Oracle files remain untouched. | 3 |
 | New `oracle::capacity::memory_failure_is_query_local_and_typed` journey | Two running queries plus one queued: force one admitted query's fallible DataFusion allocation failure after rows; sibling finishes, failed stream has one typed Failed terminal, queued query runs only after children and memory release; server stays healthy. | 2, 3 |
 | New `grpc::query::tests::resource_failure_has_no_retry_hint` unit and `bifrost::query::tests::resource_terminal_rejects_partial_rows` unit | Map pre-stream 503 and post-stream Failed terminal; assert stable code, no `retry-after-ms` for resource failure, no partial client success, and queue-full remains 429/retryable. | 3 |
 
@@ -364,6 +401,7 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner &&
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=resources::tests::shared_cap_defaults_overrides_and_concurrent_charges)'
 mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=config::tests::server_memory_minimum_rejects_impossible_plan)'
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=forge::managed::executor::tests::rewrite_pool_charges_root_and_releases_on_cancel)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=boot::data_root::tests::prepare_clears_stale_forge_spill)'
 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test forge -P journey --run-ignored=all -E 'test(=live_rewrite::failed_memory_attempt_retries_without_partial_publication)'"
 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=capacity::memory_failure_is_query_local_and_typed)'"
 mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=grpc::query::tests::resource_failure_has_no_retry_hint)'

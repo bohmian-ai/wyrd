@@ -664,16 +664,16 @@ mod tests {
         assert_eq!(admission.used_bytes(), 0);
     }
 
-    /// A compressed first frame declares a compressed length, so it is unknown.
+    /// A compressed first frame is bounded by its encoded length.
     ///
-    /// Admitting it against its declared length would lease less capacity than
-    /// the decompressed message occupies.
+    /// Transport charges the encoded bytes it retains; decompression is bounded
+    /// separately by tonic's decode limit and the decoder's own charge.
     ///
     /// # Panics
     ///
-    /// Panics when a compressed frame is bounded by its compressed length.
+    /// Panics when a compressed frame is not bounded by its encoded length.
     #[tokio::test]
-    async fn a_compressed_first_frame_is_bounded_as_unknown() {
+    async fn a_compressed_first_frame_is_bounded_by_its_encoded_length() {
         let mut compressed = vec![1_u8];
         compressed.extend_from_slice(&4_u32.to_be_bytes());
         let mut body = chunked_body(vec![compressed]);
@@ -682,7 +682,7 @@ mod tests {
             .await
             .expect("test body never errors");
 
-        assert_eq!(head.declared(), Ok(None));
+        assert_eq!(head.declared(), Ok(Some(4)));
     }
 
     /// An empty body has no header to read and is admitted as unknown.

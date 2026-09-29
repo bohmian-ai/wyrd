@@ -543,6 +543,10 @@ pub struct QueryResourceProbe {
     pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
     /// Peak counter the admitted pool writes after each successful growth.
     memory_peak_bytes: Option<Arc<AtomicUsize>>,
+    /// Park this query claimed at admission, taken once by its frame loop.
+    park: std::sync::Mutex<Option<Arc<crate::resources::OracleQueryPark>>>,
+    /// Ceiling admission granted this query's own pool.
+    granted_memory_bytes: usize,
 }
 
 #[cfg(feature = "test-support")]
@@ -572,7 +576,29 @@ impl QueryResourceProbe {
             pool: resources.map(crate::resources::OracleQueryResources::memory_pool),
             memory_peak_bytes: resources
                 .map(crate::resources::OracleQueryResources::memory_peak_bytes),
+            park: std::sync::Mutex::new(resources.and_then(|resources| resources.park.clone())),
+            granted_memory_bytes: resources.map_or(0, |resources| resources.granted_memory_bytes),
         }
+    }
+
+    /// Parks after this query's first batch frame when a journey armed a park.
+    ///
+    /// Takes the park once, so only the first batch parks. When the journey
+    /// resolves it to exhaust, this grows a fresh consumer on the query's own
+    /// admitted pool by one byte past its grant and returns the pool's real
+    /// refusal, which the frame loop then settles exactly as a refused
+    /// `DataFusion` allocation. Returns `None` when no park was armed or the
+    /// journey resumed the query.
+    pub(super) async fn park_after_rows(&self) -> Option<datafusion::error::DataFusionError> {
+        let park = self.park.lock().ok()?.take()?;
+        if !park.park().await {
+            return None;
+        }
+        let pool = self.pool.as_ref()?;
+        datafusion::execution::memory_pool::MemoryConsumer::new("oracle-test-exhaustion")
+            .register(pool)
+            .try_grow(self.granted_memory_bytes.saturating_add(1))
+            .err()
     }
     /// Returns the existing Oracle query identity.
     #[must_use]
@@ -877,6 +903,10 @@ impl OracleAdmission {
                     query_class,
                     OracleAdmissionOutcome::Rejected,
                     OracleAdmissionReason::Membership,
+                );
+                tracing::warn!(
+                    ?query_class,
+                    "Oracle admission refused: this node holds no live Oracle membership"
                 );
                 return Err(BifrostError::OracleRoleUnavailable);
             }

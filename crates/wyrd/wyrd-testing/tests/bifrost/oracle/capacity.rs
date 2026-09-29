@@ -1454,6 +1454,222 @@ async fn drain_query_within(query: &Bifrost, sql: &str, deadline_ms: i64) -> Res
     }
 }
 
+/// Rows seeded for the query-local memory-failure journey.
+const FAILURE_ROWS: i64 = 16;
+
+/// Oracle slot units the memory-failure journey's pod is configured with.
+///
+/// The smallest routable pod: a forwarding candidate must offer both classes,
+/// and three units is the least that seats one two-unit Analytical query
+/// beside the Interactive floor. Interactive work borrows all three, so three
+/// parked Interactive queries saturate it and a fourth provably queues.
+const FAILURE_SLOTS: usize = 3;
+
+/// Stable error code of an admitted query whose governed memory ran out.
+const QUERY_RESOURCES_EXHAUSTED_CODE: &str = "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED";
+
+/// A memory failure inside one admitted query is local to that query and typed.
+///
+/// Three queries are admitted on a three-slot pod and park after streaming
+/// rows, and a fourth waits in the queue. One parked query then fails its next
+/// allocation against its own admitted pool. The failed stream ends as the
+/// typed `QueryResourcesExhausted` failure, the queued query is admitted only
+/// once that failure's slot and memory return, both parked siblings resume and
+/// complete every row, and the pod ends healthy with nothing held or queued.
+///
+/// # Panics
+///
+/// Panics when any admission, failure, sibling, queue, or health claim fails.
+// Two parked streams, a queued stream, and the server share this runtime; on
+// the single-threaded default a parked stream starves the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn memory_failure_is_query_local_and_typed() {
+    prove_memory_failure_is_query_local()
+        .await
+        .expect("Oracle query-local memory failure journey");
+}
+
+/// Drives the query-local memory-failure journey over one combined server.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_memory_failure_is_query_local() -> Result<(), JourneyError> {
+    let server = WyrdTestServer::builder()
+        .with_oracle_query_slot_limit_for_test(FAILURE_SLOTS)
+        .start_bound()
+        .await?;
+    wait_ready(&server).await?;
+    let tenant = server.data_tenant_id();
+    let table = unique_table("oracle_memory_failure");
+    register_table(&server, tenant, &table).await?;
+    let rows = writer(&server, "memory-failure-writer").await?;
+    for id in 1..=FAILURE_ROWS {
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            [journey_row(id, "failure")],
+        )
+        .await?;
+    }
+    server.flush_bifrost().await?;
+    let expected_rows = usize::try_from(FAILURE_ROWS)?;
+    let health = server
+        .state()
+        .bifrost_resources()
+        .and_then(|resources| resources.oracle())
+        .ok_or("node hosts no Oracle")?
+        .health();
+    let reader = client(&server, "memory-failure-reader").await?;
+    let query = wyrd_client::Bifrost::query_only(&reader);
+    let request = BifrostQueryRequest {
+        sql: format!("SELECT id FROM vala.bifrost.{table}"),
+        deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
+    };
+
+    let mut siblings = Vec::new();
+    for _ in 0..FAILURE_SLOTS - 1 {
+        let park = server.park_next_query_after_rows()?;
+        let stream = query.query(&request).await?;
+        park.wait_entered().await;
+        siblings.push((park, stream));
+    }
+    let failing_park = server.park_next_query_after_rows()?;
+    let mut failing = query.query(&request).await?;
+    failing_park.wait_entered().await;
+    let running = server.oracle_runtime_inspection()?;
+    if running.active_queries != u64::try_from(FAILURE_SLOTS)? || running.queued_queries != 0 {
+        return Err(format!("the parked queries left the pod at {running:?}").into());
+    }
+
+    let queued_request = request.clone();
+    let queued_client = reader.clone();
+    let queued = tokio::spawn(async move {
+        drain_stream(
+            &wyrd_client::Bifrost::query_only(&queued_client),
+            &queued_request,
+        )
+        .await
+    });
+    wait_inspection(&server, |inspection| inspection.queued_queries == 1).await?;
+
+    failing_park.exhaust();
+    let mut failed_rows = 0_usize;
+    let failure = loop {
+        match failing.next_batch().await {
+            Ok(Some(batch)) => failed_rows += batch.num_rows(),
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    let failure = failure.ok_or_else(|| {
+        format!(
+            "the exhausted query ended {:?} after {failed_rows} rows",
+            failing.terminal()
+        )
+    })?;
+    let code = wyrd_spec::error::WyrdError::from(&failure).code();
+    if code != QUERY_RESOURCES_EXHAUSTED_CODE {
+        return Err(format!("the exhausted query failed with {code}: {failure}").into());
+    }
+
+    let (queued_rows, queued_outcome) = queued.await??;
+    if queued_rows != expected_rows || queued_outcome != Some(QueryTerminalOutcome::Success) {
+        return Err(
+            format!("the queued query read {queued_rows} rows ending {queued_outcome:?}").into(),
+        );
+    }
+
+    for (park, mut sibling) in siblings {
+        park.resume();
+        let mut sibling_rows = 0_usize;
+        while let Some(batch) = sibling.next_batch().await? {
+            sibling_rows += batch.num_rows();
+        }
+        let sibling_outcome = sibling.terminal().map(|terminal| terminal.outcome);
+        if sibling_rows != expected_rows || sibling_outcome != Some(QueryTerminalOutcome::Success) {
+            return Err(
+                format!("a sibling read {sibling_rows} rows ending {sibling_outcome:?}").into(),
+            );
+        }
+    }
+
+    wait_inspection(&server, |inspection| {
+        inspection.active_queries == 0
+            && inspection.queued_queries == 0
+            && inspection.reserved_memory_bytes == 0
+    })
+    .await?;
+    if let Some(reason) = health.reason() {
+        return Err(format!("a query-local memory failure poisoned the root: {reason:?}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Drains one statement to its terminal, returning its rows and outcome.
+///
+/// # Errors
+///
+/// Returns the client error that ended the stream.
+async fn drain_stream(
+    query: &Bifrost,
+    request: &BifrostQueryRequest,
+) -> Result<(usize, Option<QueryTerminalOutcome>), wyrd_client::bifrost::BifrostClientError> {
+    let mut stream = query.query(request).await?;
+    let mut rows = 0_usize;
+    while let Some(batch) = stream.next_batch().await? {
+        rows += batch.num_rows();
+    }
+    Ok((rows, stream.terminal().map(|terminal| terminal.outcome)))
+}
+
+/// Polls `/readyz` until the server, including its Oracle membership, is ready.
+///
+/// # Errors
+///
+/// Returns the HTTP error, or a timeout naming the last readiness body.
+async fn wait_ready(server: &WyrdTestServer) -> Result<(), JourneyError> {
+    let base = server.base_url().ok_or("missing HTTP URL")?;
+    let deadline = tokio::time::Instant::now() + OBSERVATION_DEADLINE;
+    loop {
+        let response = reqwest::get(format!("{base}/readyz")).await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let body = response.text().await?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("the server never became ready: {body}").into());
+        }
+        tokio::time::sleep(PHYSICAL_EVIDENCE_INTERVAL).await;
+    }
+}
+
+/// Polls the Oracle's own runtime inspection until `ready` holds.
+///
+/// # Errors
+///
+/// Returns the inspection error, or a timeout naming the last inspection.
+async fn wait_inspection(
+    server: &WyrdTestServer,
+    ready: impl Fn(&wyrd_testing::server::OracleRuntimeInspection) -> bool,
+) -> Result<(), JourneyError> {
+    let deadline = tokio::time::Instant::now() + OBSERVATION_DEADLINE;
+    loop {
+        let inspection = server.oracle_runtime_inspection()?;
+        if ready(&inspection) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                format!("the Oracle never reached the awaited state: {inspection:?}").into(),
+            );
+        }
+        tokio::time::sleep(PHYSICAL_EVIDENCE_INTERVAL).await;
+    }
+}
+
 /// Rows seeded into each tenant's table for the bounded-scheduling journey.
 const SCHEDULING_ROWS: i64 = 24;
 

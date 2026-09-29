@@ -466,7 +466,17 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                             execution_path,
                         ),
                         Ok(None) => {}
-                        Ok(Some(frame)) => yield Ok(QueryStreamFrame::Batch(frame)),
+                        Ok(Some(frame)) => {
+                            yield Ok(QueryStreamFrame::Batch(frame));
+                            #[cfg(feature = "test-support")]
+                            if let Some(probe) = admitted
+                                .as_ref()
+                                .and_then(|admitted| admitted.resource_probe.clone())
+                                && let Some(refusal) = probe.park_after_rows().await
+                            {
+                                next = Some(Err(refusal));
+                            }
+                        }
                     }
                 }
                 QueryStreamEvent::Batch(Some(Err(error))) => {

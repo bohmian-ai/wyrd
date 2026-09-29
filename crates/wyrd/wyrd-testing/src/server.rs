@@ -1219,6 +1219,21 @@ impl WyrdTestServer {
             })
     }
 
+    /// Arms the next admitted Oracle query to park after its first batch frame.
+    ///
+    /// Forwards to the controller `OracleResources` owns; the returned park
+    /// reports when the query has streamed rows and parked, and resolves it to
+    /// resume or to fail through a real refused growth of its own pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start error when this server does not host an Oracle role.
+    pub fn park_next_query_after_rows(
+        &self,
+    ) -> Result<Arc<vala_bifrost_redux::resources::OracleQueryPark>, WyrdTestServerError> {
+        Ok(self.oracle_memory_hold()?.park_next_after_rows())
+    }
+
     /// Releases the retained reservation back to the shared Oracle root.
     ///
     /// # Errors

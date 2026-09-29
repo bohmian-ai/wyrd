@@ -1570,6 +1570,81 @@ pub struct OracleQueryMemoryHold {
     reached: Notify,
     /// Set with `reached` so a waiter arriving afterwards still observes it.
     engaged: std::sync::atomic::AtomicBool,
+    /// Parks the next admitted queries claim, in admission order.
+    parks: Mutex<std::collections::VecDeque<Arc<OracleQueryPark>>>,
+}
+
+/// Test-tier park that holds one admitted query after its first batch frame.
+///
+/// Journeys need admitted queries that are provably running, having already
+/// streamed rows, while a sibling fails and a third query waits. The query's
+/// own frame loop parks here after emitting its first batch and, once the
+/// journey resolves the park, either resumes or fails through a real refused
+/// growth of its own admitted `DataFusion` pool. Nothing here bypasses the
+/// governor or synthesizes the failure's error.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct OracleQueryPark {
+    /// Set once the query has emitted its first batch and parked.
+    entered: std::sync::atomic::AtomicBool,
+    /// Wakes a waiter once the query parks.
+    entered_signal: Notify,
+    /// The journey's resolution: `Some(true)` exhausts, `Some(false)` resumes.
+    resolution: Mutex<Option<bool>>,
+    /// Wakes the parked query once a resolution is set.
+    resolved: Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl OracleQueryPark {
+    /// Waits until the claiming query has emitted rows and parked.
+    pub async fn wait_entered(&self) {
+        loop {
+            let entered = self.entered_signal.notified();
+            if self.entered.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            entered.await;
+        }
+    }
+
+    /// Resumes the parked query so it drains to its ordinary terminal.
+    pub fn resume(&self) {
+        self.resolve(false);
+    }
+
+    /// Fails the parked query's next allocation against its own admitted pool.
+    pub fn exhaust(&self) {
+        self.resolve(true);
+    }
+
+    /// Records one resolution and wakes the parked query.
+    fn resolve(&self, exhaust: bool) {
+        if let Ok(mut resolution) = self.resolution.lock() {
+            *resolution = Some(exhaust);
+        }
+        self.resolved.notify_waiters();
+    }
+
+    /// Parks the calling query until resolved and returns whether to exhaust.
+    ///
+    /// Called once by the query's frame loop after its first batch frame.
+    /// A poisoned resolution lock resumes the query rather than parking it
+    /// forever.
+    pub(crate) async fn park(&self) -> bool {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.entered_signal.notify_waiters();
+        loop {
+            let resolved = self.resolved.notified();
+            match self.resolution.lock().map(|resolution| *resolution) {
+                Ok(Some(exhaust)) => return exhaust,
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+            resolved.await;
+        }
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1607,6 +1682,23 @@ impl OracleQueryMemoryHold {
         self.engaged
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.reached.notify_waiters();
+    }
+
+    /// Arms the next admitted query without a park to park after its first batch.
+    ///
+    /// Parks are claimed in admission order, so arming two parks the next two
+    /// admitted queries in the order they are admitted.
+    pub fn park_next_after_rows(&self) -> Arc<OracleQueryPark> {
+        let park = Arc::new(OracleQueryPark::default());
+        if let Ok(mut parks) = self.parks.lock() {
+            parks.push_back(Arc::clone(&park));
+        }
+        park
+    }
+
+    /// Claims the oldest armed park for the query being admitted, if any.
+    fn claim_park(&self) -> Option<Arc<OracleQueryPark>> {
+        self.parks.lock().ok()?.pop_front()
     }
 
     /// Waits until an admitted query is holding the armed reservation.
@@ -1806,7 +1898,12 @@ impl OracleResources {
             .governor
             .try_acquire_oracle(request, &self.memory_root)?;
         #[cfg(feature = "test-support")]
-        self.memory_hold.engage(&resources.memory_pool);
+        let resources = {
+            let mut resources = resources;
+            self.memory_hold.engage(&resources.memory_pool);
+            resources.park = self.memory_hold.claim_park();
+            resources
+        };
         Ok(resources)
     }
 
@@ -2589,6 +2686,8 @@ impl BifrostResourceGovernor {
             governor: self.clone(),
             released: false,
             admission_charge: None,
+            #[cfg(feature = "test-support")]
+            park: None,
         })
     }
 
@@ -3993,6 +4092,9 @@ pub struct OracleQueryResources {
     /// leader woken by that wake sees the slot and its tenant charge free
     /// together. A remote follower's owner carries none.
     admission_charge: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// Test-tier park this query claimed at admission, if a journey armed one.
+    #[cfg(feature = "test-support")]
+    pub(crate) park: Option<Arc<OracleQueryPark>>,
 }
 
 impl OracleQueryResources {

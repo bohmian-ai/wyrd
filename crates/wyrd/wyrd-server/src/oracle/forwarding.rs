@@ -237,6 +237,12 @@ impl ReadyOracleForwarder {
             now + chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
         let snapshot = self.cluster.snapshot();
         let mut candidates = eligible_oracle_candidates(&snapshot);
+        if candidates.is_empty() {
+            tracing::warn!(
+                live_oracles = snapshot.live_oracles().len(),
+                "no ready Oracle advertises both query classes; the query is unroutable"
+            );
+        }
         if let Some(local) = candidates.iter().find(|lease| {
             lease.key.node_id == self.local_node_id
                 && self

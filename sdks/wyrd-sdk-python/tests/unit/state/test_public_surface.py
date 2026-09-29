@@ -53,8 +53,7 @@ def test_public_state_surfaces_have_runtime_docstrings() -> None:
             "data",
             "agent",
             "prompt",
-            "eval",
-            "drift",
+            "verifier",
             "workflow",
         ),
     }
@@ -104,8 +103,7 @@ def test_generated_state_stubs_retain_docstrings() -> None:
             "data",
             "agent",
             "prompt",
-            "eval",
-            "drift",
+            "verifier",
             "workflow",
         ),
     }.items():

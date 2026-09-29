@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use datafusion::common::DataFusionError;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -16,9 +17,12 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
+use futures_util::StreamExt as _;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
 use prost::Message;
 use thiserror::Error;
@@ -34,11 +38,12 @@ use crate::catalog::layout::TimePartition;
 use crate::catalog::{
     BIFROST_CATALOG_NAME, BifrostCatalog, TableRef, TenantTableBinding as CatalogTableBinding,
 };
+use crate::contracts::ScribeError;
 use crate::oracle::reader_pins::{
     OracleReaderAuthority, ReaderIoPermit, ReaderQueryGuard, local_cut_from_follower,
 };
 use crate::scribe::stream_identity::StreamIdentity;
-use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, HotBatch};
+use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, LiveTailBatches};
 
 /// Hard private plan-size default enforced before protobuf decoding.
 pub const DEFAULT_MAX_PHYSICAL_PLAN_BYTES: usize = 8 * 1024 * 1024;
@@ -51,7 +56,7 @@ pub enum PhysicalPlanFollowerError {
     Preflight(String),
     /// A role-bound source could not be constructed.
     #[error("role-bound provider resolution failed: {0}")]
-    Resolution(String),
+    Resolution(FollowerResolutionError),
     /// `DataFusion` rejected native physical fields after complete resolution.
     #[error("physical-plan decode failed after provider resolution: {0}")]
     PostResolutionDecode(String),
@@ -61,6 +66,34 @@ pub enum PhysicalPlanFollowerError {
     /// A second reader epoch was offered to a follower that already holds one.
     #[error("follower reader authority is already installed")]
     AuthorityAlreadyInstalled,
+}
+
+/// Why one role-bound source could not be resolved.
+///
+/// The class is decided where the cause is known and carried unchanged to the
+/// role's dispatch mapping, which is the only place it becomes a wire
+/// outcome. A published follower treats every class as eligible source loss;
+/// a Scribe follower degrades only `SourceLoss`, refuses `Capacity` as
+/// capacity, and fails `Fault`.
+#[derive(Debug, Error)]
+pub enum FollowerResolutionError {
+    /// Schema, projection, predicate, binding, integrity, or local execution
+    /// fault. Every untyped resolver message is this class.
+    #[error("{0}")]
+    Fault(String),
+    /// A bounded local admission ceiling refused the read.
+    #[error("resolution refused for capacity: {0}")]
+    Capacity(String),
+    /// The assigned source no longer exists at the signed incarnation.
+    #[error("assigned source is gone: {0}")]
+    SourceLoss(String),
+}
+
+impl From<String> for FollowerResolutionError {
+    /// Treats an unclassified resolver message as a fail-closed fault.
+    fn from(detail: String) -> Self {
+        Self::Fault(detail)
+    }
 }
 
 /// One resolved role-local source and the authenticated schema it came from.
@@ -134,8 +167,10 @@ impl FollowerSourceResolver for UnresolvableSource {
         _assignment: &FollowerScanAssignment,
         _session: &SessionState,
         _reader_io_permit: Option<&ReaderIoPermit>,
-    ) -> Result<ResolvedFollowerSource, String> {
-        Err("fixture resolver refuses every assignment".to_owned())
+    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
+        Err(FollowerResolutionError::Fault(
+            "fixture resolver refuses every assignment".to_owned(),
+        ))
     }
 }
 
@@ -152,14 +187,15 @@ pub trait FollowerSourceResolver: Send + Sync {
     /// complete authenticated follower request.
     ///
     /// # Errors
-    /// Returns a redacted message when catalog, storage, or Scribe snapshot IO fails.
+    /// Returns a redacted [`FollowerResolutionError`] when catalog, storage, or
+    /// Scribe snapshot IO fails, classed by its known cause.
     async fn resolve(
         &self,
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
         reader_io_permit: Option<&ReaderIoPermit>,
-    ) -> Result<ResolvedFollowerSource, String>;
+    ) -> Result<ResolvedFollowerSource, FollowerResolutionError>;
 }
 
 #[async_trait]
@@ -174,7 +210,7 @@ where
         assignment: &FollowerScanAssignment,
         session: &SessionState,
         reader_io_permit: Option<&ReaderIoPermit>,
-    ) -> Result<ResolvedFollowerSource, String> {
+    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         self.as_ref()
             .resolve(target_role, assignment, session, reader_io_permit)
             .await
@@ -388,21 +424,24 @@ impl OracleCatalogResolver {
 /// A signed closure can legitimately select nothing once the leader has pruned
 /// it, and that is a correct empty result rather than an error: the follower
 /// still returns a plan at the closure schema so the union above it sees the
-/// same columns every other fragment produces.
+/// same columns every other fragment produces. A Scribe follower uses it for a
+/// sibling Scribe's placeholder, which this node must not read.
 ///
 /// # Errors
 /// Returns a scrubbed message when the empty in-memory source cannot be built.
 fn empty_assignment_leaf(
     required_schema: &SchemaRef,
     full_schema: SchemaRef,
-) -> Result<ResolvedFollowerSource, String> {
+) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
     let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(required_schema));
     MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(required_schema), None)
         .map(|plan| ResolvedFollowerSource {
             plan: plan as Arc<dyn ExecutionPlan>,
             full_schema,
         })
-        .map_err(|_| "authenticated Oracle empty provider failed".to_owned())
+        .map_err(|_| {
+            FollowerResolutionError::Fault("authenticated empty provider failed".to_owned())
+        })
 }
 
 #[async_trait]
@@ -439,14 +478,16 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         assignment: &FollowerScanAssignment,
         session: &SessionState,
         reader_io_permit: Option<&ReaderIoPermit>,
-    ) -> Result<ResolvedFollowerSource, String> {
+    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         // Required, not optional: this resolver is the only one that opens
         // snapshot-dependent objects, so it refuses to build anything without
         // the permit proving its node's epoch already protects that snapshot.
         let permit = reader_io_permit
             .ok_or_else(|| "Oracle resolver has no reader epoch permit".to_owned())?;
         if target_role != ClusterRole::Oracle || assignment.scribe_provider_cut.is_some() {
-            return Err("Oracle resolver received a non-Oracle assignment".to_owned());
+            return Err(FollowerResolutionError::Fault(
+                "Oracle resolver received a non-Oracle assignment".to_owned(),
+            ));
         }
         let table = assignment_table(&assignment.binding)?;
         // Classified before any catalog or object I/O. The scan id is a
@@ -485,7 +526,9 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         let full_schema = provider.schema();
         let actual = super::assignment_schema_fingerprint(full_schema.as_ref());
         if actual != assignment.schema_fingerprint {
-            return Err("resolved provider schema fingerprint differs from assignment".to_owned());
+            return Err(FollowerResolutionError::Fault(
+                "resolved provider schema fingerprint differs from assignment".to_owned(),
+            ));
         }
         // Derived before any object I/O so an assignment naming a column this
         // table does not have is refused rather than partially read.
@@ -660,7 +703,7 @@ impl FollowerSourceResolver for FixedCohortResolver {
         assignment: &FollowerScanAssignment,
         _session: &SessionState,
         _reader_io_permit: Option<&ReaderIoPermit>,
-    ) -> Result<ResolvedFollowerSource, String> {
+    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         let required_schema =
             signed_closure_schema(self.schema.as_ref(), &assignment.required_columns)?;
         let projected = self
@@ -691,7 +734,11 @@ impl FollowerSourceResolver for FixedCohortResolver {
             plan: plan as Arc<dyn ExecutionPlan>,
             full_schema: Arc::clone(&self.schema),
         })
-        .map_err(|_| "fixed cohort resolver rejected its bound cohort".to_owned())
+        .map_err(|_| {
+            FollowerResolutionError::Fault(
+                "fixed cohort resolver rejected its bound cohort".to_owned(),
+            )
+        })
     }
 }
 
@@ -701,13 +748,18 @@ trait LiveTailSource: Send + Sync + std::fmt::Debug {
     /// Returns the exact stream incarnation served by this source.
     fn stream(&self) -> StreamIdentity;
 
-    /// Captures one bounded active-plus-unretired-immutable Arrow cohort.
-    /// Cancellation may abandon the local snapshot attempt before it is returned;
-    /// no partial cohort is exposed and a retry takes a new atomic snapshot.
+    /// Opens one lazily produced live read over the bounded memtable cut and
+    /// the staged members it did not serve.
+    /// Cancellation before the open returns exposes no producer; a retry opens
+    /// a new cut.
     ///
     /// # Errors
-    /// Returns a redacted error when the unchanged Scribe snapshot call fails.
-    async fn fetch(&self, request: FetchLiveTailRequest) -> Result<Vec<HotBatch>, String>;
+    /// Returns a redacted [`FollowerResolutionError`] when Scribe rejects or
+    /// cannot open the read.
+    async fn open(
+        &self,
+        request: FetchLiveTailRequest,
+    ) -> Result<LiveTailBatches, FollowerResolutionError>;
 }
 
 #[async_trait]
@@ -717,16 +769,37 @@ impl LiveTailSource for FetchLiveTailService {
         FetchLiveTailService::stream(self)
     }
 
-    /// Delegates exactly once to the unchanged Scribe production snapshot operation.
-    /// Cancellation drops the in-progress snapshot future and exposes no partial
-    /// batch vector; a retry invokes a new complete snapshot.
+    /// Delegates exactly once to the Scribe live-read open.
     ///
     /// # Errors
-    /// Returns a redacted error when Scribe rejects or cannot build the snapshot.
-    async fn fetch(&self, request: FetchLiveTailRequest) -> Result<Vec<HotBatch>, String> {
-        self.fetch_hot_batches(request)
+    /// Returns [`FollowerResolutionError::SourceLoss`] when the request names
+    /// another stream incarnation, [`FollowerResolutionError::Capacity`] when
+    /// the bounded snapshot exceeds its count or byte ceiling, and
+    /// [`FollowerResolutionError::Fault`] for every other open failure.
+    async fn open(
+        &self,
+        request: FetchLiveTailRequest,
+    ) -> Result<LiveTailBatches, FollowerResolutionError> {
+        self.open_live_batches(request)
             .await
-            .map_err(|_| "Scribe live-tail snapshot failed".to_owned())
+            .map_err(|error| live_open_error(&error))
+    }
+}
+
+/// Classes one Scribe live-read open failure for the fragment's dispatch.
+///
+/// A request for another stream incarnation means the assigned source is gone;
+/// an exhausted count or byte ceiling is a capacity refusal; every other open
+/// failure is a fault. The Scribe detail is redacted.
+fn live_open_error(error: &ScribeError) -> FollowerResolutionError {
+    match error {
+        ScribeError::StreamMismatch { .. } => {
+            FollowerResolutionError::SourceLoss("Scribe stream incarnation changed".to_owned())
+        }
+        ScribeError::IngestBusy { .. } => FollowerResolutionError::Capacity(
+            "Scribe live-tail snapshot exceeds its bound".to_owned(),
+        ),
+        _ => FollowerResolutionError::Fault("Scribe live-tail snapshot failed".to_owned()),
     }
 }
 
@@ -970,9 +1043,11 @@ where
         assignment: &FollowerScanAssignment,
         _session: &SessionState,
         _reader_io_permit: Option<&ReaderIoPermit>,
-    ) -> Result<ResolvedFollowerSource, String> {
+    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
         if target_role != ClusterRole::Scribe || !assignment.persisted.files.is_empty() {
-            return Err("Scribe resolver received a non-Scribe assignment".to_owned());
+            return Err(FollowerResolutionError::Fault(
+                "Scribe resolver received a non-Scribe assignment".to_owned(),
+            ));
         }
         let cut = assignment
             .scribe_provider_cut
@@ -980,7 +1055,9 @@ where
             .ok_or_else(|| "Scribe assignment is missing its provider cut".to_owned())?;
         let stream = self.tail.stream();
         if u64::try_from(stream.writer_epoch.as_i64()).ok() != Some(cut.writer_epoch) {
-            return Err("Scribe writer epoch differs from the authenticated cut".to_owned());
+            return Err(FollowerResolutionError::SourceLoss(
+                "Scribe writer epoch differs from the authenticated cut".to_owned(),
+            ));
         }
         let binding = crate::catalog::TenantTableBinding::resolve((
             assignment.binding.tenant_id,
@@ -1003,7 +1080,9 @@ where
         if super::assignment_schema_fingerprint(full_schema.as_ref())
             != assignment.schema_fingerprint
         {
-            return Err("resolved provider schema fingerprint differs from assignment".to_owned());
+            return Err(FollowerResolutionError::Fault(
+                "resolved provider schema fingerprint differs from assignment".to_owned(),
+            ));
         }
         let required_schema =
             signed_closure_schema(full_schema.as_ref(), &assignment.required_columns)?;
@@ -1017,17 +1096,7 @@ where
             cut.writer_epoch,
         );
         if assignment.scan_id != local_scan_id {
-            let batch = RecordBatch::new_empty(Arc::clone(&required_schema));
-            return MemorySourceConfig::try_new_exec(
-                &[vec![batch]],
-                Arc::clone(&required_schema),
-                None,
-            )
-            .map(|plan| ResolvedFollowerSource {
-                plan: plan as Arc<dyn ExecutionPlan>,
-                full_schema,
-            })
-            .map_err(|_| "authenticated Scribe empty provider failed".to_owned());
+            return empty_assignment_leaf(&required_schema, full_schema);
         }
         let start_partition = TimePartition::from_wire(cut.start_partition);
         let end_partition = TimePartition::from_wire(cut.end_partition);
@@ -1035,10 +1104,9 @@ where
             .map_err(|_| "Scribe batch bound does not fit this process".to_owned())?;
         let max_retained_bytes = usize::try_from(cut.maximum_retained_bytes)
             .map_err(|_| "Scribe byte bound does not fit this process".to_owned())?;
-        let fetch_started = std::time::Instant::now();
-        let fetched = self
+        let batches = self
             .tail
-            .fetch(FetchLiveTailRequest {
+            .open(FetchLiveTailRequest {
                 binding,
                 target_stream: stream,
                 start_partition,
@@ -1053,33 +1121,81 @@ where
                 max_batches,
                 max_retained_bytes,
             })
-            .await;
-        // The leader skips its own fence drain whenever followers are dispatched,
-        // so this bounded snapshot is the only live-tail read a distributed query
-        // performs. It carries the `remote` locality of the same page families the
-        // single-node drain emits, keeping live-tail observation continuous across
-        // both execution shapes.
-        let page_outcome = if fetched.is_ok() { "success" } else { "failed" };
-        metrics::counter!(
-            "bifrost_oracle_tail_pages_total",
-            "locality" => "remote",
-            "outcome" => page_outcome
+            .await?;
+        let partition = Arc::new(LiveTailPartition {
+            schema: Arc::clone(&required_schema),
+            batches: std::sync::Mutex::new(Some(batches)),
+        });
+        StreamingTableExec::try_new(
+            Arc::clone(&required_schema),
+            vec![partition as Arc<dyn PartitionStream>],
+            None,
+            Vec::new(),
+            false,
+            None,
         )
-        .increment(1);
-        metrics::histogram!(
-            "bifrost_oracle_tail_page_seconds",
-            "locality" => "remote",
-            "outcome" => page_outcome
-        )
-        .record(fetch_started.elapsed().as_secs_f64());
-        let batches = fetched?;
-        let rows = batches
-            .into_iter()
-            .map(|batch| batch.rows)
-            .collect::<Vec<_>>();
-        super::exec::OracleTableProvider::projected_memory_source(&rows, &required_schema)
-            .map(|plan| ResolvedFollowerSource { plan, full_schema })
-            .map_err(|_| "Scribe Arrow provider construction failed".to_owned())
+        .map(|plan| ResolvedFollowerSource {
+            plan: Arc::new(plan) as Arc<dyn ExecutionPlan>,
+            full_schema,
+        })
+        .map_err(|_| {
+            FollowerResolutionError::Fault("Scribe Arrow provider construction failed".to_owned())
+        })
+    }
+}
+
+/// One-shot partition over an opened Scribe live read.
+///
+/// The fragment executes its single leaf partition once, so the producer is
+/// taken on first execution and each batch is projected to the signed closure
+/// as it is pulled. Dropping the returned stream drops the producer and with
+/// it the memtable references and staged lease.
+#[derive(Debug)]
+struct LiveTailPartition {
+    /// Signed closure schema every produced batch is projected to.
+    schema: SchemaRef,
+    /// Opened producer, present until the partition is executed.
+    batches: std::sync::Mutex<Option<LiveTailBatches>>,
+}
+
+impl PartitionStream for LiveTailPartition {
+    /// Returns the signed closure schema.
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Takes the producer and streams its batches projected to the closure.
+    ///
+    /// A second execution yields one internal error instead of rows, because
+    /// the live cut has already been handed out. Staged reads are charged to
+    /// the task's memory pool, which is the follower's granted pool.
+    fn execute(&self, ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let schema = Arc::clone(&self.schema);
+        let taken = self
+            .batches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let stream = match taken {
+            Some(batches) => batches
+                .into_stream(Arc::clone(ctx.memory_pool()))
+                .map(move |batch| {
+                    batch
+                        .map_err(|error| DataFusionError::External(Box::new(error)))
+                        .and_then(|batch| super::exec::project_batch(&batch, Arc::clone(&schema)))
+                })
+                .boxed(),
+            None => futures_util::stream::once(async {
+                Err(DataFusionError::Internal(
+                    "Scribe live read was already executed".to_owned(),
+                ))
+            })
+            .boxed(),
+        };
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            stream,
+        ))
     }
 }
 
@@ -1430,16 +1546,20 @@ where
             let actual = super::assignment_schema_fingerprint(resolved.full_schema.as_ref());
             if actual != assignment.schema_fingerprint {
                 return Err(PhysicalPlanFollowerError::Resolution(
-                    "resolved provider schema fingerprint differs from assignment".to_owned(),
+                    FollowerResolutionError::Fault(
+                        "resolved provider schema fingerprint differs from assignment".to_owned(),
+                    ),
                 ));
             }
             let expected =
                 signed_closure_schema(resolved.full_schema.as_ref(), &assignment.required_columns)
-                    .map_err(PhysicalPlanFollowerError::Resolution)?;
+                    .map_err(|detail| PhysicalPlanFollowerError::Resolution(detail.into()))?;
             if resolved.plan.schema() != expected {
                 return Err(PhysicalPlanFollowerError::Resolution(
-                    "resolved provider schema differs from the signed projection closure"
-                        .to_owned(),
+                    FollowerResolutionError::Fault(
+                        "resolved provider schema differs from the signed projection closure"
+                            .to_owned(),
+                    ),
                 ));
             }
             providers.insert(scan_id, resolved.plan);
@@ -1813,8 +1933,10 @@ pub fn authenticated_preflight(
             _assignment: &FollowerScanAssignment,
             _session: &SessionState,
             _reader_io_permit: Option<&ReaderIoPermit>,
-        ) -> Result<ResolvedFollowerSource, String> {
-            Err("preflight resolver must not run".to_owned())
+        ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
+            Err(FollowerResolutionError::Fault(
+                "preflight resolver must not run".to_owned(),
+            ))
         }
     }
     PhysicalPlanFollower::new(NoResolver)
@@ -1826,6 +1948,7 @@ pub fn authenticated_preflight(
 pub(crate) mod tests {
     //! Authenticated preflight and role-local provider behavior proofs.
 
+    use crate::scribe::tail_rpc::HotBatch;
     use crate::scribe::wal::WalLsn;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2029,12 +2152,19 @@ pub(crate) mod tests {
         ///
         /// # Errors
         /// This focused source is infallible.
-        async fn fetch(&self, request: FetchLiveTailRequest) -> Result<Vec<HotBatch>, String> {
+        async fn open(
+            &self,
+            request: FetchLiveTailRequest,
+        ) -> Result<LiveTailBatches, FollowerResolutionError> {
+            let predicates = request.predicates.clone();
             self.requests
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(request);
-            Ok(self.batches.clone())
+            Ok(LiveTailBatches::from_snapshot(
+                self.batches.clone(),
+                predicates,
+            ))
         }
     }
 
@@ -2050,7 +2180,7 @@ pub(crate) mod tests {
             assignment: &FollowerScanAssignment,
             _session: &SessionState,
             _reader_io_permit: Option<&ReaderIoPermit>,
-        ) -> Result<ResolvedFollowerSource, String> {
+        ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let required_schema =
                 signed_closure_schema(self.schema.as_ref(), &assignment.required_columns)?;
@@ -2218,6 +2348,100 @@ pub(crate) mod tests {
             1,
             "the sibling placeholder must not fetch the local hot stream"
         );
+    }
+
+    /// Scribe resolution keeps the cause class the dispatch decision needs.
+    ///
+    /// A cut for another writer epoch is source loss, a fingerprint that
+    /// differs from the authenticated schema is a fault that never reaches the
+    /// tail, and live-read open failures keep their incarnation, capacity, or
+    /// fault class instead of collapsing into one message.
+    ///
+    /// # Panics
+    /// Panics when a class differs or a refused assignment reaches the tail.
+    #[tokio::test]
+    async fn scribe_resolution_failures_keep_their_class() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_u128(11)),
+            WriterEpoch::new(2),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("wyrd_event_time", DataType::Utf8, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]));
+        let resolver = ScribeTailResolver::with_schema(
+            Arc::new(RecordingTail {
+                stream,
+                requests: Arc::clone(&requests),
+                batches: Vec::new(),
+            }),
+            Arc::clone(&schema),
+        );
+        let binding = TenantTableBinding {
+            tenant_id: DataTenantId::new_v7(),
+            namespace: "vala.logs".to_owned(),
+            table: "records".to_owned(),
+        };
+        let assignment = FollowerScanAssignment {
+            scan_id: local_scribe_scan_id(&binding, stream),
+            binding: binding.clone(),
+            persisted: PersistedFileAssignment { files: Vec::new() },
+            scribe_provider_cut: Some(cut()),
+            schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
+            required_columns: vec!["wyrd_event_time".to_owned(), DATA_TENANT_ID.to_owned()],
+            predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
+        };
+        let session = SessionContext::new().state();
+
+        let mut other_epoch = assignment.clone();
+        if let Some(cut) = other_epoch.scribe_provider_cut.as_mut() {
+            cut.writer_epoch += 1;
+        }
+        let mut other_schema = assignment.clone();
+        other_schema.schema_fingerprint = super::super::assignment_schema_fingerprint(
+            &Schema::new(vec![Field::new(DATA_TENANT_ID, DataType::Utf8, false)]),
+        );
+        for (refused, expected) in [(other_epoch, "source loss"), (other_schema, "fault")] {
+            let class = match resolver
+                .resolve(ClusterRole::Scribe, &refused, &session, None)
+                .await
+            {
+                Err(FollowerResolutionError::SourceLoss(_)) => "source loss",
+                Err(FollowerResolutionError::Fault(_)) => "fault",
+                Err(FollowerResolutionError::Capacity(_)) => "capacity",
+                Ok(_) => "resolved",
+            };
+            assert_eq!(class, expected);
+        }
+        assert!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a refused assignment must never reach the live tail"
+        );
+
+        assert!(matches!(
+            live_open_error(&ScribeError::StreamMismatch {
+                requested: stream,
+                actual: stream,
+            }),
+            FollowerResolutionError::SourceLoss(_)
+        ));
+        assert!(matches!(
+            live_open_error(&ScribeError::IngestBusy {
+                table: "records".to_owned(),
+            }),
+            FollowerResolutionError::Capacity(_)
+        ));
+        assert!(matches!(
+            live_open_error(&ScribeError::Internal {
+                detail: "staged schema".to_owned(),
+            }),
+            FollowerResolutionError::Fault(_)
+        ));
     }
 
     /// Oracle and Scribe assignments remain a closed role-local matrix.
@@ -2639,21 +2863,11 @@ pub(crate) mod tests {
         )]));
         let day = crate::test_support::day_partition(2026, 8, 19);
         let (_key, memtable) = scribe_cohort_memtable(tenant_id, day, &schema);
-        let role_resources = crate::resources::BifrostRuntimeResources::composed_for_test(
-            crate::resources::MIN_UNMANAGED_RESERVE_BYTES
-                + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
-            crate::resources::MIN_SCRATCH_FREE_BYTES,
-            [crate::resources::BifrostRole::Scribe],
-        );
         let stream = StreamIdentity::new(
             crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
             WriterEpoch::new(2),
         );
-        let service = Arc::new(FetchLiveTailService::new(
-            stream,
-            memtable,
-            role_resources.scribe().expect("Scribe capability"),
-        ));
+        let service = Arc::new(FetchLiveTailService::new(stream, memtable));
         let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
         let session = SessionContext::new().state();
         let binding = TenantTableBinding {
@@ -2854,21 +3068,11 @@ pub(crate) mod tests {
         let schema = closure_fixture_schema();
         let day = crate::test_support::day_partition(2026, 8, 19);
         let (_key, memtable) = closure_fixture_memtable(tenant_id, day, &schema);
-        let role_resources = crate::resources::BifrostRuntimeResources::composed_for_test(
-            crate::resources::MIN_UNMANAGED_RESERVE_BYTES
-                + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
-            crate::resources::MIN_SCRATCH_FREE_BYTES,
-            [crate::resources::BifrostRole::Scribe],
-        );
         let stream = StreamIdentity::new(
             crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
             WriterEpoch::new(2),
         );
-        let service = Arc::new(FetchLiveTailService::new(
-            stream,
-            memtable,
-            role_resources.scribe().expect("Scribe capability"),
-        ));
+        let service = Arc::new(FetchLiveTailService::new(stream, memtable));
         let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
         (tenant_id, schema, stream, resolver)
     }

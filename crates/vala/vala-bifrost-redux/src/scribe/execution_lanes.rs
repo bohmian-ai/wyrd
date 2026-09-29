@@ -752,6 +752,41 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
     Ok(())
 }
 
+/// Requires every row of `rows` to carry one in-scope `card_ref`.
+///
+/// This is the mandatory form of [`validate_card_scope`] that Gate applies to
+/// the SYSTEM writer's verification-result batches before recording its one
+/// canonical write decision. Where the optional form admits an absent column
+/// or a null row as uncorrelated, a result row must be attributable, so the
+/// batch must declare exactly one `card_ref` field with no null value; every
+/// value is then parsed and authorized by the shared optional check. Scribe
+/// still runs the optional check and trusted UID stamping on admission, so
+/// this adds a precondition without replacing either.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::CardScopeDenied`] when the batch declares zero or
+/// several `card_ref` fields, any row is null, or [`validate_card_scope`]
+/// refuses the column type, a value's grammar, or its scope.
+pub(crate) fn require_card_scope(
+    rows: &RecordBatch,
+    principal: &Principal,
+) -> Result<(), ScribeError> {
+    let schema = rows.schema();
+    let mut fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name() == CARD_REF);
+    let (Some((index, _)), None) = (fields.next(), fields.next()) else {
+        return Err(ScribeError::CardScopeDenied);
+    };
+    if rows.column(index).null_count() != 0 {
+        return Err(ScribeError::CardScopeDenied);
+    }
+    validate_card_scope(rows, principal)
+}
+
 /// Lifts a caller-supplied `run_id` column out of a payload, if it carries one.
 ///
 /// `run_id` is a correlation name the caller may echo, so the column is taken
@@ -1803,6 +1838,9 @@ pub struct ScribeWalIoPool {
     /// Retire operations submitted through the production lane in unit tests.
     #[cfg(test)]
     retire_submissions: Arc<AtomicU64>,
+    /// Sync operations submitted through the production lane in unit tests.
+    #[cfg(test)]
+    sync_submissions: Arc<AtomicU64>,
 }
 
 impl ScribeWalIoPool {
@@ -1861,6 +1899,8 @@ impl ScribeWalIoPool {
             capacity,
             #[cfg(test)]
             retire_submissions: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            sync_submissions: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1871,6 +1911,10 @@ impl ScribeWalIoPool {
         #[cfg(test)]
         if matches!(&operation, ScribeWalIoOp::RetireWal { .. }) {
             self.retire_submissions.fetch_add(1, Ordering::AcqRel);
+        }
+        #[cfg(test)]
+        if matches!(&operation, ScribeWalIoOp::SyncWal { .. }) {
+            self.sync_submissions.fetch_add(1, Ordering::AcqRel);
         }
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
@@ -1965,6 +2009,12 @@ impl ScribeWalIoPool {
     #[cfg(test)]
     pub(crate) fn retire_submissions_for_test(&self) -> u64 {
         self.retire_submissions.load(Ordering::Acquire)
+    }
+
+    /// Returns sync submissions observed at the production WAL lane boundary.
+    #[cfg(test)]
+    pub(crate) fn sync_submissions_for_test(&self) -> u64 {
+        self.sync_submissions.load(Ordering::Acquire)
     }
 }
 
@@ -2097,7 +2147,9 @@ fn execute_replay_directory_stream(
             }
             let state_count = chunk.states.len();
             let (response, receiver) = tokio::sync::oneshot::channel();
-            shard_senders[shard]
+            // A lane recorded under an earlier shard count maps onto the
+            // running one; the owner retains the replayed segments by path.
+            shard_senders[shard % shard_senders.len()]
                 .blocking_send(crate::scribe::shards::ShardCommand::Replay {
                     chunk: Box::new(chunk),
                     response,
@@ -4104,5 +4156,57 @@ mod tests {
                 "{label} fails closed without registry IO"
             );
         }
+    }
+
+    /// The SYSTEM writer may correlate result rows only with its one signed
+    /// Verifier, and Scribe stamps that Verifier's signed UID.
+    ///
+    /// The SYSTEM principal has no root Card, so its signed scope is the sole
+    /// authority for row correlation: a row naming another Verifier is a
+    /// forgery and refuses the frame before admission.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the signed Verifier is refused or stamps a UID other than
+    /// its signed one, or when a different Verifier is admitted by either the
+    /// admission scope check or the stamping resolution.
+    #[test]
+    fn system_writer_correlates_only_its_signed_verifier() {
+        let verifier = resolved_card("prod/Verifier/drift@1.0.0");
+        let principal = Principal::new(
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalKind::System {
+                card_ref_scope: CardRefScope::own(&verifier),
+            },
+            crate::test_support::tenant(),
+            Vec::new(),
+            PermissionSet::new(),
+        );
+        let identity = CardRef {
+            uid: None,
+            ..verifier.clone()
+        }
+        .to_string();
+
+        let stamped = stamp_card_ref(&principal, SuppliedCardRef::Text(&identity))
+            .expect("the signed Verifier is admitted");
+        assert_eq!(
+            stamped_card_uid(&stamped).as_deref(),
+            verifier.uid.as_ref().map(CardUid::as_str),
+        );
+
+        let forged = "prod/Verifier/other@1.0.0";
+        let rows = batch(
+            vec![Field::new(CARD_REF, DataType::Utf8, true)],
+            vec![Arc::new(StringArray::from(vec![Some(forged)]))],
+        );
+        assert!(matches!(
+            super::validate_card_scope(&rows, &principal),
+            Err(ScribeError::CardScopeDenied)
+        ));
+        assert!(matches!(
+            stamp_card_ref(&principal, SuppliedCardRef::Text(forged)),
+            Err(ScribeError::CardUnresolved)
+        ));
     }
 }

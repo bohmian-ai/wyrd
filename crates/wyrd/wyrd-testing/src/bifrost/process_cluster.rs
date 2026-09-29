@@ -118,6 +118,10 @@ mod env {
     /// Oracle query slot units each child admits with, when the topology states
     /// one. Absent unless the caller asked for a stated admission capacity.
     pub const ORACLE_QUERY_SLOT_LIMIT: &str = "WYRD_PEER_TEST_ORACLE_QUERY_SLOT_LIMIT";
+    /// Memory envelope the child injects into its resource plan, when the
+    /// topology states one. Absent for every journey topology; only the
+    /// benchmark launch sets it, to the same bytes its systemd scope is limited to.
+    pub const MEMORY_LIMIT_BYTES: &str = "WYRD_PEER_TEST_MEMORY_LIMIT_BYTES";
 }
 
 /// Bifrost target one simulated pod serves.
@@ -210,7 +214,7 @@ pub enum ControlRequest {
         /// Table name inside the `vala.bifrost` namespace.
         table: String,
     },
-    /// Write and publish deterministic fixture rows through this child's Scribe.
+    /// Write deterministic fixture rows through this child's Scribe.
     IngestRows {
         /// Table name inside the `vala.bifrost` namespace.
         table: String,
@@ -220,6 +224,8 @@ pub enum ControlRequest {
         rows: i64,
         /// Distinct `filter_key` groups the rows fall into.
         groups: i64,
+        /// Whether to freeze and publish the rows, rather than leave them live.
+        publish: bool,
     },
     /// Freeze and publish everything this child's Scribe currently holds.
     ///
@@ -243,6 +249,8 @@ pub enum ControlRequest {
     PeerProbe(PeerProbePlan),
     /// Report how many request bodies this child's peer plane has polled.
     PeerBodyPolls,
+    /// Report this child's cumulative Scribe fragment executions.
+    ScribeFragments,
     /// Report this child's physical-build total, latest cut, and active cuts.
     PhysicalBuildEvidence,
     /// Arm the one-shot refusal of this child's next distributed physical build.
@@ -277,6 +285,17 @@ pub enum ControlRequest {
     CancelInactiveSql,
     /// Block until that statement reaches its terminal and report it.
     AwaitInactiveSql,
+    /// Write this child's raw metrics exposition and cgroup files, and report
+    /// its effective limits and resource plan.
+    ///
+    /// Read-only against the server. The raw files land under `directory`, a
+    /// parent-chosen path inside this child's private root, because a full
+    /// Prometheus exposition exceeds the bounded control line.
+    CaptureResourceEvidence {
+        /// Existing directory the child writes `metrics.prom` and the cgroup
+        /// files into.
+        directory: PathBuf,
+    },
     /// Begin ordered shutdown and exit.
     Shutdown,
 }
@@ -526,8 +545,15 @@ pub enum ControlResponse {
         /// Request bodies this child's peer plane has polled since start.
         count: u64,
     },
+    /// Answer to [`ControlRequest::ScribeFragments`].
+    ScribeFragments {
+        /// Scribe fragments this child executed after authenticated resolution.
+        executions: u64,
+    },
     /// Answer to [`ControlRequest::PhysicalBuildEvidence`].
     PhysicalBuilds(PhysicalBuildEvidence),
+    /// Answer to [`ControlRequest::CaptureResourceEvidence`].
+    ResourceEvidence(ResourceEvidence),
     /// The request could not be served.
     ///
     /// Carries a non-secret detail only: the child never renders key material,
@@ -614,8 +640,6 @@ pub struct OracleOwnershipSnapshot {
     pub queued_queries: u64,
     /// Memory bytes reserved by active queries.
     pub reserved_memory_bytes: u64,
-    /// Spill bytes reserved by active queries.
-    pub reserved_spill_bytes: u64,
     /// Peer pending reservations held by this Oracle.
     pub peer_pending: u64,
     /// Peer running reservations held by this Oracle.
@@ -628,8 +652,6 @@ pub struct OracleOwnershipSnapshot {
     pub root_query_slot_units: u32,
     /// Memory retained specifically by Oracle query owners.
     pub root_query_memory_used_bytes: u64,
-    /// Scratch retained specifically by Oracle query owners.
-    pub root_query_scratch_used_bytes: u64,
     /// Whether at least one Oracle query owner is active.
     pub root_query_active: bool,
     /// Process-owned Oracle scratch occupancy.
@@ -640,6 +662,159 @@ pub struct OracleOwnershipSnapshot {
     pub exchanges_active: f64,
     /// Live `oracle_fragments_active` production gauge.
     pub fragments_active: f64,
+}
+
+/// Cgroup files a child copies into its resource-evidence directory.
+///
+/// `cpu.max` and `memory.max` are the limits the benchmark verifies; the rest
+/// are the child resource evidence a report carries — CPU usage and
+/// throttling, current and peak memory, and OOM events.
+pub const CGROUP_EVIDENCE_FILES: [&str; 6] = [
+    "cpu.max",
+    "memory.max",
+    "cpu.stat",
+    "memory.current",
+    "memory.peak",
+    "memory.events",
+];
+
+/// A child's effective OS limits and the resource plan it booted with.
+///
+/// Produced inside the child, so the limits are what its own cgroup enforces
+/// rather than what the parent believes it asked systemd for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceEvidence {
+    /// The child's cgroup-v2 path from `/proc/self/cgroup`, relative to
+    /// `/sys/fs/cgroup`; absent when the process reports no unified cgroup.
+    pub cgroup: Option<String>,
+    /// Contents of the child's `cpu.max`, absent when no cgroup limit exists.
+    pub cpu_max: Option<String>,
+    /// Contents of the child's `memory.max`, absent when no cgroup limit exists.
+    pub memory_max: Option<String>,
+    /// Memory envelope the child's resource plan was resolved from.
+    pub plan_memory_limit_bytes: usize,
+    /// Effective CPU count the child's resource plan was resolved from.
+    pub plan_effective_cpu: usize,
+    /// Oracle slot units the child's resource plan derives.
+    pub plan_oracle_slots: usize,
+    /// Oracle slot units the child installed and reports through its
+    /// `bifrost_oracle_local_slot_units{kind="limit"}` gauge, or `None` for a
+    /// target that composes no Oracle.
+    pub oracle_slot_units: Option<usize>,
+}
+
+impl ResourceEvidence {
+    /// Checks that the child's OS limits and resource plan both equal the
+    /// stated envelope.
+    ///
+    /// A benchmark number is only evidence for the envelope it ran under, so a
+    /// child whose cgroup is unlimited, differently limited, or whose plan was
+    /// resolved from a different snapshot is refused rather than measured.
+    /// `cpu.max` must be exactly `effective_cpu` periods of quota,
+    /// `memory.max` exactly `memory_limit_bytes`, and any installed Oracle slot
+    /// count the one that plan derives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] naming the first limit that is
+    /// absent, unlimited, malformed, or different from the envelope, or an
+    /// installed slot count the plan does not derive.
+    pub fn verify_envelope(
+        &self,
+        effective_cpu: usize,
+        memory_limit_bytes: usize,
+    ) -> Result<(), ProcessClusterError> {
+        let refuse = |detail: String| Err(ProcessClusterError::Resource(detail));
+        let Some(cpu_max) = self.cpu_max.as_deref() else {
+            return refuse("the child has no cgroup cpu.max limit".to_owned());
+        };
+        let mut fields = cpu_max.split_whitespace();
+        let quota = fields.next().and_then(|value| value.parse::<u64>().ok());
+        let period = fields.next().and_then(|value| value.parse::<u64>().ok());
+        let (Some(quota), Some(period)) = (quota, period) else {
+            return refuse(format!("the child's cpu.max `{cpu_max}` sets no CPU quota"));
+        };
+        if u64::try_from(effective_cpu)
+            .ok()
+            .and_then(|cpus| cpus.checked_mul(period))
+            != Some(quota)
+        {
+            return refuse(format!(
+                "the child's cpu.max `{cpu_max}` is not {effective_cpu} CPUs"
+            ));
+        }
+        let Some(memory_max) = self.memory_max.as_deref() else {
+            return refuse("the child has no cgroup memory.max limit".to_owned());
+        };
+        if memory_max.trim().parse::<usize>().ok() != Some(memory_limit_bytes) {
+            return refuse(format!(
+                "the child's memory.max `{}` is not {memory_limit_bytes} bytes",
+                memory_max.trim()
+            ));
+        }
+        if self.plan_effective_cpu != effective_cpu
+            || self.plan_memory_limit_bytes != memory_limit_bytes
+        {
+            return refuse(format!(
+                "the child's resource plan ({} CPUs, {} bytes) is not the injected envelope",
+                self.plan_effective_cpu, self.plan_memory_limit_bytes
+            ));
+        }
+        if let Some(installed) = self.oracle_slot_units
+            && installed != self.plan_oracle_slots
+        {
+            return refuse(format!(
+                "the child installed {installed} Oracle slot units, but its plan derives {}",
+                self.plan_oracle_slots
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// CPUs the benchmark child's scope is limited to and its plan uses.
+pub const BENCHMARK_EFFECTIVE_CPU: usize = 4;
+
+/// Memory limit of the benchmark child's scope, with no swap, which its plan
+/// also uses: 8 GiB.
+pub const BENCHMARK_MEMORY_LIMIT_BYTES: usize = 8_589_934_592;
+
+/// Rewrites a prepared child command to run in its own systemd user scope.
+///
+/// `systemd-run --scope` places itself in a new transient `unit` limited to
+/// [`BENCHMARK_EFFECTIVE_CPU`] CPUs and [`BENCHMARK_MEMORY_LIMIT_BYTES`] with
+/// no swap, then execs `child` in place. The child therefore keeps the parent's
+/// PID, stdin/stdout control pipes, environment, working directory, loopback
+/// listeners, and private roots, while the parent, the benchmark driver, and
+/// PostgreSQL stay outside that cgroup. `--collect` removes the unit once the
+/// child exits, so the existing kill-and-reap path also stops the scope.
+/// (`--pipe` is rejected in scope mode and unnecessary: the exec keeps the
+/// child's own stdio.)
+fn benchmark_scope(child: &Command, unit: &str) -> Command {
+    let mut command = Command::new("systemd-run");
+    command
+        .args(["--user", "--scope", "--quiet", "--collect", "--unit", unit])
+        .arg(format!(
+            "--property=CPUQuota={}%",
+            BENCHMARK_EFFECTIVE_CPU * 100
+        ))
+        .arg(format!(
+            "--property=MemoryMax={BENCHMARK_MEMORY_LIMIT_BYTES}"
+        ))
+        .arg("--property=MemorySwapMax=0")
+        .arg("--")
+        .arg(child.get_program())
+        .args(child.get_args());
+    for (key, value) in child.get_envs() {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    if let Some(directory) = child.get_current_dir() {
+        command.current_dir(directory);
+    }
+    command
 }
 
 /// One directory tree's entry and byte occupancy at a moment.
@@ -778,17 +953,23 @@ pub enum AddressPlan {
 }
 
 impl AddressPlan {
-    /// Detects whether this platform can assign distinct loopback addresses,
-    /// and picks this cluster's random loopback block when it can.
+    /// Detects whether this platform can bind the canonical ports on a distinct
+    /// loopback address, and picks this cluster's random block when it can.
     #[must_use]
     pub fn detect() -> Self {
         let subnet: [u8; 2] = rand::random();
-        match TcpListener::bind((Ipv4Addr::new(127, subnet[0], subnet[1], 2), 0)) {
-            Ok(listener) => {
-                drop(listener);
-                Self::DistinctLoopbackAddresses { subnet }
-            }
-            Err(_) => Self::DistinctPortsOnLocalhost,
+        let host = Ipv4Addr::new(127, subnet[0], subnet[1], 2);
+        let canonical_ports_available = [
+            CANONICAL_PUBLIC_HTTP_PORT,
+            CANONICAL_PUBLIC_GRPC_PORT,
+            CANONICAL_PEER_PORT,
+        ]
+        .into_iter()
+        .all(|port| TcpListener::bind((host, port)).is_ok());
+        if canonical_ports_available {
+            Self::DistinctLoopbackAddresses { subnet }
+        } else {
+            Self::DistinctPortsOnLocalhost
         }
     }
 
@@ -1144,11 +1325,47 @@ impl ProcessNode {
         rows: i64,
         groups: i64,
     ) -> Result<(), ProcessClusterError> {
+        self.ingest(table, start_id, rows, groups, true)
+    }
+
+    /// Writes deterministic fixture rows and leaves them live on this Scribe.
+    ///
+    /// Nothing is frozen or published, so a later query can only read these
+    /// rows through a live fragment on this pod.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest_rows`].
+    pub fn ingest_live_rows(
+        &mut self,
+        table: &str,
+        start_id: i64,
+        rows: i64,
+        groups: i64,
+    ) -> Result<(), ProcessClusterError> {
+        self.ingest(table, start_id, rows, groups, false)
+    }
+
+    /// Sends one fixture ingest, optionally followed by publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the ingest or publication failed.
+    fn ingest(
+        &mut self,
+        table: &str,
+        start_id: i64,
+        rows: i64,
+        groups: i64,
+        publish: bool,
+    ) -> Result<(), ProcessClusterError> {
         match self.request(&ControlRequest::IngestRows {
             table: table.to_owned(),
             start_id,
             rows,
             groups,
+            publish,
         })? {
             ControlResponse::Ingested => Ok(()),
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
@@ -1255,6 +1472,31 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected metric totals, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Asks this child to write its raw metrics and cgroup files into
+    /// `directory` and report its effective limits and resource plan.
+    ///
+    /// `directory` must already exist and be visible to the child at the same
+    /// path — under this node's [`Self::root`] it always is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the child could not write the files.
+    pub fn capture_resource_evidence(
+        &mut self,
+        directory: &Path,
+    ) -> Result<ResourceEvidence, ProcessClusterError> {
+        match self.request(&ControlRequest::CaptureResourceEvidence {
+            directory: directory.to_path_buf(),
+        })? {
+            ControlResponse::ResourceEvidence(evidence) => Ok(evidence),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected resource evidence, received {other:?}"
             ))),
         }
     }
@@ -1395,6 +1637,25 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected a body-poll count, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Reads how many Scribe fragments this child has executed.
+    ///
+    /// Differenced across one query, it names exactly which Scribe pods a
+    /// live read dispatched to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when this target composes no Scribe.
+    pub fn scribe_fragments(&mut self) -> Result<u64, ProcessClusterError> {
+        match self.request(&ControlRequest::ScribeFragments)? {
+            ControlResponse::ScribeFragments { executions } => Ok(executions),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected a Scribe fragment count, received {other:?}"
             ))),
         }
     }
@@ -1852,6 +2113,9 @@ pub struct BifrostProcessCluster {
     /// capacity is a property of the topology rather than of whatever the
     /// injected memory envelope happens to divide into.
     oracle_query_slot_limit: Option<usize>,
+    /// Whether every child is launched in its own limited systemd scope with
+    /// the benchmark envelope, set only by [`Self::start_benchmark`].
+    benchmark: bool,
 }
 
 impl std::fmt::Debug for BifrostProcessCluster {
@@ -1926,6 +2190,83 @@ impl BifrostProcessCluster {
         targets: &[ProcessNodeTarget],
         oracle_query_slot_limit: Option<usize>,
     ) -> Result<Self, ProcessClusterError> {
+        Self::launch_topology(binary.into(), targets, oracle_query_slot_limit, false).await
+    }
+
+    /// Launches one local child per target, each in its own limited systemd
+    /// user scope, for the query capacity benchmark.
+    ///
+    /// The colocated benchmark launches one mixed `All` pod; the remote-Scribe
+    /// run adds a `Scribe` pod beside it. Each child boots with a [`BENCHMARK_EFFECTIVE_CPU`]-CPU,
+    /// [`BENCHMARK_MEMORY_LIMIT_BYTES`]-byte injected resource snapshot, and
+    /// [`benchmark_scope`] enforces exactly that envelope. Before returning,
+    /// the `cpu.max`, `memory.max`, resolved plan, and installed Oracle slot
+    /// count of each child's own cgroup are read back and compared with it; a
+    /// mismatch, an unlimited cgroup, or an unready child is refused and every
+    /// pod torn down. Oracle admission is left on its derived slot count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::start`], and
+    /// [`ProcessClusterError::Resource`] when the child's effective limits or
+    /// plan differ from the injected envelope.
+    pub async fn start_benchmark(
+        binary: impl Into<PathBuf>,
+        targets: &[ProcessNodeTarget],
+    ) -> Result<Self, ProcessClusterError> {
+        let mut cluster = Self::launch_topology(binary.into(), targets, None, true).await?;
+        let verified = cluster.verify_benchmark_envelope();
+        match verified {
+            Ok(()) => Ok(cluster),
+            Err(error) => match cluster.shutdown() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(ProcessClusterError::Child(format!(
+                    "{error}; cleanup after it also failed: {cleanup}"
+                ))),
+            },
+        }
+    }
+
+    /// Refuses a benchmark topology with a pod that is unready or not limited
+    /// to its envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when no pod launched, a pod is
+    /// unready, or its evidence fails [`ResourceEvidence::verify_envelope`],
+    /// and the control errors of [`ProcessNode::capture_resource_evidence`].
+    fn verify_benchmark_envelope(&mut self) -> Result<(), ProcessClusterError> {
+        if self.nodes.is_empty() {
+            return Err(ProcessClusterError::Resource(
+                "the benchmark launched no pod".to_owned(),
+            ));
+        }
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            if !node.inspect()?.ready {
+                return Err(ProcessClusterError::Resource(format!(
+                    "benchmark pod {index} is not ready"
+                )));
+            }
+            let directory = node.root().join("launch-evidence");
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
+            node.capture_resource_evidence(&directory)?
+                .verify_envelope(BENCHMARK_EFFECTIVE_CPU, BENCHMARK_MEMORY_LIMIT_BYTES)?;
+        }
+        Ok(())
+    }
+
+    /// Prepares the shared resources and launches one child per target.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::start`].
+    async fn launch_topology(
+        binary: PathBuf,
+        targets: &[ProcessNodeTarget],
+        oracle_query_slot_limit: Option<usize>,
+        benchmark: bool,
+    ) -> Result<Self, ProcessClusterError> {
         let fixture = Arc::new(
             PgFixture::start()
                 .await
@@ -1958,8 +2299,9 @@ impl BifrostProcessCluster {
             shared,
             nodes: Vec::new(),
             address_plan,
-            binary: binary.into(),
+            binary,
             oracle_query_slot_limit,
+            benchmark,
         };
         for (index, target) in targets.iter().copied().enumerate() {
             let plan = LaunchPlan {
@@ -2344,6 +2686,18 @@ impl BifrostProcessCluster {
         if let Some(slots) = self.oracle_query_slot_limit {
             command.env(env::ORACLE_QUERY_SLOT_LIMIT, slots.to_string());
         }
+        if self.benchmark {
+            command.env(
+                env::MEMORY_LIMIT_BYTES,
+                BENCHMARK_MEMORY_LIMIT_BYTES.to_string(),
+            );
+            let unit = format!("wyrd-bench-{label}-{}", uuid::Uuid::now_v7().simple());
+            command = benchmark_scope(&command, &unit);
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
         let mut child = command
             .spawn()
             .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
@@ -2393,6 +2747,10 @@ impl BifrostProcessCluster {
         // nothing at all, so a diagnosing run that already asked for logs
         // through `RUST_LOG` gets every child line on the parent's stderr.
         let echo = std::env::var_os("RUST_LOG").is_some();
+        // Every line is also kept whole in `stderr.log` under the child's root,
+        // so a benchmark can save the pod's complete log beside its report.
+        let mut log = std::fs::File::create(root.join("stderr.log"))
+            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         let stderr_thread = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
@@ -2400,6 +2758,7 @@ impl BifrostProcessCluster {
                 if echo {
                     eprintln!("[child {pid}] {line}");
                 }
+                let _ = writeln!(log, "{line}");
                 match drain_tail.lock() {
                     Ok(mut tail) => tail.push(line),
                     Err(poisoned) => poisoned.into_inner().push(line),
@@ -2578,6 +2937,160 @@ mod child;
 mod tests {
     use super::*;
 
+    /// The benchmark launch refuses a pod whose OS limits or plan are not its
+    /// envelope, while journey pods keep their existing snapshot.
+    ///
+    /// Covers the three places the envelope is stated: the systemd scope
+    /// wrapped around the local child, the child's injected resource snapshot,
+    /// and the read-back verification that refuses absent, unlimited, or
+    /// mismatched limits and a slot count the plan does not derive.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a wrong envelope verifies, the exact one does not, a
+    /// journey snapshot moved, or the scope launches through a container
+    /// runtime, leaks an environment value into its argv, omits a limit, or
+    /// does not exec the unchanged child command.
+    #[test]
+    fn benchmark_launch_refuses_mismatched_or_absent_limits() {
+        let cpus = BENCHMARK_EFFECTIVE_CPU;
+        let bytes = BENCHMARK_MEMORY_LIMIT_BYTES;
+        let exact = ResourceEvidence {
+            cgroup: Some("/user.slice/app.slice/wyrd-bench-pod-0.scope".to_owned()),
+            cpu_max: Some("400000 100000".to_owned()),
+            memory_max: Some("8589934592".to_owned()),
+            plan_memory_limit_bytes: bytes,
+            plan_effective_cpu: cpus,
+            plan_oracle_slots: 8,
+            oracle_slot_units: Some(8),
+        };
+        exact
+            .verify_envelope(cpus, bytes)
+            .expect("the exact envelope verifies");
+        let broken = [
+            (
+                "absent cpu.max",
+                ResourceEvidence {
+                    cpu_max: None,
+                    ..exact.clone()
+                },
+            ),
+            (
+                "unlimited cpu",
+                ResourceEvidence {
+                    cpu_max: Some("max 100000".to_owned()),
+                    ..exact.clone()
+                },
+            ),
+            (
+                "two CPUs",
+                ResourceEvidence {
+                    cpu_max: Some("200000 100000".to_owned()),
+                    ..exact.clone()
+                },
+            ),
+            (
+                "absent memory.max",
+                ResourceEvidence {
+                    memory_max: None,
+                    ..exact.clone()
+                },
+            ),
+            (
+                "unlimited memory",
+                ResourceEvidence {
+                    memory_max: Some("max".to_owned()),
+                    ..exact.clone()
+                },
+            ),
+            (
+                "2 GiB",
+                ResourceEvidence {
+                    memory_max: Some("2147483648".to_owned()),
+                    ..exact.clone()
+                },
+            ),
+            (
+                "journey plan",
+                ResourceEvidence {
+                    plan_memory_limit_bytes: 2 << 30,
+                    ..exact.clone()
+                },
+            ),
+            (
+                "plan CPUs",
+                ResourceEvidence {
+                    plan_effective_cpu: 8,
+                    ..exact.clone()
+                },
+            ),
+            (
+                "installed slots",
+                ResourceEvidence {
+                    oracle_slot_units: Some(4),
+                    ..exact.clone()
+                },
+            ),
+        ];
+        for (case, evidence) in broken {
+            assert!(
+                evidence.verify_envelope(cpus, bytes).is_err(),
+                "{case} must be refused"
+            );
+        }
+
+        let journey = child::pod_system_resources(ProcessNodeTarget::All, None);
+        assert_eq!(
+            (journey.effective_cpu, journey.memory_limit_bytes),
+            (4, 2 << 30),
+            "the journey constructor keeps its 4-CPU/2-GiB snapshot"
+        );
+        assert_eq!(
+            child::pod_system_resources(ProcessNodeTarget::Oracle, None).memory_limit_bytes,
+            512 << 20
+        );
+        let benchmark = child::pod_system_resources(ProcessNodeTarget::All, Some(bytes));
+        assert_eq!(
+            (benchmark.effective_cpu, benchmark.memory_limit_bytes),
+            (cpus, bytes)
+        );
+
+        let mut child = Command::new("/opt/node");
+        child
+            .arg("--flag")
+            .env(env::DATABASE, "secret-database-value")
+            .current_dir("/roots");
+        let scoped = benchmark_scope(&child, "wyrd-bench-pod-0-1");
+        assert_eq!(scoped.get_program(), "systemd-run");
+        let args: Vec<String> = scoped
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--unit",
+                "wyrd-bench-pod-0-1",
+                "--property=CPUQuota=400%",
+                "--property=MemoryMax=8589934592",
+                "--property=MemorySwapMax=0",
+                "--",
+                "/opt/node",
+                "--flag",
+            ]
+        );
+        assert!(
+            scoped.get_envs().any(|(key, value)| key == env::DATABASE
+                && value == Some("secret-database-value".as_ref())),
+            "the child environment is inherited, not put in argv"
+        );
+        assert_eq!(scoped.get_current_dir(), Some(Path::new("/roots")));
+    }
+
     /// The ownership control shape survives the control protocol unchanged.
     ///
     /// The snapshot is the parent's only view of a child's retained ownership,
@@ -2601,14 +3114,12 @@ mod tests {
             active_queries: 7,
             queued_queries: 8,
             reserved_memory_bytes: 9,
-            reserved_spill_bytes: 10,
             peer_pending: 11,
             peer_running: 12,
             root_active_queries: 13,
             root_analytical_queries: 14,
             root_query_slot_units: 15,
             root_query_memory_used_bytes: 16,
-            root_query_scratch_used_bytes: 17,
             root_query_active: true,
             scratch: ScratchUsage {
                 entries: 18,

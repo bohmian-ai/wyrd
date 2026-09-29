@@ -1,4 +1,5 @@
-//! `EvalSpec` — the typed spec body for the `Eval` card kind.
+//! `EvalSpec` — the typed spec body carried by a `kind: Verifier` card
+//! whose `implementation.kind` is `eval`.
 //!
 //! Envelope-level fields (`metadata.space`, `metadata.name`,
 //! `metadata.version`, `apiVersion`) live on the outer `Card`, not here.
@@ -25,10 +26,11 @@ use super::workflow::Workflow;
 /// side.
 pub const MAX_EVAL_TASKS: usize = 512;
 
-/// The typed spec body for an `Eval` card.
+/// The typed spec body of an `eval` Verifier implementation.
 ///
-/// This struct does not carry a discriminator; the outer `CardBody` enum
-/// carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.
+/// This struct does not carry a discriminator; the enclosing
+/// `VerifierImplementation` union supplies the `implementation.kind: eval` and
+/// `implementation.spec: { ... }` wire shape on a `Verifier` Card.
 ///
 /// Authors declare:
 /// - `dataset` — source data, typically a `Data` card with eval scenarios.

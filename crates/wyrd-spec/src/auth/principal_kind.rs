@@ -1,8 +1,8 @@
 //! Principal-kind discriminator contract.
 //!
 //! [`PrincipalKindTag`] is the canonical **bare discriminator** — the kind label
-//! (`global_admin` / `tenant_admin` / `user` / `service` / `agent`) without a
-//! bound card. It is the single wire
+//! (`global_admin` / `tenant_admin` / `user` / `service` / `agent` /
+//! `system`) without a bound card. It is the single wire
 //! encoding for every site that identifies a principal kind: the revoke-by-id
 //! request body, access- and refresh-token claims, the audit event, and the
 //! CLI.
@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 /// Principal-kind discriminator without a bound card.
 ///
 /// Serializes as a bare snake_case string (`"global_admin"`, `"tenant_admin"`,
-/// `"user"`, `"service"`, `"agent"`); this is a stable wire contract for the
-/// revoke request body, token claims, and the durable `principal_kind`
-/// columns.
+/// `"user"`, `"service"`, `"agent"`, `"system"`); this is a stable wire
+/// contract for the revoke request body, token claims, and the durable
+/// `principal_kind` columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +39,15 @@ pub enum PrincipalKindTag {
     Service,
     /// Agent principal.
     Agent,
+    /// Internal tenant verification-result writer.
+    ///
+    /// Exactly one credentialless principal of this kind exists per tenant,
+    /// created by tenant provisioning. It binds no Card, holds no role, and is
+    /// absent from every public principal-management and credential path; the
+    /// server alone mints its short-lived token, scoped to one exact Verifier
+    /// Card, to publish canonical verification results. It stays representable
+    /// here so token claims and audit records can attribute those writes.
+    System,
 }
 
 impl PrincipalKindTag {
@@ -51,6 +60,7 @@ impl PrincipalKindTag {
             Self::User => "user",
             Self::Service => "service",
             Self::Agent => "agent",
+            Self::System => "system",
         }
     }
 }
@@ -66,6 +76,25 @@ mod tests {
         assert_eq!(PrincipalKindTag::User.as_str(), "user");
         assert_eq!(PrincipalKindTag::Service.as_str(), "service");
         assert_eq!(PrincipalKindTag::Agent.as_str(), "agent");
+        assert_eq!(PrincipalKindTag::System.as_str(), "system");
+    }
+
+    /// The internal verification-result writer is the sixth wire value and
+    /// round-trips as the bare `system` label in token and audit contracts.
+    ///
+    /// # Panics
+    /// Panics when the tag does not serialize or deserialize as `"system"`.
+    #[test]
+    fn system_tag_round_trips_as_bare_string() {
+        assert_eq!(
+            serde_json::to_value(PrincipalKindTag::System).expect("serializes"),
+            serde_json::json!("system")
+        );
+        assert_eq!(
+            serde_json::from_value::<PrincipalKindTag>(serde_json::json!("system"))
+                .expect("deserializes"),
+            PrincipalKindTag::System
+        );
     }
 
     #[test]

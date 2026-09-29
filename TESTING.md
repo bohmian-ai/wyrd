@@ -70,6 +70,7 @@ mise run test:bifrost                    # all Bifrost tests and language surfac
 mise run test:bifrost:integration:redux  # tier 2: the whole redux crate
 mise run test:bifrost:journey            # tier 1: every capability, one DB lifecycle
 mise run test:bifrost:journey:oracle     # tier 1: one capability
+mise run test:bifrost:journey:scribe:production-geometry  # scheduled 512 MiB object qualification
 #                     :sdk :forge :scribe :oracle :otlp :server :mcp :python :typescript
 ```
 

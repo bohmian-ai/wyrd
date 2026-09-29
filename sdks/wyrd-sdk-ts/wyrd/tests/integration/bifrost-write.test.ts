@@ -220,6 +220,46 @@ describe("Bifrost write journey", () => {
     }
   }, 30_000);
 
+  it("registers a compaction target, describes it back, and refuses a different one", async () => {
+    const server = startTestServer();
+    try {
+      const fqn = `vala.datasets.target_${Date.now().toString(36)}`;
+      const target = 256 * 1024 * 1024;
+      const register = async (bytes?: number) => {
+        const bifrost = await connect(
+          server,
+          TableConfig.fromJsonSchema(fqn, SCHEMA, undefined, bytes),
+        );
+        try {
+          return await bifrost.register();
+        } finally {
+          await bifrost.shutdown();
+        }
+      };
+      const describeTarget = async () =>
+        (
+          await TableConfig.describe(fqn, {
+            serverUrl: server.baseUrl,
+            credential: server.apiKey,
+            grpcUrl: server.grpcUrl,
+          })
+        ).compactionTargetFileSizeBytes;
+
+      expect(await register(target)).toBe("created");
+      expect(await describeTarget()).toBe(target);
+      expect(await register(target)).toBe("already_exists");
+      // Omitting the target defers to what the table already recorded.
+      expect(await register()).toBe("already_exists");
+
+      const mismatch = await rejection(register(target * 2));
+      expect(mismatch.code).toBe("WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH");
+      expect(mismatch.status).toBe(409);
+      expect(await describeTarget()).toBe(target);
+    } finally {
+      server.shutdown();
+    }
+  }, 30_000);
+
   it("describes an existing table without restating its schema", async () => {
     const server = startTestServer();
     try {

@@ -16,6 +16,11 @@ class WyrdTestServer:
     ``cleanup`` is reserved for a future teardown-skip feature; currently ignored
     (the server and embedded Postgres are always cleaned up on exit).
 
+    ``audit_publication=False`` keeps the server's audit publisher from retiring
+    staged audit rows, for a journey that counts staged decisions.
+
+    ``verification_runtime=True`` composes the verification runtime, so Drift
+    baselines fit and verification runs execute in the background.
     ``provider_base_url``, when set, makes the gateway dispatch over HTTP with
     every built-in adapter pointed at that local mock upstream (``OpenAI`` under
     ``/v1``); operator credential bindings read ``WYRD_TEST_GATEWAY_PROVIDER_KEY``.
@@ -29,6 +34,8 @@ class WyrdTestServer:
         self,
         cleanup: bool = True,
         mutate_env: bool = True,
+        audit_publication: bool = True,
+        verification_runtime: bool = False,
         provider_base_url: str | None = None,
         live_providers: bool = False,
     ) -> None: ...
@@ -69,6 +76,21 @@ class WyrdTestServer:
         """
         ...
 
+    def credential_registered_service(self, card_ref: str, roles: list[str]) -> str:
+        """Issue an API key for the principal a registered Service Card projects.
+
+        ``card_ref`` is the canonical ``space/Kind/name@version`` identity of an
+        already-registered Service. The key carries that Service's real card-ref
+        scope, so a run may observe the component Cards its spec references.
+        """
+        ...
+
+    def make_binding_due(self, binding_id: str) -> None: ...
+    def verification_runs(self) -> list[str]: ...
+    def retire_fitted_format(self, verifier_uid: str) -> None: ...
+    def table_describe_count(self, fqn: str) -> int: ...
+    def fail_table_describe(self, fqn: str) -> None: ...
+    def restore_table_describe(self) -> None: ...
     def scoped_api_key(self, role: str, permissions: list[str | dict[str, object]]) -> str:
         """Seed ``role`` with exactly ``permissions`` and return a service API key.
 

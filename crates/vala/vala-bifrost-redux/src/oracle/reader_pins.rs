@@ -27,8 +27,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedMutexGuard, mpsc};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tokio_util::task::task_tracker::TaskTrackerToken;
 use vala_sql::queries::oracle_reader_authority::{
     BifrostTableMaintenanceAuthority, OracleReaderEpochs, OracleTableProtections,
 };
@@ -452,17 +454,17 @@ struct OracleTableCoordinator {
     confirmed: Option<ProtectionRecord>,
 }
 
-/// One reserved instruction to remove a query's pins from its tables.
+/// One instruction to remove a query's pins from its tables.
 ///
-/// The permit is reserved at admission, before any cut is published, so a
-/// saturated queue can never lose a release: the query could not have been
-/// admitted without one.
+/// The command carries the query's descendant token until the narrowing
+/// worker has applied it, so the epoch's descendant join cannot complete while
+/// a released query's pins are still queued for removal.
 #[derive(Debug)]
 struct NarrowingCommand {
     /// Exact per-table pins to remove.
     holdings: Vec<(TableAuthorityIdentity, u64)>,
-    /// Reservation consumed by this command.
-    _permit: OwnedSemaphorePermit,
+    /// Descendant token dropped once this command has been applied.
+    _descendant: TaskTrackerToken,
 }
 
 /// Clonable proof that one query may still perform snapshot-dependent IO.
@@ -570,16 +572,20 @@ impl ReaderIoPermit {
 /// The guard is the query's claim, and its lifetime is the cut's lifetime by
 /// construction: a plan abandoned before execution, a stream dropped mid-scan,
 /// and a cancelled attempt all release through the same path without anyone
-/// remembering to. Release enqueues the reservation taken at admission rather
-/// than performing SQL inline, because the last descendant may terminate on a
-/// path that cannot await.
+/// remembering to. Release enqueues a narrowing command rather than performing
+/// SQL inline, because the last descendant may terminate on a path that
+/// cannot await.
+///
+/// The guard counts toward the epoch's descendant join but imposes no limit:
+/// query capacity belongs to Oracle admission and the pod governor, never to
+/// snapshot protection.
 pub struct ReaderQueryGuard {
-    /// Authority the reserved release command is sent to.
+    /// Authority the release command is sent to.
     authority: Arc<OracleReaderAuthority>,
     /// Exact per-table pins this query holds.
     holdings: Vec<(TableAuthorityIdentity, u64)>,
-    /// Reservation consumed when the pins are enqueued for removal.
-    release: Option<OwnedSemaphorePermit>,
+    /// Descendant token moved into the narrowing command on release.
+    release: Option<TaskTrackerToken>,
     /// Query-scoped cancellation shared with every permit this guard issued.
     ///
     /// Cancelling it on release is what makes the permit strictly weaker than
@@ -600,23 +606,34 @@ impl std::fmt::Debug for ReaderQueryGuard {
 }
 
 impl Drop for ReaderQueryGuard {
-    /// Enqueues this query's exact pin removals using its reserved permit.
+    /// Cancels this query's IO permits and enqueues its exact pin removals.
     ///
-    /// A closed queue means the authority is already shutting down and has
-    /// taken ownership of draining; the pins it would remove are removed there.
+    /// The channel is unbounded, so the send cannot fail for lack of room. It
+    /// fails only when the narrowing worker has stopped: during retirement that
+    /// is expected, because retirement joins every descendant before stopping
+    /// the worker and then releases each table whole. A failed send while the
+    /// epoch still admits is an authority fault; the pins stay durable, which
+    /// is the conservative side, and it is never reported as query capacity.
     fn drop(&mut self) {
         self.query_cancel.cancel();
-        let Some(permit) = self.release.take() else {
+        let Some(descendant) = self.release.take() else {
             return;
         };
         let command = NarrowingCommand {
             holdings: std::mem::take(&mut self.holdings),
-            _permit: permit,
+            _descendant: descendant,
         };
-        if self.authority.narrowing_tx.try_send(command).is_err() {
-            tracing::debug!(
-                "Oracle reader guard released after its authority closed; shutdown owns the drain"
-            );
+        if self.authority.narrowing_tx.send(command).is_err() {
+            if self.authority.admits() {
+                tracing::error!(
+                    "Oracle reader narrowing worker stopped while its epoch still admits; \
+                     the released pins stay durable until retirement or expiry recovery"
+                );
+            } else {
+                tracing::debug!(
+                    "Oracle reader guard released after its authority closed; shutdown owns the drain"
+                );
+            }
         }
     }
 }
@@ -650,19 +667,21 @@ pub struct OracleReaderAuthority {
     renewal_cancel: CancellationToken,
     /// One coordinator per durable table, keyed in canonical lock order.
     coordinators: Mutex<BTreeMap<TableAuthorityIdentity, Arc<Mutex<OracleTableCoordinator>>>>,
-    /// Release reservations, one per concurrently admissible query.
-    release_permits: Arc<Semaphore>,
-    /// Exact reservation count, which is also the fully-drained permit total.
-    release_capacity: usize,
-    /// Bounded queue the narrowing worker drains.
-    narrowing_tx: mpsc::Sender<NarrowingCommand>,
+    /// Every live reader guard and unapplied narrowing command of this epoch.
+    ///
+    /// Tokens are taken under the lifecycle mutex and the tracker is closed
+    /// under that same mutex when loss is selected, so the descendant join can
+    /// never observe zero while a protection attempt is still entering.
+    descendants: TaskTracker,
+    /// Unbounded queue the narrowing worker drains.
+    narrowing_tx: mpsc::UnboundedSender<NarrowingCommand>,
     /// Signal telling the narrowing worker to drain what remains and stop.
     narrowing_drain: CancellationToken,
     /// Whether new admission is still open.
     admission_open: AtomicBool,
     /// What this process does when it cannot join descendants in time.
     terminator: Arc<dyn OracleEpochTerminator>,
-    /// Bounded worker draining reserved narrowing commands.
+    /// Bounded worker draining queued narrowing commands.
     ///
     /// Owned here rather than by the engine because retirement's ordering is
     /// this type's invariant: the narrowing worker must be drained and joined
@@ -703,8 +722,6 @@ pub struct OracleReaderAuthorityConfig {
     pub node_id: uuid::Uuid,
     /// Exact `cluster_nodes` Oracle fence this epoch is acquired under.
     pub fencing_token: u64,
-    /// Maximum queries this Oracle admits at once, which bounds the queue.
-    pub max_concurrent_queries: usize,
     /// What this process does when it cannot join descendants in time.
     pub terminator: Arc<dyn OracleEpochTerminator>,
     /// Process shutdown token that stops this epoch's lease supervisor.
@@ -723,18 +740,13 @@ impl OracleReaderAuthority {
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when no Tokio runtime is entered,
-    /// when the concurrency bound is zero, when the fence is not representable,
+    /// when the fence is not representable,
     /// when the `cluster_nodes` fence has already been replaced, when an epoch
     /// row already exists at this exact new fence, or when the acquisition
     /// transaction or its audit fails.
     pub async fn start(config: OracleReaderAuthorityConfig) -> Result<Arc<Self>, BifrostError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| internal("Oracle reader authority requires an active Tokio runtime"))?;
-        if config.max_concurrent_queries == 0 {
-            return Err(internal(
-                "Oracle reader authority needs a positive query concurrency bound",
-            ));
-        }
         let fencing_token = i64::try_from(config.fencing_token)
             .map_err(|_| internal("Oracle role fence exceeds the durable epoch fence width"))?;
 
@@ -753,7 +765,7 @@ impl OracleReaderAuthority {
         };
         let deadlines = EpochDeadlines::from_sample(sampled_before, sample)?;
 
-        let (narrowing_tx, narrowing_rx) = mpsc::channel(config.max_concurrent_queries);
+        let (narrowing_tx, narrowing_rx) = mpsc::unbounded_channel();
         let authority = Arc::new(Self {
             vala: config.vala,
             operator_pool: config.operator_pool,
@@ -769,8 +781,7 @@ impl OracleReaderAuthority {
             loss_selected_notify: CancellationToken::new(),
             renewal_cancel: CancellationToken::new(),
             coordinators: Mutex::new(BTreeMap::new()),
-            release_permits: Arc::new(Semaphore::new(config.max_concurrent_queries)),
-            release_capacity: config.max_concurrent_queries,
+            descendants: TaskTracker::new(),
             narrowing_tx,
             narrowing_drain: CancellationToken::new(),
             admission_open: AtomicBool::new(false),
@@ -980,6 +991,9 @@ impl OracleReaderAuthority {
         }
         lifecycle.loss_selected = true;
         lifecycle.phase = EpochPhase::Closed;
+        // Closed under the lifecycle mutex: `protect` takes its descendant
+        // token under the same mutex, so no token can appear after this.
+        self.descendants.close();
         drop(lifecycle);
         self.admission_open.store(false, Ordering::SeqCst);
         // Both before any awaited SQL: readiness must be gone at selection,
@@ -1176,29 +1190,29 @@ impl OracleReaderAuthority {
         self: &Arc<Self>,
         requested: BTreeMap<TableAuthorityIdentity, LocalReaderCut>,
     ) -> Result<(ReaderQueryGuard, ReaderIoPermit), BifrostError> {
-        let (no_io_deadline, admission_cutoff) = {
+        // The descendant token is taken under the lifecycle mutex, which is
+        // where loss selection closes the tracker, so a protection attempt is
+        // either counted by the descendant join or refused here. It is taken
+        // before any cut is published and moves into the guard, so every pin
+        // this attempt creates is released while the join still waits for it.
+        let (release, no_io_deadline, admission_cutoff) = {
             let lifecycle = self.lifecycle.lock().await;
+            if lifecycle.loss_selected || !self.admits() {
+                return Err(internal(
+                    "Oracle reader authority is no longer admitting queries",
+                ));
+            }
             (
+                self.descendants.token(),
                 lifecycle.deadlines.no_io,
                 lifecycle.deadlines.admission_cutoff,
             )
         };
-        if !self.admits() {
-            return Err(internal(
-                "Oracle reader authority is no longer admitting queries",
-            ));
-        }
         if tokio::time::Instant::now() >= admission_cutoff {
             return Err(internal(
                 "Oracle reader authority reached its epoch's admission cutoff",
             ));
         }
-        // Reserved before any cut is published so a saturated queue can never
-        // lose a release: a query that could not reserve is never admitted.
-        let release = Arc::clone(&self.release_permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| internal("Oracle reader authority release queue is closed"))?;
 
         let mut coordinators = Vec::with_capacity(requested.len());
         for identity in requested.keys() {
@@ -1432,7 +1446,7 @@ fn covers_all(confirmed: &ProtectionFrontier, required: &ProtectionFrontier) -> 
 }
 
 impl OracleReaderAuthority {
-    /// Drains reserved release commands until the sender closes.
+    /// Drains queued release commands until the sender closes.
     ///
     /// Narrowing is batched and delayed on purpose: excess retention is safe
     /// and protection expansion is not delayable, so the cheap side of the
@@ -1440,7 +1454,10 @@ impl OracleReaderAuthority {
     /// canonical order admission uses, removes only that query's pins, and
     /// commits the remaining frontier. A failed mutation keeps the prior
     /// confirmed frontier rather than advertising an unconfirmed narrowing.
-    async fn run_narrowing(self: Arc<Self>, mut commands: mpsc::Receiver<NarrowingCommand>) {
+    async fn run_narrowing(
+        self: Arc<Self>,
+        mut commands: mpsc::UnboundedReceiver<NarrowingCommand>,
+    ) {
         loop {
             tokio::select! {
                 biased;
@@ -1549,7 +1566,7 @@ impl OracleReaderAuthority {
     /// Closes admission, drains the narrowing queue, and releases every table.
     ///
     /// Ordering is the point. Admission closes first, then the queue is drained
-    /// so no reserved release is lost, then each remaining table is released in
+    /// so no queued release is lost, then each remaining table is released in
     /// canonical order, then the audited `invalidated` edge commits, and only
     /// then is the epoch row deleted — and only after Postgres proves no header
     /// remains for this exact epoch. A failed table release retains the epoch
@@ -1589,7 +1606,7 @@ impl OracleReaderAuthority {
         // Ordered, not incidental: descendants are joined before the narrowing
         // worker is stopped, and both happen before the first table release, so
         // no table is released while a reader of it can still be running and no
-        // reserved narrowing is abandoned unapplied.
+        // queued narrowing is abandoned unapplied.
         if !self.join_descendants(bound).await {
             return Err(self.terminate_exhausted(
                 "Oracle reader epoch descendants outlived retirement's join budget",
@@ -1645,7 +1662,7 @@ impl OracleReaderAuthority {
     /// Closes the narrowing queue, then joins only the narrowing worker.
     ///
     /// The narrowing worker is drained rather than cancelled, because its
-    /// queue may still hold reserved releases that must reach Postgres. The
+    /// queue may still hold queued releases that must reach Postgres. The
     /// lease supervisor is not touched here: it was already joined while
     /// retirement resolved who owns this epoch's loss.
     async fn stop_narrowing_worker(&self) {
@@ -1878,21 +1895,24 @@ impl OracleReaderAuthority {
         }
     }
 
-    /// Waits for every admitted query's reservation to come back.
+    /// Waits until every reader guard and its narrowing command are gone.
     ///
-    /// A returned reservation is proof that the query's guard dropped, which is
-    /// exactly the descendant this epoch had to join. Reporting `false` means
-    /// this process cannot prove its readers stopped, which is the one
-    /// condition the terminator exists for.
+    /// The tracker is already closed by loss selection; closing it again here
+    /// is idempotent and keeps the join from waiting forever on an epoch that
+    /// was never closed. An empty closed tracker is proof that every query's
+    /// guard dropped and its pins were applied, which is exactly the
+    /// descendant set this epoch had to join. Reporting `false` means this
+    /// process cannot prove its readers stopped, which is the one condition
+    /// the terminator exists for.
     ///
     /// `deadline` is the caller's already-reduced absolute instant, never a
     /// fresh window: a join that began late gets whatever is left, not another
     /// [`EPOCH_JOIN_BUDGET`].
     async fn join_descendants(&self, deadline: tokio::time::Instant) -> bool {
-        let capacity = u32::try_from(self.release_capacity).unwrap_or(u32::MAX);
-        tokio::time::timeout_at(deadline, self.release_permits.acquire_many(capacity))
+        self.descendants.close();
+        tokio::time::timeout_at(deadline, self.descendants.wait())
             .await
-            .is_ok_and(|permit| permit.is_ok())
+            .is_ok()
     }
 }
 

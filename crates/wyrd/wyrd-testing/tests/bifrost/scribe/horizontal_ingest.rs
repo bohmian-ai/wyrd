@@ -5,7 +5,7 @@
 //! store and one catalog — accept work on every pod at once, and does adding
 //! tenants and tables to that topology change the pod-local machine that serves
 //! them? Every write is a public authenticated gRPC append to one endpoint,
-//! every read is the public strict fused query route, and every claim about a
+//! every read is the public query route, and every claim about a
 //! pod is read from that pod's own production Scribe inspection rather than
 //! inferred from the client side.
 
@@ -17,7 +17,7 @@ use arrow::array::{FixedSizeBinaryArray, Int32Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT;
+use vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT;
 use wyrd_client::WyrdClient;
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
@@ -178,7 +178,7 @@ async fn multi_pod_concurrent_batches_are_owned_and_visible() {
 ///
 /// So this submits one immutable batch — one batch id over one byte-identical
 /// Arrow payload — to all three pod endpoints simultaneously from one barrier,
-/// and requires the public strict fused read to return each
+/// and requires the public public read to return each
 /// `(batch id, row ordinal)` exactly once. Every attempt must still be
 /// acknowledged: a suppressed duplicate is an idempotent success, not a refusal
 /// the caller has to interpret.
@@ -458,7 +458,7 @@ fn expected_rows(batches: &[SubmittedBatch]) -> Vec<RowIdentity> {
 
 /// Reads one table's complete durable identities through the public query route.
 ///
-/// Strict fused visibility is what makes this an authority read: the rows must
+/// A successful terminal is what makes this an authority read: the rows must
 /// come from whichever source currently owns them. The batch id and row ordinal
 /// are the identity Scribe itself stamped, so the returned set is comparable to
 /// the submitted set without the test inventing an identity of its own.
@@ -472,8 +472,6 @@ async fn read_rows(client: &WyrdClient, table: &str) -> Vec<RowIdentity> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
             sql: sql.clone(),
-            visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(120_000),
         })
         .await
@@ -570,21 +568,21 @@ fn topology_by_pod(cluster: &WyrdTestCluster) -> Vec<(usize, usize, usize)> {
 ///
 /// # Panics
 ///
-/// Panics when any pod reports other than [`SCRIBE_SHARD_COUNT`] shard tasks or
+/// Panics when any pod reports other than [`DEFAULT_SHARD_COUNT`] shard tasks or
 /// channels, or more open WAL streams than it has lanes.
 fn assert_fixed_topology(observed: &[(usize, usize, usize)], phase: &str) {
     for (index, (tasks, channels, wal)) in observed.iter().enumerate() {
         assert_eq!(
-            *tasks, SCRIBE_SHARD_COUNT,
-            "pod {index} must own exactly {SCRIBE_SHARD_COUNT} shard tasks {phase}"
+            *tasks, DEFAULT_SHARD_COUNT,
+            "pod {index} must own exactly {DEFAULT_SHARD_COUNT} shard tasks {phase}"
         );
         assert_eq!(
-            *channels, SCRIBE_SHARD_COUNT,
-            "pod {index} must own exactly {SCRIBE_SHARD_COUNT} shard channels {phase}"
+            *channels, DEFAULT_SHARD_COUNT,
+            "pod {index} must own exactly {DEFAULT_SHARD_COUNT} shard channels {phase}"
         );
         assert!(
-            *wal <= SCRIBE_SHARD_COUNT,
-            "pod {index} must not open more than {SCRIBE_SHARD_COUNT} WAL streams \
+            *wal <= DEFAULT_SHARD_COUNT,
+            "pod {index} must not open more than {DEFAULT_SHARD_COUNT} WAL streams \
              {phase}, but it holds {wal}"
         );
     }

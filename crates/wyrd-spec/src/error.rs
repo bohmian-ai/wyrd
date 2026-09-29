@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::error::derive::WyrdError as WyrdErrorMeta;
@@ -1186,6 +1187,78 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A second `start_bifrost` was attempted on a state that already owns a
+    /// connected writer.
+    ///
+    /// One state owns one Bifrost lifetime. Replacing a live writer — even
+    /// with identical options — would strand whatever rows the running
+    /// producers still hold, so the second start is refused rather than
+    /// silently reconnecting.
+    #[error("[WYRD_SDK_409_BIFROST_ALREADY_STARTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_409_BIFROST_ALREADY_STARTED",
+        status = 409,
+        title = "WyrdState Bifrost writer is already started",
+        remediation = "Reuse the state's existing writer, or shut it down and create a new WyrdState to start again."
+    )]
+    SdkBifrostAlreadyStarted {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An observation was attempted before `start_bifrost` connected a writer.
+    #[error("[WYRD_SDK_400_BIFROST_NOT_STARTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_400_BIFROST_NOT_STARTED",
+        status = 400,
+        title = "WyrdState Bifrost writer is not started",
+        remediation = "Call start_bifrost on the state before opening a run and emitting observations."
+    )]
+    SdkBifrostNotStarted {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An observation was attempted after the state's writer was shut down.
+    ///
+    /// Graceful shutdown is the durability barrier: once it succeeds the state
+    /// stays closed, because accepting a row afterwards would enqueue it onto a
+    /// pool that will never drain again.
+    #[error("[WYRD_SDK_409_BIFROST_CLOSED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_409_BIFROST_CLOSED",
+        status = 409,
+        title = "WyrdState Bifrost writer is closed",
+        remediation = "Create a new WyrdState and start its Bifrost writer; a shut-down state stays closed to writes."
+    )]
+    SdkBifrostClosed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An observation input could not be projected into its fixed table row.
+    ///
+    /// Raised at the SDK authoring boundary, before queue admission, for an
+    /// input shape no canonical observation record accepts: a non-object JSON
+    /// root, a nested or array value where a scalar is required, a non-finite
+    /// or unrepresentable number, an invalid feature name, or a media
+    /// descriptor that names no binding slot.
+    #[error("[WYRD_SDK_400_INVALID_OBSERVATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_400_INVALID_OBSERVATION",
+        status = 400,
+        title = "Invalid observation input",
+        remediation = "Emit a flat object of boolean, integer, finite float, or string values, with valid feature names and media bindings."
+    )]
+    SdkInvalidObservation {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// A typed Card lookup found a Card of a different kind.
     #[error("[WYRD_SDK_400_CARD_KIND_MISMATCH] {message}")]
     #[wyrd_error(
@@ -1550,29 +1623,155 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A spec declares the same publication target more than once.
-    #[error("[WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET] {message}")]
+    /// One subject occurrence binds the same Verifier more than once.
+    #[error("[WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING] {message}")]
     #[wyrd_error(
-        code = "WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET",
+        code = "WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING",
         status = 400,
-        title = "Duplicate publication target",
-        remediation = "Remove duplicate Eval or Drift CardRefs from publishes_to."
+        title = "Duplicate verification binding",
+        remediation = "Remove the duplicate verified_by entry; one subject occurrence binds each Verifier version once."
     )]
-    SpecDuplicatePublishTarget {
+    SpecDuplicateVerificationBinding {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A spec publication target is not an Eval or Drift card.
-    #[error("[WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND] {message}")]
+    /// A `verified_by` entry names a Card that is not a Verifier.
+    #[error("[WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND] {message}")]
     #[wyrd_error(
-        code = "WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND",
+        code = "WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND",
         status = 400,
-        title = "Invalid publication target kind",
-        remediation = "Set publishes_to targets to Eval or Drift CardRefs."
+        title = "Invalid Verifier reference kind",
+        remediation = "Set verified_by[..].verifier to a Verifier CardRef."
     )]
-    SpecInvalidPublishTargetKind {
+    SpecInvalidVerifierRefKind {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A `runs_on` or `on_failure` reference names the wrong Card kind.
+    #[error("[WYRD_SPEC_400_INVALID_BINDING_REF_KIND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_INVALID_BINDING_REF_KIND",
+        status = 400,
+        title = "Invalid verification binding reference kind",
+        remediation = "Set runs_on to a Trigger CardRef or inline TriggerSpec, and each on_failure entry to an Operator CardRef or inline OperatorSpec."
+    )]
+    SpecInvalidBindingRefKind {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// One binding lists the same Operator identity more than once.
+    #[error("[WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_DUPLICATE_BINDING_OPERATOR",
+        status = 400,
+        title = "Duplicate binding Operator",
+        remediation = "Remove the duplicate on_failure Operator from this binding."
+    )]
+    SpecDuplicateBindingOperator {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// No verification binding with this identity is visible to the caller's tenant.
+    #[error("[WYRD_VERIFICATION_404_BINDING_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_404_BINDING_NOT_FOUND",
+        status = 404,
+        title = "Verification binding not found",
+        remediation = "Read the owner Card's card.status.verification.binding_ids and retry with one of those binding IDs."
+    )]
+    VerificationBindingNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// No Verifier run with this identity is visible to the caller's tenant.
+    #[error("[WYRD_VERIFICATION_404_RUN_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_404_RUN_NOT_FOUND",
+        status = 404,
+        title = "Verification run not found",
+        remediation = "Use the run_id returned by POST /v1/verification/runs in the same tenant."
+    )]
+    VerificationRunNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A manual run's target cannot run the requested input.
+    #[error("[WYRD_VERIFICATION_400_INVALID_TARGET] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_400_INVALID_TARGET",
+        status = 400,
+        title = "Invalid verification run target",
+        remediation = "Target an existing binding, or an active Verifier Card UID plus an active subject Card UID in this tenant, whose implementation accepts the requested input."
+    )]
+    VerificationInvalidTarget {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A manual run's Drift window is empty, inverted, or too long.
+    #[error("[WYRD_VERIFICATION_400_INVALID_WINDOW] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_400_INVALID_WINDOW",
+        status = 400,
+        title = "Invalid Drift window",
+        remediation = "Send a UTC half-open drift_window with start before end spanning at most 31 days."
+    )]
+    VerificationInvalidWindow {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The target Verifier cannot run yet, such as an unfitted PSI/SPC baseline.
+    #[error("[WYRD_VERIFICATION_409_VERIFIER_NOT_READY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_VERIFIER_NOT_READY",
+        status = 409,
+        title = "Verifier not ready",
+        remediation = "Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry."
+    )]
+    VerificationNotReady {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A binding attaches the non-executable `workflow` Operator action.
+    #[error("[WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION",
+        status = 400,
+        title = "Unsupported Operator action",
+        remediation = "Use a notify or http Operator in on_failure; the workflow action is not invocable yet."
+    )]
+    SpecUnsupportedOperatorAction {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A binding's effective Trigger activation cannot run its Verifier's implementation.
+    #[error("[WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH",
+        status = 400,
+        title = "Trigger activation does not match Verifier",
+        remediation = "Use a schedule Trigger for a drift Verifier and an observations_ready Trigger for an eval Verifier."
+    )]
+    SpecTriggerActivationMismatch {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1584,7 +1783,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND",
         status = 400,
         title = "Invalid Service component kind",
-        remediation = "Move Eval, Drift, Trigger, Operator, Audit, and Source cards out of Service.components; connect observability peers with publishes_to."
+        remediation = "Move Verifier, Trigger, Operator, Audit, and Source cards out of Service.components; attach a Verifier with verified_by."
     )]
     SpecInvalidServiceComponentKind {
         /// Human-readable error message.
@@ -1592,15 +1791,15 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A Service-root bundle includes an Eval or Drift with no local publisher.
-    #[error("[WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER] {message}")]
+    /// A Service-root bundle includes a Verifier no local subject binds.
+    #[error("[WYRD_SPEC_400_UNBOUND_VERIFIER_PEER] {message}")]
     #[wyrd_error(
-        code = "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER",
+        code = "WYRD_SPEC_400_UNBOUND_VERIFIER_PEER",
         status = 400,
-        title = "Unpublished observability peer",
-        remediation = "Add the Eval or Drift CardRef to the Service, a Service component, or a submitted Agent publishes_to list, or register the shared peer separately."
+        title = "Unbound Verifier peer",
+        remediation = "Add the Verifier CardRef to the Service, a Service component, or a submitted Agent verified_by list, or register the shared Verifier separately."
     )]
-    SpecUnpublishedObservabilityPeer {
+    SpecUnboundVerifierPeer {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1736,13 +1935,13 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// DriftCard validation failed.
+    /// Drift Verifier implementation validation failed.
     #[error("[WYRD_DRIFT_400_VALIDATION] {message}")]
     #[wyrd_error(
         code = "WYRD_DRIFT_400_VALIDATION",
         status = 400,
-        title = "DriftCard validation failed",
-        remediation = "Fix the DriftCard envelope, profile, condition, or signal fields."
+        title = "Drift Verifier validation failed",
+        remediation = "Fix the drift implementation profile, condition, or signal fields."
     )]
     DriftValidation {
         /// Human-readable error message.
@@ -1750,12 +1949,12 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A DriftCard signal variant is not compatible with the requested method.
+    /// A drift signal variant is not compatible with the requested method.
     #[error("[WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH] {message}")]
     #[wyrd_error(
         code = "WYRD_DRIFT_400_SIGNAL_METHOD_MISMATCH",
         status = 400,
-        title = "DriftCard signal/method mismatch",
+        title = "Drift signal/method mismatch",
         remediation = "Use a signal variant supported by the chosen DriftMethod (see DriftSpec docs)."
     )]
     DriftSignalMethodMismatch {
@@ -1764,12 +1963,12 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// A DriftCard method that requires a profile was registered without one.
+    /// A drift method that requires a profile was registered without one.
     #[error("[WYRD_DRIFT_400_PROFILE_REQUIRED] {message}")]
     #[wyrd_error(
         code = "WYRD_DRIFT_400_PROFILE_REQUIRED",
         status = 400,
-        title = "DriftCard profile required",
+        title = "Drift profile required",
         remediation = "Attach the method-matching DriftProfile (PsiProfile, SpcProfile, or CustomProfile)."
     )]
     DriftProfileRequired {
@@ -3220,91 +3419,6 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
 
-    // --- WYRD_EVAL_* — eval pull-protocol ---
-    /// Eval run id not found in the in-memory run map.
-    #[error("[WYRD_EVAL_404_RUN_NOT_FOUND] {message}")]
-    #[wyrd_error(
-        code = "WYRD_EVAL_404_RUN_NOT_FOUND",
-        status = 404,
-        title = "Eval run not found",
-        remediation = "Re-open a run with POST /v1/eval/runs."
-    )]
-    EvalRunNotFound {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Request lacked the bearer lease token on a protected eval-run route.
-    #[error("[WYRD_EVAL_401_MISSING_LEASE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_EVAL_401_MISSING_LEASE",
-        status = 401,
-        title = "Missing lease token",
-        remediation = "Send the lease_token from EvalRunOpenResponse in the X-Wyrd-Eval-Lease: Bearer <token> header."
-    )]
-    EvalMissingLease {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Request carried a lease that does not match the run.
-    #[error("[WYRD_EVAL_403_INVALID_LEASE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_EVAL_403_INVALID_LEASE",
-        status = 403,
-        title = "Invalid lease token",
-        remediation = "Re-open the run via POST /v1/eval/runs; leases are bound to one run."
-    )]
-    EvalInvalidLease {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Submission did not match the outstanding directive.
-    #[error("[WYRD_EVAL_409_SUBMISSION_MISMATCH] {message}")]
-    #[wyrd_error(
-        code = "WYRD_EVAL_409_SUBMISSION_MISMATCH",
-        status = 409,
-        title = "Eval submission did not match outstanding directive",
-        remediation = "Call POST /v1/eval/runs/{run_id}/next to retrieve the outstanding directive and retry."
-    )]
-    EvalSubmissionMismatch {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Engine, simulator, scenario loading, or server configuration failure.
-    #[error("[WYRD_EVAL_500_RUN_FAILED] {message}")]
-    #[wyrd_error(
-        code = "WYRD_EVAL_500_RUN_FAILED",
-        status = 500,
-        title = "Eval run failed",
-        remediation = "Inspect the eval route logs and retry after correcting the underlying server or provider issue."
-    )]
-    EvalRunFailed {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
-    /// Too many concurrent eval runs; client must retry after existing runs complete.
-    #[error("[WYRD_EVAL_429_TOO_MANY_RUNS] {message}")]
-    #[wyrd_error(
-        code = "WYRD_EVAL_429_TOO_MANY_RUNS",
-        status = 429,
-        title = "Too many concurrent eval runs",
-        remediation = "Wait for an existing run to complete, then retry."
-    )]
-    EvalTooManyRuns {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// Structural validation rejected a client configuration field.
     #[error("[WYRD_CLIENT_400_CONFIG_INVALID] {message}")]
     #[wyrd_error(
@@ -3428,6 +3542,12 @@ impl WyrdError {
         })
     }
 
+    /// The human message and structured details the problem-json body carries.
+    ///
+    /// Every `message`/`details` variant, including each new SDK Bifrost
+    /// lifecycle and observation variant, must be listed here so its body is
+    /// built from one place; the wrapped `Storage` and `Vala` errors render
+    /// their own `Display` text and serialized value instead.
     fn message_details(&self) -> (Cow<'_, str>, serde_json::Value) {
         match self {
             Self::Validation { message, details }
@@ -3563,6 +3683,10 @@ impl WyrdError {
             | Self::SdkRuntimeHydrationFailed { message, details }
             | Self::SdkInvalidStateBundle { message, details }
             | Self::SdkUnknownAlias { message, details }
+            | Self::SdkBifrostAlreadyStarted { message, details }
+            | Self::SdkBifrostNotStarted { message, details }
+            | Self::SdkBifrostClosed { message, details }
+            | Self::SdkInvalidObservation { message, details }
             | Self::SdkCardKindMismatch { message, details }
             | Self::RegistryInvalidVersionBlock { message, details }
             | Self::RegistrySpecTooLarge { message, details }
@@ -3588,11 +3712,20 @@ impl WyrdError {
             | Self::RegistryIdempotencyConflict { message, details }
             | Self::RegistryOperationExpired { message, details }
             | Self::RegistryArtifactVerifyFailed { message, details }
-            | Self::SpecDuplicatePublishTarget { message, details }
+            | Self::SpecDuplicateVerificationBinding { message, details }
             | Self::SpecDuplicateSubmission { message, details }
-            | Self::SpecInvalidPublishTargetKind { message, details }
+            | Self::SpecInvalidVerifierRefKind { message, details }
+            | Self::SpecInvalidBindingRefKind { message, details }
+            | Self::SpecDuplicateBindingOperator { message, details }
+            | Self::VerificationBindingNotFound { message, details }
+            | Self::VerificationRunNotFound { message, details }
+            | Self::VerificationInvalidTarget { message, details }
+            | Self::VerificationInvalidWindow { message, details }
+            | Self::VerificationNotReady { message, details }
+            | Self::SpecUnsupportedOperatorAction { message, details }
+            | Self::SpecTriggerActivationMismatch { message, details }
             | Self::SpecInvalidServiceComponentKind { message, details }
-            | Self::SpecUnpublishedObservabilityPeer { message, details }
+            | Self::SpecUnboundVerifierPeer { message, details }
             | Self::TsHeavyUploadDeferred { message, details }
             | Self::PrincipalOrphaned { message, details }
             | Self::ServerNotReady { message, details }
@@ -3602,12 +3735,6 @@ impl WyrdError {
             | Self::HarnessStart { message, details }
             | Self::HarnessBound { message, details }
             | Self::HarnessBootstrap { message, details }
-            | Self::EvalRunNotFound { message, details }
-            | Self::EvalMissingLease { message, details }
-            | Self::EvalInvalidLease { message, details }
-            | Self::EvalSubmissionMismatch { message, details }
-            | Self::EvalRunFailed { message, details }
-            | Self::EvalTooManyRuns { message, details }
             | Self::AgentToolNotFound { message, details }
             | Self::AgentToolNotInAgent { message, details }
             | Self::AgentProviderMismatch { message, details }
@@ -4440,164 +4567,6 @@ mod wyrd_cfg_tests {
         assert_eq!(back.code(), "WYRD_CFG_400_NAME_DEFAULT_REJECTED");
         assert_eq!(back.status(), 400);
         assert!(!back.remediation().is_empty());
-    }
-}
-
-#[cfg(test)]
-mod error_eval_tests {
-    use std::collections::HashSet;
-
-    use crate::error::WyrdError;
-
-    fn eval_errors() -> Vec<WyrdError> {
-        vec![
-            WyrdError::EvalRunNotFound {
-                message: "eval run abc not found".to_owned(),
-                details: serde_json::json!({}),
-            },
-            WyrdError::EvalMissingLease {
-                message: "missing lease token on protected eval-run route".to_owned(),
-                details: serde_json::json!({}),
-            },
-            WyrdError::EvalInvalidLease {
-                message: "lease token does not match the lease issued for run abc".to_owned(),
-                details: serde_json::json!({}),
-            },
-            WyrdError::EvalSubmissionMismatch {
-                message: "submission rejected: wrong turn".to_owned(),
-                details: serde_json::json!({}),
-            },
-            WyrdError::EvalRunFailed {
-                message: "eval run failed: internal engine error".to_owned(),
-                details: serde_json::json!({}),
-            },
-            WyrdError::EvalTooManyRuns {
-                message: "too many concurrent eval runs; retry after an existing run completes"
-                    .to_owned(),
-                details: serde_json::json!({}),
-            },
-        ]
-    }
-
-    #[test]
-    fn eval_error_codes_are_non_empty_and_have_wyrd_eval_prefix() {
-        for err in eval_errors() {
-            let problem = err.as_problem_json();
-            let code = problem["code"].as_str().expect("code is a string");
-            assert!(
-                code.starts_with("WYRD_EVAL_"),
-                "expected WYRD_EVAL_ prefix, got: {code}"
-            );
-            assert!(!code.is_empty(), "code must be non-empty");
-            let status = problem["status"].as_u64().expect("status is a number");
-            assert!(status >= 400, "expected error status, got {status}");
-            assert!(
-                problem["title"].as_str().is_some_and(|t| !t.is_empty()),
-                "title must be non-empty for {code}"
-            );
-            assert!(
-                problem["remediation"]
-                    .as_str()
-                    .is_some_and(|r| !r.is_empty()),
-                "remediation must be non-empty for {code}"
-            );
-        }
-    }
-
-    #[test]
-    fn eval_error_codes_are_unique() {
-        let codes: Vec<&'static str> = eval_errors().iter().map(|e| e.code()).collect();
-        let unique: HashSet<&str> = codes.iter().copied().collect();
-        assert_eq!(
-            unique.len(),
-            codes.len(),
-            "duplicate eval error code detected"
-        );
-    }
-
-    #[test]
-    fn eval_run_not_found_is_404() {
-        let err = WyrdError::EvalRunNotFound {
-            message: "not found".to_owned(),
-            details: serde_json::json!({}),
-        };
-        assert_eq!(err.code(), "WYRD_EVAL_404_RUN_NOT_FOUND");
-        assert_eq!(err.status(), 404);
-    }
-
-    #[test]
-    fn eval_missing_lease_is_401() {
-        let err = WyrdError::EvalMissingLease {
-            message: "no lease".to_owned(),
-            details: serde_json::json!({}),
-        };
-        assert_eq!(err.code(), "WYRD_EVAL_401_MISSING_LEASE");
-        assert_eq!(err.status(), 401);
-    }
-
-    #[test]
-    fn eval_invalid_lease_is_403() {
-        let err = WyrdError::EvalInvalidLease {
-            message: "bad lease".to_owned(),
-            details: serde_json::json!({}),
-        };
-        assert_eq!(err.code(), "WYRD_EVAL_403_INVALID_LEASE");
-        assert_eq!(err.status(), 403);
-    }
-
-    #[test]
-    fn eval_submission_mismatch_is_409() {
-        let err = WyrdError::EvalSubmissionMismatch {
-            message: "mismatch".to_owned(),
-            details: serde_json::json!({}),
-        };
-        assert_eq!(err.code(), "WYRD_EVAL_409_SUBMISSION_MISMATCH");
-        assert_eq!(err.status(), 409);
-    }
-
-    #[test]
-    fn eval_run_failed_is_500() {
-        let err = WyrdError::EvalRunFailed {
-            message: "engine died".to_owned(),
-            details: serde_json::json!({}),
-        };
-        assert_eq!(err.code(), "WYRD_EVAL_500_RUN_FAILED");
-        assert_eq!(err.status(), 500);
-    }
-
-    #[test]
-    fn eval_too_many_runs_is_429() {
-        let err = WyrdError::EvalTooManyRuns {
-            message: "cap reached".to_owned(),
-            details: serde_json::json!({}),
-        };
-        assert_eq!(err.code(), "WYRD_EVAL_429_TOO_MANY_RUNS");
-        assert_eq!(err.status(), 429);
-    }
-
-    #[test]
-    fn dropped_eval_codes_are_absent_from_wyrd_spec() {
-        let all_codes: Vec<&str> = eval_errors().iter().map(|e| e.code()).collect();
-        assert!(
-            !all_codes.contains(&"WYRD_EVAL_401_API_KEY_INVALID"),
-            "WYRD_EVAL_401_API_KEY_INVALID must not be present in WyrdError"
-        );
-        assert!(
-            !all_codes.contains(&"WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED"),
-            "WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED must not be present in WyrdError"
-        );
-    }
-
-    #[test]
-    fn eval_remediation_strings_use_v1_not_api_v1() {
-        for err in eval_errors() {
-            let remediation = err.remediation();
-            assert!(
-                !remediation.contains("/api/v1"),
-                "remediation for {} must not contain /api/v1, got: {remediation}",
-                err.code()
-            );
-        }
     }
 }
 

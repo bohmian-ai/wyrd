@@ -88,6 +88,8 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) source_count: usize,
     /// Canonical built-in whose physical identity every source must preserve.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+    /// Expanded-data ceiling the decoded, stamped output must fit before WAL.
+    pub(crate) expanded_limit_bytes: usize,
 }
 
 /// A request after deterministic event-day splitting and serialization.
@@ -148,6 +150,8 @@ pub(crate) struct NativeSliceProducer {
     next_row_ordinal: i32,
     /// Exact count established by the non-retaining first pass.
     slice_count: u32,
+    /// Running decoded and stamped output checked against the expanded ceiling.
+    output_bytes: usize,
     /// Authenticated tenant used by every produced seal key.
     tenant: DataTenantId,
     /// Logical table used by every produced seal key.
@@ -192,6 +196,7 @@ impl NativeSliceProducer {
             slice_index: 0,
             next_row_ordinal: 0,
             slice_count: 0,
+            output_bytes: 0,
             tenant,
             table,
             partition_granularity,
@@ -200,10 +205,16 @@ impl NativeSliceProducer {
 
     /// Produces one exact-capacity current slice and advances its owner state.
     ///
+    /// Each decoded source is stamped and its actual retained output added to
+    /// the running request total before any slice of it is produced, so output
+    /// above the expanded ceiling is refused before WAL.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when decoding diverges from preflight, stamping
-    /// or day materialization fails, or fixed-capacity IPC encoding fails.
+    /// or day materialization fails, or fixed-capacity IPC encoding fails, and
+    /// [`ScribeError::DecodedPayloadTooLarge`] when actual output exceeds the
+    /// expanded ceiling.
     pub(crate) fn next_slice(&mut self) -> Result<Option<PreparedSlice>, ScribeError> {
         loop {
             if let Some(current) = self.current.as_mut() {
@@ -244,6 +255,19 @@ impl NativeSliceProducer {
             };
             self.source_index += 1;
             let rows = stamp_native_source(&rows, &self.source, self.next_row_ordinal)?;
+            self.output_bytes = self
+                .output_bytes
+                .checked_add(crate::scribe::material_plan::retained_slice_bytes(&rows)?)
+                .ok_or(ScribeError::DecodedPayloadTooLarge {
+                    bytes: usize::MAX,
+                    limit: self.source.expanded_limit_bytes,
+                })?;
+            if self.output_bytes > self.source.expanded_limit_bytes {
+                return Err(ScribeError::DecodedPayloadTooLarge {
+                    bytes: self.output_bytes,
+                    limit: self.source.expanded_limit_bytes,
+                });
+            }
             // Advance only after stamping succeeded, so a refused record batch
             // never consumes ordinals the accepted stream would have used.
             self.next_row_ordinal = i32::try_from(rows.num_rows())
@@ -1041,6 +1065,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         NativeAdmittedRows {
             definition: None,
+            expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
             principal: Principal {
                 id: PrincipalId::new(uuid::Uuid::now_v7()),

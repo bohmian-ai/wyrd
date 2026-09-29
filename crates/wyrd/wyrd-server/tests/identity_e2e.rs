@@ -5,10 +5,11 @@ use std::time::Duration as StdDuration;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use base64::Engine as _;
-use chrono::Duration as ChronoDuration;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use secrecy::SecretString;
 use serde_json::Value;
 use url::Url;
+use uuid::Uuid;
 use wyrd_auth_check::AuthzCheckRequest;
 use wyrd_auth_check::response::AuthzCheckDecision;
 use wyrd_auth_oidc::IssuerConfigResolver;
@@ -24,7 +25,7 @@ use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_semver::VersionBlock;
 use wyrd_server::config::{ClaimMappingEntry, ClientAuthEntry, IssuerEntry, WorkloadBindingEntry};
 use wyrd_spec::auth::{
-    IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, TokenAudience,
+    IssueKeyRequest, IssueKeyResponse, IssuerTokenPolicy, IssuerUrl, PrincipalId, TokenAudience,
 };
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
@@ -158,9 +159,18 @@ fn authz_check_request(target: &Bootstrap, action: &str) -> AuthzCheckRequest {
 /// check on its own Card — the proven guard-passing terminal (delegated chain,
 /// eligible actor, `card_write` in the subject/actor intersection).
 ///
+/// Returns the actor's principal id. That exchange is a qualifying machine
+/// API-key exchange, so it is the one runtime activation this helper causes,
+/// and a journey asserting on activity names the ids it returned rather than
+/// expecting none.
+///
 /// # Panics
 /// Panics when bootstrap, exchange, or the check fails, or the check is not `200`.
-async fn assert_v1_authz_check_ok(srv: &WyrdTestServer, subject_jwt: &str, label: &str) {
+async fn assert_v1_authz_check_ok(
+    srv: &WyrdTestServer,
+    subject_jwt: &str,
+    label: &str,
+) -> PrincipalId {
     let actor = srv
         .bootstrap_service(&format!("{label}-actor"), &["writer"])
         .await
@@ -188,6 +198,7 @@ async fn assert_v1_authz_check_ok(srv: &WyrdTestServer, subject_jwt: &str, label
         Some(AuthzCheckDecision::Allow),
         "{label}: the subject/actor intersection allows card_write"
     );
+    actor.id()
 }
 
 fn response_code(body: &Value) -> &str {
@@ -477,6 +488,166 @@ async fn workload_jwt_bearer_unbound_subject_returns_404_keycloak() {
         response_code(&body),
         "WYRD_AUTH_404_PRINCIPAL_NOT_FOUND",
         "unbound subject error code; body={body}"
+    );
+}
+
+/// The tenant's machine principals that record runtime activity, sorted.
+///
+/// Activity is written only by a qualifying API-key or workload `jwt-bearer`
+/// exchange for a Card-bound Service or Agent, so naming the exact set — not a
+/// bare count — is what proves an excluded path recorded nothing: a grant that
+/// wrongly activated would add an id the caller never exchanged for.
+///
+/// # Panics
+/// Panics when the tenant connection or the query fails.
+async fn activated_principals(srv: &WyrdTestServer) -> Vec<Uuid> {
+    let mut conn = srv
+        .tenant_conn_for(srv.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let mut ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM wyrd.auth_service_accounts WHERE last_authenticated_at IS NOT NULL",
+    )
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("activity ids read");
+    conn.commit().await.expect("assertion transaction commits");
+    ids.sort_unstable();
+    ids
+}
+
+/// Register an empty Service `name` at 1.0.0 in `space` through the public route.
+///
+/// Registration projects the Card-bound principal a workload binding selects;
+/// returns the Service's registered UID.
+///
+/// # Panics
+/// Panics when the route fails to respond, refuses the Card, or returns no UID.
+async fn register_service(srv: &WyrdTestServer, jwt: &str, name: &str, space: &str) -> Uuid {
+    let body = serde_json::json!({ "submissions": [{
+        "apiVersion": "wyrd/v1", "kind": "Service",
+        "metadata": { "name": name, "version": "1.0.0", "space": space },
+        "spec": {},
+        "artifacts": []
+    }] });
+    let response = srv
+        .oneshot_authenticated(
+            jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/cards")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("Idempotency-Key", format!("{name}-{space}"))
+                .body(Body::from(body.to_string()))
+                .expect("registration request builds"),
+        )
+        .await
+        .expect("registration responds");
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("registration body reads");
+    let body: Value = serde_json::from_slice(&bytes).expect("registration body is JSON");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    uuid::Uuid::parse_str(
+        body["outcomes"][0]["card_ref"]["uid"]
+            .as_str()
+            .expect("Service outcome UID exists"),
+    )
+    .expect("Service UID parses")
+}
+
+/// The last qualifying exchange of the principal the Service `owner` projects.
+///
+/// # Panics
+/// Panics when the read fails or the owner projects no principal.
+async fn owner_last_authenticated(srv: &WyrdTestServer, owner: Uuid) -> Option<DateTime<Utc>> {
+    let mut conn = srv
+        .tenant_conn_for(srv.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let seen = sqlx::query_scalar(
+        "SELECT last_authenticated_at FROM wyrd.auth_service_accounts WHERE card_uid = $1",
+    )
+    .bind(owner)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("owner principal reads");
+    conn.commit().await.expect("assertion transaction commits");
+    seen
+}
+
+/// A configured workload `jwt-bearer` exchange activates only its exact owner.
+///
+/// Registers one Service identity in the `prod` and `staging` spaces, binds the
+/// live Keycloak workload subject to the `prod` version, and exchanges the real
+/// assertion twice. The first exchange activates exactly the `prod` owner; the
+/// second, re-presenting the platform assertion as a workload does to renew,
+/// renews that one timestamp. The same-named `staging` owner is never touched.
+///
+/// # Panics
+/// Panics when the server fails to boot, a registration or exchange fails, or
+/// an activity expectation does not hold.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let assertion = keycloak
+        .workload_token("wyrd-workload", "wyrd-workload-secret", "wyrd-workload")
+        .await;
+    let subject = jwt_claims(&assertion)["sub"]
+        .as_str()
+        .expect("workload token carries a subject")
+        .to_owned();
+    let srv = WyrdTestServerBuilder::default()
+        .with_trusted_issuer_configs(vec![keycloak_workload_issuer()])
+        .with_workload_binding_configs(vec![WorkloadBindingEntry {
+            issuer: keycloak_issuer(),
+            subject,
+            audience: Some("wyrd-workload".to_owned()),
+            kind: "service".to_owned(),
+            name: "wyrd-workload-live".to_owned(),
+            space: "prod".to_owned(),
+            version: "1.0.0".to_owned(),
+        }])
+        .start_in_process()
+        .await
+        .expect("server boots config-driven");
+    let Bootstrap::User { jwt, .. } = srv
+        .bootstrap_user("workload-live-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let prod = register_service(&srv, &jwt, "wyrd-workload-live", "prod").await;
+    let staging = register_service(&srv, &jwt, "wyrd-workload-live", "staging").await;
+    assert_eq!(owner_last_authenticated(&srv, prod).await, None);
+
+    let first = post_jwt_bearer(&srv, &assertion).await;
+    assert_eq!(first.status(), StatusCode::OK, "first workload exchange");
+    let activated = owner_last_authenticated(&srv, prod)
+        .await
+        .expect("the workload exchange activates its exact owner");
+    assert_eq!(owner_last_authenticated(&srv, staging).await, None);
+
+    let renewal = post_jwt_bearer(&srv, &assertion).await;
+    assert_eq!(
+        renewal.status(),
+        StatusCode::OK,
+        "renewal workload exchange"
+    );
+    let renewed = owner_last_authenticated(&srv, prod)
+        .await
+        .expect("renewal keeps activity");
+    assert!(
+        renewed >= activated,
+        "renewal never moves activity backward"
+    );
+    assert_eq!(
+        owner_last_authenticated(&srv, staging).await,
+        None,
+        "the same-named owner in another space is never activated"
     );
 }
 
@@ -926,16 +1097,13 @@ fn principal_id_of(access_token: &str) -> String {
 ///   2. `GET /auth/login` → authorization URL + state,
 ///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
 ///   4. `GET /auth/callback` → Wyrd access token,
-///   5. the human token reaches a real `/v1/authz/check` `200` via delegation.
-///
-/// It then rotates the refresh token, proves the successor still authorizes,
-/// and proves a replay of the consumed token is refused and kills the successor.
+///   5. the human token reaches a real `/v1/authz/check` `200` via delegation,
+///   6. the refresh token rotates, replay is refused and contained, and none
+///      of login, refresh, or delegation records machine runtime activity.
 ///
 /// # Panics
-/// Panics when the login flow fails, the session lacks an access or refresh
-/// token, rotation does not return `200` with both tokens, either access token
-/// fails to reach `200`, the replay is not `401 WYRD_AUTH_401_REFRESH_REUSED`,
-/// or the successor can still rotate after the replay.
+/// Panics when the server fails to start, a login, refresh, or check step
+/// fails, or any status, code, or activity expectation does not hold.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn human_oidc_login_journey() {
@@ -957,7 +1125,7 @@ async fn human_oidc_login_journey() {
     assert!(!access_token.is_empty(), "access token is non-empty");
 
     // Step 4: human token reaches a real authenticated /v1 200 via delegation.
-    assert_v1_authz_check_ok(&srv, access_token, "human-sso").await;
+    let first_actor = assert_v1_authz_check_ok(&srv, access_token, "human-sso").await;
 
     // Step 5: the human session carries a refresh token. Only human sessions
     // do; a machine client re-exchanges its durable credential instead.
@@ -986,7 +1154,19 @@ async fn human_oidc_login_journey() {
 
     // Step 7: the successor reaches the same protected /v1 200, proving the
     // renewed session kept the authority the provider asserted at login.
-    assert_v1_authz_check_ok(&srv, &rotated_access, "human-sso-rotated").await;
+    let second_actor = assert_v1_authz_check_ok(&srv, &rotated_access, "human-sso-rotated").await;
+
+    // Neither the human login, its refresh rotation, nor the delegations the
+    // checks drove are a qualifying machine exchange. The only activations are
+    // the two actors' own API-key exchanges, so the activated set is exactly
+    // those two ids and nothing the human session touched.
+    let mut expected_actors = vec![first_actor.as_uuid(), second_actor.as_uuid()];
+    expected_actors.sort_unstable();
+    assert_eq!(
+        activated_principals(&srv).await,
+        expected_actors,
+        "only the delegation actors' own key exchanges record runtime activity"
+    );
 
     // Step 8: replaying the consumed token is refused and contains the theft.
     let (replay_status, replay_body) = post_refresh(&srv, &refresh_token).await;

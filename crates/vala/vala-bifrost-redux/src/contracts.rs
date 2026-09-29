@@ -32,9 +32,10 @@ use crate::scribe::stream_identity::StreamIdentity;
 
 /// Computes the user-visible fingerprint from a physical Scribe Arrow schema.
 ///
-/// Tail planning and fenced reads use this same projection as ingest admission:
-/// server-owned correlation and `wyrd_*` fields never change a table's user
-/// schema identity.
+/// Scribe fixtures use this to state the expected fingerprint an ingest frame
+/// carries: server-owned correlation and `wyrd_*` fields never change a
+/// table's user schema identity.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn projected_source_schema_fingerprint(
     schema: &arrow::datatypes::Schema,

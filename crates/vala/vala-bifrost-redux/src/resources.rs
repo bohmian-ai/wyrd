@@ -300,69 +300,6 @@ pub struct BifrostVolumeRoots {
     pub scribe_stage: PathBuf,
     /// Process-owned Scribe output scratch namespace.
     pub scribe_output_scratch: PathBuf,
-    /// Oracle query scratch root.
-    pub oracle_scratch: PathBuf,
-}
-
-/// Closed volume purpose used for bounded telemetry and diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum BifrostVolumeClass {
-    /// Durable write-ahead log occupancy.
-    Wal,
-    /// Durable Scribe staged-member occupancy.
-    ScribeStage,
-    /// Disposable Scribe persistence output.
-    ScribeOutput,
-    /// Disposable Oracle query spill.
-    Oracle,
-}
-
-impl BifrostVolumeClass {
-    /// Returns the closed telemetry label for this physical-volume purpose.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Wal => "wal",
-            Self::ScribeStage => "scribe_stage",
-            Self::ScribeOutput => "scribe_output",
-            Self::Oracle => "oracle",
-        }
-    }
-
-    /// Returns whether occupancy in this class survives a process restart.
-    ///
-    /// A durable class is reconciled from the filesystem at registration and
-    /// released only by an explicit retirement; a disposable class is owned by
-    /// live leases and returns its bytes when they drop.
-    const fn is_durable(self) -> bool {
-        matches!(self, Self::Wal | Self::ScribeStage)
-    }
-
-    /// Returns the closed role label responsible for this volume purpose.
-    const fn role(self) -> &'static str {
-        match self {
-            Self::Wal | Self::ScribeStage | Self::ScribeOutput => "scribe",
-            Self::Oracle => "oracle",
-        }
-    }
-}
-
-/// Publishes one closed physical-volume lifecycle transition.
-fn record_volume_transition(class: BifrostVolumeClass, result: &'static str, current_bytes: u64) {
-    metrics::counter!(
-        "bifrost_resource_acquisitions_total",
-        "role" => class.role(),
-        "resource" => "volume",
-        "result" => result,
-        "volume_class" => class.as_str()
-    )
-    .increment(1);
-    metrics::gauge!(
-        "bifrost_resource_current_bytes",
-        "role" => class.role(),
-        "resource" => "volume",
-        "volume_class" => class.as_str()
-    )
-    .set(current_bytes.to_f64().unwrap_or(f64::MAX));
 }
 
 /// Publishes one closed role-memory lifecycle transition.
@@ -382,359 +319,45 @@ fn record_memory_transition(role: &'static str, result: &'static str, current_by
     .set(current_bytes.to_f64().unwrap_or(f64::MAX));
 }
 
-/// Emits the pod-local Oracle capacity gauges from one locked ledger read.
+/// Emits the four pod-local Oracle capacity gauges from one locked ledger read.
 ///
-/// Every series is local: the cooperative memory root, the headroom holding
-/// `DataFusion`'s infallible growth, scratch, and the aggregate slot ledger with
-/// its protected Interactive floor. Labels come from a closed `kind` domain and
-/// never carry tenant, query, node, or table identity, and nothing here claims a
-/// cluster-wide quota. It is called wherever an Oracle owner is admitted or
-/// released, so an Oracle-only pod that never runs the Scribe tick still
-/// exports live occupancy.
+/// `memory_limit` is the governed Oracle budget, `memory_used` is Oracle query
+/// memory (see [`record_oracle_memory`]), and the slot series are the aggregate
+/// slot ledger's limit and occupancy. Labels come from a closed `kind` domain
+/// and never carry tenant, query, node, or table identity, and nothing here
+/// claims a cluster-wide quota. It is called wherever an Oracle owner is
+/// admitted or released, so an Oracle-only pod that never runs the Scribe tick
+/// still exports live occupancy. Per-growth reservations and releases call
+/// only [`record_oracle_memory`], because the limit and slot series cannot
+/// change there.
 fn record_oracle_capacity(state: &ResourceState, plan: &ResourcePlan, split: OracleClassSplit) {
-    let bytes = |kind: &'static str, value: usize| {
-        metrics::gauge!("bifrost_oracle_local_bytes", "kind" => kind)
-            .set(value.to_f64().unwrap_or(f64::MAX));
-    };
-    bytes(
-        "memory_limit",
+    metrics::gauge!("bifrost_oracle_local_bytes", "kind" => "memory_limit").set(
         plan.oracle_floor_bytes
-            .saturating_add(plan.elastic_memory_bytes),
-    );
-    bytes("memory_used", state.oracle_query_memory_used_bytes);
-    bytes("memory_headroom", state.oracle_infallible_bytes);
-    metrics::gauge!("bifrost_oracle_local_bytes", "kind" => "scratch_used").set(
-        state
-            .oracle_query_scratch_used_bytes
+            .saturating_add(plan.elastic_memory_bytes)
             .to_f64()
             .unwrap_or(f64::MAX),
     );
-    let slot_units = |kind: &'static str, value: u32| {
-        metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => kind).set(f64::from(value));
-    };
-    slot_units("limit", split.total_units());
-    slot_units("used", state.oracle_query_slot_units);
-    slot_units("analytical_used", state.oracle_analytical_slot_units);
-    slot_units("interactive_floor", split.interactive_floor_units);
+    record_oracle_memory(state);
+    metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => "limit")
+        .set(f64::from(split.total_units()));
+    metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => "used")
+        .set(f64::from(state.oracle_query_slot_units));
 }
 
-/// One registered root resolved to its physical filesystem device.
-#[derive(Debug, Clone)]
-struct RegisteredVolumeRoot {
-    /// Configured path used for live free-space probes.
-    path: PathBuf,
-    /// Stable device identity derived from filesystem metadata.
-    device: u64,
-    /// Closed ownership class.
-    class: BifrostVolumeClass,
-}
-
-/// Exact per-device durable and provisional ownership.
-#[derive(Debug, Default)]
-struct VolumeDeviceState {
-    /// Durable bytes reconciled or committed on this device, per class.
-    ///
-    /// Two classes are durable for different reasons: WAL bytes are the
-    /// acknowledged rows themselves, and staged bytes are the local runs that
-    /// let those WAL bytes retire. Both survive a restart, so both are
-    /// reconciled from the filesystem at registration rather than assumed zero.
-    durable_bytes: BTreeMap<BifrostVolumeClass, u64>,
-    /// Durable growth admitted before its mutation completes, per class.
-    provisional_bytes: BTreeMap<BifrostVolumeClass, u64>,
-    /// Live disposable scratch leases.
-    scratch_bytes: BTreeMap<BifrostVolumeClass, u64>,
-    /// Whether accounting on this device remains trustworthy.
-    poisoned: bool,
-}
-
-impl VolumeDeviceState {
-    /// Returns committed durable bytes owned by one class.
-    fn durable(&self, class: BifrostVolumeClass) -> u64 {
-        self.durable_bytes.get(&class).copied().unwrap_or_default()
-    }
-
-    /// Returns admitted but uncommitted durable bytes owned by one class.
-    fn provisional(&self, class: BifrostVolumeClass) -> u64 {
-        self.provisional_bytes
-            .get(&class)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// Returns live disposable scratch bytes owned by one class.
-    fn scratch(&self, class: BifrostVolumeClass) -> u64 {
-        self.scratch_bytes.get(&class).copied().unwrap_or_default()
-    }
-
-    /// Returns the bytes one class currently owns under its own accounting.
-    ///
-    /// A durable class owns committed plus provisional growth; a disposable
-    /// class owns its live leases. This is what telemetry reports and what a
-    /// refusal diagnostic names.
-    fn owned(&self, class: BifrostVolumeClass) -> u64 {
-        if class.is_durable() {
-            self.durable(class).saturating_add(self.provisional(class))
-        } else {
-            self.scratch(class)
-        }
-    }
-
-    /// Sums every class's ownership on this device.
-    ///
-    /// # Errors
-    ///
-    /// Returns an accounting overflow when the device totals cannot be summed.
-    fn total(&self) -> Result<u64, BifrostResourceError> {
-        self.durable_bytes
-            .values()
-            .chain(self.provisional_bytes.values())
-            .chain(self.scratch_bytes.values())
-            .try_fold(0_u64, |total, bytes| total.checked_add(*bytes))
-            .ok_or_else(accounting_overflow)
-    }
-}
-
-/// Shared physical-volume authority grouped by filesystem device identity.
-#[derive(Debug, Clone)]
-pub struct BifrostVolumeGovernor {
-    /// Registered role roots; aliases intentionally point at one device state.
-    roots: Arc<BTreeMap<BifrostVolumeClass, RegisteredVolumeRoot>>,
-    /// Exact per-device ownership serialized under one process lock.
-    devices: Arc<Mutex<BTreeMap<u64, VolumeDeviceState>>>,
-    /// Per-device configured disposable/durable occupancy ceiling.
-    configured_limit_bytes: u64,
-    /// Process lifecycle signal shared with memory accounting.
-    health: BifrostResourceHealth,
-}
-
-impl BifrostVolumeGovernor {
-    /// Registers roots, groups aliases by device, and reconciles retained WAL.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed unavailable or invalid-plan error when a root cannot be
-    /// inspected, retained WAL cannot be measured, or no positive capacity
-    /// remains after the 256 MiB physical free-space floor.
-    pub fn register(
-        roots: BifrostVolumeRoots,
-        configured_limit_bytes: u64,
-        health: BifrostResourceHealth,
-    ) -> Result<Self, BifrostResourceError> {
-        reconcile_scribe_scratch_namespace(&roots.scribe_output_scratch)?;
-        let entries = [
-            (BifrostVolumeClass::Wal, roots.wal),
-            (BifrostVolumeClass::ScribeStage, roots.scribe_stage),
-            (
-                BifrostVolumeClass::ScribeOutput,
-                roots.scribe_output_scratch,
-            ),
-            (BifrostVolumeClass::Oracle, roots.oracle_scratch),
-        ];
-        let mut registered = BTreeMap::new();
-        let mut devices = BTreeMap::new();
-        for (class, path) in entries {
-            let metadata =
-                fs::metadata(&path).map_err(|error| BifrostResourceError::Unavailable {
-                    detail: format!("cannot inspect registered Bifrost volume root: {error}"),
-                })?;
-            #[cfg(unix)]
-            let device = {
-                use std::os::unix::fs::MetadataExt;
-                metadata.dev()
-            };
-            #[cfg(not(unix))]
-            let device = metadata.len();
-            devices
-                .entry(device)
-                .or_insert_with(VolumeDeviceState::default);
-            registered.insert(
-                class,
-                RegisteredVolumeRoot {
-                    path,
-                    device,
-                    class,
-                },
-            );
-        }
-        let wal = registered.get(&BifrostVolumeClass::Wal).ok_or_else(|| {
-            BifrostResourceError::InvalidPlan {
-                detail: "WAL volume root was not registered".to_owned(),
-            }
-        })?;
-        let retained = retained_wal_root_bytes(&wal.path)?;
-        devices
-            .get_mut(&wal.device)
-            .ok_or_else(accounting_overflow)?
-            .durable_bytes
-            .insert(BifrostVolumeClass::Wal, retained);
-        let stage_root = registered
-            .get(&BifrostVolumeClass::ScribeStage)
-            .ok_or_else(|| BifrostResourceError::InvalidPlan {
-                detail: "Scribe stage volume root was not registered".to_owned(),
-            })?;
-        let staged = retained_stage_root_bytes(&stage_root.path)?;
-        devices
-            .get_mut(&stage_root.device)
-            .ok_or_else(accounting_overflow)?
-            .durable_bytes
-            .insert(BifrostVolumeClass::ScribeStage, staged);
-        let governor = Self {
-            roots: Arc::new(registered),
-            devices: Arc::new(Mutex::new(devices)),
-            configured_limit_bytes,
-            health,
-        };
-        for class in [
-            BifrostVolumeClass::Wal,
-            BifrostVolumeClass::ScribeStage,
-            BifrostVolumeClass::ScribeOutput,
-            BifrostVolumeClass::Oracle,
-        ] {
-            metrics::gauge!(
-                "bifrost_resource_planned_bytes",
-                "role" => class.role(),
-                "resource" => "volume",
-                "volume_class" => class.as_str()
-            )
-            .set(configured_limit_bytes.to_f64().unwrap_or(f64::MAX));
-        }
-        if governor.available_for(BifrostVolumeClass::Wal)? == 0 {
-            return Err(BifrostResourceError::InvalidPlan {
-                detail: "registered Bifrost volume has no usable capacity".to_owned(),
-            });
-        }
-        Ok(governor)
-    }
-
-    /// Returns role-bound volume capabilities without exposing generic grants.
-    #[must_use]
-    pub fn capabilities(&self) -> BifrostVolumeCapabilities {
-        BifrostVolumeCapabilities {
-            wal: WalVolume {
-                governor: self.clone(),
-            },
-            scribe_stage: StageVolume {
-                governor: self.clone(),
-            },
-            scribe_output: ScratchVolume {
-                governor: self.clone(),
-                class: BifrostVolumeClass::ScribeOutput,
-            },
-            oracle: ScratchVolume {
-                governor: self.clone(),
-                class: BifrostVolumeClass::Oracle,
-            },
-        }
-    }
-
-    /// Returns exact ownership of one class for deterministic volume tests.
-    ///
-    /// The triple is the class's committed durable bytes, its provisional
-    /// durable growth, and its disposable scratch bytes, so a test can prove a
-    /// transition moved a charge between exactly those counters.
-    ///
-    /// # Errors
-    ///
-    /// Returns poison when the device lock or registered class cannot be read.
-    #[cfg(test)]
-    pub(crate) fn usage_for_test(
-        &self,
-        class: BifrostVolumeClass,
-    ) -> Result<(u64, u64, u64), BifrostResourceError> {
-        let root = self.roots.get(&class).ok_or_else(accounting_overflow)?;
-        let devices = self
-            .devices
-            .lock()
-            .map_err(|_| BifrostResourceError::Poisoned {
-                detail: "volume state lock is poisoned".to_owned(),
-            })?;
-        let state = devices.get(&root.device).ok_or_else(accounting_overflow)?;
-        Ok((
-            state.durable(class),
-            state.provisional(class),
-            state.scratch(class),
-        ))
-    }
-
-    /// Computes currently grantable bytes after configured and physical floors.
-    fn available_for(&self, class: BifrostVolumeClass) -> Result<u64, BifrostResourceError> {
-        let root = self
-            .roots
-            .get(&class)
-            .ok_or_else(|| BifrostResourceError::InvalidPlan {
-                detail: "volume class is not registered".to_owned(),
-            })?;
-        debug_assert_eq!(root.class, class);
-        let available = filesystem_available_bytes(&root.path)?
-            .checked_sub(MIN_SCRATCH_FREE_BYTES)
-            .ok_or_else(|| BifrostResourceError::Occupied {
-                detail: "physical volume cannot preserve the 256 MiB free-space floor".to_owned(),
-            })?;
-        Ok(self.configured_limit_bytes.min(available))
-    }
-
-    /// Atomically charges one device after a fresh physical free-space probe.
-    ///
-    /// `durable` selects which counter receives the charge: a durable class
-    /// takes provisional growth that a later commit converts into retained
-    /// occupancy, while a disposable class takes a live scratch lease that
-    /// returns its bytes on drop.
-    fn acquire(
-        &self,
-        class: BifrostVolumeClass,
-        bytes: u64,
-        durable: bool,
-    ) -> Result<VolumeLease, BifrostResourceError> {
-        if let Some(reason) = self.health.reason() {
-            return Err(BifrostResourceError::Poisoned {
-                detail: format!("resource health entered {reason:?}"),
-            });
-        }
-        let available = self.available_for(class)?;
-        let root = self
-            .roots
-            .get(&class)
-            .ok_or_else(|| BifrostResourceError::InvalidPlan {
-                detail: "volume class is not registered".to_owned(),
-            })?;
-        let mut devices = self
-            .devices
-            .lock()
-            .map_err(|_| BifrostResourceError::Poisoned {
-                detail: "volume state lock is poisoned".to_owned(),
-            })?;
-        let state = devices
-            .get_mut(&root.device)
-            .ok_or_else(accounting_overflow)?;
-        if state.poisoned {
-            return Err(BifrostResourceError::Poisoned {
-                detail: "a prior physical-volume invariant failed".to_owned(),
-            });
-        }
-        let used = state.total()?;
-        let next = used.checked_add(bytes).ok_or_else(accounting_overflow)?;
-        if next > self.configured_limit_bytes || next > available {
-            record_volume_transition(class, "refused", state.owned(class));
-            return Err(BifrostResourceError::Occupied {
-                detail: "physical-volume request exceeds configured or live-free capacity"
-                    .to_owned(),
-            });
-        }
-        if durable {
-            *state.provisional_bytes.entry(class).or_default() += bytes;
-        } else {
-            *state.scratch_bytes.entry(class).or_default() += bytes;
-        }
-        record_volume_transition(class, "acquired", state.owned(class));
-        Ok(VolumeLease {
-            governor: self.clone(),
-            device: root.device,
-            bytes,
-            class,
-            durable,
-            retained: false,
-        })
-    }
+/// Emits `memory_used`, the one capacity series a query's growth changes.
+///
+/// The value is Oracle query memory, not pod RAM: governed query bytes plus
+/// the infallible bytes `DataFusion` grew past what the root could govern,
+/// both read from the same locked state. Because the infallible share is real
+/// memory the process holds, `memory_used` may exceed `memory_limit`.
+fn record_oracle_memory(state: &ResourceState) {
+    metrics::gauge!("bifrost_oracle_local_bytes", "kind" => "memory_used").set(
+        state
+            .oracle_query_memory_used_bytes
+            .saturating_add(state.oracle_infallible_bytes)
+            .to_f64()
+            .unwrap_or(f64::MAX),
+    );
 }
 
 /// Name prefix of the scratch directory one assembly claim merges into.
@@ -776,286 +399,27 @@ fn reconcile_scribe_scratch_namespace(root: &Path) -> Result<(), BifrostResource
     Ok(())
 }
 
-/// Role-bound physical-volume capabilities issued by one registration.
-#[derive(Debug)]
-pub struct BifrostVolumeCapabilities {
-    /// Durable WAL growth capability.
-    pub wal: WalVolume,
-    /// Durable Scribe staged-member capability.
-    pub scribe_stage: StageVolume,
-    /// Scribe output-scratch capability.
-    pub scribe_output: ScratchVolume,
-    /// Oracle scratch capability.
-    pub oracle: ScratchVolume,
-}
-
-/// Converts one class's provisional growth into retained durable occupancy.
+/// Scribe output scratch namespace where assembly claims write their Parquet.
 ///
-/// # Errors
-///
-/// Returns poison when the registered device or provisional counter no longer
-/// covers this exact growth; the lease is retained rather than rolled back so
-/// the divergence cannot be hidden by returning capacity twice.
-fn commit_durable(mut lease: VolumeLease) -> Result<(), BifrostResourceError> {
-    let class = lease.class;
-    let mut devices =
-        lease
-            .governor
-            .devices
-            .lock()
-            .map_err(|_| BifrostResourceError::Poisoned {
-                detail: "volume state lock is poisoned".to_owned(),
-            })?;
-    let state = devices
-        .get_mut(&lease.device)
-        .ok_or_else(accounting_overflow)?;
-    if state.provisional(class) < lease.bytes {
-        state.poisoned = true;
-        lease
-            .governor
-            .health
-            .poison(BifrostResourcePoisonReason::Volume);
-        return Err(BifrostResourceError::Poisoned {
-            detail: "provisional durable growth diverged before commit".to_owned(),
-        });
-    }
-    *state.provisional_bytes.entry(class).or_default() -= lease.bytes;
-    let durable = state
-        .durable(class)
-        .checked_add(lease.bytes)
-        .ok_or_else(accounting_overflow)?;
-    state.durable_bytes.insert(class, durable);
-    lease.retained = true;
-    record_volume_transition(class, "committed", durable);
-    Ok(())
-}
-
-/// Releases exact committed durable occupancy after its files are gone.
-///
-/// # Errors
-///
-/// Returns poison when reconciled durable ownership cannot cover the exact
-/// retired length; no capacity is returned on mismatch.
-fn retire_durable(
-    governor: &BifrostVolumeGovernor,
-    class: BifrostVolumeClass,
-    bytes: u64,
-) -> Result<(), BifrostResourceError> {
-    let root = governor.roots.get(&class).ok_or_else(accounting_overflow)?;
-    let mut devices = governor
-        .devices
-        .lock()
-        .map_err(|_| BifrostResourceError::Poisoned {
-            detail: "volume state lock is poisoned".to_owned(),
-        })?;
-    let state = devices
-        .get_mut(&root.device)
-        .ok_or_else(accounting_overflow)?;
-    if state.durable(class) < bytes {
-        state.poisoned = true;
-        governor.health.poison(BifrostResourcePoisonReason::Volume);
-        return Err(BifrostResourceError::Poisoned {
-            detail: "durable volume retirement underflow".to_owned(),
-        });
-    }
-    let remaining = state.durable(class) - bytes;
-    state.durable_bytes.insert(class, remaining);
-    record_volume_transition(class, "released", remaining);
-    Ok(())
-}
-
-/// Non-generic durable Scribe staging capability.
-///
-/// Staged runs are the reason a WAL segment may retire, so their bytes are
-/// accounted like WAL bytes rather than like scratch: they are reconciled from
-/// the filesystem at registration, admitted before the runs are written,
-/// committed when the member's record lands, and released only when the member
-/// is retired after publication.
-#[derive(Debug)]
-pub struct StageVolume {
-    /// Shared device-grouped authority.
-    governor: BifrostVolumeGovernor,
-}
-
-impl StageVolume {
-    /// Returns the registered durable staging root.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invalid-plan error when the staging class is not registered,
-    /// which registration prevents.
-    pub fn root(&self) -> Result<&Path, BifrostResourceError> {
-        self.governor
-            .roots
-            .get(&BifrostVolumeClass::ScribeStage)
-            .map(|root| root.path.as_path())
-            .ok_or_else(|| BifrostResourceError::InvalidPlan {
-                detail: "Scribe stage volume class is not registered".to_owned(),
-            })
-    }
-
-    /// Provisionally admits exact staged growth before the runs are written.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed refusal when the shared device cannot preserve both its
-    /// configured ceiling and current physical free-space floor.
-    pub fn try_reserve_growth(&self, bytes: u64) -> Result<StageGrowth, BifrostResourceError> {
-        Ok(StageGrowth {
-            lease: Some(
-                self.governor
-                    .acquire(BifrostVolumeClass::ScribeStage, bytes, true)?,
-            ),
-        })
-    }
-
-    /// Releases exact staged occupancy after a member's files are removed.
-    ///
-    /// # Errors
-    ///
-    /// Returns poison when reconciled staged ownership cannot cover the exact
-    /// retired length.
-    pub fn retire(&self, bytes: u64) -> Result<(), BifrostResourceError> {
-        retire_durable(&self.governor, BifrostVolumeClass::ScribeStage, bytes)
-    }
-}
-
-/// Provisional staged growth awaiting the record that makes it authoritative.
-#[derive(Debug)]
-pub struct StageGrowth {
-    /// Shared provisional owner; `None` after durable commit.
-    lease: Option<VolumeLease>,
-}
-
-impl StageGrowth {
-    /// Reconciles the admitted estimate to measured bytes, then commits them.
-    ///
-    /// Staged bytes are admitted before encoding against the frozen bucket's
-    /// retained Arrow size, which is an estimate rather than the encoded
-    /// length. Committing therefore settles the difference first: a smaller
-    /// encoding releases the unused provisional charge, and a larger one is
-    /// re-admitted through the same ceiling and free-space floor as the
-    /// original request, so a member never owns bytes the device never
-    /// approved.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed refusal when measured bytes exceed the estimate and the
-    /// device cannot admit the difference, and poison when the registered
-    /// device or provisional counter no longer covers the admitted growth. A
-    /// refusal leaves the estimate charged until this owner drops, so the
-    /// caller must remove the measured files it could not commit.
-    pub fn commit(mut self, measured_bytes: u64) -> Result<(), BifrostResourceError> {
-        let mut lease = self.lease.take().ok_or_else(accounting_overflow)?;
-        if measured_bytes > lease.bytes {
-            let mut extra =
-                lease
-                    .governor
-                    .acquire(lease.class, measured_bytes - lease.bytes, true)?;
-            extra.retained = true;
-            lease.bytes = measured_bytes;
-        } else if measured_bytes < lease.bytes {
-            release_provisional(&lease, lease.bytes - measured_bytes)?;
-            lease.bytes = measured_bytes;
-        }
-        commit_durable(lease)
-    }
-}
-
-/// Releases part of one lease's provisional durable charge before commit.
-///
-/// # Errors
-///
-/// Returns poison when the registered device or provisional counter no longer
-/// covers the released difference; capacity is not returned on mismatch.
-fn release_provisional(lease: &VolumeLease, bytes: u64) -> Result<(), BifrostResourceError> {
-    let mut devices =
-        lease
-            .governor
-            .devices
-            .lock()
-            .map_err(|_| BifrostResourceError::Poisoned {
-                detail: "volume state lock is poisoned".to_owned(),
-            })?;
-    let state = devices
-        .get_mut(&lease.device)
-        .ok_or_else(accounting_overflow)?;
-    if state.provisional(lease.class) < bytes {
-        state.poisoned = true;
-        lease
-            .governor
-            .health
-            .poison(BifrostResourcePoisonReason::Volume);
-        return Err(BifrostResourceError::Poisoned {
-            detail: "provisional durable growth diverged before reconciliation".to_owned(),
-        });
-    }
-    *state.provisional_bytes.entry(lease.class).or_default() -= bytes;
-    record_volume_transition(lease.class, "released", state.owned(lease.class));
-    Ok(())
-}
-
-/// Non-generic WAL volume capability.
-#[derive(Debug)]
-pub struct WalVolume {
-    /// Shared device-grouped authority.
-    governor: BifrostVolumeGovernor,
-}
-
-impl WalVolume {
-    /// Provisionally admits exact WAL growth before write and fsync.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed refusal when the shared device cannot preserve both its
-    /// configured ceiling and current physical free-space floor.
-    pub fn try_reserve_growth(&self, bytes: u64) -> Result<WalVolumeGrowth, BifrostResourceError> {
-        Ok(WalVolumeGrowth {
-            lease: Some(
-                self.governor
-                    .acquire(BifrostVolumeClass::Wal, bytes, true)?,
-            ),
-        })
-    }
-
-    /// Releases exact durable occupancy after file removal and directory fsync.
-    ///
-    /// # Errors
-    ///
-    /// Returns poison when reconciled durable ownership cannot cover the exact
-    /// retired file length; no capacity is returned on mismatch.
-    pub fn retire(&self, bytes: u64) -> Result<(), BifrostResourceError> {
-        retire_durable(&self.governor, BifrostVolumeClass::Wal, bytes)
-    }
-
-    /// Poisons shared health when failed WAL mutation cannot be reconciled.
-    pub(crate) fn poison_divergence(&self) {
-        self.governor
-            .health
-            .poison(BifrostResourcePoisonReason::Volume);
-    }
-}
-
-/// Non-generic disposable scratch capability bound to one role root.
-#[derive(Debug)]
+/// Not capacity-governed: a full device surfaces as the writer's own IO error.
+/// Registration clears only claim directories this process family created, so
+/// residue from an interrupted claim never outlives a restart.
+#[derive(Debug, Clone)]
 pub struct ScratchVolume {
-    /// Shared device-grouped authority.
-    governor: BifrostVolumeGovernor,
-    /// Closed role volume class.
-    class: BifrostVolumeClass,
+    /// Registered Scribe output namespace.
+    root: PathBuf,
 }
 
 impl ScratchVolume {
-    /// Acquires exact disposable occupancy until cleanup completes.
+    /// Clears retained claim directories and binds the namespace.
     ///
     /// # Errors
     ///
-    /// Returns a typed refusal when the aliased physical device cannot cover
-    /// the request while preserving configured and actual-free bounds.
-    pub fn try_acquire(&self, bytes: u64) -> Result<ScratchLease, BifrostResourceError> {
-        Ok(ScratchLease {
-            lease: Some(self.governor.acquire(self.class, bytes, false)?),
-        })
+    /// Returns unavailable when the namespace cannot be listed or a retained
+    /// claim directory cannot be removed and its parent fsynced.
+    pub fn register(root: PathBuf) -> Result<Self, BifrostResourceError> {
+        reconcile_scribe_scratch_namespace(&root)?;
+        Ok(Self { root })
     }
 
     /// Creates the exact owned output directory one assembly claim merges into.
@@ -1066,57 +430,25 @@ impl ScratchVolume {
     ///
     /// # Errors
     ///
-    /// Returns a typed plan error for a non-Scribe capability or an unsafe
-    /// stream component, a capacity refusal from the shared device governor, or
+    /// Returns a typed plan error for an unsafe stream or claim component, or
     /// an unavailable error when the exact owned directory cannot be created.
     pub fn create_scribe_claim(
         &self,
         stream: &str,
         claim: &str,
-        bytes: u64,
     ) -> Result<ScribeClaimScratch, BifrostResourceError> {
         let component = safe_scratch_component(stream)?;
         let claim = safe_scratch_component(claim)?;
-        self.create_owned_directory(&format!("{CLAIM_SCRATCH_PREFIX}{component}-{claim}"), bytes)
-    }
-
-    /// Creates one uniquely suffixed owned directory under the Scribe namespace.
-    ///
-    /// The returned owner removes only the directory it creates. Its name is
-    /// rooted beneath the registered Scribe namespace and carries the identity
-    /// its caller needs for restart reconciliation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed plan error for a non-Scribe capability, a capacity
-    /// refusal from the shared device governor, or an unavailable error when
-    /// the exact owned directory cannot be created.
-    fn create_owned_directory(
-        &self,
-        name: &str,
-        bytes: u64,
-    ) -> Result<ScribeClaimScratch, BifrostResourceError> {
-        if self.class != BifrostVolumeClass::ScribeOutput {
-            return Err(BifrostResourceError::InvalidPlan {
-                detail: "Scribe claim scratch requires the Scribe output capability".to_owned(),
-            });
-        }
-        let lease = self.try_acquire(bytes)?;
-        let root = self
-            .governor
-            .roots
-            .get(&self.class)
-            .ok_or_else(accounting_overflow)?;
         let suffix = SCRATCH_NAMESPACE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-        let path = root.path.join(format!("{name}-{suffix}"));
+        let path = self.root.join(format!(
+            "{CLAIM_SCRATCH_PREFIX}{component}-{claim}-{suffix}"
+        ));
         fs::create_dir(&path).map_err(|error| BifrostResourceError::Unavailable {
             detail: format!("cannot create Scribe claim scratch: {error}"),
         })?;
         Ok(ScribeClaimScratch {
             path,
-            namespace_root: root.path.clone(),
-            lease: Some(lease),
-            health: self.governor.health.clone(),
+            namespace_root: self.root.clone(),
         })
     }
 }
@@ -1144,17 +476,16 @@ fn safe_scratch_component(stream: &str) -> Result<&str, BifrostResourceError> {
     Ok(stream)
 }
 
-/// Claim-owned Scribe output directory and its exact physical charge.
+/// Claim-owned Scribe output directory.
+///
+/// Dropping it without [`Self::cleanup`] leaves the directory for the next
+/// registration's reconciliation to remove.
 #[derive(Debug)]
 pub struct ScribeClaimScratch {
     /// Exact directory created for this claim.
     path: PathBuf,
     /// Registered parent used to prove cleanup containment and fsync completion.
     namespace_root: PathBuf,
-    /// Charge released only after confirmed directory removal and parent fsync.
-    lease: Option<ScratchLease>,
-    /// Shared fail-stop signal poisoned after the final cleanup failure.
-    health: BifrostResourceHealth,
 }
 
 impl ScribeClaimScratch {
@@ -1164,72 +495,17 @@ impl ScribeClaimScratch {
         &self.path
     }
 
-    /// Removes the exact claim directory and releases its physical charge.
+    /// Removes the exact claim directory with bounded retries.
     ///
     /// # Errors
     ///
-    /// Returns a poisoned resource error after all bounded cleanup attempts
-    /// fail. The exact charge remains retained and shared health is poisoned.
-    pub fn cleanup(mut self) -> Result<(), BifrostResourceError> {
-        self.cleanup_owned_prefix()
-    }
-
-    /// Runs the bounded exact-prefix cleanup protocol for explicit and drop paths.
-    fn cleanup_owned_prefix(&mut self) -> Result<(), BifrostResourceError> {
-        let namespace_root = self.namespace_root.clone();
-        let path = self.path.clone();
-        self.cleanup_owned_prefix_with(|| remove_exact_scratch_prefix(&namespace_root, &path))
-    }
-
-    /// Applies cleanup through an injectable exact-prefix operation for regression tests.
-    fn cleanup_owned_prefix_with(
-        &mut self,
-        cleanup: impl FnMut() -> std::io::Result<()>,
-    ) -> Result<(), BifrostResourceError> {
-        if self.lease.is_none() {
-            return Ok(());
-        }
-        let result = retry_scratch_cleanup(cleanup);
-        if result.is_ok() {
-            self.lease.take();
-            return Ok(());
-        }
-        if let Some(lease) = self.lease.take() {
-            lease.retain();
-        }
-        self.health.poison(BifrostResourcePoisonReason::Volume);
-        Err(BifrostResourceError::Poisoned {
-            detail: "Scribe claim scratch cleanup exhausted bounded retries".to_owned(),
-        })
-    }
-}
-
-impl Drop for ScribeClaimScratch {
-    /// Retains ownership without filesystem work on cancellation and unwind.
-    ///
-    /// Explicit cleanup owns the blocking deletion and bounded retry boundary.
-    /// A dropped owner may be running on a Tokio worker, so it cannot delete or
-    /// sleep here. Retaining the exact charge and poisoning shared health keeps
-    /// the residue visible to startup reconciliation and stops new admissions.
-    fn drop(&mut self) {
-        if let Some(lease) = self.lease.take() {
-            lease.retain();
-            self.health.poison(BifrostResourcePoisonReason::Volume);
-            tracing::error!(
-                operation = "scribe_claim_scratch_drop",
-                outcome = "retained_poisoned",
-                "Scribe claim scratch ownership dropped before explicit cleanup"
-            );
-        }
-    }
-}
-
-/// Retains one failed scratch charge without running its ordinary release drop.
-impl ScratchLease {
-    fn retain(mut self) {
-        if let Some(mut lease) = self.lease.take() {
-            lease.retained = true;
-        }
+    /// Returns unavailable after all bounded cleanup attempts fail; the
+    /// directory is then left for restart reconciliation.
+    pub fn cleanup(self) -> Result<(), BifrostResourceError> {
+        retry_scratch_cleanup(|| remove_exact_scratch_prefix(&self.namespace_root, &self.path))
+            .map_err(|error| BifrostResourceError::Unavailable {
+                detail: format!("Scribe claim scratch cleanup exhausted bounded retries: {error}"),
+            })
     }
 }
 
@@ -1268,226 +544,6 @@ fn remove_exact_scratch_prefix(root: &Path, owned: &Path) -> std::io::Result<()>
         Err(error) => return Err(error),
     }
     fs::File::open(root)?.sync_all()
-}
-
-/// Provisional exact WAL growth committed only after durable mutation.
-#[derive(Debug)]
-pub struct WalVolumeGrowth {
-    /// Shared provisional owner; `None` after durable commit.
-    lease: Option<VolumeLease>,
-}
-
-impl WalVolumeGrowth {
-    /// Converts provisional growth into retained durable WAL occupancy.
-    ///
-    /// # Errors
-    ///
-    /// Returns poison when the registered device or provisional counter no
-    /// longer covers this exact growth.
-    pub fn commit(mut self) -> Result<(), BifrostResourceError> {
-        commit_durable(self.lease.take().ok_or_else(accounting_overflow)?)
-    }
-
-    /// Retains provisional ownership and poisons health after mutation divergence.
-    pub(crate) fn retain_and_poison(mut self) {
-        if let Some(mut lease) = self.lease.take() {
-            lease.retained = true;
-            lease
-                .governor
-                .health
-                .poison(BifrostResourcePoisonReason::Volume);
-        }
-    }
-}
-
-/// Exact disposable scratch occupancy released after owned-prefix cleanup.
-#[derive(Debug)]
-pub struct ScratchLease {
-    /// Shared lease retained until cleanup success or cancellation.
-    lease: Option<VolumeLease>,
-}
-
-impl ScratchLease {
-    /// Returns the exact charged disposable bytes.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.lease.as_ref().map_or(0, |lease| lease.bytes)
-    }
-}
-
-/// Internal exact per-device ownership common to WAL and scratch shapes.
-#[derive(Debug)]
-struct VolumeLease {
-    /// Device-grouped authority.
-    governor: BifrostVolumeGovernor,
-    /// Exact physical device charged by this owner.
-    device: u64,
-    /// Exact byte charge.
-    bytes: u64,
-    /// Closed capability class whose exact counter receives this ownership.
-    class: BifrostVolumeClass,
-    /// Whether this is provisional durable growth rather than disposable scratch.
-    durable: bool,
-    /// Committed durable or failed-cleanup ownership retained after this drops.
-    retained: bool,
-}
-
-impl Drop for VolumeLease {
-    /// Rolls back provisional durable growth or releases disposable scratch.
-    fn drop(&mut self) {
-        if self.retained {
-            return;
-        }
-        let Ok(mut devices) = self.governor.devices.lock() else {
-            self.governor
-                .health
-                .poison(BifrostResourcePoisonReason::Volume);
-            return;
-        };
-        let Some(state) = devices.get_mut(&self.device) else {
-            self.governor
-                .health
-                .poison(BifrostResourcePoisonReason::Volume);
-            return;
-        };
-        let counter = if self.durable {
-            state.provisional_bytes.entry(self.class).or_default()
-        } else {
-            state.scratch_bytes.entry(self.class).or_default()
-        };
-        if *counter < self.bytes {
-            state.poisoned = true;
-            self.governor
-                .health
-                .poison(BifrostResourcePoisonReason::Volume);
-            return;
-        }
-        *counter -= self.bytes;
-        let current = *counter;
-        record_volume_transition(self.class, "released", current);
-    }
-}
-
-/// Measures WAL segments and the flat, authorized Scribe staging namespace.
-///
-/// # Errors
-///
-/// Returns unavailable when a registered path cannot be read or measured.
-fn retained_wal_root_bytes(root: &Path) -> Result<u64, BifrostResourceError> {
-    retained_path_bytes(root, &root.join("staged"))
-}
-
-/// Measures retained Scribe staged bytes under the registered staging root.
-///
-/// The staging root is owned end to end by `ScribeHotStage`: every regular file
-/// beneath it is either a staged run or a staged member record, and both are
-/// durable until the member retires. Reconciliation therefore counts the whole
-/// tree rather than a filename allowlist, so an interrupted stage cannot leave
-/// bytes on the device that the governor does not own.
-///
-/// # Errors
-///
-/// Returns unavailable when the staging root cannot be read or measured.
-fn retained_stage_root_bytes(root: &Path) -> Result<u64, BifrostResourceError> {
-    let metadata =
-        fs::symlink_metadata(root).map_err(|error| BifrostResourceError::Unavailable {
-            detail: format!("cannot inspect retained stage path: {error}"),
-        })?;
-    if metadata.is_file() {
-        return Ok(metadata.len());
-    }
-    if !metadata.is_dir() {
-        return Ok(0);
-    }
-    let mut total = 0_u64;
-    for entry in fs::read_dir(root).map_err(|error| BifrostResourceError::Unavailable {
-        detail: format!("cannot enumerate retained stage path: {error}"),
-    })? {
-        let entry = entry.map_err(|error| BifrostResourceError::Unavailable {
-            detail: format!("cannot inspect retained stage entry: {error}"),
-        })?;
-        total = total
-            .checked_add(retained_stage_root_bytes(&entry.path())?)
-            .ok_or_else(accounting_overflow)?;
-    }
-    Ok(total)
-}
-
-/// Recursively measures retained WAL bytes without following symlinks.
-///
-/// Regular WAL files are counted outside the staged namespace. Inside the
-/// staged namespace only Scribe's flat, closed filename set participates, so
-/// an unrelated operator file cannot consume or release WAL capacity.
-///
-/// # Errors
-///
-/// Returns unavailable when a registered path cannot be read or measured.
-fn retained_path_bytes(path: &Path, staged_root: &Path) -> Result<u64, BifrostResourceError> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| BifrostResourceError::Unavailable {
-            detail: format!("cannot inspect retained WAL path: {error}"),
-        })?;
-    if metadata.is_file() {
-        let retained = if path.starts_with(staged_root) {
-            path.parent() == Some(staged_root)
-                && path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(is_authorized_staged_name)
-        } else {
-            path.extension().and_then(|value| value.to_str()) == Some("wal")
-        };
-        return Ok(if retained { metadata.len() } else { 0 });
-    }
-    if !metadata.is_dir() || (path.starts_with(staged_root) && path != staged_root) {
-        return Ok(0);
-    }
-    let mut total = 0_u64;
-    for entry in fs::read_dir(path).map_err(|error| BifrostResourceError::Unavailable {
-        detail: format!("cannot enumerate retained WAL path: {error}"),
-    })? {
-        let entry = entry.map_err(|error| BifrostResourceError::Unavailable {
-            detail: format!("cannot inspect retained WAL entry: {error}"),
-        })?;
-        total = total
-            .checked_add(retained_path_bytes(&entry.path(), staged_root)?)
-            .ok_or_else(accounting_overflow)?;
-    }
-    Ok(total)
-}
-
-/// Identifies one durable filename owned by the flat Scribe stage lifecycle.
-fn is_authorized_staged_name(name: &str) -> bool {
-    name.ends_with(".par.tmp")
-        || name.ends_with(".parquet")
-        || name.ends_with(".attempt.json")
-        || name.ends_with(".winner")
-        || name.ends_with(".publication.tmp")
-        || name.ends_with(".publication.json")
-}
-
-/// Samples current filesystem-available bytes for one registered root.
-///
-/// The probed path is included in the failure detail. A registered volume root
-/// that has been removed underneath a running pod reports the same errno as a
-/// permission or mount fault, and without the path an operator cannot tell
-/// which of the four volume classes failed or whether the directory simply no
-/// longer exists.
-///
-/// # Errors
-///
-/// Returns unavailable when the live filesystem probe fails or overflows.
-fn filesystem_available_bytes(path: &Path) -> Result<u64, BifrostResourceError> {
-    let stats = statvfs(path).map_err(|error| BifrostResourceError::Unavailable {
-        detail: format!(
-            "cannot sample Bifrost volume free space at {}: {error}",
-            path.display()
-        ),
-    })?;
-    stats
-        .f_bavail
-        .checked_mul(stats.f_frsize)
-        .ok_or_else(accounting_overflow)
 }
 
 /// Exact immutable capacity calculation shared by boot, telemetry, and tests.
@@ -1677,8 +733,6 @@ pub struct ResourceSnapshot {
     pub oracle_memory_used_bytes: usize,
     /// Elastic memory held by Oracle.
     pub elastic_memory_used_bytes: usize,
-    /// Disposable scratch held by Oracle.
-    pub scratch_used_bytes: u64,
     /// Aggregate number of live Oracle query owners.
     pub oracle_active_queries: u32,
     /// Live interactive Oracle query owners.
@@ -1695,8 +749,6 @@ pub struct ResourceSnapshot {
     /// rather than to governed free capacity, so they suppress later fallible
     /// growth without ever being offered as available memory.
     pub oracle_infallible_bytes: usize,
-    /// Aggregate scratch retained specifically by Oracle query owners.
-    pub oracle_query_scratch_used_bytes: u64,
     /// Whether at least one Oracle query owner is active.
     pub oracle_query_active: bool,
 }
@@ -1736,8 +788,10 @@ pub struct OracleResourceRequest {
     /// request cannot disagree with it; it reserves no bytes. Governed memory is
     /// charged only when the query's shared-pool consumers grow.
     pub memory_bytes: usize,
-    /// Exact positive root scratch demand.
-    pub scratch_bytes: u64,
+    /// Class spill quantum: the most `DataFusion` may write to disk for this
+    /// query, clamped to the resolved scratch limit. A limit only; admission
+    /// never debits it.
+    pub spill_limit_bytes: u64,
     /// Exact positive Oracle slot-unit demand.
     pub slot_units: u32,
     /// Fraction of pinned input bytes expected to be local, in `[0, 1]`.
@@ -1754,10 +808,8 @@ impl OracleResourceRequest {
     ///
     /// The memory term is a validated sizing quantum, not a reservation: no
     /// admission path debits it, and the ceiling the query may actually grow
-    /// into is derived per query and is generally much larger. Scratch is the
-    /// one term that is genuinely leased here, because spill is consumed disk
-    /// rather than a ceiling, so a query that spills must already own the space
-    /// it spills into.
+    /// into is derived per query and is generally much larger. The spill term
+    /// is likewise only a ceiling: an unspilled query owns no disk.
     #[must_use]
     pub fn for_class(query_class: QueryClass, local_ratio: f64) -> Self {
         let slot_units = match query_class {
@@ -1767,7 +819,7 @@ impl OracleResourceRequest {
         Self {
             query_class,
             memory_bytes: ORACLE_PARTITION_WORKING_MEMORY_BYTES * slot_units as usize,
-            scratch_bytes: ORACLE_PARTITION_MEMORY_BYTES as u64 * u64::from(slot_units),
+            spill_limit_bytes: ORACLE_PARTITION_MEMORY_BYTES as u64 * u64::from(slot_units),
             slot_units,
             local_ratio,
         }
@@ -1806,7 +858,6 @@ struct ResourceState {
     scribe_memory_used_bytes: usize,
     oracle_memory_used_bytes: usize,
     elastic_memory_used_bytes: usize,
-    scratch_used_bytes: u64,
     oracle_active_queries: u32,
     oracle_interactive_queries: u32,
     oracle_analytical_queries: u32,
@@ -1814,10 +865,15 @@ struct ResourceState {
     oracle_analytical_slot_units: u32,
     oracle_query_memory_used_bytes: usize,
     oracle_infallible_bytes: usize,
-    oracle_query_scratch_used_bytes: u64,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
     memory_epoch: u64,
+    /// Advances only when Oracle slot units return to the ledger.
+    ///
+    /// Oracle admission refuses on slots alone, so its waiters
+    /// follow this epoch rather than `memory_epoch`, which also moves on every
+    /// query-memory grow and shrink and would wake the whole queue per batch.
+    oracle_capacity_epoch: u64,
     poisoned: bool,
 }
 
@@ -1843,8 +899,8 @@ pub struct BifrostRuntimeResources {
     governor: BifrostResourceGovernor,
     /// Process-wide encoded transport-body admission inside unmanaged memory.
     transport: crate::gate::limits::BifrostTransportAdmission,
-    /// Device-grouped physical-volume authority, present on live boot.
-    volumes: Option<BifrostVolumeGovernor>,
+    /// Registered Scribe stage and output roots, present on live boot.
+    volumes: Option<BifrostVolumeRoots>,
 }
 
 impl BifrostRuntimeResources {
@@ -1855,6 +911,8 @@ impl BifrostRuntimeResources {
     }
     /// Detects process-visible resources and constructs the shared role graph.
     ///
+    /// The transport message maximum is the default ingest request ceiling.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError`] when detection or checked root-policy
@@ -1862,7 +920,7 @@ impl BifrostRuntimeResources {
     pub fn detect(policy: BifrostResourcePolicy) -> Result<Self, BifrostResourceError> {
         Self::detect_with_transport_message_limit(
             policy,
-            crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
         )
     }
 
@@ -1890,6 +948,8 @@ impl BifrostRuntimeResources {
     /// stage as live boot; callers may vary observations but cannot request a
     /// derived grant or construct a sibling governor.
     ///
+    /// The transport message maximum is the default ingest request ceiling.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError`] when the observation cannot satisfy the
@@ -1901,7 +961,7 @@ impl BifrostRuntimeResources {
         Self::from_snapshot_with_transport_message_limit(
             snapshot,
             policy,
-            crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
         )
     }
 
@@ -1916,16 +976,11 @@ impl BifrostRuntimeResources {
         policy: BifrostResourcePolicy,
         transport_message_limit_bytes: usize,
     ) -> Result<Self, BifrostResourceError> {
-        let roots = policy.volume_roots.clone();
-        let configured_limit = policy
-            .scratch_limit_bytes
-            .unwrap_or(snapshot.scratch_capacity_bytes);
+        let volumes = policy.volume_roots.clone();
+        if let Some(roots) = &volumes {
+            ScratchVolume::register(roots.scribe_output_scratch.clone())?;
+        }
         let root = BifrostResourceGovernor::from_snapshot(snapshot, policy)?;
-        let volumes = roots
-            .map(|roots| {
-                BifrostVolumeGovernor::register(roots, configured_limit, root.inner.health.clone())
-            })
-            .transpose()?;
         let transport = crate::gate::limits::BifrostTransportAdmission::new(
             root.plan().unmanaged_reserve_bytes,
             transport_message_limit_bytes,
@@ -2013,7 +1068,6 @@ impl BifrostRuntimeResources {
             scribe,
             oracle: (plan.oracle_floor_bytes > 0).then(|| OracleResources {
                 governor: self.governor.clone(),
-                volumes: self.volumes.clone(),
                 memory_root: Arc::new(OracleMemoryRoot::new(
                     self.governor.clone(),
                     plan.oracle_floor_bytes
@@ -2024,7 +1078,6 @@ impl BifrostRuntimeResources {
             }),
             governor: self.governor.clone(),
             transport: self.transport.clone(),
-            volumes: self.volumes.clone(),
         })
     }
 
@@ -2062,18 +1115,9 @@ pub struct BifrostRoleResources {
     governor: BifrostResourceGovernor,
     /// Process-wide encoded body owner shared by HTTP and tonic surfaces.
     transport: crate::gate::limits::BifrostTransportAdmission,
-    /// Device-grouped physical-volume authority registered during live boot.
-    volumes: Option<BifrostVolumeGovernor>,
 }
 
 impl BifrostRoleResources {
-    /// Returns fresh non-cloneable role-bound physical-volume capabilities.
-    #[must_use]
-    pub fn volume_capabilities(&self) -> Option<BifrostVolumeCapabilities> {
-        self.volumes
-            .as_ref()
-            .map(BifrostVolumeGovernor::capabilities)
-    }
     /// Returns the sole process resource-health lifecycle signal.
     #[must_use]
     pub fn health(&self) -> BifrostResourceHealth {
@@ -2127,8 +1171,8 @@ impl BifrostRoleResources {
 #[derive(Debug, Clone)]
 pub struct ScribeResources {
     governor: BifrostResourceGovernor,
-    /// Physical WAL/output-scratch authority registered during live boot.
-    volumes: Option<BifrostVolumeGovernor>,
+    /// Registered Scribe stage and output roots, present on live boot.
+    volumes: Option<BifrostVolumeRoots>,
     /// Existing-role bounded concurrency for request-local live-tail followers.
     follower_permits: Arc<Semaphore>,
 }
@@ -2212,22 +1256,28 @@ impl ScribeResources {
         }
     }
 
-    /// Returns fixed closed shard totals from root attribution.
+    /// Returns root-attributed bytes for each of `shard_count` shards.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the root state lock is poisoned.
     #[must_use]
-    pub(crate) fn shard_snapshot(&self) -> [usize; 16] {
+    pub(crate) fn shard_snapshot(&self, shard_count: usize) -> Vec<usize> {
         let state = self
             .governor
             .inner
             .state
             .lock()
             .expect("Scribe root state lock");
-        std::array::from_fn(|shard| {
-            state
-                .scribe_shard_bytes
-                .get(&shard)
-                .copied()
-                .unwrap_or_default()
-        })
+        (0..shard_count)
+            .map(|shard| {
+                state
+                    .scribe_shard_bytes
+                    .get(&shard)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Emits only the root-owned closed resource gauge family.
@@ -2278,25 +1328,19 @@ impl ScribeResources {
     pub(crate) fn cgroup_tripwire_engaged(&self) -> bool {
         matches!(self.governor.cgroup_pressure(), Some((current, limit)) if current.saturating_mul(100) >= limit.saturating_mul(90))
     }
-    /// Returns a fresh handle on the durable Scribe staging volume.
-    ///
-    /// Kept separate from [`Self::volume_capabilities`] because staged runs are
-    /// durable in a way output scratch is not: they authorize WAL retirement,
-    /// so a caller that only needs encoding workspace must not be handed the
-    /// capability that charges the staging floor.
+    /// Returns the registered durable Scribe staging root.
     #[must_use]
-    pub fn stage_volume(&self) -> Option<StageVolume> {
+    pub fn stage_root(&self) -> Option<&Path> {
         self.volumes
             .as_ref()
-            .map(|volumes| volumes.capabilities().scribe_stage)
+            .map(|volumes| volumes.scribe_stage.as_path())
     }
 
-    /// Returns fresh non-cloneable WAL and output-scratch capabilities.
+    /// Returns the Scribe output scratch namespace reconciled at registration.
     #[must_use]
-    pub fn volume_capabilities(&self) -> Option<(WalVolume, ScratchVolume)> {
-        self.volumes.as_ref().map(|volumes| {
-            let capabilities = volumes.capabilities();
-            (capabilities.wal, capabilities.scribe_output)
+    pub fn output_scratch(&self) -> Option<ScratchVolume> {
+        self.volumes.as_ref().map(|volumes| ScratchVolume {
+            root: volumes.scribe_output_scratch.clone(),
         })
     }
     /// Acquires one exact root-owned Scribe lease with lifecycle attribution.
@@ -2445,8 +1489,6 @@ impl ScribeResources {
 #[derive(Debug, Clone)]
 pub struct OracleResources {
     governor: BifrostResourceGovernor,
-    /// Physical Oracle scratch authority registered during live boot.
-    volumes: Option<BifrostVolumeGovernor>,
     /// The one governed `DataFusion` root every query on this pod shares.
     ///
     /// Cloning this capability shares the same root, which is the point: two
@@ -2632,27 +1674,31 @@ impl OracleResources {
         self.memory_root.limit_bytes()
     }
 
-    /// Captures the shared root capacity epoch before an admission attempt.
+    /// Captures the Oracle slot-and-scratch epoch before an admission attempt.
     #[must_use]
-    pub fn memory_epoch(&self) -> u64 {
-        self.governor.memory_epoch()
+    pub fn capacity_epoch(&self) -> u64 {
+        self.governor.oracle_capacity_epoch()
     }
 
-    /// Waits until a release, resize, or poison advances the root capacity epoch.
+    /// Waits until a slot or scratch return, or poison, advances the Oracle capacity epoch.
     ///
     /// Waiting never grants capacity. A queued Oracle leader uses this to learn
-    /// that a follower or sibling query returned slot units or memory, then
+    /// that a follower or sibling query returned slot units or scratch, then
     /// re-runs its own scheduler; it must never treat a wake as an admission.
+    /// Query-memory growth and shrink do not advance this epoch because Oracle
+    /// admission never refuses on resident query memory.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError::Poisoned`] when root accounting becomes
     /// untrustworthy before or during the wait.
-    pub async fn wait_for_memory_change(
+    pub async fn wait_for_capacity_change(
         &self,
         observed_epoch: u64,
     ) -> Result<u64, BifrostResourceError> {
-        self.governor.wait_for_memory_change(observed_epoch).await
+        self.governor
+            .wait_for_oracle_capacity_change(observed_epoch)
+            .await
     }
 
     /// Returns aggregate slot units currently held across leaders and followers.
@@ -2693,31 +1739,24 @@ impl OracleResources {
 
     /// Atomically acquires one exact query envelope alongside compatible owners.
     ///
-    /// Memory is charged floor-first, scratch and slot units are additive, and
-    /// analytical admission preserves one interactive quantum. The returned
-    /// query owns a bounded `DataFusion` pool and nested scratch ceiling equal
-    /// to this request rather than the role's remaining capacity.
+    /// Slot units are additive and analytical admission preserves one
+    /// interactive quantum. The returned query owns a bounded `DataFusion`
+    /// pool and a spill limit; it charges no disk.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostResourceError::Occupied`] when aggregate memory,
-    /// scratch, slot units, physical scratch, or the protected interactive
-    /// reserve cannot cover the exact request. Returns
+    /// Returns [`BifrostResourceError::Occupied`] when slot units or the
+    /// protected interactive reserve cannot cover the exact request. Returns
     /// [`BifrostResourceError::InvalidPlan`] for zero, overflowing, inactive,
     /// or invalid partition demand, and a poison error for divergent root
-    /// accounting. No root counter changes on root-admission refusal.
+    /// accounting. No root counter changes on refusal.
     pub fn try_acquire_query(
         &self,
         request: OracleResourceRequest,
     ) -> Result<OracleQueryResources, BifrostResourceError> {
-        let mut resources = self
+        let resources = self
             .governor
             .try_acquire_oracle(request, &self.memory_root)?;
-        if let Some(volumes) = &self.volumes {
-            let capabilities = volumes.capabilities();
-            resources.volume_scratch =
-                Some(capabilities.oracle.try_acquire(resources.scratch_bytes)?);
-        }
         #[cfg(feature = "test-support")]
         self.memory_hold.engage(&resources.memory_pool);
         Ok(resources)
@@ -2761,6 +1800,8 @@ struct ResourceGovernorInner {
     state: Mutex<ResourceState>,
     /// Lost-wakeup-safe notification paired with `ResourceState::memory_epoch`.
     memory_changed: Notify,
+    /// Lost-wakeup-safe notification paired with `ResourceState::oracle_capacity_epoch`.
+    oracle_capacity_changed: Notify,
     /// Cgroup hard limit used by the live external-pressure tripwire.
     cgroup_limit_bytes: Option<usize>,
     /// Live cgroup usage cached for at most one second under the root owner.
@@ -2990,6 +2031,7 @@ impl BifrostResourceGovernor {
                 oracle_class_split: OnceLock::new(),
                 state: Mutex::new(ResourceState::default()),
                 memory_changed: Notify::new(),
+                oracle_capacity_changed: Notify::new(),
                 cgroup_limit_bytes: crate::scribe::memory::read_cgroup_limit(),
                 cgroup_current: Mutex::new(None),
                 health: BifrostResourceHealth::default(),
@@ -3078,14 +2120,12 @@ impl BifrostResourceGovernor {
             scribe_memory_used_bytes: state.scribe_memory_used_bytes,
             oracle_memory_used_bytes: state.oracle_memory_used_bytes,
             elastic_memory_used_bytes: state.elastic_memory_used_bytes,
-            scratch_used_bytes: state.scratch_used_bytes,
             oracle_active_queries: state.oracle_active_queries,
             oracle_interactive_queries: state.oracle_interactive_queries,
             oracle_analytical_queries: state.oracle_analytical_queries,
             oracle_query_slot_units: state.oracle_query_slot_units,
             oracle_query_memory_used_bytes: state.oracle_query_memory_used_bytes,
             oracle_infallible_bytes: state.oracle_infallible_bytes,
-            oracle_query_scratch_used_bytes: state.oracle_query_scratch_used_bytes,
             oracle_query_active: state.oracle_active_queries > 0,
         })
     }
@@ -3165,6 +2205,7 @@ impl BifrostResourceGovernor {
                 .health
                 .poison(BifrostResourcePoisonReason::Accounting);
             self.inner.memory_changed.notify_waiters();
+            self.notify_oracle_capacity();
             return Err(BifrostResourceError::Poisoned {
                 detail: "Scribe root attribution does not reconcile to live ownership".to_owned(),
             });
@@ -3206,8 +2247,6 @@ impl BifrostResourceGovernor {
                 .to_f64()
                 .unwrap_or(f64::MAX),
         );
-        metrics::gauge!("bifrost_resource_scratch_bytes", "kind" => "used")
-            .set(snapshot.scratch_used_bytes.to_f64().unwrap_or(f64::MAX));
         Ok(())
     }
 
@@ -3314,6 +2353,46 @@ impl BifrostResourceGovernor {
         }
     }
 
+    /// Returns the Oracle slot-and-scratch epoch from the authoritative lock.
+    fn oracle_capacity_epoch(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .map_or(u64::MAX, |state| state.oracle_capacity_epoch)
+    }
+
+    /// Waits for a strictly newer Oracle capacity epoch without granting capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error when the root becomes untrustworthy.
+    async fn wait_for_oracle_capacity_change(
+        &self,
+        observed_epoch: u64,
+    ) -> Result<u64, BifrostResourceError> {
+        loop {
+            let notified = self.inner.oracle_capacity_changed.notified();
+            let current_epoch = { self.lock_state()?.oracle_capacity_epoch };
+            if current_epoch > observed_epoch {
+                return Ok(current_epoch);
+            }
+            notified.await;
+        }
+    }
+
+    /// Advances the Oracle capacity epoch after slots or scratch returned.
+    ///
+    /// The caller holds the state lock and must call
+    /// [`Self::notify_oracle_capacity`] after dropping it.
+    fn advance_oracle_capacity(state: &mut ResourceState) {
+        state.oracle_capacity_epoch = state.oracle_capacity_epoch.wrapping_add(1);
+    }
+
+    /// Wakes queued Oracle admission after a capacity return or poison.
+    fn notify_oracle_capacity(&self) {
+        self.inner.oracle_capacity_changed.notify_waiters();
+    }
+
     /// Validates one query request against the active Oracle class contract.
     ///
     /// # Errors
@@ -3329,18 +2408,13 @@ impl BifrostResourceGovernor {
                 detail: "Oracle resources requested while the role is inactive".to_owned(),
             });
         }
-        if request.memory_bytes == 0 || request.scratch_bytes == 0 || request.slot_units == 0 {
+        if request.memory_bytes == 0 || request.slot_units == 0 {
             return Err(BifrostResourceError::InvalidPlan {
                 detail: "Oracle query demands must be positive".to_owned(),
             });
         }
         let exact = OracleResourceRequest::for_class(request.query_class, request.local_ratio);
-        if (
-            request.memory_bytes,
-            request.scratch_bytes,
-            request.slot_units,
-        ) != (exact.memory_bytes, exact.scratch_bytes, exact.slot_units)
-        {
+        if (request.memory_bytes, request.slot_units) != (exact.memory_bytes, exact.slot_units) {
             return Err(BifrostResourceError::InvalidPlan {
                 detail: "Oracle query demand must match its class quantum".to_owned(),
             });
@@ -3488,17 +2562,8 @@ impl BifrostResourceGovernor {
         // The class quantum is a ceiling and a partition-planning input, not
         // resident memory: what a query actually reserves is charged as its
         // `DataFusion` consumers grow through the shared Oracle root. Slots are
-        // the concurrency authority; scratch remains an admitted lease.
-        let next_scratch = state
-            .scratch_used_bytes
-            .checked_add(request.scratch_bytes)
-            .ok_or_else(accounting_overflow)?;
-        if next_scratch > plan.scratch_limit_bytes {
-            record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
-            return Err(BifrostResourceError::Occupied {
-                detail: "Oracle query exceeds aggregate scratch capacity".to_owned(),
-            });
-        }
+        // the concurrency authority; spill is bytes `DataFusion` actually writes
+        // under its own per-query limit, never an admission charge.
         // Slot units are the sole concurrency authority and the sole protector
         // of the Interactive floor. The ledger is shared with follower
         // acquisition, so an Analytical leader and a remote Analytical fragment
@@ -3529,17 +2594,11 @@ impl BifrostResourceGovernor {
             .oracle_analytical_queries
             .checked_add(u32::from(request.query_class == QueryClass::Analytical))
             .ok_or_else(accounting_overflow)?;
-        let next_query_scratch = state
-            .oracle_query_scratch_used_bytes
-            .checked_add(request.scratch_bytes)
-            .ok_or_else(accounting_overflow)?;
-        state.scratch_used_bytes = next_scratch;
         state.oracle_query_slot_units = next_slots;
         state.oracle_analytical_slot_units = next_analytical_slots;
         state.oracle_active_queries = next_active;
         state.oracle_interactive_queries = next_interactive;
         state.oracle_analytical_queries = next_analytical;
-        state.oracle_query_scratch_used_bytes = next_query_scratch;
         record_memory_transition("oracle", "acquired", state.oracle_memory_used_bytes);
         record_oracle_capacity(&state, &plan, self.oracle_class_split());
         let memory_peak_bytes = Arc::new(AtomicUsize::new(0));
@@ -3547,15 +2606,14 @@ impl BifrostResourceGovernor {
         Ok(OracleQueryResources {
             query_class: request.query_class,
             granted_memory_bytes,
-            scratch_bytes: request.scratch_bytes,
+            spill_limit_bytes: request.spill_limit_bytes.min(plan.scratch_limit_bytes),
             slot_units: request.slot_units,
             target_partitions,
             memory_pool,
             memory_peak_bytes,
-            nested_scratch_used_bytes: Arc::new(Mutex::new(0)),
             governor: self.clone(),
             released: false,
-            volume_scratch: None,
+            admission_charge: None,
         })
     }
 
@@ -3646,7 +2704,7 @@ impl BifrostResourceGovernor {
         state.oracle_memory_used_bytes = next;
         state.elastic_memory_used_bytes = next_elastic;
         state.oracle_query_memory_used_bytes = next_query;
-        record_oracle_capacity(&state, &plan, self.oracle_class_split());
+        record_oracle_memory(&state);
         Ok(OracleMemoryCharge {
             governed_bytes: bytes,
             headroom_bytes: 0,
@@ -3708,7 +2766,7 @@ impl BifrostResourceGovernor {
             .checked_add(headroom)
             .ok_or_else(accounting_overflow)?;
         state.oracle_memory_used_bytes = next;
-        record_oracle_capacity(&state, &plan, self.oracle_class_split());
+        record_oracle_memory(&state);
         Ok(OracleMemoryCharge {
             governed_bytes: governed,
             headroom_bytes: headroom,
@@ -3752,7 +2810,7 @@ impl BifrostResourceGovernor {
         state.oracle_memory_used_bytes -= charge.governed_bytes;
         state.oracle_query_memory_used_bytes -= charge.governed_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
-        record_oracle_capacity(&state, &plan, self.oracle_class_split());
+        record_oracle_memory(&state);
         drop(state);
         self.inner.memory_changed.notify_waiters();
         Ok(())
@@ -3790,6 +2848,7 @@ impl BifrostResourceGovernor {
             .health
             .poison(BifrostResourcePoisonReason::Accounting);
         self.inner.memory_changed.notify_waiters();
+        self.notify_oracle_capacity();
         BifrostResourceError::Poisoned {
             detail: detail.to_owned(),
         }
@@ -3807,6 +2866,7 @@ impl BifrostResourceGovernor {
             state.poisoned = true;
             state.memory_epoch = state.memory_epoch.wrapping_add(1);
             self.inner.memory_changed.notify_waiters();
+            self.notify_oracle_capacity();
             tracing::error!(detail, "Bifrost resource accounting poisoned");
         } else {
             tracing::error!(detail, "Bifrost resource lock poisoned");
@@ -4360,9 +3420,11 @@ impl OracleSlotCharge {
         self.governor
             .release_oracle_slots(&mut state, self.query_class, self.slot_units)?;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        BifrostResourceGovernor::advance_oracle_capacity(&mut state);
         self.released = true;
         drop(state);
         self.governor.inner.memory_changed.notify_waiters();
+        self.governor.notify_oracle_capacity();
         Ok(())
     }
 }
@@ -4936,7 +3998,7 @@ impl Drop for OracleMemoryLease {
     }
 }
 
-/// Query-lifetime Oracle memory, scratch, and adaptive parallelism owner.
+/// Query-lifetime Oracle memory, slot, and adaptive parallelism owner.
 #[derive(Debug)]
 pub struct OracleQueryResources {
     /// Scheduling class charged by this query owner.
@@ -4948,8 +4010,10 @@ pub struct OracleQueryResources {
     /// life. Admission charges no memory of its own: this is the maximum the
     /// query's actual consumer growth may govern, never a resident reservation.
     pub granted_memory_bytes: usize,
-    /// Exact bounded disposable scratch capacity.
-    pub scratch_bytes: u64,
+    /// Most bytes `DataFusion` may spill for this query: the class spill
+    /// quantum clamped to the resolved scratch limit. Nothing is charged for
+    /// it; an unspilled query owns no disk.
+    pub spill_limit_bytes: u64,
     /// Exact slot units retained by this query owner.
     slot_units: u32,
     /// Query-local `DataFusion` target partition count.
@@ -4963,15 +4027,28 @@ pub struct OracleQueryResources {
     /// was admitted under. Only the observing pool wrapper writes it, so it
     /// stays zero on a build without `test-support`.
     memory_peak_bytes: Arc<AtomicUsize>,
-    /// Query-local scratch children split from the already admitted envelope.
-    nested_scratch_used_bytes: Arc<Mutex<u64>>,
     governor: BifrostResourceGovernor,
     released: bool,
-    /// Exact physical Oracle scratch ownership when live roots are registered.
-    volume_scratch: Option<ScratchLease>,
+    /// Leader-local admission charge returned with this owner's slots.
+    ///
+    /// Opaque on purpose: the governor never inspects it, it only drops it
+    /// after the slot units return and before the capacity wake, so a queued
+    /// leader woken by that wake sees the slot and its tenant charge free
+    /// together. A remote follower's owner carries none.
+    admission_charge: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl OracleQueryResources {
+    /// Attaches the leader-local admission charge this owner returns on release.
+    ///
+    /// Oracle admission calls this once, under its own lock, immediately after
+    /// the governor grants the slot charge. The charge's drop is its release:
+    /// it runs exactly once, after the slot units return and before queued
+    /// admission is woken. A later call replaces and drops the earlier charge.
+    pub(crate) fn attach_admission_charge(&mut self, charge: Box<dyn std::any::Any + Send + Sync>) {
+        self.admission_charge = Some(charge);
+    }
+
     /// Builds the tracked first-come, first-served query-local `DataFusion` pool.
     #[must_use]
     pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
@@ -4987,7 +4064,7 @@ impl OracleQueryResources {
         Arc::clone(&self.memory_peak_bytes)
     }
 
-    /// Reports whether every nested child of this query envelope is gone.
+    /// Reports whether every nested memory child of this query envelope is gone.
     ///
     /// [`OracleQueryResources::release`] poisons the process governor when a
     /// child outlives its owner, which is correct for a leak but wrong for a
@@ -4995,34 +4072,17 @@ impl OracleQueryResources {
     /// its consumers directly — a follower whose stage plan is dropped by
     /// upstream's own task cache — asks this first and waits, so the poison
     /// keeps its meaning.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostResourceError::Poisoned`] when the scratch attribution
-    /// lock is poisoned.
-    pub fn nested_idle(&self) -> Result<bool, BifrostResourceError> {
-        self.nested_debt()
-            .map(|(scratch_bytes, memory_bytes)| scratch_bytes == 0 && memory_bytes == 0)
+    #[must_use]
+    pub fn nested_idle(&self) -> bool {
+        self.nested_memory_bytes() == 0
     }
 
-    /// Reports exactly what a non-idle query envelope still owes, in bytes.
+    /// Returns the query-pool memory a child still holds, in bytes.
     ///
-    /// A drain that times out is only actionable if it names what stayed. This
-    /// returns the scratch and memory a child still holds, in that order, so the
-    /// refusal can say which one it was rather than only that one existed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostResourceError::Poisoned`] when the scratch attribution
-    /// lock is poisoned.
-    pub fn nested_debt(&self) -> Result<(u64, usize), BifrostResourceError> {
-        let nested_scratch =
-            self.nested_scratch_used_bytes
-                .lock()
-                .map_err(|_| BifrostResourceError::Poisoned {
-                    detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
-                })?;
-        Ok((*nested_scratch, self.memory_pool.reserved()))
+    /// A drain that times out is only actionable if it names what stayed.
+    #[must_use]
+    pub fn nested_memory_bytes(&self) -> usize {
+        self.memory_pool.reserved()
     }
 
     /// Splits one named memory child from the already admitted query pool.
@@ -5044,81 +4104,44 @@ impl OracleQueryResources {
         )
     }
 
-    /// Splits exact scratch attribution from the admitted query owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed refusal without mutation when sibling scratch children
-    /// would exceed the query envelope.
-    pub fn try_split_scratch(
-        &self,
-        bytes: u64,
-    ) -> Result<OracleQueryScratchReservation, BifrostResourceError> {
-        let mut used =
-            self.nested_scratch_used_bytes
-                .lock()
-                .map_err(|_| BifrostResourceError::Poisoned {
-                    detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
-                })?;
-        let next = used.checked_add(bytes).ok_or_else(accounting_overflow)?;
-        if next > self.scratch_bytes {
-            return Err(BifrostResourceError::Occupied {
-                detail: "Oracle query scratch children exceed the admitted envelope".to_owned(),
-            });
-        }
-        *used = next;
-        Ok(OracleQueryScratchReservation {
-            bytes,
-            used: Arc::clone(&self.nested_scratch_used_bytes),
-            governor: self.governor.clone(),
-            released: false,
-        })
-    }
-
     /// Releases the query envelope only after every nested child is gone.
+    ///
+    /// Slot units return under the governor lock; the attached admission
+    /// charge is then dropped outside it, and only after both is the Oracle
+    /// capacity wake sent, so queued admission is reconsidered once with the
+    /// whole query's capacity already free.
     ///
     /// # Errors
     ///
     /// Returns a poison error while retaining root capacity when nested memory
-    /// or scratch ownership survives, or when root counters diverge.
+    /// ownership survives, or when root counters diverge.
     fn release(&mut self) -> Result<(), BifrostResourceError> {
         if self.released {
             return Ok(());
         }
-        let nested_scratch =
-            self.nested_scratch_used_bytes
-                .lock()
-                .map_err(|_| BifrostResourceError::Poisoned {
-                    detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
-                })?;
-        if *nested_scratch != 0 || self.memory_pool.reserved() != 0 {
-            drop(nested_scratch);
+        if self.memory_pool.reserved() != 0 {
             self.governor
                 .poison("Oracle query owner outlived a nested resource child");
             return Err(BifrostResourceError::Poisoned {
                 detail: "Oracle query nested resource child survived owner release".to_owned(),
             });
         }
-        drop(nested_scratch);
         let mut state = self.governor.lock_state()?;
         let class_count = match self.query_class {
             QueryClass::Interactive => state.oracle_interactive_queries,
             QueryClass::Analytical => state.oracle_analytical_queries,
         };
         // Query memory is released by the shared root as each consumer shrinks,
-        // so this owner returns only what it actually charged: slots, scratch,
-        // and the class counters.
+        // so this owner returns only what it actually charged: slots and the
+        // class counters.
         if state.oracle_active_queries == 0
             || class_count == 0
             || state.oracle_query_slot_units < self.slot_units
-            || state.oracle_query_scratch_used_bytes < self.scratch_bytes
-            || state.scratch_used_bytes < self.scratch_bytes
         {
             return Err(self
                 .governor
                 .poison_locked(&mut state, "Oracle query release underflow"));
         }
-        state.scratch_used_bytes -= self.scratch_bytes;
         state.oracle_active_queries -= 1;
         match self.query_class {
             QueryClass::Interactive => state.oracle_interactive_queries -= 1,
@@ -5126,18 +4149,23 @@ impl OracleQueryResources {
         }
         self.governor
             .release_oracle_slots(&mut state, self.query_class, self.slot_units)?;
-        state.oracle_query_scratch_used_bytes -= self.scratch_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        BifrostResourceGovernor::advance_oracle_capacity(&mut state);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
         record_oracle_capacity(
             &state,
             &self.governor.plan(),
             self.governor.oracle_class_split(),
         );
-        self.volume_scratch.take();
         self.released = true;
         drop(state);
+        // After the slots return and before the wake: the admission charge
+        // takes the admission lock, which is ordered before the governor lock,
+        // so it must not run under the state lock above; and the wake below is
+        // what reconsiders queued work, so the charge must already be free.
+        drop(self.admission_charge.take());
         self.governor.inner.memory_changed.notify_waiters();
+        self.governor.notify_oracle_capacity();
         Ok(())
     }
 }
@@ -5183,63 +4211,6 @@ impl OracleQueryMemoryReservation {
     pub fn poison(&self) {
         self.governor
             .poison("Oracle query memory telemetry diverged");
-    }
-}
-
-/// Move-only scratch child split from one already admitted Oracle query.
-#[derive(Debug)]
-pub struct OracleQueryScratchReservation {
-    /// Exact scratch bytes attributed to this child.
-    bytes: u64,
-    /// Shared query-local attribution counter, never a capacity authority.
-    used: Arc<Mutex<u64>>,
-    /// Root poisoned when query-local attribution diverges.
-    governor: BifrostResourceGovernor,
-    /// Whether this child has already returned its attribution.
-    released: bool,
-}
-
-impl OracleQueryScratchReservation {
-    /// Returns the exact query-local scratch attribution.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    /// Returns query-local attribution exactly once.
-    ///
-    /// # Errors
-    ///
-    /// Returns a poison error and retains suspect attribution on underflow.
-    fn release(&mut self) -> Result<(), BifrostResourceError> {
-        if self.released {
-            return Ok(());
-        }
-        let mut used = self
-            .used
-            .lock()
-            .map_err(|_| BifrostResourceError::Poisoned {
-                detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
-            })?;
-        if *used < self.bytes {
-            self.governor
-                .poison("Oracle query scratch attribution diverged");
-            return Err(BifrostResourceError::Poisoned {
-                detail: "Oracle query scratch attribution underflow".to_owned(),
-            });
-        }
-        *used -= self.bytes;
-        self.released = true;
-        Ok(())
-    }
-}
-
-impl Drop for OracleQueryScratchReservation {
-    /// Returns the exact nested scratch attribution on every terminal path.
-    fn drop(&mut self) {
-        if let Err(error) = self.release() {
-            tracing::error!(%error, "Oracle query scratch child cleanup failed");
-        }
     }
 }
 
@@ -5689,8 +4660,6 @@ mod tests {
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
 
     /// Every Oracle session owner must set all four Parquet reader pushdown
     /// and indexing options to exactly `true`; a closed leaf predicate only
@@ -6437,139 +5406,19 @@ mod tests {
         );
     }
 
-    /// Aliased roots share one exact device ceiling and provisional WAL rolls back.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the deterministic volume fixture cannot be constructed.
-    #[test]
-    fn bifrost_volume_governor_groups_aliases_and_preserves_exact_capacity() {
-        let temp = tempfile::tempdir().expect("temporary volume root");
-        let wal = temp.path().join("wal");
-        let stage_root = temp.path().join("scribe-stage");
-        let scribe = temp.path().join("scribe-output-scratch");
-        let oracle = temp.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &oracle] {
-            fs::create_dir(path).expect("registered volume root");
-        }
-        fs::write(wal.join("retained.wal"), [0_u8; 16]).expect("retained WAL fixture");
-        let health = BifrostResourceHealth::default();
-        let governor = BifrostVolumeGovernor::register(
-            BifrostVolumeRoots {
-                wal,
-                scribe_stage: stage_root,
-                scribe_output_scratch: scribe,
-                oracle_scratch: oracle,
-            },
-            80,
-            health.clone(),
-        )
-        .expect("same-device roots register once");
-        let capabilities = governor.capabilities();
-        {
-            let provisional = capabilities
-                .wal
-                .try_reserve_growth(32)
-                .expect("provisional WAL growth");
-            assert!(capabilities.oracle.try_acquire(33).is_err());
-            drop(provisional);
-        }
-        let scratch = capabilities
-            .oracle
-            .try_acquire(64)
-            .expect("retained WAL plus exact-limit scratch succeeds");
-        assert!(capabilities.oracle.try_acquire(1).is_err());
-        drop(scratch);
-        let growth = capabilities
-            .wal
-            .try_reserve_growth(64)
-            .expect("exact-limit WAL growth");
-        growth.commit().expect("durable WAL commit");
-        assert!(capabilities.scribe_output.try_acquire(1).is_err());
-        assert_eq!(health.reason(), None);
-    }
-
-    /// Concurrent same-device WAL and scratch grants admit exactly one boundary owner.
-    ///
-    /// # Panics
-    ///
-    /// Panics when thread coordination or the deterministic volume fixture fails.
-    #[test]
-    fn bifrost_volume_governor_serializes_same_device_wal_scratch_race() {
-        let temp = tempfile::tempdir().expect("temporary volume root");
-        let wal = temp.path().join("wal");
-        let stage_root = temp.path().join("scribe-stage");
-        let scribe = temp.path().join("scribe-output-scratch");
-        let oracle = temp.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &oracle] {
-            fs::create_dir(path).expect("registered volume root");
-        }
-        let governor = BifrostVolumeGovernor::register(
-            BifrostVolumeRoots {
-                wal,
-                scribe_stage: stage_root,
-                scribe_output_scratch: scribe,
-                oracle_scratch: oracle,
-            },
-            64,
-            BifrostResourceHealth::default(),
-        )
-        .expect("same-device roots");
-        let start = Arc::new(std::sync::Barrier::new(3));
-        let finish = Arc::new(std::sync::Barrier::new(3));
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut joins = Vec::new();
-        for wal_request in [true, false] {
-            let governor = governor.clone();
-            let start = Arc::clone(&start);
-            let finish = Arc::clone(&finish);
-            let sender = sender.clone();
-            joins.push(std::thread::spawn(move || {
-                start.wait();
-                let owner = if wal_request {
-                    governor
-                        .capabilities()
-                        .wal
-                        .try_reserve_growth(64)
-                        .map(|owner| Box::new(owner) as Box<dyn std::any::Any>)
-                } else {
-                    governor
-                        .capabilities()
-                        .oracle
-                        .try_acquire(64)
-                        .map(|owner| Box::new(owner) as Box<dyn std::any::Any>)
-                };
-                sender.send(owner.is_ok()).expect("race result");
-                finish.wait();
-                drop(owner);
-            }));
-        }
-        start.wait();
-        let admitted = [
-            receiver.recv().expect("first result"),
-            receiver.recv().expect("second result"),
-        ];
-        assert_eq!(admitted.into_iter().filter(|value| *value).count(), 1);
-        finish.wait();
-        for join in joins {
-            join.join().expect("volume race thread");
-        }
-        assert_eq!(governor.health.reason(), None);
-    }
-
-    /// Scribe scratch cancellation retains ownership without touching foreign siblings.
+    /// Registration clears only process-owned claim directories, and a dropped
+    /// claim leaves its directory for the next registration.
     ///
     /// # Panics
     ///
     /// Panics when deterministic namespace setup or cleanup fails.
     #[test]
-    fn bifrost_volume_governor_scribe_namespace_is_exactly_scoped() {
+    fn scribe_output_scratch_namespace_is_exactly_scoped() {
         let temp = tempfile::tempdir().expect("temporary volume root");
         let wal = temp.path().join("wal");
         let stage_root = wal.join("scribe-stage");
         let scribe = wal.join("scribe-output-scratch");
-        let oracle = wal.join("oracle");
-        for path in [&wal, &stage_root, &scribe, &oracle] {
+        for path in [&wal, &stage_root, &scribe] {
             fs::create_dir_all(path).expect("registered volume root");
         }
         let retained_wal = wal.join("retained.wal");
@@ -6579,26 +5428,14 @@ mod tests {
         fs::create_dir(&peer).expect("peer directory");
         fs::create_dir(&stale).expect("stale runtime directory");
 
-        let health = BifrostResourceHealth::default();
-        let governor = BifrostVolumeGovernor::register(
-            BifrostVolumeRoots {
-                wal,
-                scribe_stage: stage_root,
-                scribe_output_scratch: scribe.clone(),
-                oracle_scratch: oracle,
-            },
-            1024,
-            health.clone(),
-        )
-        .expect("registered roots reconcile process-owned scratch");
+        let output = ScratchVolume::register(scribe.clone())
+            .expect("registration reconciles process-owned scratch");
         assert!(!stale.exists());
         assert!(peer.exists());
         assert!(retained_wal.exists());
 
-        let scratch = governor
-            .capabilities()
-            .scribe_output
-            .create_scribe_claim("stream_1", "claim_9", 32)
+        let scratch = output
+            .create_scribe_claim("stream_1", "claim_9")
             .expect("claim scratch");
         let owned = scratch.path().to_owned();
         assert_eq!(owned.parent(), Some(scribe.as_path()));
@@ -6609,71 +5446,11 @@ mod tests {
                 .is_some_and(|name| name.starts_with("scribe-claim-stream_1-claim_9-"))
         );
         drop(scratch);
-        assert!(owned.exists());
-        assert_eq!(health.reason(), Some(BifrostResourcePoisonReason::Volume));
+        assert!(owned.exists(), "a dropped claim leaves its directory");
+        ScratchVolume::register(scribe).expect("restart reconciles the dropped claim");
+        assert!(!owned.exists());
         assert!(peer.exists());
         assert!(retained_wal.exists());
-    }
-
-    /// Final exact-prefix cleanup failure retains charge and poisons once.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the deterministic injected failure does not fail closed.
-    #[test]
-    fn bifrost_volume_governor_cleanup_failure_retains_charge_and_poisons() {
-        let temp = tempfile::tempdir().expect("temporary volume root");
-        let wal = temp.path().join("wal");
-        let stage_root = wal.join("scribe-stage");
-        let scribe = wal.join("scribe-output-scratch");
-        let oracle = wal.join("oracle");
-        for path in [&wal, &stage_root, &scribe, &oracle] {
-            fs::create_dir_all(path).expect("registered volume root");
-        }
-        let health = BifrostResourceHealth::default();
-        let governor = BifrostVolumeGovernor::register(
-            BifrostVolumeRoots {
-                wal,
-                scribe_stage: stage_root,
-                scribe_output_scratch: scribe,
-                oracle_scratch: oracle,
-            },
-            1024,
-            health.clone(),
-        )
-        .expect("registered roots");
-        let mut scratch = governor
-            .capabilities()
-            .scribe_output
-            .create_scribe_claim("stream", "claim_4", 32)
-            .expect("claim scratch");
-        let attempts = std::cell::Cell::new(0);
-        let error = scratch
-            .cleanup_owned_prefix_with(|| {
-                attempts.set(attempts.get() + 1);
-                Err(std::io::Error::other("injected unlink failure"))
-            })
-            .expect_err("exhausted cleanup must fail closed");
-        assert!(matches!(error, BifrostResourceError::Poisoned { .. }));
-        assert_eq!(attempts.get(), 4);
-        assert_eq!(health.reason(), Some(BifrostResourcePoisonReason::Volume));
-        let root = governor
-            .roots
-            .get(&BifrostVolumeClass::ScribeOutput)
-            .expect("Scribe root");
-        assert_eq!(
-            governor
-                .devices
-                .lock()
-                .expect("device state")
-                .get(&root.device)
-                .expect("Scribe device")
-                .scratch_bytes
-                .get(&BifrostVolumeClass::ScribeOutput)
-                .copied()
-                .unwrap_or_default(),
-            32
-        );
     }
 
     /// Scratch cleanup attempts immediately and then after every configured delay.
@@ -6707,13 +5484,13 @@ mod tests {
         }
     }
 
-    /// Closed resource telemetry covers plans, grants, refusals, releases, and volume classes.
+    /// Closed resource telemetry covers plans, grants, refusals, and releases.
     ///
     /// # Panics
     ///
     /// Panics when the deterministic owner lifecycle or metric assertions fail.
     #[test]
-    fn resource_plan_metrics_cover_closed_memory_and_volume_lifecycle() {
+    fn resource_plan_metrics_cover_closed_memory_lifecycle() {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         metrics::with_local_recorder(&recorder, || {
             let roles = BifrostRuntimeResources::composed_for_test(
@@ -6738,30 +5515,6 @@ mod tests {
                 "a saturated budget refuses and records the refusal"
             );
             drop(filled);
-
-            let temp = tempfile::tempdir().expect("temporary volume root");
-            let wal = temp.path().join("wal");
-            let stage_root = temp.path().join("scribe-stage");
-            let scribe = temp.path().join("scribe-output-scratch");
-            let oracle_root = temp.path().join("oracle");
-            for path in [&wal, &stage_root, &scribe, &oracle_root] {
-                fs::create_dir(path).expect("registered volume root");
-            }
-            let volumes = BifrostVolumeGovernor::register(
-                BifrostVolumeRoots {
-                    wal,
-                    scribe_stage: stage_root,
-                    scribe_output_scratch: scribe,
-                    oracle_scratch: oracle_root,
-                },
-                64,
-                BifrostResourceHealth::default(),
-            )
-            .expect("volume plan");
-            let capability = volumes.capabilities().oracle;
-            let scratch = capability.try_acquire(64).expect("volume grant");
-            assert!(capability.try_acquire(1).is_err());
-            drop(scratch);
         });
         let snapshot = recorder.snapshot();
         let metric_exists = |fragment: &str| {
@@ -6777,7 +5530,6 @@ mod tests {
             "result=\"acquired\"",
             "result=\"refused\"",
             "result=\"released\"",
-            "volume_class=\"oracle\"",
             "bifrost_resource_current_bytes",
         ] {
             assert!(
@@ -6785,57 +5537,6 @@ mod tests {
                 "missing metric fragment {fragment}"
             );
         }
-    }
-
-    /// Roots on distinct filesystem devices retain independent exact ceilings.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an available distinct-device fixture violates its boundaries.
-    #[cfg(unix)]
-    #[test]
-    fn bifrost_volume_governor_keeps_distinct_devices_independent() {
-        let disk = tempfile::tempdir().expect("disk-backed temporary root");
-        let Ok(memory) = tempfile::tempdir_in("/dev/shm") else {
-            return;
-        };
-        let wal = disk.path().join("wal");
-        let stage_root = disk.path().join("scribe-stage");
-        let scribe = disk.path().join("scribe-output-scratch");
-        let oracle = memory.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &oracle] {
-            fs::create_dir(path).expect("registered volume root");
-        }
-        if fs::metadata(&scribe).expect("Scribe metadata").dev()
-            == fs::metadata(&oracle).expect("Oracle metadata").dev()
-            || filesystem_available_bytes(&oracle)
-                .map_or(true, |available| available < MIN_SCRATCH_FREE_BYTES + 64)
-        {
-            return;
-        }
-        let governor = BifrostVolumeGovernor::register(
-            BifrostVolumeRoots {
-                wal,
-                scribe_stage: stage_root,
-                scribe_output_scratch: scribe,
-                oracle_scratch: oracle,
-            },
-            64,
-            BifrostResourceHealth::default(),
-        )
-        .expect("distinct roots register");
-        let capabilities = governor.capabilities();
-        let scribe_lease = capabilities
-            .scribe_output
-            .try_acquire(64)
-            .expect("Scribe output consumes its device boundary");
-        let oracle_lease = capabilities
-            .oracle
-            .try_acquire(64)
-            .expect("Oracle independently consumes its device boundary");
-        assert!(capabilities.scribe_output.try_acquire(1).is_err());
-        assert!(capabilities.oracle.try_acquire(1).is_err());
-        drop((scribe_lease, oracle_lease));
     }
 
     /// Enabled roles alone receive protected floors and elastic arithmetic is exact.
@@ -6906,14 +5607,12 @@ mod tests {
                 scribe_memory_used_bytes: 0,
                 oracle_memory_used_bytes: 0,
                 elastic_memory_used_bytes: 0,
-                scratch_used_bytes: 0,
                 oracle_active_queries: 0,
                 oracle_interactive_queries: 0,
                 oracle_analytical_queries: 0,
                 oracle_query_slot_units: 0,
                 oracle_query_memory_used_bytes: 0,
                 oracle_infallible_bytes: 0,
-                oracle_query_scratch_used_bytes: 0,
                 oracle_query_active: false,
             }
         );
@@ -7102,6 +5801,42 @@ mod tests {
         assert_eq!(pool.reserved(), 0);
         drop(query);
         assert!(!roles.snapshot().expect("snapshot").oracle_query_active);
+    }
+
+    /// Only a slot or scratch return advances the epoch Oracle admission waits on.
+    ///
+    /// A queued query can be refused only for slots or scratch, so resident
+    /// query-memory churn must leave the epoch alone: every advance wakes the
+    /// whole admission queue to re-run a grant pass that cannot succeed.
+    #[tokio::test]
+    async fn oracle_capacity_epoch_ignores_query_memory_and_advances_on_release() {
+        let roles = BifrostRuntimeResources::from_snapshot(
+            snapshot(1024 * MIB),
+            policy(&[BifrostRole::Scribe, BifrostRole::Oracle]),
+        )
+        .expect("combined plan")
+        .compose_roles()
+        .expect("combined role composition");
+        let oracle = roles.oracle().expect("Oracle capability");
+        let query = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("complete query grant");
+        let observed = oracle.capacity_epoch();
+        let reservation = MemoryConsumer::new("oracle-epoch").register(&query.memory_pool());
+        reservation.try_grow(MIB).expect("query memory growth");
+        reservation.shrink(MIB);
+        assert_eq!(
+            oracle.capacity_epoch(),
+            observed,
+            "query-memory churn is not an admission capacity change"
+        );
+        drop(reservation);
+        drop(query);
+        let advanced = oracle
+            .wait_for_capacity_change(observed)
+            .await
+            .expect("a query release advances the epoch");
+        assert!(advanced > observed);
     }
 
     /// Live detection reaches the same checked constructor as an injection.
@@ -7359,10 +6094,6 @@ mod tests {
             2 * ANALYTICAL_QUERY_SLOT_UNITS,
             "both sides charge the one aggregate slot ledger"
         );
-        assert!(
-            admitted.oracle_query_scratch_used_bytes > 0,
-            "scratch remains an independently retained admission lease"
-        );
 
         // The first actual consumer growth is the first memory charge, and it is
         // the only figure the shared root reports.
@@ -7391,7 +6122,67 @@ mod tests {
         assert!(oracle.health().reason().is_none());
     }
 
-    /// Query memory and scratch children split admitted ownership without root charge.
+    /// `memory_used` follows a running query's growth and shrink.
+    ///
+    /// Owner grant and release refresh every capacity series, but a query's
+    /// memory moves between those two points. This holds one admitted query
+    /// while its pool grows fallibly, shrinks, and then grows infallibly past
+    /// its grant, reading `memory_used` at each step: a gauge that only moved at
+    /// grant or release would show zero while bytes are held, and one that
+    /// counted only governed bytes would stop at the grant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when admission or growth fails or `memory_used` disagrees with
+    /// the bytes the running query holds.
+    #[test]
+    fn oracle_memory_gauges_track_growth_while_a_query_is_held() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let roles = BifrostRuntimeResources::composed_for_test(
+                768 * MIB,
+                512 * MIB as u64,
+                [BifrostRole::Oracle],
+            );
+            let oracle = roles.oracle().expect("Oracle capability");
+            let query = oracle
+                .try_acquire_query(interactive_query(0.0))
+                .expect("query owner");
+            let gauge = |kind: &str| {
+                recorder
+                    .snapshot()
+                    .gauges
+                    .get(&format!("bifrost_oracle_local_bytes{{kind=\"{kind}\"}}"))
+                    .copied()
+            };
+            let pool = query.memory_pool();
+            let bytes = MemoryConsumer::new("gauge-growth").register(&pool);
+
+            bytes.try_grow(8 * MIB).expect("fallible growth is funded");
+            assert_eq!(gauge("memory_used"), (8 * MIB).to_f64());
+            bytes.shrink(8 * MIB);
+            assert_eq!(
+                gauge("memory_used"),
+                Some(0.0),
+                "shrink lowers the gauge while the query is still held"
+            );
+
+            bytes.grow(2048 * MIB);
+            let grant = query
+                .granted_memory_bytes
+                .to_f64()
+                .expect("grant is representable");
+            assert!(
+                gauge("memory_used").is_some_and(|value| value > grant),
+                "infallible growth counts past the query's grant"
+            );
+            drop(bytes);
+            drop(query);
+            assert_eq!(gauge("memory_used"), Some(0.0));
+        });
+    }
+
+    /// Query memory children nest under the admitted owner and charge the shared root.
     #[test]
     fn oracle_query_children_remain_nested_under_one_root_owner() {
         let roles = BifrostRuntimeResources::composed_for_test(
@@ -7407,65 +6198,57 @@ mod tests {
         let memory = query
             .try_split_memory("nested-query-test", 32 * MIB)
             .expect("nested memory child");
-        let scratch = query
-            .try_split_scratch(64 * MIB as u64)
-            .expect("nested scratch child");
         assert_eq!(memory.bytes(), 32 * MIB);
-        assert_eq!(scratch.bytes(), 64 * MIB as u64);
-        // Scratch was reserved at admission, so a scratch child only splits
-        // already-owned bytes. Memory is not reserved at admission, so a memory
-        // child is a real charge against the shared process root.
+        // Memory is not reserved at admission, so a memory child is a real
+        // charge against the shared process root.
         let nested = oracle.snapshot().expect("nested snapshot");
         assert_eq!(
             nested.oracle_memory_used_bytes,
             root_snapshot.oracle_memory_used_bytes + 32 * MIB
         );
-        assert_eq!(
-            nested.oracle_query_scratch_used_bytes,
-            root_snapshot.oracle_query_scratch_used_bytes
-        );
         drop(memory);
-        drop(scratch);
         drop(query);
         assert!(!oracle.snapshot().expect("released").oracle_query_active);
     }
 
-    /// Exact interactive queries overlap until one aggregate dimension is full.
+    /// Exact interactive queries overlap until the slot ledger is full.
+    ///
+    /// Admission reserves neither memory nor disk, so slots are the only
+    /// dimension that saturates and a refusal changes no counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics when admission never saturates or a refusal or release mutates state.
     #[test]
-    fn oracle_exact_queries_overlap_until_memory_or_scratch_exhaustion() {
+    fn oracle_exact_queries_overlap_until_slot_exhaustion() {
         let roles = BifrostRuntimeResources::composed_for_test(
             1024 * MIB,
             512 * MIB as u64,
             [BifrostRole::Oracle],
         );
         let oracle = roles.oracle().expect("Oracle capability");
-        let first = oracle
-            .try_acquire_query(interactive_query(0.0))
-            .expect("first exact query");
-        let second = oracle
-            .try_acquire_query(interactive_query(1.0))
-            .expect("second exact query");
+        let mut admitted = Vec::new();
+        while let Ok(query) = oracle.try_acquire_query(interactive_query(0.0)) {
+            admitted.push(query);
+        }
+        assert!(admitted.len() >= 2, "exact queries overlap");
         let occupied = oracle.snapshot().expect("aggregate snapshot");
-        assert_eq!(occupied.oracle_active_queries, 2);
         assert_eq!(
             occupied.oracle_query_memory_used_bytes, 0,
             "admission reserves no memory; the shared root is charged as consumers grow"
         );
-        // Scratch is still reserved at the grant cap because it is consumed disk
-        // rather than a ceiling, so scratch — not memory — is the dimension that
-        // saturates first here.
-        assert_eq!(occupied.oracle_query_scratch_used_bytes, 512 * MIB as u64);
         assert!(oracle.try_acquire_query(interactive_query(0.5)).is_err());
         assert_eq!(oracle.snapshot().expect("atomic refusal"), occupied);
-        drop(first);
-        let replacement = oracle
-            .try_acquire_query(interactive_query(0.5))
-            .expect("release restores exact eligibility");
-        drop((second, replacement));
+        admitted.pop();
+        admitted.push(
+            oracle
+                .try_acquire_query(interactive_query(0.5))
+                .expect("release restores exact eligibility"),
+        );
+        drop(admitted);
         let released = oracle.snapshot().expect("released aggregate snapshot");
         assert_eq!(released.oracle_active_queries, 0);
         assert_eq!(released.oracle_memory_used_bytes, 0);
-        assert_eq!(released.scratch_used_bytes, 0);
     }
 
     /// Query classes reject every noncanonical demand tuple without mutation.
@@ -7484,31 +6267,27 @@ mod tests {
                 ..interactive_query(0.0)
             },
             OracleResourceRequest {
-                scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
-                ..interactive_query(0.0)
-            },
-            OracleResourceRequest {
                 slot_units: 2,
                 ..interactive_query(0.0)
             },
             OracleResourceRequest {
                 query_class: QueryClass::Analytical,
                 memory_bytes: ORACLE_PARTITION_MEMORY_BYTES,
-                scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+                spill_limit_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
                 slot_units: 2,
                 local_ratio: 0.0,
             },
             OracleResourceRequest {
                 query_class: QueryClass::Analytical,
                 memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
-                scratch_bytes: ORACLE_PARTITION_MEMORY_BYTES as u64,
+                spill_limit_bytes: ORACLE_PARTITION_MEMORY_BYTES as u64,
                 slot_units: 2,
                 local_ratio: 0.0,
             },
             OracleResourceRequest {
                 query_class: QueryClass::Analytical,
                 memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
-                scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+                spill_limit_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
                 slot_units: 1,
                 local_ratio: 0.0,
             },
@@ -7982,7 +6761,6 @@ mod tests {
         let released = roles.snapshot().expect("shared-root release");
         assert_eq!(released.scribe_memory_used_bytes, 0);
         assert_eq!(released.oracle_memory_used_bytes, 0);
-        assert_eq!(released.scratch_used_bytes, 0);
     }
 
     /// Query release is exact, idempotent, and fail-closed on surviving children.
@@ -7997,8 +6775,10 @@ mod tests {
         let mut explicit = oracle
             .try_acquire_query(interactive_query(0.0))
             .expect("explicit owner");
-        let scratch = explicit.try_split_scratch(1).expect("scratch child");
-        drop(scratch);
+        let memory = explicit
+            .try_split_memory("release-child", 1)
+            .expect("memory child");
+        drop(memory);
         explicit.release().expect("explicit release");
         explicit.release().expect("idempotent release");
         drop(explicit);
@@ -8023,7 +6803,9 @@ mod tests {
         let owner = poisoned_oracle
             .try_acquire_query(interactive_query(0.0))
             .expect("poison owner");
-        let child = owner.try_split_scratch(1).expect("surviving child");
+        let child = owner
+            .try_split_memory("surviving-child", 1)
+            .expect("surviving child");
         drop(owner);
         assert_eq!(
             poisoned_roles.health().reason(),
@@ -8085,7 +6867,6 @@ mod tests {
         drop(filled);
         let released = oracle.snapshot().expect("released snapshot");
         assert_eq!(released.elastic_memory_used_bytes, 0);
-        assert_eq!(released.scratch_used_bytes, 0);
         assert!(!released.oracle_query_active);
         assert!(
             oracle.try_acquire_query(interactive_query(0.0)).is_ok(),
@@ -8210,13 +6991,12 @@ mod tests {
                 .expect("Oracle admission snapshot")
                 .oracle_query_memory_used_bytes,
             0,
-            "Oracle admission takes slots and scratch, never resident memory"
+            "Oracle admission takes slots, never resident memory"
         );
         assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         drop(query);
         drop(scribe_owner);
         let snapshot = roles.snapshot().expect("released resource snapshot");
         assert_eq!(snapshot.elastic_memory_used_bytes, 0);
-        assert_eq!(snapshot.scratch_used_bytes, 0);
     }
 }

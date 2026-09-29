@@ -8,24 +8,34 @@ use num_traits::ToPrimitive;
 
 /// Smallest accounting unit used for transport body ownership.
 pub const BIFROST_TRANSPORT_QUANTUM_BYTES: usize = 64 * 1024;
-/// Largest encoded body any Bifrost transport surface admits before parsing.
-///
-/// An abuse ceiling only. It bounds nothing else and is never a memory-sizing
-/// input; Scribe plans against [`BIFROST_INGEST_REQUEST_LIMIT_BYTES`].
-pub const BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES: usize = 200 * 1024 * 1024;
 /// Default largest single ingest request Scribe plans and reserves for.
 ///
 /// Scribe reserves a crash-replayable envelope for one request of this size and
 /// refuses to boot when the node cannot cover it, so raising it raises the
 /// memory a node needs to start. Operators override it with
-/// `scribe.ingest_request_bytes`.
+/// `scribe.ingest_request_bytes`; the ingest HTTP body and ingest gRPC
+/// decoded-message ceilings both equal it exactly.
 pub const BIFROST_INGEST_REQUEST_LIMIT_BYTES: usize = 16 * 1024 * 1024;
-/// Largest canonical native schema accepted by V1.
+/// Multiplier deriving the per-request expanded-data ceiling from the wire ceiling.
+///
+/// Expanded data is the Arrow value, offset, and validity buffers one request's
+/// canonical rows retain plus the Scribe-managed physical columns, and for OTLP
+/// the generated typed-request backing. Every ingest decoder refuses a request
+/// whose expanded data exceeds this multiple of its wire ceiling before WAL.
+pub const BIFROST_INGEST_EXPANSION_FACTOR: usize = 4;
+/// Largest flattened native schema node count the IPC preflight represents.
+///
+/// A fixed structural parser bound, not a memory ceiling: the table's physical
+/// leaf count is validated at registration.
 pub const BIFROST_NATIVE_FIELD_LIMIT: usize = 256;
-/// Largest canonical native record-batch count accepted by V1.
+/// Largest native record-batch count the IPC preflight represents.
+///
+/// A fixed structural parser bound, not a memory ceiling.
 pub const BIFROST_NATIVE_SOURCE_LIMIT: usize = 64;
-/// Largest logical row count accepted by one V1 request.
-pub const BIFROST_INGEST_ROW_LIMIT: usize = 131_072;
+/// Largest recursive OTLP `AnyValue` nesting depth any decoder accepts.
+///
+/// A fixed structural parser bound, not a memory ceiling.
+pub const BIFROST_OTLP_VALUE_DEPTH_LIMIT: usize = 8;
 /// Fixed WAL header and digest scratch maximum.
 pub const BIFROST_WAL_WORKSPACE_LIMIT_BYTES: usize = 4 * 1024;
 
@@ -34,16 +44,6 @@ pub const BIFROST_WAL_WORKSPACE_LIMIT_BYTES: usize = 4 * 1024;
 pub struct OtlpWireLimits {
     /// Largest encoded protobuf or JSON request accepted by an adapter.
     pub request_bytes: usize,
-    /// Largest number of resource groups in one export.
-    pub resources: usize,
-    /// Largest number of instrumentation-scope groups in one export.
-    pub scopes: usize,
-    /// Largest number of signal records in one export.
-    pub records: usize,
-    /// Largest number of attribute entries in one export.
-    pub attributes: usize,
-    /// Largest cumulative key, value, body, and identifier byte count.
-    pub value_bytes: usize,
     /// Largest recursive `AnyValue` nesting depth.
     pub value_depth: usize,
     /// Largest number of distinct time partitions one source may span.
@@ -57,14 +57,21 @@ pub struct OtlpWireLimits {
 /// Canonical OTLP V1 defaults used to initialize decode and projection limits.
 pub const OTLP_WIRE_LIMITS: OtlpWireLimits = OtlpWireLimits {
     request_bytes: BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-    resources: 4_096,
-    scopes: 8_192,
-    records: 131_072,
-    attributes: 1_048_576,
-    value_bytes: 32 * 1024 * 1024,
-    value_depth: 8,
+    value_depth: BIFROST_OTLP_VALUE_DEPTH_LIMIT,
     time_partitions: 32,
 };
+
+impl OtlpWireLimits {
+    /// Returns the per-request expanded-data ceiling derived from the wire ceiling.
+    ///
+    /// Boot configuration rejects a wire ceiling whose multiplication overflows,
+    /// so saturation is unreachable for a validated limit.
+    #[must_use]
+    pub const fn expanded_bytes(&self) -> usize {
+        self.request_bytes
+            .saturating_mul(BIFROST_INGEST_EXPANSION_FACTOR)
+    }
+}
 
 /// Byte-weighted process admission for encoded HTTP and tonic bodies.
 #[derive(Debug, Clone)]
@@ -112,8 +119,9 @@ impl BifrostTransportAdmission {
     /// Every serving path derives both bounds from the resource plan, so this
     /// exists only so unit tests and test shells can exercise byte-weighted
     /// admission without a resource observation. The aggregate is sized to hold
-    /// exactly two maximum messages, which is what the boundary tests assert
-    /// against; it is not a production budget and must not be read as one.
+    /// exactly two default maximum ingest messages, which is what the boundary
+    /// tests assert against; it is not a production budget and must not be read
+    /// as one.
     ///
     /// # Panics
     ///
@@ -122,8 +130,8 @@ impl BifrostTransportAdmission {
     #[must_use]
     pub fn for_tests() -> Self {
         Self::new(
-            2 * BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
-            BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+            2 * BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+            BIFROST_INGEST_REQUEST_LIMIT_BYTES,
         )
         .expect("fixed test transport bounds are internally consistent")
     }
@@ -251,32 +259,34 @@ fn record_transport(result: &'static str, current_bytes: usize) {
 /// Hard bounds enforced before a batch enters Scribe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IngestLimits {
-    /// Maximum size of one decompressed Arrow IPC batch.
+    /// Operator-selected wire ceiling for one ingest request.
+    ///
+    /// It is also the ingest gRPC decoded-message ceiling and the ingest HTTP
+    /// body ceiling; no framing allowance is added.
     pub max_frame_bytes: usize,
-    /// tonic `max_decoding_message_size` (default 4 MiB silently drops large
-    /// frames; the server raises it and enforces its own cap instead).
-    pub max_decoding_message_size: usize,
-    /// Immutable operator-selected OTLP count and material ceilings.
+    /// Immutable OTLP wire and structural shape limits.
     pub otlp: OtlpWireLimits,
-    /// Maximum canonical native schema field count.
-    pub native_fields: usize,
-    /// Maximum canonical native record-batch/source count.
-    pub native_sources: usize,
-    /// Maximum logical rows in one native or OTLP request.
-    pub rows: usize,
     /// Fixed WAL header and digest scratch retained by one ingress root.
     pub wal_workspace_bytes: usize,
+}
+
+impl IngestLimits {
+    /// Returns the per-request expanded-data ceiling derived from the wire ceiling.
+    ///
+    /// Boot configuration rejects a wire ceiling whose multiplication overflows,
+    /// so saturation is unreachable for a validated limit.
+    #[must_use]
+    pub const fn expanded_bytes(&self) -> usize {
+        self.max_frame_bytes
+            .saturating_mul(BIFROST_INGEST_EXPANSION_FACTOR)
+    }
 }
 
 impl Default for IngestLimits {
     fn default() -> Self {
         Self {
             max_frame_bytes: BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-            max_decoding_message_size: BIFROST_INGEST_REQUEST_LIMIT_BYTES + 64 * 1024,
             otlp: OTLP_WIRE_LIMITS,
-            native_fields: BIFROST_NATIVE_FIELD_LIMIT,
-            native_sources: BIFROST_NATIVE_SOURCE_LIMIT,
-            rows: BIFROST_INGEST_ROW_LIMIT,
             wal_workspace_bytes: BIFROST_WAL_WORKSPACE_LIMIT_BYTES,
         }
     }
@@ -295,10 +305,10 @@ mod tests {
     fn bifrost_transport_admission_is_byte_weighted_and_exact_at_boundaries() {
         let admission = BifrostTransportAdmission::for_tests();
         let first = admission
-            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("first maximum body");
         let second = admission
-            .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("equal aggregate boundary succeeds");
         assert!(admission.try_acquire(1).is_err());
         drop(first);
@@ -309,12 +319,12 @@ mod tests {
         drop(small);
         drop(second);
         let unknown = admission.try_acquire_unknown().expect("unknown body");
-        assert_eq!(unknown.bytes(), BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES);
+        assert_eq!(unknown.bytes(), BIFROST_INGEST_REQUEST_LIMIT_BYTES);
         drop(unknown);
         assert_eq!(admission.used_bytes(), 0);
         assert!(
             admission
-                .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES + 1)
+                .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES + 1)
                 .is_err()
         );
     }
@@ -326,7 +336,7 @@ mod tests {
     /// Panics when a supported selected bound is rejected or exact accounting drifts.
     #[test]
     fn bifrost_transport_admission_uses_selected_message_limit_and_independent_aggregate() {
-        let selected = 201 * 1024 * 1024;
+        let selected = 48 * 1024 * 1024;
         let aggregate = selected * 2;
         let admission = BifrostTransportAdmission::new(aggregate, selected)
             .expect("selected maximum fits aggregate capacity");

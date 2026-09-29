@@ -50,6 +50,17 @@ enum ReconstructableError {
         remediation = "Retry."
     )]
     Conflict { message: String, details: u32 },
+    // The same `details` type named through a longer path; must still qualify.
+    #[wyrd_error(
+        code = "WYRD_TEST_400_ALIASED",
+        status = 400,
+        title = "Aliased",
+        remediation = "Fix the request."
+    )]
+    Aliased {
+        message: String,
+        details: core::primitive::u32,
+    },
     // Does not qualify for `from_code` (extra field); must still compile.
     #[wyrd_error(
         code = "WYRD_TEST_500_INTERNAL",
@@ -73,6 +84,14 @@ fn from_code_reconstructs_message_details_variants() {
     );
     // The reconstructed typed variant reports its own status, not a catch-all.
     assert_eq!(reconstructed.expect("reconstructs").status(), 404);
+    assert_eq!(
+        ReconstructableError::from_code("WYRD_TEST_400_ALIASED", "aliased".to_string(), 1),
+        Some(ReconstructableError::Aliased {
+            message: "aliased".to_string(),
+            details: 1,
+        }),
+        "a field type spelled as a longer path is the same type, so it qualifies"
+    );
 }
 
 #[test]

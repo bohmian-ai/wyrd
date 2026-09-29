@@ -1,6 +1,7 @@
 //! Sustained-load journey helpers.
 
 mod assertions;
+pub mod capacity;
 mod harness;
 mod matrix;
 mod workload;

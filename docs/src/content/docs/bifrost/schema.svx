@@ -128,19 +128,6 @@ Source type: `LogRecord`.
 | `span_id` | `FixedSizeBinary(8)` nullable |
 | + system columns | |
 
-## vala.eval.assertions
-
-Source type: `EvalRecordObservation` (per-assertion rows).
-
-| Column | Physical type |
-|---|---|
-| `record_id` | `Utf8` |
-| `eval_ref` | `Utf8` nullable |
-| `assertion_name` | `Utf8` |
-| `score_value` | `Float64` nullable |
-| `created_at` | `Timestamp(µs, UTC)` |
-| + system columns | |
-
 ## vala.drift.observations
 
 Source type: `DriftRecordObservation`.

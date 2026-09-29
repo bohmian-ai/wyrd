@@ -3,6 +3,7 @@ mod budgets;
 mod cross_shard;
 mod fencing;
 mod horizontal_ingest;
+mod ingest_bounds;
 mod lifecycle;
 mod qualification;
 mod round_robin;

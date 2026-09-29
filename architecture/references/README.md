@@ -45,6 +45,7 @@ references/
 | `architecture/patterns.md` | Ownership, contract placement, server/client/storage/provider/audit structure |
 | `languages/spec-driven-development.md` | Approved change specs, task decomposition, TDD execution, remediation, or final evidence mapping |
 | `languages/implementation-execution.md` | Execution authority, adaptation, verification recovery, or completion evidence |
+| `languages/maintainer-style.md` | Code layout, owner and method shape, tests, documentation, and maintainer readability |
 | `languages/rust-core.md` | Rust ownership, async, traits, allocation, or API shape |
 | `languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversion, or module registration |
 | `languages/python-api-and-stubs.md` | Python exports, stubs, package layout, or typing |
@@ -54,7 +55,7 @@ references/
 | `languages/errors.md` | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
 | `domain/vala-architecture.md` | Broad Vala architecture, ownership, Bifrost orientation, or cross-domain advice |
 | `domain/telemetry-observations.md` | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
-| `domain/evaluation.md` | Eval Cards, scenarios, judge quality, scoring, or evidence |
+| `domain/evaluation.md` | Eval-backed Verifiers, scenarios, judge quality, scoring, or evidence |
 | `domain/drift-monitoring.md` | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
 | `domain/olap-serving.md` | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
 | `domain/iceberg.md` | Iceberg snapshots, catalogs, schemas, partitions, object storage, or compaction |

@@ -3,6 +3,7 @@
 use std::mem::size_of;
 
 use vala_bifrost_redux::gate::{IngestError, OtlpWireLimits};
+use vala_bifrost_redux::tables::metrics::MetricOutputWidths;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
@@ -15,35 +16,24 @@ use wyrd_tonic::otlp::metrics::v1::{
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 use wyrd_tonic::otlp::resource::v1::Resource;
 
+use crate::otlp_decode::{
+    GROUP_FAN_OUT, OtlpDecodePlan, ProjectedOutput, RESOURCE_FAN_OUT, enforce_expanded_ceiling,
+};
+
 /// Maximum deprecated protobuf group nesting accepted by the bounded scanner.
 const MAX_WIRE_GROUP_DEPTH: usize = 8;
 
-/// Exact allocation facts established before constructing a metrics request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MetricsDecodePlan {
-    /// Encoded bytes inspected by preflight and required by the decoder.
-    pub(crate) wire_bytes: usize,
-    /// Exact live generated-message capacity admitted for construction.
-    pub(crate) decode_bytes: usize,
-}
-
-/// Bounded allocation and cardinality facts for one metrics export.
+/// Bounded allocation facts for one metrics export.
 #[derive(Debug)]
 struct MetricsWireFacts {
     /// Immutable limits shared with the transport and Scribe admission path.
     limits: OtlpWireLimits,
-    /// Resource message count.
-    resources: usize,
-    /// Scope message count.
-    scopes: usize,
-    /// Metric data-point count across every aggregation shape.
-    records: usize,
-    /// Attribute count including metadata and exemplar filtered attributes.
-    attributes: usize,
-    /// Retained string, byte, and recursive value backing bytes.
-    value_bytes: usize,
+    /// Fixed Arrow widths charged per projected point and exemplar.
+    widths: MetricOutputWidths,
     /// Exact live public layouts and collection backing bytes.
     decode_bytes: usize,
+    /// Conservative projected canonical output.
+    output: ProjectedOutput,
 }
 
 impl MetricsWireFacts {
@@ -51,37 +41,18 @@ impl MetricsWireFacts {
     fn new(limits: OtlpWireLimits) -> Self {
         Self {
             limits,
-            resources: 0,
-            scopes: 0,
-            records: 0,
-            attributes: 0,
-            value_bytes: 0,
+            widths: MetricOutputWidths::new(),
             decode_bytes: size_of::<ExportMetricsServiceRequest>(),
+            output: ProjectedOutput::default(),
         }
-    }
-
-    /// Adds a checked cardinality or byte fact and enforces its ceiling.
-    ///
-    /// # Errors
-    ///
-    /// Returns a malformed-request error on arithmetic overflow or limit excess.
-    fn add_count(current: &mut usize, amount: usize, limit: usize) -> Result<(), IngestError> {
-        *current = current
-            .checked_add(amount)
-            .ok_or_else(|| malformed("OTLP metrics cardinality overflow"))?;
-        if *current > limit {
-            return Err(malformed("OTLP metrics cardinality limit exceeded"));
-        }
-        Ok(())
     }
 
     /// Charges retained variable-width bytes and generated backing storage.
     ///
     /// # Errors
     ///
-    /// Returns a malformed-request error on overflow or configured limit excess.
+    /// Returns a malformed-request error on arithmetic overflow.
     fn add_value_bytes(&mut self, amount: usize) -> Result<(), IngestError> {
-        Self::add_count(&mut self.value_bytes, amount, self.limits.value_bytes)?;
         self.add_decode_bytes(amount)
     }
 
@@ -89,29 +60,51 @@ impl MetricsWireFacts {
     ///
     /// # Errors
     ///
-    /// Returns a malformed-request error on overflow or material limit excess.
+    /// Returns a malformed-request error on arithmetic overflow.
     fn add_decode_bytes(&mut self, amount: usize) -> Result<(), IngestError> {
-        Self::add_count(&mut self.decode_bytes, amount, usize::MAX)
+        self.decode_bytes = self
+            .decode_bytes
+            .checked_add(amount)
+            .ok_or_else(|| malformed("OTLP metrics capacity overflow"))?;
+        Ok(())
     }
 
     /// Charges one retained attribute and its `KeyValue` layout.
     ///
     /// # Errors
     ///
-    /// Returns a malformed-request error when attribute or material limits fail.
+    /// Returns a malformed-request error on arithmetic overflow.
     fn add_attribute(&mut self) -> Result<(), IngestError> {
-        Self::add_count(&mut self.attributes, 1, self.limits.attributes)?;
         self.add_decode_bytes(size_of::<KeyValue>())
     }
 
-    /// Charges one metric data point against the signal-record ceiling.
+    /// Charges one data point of generated type `T`, visits its body, and
+    /// charges its projected row.
     ///
     /// # Errors
     ///
-    /// Returns a malformed-request error when record or material limits fail.
-    fn add_record<T>(&mut self) -> Result<(), IngestError> {
-        Self::add_count(&mut self.records, 1, self.limits.records)?;
-        self.add_decode_bytes(size_of::<T>())
+    /// Returns the refusal from `visit` or a malformed-request error on
+    /// arithmetic overflow.
+    fn visit_record<T>(
+        &mut self,
+        body: &[u8],
+        visit: fn(&[u8], &mut Self) -> Result<(), IngestError>,
+    ) -> Result<(), IngestError> {
+        self.output.open(self.decode_bytes, size_of::<T>());
+        self.add_decode_bytes(size_of::<T>())?;
+        visit(body, self)?;
+        self.output.close_record(self.decode_bytes, self.widths.row);
+        Ok(())
+    }
+
+    /// Charges one exemplar's generated layout and projected fixed width.
+    ///
+    /// # Errors
+    ///
+    /// Returns a malformed-request error on arithmetic overflow.
+    fn add_exemplar(&mut self) -> Result<(), IngestError> {
+        self.output.add(self.widths.exemplar);
+        self.add_decode_bytes(size_of::<Exemplar>())
     }
 
     /// Charges exact backing for a repeated primitive field.
@@ -354,7 +347,7 @@ impl<'a> WireFields<'a> {
 pub(crate) fn preflight_metrics_protobuf(
     bytes: &[u8],
     limits: OtlpWireLimits,
-) -> Result<MetricsDecodePlan, IngestError> {
+) -> Result<OtlpDecodePlan, IngestError> {
     if bytes.len() > limits.request_bytes {
         return Err(IngestError::PayloadTooLarge {
             bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -366,17 +359,24 @@ pub(crate) fn preflight_metrics_protobuf(
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
             (1, WireValue::Bytes(body)) => {
-                MetricsWireFacts::add_count(&mut facts.resources, 1, limits.resources)?;
+                facts
+                    .output
+                    .open(facts.decode_bytes, size_of::<ResourceMetrics>());
                 facts.add_decode_bytes(size_of::<ResourceMetrics>())?;
                 visit_resource_metrics(body, &mut facts)?;
+                facts
+                    .output
+                    .close_group(facts.decode_bytes, RESOURCE_FAN_OUT);
             }
             (1, _) => return Err(wrong_wire("metrics resource group")),
             _ => {}
         }
     }
-    Ok(MetricsDecodePlan {
+    enforce_expanded_ceiling(facts.decode_bytes, facts.output.bytes(), limits)?;
+    Ok(OtlpDecodePlan {
         wire_bytes: bytes.len(),
         decode_bytes: facts.decode_bytes,
+        projected_bytes: facts.output.bytes(),
     })
 }
 
@@ -395,9 +395,12 @@ fn visit_resource_metrics(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result<
         match (tag, value) {
             (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(body)) => {
-                MetricsWireFacts::add_count(&mut facts.scopes, 1, facts.limits.scopes)?;
+                facts
+                    .output
+                    .open(facts.decode_bytes, size_of::<ScopeMetrics>());
                 facts.add_decode_bytes(size_of::<ScopeMetrics>())?;
                 visit_scope_metrics(body, facts)?;
+                facts.output.close_group(facts.decode_bytes, GROUP_FAN_OUT);
             }
             (1..=3, _) => return Err(wrong_wire("resource metrics")),
             _ => {}
@@ -421,8 +424,10 @@ fn visit_scope_metrics(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result<(),
         match (tag, value) {
             (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(body)) => {
+                facts.output.open(facts.decode_bytes, size_of::<Metric>());
                 facts.add_decode_bytes(size_of::<Metric>())?;
                 visit_metric(body, facts)?;
+                facts.output.close_group(facts.decode_bytes, GROUP_FAN_OUT);
             }
             (1..=3, _) => return Err(wrong_wire("scope metrics")),
             _ => {}
@@ -480,20 +485,17 @@ fn visit_metric_data(
     while let Some((field_tag, value)) = fields.next()? {
         match (tag, field_tag, value) {
             (5 | 7, 1, WireValue::Bytes(body)) => {
-                facts.add_record::<NumberDataPoint>()?;
-                visit_number_point(body, facts)?;
+                facts.visit_record::<NumberDataPoint>(body, visit_number_point)?;
             }
             (9, 1, WireValue::Bytes(body)) => {
-                facts.add_record::<HistogramDataPoint>()?;
-                visit_histogram_point(body, facts)?;
+                facts.visit_record::<HistogramDataPoint>(body, visit_histogram_point)?;
             }
             (10, 1, WireValue::Bytes(body)) => {
-                facts.add_record::<ExponentialHistogramDataPoint>()?;
-                visit_exponential_point(body, facts)?;
+                facts
+                    .visit_record::<ExponentialHistogramDataPoint>(body, visit_exponential_point)?;
             }
             (11, 1, WireValue::Bytes(body)) => {
-                facts.add_record::<SummaryDataPoint>()?;
-                visit_summary_point(body, facts)?;
+                facts.visit_record::<SummaryDataPoint>(body, visit_summary_point)?;
             }
             (7 | 9 | 10, 2, WireValue::Varint(_)) | (7, 3, WireValue::Varint(_)) => {}
             (5, 1, _) | (7, 1..=3, _) | (9 | 10, 1..=2, _) | (11, 1, _) => {
@@ -516,7 +518,7 @@ fn visit_number_point(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result<(), 
         match (tag, value) {
             (7, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
             (5, WireValue::Bytes(exemplar)) => {
-                facts.add_decode_bytes(size_of::<Exemplar>())?;
+                facts.add_exemplar()?;
                 visit_exemplar(exemplar, facts)?;
             }
             (2 | 3 | 4 | 6, WireValue::Fixed64(_)) | (8, WireValue::Varint(_)) => {}
@@ -538,7 +540,7 @@ fn visit_histogram_point(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result<(
         match (tag, value) {
             (9, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
             (8, WireValue::Bytes(exemplar)) => {
-                facts.add_decode_bytes(size_of::<Exemplar>())?;
+                facts.add_exemplar()?;
                 visit_exemplar(exemplar, facts)?;
             }
             (6 | 7, WireValue::Fixed64(_)) => facts.add_primitive::<u64>(1)?,
@@ -573,7 +575,7 @@ fn visit_exponential_point(bytes: &[u8], facts: &mut MetricsWireFacts) -> Result
         match (tag, value) {
             (1, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
             (11, WireValue::Bytes(exemplar)) => {
-                facts.add_decode_bytes(size_of::<Exemplar>())?;
+                facts.add_exemplar()?;
                 visit_exemplar(exemplar, facts)?;
             }
             (8 | 9, WireValue::Bytes(_)) => {}
@@ -1002,7 +1004,7 @@ fn validate_any_value_wire(tag: u32, value: WireValue<'_>) -> Result<(), IngestE
 /// preflighted input or contain invalid UTF-8, framing, or known wire types.
 pub(crate) fn decode_metrics_protobuf(
     bytes: &[u8],
-    plan: MetricsDecodePlan,
+    plan: OtlpDecodePlan,
 ) -> Result<ExportMetricsServiceRequest, IngestError> {
     if bytes.len() != plan.wire_bytes {
         return Err(malformed("metrics decode input differs from preflight"));
@@ -2652,18 +2654,6 @@ mod tests {
         );
         assert_exact_capacities(&decoded);
         assert_eq!(plan.decode_bytes, decoded_capacity(&decoded));
-    }
-
-    /// Verifies the record ceiling rejects exactly the first excess point.
-    #[test]
-    fn metrics_preflight_rejects_record_cap_plus_one() {
-        let request = metrics_fixture();
-        let bytes = request.encode_to_vec();
-        let limits = OtlpWireLimits {
-            records: 4,
-            ..OTLP_WIRE_LIMITS
-        };
-        assert!(preflight_metrics_protobuf(&bytes, limits).is_err());
     }
 
     /// Verifies alternating array/list recursion is rejected beyond the configured depth.

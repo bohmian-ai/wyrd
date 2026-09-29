@@ -141,6 +141,8 @@ pub struct BifrostClusterSpec {
     /// composes the same owner as its first boot; a cache mode that changed
     /// across a restart would make a parity comparison meaningless.
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
+    /// Oracle runtime bounds every Oracle node boots with, when not the defaults.
+    oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
 }
 
 impl BifrostClusterSpec {
@@ -190,6 +192,20 @@ impl BifrostClusterSpec {
         self
     }
 
+    /// Boots every node with the given Oracle queue and deadline bounds.
+    ///
+    /// The values pass through the ordinary server Oracle configuration, so a
+    /// journey proves expiry with short stated limits rather than the
+    /// hour-scale production defaults.
+    #[must_use]
+    pub fn with_oracle_runtime_for_test(
+        mut self,
+        config: wyrd_server::config::OracleRuntimeConfig,
+    ) -> Self {
+        self.oracle_runtime = Some(config);
+        self
+    }
+
     /// Applies one raw process observation to every Oracle node.
     ///
     /// Restarted nodes retain this observation and rerun the production policy;
@@ -229,6 +245,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -250,6 +267,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -276,6 +294,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -305,6 +324,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -327,6 +347,7 @@ impl BifrostClusterSpec {
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
         }
     }
 
@@ -452,16 +473,12 @@ pub struct OracleMembershipInspection {
 pub struct OracleInspection {
     /// Durable Scribe and Oracle membership rows.
     pub memberships: Vec<OracleMembershipInspection>,
-    /// Live-tail fences retained across every Scribe process.
-    pub active_tail_fences: u64,
     /// Active local Oracle queries across running pods.
     pub active_queries: u64,
     /// Queued local Oracle queries across running pods.
     pub queued_queries: u64,
     /// Memory reservations retained by Oracle queries.
     pub reserved_memory_bytes: u64,
-    /// Spill reservations retained by Oracle queries.
-    pub reserved_spill_bytes: u64,
     /// Active Oracle-owned process/query scratch directories.
     pub spill_directories: u64,
     /// Regular files beneath all running Oracle-owned scratch prefixes.
@@ -805,6 +822,8 @@ pub struct WyrdTestCluster {
         Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
     /// Storage I/O bounds every node start and restart resolves its owner from.
     storage_io: wyrd_server::config::BifrostStorageIoConfig,
+    /// Oracle runtime bounds every node start and restart boots with.
+    oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
@@ -1561,6 +1580,7 @@ impl WyrdTestCluster {
         let scribe_geometry_for_test = spec.scribe_geometry_for_test;
         let scribe_persistence_faults_for_test = spec.scribe_persistence_faults_for_test.clone();
         let storage_io = spec.storage_io;
+        let oracle_runtime = spec.oracle_runtime.clone();
         let process = process_telemetry()?;
         // `explicit_root` is the storage root to reuse (a shared or a
         // caller-declared dedicated root); `None` selects a temporary root.
@@ -1712,6 +1732,7 @@ impl WyrdTestCluster {
             scribe_geometry_for_test,
             scribe_persistence_faults_for_test,
             storage_io,
+            oracle_runtime,
             faults: OracleFaultController::default(),
             telemetry: process.forge_capture.clone(),
             oracle_peer_credentials,
@@ -1762,6 +1783,9 @@ impl WyrdTestCluster {
         }
         if let Some(bytes) = resources.spec.forge_compaction_memory_limit_bytes {
             builder = builder.with_forge_compaction_memory_limit_for_test(bytes);
+        }
+        if let Some(oracle) = self.oracle_runtime.clone() {
+            builder = builder.with_oracle_runtime_for_test(oracle);
         }
         builder = builder.with_forge_process_role_for_test(resources.process_role);
         builder = builder.with_forge_interval(self.forge_interval);
@@ -1912,17 +1936,6 @@ impl WyrdTestCluster {
             .fetch_one(pool)
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let active_tail_fences = self
-            .servers
-            .values()
-            .filter_map(Option::as_ref)
-            .filter(|server| server.bifrost_scribe().is_some())
-            .map(|server| server.active_bifrost_tail_fences())
-            .try_fold(0_u64, |total, count| {
-                count
-                    .map(|count| total.saturating_add(count))
-                    .map_err(|error| ClusterError::Resource(error.to_string()))
-            })?;
         let mut runtime = OracleRuntimeInspection::default();
         for server in self.servers.values().flatten() {
             if let Ok(snapshot) = server.oracle_runtime_inspection() {
@@ -1935,9 +1948,6 @@ impl WyrdTestCluster {
                 runtime.reserved_memory_bytes = runtime
                     .reserved_memory_bytes
                     .saturating_add(snapshot.reserved_memory_bytes);
-                runtime.reserved_spill_bytes = runtime
-                    .reserved_spill_bytes
-                    .saturating_add(snapshot.reserved_spill_bytes);
                 runtime.peer_pending = runtime.peer_pending.saturating_add(snapshot.peer_pending);
                 runtime.peer_running = runtime.peer_running.saturating_add(snapshot.peer_running);
                 runtime.audit_pending =
@@ -1953,11 +1963,9 @@ impl WyrdTestCluster {
         }
         Ok(OracleInspection {
             memberships,
-            active_tail_fences,
             active_queries: runtime.active_queries,
             queued_queries: runtime.queued_queries,
             reserved_memory_bytes: runtime.reserved_memory_bytes,
-            reserved_spill_bytes: runtime.reserved_spill_bytes,
             spill_directories: runtime.spill_directories,
             spill_files: runtime.spill_files,
             spill_file_bytes: runtime.spill_file_bytes,
@@ -2073,11 +2081,12 @@ impl WyrdTestCluster {
             .servers()
             .filter(|server| server.bifrost_scribe().is_some())
         {
-            let reader = scribe_server
+            let source = scribe_server
                 .state()
-                .bifrost_tail_reader_for_test()
-                .ok_or_else(|| ClusterError::Resource("Scribe tail reader missing".to_owned()))?;
-            let streams = reader
+                .bifrost_ingest()
+                .map(|runtime| runtime.tail_service())
+                .ok_or_else(|| ClusterError::Resource("Scribe tail service missing".to_owned()))?;
+            let streams = source
                 .list_active_streams(&binding)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             if streams
@@ -2710,6 +2719,19 @@ mod tests {
     }
 
     /// A stopped node retains raw observations and re-derives the same clean plan.
+    ///
+    /// The replacement process is proved usable by querying its application and
+    /// Vala pools, not by comparing allocator addresses, which the allocator may
+    /// legally reuse once the stopped server has been dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cluster fails to start, stop, restart, or shut down,
+    /// when either replacement pool fails a trivial query, when the retained WAL
+    /// root, re-derived resource plan, or reset resource counters diverge, or
+    /// when the Oracle peer role, its stored permissions, or its exchanged
+    /// bearer's effective permissions do not match the expected single
+    /// `bifrost_peer` grant.
     #[tokio::test]
     async fn cluster_restart_rederives_same_plan_from_retained_snapshot() {
         let observation = SystemResourceSnapshot {
@@ -2727,7 +2749,6 @@ mod tests {
         .expect("cluster starts");
         let node_id = cluster.ready_query_nodes()[0];
         let original = cluster.server_by_node(node_id).expect("running node");
-        let original_identity = original.postgres_pool_identity();
         let original_resources = original
             .state()
             .bifrost_resources()
@@ -2739,7 +2760,14 @@ mod tests {
         assert!(cluster.server_by_node(node_id).is_none());
         cluster.restart_node(node_id).await.expect("node restarts");
         let server = cluster.server_by_node(node_id).expect("node is running");
-        assert_ne!(server.postgres_pool_identity(), original_identity);
+        sqlx::query("SELECT 1")
+            .execute(server.state().postgres.app_pool())
+            .await
+            .expect("replacement application pool is usable");
+        sqlx::query("SELECT 1")
+            .execute(server.state().postgres.vala().pool())
+            .await
+            .expect("replacement Vala pool is usable");
         assert_eq!(cluster.wal_dirs().next(), Some(wal_root.as_path()));
         let restarted_resources = server
             .state()
@@ -2750,7 +2778,6 @@ mod tests {
         assert_eq!(restarted_resources.plan, original_resources.plan);
         assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
         assert_eq!(restarted_resources.elastic_memory_used_bytes, 0);
-        assert_eq!(restarted_resources.scratch_used_bytes, 0);
         assert!(!restarted_resources.oracle_query_active);
         let mut system_conn = cluster
             .fixture
@@ -2786,41 +2813,47 @@ mod tests {
         cluster.shutdown().await.expect("cluster shuts down");
     }
 
-    /// Stopping one process closes only its fresh pools while another process
-    /// remains queryable, and restart allocates a new pool graph.
+    /// Stopping one process leaves every surviving process queryable, and the
+    /// restarted node comes back with a usable pool graph of its own.
+    ///
+    /// Replacement is proved by exercising each process's application and Vala
+    /// pools rather than by comparing allocator addresses: the stopped server
+    /// is dropped before its replacement allocates, so the allocator may
+    /// legally reuse the same address, and an unequal address would not show
+    /// that the new pools work.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cluster fails to start, stop, restart, or shut down,
+    /// when the stopped node is still present, or when any process's
+    /// application or Vala pool fails to answer a trivial query.
     #[tokio::test]
     async fn process_pool_lifecycle_isolated_across_restart() {
         let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
             .await
             .expect("cluster starts");
         let ids = cluster.configured_node_ids();
-        let before = ids
-            .iter()
-            .map(|id| {
-                cluster
-                    .server_by_node(*id)
-                    .expect("running node")
-                    .postgres_pool_identity()
-            })
-            .collect::<Vec<_>>();
         cluster.stop_node(ids[0]).await.expect("node stops");
+        assert!(cluster.server_by_node(ids[0]).is_none());
         let survivor = cluster.server_by_node(ids[1]).expect("survivor remains");
         sqlx::query("SELECT 1")
             .execute(survivor.state().postgres.app_pool())
             .await
             .expect("survivor pool remains usable");
         cluster.restart_node(ids[0]).await.expect("node restarts");
-        let after = ids
-            .iter()
-            .map(|id| {
-                cluster
-                    .server_by_node(*id)
-                    .expect("running replacement")
-                    .postgres_pool_identity()
-            })
-            .collect::<Vec<_>>();
-        assert_ne!(after[0], before[0]);
-        assert_eq!(after[1..], before[1..]);
+        for id in &ids {
+            let server = cluster
+                .server_by_node(*id)
+                .expect("every configured node is running");
+            sqlx::query("SELECT 1")
+                .execute(server.state().postgres.app_pool())
+                .await
+                .expect("application pool is usable after the restart");
+            sqlx::query("SELECT 1")
+                .execute(server.state().postgres.vala().pool())
+                .await
+                .expect("Vala pool is usable after the restart");
+        }
         cluster.shutdown().await.expect("cluster shuts down");
     }
 

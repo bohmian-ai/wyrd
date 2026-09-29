@@ -344,7 +344,6 @@ mod pg_tests {
         admission_slots: 0,
         memory_bytes: 0,
         peer_slots: 0,
-        tail_fences: 0,
     };
 
     /// An agent debugging a trace reads it once, completely, and can call it off.
@@ -507,9 +506,9 @@ mod pg_tests {
             "Oracle owns path selection and chose Interactive: {content}"
         );
         assert_eq!(content["terminal"]["outcome"], serde_json::json!("success"));
-        assert_eq!(
-            content["terminal"]["freshness"],
-            serde_json::json!("complete")
+        assert!(
+            content["terminal"].get("freshness").is_none(),
+            "the terminal carries no freshness field: {content}"
         );
         assert_eq!(content["terminal"]["row_count"], serde_json::json!(1));
 

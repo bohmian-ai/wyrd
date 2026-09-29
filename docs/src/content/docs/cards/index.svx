@@ -75,7 +75,7 @@ ModelCard artifacts. See [Declare a card](/how-to/declare/).
 
 ## Catalog
 
-The card *model* defines 16 native kinds plus `External`. Three are runnable end to
+The card *model* defines 15 native kinds plus `External`. Three are runnable end to
 end today; the rest are specified — their schemas and validation exist — but have
 no holder, Python surface, or runnable example yet. Status is shown honestly so the
 model's breadth is visible without implying more than ships.
@@ -88,15 +88,14 @@ model's breadth is visible without implying more than ships.
 | Agent | A declared agent — the runnable thing lives in the [Skald runtime](/concepts/architecture/). | ◷ Spec only |
 | Workflow | A declared multi-step workflow; runnable form is in [Skald](/concepts/architecture/). | ◷ Spec only |
 | Artifact | Durable artifact-metadata record that specs link to via `CardRef`. | ◷ Spec only |
-| Eval | An evaluation rubric bound to a card version. | ◷ Spec only |
 | Experiment | A grouping of runs and their measured outcomes. | ◷ Spec only |
-| Drift | A drift-monitoring declaration over a data or model card. | ◷ Spec only |
+| Verifier | One reusable `drift` or `eval` judgment, bound to a Service, component, or Agent through `verified_by`. | ◷ Spec only |
 | Policy | A declared rule that decides whether an action is allowed. | ◷ Spec only |
 | Audit | Declared audit scope, requirements, or an evidence package. | ◷ Spec only |
 | Service | A deployable bundle of declared behavior with a bill of materials. | ◷ Spec only |
-| Operator | A declared operational unit within a service. | ◷ Spec only |
+| Operator | One `notify` or `http` reaction to a failed verification. | ◷ Spec only |
 | Source | A declared upstream data or artifact source. | ◷ Spec only |
-| Trigger | A declared condition that initiates an action. | ◷ Spec only |
+| Trigger | When a bound Verifier runs: `schedule` or `observations_ready`. | ◷ Spec only |
 | MCP | A declared MCP tool or server surface. | ◷ Spec only |
 | External | An escape hatch for components Wyrd references but does not own. | ◷ Spec only |
 

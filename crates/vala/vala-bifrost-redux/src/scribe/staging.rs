@@ -1,7 +1,6 @@
 //! Crash-recoverable local staging and single-mover election for Scribe artifacts.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -35,8 +34,6 @@ pub(crate) struct StagedArtifactClaim {
     pub(crate) sha256: [u8; 32],
     /// Manifest-fixed byte length.
     pub(crate) length: u64,
-    /// Exact durable local bytes charged to the WAL volume.
-    pub(crate) accounted_bytes: u64,
 }
 
 /// Durable attempt facts written before competing persistors elect a winner.
@@ -201,74 +198,16 @@ pub(crate) enum StageElection {
 pub(crate) struct ScribeStaging {
     /// WAL-root-relative namespace containing attempt, winner, and publication files.
     root: PathBuf,
-    /// Optional WAL owner that charges and retires staged bytes in production.
-    wal: Option<Arc<crate::scribe::wal::WalWriter>>,
-}
-
-/// Provisional durable-stage charge retained fail-stop if cancellation follows mutation.
-struct PendingStageGrowth {
-    /// Exact provisional WAL-volume capability reserved before the first write.
-    growth: Option<crate::resources::WalVolumeGrowth>,
-    /// Whether an async filesystem operation may already have mutated the namespace.
-    mutation_possible: bool,
-}
-
-impl PendingStageGrowth {
-    /// Wraps an optional production growth capability before local IO starts.
-    fn new(growth: Option<crate::resources::WalVolumeGrowth>) -> Self {
-        Self {
-            growth,
-            mutation_possible: false,
-        }
-    }
-
-    /// Marks the capability conservative before the first cancellable write.
-    fn arm(&mut self) {
-        self.mutation_possible = true;
-    }
-
-    /// Commits the exact charge after file and parent-directory fsync complete.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal error when volume accounting contradicts the reserved growth.
-    fn commit(mut self) -> Result<(), ScribeError> {
-        if let Some(growth) = self.growth.take() {
-            growth.commit().map_err(|error| ScribeError::Internal {
-                detail: format!("commit Scribe staged WAL-volume growth: {error}"),
-            })?;
-        }
-        self.mutation_possible = false;
-        Ok(())
-    }
-}
-
-impl Drop for PendingStageGrowth {
-    /// Retains and poisons a possibly materialized but uncommitted stage charge.
-    fn drop(&mut self) {
-        if self.mutation_possible
-            && let Some(growth) = self.growth.take()
-        {
-            growth.retain_and_poison();
-        }
-    }
 }
 
 impl ScribeStaging {
     /// Creates the local stage owner under the WAL recovery root.
-    pub(crate) fn new(wal: Arc<crate::scribe::wal::WalWriter>) -> Self {
-        Self {
-            root: wal.base_dir().join("staged"),
-            wal: Some(wal),
-        }
-    }
-
-    /// Creates an ungoverned staging owner for isolated filesystem unit tests.
-    #[cfg(test)]
-    fn ungoverned_for_test(wal_root: &Path) -> Self {
+    ///
+    /// The namespace is not capacity-governed: a full device surfaces as the
+    /// failing file operation's own IO error.
+    pub(crate) fn new(wal_root: &Path) -> Self {
         Self {
             root: wal_root.join("staged"),
-            wal: None,
         }
     }
 
@@ -295,7 +234,7 @@ impl ScribeStaging {
     ) -> Result<StageElection, ScribeError> {
         if chunk.is_empty() || !safe_component(logical_identity) {
             return Err(ScribeError::Internal {
-                detail: "invalid or ungoverned Scribe stage identity".to_owned(),
+                detail: "invalid Scribe stage identity".to_owned(),
             });
         }
         tokio::fs::create_dir_all(&self.root)
@@ -312,31 +251,6 @@ impl ScribeStaging {
             sha256,
             length,
         };
-        let manifest_bytes =
-            serde_json::to_vec(&manifest).map_err(|error| ScribeError::Internal {
-                detail: format!("encode Scribe attempt manifest: {error}"),
-            })?;
-        let winner_bytes = manifest_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "Scribe attempt manifest has no stable filename".to_owned(),
-            })?
-            .len() as u64;
-        let accounted_bytes = length
-            .checked_add(manifest_bytes.len() as u64)
-            .and_then(|bytes| bytes.checked_add(winner_bytes))
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "Scribe staged volume charge overflow".to_owned(),
-            })?;
-        let growth = self
-            .wal
-            .as_ref()
-            .map(|wal| wal.reserve_staged_growth(accounted_bytes))
-            .transpose()?
-            .flatten();
-        let mut growth = PendingStageGrowth::new(growth);
-        growth.arm();
         copy_fsynced(source, &temporary, sha256, length, chunk).await?;
         sync_directory(&self.root).await?;
         write_manifest_fsynced(&manifest_path, &manifest).await?;
@@ -372,21 +286,12 @@ impl ScribeStaging {
                     .await
                     .map_err(stage_io("finalize elected stage"))?;
                 sync_directory(&self.root).await?;
-                growth.commit()?;
-                Ok(StageElection::Winner(claim(
-                    &manifest,
-                    finalized,
-                    accounted_bytes,
-                )))
+                Ok(StageElection::Winner(claim(&manifest, finalized)))
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 remove_if_present(&temporary).await?;
                 remove_if_present(&manifest_path).await?;
                 sync_directory(&self.root).await?;
-                // No bytes from this attempt remain durable. Dropping the
-                // provisional capability releases it without ever creating a
-                // competing retirement authority.
-                growth.mutation_possible = false;
                 Ok(StageElection::ExistingWinner(
                     self.load_winner(&winner_path, chunk).await?,
                 ))
@@ -533,18 +438,6 @@ impl ScribeStaging {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "recovered attempt manifest lacks a safe filename".to_owned(),
             })?;
-        let winner_bytes =
-            u64::try_from(manifest_name.len()).map_err(|_| ScribeError::Internal {
-                detail: "recovered winner marker length overflow".to_owned(),
-            })?;
-        let growth = self
-            .wal
-            .as_ref()
-            .map(|wal| wal.reserve_staged_growth(winner_bytes))
-            .transpose()?
-            .flatten();
-        let mut growth = PendingStageGrowth::new(growth);
-        growth.arm();
         match tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -561,22 +454,18 @@ impl ScribeStaging {
                     .await
                     .map_err(stage_io("fsync recovered winner marker"))?;
                 sync_directory(&self.root).await?;
-                growth.commit()?;
                 Ok(Some(self.load_winner(&winner_path, chunk).await?))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                growth.mutation_possible = false;
-                Ok(None)
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(error) => Err(stage_io("elect recovered Scribe stage")(error)),
         }
     }
 
-    /// Removes one proven non-winning attempt and retires only its exact local bytes.
+    /// Removes one proven non-winning attempt's exact local files.
     ///
     /// # Errors
     ///
-    /// Returns an internal error when metadata, removal, fsync, or volume retirement fails.
+    /// Returns an internal error when removal or fsync fails.
     async fn cleanup_recovered_attempt(
         &self,
         manifest: &AttemptManifest,
@@ -593,29 +482,19 @@ impl ScribeStaging {
         sync_directory(&self.root).await
     }
 
-    /// Removes one exact recovered path and retires its measured durable charge.
+    /// Removes one exact recovered path inside the stage namespace.
     ///
     /// # Errors
     ///
-    /// Returns an internal error for unsafe paths, metadata/removal failure, or
-    /// volume-accounting contradiction.
+    /// Returns an internal error for unsafe paths or a removal/fsync failure.
     async fn remove_recovered_bytes(&self, path: &Path) -> Result<(), ScribeError> {
         if path.parent() != Some(self.root.as_path()) {
             return Err(ScribeError::Internal {
                 detail: "recovered stage cleanup escaped its namespace".to_owned(),
             });
         }
-        let bytes = match tokio::fs::metadata(path).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(stage_io("stat recovered orphan")(error)),
-        };
         remove_if_present(path).await?;
-        sync_directory(&self.root).await?;
-        if let Some(wal) = &self.wal {
-            wal.retire_staged_bytes(bytes)?;
-        }
-        Ok(())
+        sync_directory(&self.root).await
     }
 
     /// Atomically persists the complete generation/member publication transaction.
@@ -685,21 +564,12 @@ impl ScribeStaging {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(stage_io("stat Scribe publication manifest")(error)),
         }
-        let growth = self
-            .wal
-            .as_ref()
-            .map(|wal| wal.reserve_staged_growth(manifest_len))
-            .transpose()?
-            .flatten();
-        let mut growth = PendingStageGrowth::new(growth);
-        growth.arm();
         write_bytes_fsynced(&temporary_path, &manifest_bytes).await?;
         sync_directory(&self.root).await?;
         tokio::fs::rename(&temporary_path, &final_path)
             .await
             .map_err(stage_io("publish Scribe generation manifest"))?;
-        sync_directory(&self.root).await?;
-        growth.commit()
+        sync_directory(&self.root).await
     }
 
     /// Loads and validates every durable publication before startup readiness.
@@ -888,16 +758,7 @@ impl ScribeStaging {
             sync_directory(&self.root).await?;
         }
         verify_staged_artifact(&finalized, manifest.sha256, manifest.length, chunk).await?;
-        let accounted_bytes = manifest.length
-            + tokio::fs::metadata(&manifest_path)
-                .await
-                .map_err(stage_io("stat attempt manifest"))?
-                .len()
-            + tokio::fs::metadata(winner_path)
-                .await
-                .map_err(stage_io("stat winner marker"))?
-                .len();
-        Ok(claim(&manifest, finalized, accounted_bytes))
+        Ok(claim(&manifest, finalized))
     }
 }
 
@@ -1031,11 +892,7 @@ fn validate_publication(
 }
 
 /// Builds the public claim from one validated durable attempt manifest.
-fn claim(
-    manifest: &AttemptManifest,
-    staged_path: PathBuf,
-    accounted_bytes: u64,
-) -> StagedArtifactClaim {
+fn claim(manifest: &AttemptManifest, staged_path: PathBuf) -> StagedArtifactClaim {
     StagedArtifactClaim {
         logical_identity: manifest.logical_identity.clone(),
         attempt_id: manifest.attempt_id,
@@ -1043,7 +900,6 @@ fn claim(
         object_key: manifest.object_key.clone(),
         sha256: manifest.sha256,
         length: manifest.length,
-        accounted_bytes,
     }
 }
 
@@ -1187,8 +1043,8 @@ async fn write_manifest_fsynced<T: Serialize>(
 ///
 /// # Cancellation
 ///
-/// Cancellation may leave a partial file. The caller must retain its preceding
-/// growth capability and let startup classification reconcile the exact path.
+/// Cancellation may leave a partial file; startup classification reconciles
+/// the exact path.
 async fn write_bytes_fsynced(path: &Path, bytes: &[u8]) -> Result<(), ScribeError> {
     let mut file = tokio::fs::File::create(path)
         .await
@@ -1299,10 +1155,6 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::*;
-    use crate::resources::{
-        BifrostResourceHealth, BifrostVolumeClass, BifrostVolumeGovernor, BifrostVolumeRoots,
-    };
-    use crate::scribe::wal::{WalConfig, WalWriter};
 
     /// Proves one competing attempt wins and restart reconstructs the same mover claim.
     #[tokio::test]
@@ -1313,7 +1165,7 @@ mod tests {
         tokio::fs::write(&source, content)
             .await
             .expect("source write");
-        let staging = ScribeStaging::ungoverned_for_test(directory.path());
+        let staging = ScribeStaging::new(directory.path());
         let identity =
             ParquetObjectIdentity::new("tenant/table/artifact.parquet").expect("object key");
         let digest = Sha256::digest(content).into();
@@ -1381,7 +1233,7 @@ mod tests {
         tokio::fs::write(&source, mutated)
             .await
             .expect("mutated source write");
-        let staging = ScribeStaging::ungoverned_for_test(directory.path());
+        let staging = ScribeStaging::new(directory.path());
         let identity =
             ParquetObjectIdentity::new("tenant/table/artifact.parquet").expect("object key");
 
@@ -1423,7 +1275,7 @@ mod tests {
         tokio::fs::write(&source, content)
             .await
             .expect("source write");
-        let staging = ScribeStaging::ungoverned_for_test(directory.path());
+        let staging = ScribeStaging::new(directory.path());
         let identity =
             ParquetObjectIdentity::new("tenant/table/artifact.parquet").expect("object key");
         let claim = match staging
@@ -1466,7 +1318,7 @@ mod tests {
         let digest: [u8; 32] = Sha256::digest(content).into();
         for boundary in 0_u8..4 {
             let directory = tempfile::tempdir().expect("stage root");
-            let staging = ScribeStaging::ungoverned_for_test(directory.path());
+            let staging = ScribeStaging::new(directory.path());
             tokio::fs::create_dir_all(&staging.root)
                 .await
                 .expect("stage namespace");
@@ -1559,7 +1411,7 @@ mod tests {
         tokio::fs::write(&source, content)
             .await
             .expect("source write");
-        let staging = ScribeStaging::ungoverned_for_test(directory.path());
+        let staging = ScribeStaging::new(directory.path());
         let object_key = "tenant/table/generation.parquet";
         let identity = ParquetObjectIdentity::new(object_key).expect("object key");
         let digest: [u8; 32] = Sha256::digest(content).into();
@@ -1627,327 +1479,5 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].actor_stream, actor);
         assert_eq!(recovered[0].rows[0].file_path, object_key);
-    }
-
-    /// Publishes the elected artifact and returns its manifest's durable bytes.
-    ///
-    /// The publication is written through the production `persist_publication`
-    /// path so the manifest the restart later recovers is the real one, not a
-    /// fixture approximation. The returned length is the on-disk manifest size,
-    /// which the caller folds into the expected durable WAL occupancy.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the publication cannot be persisted or its manifest cannot be
-    /// stat-ed.
-    async fn publish_elected_artifact(
-        staging: &ScribeStaging,
-        object_key: &str,
-        content: &[u8],
-        digest: [u8; 32],
-        claim: &StagedArtifactClaim,
-    ) -> u64 {
-        let node_id = Uuid::from_bytes([7_u8; 16]);
-        let actor = StreamIdentity::new(
-            crate::scribe::stream_identity::NodeId::new(node_id),
-            crate::scribe::stream_identity::WriterEpoch::new(11),
-        );
-        let tenant = DataTenantId::new_v7();
-        let now = chrono::Utc::now();
-        let row_id = Uuid::now_v7();
-        let rows = vec![FileListArtifactInsert {
-            id: row_id,
-            data_tenant_id: tenant,
-            namespace: "vala.traces".to_owned(),
-            table_name: "spans".to_owned(),
-            file_path: object_key.to_owned(),
-            file_size: i64::try_from(content.len()).expect("fixture length"),
-            row_count: 1,
-            min_event_time: now,
-            max_event_time: now,
-            partition: crate::catalog::TimeGranularity::Hour
-                .bucket(now)
-                .expect("fixture instant buckets"),
-            node_id,
-            writer_epoch: 11,
-            wal_lsn_min: 1,
-            wal_lsn_max: 2,
-            file_ordinal: 0,
-            file_checksum: hex::encode(digest),
-            promotion_record: fixture_promotion_record(
-                tenant,
-                object_key,
-                &hex::encode(digest),
-                content.len() as u64,
-                crate::catalog::TimeGranularity::Hour
-                    .bucket(now)
-                    .expect("fixture instant buckets"),
-                row_id,
-            ),
-        }];
-        staging
-            .persist_publication("generation-9", actor, &rows, std::slice::from_ref(claim))
-            .await
-            .expect("publication manifest");
-        let publication_path = staging.root.join("generation-9.publication.json");
-
-        tokio::fs::metadata(&publication_path)
-            .await
-            .expect("publication metadata")
-            .len()
-    }
-
-    /// Stages one uncommitted attempt and returns its bytes and manifest path.
-    ///
-    /// The attempt is deliberately left pending — staged and fsynced, with its
-    /// attempt manifest written, but never elected — so the restart has an
-    /// unresolved election to reconstruct. Growth is reserved and committed
-    /// through the production WAL volume so the durable counter reflects it.
-    ///
-    /// # Panics
-    ///
-    /// Panics if growth cannot be reserved or committed, or if the staged copy,
-    /// manifest write, or directory fsync fails.
-    async fn stage_pending_attempt(
-        staging: &ScribeStaging,
-        writer: &Arc<WalWriter>,
-        source: &std::path::Path,
-        digest: [u8; 32],
-        content: &[u8],
-    ) -> (u64, std::path::PathBuf) {
-        let pending_identity = "generation-10-artifact-0";
-        let pending_attempt = Uuid::now_v7();
-        let pending_prefix = format!("{pending_identity}.{pending_attempt}");
-        let pending_path = staging.root.join(format!("{pending_prefix}.par.tmp"));
-        let pending_manifest_path = staging.root.join(format!("{pending_prefix}.attempt.json"));
-        let pending_manifest = AttemptManifest {
-            logical_identity: pending_identity.to_owned(),
-            attempt_id: pending_attempt,
-            object_key: "tenant/table/recovered-election.parquet".to_owned(),
-            sha256: digest,
-            length: content.len() as u64,
-        };
-        let pending_manifest_bytes = serde_json::to_vec(&pending_manifest)
-            .expect("pending attempt manifest representation")
-            .len() as u64;
-        let pending_bytes = (content.len() as u64)
-            .checked_add(pending_manifest_bytes)
-            .expect("pending stage bytes");
-        let pending_growth = writer
-            .reserve_staged_growth(pending_bytes)
-            .expect("pending stage growth")
-            .expect("production WAL volume");
-        copy_fsynced(
-            source,
-            &pending_path,
-            digest,
-            content.len() as u64,
-            &mut [0_u8; 8],
-        )
-        .await
-        .expect("pending stage copy");
-        sync_directory(&staging.root)
-            .await
-            .expect("pending stage directory fsync");
-        write_manifest_fsynced(&pending_manifest_path, &pending_manifest)
-            .await
-            .expect("pending attempt manifest");
-        sync_directory(&staging.root)
-            .await
-            .expect("pending manifest directory fsync");
-        pending_growth.commit().expect("pending stage commit");
-        (pending_bytes, pending_manifest_path)
-    }
-
-    /// Asserts a restart reconstructs the exact namespace and retires it fully.
-    ///
-    /// Registering a fresh governor over the same roots must reconcile to
-    /// exactly the durable bytes the pre-restart run accounted for — no more, so
-    /// unauthorized files are excluded, and no less, so authorized staged files
-    /// are not lost. Recovery must then resolve the pending election, growing
-    /// the counter by exactly the winner marker, and cleaning up every recovered
-    /// claim and the publication must return the counter to zero.
-    ///
-    /// # Panics
-    ///
-    /// Panics if registration, recovery, or cleanup fails, or if any usage
-    /// reading differs from the exact expected occupancy.
-    async fn assert_restart_reconstructs_and_retires(
-        roots: BifrostVolumeRoots,
-        wal_root: &std::path::Path,
-        expected: u64,
-        claim: &StagedArtifactClaim,
-        pending_manifest_path: &std::path::Path,
-    ) {
-        let restarted =
-            BifrostVolumeGovernor::register(roots, 1024 * 1024, BifrostResourceHealth::default())
-                .expect("restart volume registration");
-        assert_eq!(
-            restarted
-                .usage_for_test(BifrostVolumeClass::Wal)
-                .expect("reconciled usage"),
-            (expected, 0, 0),
-            "restart counts only WAL and authorized staged files"
-        );
-        let restarted_writer = Arc::new(
-            WalWriter::new_with_volume(
-                wal_root,
-                [7_u8; 16],
-                11,
-                WalConfig::default(),
-                restarted.capabilities().wal,
-            )
-            .expect("restarted governed WAL writer"),
-        );
-        let restarted_staging = ScribeStaging::new(restarted_writer);
-        let recovered_claims = restarted_staging
-            .recover(&mut [0_u8; 8])
-            .await
-            .expect("stage recovery");
-        let recovered_publications = restarted_staging
-            .recover_publications(&mut [0_u8; 8])
-            .await
-            .expect("publication recovery");
-        assert_eq!(recovered_claims.len(), 2);
-        assert!(recovered_claims.contains(claim));
-        assert_eq!(recovered_publications.len(), 1);
-        let recovered_winner_bytes = u64::try_from(
-            pending_manifest_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("pending manifest filename")
-                .len(),
-        )
-        .expect("winner marker bytes");
-        assert_eq!(
-            restarted
-                .usage_for_test(BifrostVolumeClass::Wal)
-                .expect("post-election usage"),
-            (
-                expected
-                    .checked_add(recovered_winner_bytes)
-                    .expect("post-election durable bytes"),
-                0,
-                0
-            )
-        );
-        for recovered_claim in &recovered_claims {
-            restarted_staging
-                .cleanup_published(recovered_claim)
-                .await
-                .expect("stage cleanup");
-        }
-        restarted_staging
-            .cleanup_publication("generation-9")
-            .await
-            .expect("publication cleanup");
-        assert_eq!(
-            restarted
-                .usage_for_test(BifrostVolumeClass::Wal)
-                .expect("settled usage"),
-            (0, 0, 0)
-        );
-    }
-
-    /// Proves restart reconstructs every authorized stage byte and exact cleanup.
-    ///
-    /// This uses the production WAL-volume capability on both sides of restart,
-    /// retains an elected artifact plus its publication manifest, and verifies
-    /// that an unrelated file in the same directory neither enters nor leaves
-    /// the durable WAL counter.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the production-capability fixture cannot stage, reconcile,
-    /// or retire its exact durable namespace without residual occupancy.
-    #[tokio::test]
-    async fn governed_staging_restart_reconstructs_and_retires_exact_namespace_bytes() {
-        let directory = tempfile::tempdir().expect("stage volume root");
-        let wal_root = directory.path().join("wal");
-        let scribe_stage = directory.path().join("scribe-stage");
-        let scribe_scratch = directory.path().join("scribe-scratch");
-        let oracle_scratch = directory.path().join("oracle-scratch");
-        for path in [&wal_root, &scribe_stage, &scribe_scratch, &oracle_scratch] {
-            std::fs::create_dir(path).expect("registered volume root");
-        }
-        let roots = BifrostVolumeRoots {
-            wal: wal_root.clone(),
-            scribe_stage: scribe_stage.clone(),
-            scribe_output_scratch: scribe_scratch.clone(),
-            oracle_scratch: oracle_scratch.clone(),
-        };
-        let governor =
-            BifrostVolumeGovernor::register(roots, 1024 * 1024, BifrostResourceHealth::default())
-                .expect("initial volume registration");
-        let writer = Arc::new(
-            WalWriter::new_with_volume(
-                &wal_root,
-                [7_u8; 16],
-                11,
-                WalConfig::default(),
-                governor.capabilities().wal,
-            )
-            .expect("governed WAL writer"),
-        );
-        let staging = ScribeStaging::new(Arc::clone(&writer));
-        let source = directory.path().join("source.parquet");
-        let content = b"restart-governed publication";
-        tokio::fs::write(&source, content)
-            .await
-            .expect("source write");
-        let object_key = "tenant/table/restart.parquet";
-        let identity = ParquetObjectIdentity::new(object_key).expect("object key");
-        let digest: [u8; 32] = Sha256::digest(content).into();
-        let claim = match staging
-            .stage_and_elect(
-                "generation-9-artifact-0",
-                &source,
-                &identity,
-                digest,
-                content.len() as u64,
-                &mut [0_u8; 8],
-            )
-            .await
-            .expect("stage election")
-        {
-            StageElection::Winner(claim) | StageElection::ExistingWinner(claim) => claim,
-        };
-        let publication_bytes =
-            publish_elected_artifact(&staging, object_key, content, digest, &claim).await;
-        let (pending_bytes, pending_manifest_path) =
-            stage_pending_attempt(&staging, &writer, &source, digest, content).await;
-        let expected = claim
-            .accounted_bytes
-            .checked_add(publication_bytes)
-            .and_then(|bytes| bytes.checked_add(pending_bytes))
-            .expect("retained stage bytes");
-        assert_eq!(
-            governor
-                .usage_for_test(BifrostVolumeClass::Wal)
-                .expect("initial usage"),
-            (expected, 0, 0)
-        );
-        let unrelated = staging.root.join("operator-note.txt");
-        tokio::fs::write(&unrelated, b"not a Scribe stage")
-            .await
-            .expect("unrelated file");
-        drop(staging);
-        drop(writer);
-        drop(governor);
-
-        assert_restart_reconstructs_and_retires(
-            BifrostVolumeRoots {
-                wal: wal_root.clone(),
-                scribe_stage,
-                scribe_output_scratch: scribe_scratch,
-                oracle_scratch,
-            },
-            &wal_root,
-            expected,
-            &claim,
-            &pending_manifest_path,
-        )
-        .await;
-        assert!(unrelated.exists(), "unrelated namespace file is untouched");
     }
 }

@@ -28,9 +28,7 @@ use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, QueryTerminalOutcome, VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryStreamFrame, QueryTerminalOutcome};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::telemetry::BifrostMetricSample;
 use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
@@ -205,8 +203,6 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
             query_context(tenant_a)?,
             BifrostQueryRequest {
                 sql: analytical_baseline_sql(&left, &right),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(ANALYTICAL_DEADLINE_MS),
             },
             attempt_context(),
@@ -294,7 +290,18 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
     }
 
     await_clean_nodes(&cluster).await?;
-    let settled = ownership_baseline(&cluster).await?;
+    // Query-owned leases, including each query runtime's empty spill
+    // directory, live until coordinator end-of-stream and cache invalidation
+    // (bifrost-design.md), which can trail graph release. The exact baseline
+    // is therefore observed under the clean-node bound rather than sampled once.
+    let mut settled = ownership_baseline(&cluster).await?;
+    for _ in 0..CLEAN_NODE_POLLS {
+        if settled == baseline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        settled = ownership_baseline(&cluster).await?;
+    }
     if settled != baseline {
         return Err(format!(
             "Oracle ownership did not return to baseline: {baseline:?} then {settled:?}"
@@ -364,8 +371,6 @@ async fn prove_interactive_window(
             // Analytical query would never reach the Interactive floor this
             // window exists to observe. Rows are counted, not ordered.
             sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(INTERACTIVE_DEADLINE_MS),
         })
         .await?;
@@ -598,8 +603,6 @@ struct OwnershipBaseline {
     queued_queries: u64,
     /// Query-grant memory retained across every node.
     reserved_memory_bytes: u64,
-    /// Query-grant scratch retained across every node.
-    reserved_spill_bytes: u64,
     /// Retained Oracle spill directories.
     spill_directories: u64,
     /// Retained Oracle spill files.
@@ -610,8 +613,6 @@ struct OwnershipBaseline {
     peer_pending: u64,
     /// Running peer reservations across every node.
     peer_running: u64,
-    /// Live-tail fences retained by every Scribe.
-    active_tail_fences: u64,
 }
 
 /// Projects the live-ownership half of the cluster's own inspection.
@@ -625,13 +626,11 @@ async fn ownership_baseline(cluster: &WyrdTestCluster) -> Result<OwnershipBaseli
         active_queries: inspection.active_queries,
         queued_queries: inspection.queued_queries,
         reserved_memory_bytes: inspection.reserved_memory_bytes,
-        reserved_spill_bytes: inspection.reserved_spill_bytes,
         spill_directories: inspection.spill_directories,
         spill_files: inspection.spill_files,
         spill_file_bytes: inspection.spill_file_bytes,
         peer_pending: inspection.peer_pending,
         peer_running: inspection.peer_running,
-        active_tail_fences: inspection.active_tail_fences,
     })
 }
 
@@ -1126,7 +1125,7 @@ async fn query_each_node(
         // One machine principal per pod and per pass: a bootstrap name is a
         // Card identity, so reusing it would collide rather than authenticate.
         let reader = client(server, &format!("heterogeneous-reader-{label}-{index}")).await?;
-        let rows = query_rows(&reader, table, VisibilityMode::PublishedOnly).await?;
+        let rows = query_rows(&reader, table).await?;
         if rows != u64::try_from(HETEROGENEOUS_ROWS)? {
             return Err(format!(
                 "during {label} node {} returned {rows} rows",
@@ -1211,6 +1210,10 @@ fn prove_no_durable_admission_telemetry(cluster: &WyrdTestCluster) -> Result<(),
 /// Rows written to the fixture table the refusal journey reads.
 const REFUSAL_ROWS: i64 = 24;
 
+/// Acknowledged but unflushed rows, so every refusal-journey query also reads
+/// a live Scribe source.
+const REFUSAL_LIVE_ROWS: i64 = 8;
+
 /// Deadline the stalled memory holder is submitted with, in milliseconds.
 ///
 /// Long enough that the refusal, the release, and the cancel below all happen
@@ -1238,8 +1241,16 @@ const REFUSAL_SORT_KEY_BYTES: usize = 15_000_000;
 /// Stable error code a query refused for capacity must carry.
 const QUERY_ADMISSION_REJECTED_CODE: &str = "WYRD_VALA_429_QUERY_ADMISSION_REJECTED";
 
+/// Stable error code a query refused because every waiting place is taken must carry.
+const QUERY_QUEUE_FULL_CODE: &str = "WYRD_VALA_429_QUERY_QUEUE_FULL";
+
 /// A memory refusal under a fully occupied Oracle root leaves the pod healthy
 /// and its next query serviceable.
+///
+/// The table holds published and live Scribe rows, so the refused query has a
+/// live source: its refusal must still end the whole query as a failure, never
+/// a successful or degraded partial, and the next query must read both
+/// sources with a `Success` terminal.
 ///
 /// # Panics
 ///
@@ -1285,6 +1296,14 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     }
     ingest.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
+    for id in REFUSAL_ROWS + 1..=REFUSAL_ROWS + REFUSAL_LIVE_ROWS {
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            [journey_row(id, "refusal-live")],
+        )
+        .await?;
+    }
 
     let server = cluster.server(0).ok_or("missing Oracle node")?;
     let resources = server
@@ -1307,8 +1326,6 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     let stream = holder_query
         .query(&BifrostQueryRequest {
             sql: format!("SELECT id FROM vala.bifrost.{table}"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
         })
         .await
@@ -1368,13 +1385,37 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         );
     }
     let next = client(server, "memory-refusal-next").await?;
-    let served = query_rows(&next, &table, VisibilityMode::PublishedOnly).await?;
-    if served != u64::try_from(REFUSAL_ROWS)? {
-        return Err(format!("the next query returned {served} rows after the refusal").into());
+    let mut stream = wyrd_client::Bifrost::query_only(&next)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id FROM vala.bifrost.{table}"),
+            deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
+        })
+        .await?;
+    let mut served = 0_u64;
+    while let Some(batch) = stream.next_batch().await? {
+        served = served.saturating_add(u64::try_from(batch.num_rows())?);
+    }
+    let outcome = stream.terminal().map(|terminal| terminal.outcome);
+    if served != u64::try_from(REFUSAL_ROWS + REFUSAL_LIVE_ROWS)?
+        || outcome != Some(QueryTerminalOutcome::Success)
+    {
+        return Err(format!(
+            "the next query returned {served} published and live rows ending {outcome:?}"
+        )
+        .into());
     }
 
     cluster.shutdown().await?;
     Ok(())
+}
+
+/// Drains one statement to its terminal under the refusal deadline.
+///
+/// # Errors
+///
+/// Returns the rendered refusal when the statement does not complete.
+async fn drain_query(query: &Bifrost, sql: &str) -> Result<u64, String> {
+    drain_query_within(query, sql, REFUSAL_QUERY_DEADLINE_MS).await
 }
 
 /// Drains one statement to its terminal, rendering any refusal as its code.
@@ -1386,14 +1427,13 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
 ///
 /// # Errors
 ///
-/// Returns the rendered refusal when the statement does not complete.
-async fn drain_query(query: &Bifrost, sql: &str) -> Result<u64, String> {
+/// Returns the rendered refusal when the statement does not complete within
+/// `deadline_ms`.
+async fn drain_query_within(query: &Bifrost, sql: &str, deadline_ms: i64) -> Result<u64, String> {
     let mut stream = query
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
-            deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
+            deadline_ms: Some(deadline_ms),
         })
         .await
         .map_err(|error| {
@@ -1434,13 +1474,11 @@ const SCHEDULING_GROUPS: i64 = 4;
 /// Concurrent Interactive queries the lowest supported Oracle rung seats.
 ///
 /// The rung derives four slot units from two effective CPUs and protects one
-/// of them for Interactive work. Slot units are not what binds here: every
-/// admitted query leases 256 MiB of scratch per unit against this rung's
-/// 768 MiB scratch capacity, so the fourth concurrent Interactive query is
-/// refused for scratch while a slot unit is still free. Three is still three
-/// times the one unit the rung protects, so seating them is only possible by
-/// borrowing idle Analytical capacity.
-const SCHEDULING_HOLDS: usize = 3;
+/// of them for Interactive work. Disk is provisioned rather than leased, so
+/// slot units are the only binding resource and four holds saturate the pod.
+/// Four is four times the one unit the rung protects, so seating them is only
+/// possible by borrowing every idle Analytical unit.
+const SCHEDULING_HOLDS: usize = 4;
 
 /// Contention rounds run while exactly one slot unit remains free.
 ///
@@ -1452,8 +1490,8 @@ const SCHEDULING_ROTATION_ROUNDS: usize = 4;
 /// Two tenants make bounded progress across both query classes on one pod.
 ///
 /// Covers, through real authenticated requests against a live server: idle
-/// Analytical capacity borrowed by Interactive work, retryable overload once
-/// the pod is saturated, tenant rotation that serves both tenants from a
+/// Analytical capacity borrowed by Interactive work, a queued wait that ends
+/// at the caller's deadline once the pod is saturated, tenant rotation that serves both tenants from a
 /// single free slot unit, the Interactive floor an Analytical query cannot
 /// cross, and eventual progress for both classes once the pod drains.
 ///
@@ -1524,7 +1562,7 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
     let borrowed = class_gauge(&cluster, "interactive")?;
     #[expect(
         clippy::cast_precision_loss,
-        reason = "three concurrent queries is exact in f64"
+        reason = "four concurrent queries is exact in f64"
     )]
     let expected = SCHEDULING_HOLDS as f64;
     if (borrowed - expected).abs() > f64::EPSILON {
@@ -1534,7 +1572,7 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
         .into());
     }
 
-    prove_saturated_pod_refuses_retryably(&clients, &tables).await?;
+    prove_saturated_pod_queues_until_deadline(&clients, &tables).await?;
 
     // Rotation: exactly one unit is free from here, so each round can serve
     // exactly one of the two tenants that ask for it at the same moment.
@@ -1550,7 +1588,7 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
     for (index, envelope) in held.into_iter().enumerate() {
         #[expect(
             clippy::cast_precision_loss,
-            reason = "at most three concurrent queries is exact in f64"
+            reason = "at most four concurrent queries is exact in f64"
         )]
         let remaining = (SCHEDULING_HOLDS - 2 - index) as f64;
         release_envelope(&cluster, envelope, "interactive", remaining).await?;
@@ -1596,8 +1634,6 @@ async fn hold_envelope(
     let stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
         })
         .await
@@ -1636,16 +1672,23 @@ async fn release_envelope(
     .into())
 }
 
-/// Proves a saturated pod refuses both classes with the retryable typed code.
+/// Stable error code a query whose queue wait or total deadline expired carries.
+const QUERY_TIMEOUT_CODE: &str = "WYRD_VALA_504_QUERY_TIMEOUT";
+
+/// Short caller deadline a query submitted to a saturated pod waits under.
+const SATURATED_QUERY_DEADLINE_MS: i64 = 1_000;
+
+/// Proves a saturated pod queues both classes until the caller's deadline.
 ///
-/// The refusal is bounded by the pod-local queue wait, so a caller is told to
-/// retry within it rather than being held for its whole request deadline.
+/// A saturated pod no longer refuses a fundable query; the query waits in the
+/// tenant-fair queue and, when nothing is released, ends with the typed timeout
+/// at its own deadline rather than a retryable refusal.
 ///
 /// # Errors
 ///
-/// Returns an error when a saturated pod admits a query, refuses it with some
-/// other error, or holds the caller past the bounded refusal deadline.
-async fn prove_saturated_pod_refuses_retryably(
+/// Returns an error when a saturated pod admits a query, ends it with some
+/// other error, or holds the caller well past its deadline.
+async fn prove_saturated_pod_queues_until_deadline(
     clients: &[WyrdClient],
     tables: &[String],
 ) -> Result<(), JourneyError> {
@@ -1655,20 +1698,24 @@ async fn prove_saturated_pod_refuses_retryably(
             ("analytical", scheduling_analytical_sql(&tables[index])),
         ] {
             let started = std::time::Instant::now();
-            let refusal = drain_query(&wyrd_client::Bifrost::query_only(client), &sql)
-                .await
-                .err()
-                .ok_or_else(|| format!("the saturated pod admitted another {label} query"))?;
-            if !refusal.contains(QUERY_ADMISSION_REJECTED_CODE) {
+            let refusal = drain_query_within(
+                &wyrd_client::Bifrost::query_only(client),
+                &sql,
+                SATURATED_QUERY_DEADLINE_MS,
+            )
+            .await
+            .err()
+            .ok_or_else(|| format!("the saturated pod admitted another {label} query"))?;
+            if !refusal.contains(QUERY_TIMEOUT_CODE) {
                 return Err(format!(
-                    "the saturated pod refused a {label} query with {refusal}, not the retryable \
-                     capacity code"
+                    "the saturated pod ended a {label} query with {refusal}, not the typed \
+                     timeout"
                 )
                 .into());
             }
             if started.elapsed() > OBSERVATION_DEADLINE {
                 return Err(format!(
-                    "a {label} refusal took {:?}, so it was not bounded by the queue wait",
+                    "a {label} query took {:?}, so it was not bounded by its deadline",
                     started.elapsed()
                 )
                 .into());
@@ -1681,7 +1728,7 @@ async fn prove_saturated_pod_refuses_retryably(
 /// Proves one free slot unit is rotated between two concurrently asking tenants.
 ///
 /// Every round both tenants submit at the same moment against a single free
-/// unit, so exactly one is served and the other receives the retryable code.
+/// unit, so one is served first and the other waits for the unit.
 /// A rotation that ignored a tenant would show as that tenant never being
 /// served across every round.
 ///
@@ -1735,8 +1782,9 @@ async fn prove_rotation_serves_both_tenants(
 /// Proves a live Analytical query cannot take the units Interactive is owed.
 ///
 /// One Analytical query costs two of this rung's four units and the Analytical
-/// maximum cannot seat a second, so two units always remain for Interactive
-/// work no matter how much Analytical work is offered.
+/// maximum cannot seat a second, so the second waits in the queue until its
+/// deadline while two units always remain for Interactive work no matter how
+/// much Analytical work is offered.
 ///
 /// # Errors
 ///
@@ -1750,16 +1798,17 @@ async fn prove_analytical_cannot_cross_the_interactive_floor(
     tables: &[String],
 ) -> Result<(), JourneyError> {
     let parked = hold_envelope(server, &clients[0], &scheduling_analytical_sql(&tables[0])).await?;
-    let refusal = drain_query(
+    let refusal = drain_query_within(
         &wyrd_client::Bifrost::query_only(&clients[1]),
         &scheduling_analytical_sql(&tables[1]),
+        SATURATED_QUERY_DEADLINE_MS,
     )
     .await
     .err()
     .ok_or("the rung seated a second Analytical query")?;
-    if !refusal.contains(QUERY_ADMISSION_REJECTED_CODE) {
+    if !refusal.contains(QUERY_TIMEOUT_CODE) {
         return Err(format!(
-            "the second Analytical query failed with {refusal}, not the capacity code"
+            "the second Analytical query failed with {refusal}, not a queued timeout"
         )
         .into());
     }
@@ -2002,4 +2051,479 @@ async fn wait_for_queued(server: &WyrdTestServer, expected: usize) -> Result<(),
         server.oracle_runtime_inspection()?.queued_queries
     )
     .into())
+}
+
+/// Bound on polls waiting for the burst's snapshot reads to block on the lock.
+const SNAPSHOT_LOCK_POLLS: usize = 300;
+
+/// Interval between polls for blocked snapshot reads.
+const SNAPSHOT_LOCK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Queries in the snapshot burst: one more than any two-slot planning bound.
+const SNAPSHOT_BURST: usize = 3;
+
+/// Three authorized queries whose snapshot preparation is held behind one
+/// catalog lock all wait inside their leader deadline and then complete,
+/// rather than the third receiving an immediate planning refusal.
+///
+/// # Panics
+///
+/// Panics when any burst query is refused or returns the wrong rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn three_concurrent_snapshots_are_not_refused() {
+    prove_concurrent_snapshots_wait()
+        .await
+        .expect("concurrent snapshot preparation journey");
+}
+
+/// Holds the catalog table lock while a burst of public queries reaches
+/// snapshot preparation, then releases it and requires every query to finish.
+///
+/// The lock is test-owned database state: `ACCESS EXCLUSIVE` makes each
+/// query's catalog identity lookup wait in Postgres exactly as a busy
+/// connection pool or slow catalog would. The burst is only released once
+/// every query is provably blocked on that lock, or once any query has already
+/// ended — an early end is the immediate refusal this journey forbids.
+///
+/// # Errors
+///
+/// Returns the first client, Postgres, or result claim that broke.
+async fn prove_concurrent_snapshots_wait() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed()).await?;
+    let server = cluster.server(0).ok_or("missing mixed node")?;
+    let table = unique_table("oracle_snapshot_burst");
+    let fqn = format!("vala.bifrost.{table}");
+    register_table(server, cluster.data_tenant_id(), &table).await?;
+    let writer = writer(server, "snapshot-burst").await?;
+    writer
+        .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
+        .await?;
+    server.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let superuser = cluster.pg_fixture().superuser_pool().await?;
+    let mut lock = superuser.begin().await?;
+    sqlx::query("LOCK TABLE vala.bifrost_tables IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await?;
+    let burst: Vec<JoinHandle<Result<u64, String>>> = (0..SNAPSHOT_BURST)
+        .map(|_| {
+            let client = writer.client().clone();
+            let table = table.clone();
+            tokio::spawn(async move {
+                query_rows(&client, &table)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .collect();
+    let mut blocked = 0_i64;
+    for _ in 0..SNAPSHOT_LOCK_POLLS {
+        blocked = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks \
+             WHERE relation = 'vala.bifrost_tables'::regclass AND NOT granted",
+        )
+        .fetch_one(&superuser)
+        .await?;
+        if usize::try_from(blocked)? >= SNAPSHOT_BURST || burst.iter().any(JoinHandle::is_finished)
+        {
+            break;
+        }
+        tokio::time::sleep(SNAPSHOT_LOCK_INTERVAL).await;
+    }
+    lock.rollback().await?;
+
+    for (index, query) in burst.into_iter().enumerate() {
+        let rows = query
+            .await?
+            .map_err(|error| format!("burst query {index} was refused: {error}"))?;
+        if rows != 1 {
+            return Err(format!("burst query {index} returned {rows} rows, not 1").into());
+        }
+    }
+    if usize::try_from(blocked)? < SNAPSHOT_BURST {
+        return Err(format!(
+            "only {blocked} snapshot reads ever waited on the catalog lock, not {SNAPSHOT_BURST}"
+        )
+        .into());
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Caller deadline the saturated queued queries are submitted with.
+const QUEUED_QUERY_DEADLINE_MS: i64 = 30_000;
+
+/// Time the queued queries must stay waiting before a unit is released.
+const QUEUED_HOLD: Duration = Duration::from_millis(250);
+
+/// Maximum queue wait the saturated-wait journey's pods are configured with.
+///
+/// Long enough that the released waiters are granted well inside it, short
+/// enough that a queue-wait expiry is observed without the one-hour default.
+const JOURNEY_MAX_QUEUE_WAIT_MS: u64 = 5_000;
+
+/// A fundable query submitted to a saturated pod waits in the queue over both
+/// public transports, completes once a unit is released, and otherwise ends
+/// with the typed timeout at the earlier of its queue limit and its total
+/// deadline, for both query classes.
+///
+/// # Panics
+///
+/// Panics when either transport refuses a queued query, a released query
+/// returns the wrong rows, or an expired query ends with anything but the
+/// typed timeout.
+// The parked holders, both transports' queued queries, and the pods' own
+// heartbeats all need to run at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn saturated_query_waits_on_http_and_grpc() {
+    prove_saturated_query_waits()
+        .await
+        .expect("saturated Oracle queue wait journey");
+}
+
+/// Drives the saturated-wait journey over one live cluster.
+///
+/// Every slot unit is parked, one HTTP and one gRPC query are enqueued and
+/// held past [`QUEUED_HOLD`], and one unit is then released so both complete
+/// through the queue. The pod is then saturated again: a one-second total
+/// deadline and, separately, the configured queue limit under a longer total
+/// deadline must each end as the typed timeout on both transports.
+///
+/// # Errors
+///
+/// Returns the first enqueue, wait, completion, or expiry claim that broke.
+async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::three_oracles_one_scribe()
+            .with_system_resources(oracle_queue_observation())
+            .with_oracle_runtime_for_test(wyrd_server::config::OracleRuntimeConfig {
+                max_queue_wait_ms: JOURNEY_MAX_QUEUE_WAIT_MS,
+                ..wyrd_server::config::OracleRuntimeConfig::default()
+            }),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let ingest = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing ingest node")?;
+    let server = cluster.server(0).ok_or("missing query node")?;
+    let table = format!("saturated_{}", uuid::Uuid::now_v7().simple());
+    seed_fixture_table(ingest, tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+    let client = client_for_tenant(server, tenant, &format!("saturated-{table}")).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let sql = scheduling_interactive_sql(&table);
+    drain_query(&wyrd_client::Bifrost::query_only(&client), &sql)
+        .await
+        .map_err(|refusal| format!("the warm-up query was refused: {refusal}"))?;
+    let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(
+        server.grpc_url().ok_or("missing gRPC URL")?,
+    )?
+    .connect()
+    .await?;
+    let bearer = format!("Bearer {}", client.auth().bearer().await?.expose());
+
+    let mut held = Vec::new();
+    for index in 0..QUEUE_HOLDS {
+        held.push(
+            hold_envelope(server, &client, &sql)
+                .await
+                .map_err(|error| format!("saturation hold {index}: {error}"))?,
+        );
+    }
+
+    let http = {
+        let query = wyrd_client::Bifrost::query_only(&client);
+        let sql = sql.clone();
+        tokio::spawn(
+            async move { drain_query_within(&query, &sql, QUEUED_QUERY_DEADLINE_MS).await },
+        )
+    };
+    wait_for_queued(server, 1).await?;
+    let grpc = {
+        let (channel, sql, bearer) = (channel.clone(), sql.clone(), bearer.clone());
+        tokio::spawn(
+            async move { grpc_query(channel, &sql, &bearer, QUEUED_QUERY_DEADLINE_MS).await },
+        )
+    };
+    wait_for_queued(server, 2).await?;
+    tokio::time::sleep(QUEUED_HOLD).await;
+    let queued = server.oracle_runtime_inspection()?.queued_queries;
+    if queued != 2 || http.is_finished() || grpc.is_finished() {
+        return Err(format!(
+            "after {QUEUED_HOLD:?} only {queued} queries were still waiting in the queue"
+        )
+        .into());
+    }
+
+    let released = held.pop().ok_or("no held envelope to release")?;
+    released.abort();
+    let _ = released.await;
+    let expected = u64::try_from(SCHEDULING_ROWS)?;
+    let http_rows = http
+        .await?
+        .map_err(|refusal| format!("the queued HTTP query ended with {refusal}"))?;
+    let grpc_rows = grpc
+        .await?
+        .map_err(|refusal| format!("the queued gRPC query ended with {refusal}"))?;
+    if http_rows != expected || grpc_rows != expected {
+        return Err(format!(
+            "released queued queries returned {http_rows} HTTP and {grpc_rows} gRPC rows, not \
+             {expected}"
+        )
+        .into());
+    }
+
+    held.push(hold_envelope(server, &client, &sql).await?);
+    let analytical = scheduling_analytical_sql(&table);
+    for (limit, deadline_ms, statement) in [
+        ("total deadline", SATURATED_QUERY_DEADLINE_MS, &sql),
+        ("queue limit", QUEUED_QUERY_DEADLINE_MS, &sql),
+        ("queue limit", QUEUED_QUERY_DEADLINE_MS, &analytical),
+    ] {
+        let started = std::time::Instant::now();
+        let http = drain_query_within(
+            &wyrd_client::Bifrost::query_only(&client),
+            statement,
+            deadline_ms,
+        )
+        .await;
+        let http_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let grpc = grpc_query(channel.clone(), statement, &bearer, deadline_ms).await;
+        let grpc_elapsed = started.elapsed();
+        for (transport, outcome, elapsed) in
+            [("HTTP", http, http_elapsed), ("gRPC", grpc, grpc_elapsed)]
+        {
+            if !matches!(&outcome, Err(refusal) if refusal.contains(QUERY_TIMEOUT_CODE)) {
+                return Err(format!(
+                    "a {transport} wait past its {limit} ended with {outcome:?}, not \
+                     {QUERY_TIMEOUT_CODE}"
+                )
+                .into());
+            }
+            let bound =
+                Duration::from_millis(u64::try_from(deadline_ms)?.min(JOURNEY_MAX_QUEUE_WAIT_MS));
+            if elapsed + QUEUED_HOLD < bound || elapsed > bound + OBSERVATION_DEADLINE {
+                return Err(format!(
+                    "a {transport} wait past its {limit} ended after {elapsed:?}, not near {bound:?}"
+                )
+                .into());
+            }
+        }
+    }
+    if server.oracle_runtime_inspection()?.queued_queries != 0 {
+        return Err("an expired waiter retained its queue place".into());
+    }
+
+    for envelope in held {
+        envelope.abort();
+        let _ = envelope.await;
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Queue places the overflow journey boots its Oracle pods with.
+///
+/// Small enough to fill with real queued requests in one journey, and more
+/// than one so a refusal proves the bound rather than a single-waiter special
+/// case.
+const OVERFLOW_QUEUE_PLACES: usize = 2;
+
+/// Longest an overflow refusal may take through the public path.
+///
+/// A full queue refuses before waiting, so the probe must return well inside
+/// its own much longer deadline; a probe that is parked anywhere on the way to
+/// admission instead runs into that deadline.
+const OVERFLOW_REFUSAL_BOUND: Duration = Duration::from_secs(5);
+
+/// A full queue refuses the next query immediately and keeps its waiters.
+///
+/// # Panics
+///
+/// Panics when the overflow request waits, succeeds, or is refused with
+/// anything but the retryable admission code, or when the refusal disturbs a
+/// queued waiter.
+// The parked holders, the queued waiters, and the pods' own heartbeats all need
+// to run at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn full_queue_refuses_the_next_query_immediately() {
+    prove_full_queue_refuses_overflow()
+        .await
+        .expect("full Oracle queue overflow journey");
+}
+
+/// Drives the queue-overflow journey over one live cluster.
+///
+/// Every slot unit is parked, [`OVERFLOW_QUEUE_PLACES`] requests are enqueued
+/// and confirmed through inspection, and one more request is then sent through
+/// the public client with a long deadline. It must come back as
+/// `WYRD_VALA_429_QUERY_ADMISSION_REJECTED` within
+/// [`OVERFLOW_REFUSAL_BOUND`] while every queued waiter is still queued, and
+/// the waiters must still complete once the holders release.
+///
+/// # Errors
+///
+/// Returns the first saturation, enqueue, refusal, or completion claim that
+/// broke.
+async fn prove_full_queue_refuses_overflow() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::three_oracles_one_scribe()
+            .with_system_resources(oracle_queue_observation())
+            .with_oracle_runtime_for_test(wyrd_server::config::OracleRuntimeConfig {
+                admission_waiters: OVERFLOW_QUEUE_PLACES,
+                ..wyrd_server::config::OracleRuntimeConfig::default()
+            }),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let ingest = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing ingest node")?;
+    let server = cluster.server(0).ok_or("missing query node")?;
+    let table = format!("overflow_{}", uuid::Uuid::now_v7().simple());
+    seed_fixture_table(ingest, tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+    let client = client_for_tenant(server, tenant, &format!("overflow-{table}")).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let sql = scheduling_interactive_sql(&table);
+    drain_query(&wyrd_client::Bifrost::query_only(&client), &sql)
+        .await
+        .map_err(|refusal| format!("the warm-up query was refused: {refusal}"))?;
+
+    let mut held = Vec::new();
+    for index in 0..QUEUE_HOLDS {
+        held.push(
+            hold_envelope(server, &client, &sql)
+                .await
+                .map_err(|error| format!("saturation hold {index}: {error}"))?,
+        );
+    }
+    let mut waiters = Vec::new();
+    for _ in 0..OVERFLOW_QUEUE_PLACES {
+        let query = wyrd_client::Bifrost::query_only(&client);
+        let sql = sql.clone();
+        waiters.push(tokio::spawn(async move {
+            drain_query_within(&query, &sql, QUEUED_QUERY_DEADLINE_MS).await
+        }));
+        wait_for_queued(server, waiters.len()).await?;
+    }
+
+    let started = std::time::Instant::now();
+    let overflow = tokio::time::timeout(
+        OVERFLOW_REFUSAL_BOUND,
+        drain_query_within(
+            &wyrd_client::Bifrost::query_only(&client),
+            &sql,
+            QUEUED_QUERY_DEADLINE_MS,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "the overflow request was not refused within {OVERFLOW_REFUSAL_BOUND:?}; queued \
+             {:?}",
+            server
+                .oracle_runtime_inspection()
+                .map(|inspection| inspection.queued_queries)
+        )
+    })?;
+    if !matches!(&overflow, Err(refusal) if refusal.contains(QUERY_QUEUE_FULL_CODE)) {
+        return Err(format!(
+            "the overflow request ended with {overflow:?} after {:?}, not \
+             {QUERY_QUEUE_FULL_CODE}",
+            started.elapsed()
+        )
+        .into());
+    }
+    let queued = server.oracle_runtime_inspection()?.queued_queries;
+    if queued != u64::try_from(OVERFLOW_QUEUE_PLACES)? {
+        return Err(format!(
+            "the refusal left {queued} waiters queued, not {OVERFLOW_QUEUE_PLACES}"
+        )
+        .into());
+    }
+
+    for envelope in held {
+        envelope.abort();
+        let _ = envelope.await;
+    }
+    let expected = u64::try_from(SCHEDULING_ROWS)?;
+    for waiter in waiters {
+        let rows = waiter
+            .await?
+            .map_err(|refusal| format!("a queued waiter ended with {refusal}"))?;
+        if rows != expected {
+            return Err(format!("a queued waiter returned {rows} rows, not {expected}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Runs one statement over the raw public gRPC query service and counts rows.
+///
+/// A rejected call or failed stream is rendered as its canonical problem code
+/// so callers match it the same way as [`drain_query_within`].
+///
+/// # Errors
+///
+/// Returns the rendered failure when the call is rejected, the stream fails, or
+/// the terminal frame is missing.
+async fn grpc_query(
+    channel: wyrd_tonic::tonic::transport::Channel,
+    sql: &str,
+    bearer: &str,
+    deadline_ms: i64,
+) -> Result<u64, String> {
+    let status_code = |status: wyrd_tonic::tonic::Status| {
+        status
+            .metadata()
+            .get_bin(wyrd_tonic::error::WYRD_ERROR_HEADER)
+            .and_then(|value| value.to_bytes().ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|problem| problem["code"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{status:?}"))
+    };
+    let mut request = wyrd_tonic::tonic::Request::new(
+        wyrd_tonic::wyrd::v1::BifrostQueryRequest::from(BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(deadline_ms),
+        }),
+    );
+    request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        bearer.parse().map_err(|error| format!("{error}"))?,
+    );
+    let mut frames =
+        wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient::new(channel)
+            .query(request)
+            .await
+            .map_err(status_code)?
+            .into_inner();
+    let mut decoder = QueryIpcDecoder::new();
+    let mut rows = 0_u64;
+    while let Some(frame) = frames.next().await {
+        match frame.map_err(status_code)?.frame {
+            Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Schema(schema)) => {
+                decoder
+                    .accept_schema(&schema.arrow_ipc_schema)
+                    .map_err(|error| error.to_string())?;
+            }
+            Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Batch(batch)) => {
+                let batch = decoder
+                    .accept_batch(&batch.arrow_ipc_batch)
+                    .map_err(|error| error.to_string())?;
+                rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+            }
+            Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Terminal(_)) => return Ok(rows),
+            None => return Err("the gRPC stream carried an empty frame".to_owned()),
+        }
+    }
+    Err("the gRPC stream ended without a terminal frame".to_owned())
 }

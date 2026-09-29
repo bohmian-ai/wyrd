@@ -18,6 +18,7 @@ validated findings as the contract; preserve portions already satisfying it.
 Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
 [implementation execution](../../../architecture/references/languages/implementation-execution.md),
+[maintainer style](../../../architecture/references/languages/maintainer-style.md),
 and [testing workflows](../../../architecture/references/languages/testing-workflows.md).
 Load only references applicable to the changed surface. Follow CodeGraph
 instructions and inspect the nearest owner, callers, consumers, tests,

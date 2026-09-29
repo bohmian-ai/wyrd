@@ -5,13 +5,18 @@
 //! token passes auth (the empty stream then terminates without an Unauthenticated
 //! error). Reuses the same key/verifier setup as `router_smoke.rs`.
 
-use arrow::array::{Int64Array, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use sqlx::PgPool;
+use uuid::Uuid;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
@@ -19,13 +24,7 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
-use vala_bifrost_redux::scribe::tail_rpc::{
-    TailTicketAudience, TailTicketClaims, TailTicketMinter,
-};
-use vala_bifrost_redux::scribe::{
-    replay::replay_wal_directory,
-    tail_rpc::{LocalTailReadTransport, TailReadTransport, TonicTailReadTransport},
-};
+use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTailReadTransport};
 use vala_sql::TenantConn;
 use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind, RoleRef};
@@ -33,13 +32,10 @@ use wyrd_server::AppState;
 use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, build_peer_grpc, serve_grpc};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
+use wyrd_spec::auth::PrincipalKindTag;
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AcquireTailFenceRequest as DomainAcquireTailFenceRequest,
-    SchemaFingerprint as WireSchemaFingerprint, TailCursor,
-    TailPageRequest as DomainTailPageRequest, TenantTableBinding,
-};
+use wyrd_spec::vala::api::TenantTableBinding;
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::logs::v1::ResourceLogs;
@@ -53,11 +49,11 @@ use wyrd_tonic::otlp::trace::v1::ResourceSpans;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
 use wyrd_tonic::tonic::transport::Channel;
-use wyrd_tonic::tonic::{Code, Request};
+use wyrd_tonic::tonic::{Code, Request, Status};
 use wyrd_tonic::tonic_health::server::health_reporter;
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceClient;
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
-use wyrd_tonic::wyrd::v1::{AcquireTailFenceRequest, InsertBatchRequest, ReleaseTailFenceRequest};
+use wyrd_tonic::wyrd::v1::{InsertBatchRequest, ListActiveStreamsRequest};
 
 /// Seed one additional data tenant through the composed fixture's operator.
 ///
@@ -113,9 +109,7 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
 /// The instant the private-tail fixture writes its rows at.
 ///
 /// Production Scribe admission bounds event time to a window around now, so a
-/// frozen literal would age out of the accepted range and start failing. The
-/// batch timestamp and the fence request's time partition both derive from
-/// this one value so they always name the same UTC partition.
+/// frozen literal would age out of the accepted range and start failing.
 fn fixture_event_time() -> DateTime<Utc> {
     Utc::now()
 }
@@ -151,61 +145,25 @@ fn non_empty_tail_batch() -> RecordBatch {
 /// so the tail fixtures seed and read this one.
 const TAIL_TABLE: &str = "tail_events";
 
-/// Creates a metadata-only fence request matching the seeded logical schema.
-fn non_empty_tail_request(tenant: DataTenantId) -> DomainAcquireTailFenceRequest {
-    let expected = ReduxSchemaFingerprint::from_arrow_schema(&Schema::new(vec![Field::new(
-        "value",
-        DataType::Int64,
-        false,
-    )]));
-    DomainAcquireTailFenceRequest {
-        query_id: uuid::Uuid::now_v7(),
-        binding: TenantTableBinding {
-            tenant_id: tenant,
-            namespace: "datasets".to_owned(),
-            table: TAIL_TABLE.to_owned(),
-        },
-        time_partition: vala_bifrost_redux::catalog::TimeGranularity::Hour
-            .bucket(fixture_event_time())
-            .expect("fixture instant buckets to an exact hour")
-            .to_wire(),
-        exclusive_sealed: TailCursor {
-            writer_epoch: 1,
-            wal_lsn: 0,
-            batch_id: uuid::Uuid::nil(),
-            row_ordinal: 0,
-        },
-        deadline: chrono::Utc::now() + ChronoDuration::seconds(5),
-        schema_fingerprint: WireSchemaFingerprint::new(hex::encode(expected.0))
-            .expect("fixture fingerprint is valid"),
-        tail_protocol_version: 1,
+/// Names the private-tail fixture table for `tenant` on the discovery wire.
+fn tail_binding(tenant: DataTenantId) -> TenantTableBinding {
+    TenantTableBinding {
+        tenant_id: tenant,
+        namespace: "datasets".to_owned(),
+        table: TAIL_TABLE.to_owned(),
     }
 }
 
-/// Mints the private acquire ticket bound to the fixture's exact stream tuple.
-fn mint_tail_ticket(state: &AppState, request: &DomainAcquireTailFenceRequest) -> Vec<u8> {
-    let ingest = state
-        .bifrost_ingest()
-        .expect("fixture retains ingest runtime");
-    let authority = ingest
-        .tail_authority()
-        .expect("fixture retains tail authority");
-    let stream = ingest.tail_reader().stream_identity();
-    authority
-        .mint_tail_ticket(&TailTicketClaims {
-            query_id: request.query_id,
-            tenant_id: request.binding.tenant_id,
-            canonical_table: format!("vala.datasets.{TAIL_TABLE}"),
-            node_id: stream.node_id.as_uuid(),
-            writer_epoch: u64::try_from(stream.writer_epoch.as_i64())
-                .expect("fixture epoch is non-negative"),
-            deadline: request.deadline,
-            audience: TailTicketAudience::Acquire,
-            // The authority refuses a replayed nonce, so each fixture ticket
-            // derives its own from the query it is bound to.
-            nonce: request.query_id.as_bytes().to_vec(),
-        })
-        .expect("fixture tail ticket signs")
+/// Builds one raw authenticated `ListActiveStreams` request.
+fn list_request(binding: TenantTableBinding, bearer: &str) -> Request<ListActiveStreamsRequest> {
+    let mut request = Request::new(ListActiveStreamsRequest {
+        binding: Some(binding.into()),
+    });
+    request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        format!("Bearer {bearer}").parse().expect("metadata value"),
+    );
+    request
 }
 
 /// Creates the server-verified identity used to seed the embedded Scribe.
@@ -236,6 +194,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             tenant,
             table.clone(),
             vec![Field::new("value", DataType::Int64, false)],
+            None,
             None,
             None,
         )
@@ -543,10 +502,17 @@ async fn ingest_unauthenticated_is_rejected() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// A well-formed token for the fixture tenant reaches the ingest service.
+///
+/// The negative sibling proves a missing token is refused; this one pins the
+/// other side, so a revocation or tenant-admission change cannot start
+/// rejecting every valid caller while the refusal test still passes.
+///
+/// # Panics
+/// Panics when the test server fails to start, seed its tenant, build its
+/// gRPC router, bind its listener, or shut down, and when a valid token is
+/// answered with `Unauthenticated`.
 #[tokio::test]
-/// A token minted for a tenant that exists reaches the ingest service as an
-/// authenticated caller, so an authentication regression cannot hide behind a
-/// fixture that never had a tenant to authenticate against.
 async fn ingest_valid_token_is_not_rejected_as_unauthenticated() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -626,6 +592,7 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
             tenant,
             TableRef::new(BifrostNamespace::Datasets, TABLE_NAME),
             vec![Field::new("value", DataType::Int64, false)],
+            None,
             None,
             None,
         )
@@ -716,7 +683,7 @@ async fn scribe_tail_unauthenticated_is_rejected_before_lookup() {
 
     let mut client = ScribeTailServiceClient::new(connect_peer_channel(bind, &authority).await);
     let status = client
-        .acquire_fence(Request::new(AcquireTailFenceRequest::default()))
+        .list_active_streams(Request::new(ListActiveStreamsRequest::default()))
         .await
         .expect_err("missing workload token must fail before request conversion");
     shutdown.cancel();
@@ -725,28 +692,23 @@ async fn scribe_tail_unauthenticated_is_rejected_before_lookup() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Produces identical bounded non-empty pages through local and generated-tonic readers.
+/// Lists the seeded live partition through the authenticated generated-tonic client.
 ///
 /// # Panics
-/// Panics if contiguous batching, byte limits, or continuation differ across transports.
+/// Panics if discovery fails or names another stream than the local Scribe.
 #[tokio::test]
-async fn scribe_tail_local_and_tonic_pages_match() {
+async fn scribe_tail_tonic_lists_seeded_partition() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
     let state = server.state();
     let tenant = server.data_tenant_id();
     seed_tail_rows(state, tenant).await;
-    let request = non_empty_tail_request(tenant);
-    let local_reader = state
+    let stream = state
         .bifrost_ingest()
         .expect("embedded state retains Scribe")
-        .tail_reader();
-    let local = LocalTailReadTransport::new(local_reader);
-    let local_fence = local
-        .acquire_fence(request.clone())
-        .await
-        .expect("local metadata fence acquires");
+        .tail_service()
+        .stream();
 
     let (bind, shutdown, authority) = serve_peer_grpc(state).await;
     let remote = TonicTailReadTransport::new(
@@ -754,121 +716,38 @@ async fn scribe_tail_local_and_tonic_pages_match() {
         &server.peer_bearer().await.expect("peer bearer exchanges"),
     )
     .expect("peer bearer configures remote transport");
-    let query_id = request.query_id;
-    let remote_lease = remote
-        .acquire_fence_with_capability(request.clone(), mint_tail_ticket(state, &request))
+    let streams = remote
+        .list_active_streams(tail_binding(tenant))
         .await
-        .expect("remote metadata fence and capability acquire");
-    let remote_fence = remote_lease.fence.clone();
-    assert_eq!(local_fence.inclusive_live, remote_fence.inclusive_live);
-
-    let complete = local
-        .read_page(DomainTailPageRequest {
-            query_id,
-            fence_id: local_fence.fence_id,
-            after: None,
-            max_rows: 16,
-            max_encoded_bytes: 1024 * 1024,
-        })
-        .await
-        .expect("contiguous rows share one page batch");
-    assert!(complete.complete);
-    assert_eq!(complete.batches.len(), 1);
-    assert_eq!(complete.batches[0].num_rows(), 2);
-    let bytes = vala_bifrost_redux::scribe::tail_rpc::encode_tail_batch_exact(&complete.batches[0])
-        .expect("complete page encodes")
-        .len();
-    let bounded = remote
-        .read_page_with_capability(
-            DomainTailPageRequest {
-                query_id,
-                fence_id: remote_fence.fence_id,
-                after: None,
-                max_rows: 16,
-                max_encoded_bytes: u32::try_from(bytes - 1).expect("page fits wire limit"),
-            },
-            remote_lease.capability.clone(),
-        )
-        .await
-        .expect("byte ceiling splits the contiguous batch");
-    assert!(!bounded.complete);
-    assert_eq!(bounded.batches.len(), 1);
-    assert_eq!(bounded.batches[0].num_rows(), 1);
-
-    let local_first = local
-        .read_page(DomainTailPageRequest {
-            query_id,
-            fence_id: local_fence.fence_id,
-            after: None,
-            max_rows: 1,
-            max_encoded_bytes: 1024 * 1024,
-        })
-        .await
-        .expect("local first page reads");
-    let remote_first = remote
-        .read_page_with_capability(
-            DomainTailPageRequest {
-                query_id,
-                fence_id: remote_fence.fence_id,
-                after: None,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            },
-            remote_lease.capability.clone(),
-        )
-        .await
-        .expect("remote first page reads");
-    assert_eq!(local_first.batches, remote_first.batches);
-    assert_eq!(local_first.next, remote_first.next);
-    assert!(!local_first.complete);
-    assert!(!remote_first.complete);
-
-    let local_second = local
-        .read_page(DomainTailPageRequest {
-            query_id,
-            fence_id: local_fence.fence_id,
-            after: local_first.next,
-            max_rows: 1,
-            max_encoded_bytes: 1024 * 1024,
-        })
-        .await
-        .expect("local continuation reads");
-    let remote_second = remote
-        .read_page_with_capability(
-            DomainTailPageRequest {
-                query_id,
-                fence_id: remote_fence.fence_id,
-                after: remote_first.next,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            },
-            remote_lease.capability.clone(),
-        )
-        .await
-        .expect("remote continuation reads");
-    assert_eq!(local_second.batches, remote_second.batches);
-    assert_eq!(local_second.next, remote_second.next);
-    assert!(local_second.complete);
-    assert!(remote_second.complete);
-
-    assert!(
-        local
-            .release_fence(local_fence.fence_id)
-            .expect("local fence release succeeds")
-            .released
+        .expect("authorized discovery lists the seeded partition");
+    assert_eq!(streams.len(), 1, "one live partition holds the seeded rows");
+    assert_eq!(
+        streams[0].stream.node_id.as_uuid(),
+        stream.node_id.as_uuid()
     );
-    remote
-        .release_fence_with_capability(query_id, remote_fence.fence_id, remote_lease.capability)
-        .await
-        .expect("remote fence release succeeds");
+    assert_eq!(
+        streams[0].stream.writer_epoch,
+        u64::try_from(stream.writer_epoch.as_i64()).expect("fixture epoch is non-negative")
+    );
     shutdown.cancel();
 
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Denies cross-tenant page and release RPCs without exposing or removing the fence.
+/// Listing trusts the authenticated internal peer and is scoped to one table.
+///
+/// The peer plane admits one system-owner Service principal, which may list
+/// any tenant's table: that is the accepted listing trust model, and no ticket
+/// is presented. What it lists is still exactly the named tenant table, so
+/// another tenant's live rows and another table of the same tenant never
+/// appear. A peer presenting an unverifiable bearer is refused before lookup.
+///
+/// # Panics
+/// Panics when an authorized listing fails or names another tenant's or
+/// table's partitions, or when the unverifiable bearer is not refused as
+/// `Unauthenticated`.
 #[tokio::test]
-async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
+async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -880,240 +759,663 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
     seed_tail_rows(state, owner_tenant).await;
 
     let (bind, shutdown, authority) = serve_peer_grpc(state).await;
-    let channel = connect_peer_channel(bind, &authority).await;
+    let mut client = ScribeTailServiceClient::new(connect_peer_channel(bind, &authority).await);
     let peer_bearer = server.peer_bearer().await.expect("peer bearer exchanges");
-    let owner =
-        TonicTailReadTransport::new(ScribeTailServiceClient::new(channel.clone()), &peer_bearer)
-            .expect("owner transport configures");
-    let owner_request = non_empty_tail_request(owner_tenant);
-    let owner_query_id = owner_request.query_id;
-    let owner_lease = owner
-        .acquire_fence_with_capability(
-            owner_request.clone(),
-            mint_tail_ticket(state, &owner_request),
-        )
-        .await
-        .expect("owner fence acquires");
-    let fence = owner_lease.fence.clone();
-    let assertion_pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("fixture exposes a migrator assertion pool");
 
-    let (owner_seq_before, owner_count_before): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_staging \
-         WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
-    )
-    .bind(owner_tenant.as_uuid())
-    .fetch_one(&assertion_pool)
-    .await
-    .expect("owner tail-security audit baseline");
-    let (other_seq_before, other_count_before): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_staging \
-         WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
-    )
-    .bind(other_tenant.as_uuid())
-    .fetch_one(&assertion_pool)
-    .await
-    .expect("foreign tail-security audit baseline");
-    let system_seq_before: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging \
-         WHERE data_tenant_id = $1",
-    )
-    .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-    .fetch_one(&assertion_pool)
-    .await
-    .expect("system audit-chain baseline");
-
-    // On the peer plane the listener admits exactly one system-owner Service
-    // principal, so a foreign *token* never reaches the tail service at all.
-    // The reachable cross-tenant vector is a capability the foreign tenant
-    // legitimately holds for its own fence, replayed against this one. It must
-    // be a real page-audience capability: an acquire ticket fails decode
-    // before any tenant is known, and an undecodable credential is refused
-    // without a TailBinding violation to audit.
-    let other_request = non_empty_tail_request(other_tenant);
-    let other_lease = owner
-        .acquire_fence_with_capability(
-            other_request.clone(),
-            mint_tail_ticket(state, &other_request),
-        )
+    let owner = client
+        .list_active_streams(list_request(tail_binding(owner_tenant), &peer_bearer))
         .await
-        .expect("foreign tenant acquires its own fence");
-    let other_capability = other_lease.capability.clone();
-    let mut client = ScribeTailServiceClient::new(channel);
-    let mut page: Request<wyrd_tonic::wyrd::v1::TailPageRequest> = Request::new(
-        DomainTailPageRequest {
-            query_id: owner_query_id,
-            fence_id: fence.fence_id,
-            after: None,
-            max_rows: 1,
-            max_encoded_bytes: 1024 * 1024,
-        }
-        .into(),
+        .expect("the internal peer lists the owner's table")
+        .into_inner();
+    assert_eq!(
+        owner.streams.len(),
+        1,
+        "the owner's seeded partition is listed"
     );
-    page.get_mut().tail_capability = other_capability.clone();
-    page.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {peer_bearer}")
-            .parse()
-            .expect("metadata value"),
-    );
-    let page_status = client
-        .read_fence_page(page)
-        .await
-        .expect_err("foreign tenant cannot read retained rows");
-    assert_eq!(page_status.code(), Code::PermissionDenied);
 
-    let mut wrong_query_page: Request<wyrd_tonic::wyrd::v1::TailPageRequest> = Request::new(
-        DomainTailPageRequest {
-            query_id: uuid::Uuid::now_v7(),
-            fence_id: fence.fence_id,
-            after: None,
-            max_rows: 1,
-            max_encoded_bytes: 1024 * 1024,
-        }
-        .into(),
-    );
-    wrong_query_page.get_mut().tail_capability = owner_lease.capability.clone();
-    wrong_query_page.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {peer_bearer}")
-            .parse()
-            .expect("metadata value"),
-    );
-    let wrong_query_status = client
-        .read_fence_page(wrong_query_page)
+    let other = client
+        .list_active_streams(list_request(tail_binding(other_tenant), &peer_bearer))
         .await
-        .expect_err("query mismatch cannot read retained rows");
-    assert_eq!(wrong_query_status.code(), Code::PermissionDenied);
+        .expect("the internal peer lists another tenant's table")
+        .into_inner();
+    assert!(
+        other.streams.is_empty(),
+        "another tenant never sees the owner's rows"
+    );
 
-    let mut release = Request::new(ReleaseTailFenceRequest {
-        query_id: owner_query_id.as_bytes().to_vec(),
-        fence_id: fence.fence_id.as_uuid().as_bytes().to_vec(),
-        tail_capability: other_capability.clone(),
+    let mut other_table = tail_binding(owner_tenant);
+    other_table.table = "tail_events_absent".to_owned();
+    let absent = client
+        .list_active_streams(list_request(other_table, &peer_bearer))
+        .await
+        .expect("the internal peer lists an idle table")
+        .into_inner();
+    assert!(
+        absent.streams.is_empty(),
+        "another table never sees these rows"
+    );
+
+    let refused = client
+        .list_active_streams(list_request(
+            tail_binding(owner_tenant),
+            "not-a-workload-token",
+        ))
+        .await
+        .expect_err("an unverifiable bearer is refused");
+    assert_eq!(refused.code(), Code::Unauthenticated);
+    shutdown.cancel();
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Encodes one complete `vala.verification.results` row with `card_ref`.
+///
+/// Carries every authored column of the built-in result table. `card_ref`
+/// shapes the correlation column: `None` omits it, `Some(None)` declares it
+/// with a null row, and `Some(Some(value))` carries `value`, so an in-scope
+/// value lets Scribe resolve and stamp the signed Verifier UID rather than
+/// trusting a client-supplied one.
+///
+/// # Panics
+///
+/// Panics when the fixed Arrow batch or IPC stream cannot be constructed.
+fn verification_result_ipc(card_ref: Option<Option<&str>>) -> Vec<u8> {
+    let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let text = |name: &str, nullable: bool| Field::new(name, DataType::Utf8, nullable);
+    let mut fields = vec![
+        text("result_id", false),
+        text("implementation", false),
+        text("execution_status", false),
+        text("verdict", false),
+        text("verifier_version", false),
+        text("owner_card_uid", true),
+        text("subject_card_uid", false),
+        text("binding_id", true),
+        text("trigger_identity", true),
+        text("source_record_id", true),
+        Field::new("window_start", utc(), true),
+        Field::new("window_end", utc(), true),
+        Field::new("started_at", utc(), false),
+        Field::new("ended_at", utc(), false),
+        text("details", true),
+    ];
+    if card_ref.is_some() {
+        fields.push(text("card_ref", true));
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let now = Utc::now().timestamp_micros();
+    let value = |value: &str| -> ArrayRef { Arc::new(StringArray::from(vec![Some(value)])) };
+    let null = || -> ArrayRef { Arc::new(StringArray::from(vec![None::<&str>])) };
+    let at = |micros: Option<i64>| -> ArrayRef {
+        Arc::new(TimestampMicrosecondArray::from(vec![micros]).with_timezone("UTC"))
+    };
+    let mut columns = vec![
+        value(&uuid::Uuid::now_v7().to_string()),
+        value("drift"),
+        value("completed"),
+        value("pass"),
+        value("1.0.0"),
+        null(),
+        value(&uuid::Uuid::now_v7().to_string()),
+        null(),
+        null(),
+        null(),
+        at(None),
+        at(None),
+        at(Some(now)),
+        at(Some(now)),
+        null(),
+    ];
+    if let Some(card_ref) = card_ref {
+        columns.push(Arc::new(StringArray::from(vec![card_ref])));
+    }
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+        .expect("valid verification result batch");
+    let mut bytes = Vec::new();
+    let mut writer =
+        StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("IPC writer initializes");
+    writer.write(&batch).expect("IPC batch writes");
+    writer.finish().expect("IPC stream finishes");
+    bytes
+}
+
+/// Sends one native Arrow insert to `table` under `jwt`.
+///
+/// # Errors
+///
+/// Returns the gRPC status the server answers with when it refuses the write.
+///
+/// # Panics
+///
+/// Panics when the bearer metadata cannot be encoded.
+async fn insert_as(
+    addr: SocketAddr,
+    jwt: &str,
+    table: &str,
+    arrow_ipc: Vec<u8>,
+) -> Result<(), Status> {
+    let mut request = Request::new(InsertBatchRequest {
+        table: table.to_owned(),
+        arrow_ipc: arrow_ipc.into(),
+        wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
     });
-    release.metadata_mut().insert(
+    request.metadata_mut().insert(
         "x-wyrd-access-token",
-        format!("Bearer {peer_bearer}")
-            .parse()
-            .expect("metadata value"),
+        format!("Bearer {jwt}").parse().expect("metadata value"),
     );
-    let release_status = client
-        .release_fence(release)
+    connect_grpc(addr)
         .await
-        .expect_err("foreign tenant cannot remove retained rows");
-    assert_eq!(release_status.code(), Code::PermissionDenied);
+        .insert_batch(request)
+        .await
+        .map(|_| ())
+}
 
-    let mut wrong_query_release = Request::new(ReleaseTailFenceRequest {
-        query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
-        fence_id: fence.fence_id.as_uuid().as_bytes().to_vec(),
-        tail_capability: owner_lease.capability.clone(),
-    });
-    wrong_query_release.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {peer_bearer}")
-            .parse()
-            .expect("metadata value"),
-    );
-    let wrong_query_release_status = client
-        .release_fence(wrong_query_release)
-        .await
-        .expect_err("query mismatch cannot release retained rows");
-    assert_eq!(wrong_query_release_status.code(), Code::PermissionDenied);
+/// One served tenant whose provisioned SYSTEM writer holds a live token.
+///
+/// Result-writer tests share this real path: an in-process server with a
+/// seeded tenant, the tenant's provisioned SYSTEM principal minting a
+/// Verifier-scoped token through the one internal issuer, the reserved result
+/// table provisioned, and a public gRPC listener. Its fields let each test
+/// write over gRPC and read the staged audit decisions and replayed WAL.
+struct SystemWriterHarness {
+    /// Composed server whose Scribe, WAL, and audit staging are under test.
+    server: WyrdTestServer,
+    /// Tenant the SYSTEM writer and every write belong to.
+    tenant: DataTenantId,
+    /// Persisted SYSTEM principal identity.
+    writer: Uuid,
+    /// UID-bearing Verifier the SYSTEM token is scoped to.
+    verifier: CardRef,
+    /// Bearer token minted for the SYSTEM writer.
+    system_jwt: String,
+    /// Loopback address of the public gRPC listener.
+    bind: SocketAddr,
+    /// Cancels the gRPC listener on shutdown.
+    shutdown: CancellationToken,
+    /// Migrator pool used only for assertions over audit staging.
+    assertion_pool: PgPool,
+    /// Highest staged audit sequence for the tenant before any write.
+    seq_before: i64,
+}
 
-    /// One `bifrost.scribe.tail_security` audit row projected from
-    /// `vala.audit_staging`: `(data_tenant_id, principal_id, principal_kind,
-    /// permission, outcome, detail)`.
-    type SecurityAuditRow = (
-        uuid::Uuid,
-        uuid::Uuid,
-        String,
-        String,
-        String,
-        Option<String>,
-    );
-    // The violation is audited under the tenant the presented capability names,
-    // not the transport caller: on the peer plane every caller is the same
-    // system-owner Service principal. Two denials carry the foreign
-    // capability and two carry the owner's, so each tenant commits two rows.
-    for (tenant, seq_before, count_before) in [
-        (owner_tenant, owner_seq_before, owner_count_before),
-        (other_tenant, other_seq_before, other_count_before),
-    ] {
-        let security_rows: Vec<SecurityAuditRow> = sqlx::query_as(
-            "SELECT data_tenant_id, principal_id, principal_kind, permission, \
-                    outcome, detail::text \
-             FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security' AND seq > $2 \
-             ORDER BY seq",
-        )
-        .bind(tenant.as_uuid())
-        .bind(seq_before)
-        .fetch_all(&assertion_pool)
-        .await
-        .expect("durable tail-security audit rows");
-        assert_eq!(
-            security_rows.len() as i64,
-            2,
-            "one committed TailBinding row per denied page/release request"
-        );
-        let count_after: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
+impl SystemWriterHarness {
+    /// Starts the server, provisions the SYSTEM writer for a new tenant named
+    /// `slug`, mints its token, provisions the result table, and serves gRPC.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any fixture, provisioning, minting, or listener step fails.
+    async fn start(slug: &str) -> Self {
+        let server = WyrdTestServer::start_in_process()
+            .await
+            .expect("test server starts");
+        let state = server.state();
+        let tenant = DataTenantId::new_v7();
+        seed_tenant(&server, tenant, slug).await;
+        let mut conn = wyrd_sql::TenantConn::acquire(state.postgres.app_pool(), tenant)
+            .await
+            .expect("tenant connection opens");
+        seed_builtin_roles_for_tenant(&mut conn, tenant)
+            .await
+            .expect("built-in roles seed");
+        let writer = wyrd_sql::queries::auth::provision_system_principal(&mut conn)
+            .await
+            .expect("system writer provisions");
+        let verifier = <CardRef as std::str::FromStr>::from_str(&format!(
+            "prod/Verifier/drift@1.0.0#{}",
+            uuid::Uuid::now_v7()
+        ))
+        .expect("verifier card ref parses");
+        let system_jwt = state
+            .auth
+            .tenant_issuer()
+            .expect("test state has a tenant issuer")
+            .issue_system_token(&mut conn, &verifier)
+            .await
+            .expect("system token mints");
+        conn.commit().await.expect("provisioning commits");
+        let system_jwt = secrecy::ExposeSecret::expose_secret(&system_jwt.access_token).to_owned();
+        server
+            .ensure_builtin_table_for_test(tenant, "verification", "results")
+            .await
+            .expect("result table provisions");
+        let assertion_pool = server
+            .pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("fixture exposes a migrator assertion pool");
+        let seq_before: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging WHERE data_tenant_id = $1",
         )
         .bind(tenant.as_uuid())
         .fetch_one(&assertion_pool)
         .await
-        .expect("tail-security audit observation");
-        assert_eq!(count_after - count_before, 2);
-        for (data_tenant_id, principal_id, principal_kind, permission, outcome, detail) in
-            security_rows
-        {
-            assert_eq!(data_tenant_id, tenant.as_uuid());
-            assert_eq!(principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
-            assert_eq!(principal_kind, "service");
-            assert_eq!(permission, "bifrost:query:tail");
-            assert_eq!(outcome, "denied");
-            let detail: serde_json::Value =
-                serde_json::from_str(&detail.expect("security detail is present"))
-                    .expect("security detail is valid JSON");
-            assert_eq!(detail["kind"], "bifrost_security_violation");
-            assert_eq!(detail["violation"], "tail_binding");
-            assert_eq!(detail["phase"], "peer");
-            assert!(detail["query_digest"].is_null());
+        .expect("audit chain observation");
+
+        let (_, health_service) = health_reporter();
+        let router = build_app_grpc(
+            state,
+            health_service,
+            GrpcRouterConfig {
+                reflection_enabled: false,
+                tls_identity: None,
+            },
+        )
+        .expect("gRPC router builds with token verifier");
+        let bind = bind_free_loopback().await;
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        tokio::spawn(async move { serve_grpc(router, bind, token).await });
+        Self {
+            server,
+            tenant,
+            writer,
+            verifier,
+            system_jwt,
+            bind,
+            shutdown,
+            assertion_pool,
+            seq_before,
         }
     }
-    let system_seq_after: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging \
-         WHERE data_tenant_id = $1",
-    )
-    .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-    .fetch_one(&assertion_pool)
-    .await
-    .expect("system audit-chain observation");
-    assert_eq!(system_seq_after, system_seq_before);
 
-    let owner_page = owner
-        .read_page_with_capability(
-            DomainTailPageRequest {
-                query_id: owner_query_id,
-                fence_id: fence.fence_id,
-                after: None,
-                max_rows: 1,
-                max_encoded_bytes: 1024 * 1024,
-            },
-            owner_lease.capability.clone(),
+    /// The UID-free `card_ref` text naming the token's signed Verifier.
+    fn identity(&self) -> String {
+        CardRef {
+            uid: None,
+            ..self.verifier.clone()
+        }
+        .to_string()
+    }
+
+    /// Staged `bifrost.record.write` decisions since start, in order.
+    ///
+    /// Each row is `(is the SYSTEM writer, principal kind, resource, outcome)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when audit staging cannot be read or a decision names a
+    /// permission other than `bifrost:record:write`.
+    async fn write_decisions(&self) -> Vec<(bool, String, String, String)> {
+        let decisions: Vec<(uuid::Uuid, String, String, String, String)> = sqlx::query_as(
+            "SELECT principal_id, principal_kind, resource, permission, outcome \
+             FROM vala.audit_staging \
+             WHERE data_tenant_id = $1 AND operation = 'bifrost.record.write' AND seq > $2 \
+             ORDER BY seq",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(self.seq_before)
+        .fetch_all(&self.assertion_pool)
+        .await
+        .expect("staged write decisions");
+        decisions
+            .into_iter()
+            .map(|(principal, kind, resource, permission, outcome)| {
+                assert_eq!(permission, "bifrost:record:write");
+                (principal == self.writer, kind, resource, outcome)
+            })
+            .collect()
+    }
+
+    /// Drains Scribe, stops the listener, and shuts the server down.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture no longer retains Scribe or shutdown fails.
+    async fn shutdown(self) {
+        self.server
+            .state()
+            .bifrost_ingest()
+            .expect("fixture retains Scribe")
+            .scribe()
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        self.shutdown.cancel();
+        self.server.shutdown().await.expect("server shuts down");
+    }
+}
+
+/// The provisioned SYSTEM writer, and only it, writes verification results.
+///
+/// Drives the full path: the tenant's provisioned writer mints a
+/// Verifier-scoped token through the one internal issuer, writes a result row
+/// over public gRPC, and is refused every non-result table, while a wildcard
+/// administrator is refused the result table. Each admission stages exactly one
+/// canonical `bifrost:record:write` decision carrying the true principal kind.
+///
+/// # Panics
+///
+/// Panics when fixture setup or minting fails, when the SYSTEM result write is
+/// refused, when either forbidden write is admitted or answered with anything
+/// but `PermissionDenied`, or when the staged decisions differ from one row per
+/// request in order.
+#[tokio::test]
+async fn system_writer_alone_writes_verification_results() {
+    let harness = SystemWriterHarness::start("system-result-writer").await;
+    let admin_jwt = mint_user_jwt(harness.server.state(), harness.tenant, &["admin"]);
+    let (bind, system_jwt) = (harness.bind, harness.system_jwt.clone());
+    let identity = harness.identity();
+    let results = "vala.verification.results";
+    insert_as(
+        bind,
+        &system_jwt,
+        results,
+        verification_result_ipc(Some(Some(&identity))),
+    )
+    .await
+    .expect("the system writer writes a verification result");
+    let admin = insert_as(
+        bind,
+        &admin_jwt,
+        results,
+        verification_result_ipc(Some(Some(&identity))),
+    )
+    .await
+    .expect_err("a wildcard administrator is refused the result table");
+    assert_eq!(admin.code(), Code::PermissionDenied, "{admin:?}");
+    let other = insert_as(
+        bind,
+        &system_jwt,
+        "vala.datasets.system_forbidden",
+        valid_arrow_ipc(),
+    )
+    .await
+    .expect_err("the system writer is refused every other table");
+    assert_eq!(other.code(), Code::PermissionDenied, "{other:?}");
+
+    let decisions = harness.write_decisions().await;
+    assert_eq!(
+        decisions,
+        vec![
+            (
+                true,
+                "system".to_owned(),
+                results.to_owned(),
+                "allowed".to_owned()
+            ),
+            (
+                false,
+                "user".to_owned(),
+                results.to_owned(),
+                "denied".to_owned()
+            ),
+            (
+                true,
+                "system".to_owned(),
+                "vala.datasets.system_forbidden".to_owned(),
+                "denied".to_owned()
+            ),
+        ]
+    );
+
+    harness.shutdown().await;
+}
+
+/// A SYSTEM result write must attribute every row to the token's exact
+/// Verifier before Gate records its one canonical decision.
+///
+/// Over authenticated public gRPC, the writer sends result batches whose
+/// `card_ref` is absent, null, malformed, and a foreign Verifier; each is
+/// refused with `PermissionDenied` and stages exactly one denied decision.
+/// It then sends the exact signed Verifier, which stages exactly one allowed
+/// decision. The acknowledged WAL is replayed before Scribe drains: it holds
+/// only the exact-scope row, stamped with the signed Verifier UID, so no
+/// refused batch reached durable admission.
+///
+/// # Panics
+///
+/// Panics when a refusal is admitted or answered with another code, the exact
+/// write is refused, the staged decisions differ from one per request in
+/// order, or the durable result rows differ from the single stamped row.
+#[tokio::test]
+async fn system_result_writes_require_the_exact_signed_verifier_scope() {
+    let harness = SystemWriterHarness::start("system-result-scope").await;
+    let results = "vala.verification.results";
+    let refusals: [(&str, Option<Option<&str>>); 4] = [
+        ("absent", None),
+        ("null", Some(None)),
+        ("malformed", Some(Some("not a card reference"))),
+        ("foreign", Some(Some("prod/Verifier/other@1.0.0"))),
+    ];
+    for (label, card_ref) in refusals {
+        let refused = insert_as(
+            harness.bind,
+            &harness.system_jwt,
+            results,
+            verification_result_ipc(card_ref),
         )
         .await
-        .expect("denied release leaves the owner fence readable");
-    assert_eq!(owner_page.batches.len(), 1);
-    owner
-        .release_fence_with_capability(owner_query_id, fence.fence_id, owner_lease.capability)
-        .await
-        .expect("owner can still release its fence");
-    shutdown.cancel();
+        .expect_err("an unattributed or foreign result batch is refused");
+        assert_eq!(
+            refused.code(),
+            Code::PermissionDenied,
+            "{label}: {refused:?}"
+        );
+    }
+    let identity = harness.identity();
+    insert_as(
+        harness.bind,
+        &harness.system_jwt,
+        results,
+        verification_result_ipc(Some(Some(&identity))),
+    )
+    .await
+    .expect("the exact signed Verifier writes a result");
 
-    server.shutdown().await.expect("server shuts down");
+    let denied = (
+        true,
+        "system".to_owned(),
+        results.to_owned(),
+        "denied".to_owned(),
+    );
+    let allowed = (
+        true,
+        "system".to_owned(),
+        results.to_owned(),
+        "allowed".to_owned(),
+    );
+    assert_eq!(
+        harness.write_decisions().await,
+        vec![
+            denied.clone(),
+            denied.clone(),
+            denied.clone(),
+            denied,
+            allowed
+        ]
+    );
+
+    let replayed = replay_wal_directory(
+        harness
+            .server
+            .scribe_wal_root_for_test()
+            .expect("Scribe-composed server owns a WAL root"),
+    )
+    .expect("acknowledged WAL replays");
+    let stamped = replayed
+        .values()
+        .filter(|stream| stream.seal_key.table.name == "results")
+        .flat_map(|stream| &stream.data_records)
+        .flat_map(|record| {
+            StreamReader::try_new(Cursor::new(record), None)
+                .expect("durable result record decodes")
+                .map(|rows| rows.expect("durable result batch decodes"))
+        })
+        .flat_map(|rows| {
+            rows.column_by_name("card_uid")
+                .expect("durable result rows carry card_uid")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("card_uid is UTF-8")
+                .iter()
+                .map(|uid| uid.map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stamped,
+        vec![
+            harness
+                .verifier
+                .uid
+                .as_ref()
+                .map(|uid| uid.as_str().to_owned())
+        ],
+        "only the exact-scope row is durable, stamped with the signed Verifier UID"
+    );
+
+    harness.shutdown().await;
+}
+
+/// The SYSTEM Drift reader reads only its tenant's observation table.
+///
+/// Before the tenant's first observation no table exists and the issuer
+/// mints nothing. Once the table is registered, the minted token verifies as
+/// SYSTEM holding exactly `bifrost_query:read` on that table's UID; it is
+/// refused for any other tenant, refused as a result writer over public
+/// gRPC, admitted by Oracle for the observation table with an audited read
+/// decision, and refused, with an audited denial, for another table.
+///
+/// # Panics
+///
+/// Panics when a token is minted without the table, carries other authority,
+/// verifies for another tenant, writes a result, or when either query or its
+/// staged audit decision differs from the expected one.
+#[tokio::test]
+async fn system_drift_reader_reads_only_the_observation_table() {
+    let harness = SystemWriterHarness::start("system-drift-reader").await;
+    let state = harness.server.state();
+    let issuer = state.auth.tenant_issuer().expect("tenant issuer");
+    let mint = || async {
+        let mut conn = wyrd_sql::TenantConn::acquire(state.postgres.app_pool(), harness.tenant)
+            .await
+            .expect("tenant connection opens");
+        let token = issuer
+            .issue_system_drift_read_token(&mut conn, &harness.verifier)
+            .await
+            .expect("drift read mint succeeds");
+        conn.commit().await.expect("mint commits");
+        token
+    };
+    assert!(
+        mint().await.is_none(),
+        "no observation table means nothing to read"
+    );
+
+    harness
+        .server
+        .ensure_builtin_table_for_test(harness.tenant, "drift", "observations")
+        .await
+        .expect("observation table provisions");
+    let token = mint().await.expect("a registered table mints a reader");
+    let table_uid: Vec<u8> = sqlx::query_scalar(
+        "SELECT table_uid FROM vala.bifrost_tables \
+         WHERE data_tenant_id = $1 AND fqn = 'vala.drift.observations'",
+    )
+    .bind(harness.tenant.as_uuid())
+    .fetch_one(&harness.assertion_pool)
+    .await
+    .expect("observation table UID reads");
+    let verifier = state
+        .auth
+        .token_verifier
+        .as_deref()
+        .expect("token verifier");
+    let verified = verifier
+        .verify(&token.access_token, &harness.tenant)
+        .expect("the reader verifies for its tenant");
+    assert!(matches!(
+        verified.principal.kind,
+        PrincipalKind::System { .. }
+    ));
+    assert_eq!(verified.principal.id.as_uuid(), harness.writer);
+    assert_eq!(
+        verified.principal.effective_permissions,
+        PermissionSet::from_iter([wyrd_runtime::Permission::drift_table_read(
+            Uuid::from_slice(&table_uid).expect("16-byte table UID")
+        )]),
+    );
+    assert!(
+        verifier
+            .verify(&token.access_token, &DataTenantId::new_v7())
+            .is_err(),
+        "the reader is refused for another tenant"
+    );
+
+    let read_jwt = secrecy::ExposeSecret::expose_secret(&token.access_token).to_owned();
+    let write = insert_as(
+        harness.bind,
+        &read_jwt,
+        "vala.verification.results",
+        verification_result_ipc(Some(Some(&harness.identity()))),
+    )
+    .await
+    .expect_err("the reader cannot write results");
+    assert_eq!(write.code(), Code::PermissionDenied, "{write:?}");
+
+    let query = |sql: &str| {
+        let caller = wyrd_server::components::auth::Caller {
+            data_tenant_id: harness.tenant,
+            principal: verified.principal.clone(),
+            request_id: RequestId::now_v7(),
+            delegation_chain: verified.delegation_chain.clone(),
+        };
+        let request = wyrd_spec::vala::api::BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(30_000),
+        };
+        async move {
+            wyrd_server::query::scheduled::ScheduledQueryCaller::authenticated(
+                state.clone(),
+                caller,
+                CancellationToken::new(),
+            )?
+            .run(request)
+            .await
+        }
+    };
+    query("SELECT COUNT(*) AS n FROM vala.drift.observations")
+        .await
+        .expect("the reader reads its observation table");
+    let denied = query("SELECT COUNT(*) AS n FROM vala.verification.results")
+        .await
+        .expect_err("the reader is refused another table");
+    assert_eq!(
+        denied.code(),
+        wyrd_spec::error::WyrdError::from(wyrd_spec::vala::error::BifrostError::QueryForbidden)
+            .code(),
+        "{denied:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let decisions = loop {
+        let decisions: Vec<(String, String)> = sqlx::query_as(
+            "SELECT operation, outcome FROM vala.audit_staging \
+             WHERE data_tenant_id = $1 AND principal_id = $2 AND seq > $3 \
+               AND operation IN ('bifrost.query.read_decision', 'vala.query.sync') \
+             ORDER BY operation",
+        )
+        .bind(harness.tenant.as_uuid())
+        .bind(harness.writer)
+        .bind(harness.seq_before)
+        .fetch_all(&harness.assertion_pool)
+        .await
+        .expect("staged read decisions");
+        if decisions.len() >= 2 || Instant::now() > deadline {
+            break decisions;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        decisions,
+        vec![
+            (
+                "bifrost.query.read_decision".to_owned(),
+                "allowed".to_owned()
+            ),
+            ("vala.query.sync".to_owned(), "denied".to_owned()),
+        ]
+    );
+
+    harness.shutdown().await;
 }

@@ -205,7 +205,7 @@ pub struct AuditPublicationRange {
 /// batch identity — and is otherwise established from the bounded staging
 /// prefix above the watermark. Returns `None` when the tenant has never
 /// appended an audit row or owes nothing, in which case the caller has no work
-/// and the tail stays empty.
+/// this cycle.
 ///
 /// The caller commits the short transaction before performing any Scribe IO:
 /// the bound is durable progress state, not a lease, so no owner token,

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::bifrost::process_cluster::{
     BifrostProcessCluster, NodeReport, PeerTlsDefect, ProcessNodeTarget, VolumeAction,
 };
@@ -572,8 +572,6 @@ async fn coordinate_public_query(
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
             sql: format!("SELECT id FROM vala.bifrost.{table} ORDER BY id"),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await?;

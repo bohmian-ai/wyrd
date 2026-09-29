@@ -1,0 +1,21 @@
+# TASK-011 r3 domain review: query consistency and persistence
+
+**Subject:** `/home/thorrester/Documents/GitHub/wyrd-vcc-t005`; base `338f33235f81c30dfe3a570dc26934fe7bb77048`; candidate `c5c7a76cc1f45f5bdfad20de35a957b9f2f9ce57`. Reviewed the cumulative diff against approved specification revision 38, original TASK-011, r1/r2 verdicts and validation ledgers, and R1/R2 remediation tasks. **Result: PASS.**
+
+## Boundary, authority, and source coverage
+
+| Boundary | Authority | Source and determination |
+|---|---|---|
+| Observation selection and one query cut | Spec REQ-153–156, AC-034 and INV-012; R1 FIND-TASK-011-3; `AGENTS.md` §§2, 9, 11; `architecture/agent-rules.md`; `architecture/bifrost-design.md` Query and Read audit | `wyrd-server/src/verification/drift.rs:101–359,387–509,803–905`; `query/scheduled.rs`; Oracle source binding; `vala-bifrost-redux/src/tables/drift/observations.rs`. `psi_statement`/`spc_statement` put completeness and every feature aggregate in one `UNION ALL` statement. `Reader::fold` submits it once through the authenticated query consumer. Oracle pins one immutable cut for that query and emits one read audit. Every arm filters exact subject, configured series, and `[start,end)` event time. PASS. |
+| Repeated series, invalid values, and insufficient windows | Spec REQ-153–156, AC-034; R1 FIND-TASK-011-1/2; R2 FIND-TASK-011-8 | `drift.rs:161–201,383–509,1240–1294,1375–1510`; `vala-drift/src/psi/mod.rs:252–277`; `vala-drift/src/spc/mod.rs:291–345`. The completeness arm groups selected rows by non-null `record_id`; fewer distinct configured series, more physical rows than configured series, or an invalid configured value makes the whole run unscorable. The table defines one tall row per feature with shared `record_id`. The PSI scorer checks all feature counts before any feature scoring; SPC checks all subgroup states before report construction. The 99-record duplicate test executes the generated SQL and fold. PASS. |
+| Inconclusive publication and dispatch | Spec REQ-156, AC-012/034; `architecture/wyrd-design.md` Verifier model | `drift.rs:489–509,670–755`; `verification/engines.rs:55–64`; `verification/results.rs:205–263,919–929`; `verification/runner.rs:375–412,485–532`. Empty or invalid folded reports become `Drift(None)`, which maps to an inconclusive verdict; the result builder writes one summary, null details and no feature batch. Dispatch follows failed settled results, so this path cannot alert Operators. PASS. |
+| Fitted format and historical state | Spec REQ-157; `AGENTS.md` tenant and persistence rules; `architecture/references/domain/drift-monitoring.md` | `vala-drift/src/baseline/mod.rs:18–33`; `drift.rs:756–800`; `wyrd-sql/src/queries/drift_baselines.rs:361–374`; Rust/Python/TypeScript Drift journeys. The fitter writes format 2. The server fetches by exact Verifier UID through a tenant connection and refuses an absent/old marker before deserializing. Retiring the fit does not rewrite old result rows; journeys read the previous result after refusal. PASS. |
+| Test-only controls and owning runtime | Spec AC-034, INV-012; `AGENTS.md` test and server-ownership rules | `wyrd-testing/src/verification.rs`, `python.rs`, `server.rs`; `wyrd-sdk-ts/native-testing/src/lib.rs`; three SDK journeys. Controls make a binding due in Postgres or remove a fit marker; the real runtime still claims, executes, publishes and dispatches. They do not add a product route or alternate data path. PASS. |
+
+## Findings
+
+No material findings in this domain. The r2 duplicate-series gap is closed at the shared completeness SQL and PSI scoring boundary. The single-statement query cut, result persistence, legacy-fit refusal, historical reads, and test controls remain intact.
+
+## Verification limits
+
+This is source and recorded-evidence review; I did not rerun lanes. The one-query invariant is established by statement construction and Oracle's pinned-cut contract, while the focused DataFusion test runs the statement over fixed before/after row sets rather than injecting a write during an Oracle query. The 99-record duplicate proof is at SQL/fold level; SDK sparse journeys prove the published inconclusive shape, and existing result tests prove null details and no feature rows. SDK JSON cannot carry NaN or infinity; unit and server SQL tests cover those values.

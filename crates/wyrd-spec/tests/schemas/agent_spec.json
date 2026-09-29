@@ -15,13 +15,6 @@
         }
       ]
     },
-    "publishes_to": {
-      "description": "Eval and Drift cards that receive observations from this agent.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/Ref"
-      }
-    },
     "run_config": {
       "description": "Agent run configuration.",
       "allOf": [
@@ -35,6 +28,13 @@
       "type": "array",
       "items": {
         "type": "string"
+      }
+    },
+    "verified_by": {
+      "description": "Continuous verification bindings owned by this standalone Agent.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/VerificationBinding"
       }
     }
   },
@@ -1048,8 +1048,7 @@
         "Prompt",
         "Agent",
         "Workflow",
-        "Eval",
-        "Drift",
+        "Verifier",
         "Service",
         "Policy",
         "Mcp",
@@ -1761,6 +1760,177 @@
       },
       "additionalProperties": false
     },
+    "HttpAuth": {
+      "description": "Server-side authentication sources for an HTTP action.",
+      "oneOf": [
+        {
+          "description": "No authentication.",
+          "type": "object",
+          "required": [
+            "scheme"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "none"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Bearer token loaded from an environment variable.",
+          "type": "object",
+          "required": [
+            "env",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Environment variable name.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "bearer"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`user:password` loaded from an environment variable.",
+          "type": "object",
+          "required": [
+            "env",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Environment variable name.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "basic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Custom header value loaded from an environment variable.",
+          "type": "object",
+          "required": [
+            "env",
+            "name",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Environment variable name.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Header name.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "header"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HttpMethod": {
+      "description": "HTTP methods supported by an HTTP Operator action.",
+      "oneOf": [
+        {
+          "description": "GET.",
+          "type": "string",
+          "enum": [
+            "get"
+          ]
+        },
+        {
+          "description": "POST.",
+          "type": "string",
+          "enum": [
+            "post"
+          ]
+        },
+        {
+          "description": "PUT.",
+          "type": "string",
+          "enum": [
+            "put"
+          ]
+        },
+        {
+          "description": "PATCH.",
+          "type": "string",
+          "enum": [
+            "patch"
+          ]
+        },
+        {
+          "description": "DELETE.",
+          "type": "string",
+          "enum": [
+            "delete"
+          ]
+        }
+      ]
+    },
+    "InlineableRef_for_OperatorSpec": {
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "An embedded child spec.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OperatorSpec"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
+    },
     "InlineableRef_for_Prompt": {
       "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
       "anyOf": [
@@ -1800,6 +1970,107 @@
         {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
+        }
+      ]
+    },
+    "InlineableRef_for_TriggerSpec": {
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "An embedded child spec.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TriggerSpec"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
+    },
+    "NotifyChannel": {
+      "description": "Typed notification destinations.",
+      "oneOf": [
+        {
+          "description": "PagerDuty event payload.",
+          "type": "object",
+          "required": [
+            "kind",
+            "severity",
+            "summary"
+          ],
+          "properties": {
+            "dedup_key": {
+              "description": "Optional de-duplication key.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "pager_duty"
+              ]
+            },
+            "severity": {
+              "description": "PagerDuty severity.",
+              "type": "string"
+            },
+            "summary": {
+              "description": "Human-readable event summary.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Slack message payload.",
+          "type": "object",
+          "required": [
+            "kind",
+            "text"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "slack"
+              ]
+            },
+            "text": {
+              "description": "Message text.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
         }
       ]
     },
@@ -3975,6 +4246,176 @@
         }
       ]
     },
+    "OperatorBudget": {
+      "description": "Operator execution limits.",
+      "type": "object",
+      "properties": {
+        "max_tool_calls": {
+          "description": "Maximum tool calls allowed during invocation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_wall_seconds": {
+          "description": "Maximum wall-clock runtime in seconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperatorSpec": {
+      "description": "A server-owned side-effect template.",
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "Dispatch a registered Workflow.",
+          "type": "object",
+          "required": [
+            "kind",
+            "workflow_ref"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "workflow"
+              ]
+            },
+            "workflow_ref": {
+              "description": "Workflow to dispatch with the trigger context.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Ref"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Send a typed notification.",
+          "type": "object",
+          "required": [
+            "channel",
+            "kind"
+          ],
+          "properties": {
+            "channel": {
+              "description": "Notification destination and payload.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/NotifyChannel"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "notify"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Perform an HTTP request.",
+          "type": "object",
+          "required": [
+            "kind",
+            "method",
+            "url"
+          ],
+          "properties": {
+            "auth": {
+              "description": "Optional server-side authentication binding.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HttpAuth"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "body": {
+              "description": "Optional structured JSON body."
+            },
+            "expect_status": {
+              "description": "Optional expected response status.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "headers": {
+              "description": "Optional request headers.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "http"
+              ]
+            },
+            "method": {
+              "description": "HTTP method.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/HttpMethod"
+                }
+              ]
+            },
+            "timeout_seconds": {
+              "description": "Optional request timeout.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "url": {
+              "description": "URL template.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "properties": {
+        "budget": {
+          "description": "Optional execution limits.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OperatorBudget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "description": "Optional human-readable purpose.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
     "Prompt": {
       "description": "Authored native prompt request plus render metadata.",
       "type": "object",
@@ -4266,6 +4707,99 @@
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
+    },
+    "TriggerSpec": {
+      "description": "Declarative activation for a bound Verifier.",
+      "type": "object",
+      "oneOf": [
+        {
+          "description": "Activate on each due occurrence of a cron schedule.",
+          "type": "object",
+          "required": [
+            "cron",
+            "kind"
+          ],
+          "properties": {
+            "cron": {
+              "description": "Cron expression.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "schedule"
+              ]
+            },
+            "tz": {
+              "description": "Optional IANA timezone; absent means UTC.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Activate on each successfully committed observation for the subject.\n\nDeclared as a fieldless struct variant so the enum-level `deny_unknown_fields` applies: a unit variant's internally tagged visitor would silently drain every sibling key, admitting typos and pasted secrets. The authored wire shape stays `{kind: observations_ready}`.",
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "observations_ready"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "properties": {
+        "description": {
+          "description": "Optional human-readable purpose.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "VerificationBinding": {
+      "description": "One inline declaration attaching a Verifier to its containing subject.\n\nAuthored on a Service, a Service component occurrence, or a standalone Agent. Registration resolves and UID-pins the Verifier, the effective Trigger, and every effective Operator before the owning Card persists.",
+      "type": "object",
+      "required": [
+        "runs_on",
+        "verifier"
+      ],
+      "properties": {
+        "on_failure": {
+          "description": "Operators dispatched independently after a `failed` verdict.\n\nEmpty means a failed result stays durable with no reaction.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/InlineableRef_for_OperatorSpec"
+          }
+        },
+        "runs_on": {
+          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/InlineableRef_for_TriggerSpec"
+            }
+          ]
+        },
+        "verifier": {
+          "description": "The exact Verifier Card this subject is verified by.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Ref"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "VersionBlock": {
       "description": "Semver-compatible version string.",

@@ -104,7 +104,7 @@ pub fn router() -> OpenApiRouter<AppState> {
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
-          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
           WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)",
@@ -153,7 +153,7 @@ pub(crate) async fn list_running_queries(
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
-          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
           WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)",
@@ -210,7 +210,7 @@ pub(crate) async fn get_running_query(
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
-          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
           WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)",
@@ -276,7 +276,7 @@ pub(crate) async fn cancel_running_query(
           WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
-          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
           WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)",
@@ -486,10 +486,9 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        FreshnessPolicy, QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame,
-        QuerySource, QueryStreamFrame, QueryTerminalError, QueryTerminalErrorCode,
-        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
-        VisibilityMode,
+        QueryBatchFrame, QueryErrorDetail, QuerySchemaFrame, QuerySource, QueryStreamFrame,
+        QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+        SourceCompletion, SourceCompletionOutcome,
     };
     use wyrd_tonic::frame_codec::FrameDecoder;
 
@@ -570,7 +569,7 @@ mod tests {
         assert!(response.into_body().collect().await.is_err());
     }
 
-    /// Builds the required complete source set for a published-only terminal.
+    /// Builds the complete three-tier source set every successful terminal carries.
     fn complete_sources() -> Vec<SourceCompletion> {
         vec![
             SourceCompletion {
@@ -579,6 +578,10 @@ mod tests {
             },
             SourceCompletion {
                 source: QuerySource::HotSealed,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+            SourceCompletion {
+                source: QuerySource::LiveTail,
                 outcome: SourceCompletionOutcome::Complete,
             },
         ]
@@ -632,7 +635,6 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
-                freshness: QueryFreshness::Degraded,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),
@@ -713,7 +715,6 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                freshness: QueryFreshness::Complete,
                 execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
@@ -757,8 +758,6 @@ mod tests {
                 query_caller().await,
                 Json(BifrostQueryRequest {
                     sql: "SELECT 1".to_owned(),
-                    visibility: VisibilityMode::PublishedOnly,
-                    freshness: FreshnessPolicy::Strict,
                     deadline_ms: Some(1_000),
                 }),
             )
@@ -784,7 +783,6 @@ mod tests {
     async fn http_query_stream_preserves_late_failed_terminal() {
         let terminal = QueryStreamFrame::Terminal(QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            freshness: QueryFreshness::Complete,
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: 1,
             warnings: Vec::new(),

@@ -3,6 +3,7 @@
 use std::mem::size_of;
 
 use vala_bifrost_redux::gate::{IngestError, OtlpWireLimits};
+use vala_bifrost_redux::tables::traces::SpanOutputWidths;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
@@ -20,6 +21,156 @@ pub(crate) struct OtlpDecodePlan {
     pub(crate) wire_bytes: usize,
     /// Generated request storage admitted before prost construction.
     pub(crate) decode_bytes: usize,
+    /// Conservative canonical Arrow-plus-managed output the request projects to.
+    pub(crate) projected_bytes: usize,
+}
+
+impl OtlpDecodePlan {
+    /// Returns the simultaneous typed-backing and projected-output demand the
+    /// caller reserves before generated decode.
+    pub(crate) const fn reservation_bytes(&self) -> usize {
+        self.decode_bytes.saturating_add(self.projected_bytes)
+    }
+}
+
+/// Resource envelope copies each descendant row may retain: the attribute
+/// encoding, the promoted `service.name`, and entity-reference offsets.
+pub(crate) const RESOURCE_FAN_OUT: usize = 3;
+
+/// Scope and metric-descriptor copies each descendant row may retain.
+pub(crate) const GROUP_FAN_OUT: usize = 2;
+
+/// Record payload copies one row may retain: its canonical columns plus
+/// promoted attribute values and correlation text.
+const RECORD_FAN_OUT: usize = 2;
+
+/// Maximum nesting of open resource, scope, metric, and record frames.
+const MAX_OUTPUT_FRAMES: usize = 4;
+
+/// Refuses a request whose typed backing or projected output exceeds the
+/// derived expanded-data ceiling.
+///
+/// # Errors
+///
+/// Returns [`IngestError::PayloadTooLarge`] naming the first bound exceeded.
+pub(crate) fn enforce_expanded_ceiling(
+    decode_bytes: usize,
+    projected_bytes: usize,
+    limits: OtlpWireLimits,
+) -> Result<(), IngestError> {
+    let limit = limits.expanded_bytes();
+    for bytes in [decode_bytes, projected_bytes] {
+        if bytes > limit {
+            return Err(IngestError::PayloadTooLarge {
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// One open resource, scope, metric, or record while projecting output.
+#[derive(Clone, Copy, Debug, Default)]
+struct OutputFrame {
+    /// Typed backing bytes charged when the frame opened.
+    decode_start: usize,
+    /// Generated struct layout of the element, which is not projected payload.
+    layout: usize,
+    /// Rows projected when the frame opened.
+    rows_start: usize,
+    /// Typed backing bytes owned by already-closed child frames.
+    children: usize,
+}
+
+/// Conservative projected canonical output of one OTLP request.
+///
+/// The preflight opens a frame for each resource, scope, metric, and record
+/// and closes it with the typed payload backing charged meanwhile. A closed record
+/// charges its fixed row width plus [`RECORD_FAN_OUT`] copies of the backing
+/// it owns; a closed group charges its own backing once per descendant row,
+/// times its fan-out, because every row repeats its envelope. Typed backing
+/// is an upper bound on the payload bytes projection re-encodes, and charging
+/// on close keeps the bound independent of protobuf field order. Arithmetic
+/// saturates so an overflow reads as an over-limit request.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectedOutput {
+    /// Projected output bytes charged so far.
+    bytes: usize,
+    /// Records closed so far.
+    rows: usize,
+    /// Open frames, innermost last.
+    frames: [OutputFrame; MAX_OUTPUT_FRAMES],
+    /// Number of open frames.
+    depth: usize,
+}
+
+impl ProjectedOutput {
+    /// Returns the projected output bytes charged so far.
+    pub(crate) const fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Charges fixed-width output that does not depend on typed backing, such
+    /// as one nested event, link, or exemplar.
+    pub(crate) const fn add(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Opens a frame at the current typed backing total, before the caller
+    /// charges the element's generated struct `layout`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when more than [`MAX_OUTPUT_FRAMES`] frames are open, which the
+    /// fixed OTLP message hierarchy never produces.
+    pub(crate) fn open(&mut self, decode_now: usize, layout: usize) {
+        self.frames[self.depth] = OutputFrame {
+            decode_start: decode_now,
+            layout,
+            rows_start: self.rows,
+            children: 0,
+        };
+        self.depth += 1;
+    }
+
+    /// Closes the innermost frame and returns the payload backing it owns
+    /// (excluding child frames and its own struct layout), crediting its whole
+    /// backing to the enclosing frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no frame is open, which a balanced preflight never does.
+    fn close(&mut self, decode_now: usize) -> (usize, OutputFrame) {
+        self.depth -= 1;
+        let frame = self.frames[self.depth];
+        let total = decode_now.saturating_sub(frame.decode_start);
+        if let Some(parent) = self.depth.checked_sub(1) {
+            let parent = &mut self.frames[parent];
+            parent.children = parent.children.saturating_add(total);
+        }
+        (
+            total
+                .saturating_sub(frame.children)
+                .saturating_sub(frame.layout),
+            frame,
+        )
+    }
+
+    /// Closes one resource, scope, or metric group, charging its own backing
+    /// `fan_out` times for every row projected beneath it.
+    pub(crate) fn close_group(&mut self, decode_now: usize, fan_out: usize) {
+        let (own, frame) = self.close(decode_now);
+        let rows = self.rows - frame.rows_start;
+        self.add(own.saturating_mul(fan_out).saturating_mul(rows));
+    }
+
+    /// Closes one record, charging its fixed row width plus its payload copies.
+    pub(crate) fn close_record(&mut self, decode_now: usize, row_bytes: usize) {
+        let (own, _) = self.close(decode_now);
+        self.rows += 1;
+        self.add(row_bytes.saturating_add(own.saturating_mul(RECORD_FAN_OUT)));
+    }
 }
 
 /// Bounded counters used while walking one trace export.
@@ -27,18 +178,12 @@ pub(crate) struct OtlpDecodePlan {
 struct TraceWireFacts {
     /// Shared immutable limits selected by the Scribe runtime.
     limits: OtlpWireLimits,
-    /// Number of resource groups encountered.
-    resources: usize,
-    /// Number of scope groups encountered.
-    scopes: usize,
-    /// Number of spans encountered.
-    records: usize,
-    /// Number of attribute entries encountered.
-    attributes: usize,
-    /// Cumulative key, value, body, and identifier bytes.
-    value_bytes: usize,
+    /// Fixed Arrow widths charged per projected span and nested element.
+    widths: SpanOutputWidths,
     /// Public-layout and exact backing capacity required by the typed request.
     decode_bytes: usize,
+    /// Conservative projected canonical output.
+    output: ProjectedOutput,
 }
 
 impl TraceWireFacts {
@@ -46,39 +191,18 @@ impl TraceWireFacts {
     fn new(limits: OtlpWireLimits) -> Self {
         Self {
             limits,
-            resources: 0,
-            scopes: 0,
-            records: 0,
-            attributes: 0,
-            value_bytes: 0,
+            widths: SpanOutputWidths::new(),
             decode_bytes: size_of::<ExportTraceServiceRequest>(),
+            output: ProjectedOutput::default(),
         }
     }
 
-    /// Adds one bounded cardinality fact.
+    /// Adds exact generated backing bytes for one retained value.
     ///
     /// # Errors
     ///
-    /// Returns the stable malformed-request error on arithmetic overflow or
-    /// when `limit` would be exceeded.
-    fn add_count(current: &mut usize, amount: usize, limit: usize) -> Result<(), IngestError> {
-        *current = current
-            .checked_add(amount)
-            .ok_or_else(|| malformed("OTLP protobuf cardinality overflow"))?;
-        if *current > limit {
-            return Err(malformed("OTLP protobuf cardinality limit exceeded"));
-        }
-        Ok(())
-    }
-
-    /// Adds exact generated backing bytes to both value and decode facts.
-    ///
-    /// # Errors
-    ///
-    /// Returns the stable malformed-request error on overflow or a configured
-    /// value/decode ceiling breach.
+    /// Returns the stable malformed-request error on arithmetic overflow.
     fn add_value_bytes(&mut self, amount: usize) -> Result<(), IngestError> {
-        Self::add_count(&mut self.value_bytes, amount, self.limits.value_bytes)?;
         self.add_decode_bytes(amount)
     }
 
@@ -86,19 +210,21 @@ impl TraceWireFacts {
     ///
     /// # Errors
     ///
-    /// Returns the stable malformed-request error on overflow or when the
-    /// immutable material ceiling would be exceeded.
+    /// Returns the stable malformed-request error on arithmetic overflow.
     fn add_decode_bytes(&mut self, amount: usize) -> Result<(), IngestError> {
-        Self::add_count(&mut self.decode_bytes, amount, usize::MAX)
+        self.decode_bytes = self
+            .decode_bytes
+            .checked_add(amount)
+            .ok_or_else(|| malformed("OTLP protobuf capacity overflow"))?;
+        Ok(())
     }
 
     /// Records one repeated attribute element before visiting its payload.
     ///
     /// # Errors
     ///
-    /// Returns a stable refusal when attribute or decode capacity is exceeded.
+    /// Returns the stable malformed-request error on arithmetic overflow.
     fn add_attribute(&mut self) -> Result<(), IngestError> {
-        Self::add_count(&mut self.attributes, 1, self.limits.attributes)?;
         self.add_decode_bytes(size_of::<KeyValue>())
     }
 }
@@ -364,14 +490,21 @@ pub(crate) fn preflight_trace_protobuf(
             let WireValue::Bytes(resource) = value else {
                 return Err(malformed("trace resources must be length-delimited"));
             };
-            TraceWireFacts::add_count(&mut facts.resources, 1, limits.resources)?;
+            facts
+                .output
+                .open(facts.decode_bytes, size_of::<ResourceSpans>());
             facts.add_decode_bytes(size_of::<ResourceSpans>())?;
             visit_resource_spans(resource, &mut facts)?;
+            facts
+                .output
+                .close_group(facts.decode_bytes, RESOURCE_FAN_OUT);
         }
     }
+    enforce_expanded_ceiling(facts.decode_bytes, facts.output.bytes(), limits)?;
     Ok(OtlpDecodePlan {
         wire_bytes: bytes.len(),
         decode_bytes: facts.decode_bytes,
+        projected_bytes: facts.output.bytes(),
     })
 }
 
@@ -389,9 +522,12 @@ fn visit_resource_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), 
         match (tag, value) {
             (1, WireValue::Bytes(resource)) => visit_resource(resource, facts)?,
             (2, WireValue::Bytes(scope)) => {
-                TraceWireFacts::add_count(&mut facts.scopes, 1, facts.limits.scopes)?;
+                facts
+                    .output
+                    .open(facts.decode_bytes, size_of::<ScopeSpans>());
                 facts.add_decode_bytes(size_of::<ScopeSpans>())?;
                 visit_scope_spans(scope, facts)?;
+                facts.output.close_group(facts.decode_bytes, GROUP_FAN_OUT);
             }
             (3, WireValue::Bytes(_)) => {}
             (1..=3, _) => return Err(wrong_wire("resource spans")),
@@ -461,9 +597,12 @@ fn visit_scope_spans(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Ing
         match (tag, value) {
             (1, WireValue::Bytes(scope)) => visit_scope(scope, facts)?,
             (2, WireValue::Bytes(span)) => {
-                TraceWireFacts::add_count(&mut facts.records, 1, facts.limits.records)?;
+                facts.output.open(facts.decode_bytes, size_of::<Span>());
                 facts.add_decode_bytes(size_of::<Span>())?;
                 visit_span(span, facts)?;
+                facts
+                    .output
+                    .close_record(facts.decode_bytes, facts.widths.row);
             }
             (3, WireValue::Bytes(_)) => {}
             (1..=3, _) => return Err(wrong_wire("scope spans")),
@@ -495,10 +634,12 @@ fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErro
             (7 | 8, WireValue::Fixed64(_)) => {}
             (9, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
             (11, WireValue::Bytes(event)) => {
+                facts.output.add(facts.widths.event);
                 facts.add_decode_bytes(size_of::<wyrd_tonic::otlp::trace::v1::span::Event>())?;
                 visit_span_event(event, facts)?;
             }
             (13, WireValue::Bytes(link)) => {
+                facts.output.add(facts.widths.link);
                 facts.add_decode_bytes(size_of::<wyrd_tonic::otlp::trace::v1::span::Link>())?;
                 visit_span_link(link, facts)?;
             }
@@ -2243,6 +2384,176 @@ mod tests {
                 vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS,
             );
             assert_eq!(result.is_ok(), accepted, "depth {depth}");
+        }
+    }
+
+    /// One OTLP protobuf preflight under test.
+    type Preflight = fn(&[u8], OtlpWireLimits) -> Result<OtlpDecodePlan, IngestError>;
+
+    /// Wire limits whose derived expanded ceiling is 16 KiB.
+    fn small_limits() -> OtlpWireLimits {
+        OtlpWireLimits {
+            request_bytes: 4096,
+            ..vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS
+        }
+    }
+
+    /// Returns a resource carrying four 400-byte attribute keys, which every
+    /// projected row repeats.
+    fn wide_resource() -> Resource {
+        Resource {
+            attributes: (0..4)
+                .map(|index| KeyValue {
+                    key: format!("{index}").repeat(400),
+                    value: None,
+                })
+                .collect(),
+            ..Resource::default()
+        }
+    }
+
+    /// Encodes one export per signal whose resource is repeated by `rows` rows.
+    fn fan_out_requests(rows: usize) -> [(Preflight, Vec<u8>); 3] {
+        use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+        use wyrd_tonic::otlp::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+        };
+        use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
+
+        let traces = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(wide_resource()),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span::default(); rows],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            }],
+        };
+        let logs = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(wide_resource()),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord::default(); rows],
+                    ..ScopeLogs::default()
+                }],
+                ..ResourceLogs::default()
+            }],
+        };
+        let metrics = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(wide_resource()),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "m".to_owned(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint::default(); rows],
+                        })),
+                        ..Metric::default()
+                    }],
+                    ..ScopeMetrics::default()
+                }],
+                ..ResourceMetrics::default()
+            }],
+        };
+        [
+            (
+                preflight_trace_protobuf as Preflight,
+                traces.encode_to_vec(),
+            ),
+            (
+                crate::otlp_logs_decode::preflight_logs_protobuf,
+                logs.encode_to_vec(),
+            ),
+            (
+                crate::otlp_metrics_decode::preflight_metrics_protobuf,
+                metrics.encode_to_vec(),
+            ),
+        ]
+    }
+
+    /// Proves a small request whose empty nested messages expand past four
+    /// times the wire ceiling in generated backing is refused as too large.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture exceeds the wire ceiling or the preflight
+    /// accepts it.
+    #[test]
+    fn protobuf_preflight_refuses_typed_backing_above_expanded_ceiling() {
+        use wyrd_tonic::otlp::logs::v1::ResourceLogs;
+        use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+        use wyrd_tonic::otlp::metrics::v1::ResourceMetrics;
+        use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
+
+        let limits = small_limits();
+        let groups = 2000;
+        let requests: [(Preflight, Vec<u8>, usize); 3] = [
+            (
+                preflight_trace_protobuf,
+                ExportTraceServiceRequest {
+                    resource_spans: vec![ResourceSpans::default(); groups],
+                }
+                .encode_to_vec(),
+                size_of::<ResourceSpans>(),
+            ),
+            (
+                crate::otlp_logs_decode::preflight_logs_protobuf,
+                ExportLogsServiceRequest {
+                    resource_logs: vec![ResourceLogs::default(); groups],
+                }
+                .encode_to_vec(),
+                size_of::<ResourceLogs>(),
+            ),
+            (
+                crate::otlp_metrics_decode::preflight_metrics_protobuf,
+                ExportMetricsServiceRequest {
+                    resource_metrics: vec![ResourceMetrics::default(); groups],
+                }
+                .encode_to_vec(),
+                size_of::<ResourceMetrics>(),
+            ),
+        ];
+        for (preflight, bytes, layout) in requests {
+            assert!(bytes.len() <= limits.request_bytes);
+            assert!(groups * layout > limits.expanded_bytes());
+            assert!(matches!(
+                preflight(&bytes, limits),
+                Err(IngestError::PayloadTooLarge { .. })
+            ));
+            assert!(preflight(&bytes[..2 * 16], limits).is_ok());
+        }
+    }
+
+    /// Proves repeated resource attributes are charged once per projected row:
+    /// one row fits the expanded ceiling, while four rows cross it on
+    /// projected output alone even though generated backing still fits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture exceeds the wire ceiling, the one-row request
+    /// is refused, or the four-row request is accepted.
+    #[test]
+    fn protobuf_preflight_refuses_projected_fan_out_above_expanded_ceiling() {
+        let limits = small_limits();
+        let generous = OtlpWireLimits {
+            request_bytes: 1 << 20,
+            ..limits
+        };
+        for ((preflight, one_row), (_, four_rows)) in
+            fan_out_requests(1).into_iter().zip(fan_out_requests(4))
+        {
+            let plan = preflight(&one_row, limits).expect("one row fits");
+            assert!(plan.projected_bytes <= limits.expanded_bytes());
+            assert!(four_rows.len() <= limits.request_bytes);
+            let unbounded = preflight(&four_rows, generous).expect("generous preflight");
+            assert!(unbounded.decode_bytes <= limits.expanded_bytes());
+            assert!(unbounded.projected_bytes > limits.expanded_bytes());
+            assert!(matches!(
+                preflight(&four_rows, limits),
+                Err(IngestError::PayloadTooLarge { .. })
+            ));
         }
     }
 }

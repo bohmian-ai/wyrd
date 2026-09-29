@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StartVerificationRunResponse",
+  "description": "`202 Accepted` response to `POST /v1/verification/runs`.",
+  "type": "object",
+  "required": [
+    "run_id"
+  ],
+  "properties": {
+    "run_id": {
+      "description": "The durably enqueued run; poll it with `GET /v1/verification/runs/{run_id}`.",
+      "type": "string",
+      "format": "uuid"
+    }
+  }
+}

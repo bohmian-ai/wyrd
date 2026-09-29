@@ -703,49 +703,6 @@ mod tests {
         assert!(decode_logs_json(input, plan.decode_bytes + 1).is_err());
     }
 
-    /// Proves log resource, scope, record, attribute, and value-byte caps reject cap plus one.
-    #[test]
-    fn direct_logs_json_enforces_signal_preflight_caps() {
-        for (field, accepted, refused) in [
-            (
-                "resources",
-                br#"{"resourceLogs":[{}]}"#.as_slice(),
-                br#"{"resourceLogs":[{},{}]}"#.as_slice(),
-            ),
-            (
-                "scopes",
-                br#"{"resourceLogs":[{"scopeLogs":[{}]}]}"#.as_slice(),
-                br#"{"resourceLogs":[{"scopeLogs":[{},{}]}]}"#.as_slice(),
-            ),
-            (
-                "records",
-                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{}]}]}]}"#.as_slice(),
-                br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{},{}]}]}]}"#.as_slice(),
-            ),
-            (
-                "attributes",
-                br#"{"resourceLogs":[{"resource":{"attributes":[{}]}}]}"#.as_slice(),
-                br#"{"resourceLogs":[{"resource":{"attributes":[{},{}]}}]}"#.as_slice(),
-            ),
-        ] {
-            let mut limits = test_limits();
-            match field {
-                "resources" => limits.resources = 1,
-                "scopes" => limits.scopes = 1,
-                "records" => limits.records = 1,
-                "attributes" => limits.attributes = 1,
-                _ => unreachable!("closed test limit field"),
-            }
-            assert!(preflight_logs_json(accepted, limits).is_ok());
-            assert!(preflight_logs_json(refused, limits).is_err());
-        }
-
-        let mut limits = test_limits();
-        limits.value_bytes = 1;
-        assert!(preflight_logs_json(br#"{"resourceLogs":[{"schemaUrl":"a"}]}"#, limits).is_ok());
-        assert!(preflight_logs_json(br#"{"resourceLogs":[{"schemaUrl":"ab"}]}"#, limits).is_err());
-    }
-
     /// Proves escaped strings, IDs, and unpadded bytes preserve the exact owner plan.
     #[test]
     fn direct_logs_json_decodes_escaped_tokens_with_exact_owner() {
@@ -776,11 +733,6 @@ mod tests {
     fn test_limits() -> vala_bifrost_redux::gate::OtlpWireLimits {
         vala_bifrost_redux::gate::OtlpWireLimits {
             request_bytes: 1 << 20,
-            resources: 16,
-            scopes: 16,
-            records: 128,
-            attributes: 1024,
-            value_bytes: 1 << 20,
             value_depth: 8,
             time_partitions: 32,
         }

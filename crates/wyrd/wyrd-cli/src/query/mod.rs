@@ -8,7 +8,7 @@ use arrow::json::LineDelimitedWriter;
 use clap::{ArgGroup, Args, ValueEnum};
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_client::{Bifrost, WyrdClient};
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use crate::error::{CliBoundaryError, WyrdCliError};
 
@@ -32,33 +32,9 @@ pub struct QueryCommand {
     /// Bounded UTF-8 file containing SELECT-only SQL.
     #[arg(long)]
     pub file: Option<PathBuf>,
-    /// Source visibility admitted by Oracle.
-    #[arg(long, value_enum, default_value_t = QueryVisibility::PublishedOnly)]
-    pub visibility: QueryVisibility,
-    /// Freshness behavior when a complete cut is unavailable.
-    #[arg(long, value_enum, default_value_t = QueryFreshness::Strict)]
-    pub freshness: QueryFreshness,
     /// Row output encoding written to stdout.
     #[arg(long, value_enum, default_value_t = QueryOutputFormat::Jsonl)]
     pub format: QueryOutputFormat,
-}
-
-/// CLI spelling for the closed Oracle visibility modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum QueryVisibility {
-    /// Query published and sealed sources.
-    PublishedOnly,
-    /// Fuse live, sealed, and published sources.
-    Fused,
-}
-
-/// CLI spelling for Oracle freshness policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum QueryFreshness {
-    /// Reject a query that cannot meet the requested cut.
-    Strict,
-    /// Permit a successful degraded terminal.
-    AllowDegraded,
 }
 
 /// Supported stdout encodings.
@@ -142,14 +118,6 @@ fn request(command: &QueryCommand) -> Result<BifrostQueryRequest, WyrdCliError> 
     };
     Ok(BifrostQueryRequest {
         sql,
-        visibility: match command.visibility {
-            QueryVisibility::PublishedOnly => VisibilityMode::PublishedOnly,
-            QueryVisibility::Fused => VisibilityMode::Fused,
-        },
-        freshness: match command.freshness {
-            QueryFreshness::Strict => FreshnessPolicy::Strict,
-            QueryFreshness::AllowDegraded => FreshnessPolicy::AllowDegraded,
-        },
         deadline_ms: None,
     })
 }
@@ -244,7 +212,7 @@ fn output_error(error: impl std::fmt::Display) -> WyrdCliError {
 mod tests {
     use clap::{Parser, Subcommand};
 
-    use super::{QueryCommand, QueryFreshness, QueryOutputFormat, QueryVisibility, request};
+    use super::{QueryCommand, QueryOutputFormat, request};
 
     /// Minimal parser that exercises the public query command arguments.
     #[derive(Debug, Parser)]
@@ -287,61 +255,45 @@ mod tests {
     /// Pins the operator-facing defaults.
     ///
     /// # Panics
-    /// Panics when valid arguments fail to parse or a default visibility,
-    /// freshness, or output format differs.
+    /// Panics when valid arguments fail to parse or the default output format
+    /// differs.
     #[test]
     fn query_parser_uses_safe_defaults() {
         let cli = TestCli::try_parse_from(["wyrd", "query", "--server", "x", "--sql", "SELECT 1"])
             .expect("query arguments are valid");
         let TestCommand::Query(command) = cli.command;
-        assert_eq!(command.visibility, QueryVisibility::PublishedOnly);
-        assert_eq!(command.freshness, QueryFreshness::Strict);
         assert_eq!(command.format, QueryOutputFormat::Jsonl);
     }
 
-    /// The CLI request projection serializes the shared published/strict defaults.
+    /// The CLI request projection carries only SQL and the optional deadline.
+    ///
+    /// # Panics
+    /// Panics when the projection fails or serializes a source selector.
     #[test]
-    fn query_request_defaults_match_shared_client_contract() {
+    fn query_request_has_no_source_selectors() {
         let command = QueryCommand {
             server: Some("http://localhost".to_owned()),
             sql: Some("SELECT 1".to_owned()),
             file: None,
-            visibility: QueryVisibility::PublishedOnly,
-            freshness: QueryFreshness::Strict,
             format: QueryOutputFormat::Jsonl,
         };
         let request = request(&command).expect("request projection succeeds");
         assert_eq!(
             serde_json::to_value(&request).expect("request serializes"),
-            serde_json::json!({
-                "sql": "SELECT 1",
-                "visibility": "published_only",
-                "freshness": "strict",
-                "deadline_ms": null
-            })
+            serde_json::json!({"sql": "SELECT 1", "deadline_ms": null})
         );
-    }
-
-    /// Explicit CLI policy flags remain opt-ins in the wire request.
-    #[test]
-    fn query_request_explicit_opt_ins_are_preserved() {
-        let command = QueryCommand {
-            server: Some("http://localhost".to_owned()),
-            sql: Some("SELECT 1".to_owned()),
-            file: None,
-            visibility: QueryVisibility::Fused,
-            freshness: QueryFreshness::AllowDegraded,
-            format: QueryOutputFormat::Jsonl,
-        };
-        let request = request(&command).expect("request projection succeeds");
-        assert_eq!(
-            serde_json::to_value(&request).expect("request serializes"),
-            serde_json::json!({
-                "sql": "SELECT 1",
-                "visibility": "fused",
-                "freshness": "allow_degraded",
-                "deadline_ms": null
-            })
+        assert!(
+            TestCli::try_parse_from([
+                "wyrd",
+                "query",
+                "--server",
+                "x",
+                "--sql",
+                "SELECT 1",
+                "--visibility",
+                "fused",
+            ])
+            .is_err()
         );
     }
 }

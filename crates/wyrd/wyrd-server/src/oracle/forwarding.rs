@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use rand::RngCore as _;
 #[cfg(feature = "test-support")]
 use tokio::sync::watch::{Sender, error::RecvError};
 use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
@@ -17,9 +16,7 @@ use vala_bifrost_redux::oracle::{
 };
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, NodeId, QueryClass, SignedPeerTicket, VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, NodeId, QueryClass, SignedPeerTicket};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::query_conversion::QueryStreamConverter;
 use wyrd_tonic::tonic::metadata::MetadataValue;
@@ -262,11 +259,9 @@ impl ReadyOracleForwarder {
                 wall_deadline,
             }
             .into_claims((local.key.node_id, local.fencing_token))?;
-            let ticket = self
-                .authority
-                .mint_forward_query(&claims)
-                .map_err(|_| BifrostError::QueryPeerSecurity)?;
-            return self.accept(ticket).await;
+            // Same process: the context is already verified here, so nothing is
+            // signed only to be verified again.
+            return self.execute_local(claims).await;
         }
         let remote_candidates = candidates
             .drain(..)
@@ -293,9 +288,7 @@ impl ReadyOracleForwarder {
                     .mint_forward_query(claims)
                     .map_err(|_| BifrostError::QueryPeerSecurity)
             },
-            |_leader, client, ticket, visibility| {
-                self.forward_remote(ConnectedOracle { client }, ticket, visibility)
-            },
+            |_leader, client, ticket| self.forward_remote(ConnectedOracle { client }, ticket),
         )
         .await
     }
@@ -319,6 +312,24 @@ impl ReadyOracleForwarder {
             .verify_forward_query(&ticket, self.local_node_id, fence, chrono::Utc::now())
             .await
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
+        self.execute_local(claims).await
+    }
+
+    /// Runs already-authorized forwarding claims on this replica's local Oracle.
+    ///
+    /// Both entries reach here: a remote envelope after signature verification,
+    /// and a same-process selection whose context this node verified itself.
+    /// The claims are still checked against this Oracle's audience and fence.
+    ///
+    /// # Errors
+    /// Returns a closed role-fence, deadline, or query failure.
+    async fn execute_local(
+        &self,
+        claims: ForwardQueryClaims,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let fence = self
+            .local_fence
+            .ok_or(BifrostError::OracleRoleUnavailable)?;
         Self::validate_claims(&claims, self.local_node_id, fence)?;
         self.local_oracle
             .as_ref()
@@ -330,7 +341,7 @@ impl ReadyOracleForwarder {
     /// Signs a shortened ingress budget and exercises ordinary ticket acceptance.
     ///
     /// Test-only callers supply an already authorized context; verification,
-    /// replay protection, fencing and Oracle preparation remain production code.
+    /// fencing and Oracle preparation remain production code.
     ///
     /// # Errors
     /// Returns role, signing, validation or query errors from normal acceptance.
@@ -361,6 +372,14 @@ impl ReadyOracleForwarder {
     }
 
     /// Connects one endpoint without sending any query envelope bytes.
+    ///
+    /// The client lifts tonic's 4 MiB default decode cap: a forwarded query
+    /// frame carries one result batch the owning leader already materialized,
+    /// and a batch of acknowledged rows can exceed 4 MiB.
+    ///
+    /// # Errors
+    /// Returns peer-security failure for missing or invalid TLS, and role
+    /// unavailability when the endpoint cannot be reached.
     async fn connect(
         &self,
         address: String,
@@ -374,7 +393,9 @@ impl ReadyOracleForwarder {
         endpoint
             .connect()
             .await
-            .map(OraclePeerServiceClient::new)
+            .map(|channel| {
+                OraclePeerServiceClient::new(channel).max_decoding_message_size(usize::MAX)
+            })
             .map_err(|_| BifrostError::OracleRoleUnavailable)
     }
 
@@ -388,7 +409,6 @@ impl ReadyOracleForwarder {
         &self,
         mut connected: ConnectedOracle,
         ticket: SignedPeerTicket,
-        visibility: VisibilityMode,
     ) -> Result<OracleQueryStream, BifrostError> {
         let bearer = self
             .credentials
@@ -429,7 +449,7 @@ impl ReadyOracleForwarder {
             .ok_or(BifrostError::QueryPeerSecurity)?;
         let mut wire = response.into_inner();
         let frames = async_stream::stream! {
-            let mut converter = QueryStreamConverter::new(visibility);
+            let mut converter = QueryStreamConverter::new();
             let mut ipc = ForwardedQueryIpc::new();
             while let Some(frame) = wire.next().await {
                 let frame = match frame {
@@ -602,17 +622,16 @@ where
     CF: FnMut(NodeId, String) -> CFut,
     CFut: Future<Output = Result<C, BifrostError>>,
     EF: FnOnce(&ForwardQueryClaims) -> Result<E, BifrostError>,
-    DF: FnOnce((NodeId, u64), C, E, VisibilityMode) -> DFut,
+    DF: FnOnce((NodeId, u64), C, E) -> DFut,
     DFut: Future<Output = Result<O, BifrostError>>,
 {
     let (leader, connected) = connect_before_delivery(candidates, deadline, connect).await?;
     let claims = attempt.into_claims(leader)?;
-    let visibility = claims.request.visibility;
     let envelope = make_envelope(&claims)?;
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .ok_or(BifrostError::QueryTimeout)?;
-    tokio::time::timeout(remaining, deliver(leader, connected, envelope, visibility))
+    tokio::time::timeout(remaining, deliver(leader, connected, envelope))
         .await
         .map_err(|_| BifrostError::QueryTimeout)?
 }
@@ -637,9 +656,9 @@ pub(crate) struct ForwardingAttempt {
 impl ForwardingAttempt {
     /// Builds the one signed-envelope payload for the elected leader.
     ///
-    /// The envelope binds authorization only: audience, leader fence, replay
-    /// identity, expiry, the authenticated context, the unchanged request body,
-    /// and the absolute deadline. The leader pins its own participant cut.
+    /// The envelope binds authorization only: audience, leader fence, expiry,
+    /// the authenticated context, the unchanged request body, and the absolute
+    /// deadline. The leader pins its own participant cut.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryPeerSecurity`] when the request id is not a
@@ -654,13 +673,10 @@ impl ForwardingAttempt {
         if uuid::Uuid::parse_str(context.request_id.as_str()).is_err() {
             return Err(BifrostError::QueryPeerSecurity);
         }
-        let mut nonce = vec![0_u8; 16];
-        rand::rng().fill_bytes(&mut nonce);
         Ok(ForwardQueryClaims {
             protocol_version: 1,
             audience: leader.0,
             worker_fence: leader.1,
-            nonce,
             expires_at_ms: (now + FORWARD_ENVELOPE_TTL)
                 .min(wall_deadline)
                 .timestamp_millis(),
@@ -765,7 +781,7 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
         AuthMethod, ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease,
-        FreshnessPolicy, OracleCapabilitiesV1, VisibilityMode,
+        OracleCapabilitiesV1,
     };
 
     /// A remote RBAC denial remains a denial after crossing gRPC.
@@ -907,8 +923,6 @@ mod tests {
         .expect("tenant-bound query context");
         let request = BifrostQueryRequest {
             sql: "SELECT value FROM vala.bifrost.events".to_owned(),
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(5_000),
         };
         (context, request)
@@ -963,7 +977,7 @@ mod tests {
             |claims| Ok(claims.clone()),
             {
                 let delivered = Arc::clone(&delivered);
-                move |leader, (), envelope: ForwardQueryClaims, _visibility| {
+                move |leader, (), envelope: ForwardQueryClaims| {
                     delivered.lock().expect("delivery lock").push((
                         leader,
                         envelope.audience,
@@ -1012,7 +1026,7 @@ mod tests {
             |claims| Ok(claims.clone()),
             {
                 let ambiguous_deliveries = Arc::clone(&ambiguous_deliveries);
-                move |leader, (), envelope: ForwardQueryClaims, _visibility| {
+                move |leader, (), envelope: ForwardQueryClaims| {
                     ambiguous_deliveries
                         .lock()
                         .expect("ambiguous delivery lock")
@@ -1104,7 +1118,7 @@ mod tests {
             {
                 let deliveries = Arc::clone(&deliveries);
                 let cancelled = Arc::clone(&cancelled);
-                move |_leader, (), _envelope: ForwardQueryClaims, _visibility| {
+                move |_leader, (), _envelope: ForwardQueryClaims| {
                     *deliveries.lock().expect("delivery lock") += 1;
                     async move {
                         let _probe = DropProbe(cancelled);

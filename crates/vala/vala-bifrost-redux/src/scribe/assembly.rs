@@ -1,10 +1,10 @@
 //! Cross-generation staging claims — what gets merged into one hot object.
 //!
-//! Batch-ID routing deliberately spreads one logical `(tenant, table,
-//! partition)` key across all sixteen shards, and each shard rotates its
-//! generation on its own aggregate size and age. One key therefore arrives on
-//! the staging volume as many small immutable members produced by different
-//! shards at different times. Publishing each of those as its own hot object is
+//! Each shard rotates its whole generation on its own aggregate size and age,
+//! and batch-ID routing can spread one logical `(tenant, table, partition)`
+//! key across every configured shard. One key therefore arrives on the
+//! staging volume as many small immutable members produced by different
+//! generations and shards at different times. Publishing each of those as its own hot object is
 //! exactly the amplification this refactor exists to remove: one object PUT,
 //! one `file_list` row, and one Oracle footer open per 32 MiB slice.
 //!
@@ -434,8 +434,6 @@ pub enum ClaimCause {
     Dwell,
     /// The key's physical partition closed and will receive no more members.
     PartitionClosed,
-    /// Staging or scratch pressure required releasing durable bytes early.
-    Pressure,
     /// Graceful drain is settling every admitted member before shutdown.
     Drain,
     /// Startup resumed a durable claim taken by an earlier process.
@@ -452,7 +450,6 @@ impl ClaimCause {
             Self::Target => "target",
             Self::Dwell => "dwell",
             Self::PartitionClosed => "partition_closed",
-            Self::Pressure => "pressure",
             Self::Drain => "drain",
             Self::Recovery => "recovery",
         }

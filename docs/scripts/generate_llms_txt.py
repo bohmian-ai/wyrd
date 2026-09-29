@@ -103,8 +103,6 @@ CARD_SPECS = {
     "artifact": "artifact_spec.json",
     "audit": "audit_spec.json",
     "data": "data_spec.json",
-    "drift": "drift_spec.json",
-    "eval": "eval_spec.json",
     "experiment": "experiment_spec.json",
     "mcp": "mcp_spec.json",
     "model": "model_spec.json",
@@ -113,6 +111,7 @@ CARD_SPECS = {
     "prompt": "prompt_spec.json",
     "service": "service_spec.json",
     "trigger": "trigger_spec.json",
+    "verifier": "verifier_spec.json",
     "workflow": "workflow_spec.json",
 }
 
@@ -121,8 +120,6 @@ PURPOSES = {
     "artifact": "Track an immutable artifact that belongs to a card, run, or service release.",
     "audit": "Represent a reviewable event or decision that needs durable provenance.",
     "data": "Describe a dataset, feature table, document set, or other data dependency.",
-    "drift": "Describe the drift contract Wyrd uses to watch behavior over time.",
-    "eval": "Define an evaluation suite, scoring rule, or acceptance check.",
     "experiment": "Group work-in-progress runs and candidate changes under a single intent.",
     "mcp": "Describe an MCP surface that tools and agents can discover consistently.",
     "model": "Describe a model artifact, its interface, and the context needed to use it safely.",
@@ -131,6 +128,7 @@ PURPOSES = {
     "prompt": "Version prompt content and the contract around its inputs and outputs.",
     "service": "Describe a deployable service and the runtime rules Wyrd can lock.",
     "trigger": "Describe an event source that can start a workflow or service action.",
+    "verifier": "Declare one drift or eval verification a subject attaches through its own verified_by binding.",
     "workflow": "Describe a coordinated sequence of operators, tools, agents, or services.",
 }
 

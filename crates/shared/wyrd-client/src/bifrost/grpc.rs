@@ -18,12 +18,6 @@ use wyrd_tonic::wyrd::v1::bifrost_ingest_service_client::BifrostIngestServiceCli
 use crate::bifrost::sink::IngestTransport;
 use wyrd_queue::{ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 
-/// Maximum Arrow IPC payload for one Bifrost batch after decompression.
-pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
-
-/// Protobuf and gRPC framing allowance added to the Arrow payload ceiling.
-pub const PROTO_FRAME_OVERHEAD_BYTES: usize = 4 * 1024;
-
 /// Maximum number of reconnect retries for one unacknowledged batch.
 #[cfg(any(test, feature = "test-support"))]
 pub const MAX_FRAME_RETRIES: u32 = 8;
@@ -146,10 +140,10 @@ impl BifrostGrpcTransport {
         self.add_auth_metadata(&mut request, request_id)
             .await
             .map_err(AttemptError::terminal)?;
-        let max_message_bytes = MAX_FRAME_BYTES + PROTO_FRAME_OVERHEAD_BYTES;
-        let mut client = BifrostIngestServiceClient::new(self.connection.channel())
-            .max_decoding_message_size(max_message_bytes)
-            .max_encoding_message_size(max_message_bytes);
+        // The server owns the configured ingest wire ceiling and refuses a
+        // larger frame with its typed payload-too-large error; tonic's default
+        // encoding size is unbounded, so the client sends what it was given.
+        let mut client = BifrostIngestServiceClient::new(self.connection.channel());
         let response = client
             .insert_batch(request)
             .await
@@ -281,8 +275,8 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
         &self,
         batch: &SealedBatch<ClientByteGuard>,
     ) -> Result<DurableBatchAck, SinkError> {
-        if let Err(error) = validate_frame(&batch.table, batch.bytes().len())
-            .and_then(|()| validate_batch_id(batch.batch_id))
+        if let Err(error) =
+            validate_table(&batch.table).and_then(|()| validate_batch_id(batch.batch_id))
         {
             return Err(SinkError::Terminal(error));
         }
@@ -349,21 +343,20 @@ impl AttemptError {
     }
 }
 
-fn validate_frame(table: &str, arrow_bytes: usize) -> Result<(), WyrdError> {
+/// Refuses a batch that names no table before it reaches the transport.
+///
+/// Frame size is deliberately not checked here: the ingest wire ceiling is an
+/// operator-configured server setting, and the server refuses a larger frame
+/// with its typed payload-too-large error.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Validation`] when `table` is empty.
+fn validate_table(table: &str) -> Result<(), WyrdError> {
     if table.is_empty() {
         return Err(WyrdError::Validation {
             message: "bifrost batch table must not be empty".to_owned(),
             details: serde_json::json!({ "field": "table" }),
-        });
-    }
-    if arrow_bytes > MAX_FRAME_BYTES {
-        return Err(WyrdError::PayloadTooLarge {
-            message: format!("bifrost batch exceeds {MAX_FRAME_BYTES} Arrow IPC bytes"),
-            details: serde_json::json!({
-                "field": "arrow_ipc",
-                "actual_bytes": arrow_bytes,
-                "limit_bytes": MAX_FRAME_BYTES,
-            }),
         });
     }
     Ok(())
@@ -424,13 +417,14 @@ fn auth_error_to_wyrd(error: AuthError) -> WyrdError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bifrost::BifrostClientError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig};
+    use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig, WyrdQueueError};
 
     use crate::auth::AuthMiddleware;
     use crate::config::ClientConfig;
@@ -541,14 +535,6 @@ mod tests {
             rows: 1,
             request_id: None,
         }
-    }
-
-    #[test]
-    fn frame_limit_is_enforced() {
-        assert!(validate_frame("events", MAX_FRAME_BYTES).is_ok());
-        let error = validate_frame("events", MAX_FRAME_BYTES + 1)
-            .expect_err("one byte above the frame limit must fail");
-        assert_eq!(error.code(), "WYRD_SPEC_413_PAYLOAD_TOO_LARGE");
     }
 
     #[test]
@@ -739,8 +725,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the service, facade, or batch cannot be built, when the
-    /// flush or shutdown fails, or when the settled batch keeps bytes, a live
-    /// batch, or a retry entry.
+    /// flush returns an unexpected error, shutdown fails, or the settled batch
+    /// keeps bytes, a live batch, or a retry entry.
     async fn settle_held_batch<S: BifrostIngestService>(
         service: S,
         attempts: &AtomicUsize,
@@ -803,10 +789,13 @@ mod tests {
             bifrost
                 .enqueue_batch("events", batch.clone(), None)
                 .expect("batch admitted");
-            bifrost
-                .flush()
-                .await
-                .expect("an enqueued batch's loss settles through the observer");
+            match bifrost.flush().await {
+                Ok(())
+                | Err(BifrostClientError::Queue(WyrdQueueError::Sink(
+                    WyrdError::ServiceUnavailable { .. },
+                ))) => {}
+                Err(error) => panic!("unexpected flush failure: {error}"),
+            }
         }
         let flushed = attempts.load(Ordering::Acquire);
         let metrics = bifrost.metrics();

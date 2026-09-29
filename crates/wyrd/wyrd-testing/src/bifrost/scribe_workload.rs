@@ -1269,6 +1269,12 @@ impl crate::WyrdTestServer {
 
     /// Appends one fixed-identity batch through the public gRPC ingest route.
     ///
+    /// Every row carries `event_time_micros` as its caller-supplied
+    /// `wyrd_event_time`. The server would otherwise stamp each row with its
+    /// receipt time, which places a run's rows in whichever time partition the
+    /// wall clock happens to be in, so two runs of the same record could
+    /// publish different file layouts.
+    ///
     /// # Errors
     ///
     /// Returns an error when the tenant credential, Arrow IPC encoding, client
@@ -1279,16 +1285,32 @@ impl crate::WyrdTestServer {
         table_fqn: &str,
         batch_id: Uuid,
         rows: &[i64],
+        event_time_micros: i64,
     ) -> Result<(), crate::WyrdTestServerError> {
         let client = self.workload_client(tenant).await?;
         let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+                arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                ),
+                false,
+            ),
         ]));
         let batch = arrow::record_batch::RecordBatch::try_new(
             std::sync::Arc::clone(&schema),
-            vec![std::sync::Arc::new(arrow::array::Int64Array::from(
-                rows.to_vec(),
-            ))],
+            vec![
+                std::sync::Arc::new(arrow::array::Int64Array::from(rows.to_vec())),
+                std::sync::Arc::new(
+                    arrow::array::TimestampMicrosecondArray::from(vec![
+                        event_time_micros;
+                        rows.len()
+                    ])
+                    .with_timezone("UTC"),
+                ),
+            ],
         )
         .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
         let mut ipc = Vec::new();
@@ -1323,8 +1345,6 @@ impl crate::WyrdTestServer {
         let mut stream = query
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
                 sql: format!("SELECT value FROM {table_fqn}"),
-                visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
                 deadline_ms: Some(60_000),
             })
             .await
@@ -1515,6 +1535,16 @@ impl crate::bifrost::WyrdTestCluster {
         let bindings = running_pod(&cluster)?
             .seed_scribe_workload_owners_for_test(workload)
             .await?;
+        // One event time for every row of the run, including its replay, so
+        // the run's rows share one time partition however long it takes or
+        // whichever hour boundary it crosses. The start of the current UTC day
+        // stays inside the ingest acceptance window and inside one partition at
+        // hour or day granularity.
+        let event_time_micros = chrono::Utc::now()
+            .date_naive()
+            .and_time(chrono::NaiveTime::MIN)
+            .and_utc()
+            .timestamp_micros();
 
         let mut acknowledged = 0_u64;
         // Reads observed since the *previous* checkpoint. A checkpoint consumes
@@ -1549,6 +1579,7 @@ impl crate::bifrost::WyrdTestCluster {
                             &declared.fqn(),
                             *batch_id,
                             rows,
+                            event_time_micros,
                         )
                         .await?;
                     acknowledged += rows.len() as u64;
@@ -1617,6 +1648,7 @@ impl crate::bifrost::WyrdTestCluster {
                                     &declared.fqn(),
                                     *batch_id,
                                     rows,
+                                    event_time_micros,
                                 )
                                 .await?;
                             replayed += 1;

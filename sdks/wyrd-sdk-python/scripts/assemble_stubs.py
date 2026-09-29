@@ -16,6 +16,7 @@ PUBLIC_MODULE_STUBS = {
     "client.pyi": PACKAGE_DIR / "client" / "__init__.pyi",
     "config.pyi": PACKAGE_DIR / "config" / "__init__.pyi",
     "data.pyi": PACKAGE_DIR / "data" / "__init__.pyi",
+    "eval.pyi": PACKAGE_DIR / "eval" / "__init__.pyi",
     "gateway.pyi": PACKAGE_DIR / "gateway" / "__init__.pyi",
     "model.pyi": PACKAGE_DIR / "model" / "__init__.pyi",
     "observe.pyi": PACKAGE_DIR / "observe" / "__init__.pyi",
@@ -23,6 +24,7 @@ PUBLIC_MODULE_STUBS = {
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
     "state.pyi": PACKAGE_DIR / "state" / "__init__.pyi",
     "testing.pyi": PACKAGE_DIR / "testing" / "__init__.pyi",
+    "verification.pyi": PACKAGE_DIR / "verification" / "__init__.pyi",
 }
 
 ROOT_STUB_FILES = ["header.pyi", "error.pyi"]
@@ -112,6 +114,7 @@ def rewrite_public_imports(filename: str, content: str) -> str:
         },
         "observe.pyi": {
             "from .bifrost import Bifrost": "from ..bifrost import Bifrost",
+            "from .eval import MediaRef": "from ..eval import MediaRef",
         },
         "observer.pyi": {
             "from wyrd.stubs.prompt import ProviderRequest, ProviderResponse": (

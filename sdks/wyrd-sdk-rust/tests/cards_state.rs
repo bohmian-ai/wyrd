@@ -2,7 +2,8 @@
 //!
 //! Mirrors the TypeScript `cards-state` journey: register a Service graph,
 //! read it back, hydrate complete and metadata-only bundles, stop the server,
-//! and load the complete bundle offline. Negative flows cover an
+//! and load the complete bundle offline. A standalone bound Agent proves its
+//! served binding identities are stable `UUIDv7`s. Negative flows cover an
 //! under-privileged credential, an unknown alias, and an unhydrated bundle.
 
 use std::path::{Path, PathBuf};
@@ -51,6 +52,66 @@ fn write_service_graph(root: &Path) -> PathBuf {
     )
     .expect("service card writes");
     service
+}
+
+/// Write an eval Verifier and a standalone Agent bound to it.
+///
+/// The Agent is the smallest binding owner: one Agent-level binding running the
+/// Verifier on an inline `observations_ready` Trigger. It reuses the shared
+/// Prompt, so it registers after the Prompt. Returns the Verifier and Agent
+/// paths in registration order.
+///
+/// # Panics
+/// Panics when a fixture file cannot be written.
+fn write_bound_agent(root: &Path) -> (PathBuf, PathBuf) {
+    let verifier = root.join("verifier.yaml");
+    std::fs::write(
+        &verifier,
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: rust-eval\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n    spec:\n      tasks: {}\n",
+    )
+    .expect("verifier card writes");
+    let agent = root.join("bound-agent.yaml");
+    std::fs::write(
+        &agent,
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: rust-bound-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt:\n    kind: Prompt\n    name: rust-shared-prompt\n    version: 1.0.0\n    space: default\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: rust-eval\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: observations_ready\n",
+    )
+    .expect("bound agent card writes");
+    (verifier, agent)
+}
+
+/// Register the bound Agent twice and read its stable binding identities.
+///
+/// Reads the Agent through the public Cards handle after each registration and
+/// asserts `status.verification.binding_ids` holds one `UUIDv7` that the
+/// identical reapply keeps.
+///
+/// # Panics
+/// Panics when a registration or read fails, or the served binding identities
+/// are absent, not `UUIDv7`, or change on reapply.
+async fn assert_stable_binding_ids(cards: &Cards, root: &Path) {
+    let (verifier, agent) = write_bound_agent(root);
+    Box::pin(cards.register_from_path(&verifier))
+        .await
+        .expect("verifier registers");
+    let mut served = Vec::new();
+    for _ in 0..2 {
+        let receipt = Box::pin(cards.register_from_path(&agent))
+            .await
+            .expect("bound agent registers");
+        let card = cards
+            .get(CardSelector::exact(receipt.root))
+            .await
+            .expect("bound agent reads");
+        let ids = card
+            .status
+            .and_then(|status| status.verification)
+            .expect("a binding owner serves verification status")
+            .binding_ids;
+        assert_eq!(ids.len(), 1, "one Agent-level binding");
+        assert_eq!(ids[0].as_uuid().get_version_num(), 7);
+        served.push(ids);
+    }
+    assert_eq!(served[0], served[1], "reapply keeps binding identity");
 }
 
 /// Assert the offline view of a complete bundle and both offline refusals.
@@ -174,6 +235,8 @@ async fn registers_reads_hydrates_and_loads_offline_state() {
         .expect("service reads");
     assert_eq!(card.kind.wire_name(), "Service");
     assert_eq!(card.metadata.name.as_str(), "rust-hydrated-service");
+
+    assert_stable_binding_ids(&cards, root.path()).await;
 
     server
         .seed_role(

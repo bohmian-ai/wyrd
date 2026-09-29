@@ -25,3 +25,4 @@ pub(crate) mod queue;
 pub use executor::{ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite};
 pub use fingerprint::{ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput};
 pub use handoff::RewriteHandoff;
+pub use policy::ForgeTablePolicy;

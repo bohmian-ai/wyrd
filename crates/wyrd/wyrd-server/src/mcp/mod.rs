@@ -10,8 +10,9 @@
 //!
 //! The production catalog exposes three read-only Bifrost tools for table
 //! discovery, schema/layout description, and bounded terminal-safe queries,
-//! followed by the seventeen tenant gateway administration tools: seven reads,
-//! five idempotent replacements, and five destructive revocations or deletions.
+//! the Card read and Verification status tools, and per-caller write tools for
+//! credential revocation and manual Verifier runs, plus the seventeen tenant
+//! gateway administration tools.
 //! A test-support context probe is available only through explicit fixture opt-in.
 
 use std::borrow::Cow;
@@ -36,6 +37,7 @@ mod gateway;
 mod principals;
 #[cfg(feature = "test-support")]
 pub mod probe;
+mod verification;
 
 /// The only MCP protocol revision Wyrd serves.
 ///
@@ -139,6 +141,7 @@ impl WyrdMcpHandler {
     fn catalog(&self) -> Vec<Tool> {
         let mut catalog = bifrost::descriptors();
         catalog.extend(principals::descriptors_unscoped());
+        catalog.extend(verification::descriptors_unscoped());
         catalog.extend(gateway::descriptors());
         catalog
     }
@@ -176,6 +179,7 @@ impl ServerHandler for WyrdMcpHandler {
         self.catalog()
             .into_iter()
             .chain(principals::write_descriptors())
+            .chain(verification::write_descriptors())
             .chain(self.probe_descriptors())
             .find(|tool| tool.name == name)
     }
@@ -194,10 +198,13 @@ impl ServerHandler for WyrdMcpHandler {
         // permission it needs. An agent therefore never discovers a capability
         // it cannot use, and naming one anyway is still refused at dispatch.
         let mut catalog = self.catalog();
-        if let Ok(caller) = Self::caller(&context)
-            && principals::may_administer(&caller)
-        {
-            catalog.extend(principals::write_descriptors());
+        if let Ok(caller) = Self::caller(&context) {
+            if principals::may_administer(&caller) {
+                catalog.extend(principals::write_descriptors());
+            }
+            if verification::may_start_runs(&caller) {
+                catalog.extend(verification::write_descriptors());
+            }
         }
         catalog.extend(self.probe_descriptors());
         Ok(ListToolsResult::with_all_items(catalog))
@@ -255,6 +262,31 @@ impl ServerHandler for WyrdMcpHandler {
                 // it would refuse identically while auditing nothing, so it
                 // would only be a place for the two to drift apart.
                 self.mcp_revoke_credential(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            verification::CARDS_GET => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_get_card(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            verification::GET_BINDING => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_get_binding(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            verification::GET_RUN => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_get_run(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            verification::START_RUN => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                // Authorized and audited by the operation, like revocation.
+                self.mcp_start_run(caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
             }

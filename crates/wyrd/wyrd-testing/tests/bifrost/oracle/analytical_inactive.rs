@@ -23,9 +23,7 @@ use vala_bifrost_redux::oracle::analytical::DataFusionQueryId;
 use vala_bifrost_redux::oracle::analytical_supervisor::AnalyticalAttemptKey;
 use vala_bifrost_redux::oracle::telemetry::AnalyticalAttemptOutcome;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, VisibilityMode,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryStreamFrame};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
@@ -72,8 +70,6 @@ async fn execute_inactive_analytical(
             query_context(tenant)?,
             BifrostQueryRequest {
                 sql: sql.to_owned(),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(30_000),
             },
             attempt_context(),
@@ -135,8 +131,6 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
         sql: sql.to_owned(),
-        visibility: VisibilityMode::PublishedOnly,
-        freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(30_000),
     }
 }

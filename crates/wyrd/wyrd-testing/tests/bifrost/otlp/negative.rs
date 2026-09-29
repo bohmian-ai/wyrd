@@ -44,6 +44,45 @@ const LOG_REJECTION: &str = "log severity_text exceeds the accepted length";
 /// The stable reason an empty metric name is rejected with.
 const METRIC_REJECTION: &str = "metric name is empty or exceeds the accepted length";
 
+/// Scope the expanded-ceiling trace exports are recorded under.
+const FAN_OUT_TRACE_SCOPE: &str = "wyrd.tests.otlp.negative.fan_out";
+
+/// Bytes of the single resource attribute projection repeats onto every span.
+const FAN_OUT_ATTRIBUTE_BYTES: usize = 64 * 1024;
+
+/// Builds one trace export whose large resource attribute fans out per span.
+///
+/// The attribute is sent once on the wire but projected onto every span row,
+/// so the canonical output grows with `spans` while the wire stays small.
+fn fan_out_resource_spans(anchor: i64, spans: u16) -> Vec<ResourceSpans> {
+    let mut resource = support::resource();
+    resource.attributes.push(support::string_attribute(
+        "wyrd.test.padding",
+        &"p".repeat(FAN_OUT_ATTRIBUTE_BYTES),
+    ));
+    let spans = (0..spans)
+        .map(|index| {
+            let [high, low] = index.to_be_bytes();
+            support::maximal_span(
+                anchor,
+                SpanIdentity {
+                    trace_id: NEGATIVE_TRACE_ID,
+                    span_id: [0xc0, 0, 0, 0, 0, 0, high, low],
+                },
+            )
+        })
+        .collect();
+    vec![ResourceSpans {
+        resource: Some(resource),
+        scope_spans: vec![ScopeSpans {
+            scope: Some(support::signal_scope(FAN_OUT_TRACE_SCOPE)),
+            spans,
+            schema_url: SCOPE_SCHEMA_URL.to_owned(),
+        }],
+        schema_url: RESOURCE_SCHEMA_URL.to_owned(),
+    }]
+}
+
 /// A severity text past the projection's accepted length.
 fn over_long_severity_text() -> String {
     "W".repeat(128)
@@ -196,10 +235,10 @@ mod pg_tests {
     use super::super::trace_export::export_traces_over_grpc_as;
     use super::super::trace_export_http::{HttpEncoding, post_otlp, post_otlp_raw};
     use super::{
-        ATTRIBUTION_RUN, LOG_MARKERS, LOG_REJECTION, METRIC_REJECTION, NEGATIVE_LOG_SCOPE,
-        NEGATIVE_METRIC_SCOPE, NEGATIVE_TRACE_SCOPE, SPAN_MARKERS, SPAN_REJECTION,
-        correlated_resource_spans, negative_resource_logs, negative_resource_metrics,
-        negative_resource_spans, ordered_rows,
+        ATTRIBUTION_RUN, FAN_OUT_TRACE_SCOPE, LOG_MARKERS, LOG_REJECTION, METRIC_REJECTION,
+        NEGATIVE_LOG_SCOPE, NEGATIVE_METRIC_SCOPE, NEGATIVE_TRACE_SCOPE, SPAN_MARKERS,
+        SPAN_REJECTION, correlated_resource_spans, fan_out_resource_spans, negative_resource_logs,
+        negative_resource_metrics, negative_resource_spans, ordered_rows,
     };
 
     /// A mixed request commits its complete siblings and reports exactly one.
@@ -582,6 +621,69 @@ mod pg_tests {
         ] {
             assert_no_rows(&journey, table, scope).await;
         }
+
+        journey.shutdown().await;
+    }
+
+    /// A wire-small export whose projection expands past four times the wire
+    /// ceiling is refused whole before WAL, while a smaller export of the same
+    /// shape is accepted.
+    ///
+    /// The large resource attribute is sent once and repeated onto every span
+    /// row, which is exactly the expansion the wire ceiling cannot see. The
+    /// refused export must answer with the typed payload-too-large problem and
+    /// leave no row behind: the scope holds only the accepted export's spans.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fitting export is refused, the expanding export exceeds
+    /// the wire ceiling or is accepted, or any of its rows become queryable.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn projected_fan_out_above_expanded_ceiling_is_refused_before_ack() {
+        let journey = OtlpJourney::start().await;
+        let anchor = support::anchor_nanos();
+        let fits = ExportTraceServiceRequest {
+            resource_spans: fan_out_resource_spans(anchor, 8),
+        };
+        post_otlp(
+            &journey,
+            "/v1/traces",
+            HttpEncoding::Protobuf,
+            fits.encode_to_vec(),
+        )
+        .await;
+        let expands = ExportTraceServiceRequest {
+            resource_spans: fan_out_resource_spans(anchor, 2048),
+        }
+        .encode_to_vec();
+        assert!(
+            expands.len() < vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+            "the expanding export is within the wire ceiling: {}",
+            expands.len()
+        );
+        assert_refused(
+            &journey,
+            "/v1/traces",
+            HttpEncoding::Protobuf,
+            expands,
+            Some(journey.token().to_owned()),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+        )
+        .await;
+
+        journey.publish().await;
+        let stored: usize = journey
+            .try_query(&format!(
+                "SELECT wyrd_row_ordinal FROM {SPANS_TABLE} WHERE scope_name = '{FAN_OUT_TRACE_SCOPE}'"
+            ))
+            .await
+            .expect("the accepted export is queryable")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(stored, 8, "only the accepted export's spans are stored");
 
         journey.shutdown().await;
     }

@@ -123,7 +123,7 @@ impl PyAgentCard {
             prompt: prompt.borrow().inner.clone(),
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         };
         let inner = AgentCard {
             space: resolved_space.unwrap_or_else(|| "default".to_owned()),

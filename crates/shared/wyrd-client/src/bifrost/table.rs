@@ -57,6 +57,9 @@ pub struct TableConfig {
     user_schema: SchemaRef,
     /// The layout to request at register time; `None` takes the server default.
     physical_layout: Option<PhysicalLayoutWire>,
+    /// Explicit Forge compaction file target; `None` follows the deployment
+    /// default.
+    compaction_target_file_size_bytes: Option<u64>,
     /// Server-assigned once registered or described; `None` while inert.
     resolved: Option<ResolvedTable>,
 }
@@ -82,6 +85,7 @@ impl TableConfig {
             name,
             user_schema: schema,
             physical_layout: None,
+            compaction_target_file_size_bytes: None,
             resolved: None,
         })
     }
@@ -184,6 +188,7 @@ impl TableConfig {
             name: description.entry.name.clone(),
             user_schema: Arc::new(user_schema),
             physical_layout: Some(description.physical_layout.clone()),
+            compaction_target_file_size_bytes: description.compaction_target_file_size_bytes,
             resolved: Some(ResolvedTable {
                 table_uid: description.entry.table_uid.clone(),
                 fingerprint: description.entry.fingerprint.clone(),
@@ -199,6 +204,25 @@ impl TableConfig {
     pub fn with_layout(mut self, layout: PhysicalLayoutWire) -> Self {
         self.physical_layout = Some(layout);
         self
+    }
+
+    /// Declare the soft file target Forge compacts this table toward, in bytes.
+    ///
+    /// Omitted, the table follows the Forge deployment default (1 GiB unless
+    /// the operator moved it). The server refuses a target below the 128 MiB
+    /// row-group target with `WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET`,
+    /// and a re-register whose target differs from the stored one with
+    /// `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`.
+    #[must_use]
+    pub fn with_compaction_target_file_size_bytes(mut self, bytes: u64) -> Self {
+        self.compaction_target_file_size_bytes = Some(bytes);
+        self
+    }
+
+    /// The explicit compaction file target, when declared or described.
+    #[must_use]
+    pub fn compaction_target_file_size_bytes(&self) -> Option<u64> {
+        self.compaction_target_file_size_bytes
     }
 
     /// `<namespace>.<name>` — the name SQL and `SealedBatch.table` both use.
@@ -239,6 +263,7 @@ impl TableConfig {
             name: self.name.clone(),
             fields: wyrd_queue::arrow_schema_to_fieldspec(&self.user_schema),
             physical_layout: self.physical_layout.clone(),
+            compaction_target_file_size_bytes: self.compaction_target_file_size_bytes,
         }
     }
 
@@ -268,6 +293,9 @@ struct TableConfigWire {
     /// The layout to request at register time, when one was declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     physical_layout: Option<PhysicalLayoutWire>,
+    /// The explicit compaction file target, when one was declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_target_file_size_bytes: Option<u64>,
     /// The server-minted identity, when the config is already resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolved: Option<ResolvedTable>,
@@ -281,6 +309,7 @@ impl From<TableConfig> for TableConfigWire {
             name: config.name,
             fields: wyrd_queue::arrow_schema_to_fieldspec(&config.user_schema),
             physical_layout: config.physical_layout,
+            compaction_target_file_size_bytes: config.compaction_target_file_size_bytes,
             resolved: config.resolved,
         }
     }
@@ -301,8 +330,52 @@ impl TryFrom<TableConfigWire> for TableConfig {
             name: wire.name,
             user_schema: Arc::new(wyrd_queue::fieldspec_to_arrow(&wire.fields)?),
             physical_layout: wire.physical_layout,
+            compaction_target_file_size_bytes: wire.compaction_target_file_size_bytes,
             resolved: wire.resolved,
         })
+    }
+}
+
+/// One table this connected writer has described, with its cached user schema.
+///
+/// Holding this value is the proof that the table was described once for this
+/// writer's lifetime, which is what lets [`crate::bifrost::Bifrost::insert_into`]
+/// stay a synchronous, IO-free enqueue: there is no way to name a destination
+/// the writer has not already resolved, so no insert path can smuggle in a
+/// per-observation describe or a caller-supplied schema.
+///
+/// One schema is authoritative per table name for that lifetime. A server-side
+/// schema change therefore requires a new writer after shutdown; the existing
+/// fingerprint fence refuses a stale batch rather than silently replacing a
+/// live producer's schema.
+#[derive(Debug, Clone)]
+pub struct WriterTable {
+    /// Fully-qualified `<namespace>.<name>` destination.
+    fqn: Arc<str>,
+    /// The user schema the server described for this table.
+    schema: SchemaRef,
+}
+
+impl WriterTable {
+    /// Build a described destination from its resolved config.
+    #[must_use]
+    pub(crate) fn new(fqn: &str, schema: SchemaRef) -> Self {
+        Self {
+            fqn: Arc::from(fqn),
+            schema,
+        }
+    }
+
+    /// The fully-qualified table name rows are routed to.
+    #[must_use]
+    pub fn fqn(&self) -> &str {
+        &self.fqn
+    }
+
+    /// The described user schema rows are parsed against when a batch seals.
+    #[must_use]
+    pub fn user_schema(&self) -> &SchemaRef {
+        &self.schema
     }
 }
 

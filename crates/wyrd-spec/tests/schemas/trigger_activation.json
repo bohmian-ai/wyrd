@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TriggerActivation",
+  "description": "The closed set of conditions that activate a bound Verifier.\n\n`Schedule` is valid only for a Drift-backed Verifier and `ObservationsReady` only for an Eval-backed Verifier. Server registration enforces that pairing once the effective Verifier's implementation is known; the activation itself never names the Verifier.",
+  "oneOf": [
+    {
+      "description": "Activate on each due occurrence of a cron schedule.",
+      "type": "object",
+      "required": [
+        "cron",
+        "kind"
+      ],
+      "properties": {
+        "cron": {
+          "description": "Cron expression.",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "schedule"
+          ]
+        },
+        "tz": {
+          "description": "Optional IANA timezone; absent means UTC.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Activate on each successfully committed observation for the subject.\n\nDeclared as a fieldless struct variant so the enum-level `deny_unknown_fields` applies: a unit variant's internally tagged visitor would silently drain every sibling key, admitting typos and pasted secrets. The authored wire shape stays `{kind: observations_ready}`.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "observations_ready"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

@@ -79,6 +79,19 @@ pub enum BifrostError {
     )]
     QueryAdmissionRejected,
 
+    /// Every waiting place in this pod's Oracle query queue is taken.
+    ///
+    /// Retryable overload: the query was refused immediately and holds no
+    /// place, so a retry after capacity returns can succeed.
+    #[error("query queue full")]
+    #[wyrd_error(
+        code = "WYRD_VALA_429_QUERY_QUEUE_FULL",
+        status = 429,
+        title = "Query queue full",
+        remediation = "Retry after capacity becomes available."
+    )]
+    QueryQueueFull,
+
     /// One indivisible query memory request exceeds its governing ceiling.
     #[error("query memory request too large")]
     #[wyrd_error(
@@ -89,13 +102,13 @@ pub enum BifrostError {
     )]
     QueryMemoryRequestTooLarge,
 
-    /// The requested sealed or live visibility cut could not be acquired.
+    /// A required published query source could not be pinned or read.
     #[error("query visibility unavailable")]
     #[wyrd_error(
         code = "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE",
         status = 503,
         title = "Query visibility unavailable",
-        remediation = "Retry when the sealed/live source is available or select an allowed weaker freshness."
+        remediation = "Retry when the published query source is available."
     )]
     QueryVisibilityUnavailable,
 
@@ -760,6 +773,41 @@ column to let the server stamp receipt time."
         remediation = "Retry with the table's registered physical layout or register a different table."
     )]
     PhysicalLayoutMismatch {
+        /// Canonical `<namespace>.<name>` of the conflicting table.
+        table: String,
+    },
+
+    /// A register call supplied a compaction file target Forge could not honor.
+    ///
+    /// The target must be representable on the server, safe under Forge's
+    /// oversized-file arithmetic, above the default small-file threshold, and
+    /// at least the table's row-group target. Reported before any durable
+    /// state changes.
+    #[error("invalid compaction target file size {bytes} for table {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET",
+        status = 400,
+        title = "Invalid Bifrost compaction target",
+        remediation = "Omit compaction_target_file_size_bytes to follow the deployment default, or supply at least 134217728 bytes."
+    )]
+    InvalidCompactionTarget {
+        /// Canonical `<namespace>.<name>` of the table being registered.
+        table: String,
+        /// The rejected byte count.
+        bytes: u64,
+    },
+
+    /// A register retry supplied a compaction file target that differs from
+    /// the table's existing explicit target, or supplied one for a table that
+    /// follows the deployment default.
+    #[error("compaction target mismatch for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH",
+        status = 409,
+        title = "Bifrost compaction target mismatch",
+        remediation = "Retry with the table's registered compaction target, omit it, or register a different table."
+    )]
+    CompactionTargetMismatch {
         /// Canonical `<namespace>.<name>` of the conflicting table.
         table: String,
     },

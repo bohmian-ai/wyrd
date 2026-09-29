@@ -139,3 +139,12 @@ name = "bifrost_peer_test_node"
 path = "src/bin/bifrost_peer_test_node.rs"
 test = false
 bench = false
+
+# The opt-in single-pod query capacity benchmark. Run only through
+# `mise run bench:bifrost:query-capacity`; it is part of no test, gate, or
+# verify lane.
+[[bin]]
+name = "bifrost_query_capacity"
+path = "src/bin/bifrost_query_capacity.rs"
+test = false
+bench = false

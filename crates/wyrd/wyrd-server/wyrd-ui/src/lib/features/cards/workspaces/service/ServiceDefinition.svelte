@@ -45,7 +45,7 @@
       <Table label="Components">
         <table>
           <thead>
-            <tr><th>Alias</th><th>Ref (Card · version)</th><th>Kind</th><th>publishes_to</th></tr>
+            <tr><th>Alias</th><th>Ref (Card · version)</th><th>Kind</th><th>verified_by</th></tr>
           </thead>
           <tbody>
             {#each definition.components.rows as row, i (i)}

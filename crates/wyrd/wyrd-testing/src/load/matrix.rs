@@ -26,7 +26,7 @@ use wyrd_client::bifrost::{BifrostClientError, CollectedQueryLimits, CollectedQu
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use crate::Bootstrap;
 use crate::WyrdTestServer;
@@ -189,8 +189,6 @@ pub struct ClusterCleanupSnapshot {
     pub scribe_inflight: u64,
     /// Persistent Scribe WAL streams retained by the server runtime.
     pub scribe_wal_streams: u64,
-    /// Exact Oracle tail fences observed after the cancellation owner released.
-    pub oracle_tail_fences: u64,
     /// Forge claims/attempts still active at the cleanup checkpoint.
     pub forge_active_claims: u64,
     /// Forge attempts still owned by a non-terminal task.
@@ -525,8 +523,6 @@ impl BifrostClusterLoad {
             .collect_bounded(
                 &BifrostQueryRequest {
                     sql: format!("SELECT id, tenant, batch FROM {table} LIMIT 0"),
-                    visibility: VisibilityMode::PublishedOnly,
-                    freshness: FreshnessPolicy::Strict,
                     deadline_ms: Some(5_000),
                 },
                 CollectedQueryLimits {
@@ -698,8 +694,6 @@ async fn exercise_query_cancellation(
             .collect_bounded(
                 &BifrostQueryRequest {
                     sql,
-                    visibility: VisibilityMode::PublishedOnly,
-                    freshness: FreshnessPolicy::Strict,
                     deadline_ms: Some(5_000),
                 },
                 CollectedQueryLimits {
@@ -715,7 +709,6 @@ async fn exercise_query_cancellation(
         admission_slots: 0,
         memory_bytes: 0,
         peer_slots: 0,
-        tail_fences: 0,
     };
     task.abort();
     let _ = task.await;
@@ -993,8 +986,6 @@ async fn run_public_matrix(
         let final_stream = query
             .query(&BifrostQueryRequest {
                 sql: final_sql,
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(5_000),
             })
             .await
@@ -1050,7 +1041,7 @@ async fn run_public_matrix(
         }
         let terminal_valid = final_result
             .terminal
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .is_ok()
             && final_result.terminal.row_count == final_result.rows as u64;
         if !terminal_valid {
@@ -1952,8 +1943,6 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                     .collect_bounded(
                         &BifrostQueryRequest {
                             sql,
-                            visibility: VisibilityMode::PublishedOnly,
-                            freshness: FreshnessPolicy::Strict,
                             deadline_ms: Some(deadline_ms),
                         },
                         CollectedQueryLimits {
@@ -2027,6 +2016,7 @@ fn is_retryable_read_error(error: &BifrostClientError) -> bool {
     [
         // Transient saturation: the server refused or could not finish in time.
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+        "WYRD_VALA_429_QUERY_QUEUE_FULL",
         "WYRD_VALA_429_INGEST_BUSY",
         "WYRD_VALA_504_QUERY_TIMEOUT",
         "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
@@ -2155,7 +2145,6 @@ async fn cleanup_snapshot(
         scribe_queued: queued,
         scribe_inflight: inflight,
         scribe_wal_streams: wal_streams,
-        oracle_tail_fences: inspection.active_tail_fences,
         forge_active_claims: inspection.forge_active_claims,
         forge_active_attempts: inspection.forge_active_attempts,
         forge_historical_attempts: inspection.forge_historical_attempts,

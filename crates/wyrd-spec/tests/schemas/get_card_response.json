@@ -87,13 +87,6 @@
             }
           ]
         },
-        "publishes_to": {
-          "description": "Eval and Drift cards that receive observations from this agent.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Ref"
-          }
-        },
         "run_config": {
           "description": "Agent run configuration.",
           "allOf": [
@@ -107,6 +100,13 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "verified_by": {
+          "description": "Continuous verification bindings owned by this standalone Agent.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/VerificationBinding"
           }
         }
       },
@@ -1311,8 +1311,7 @@
         "Prompt",
         "Agent",
         "Workflow",
-        "Eval",
-        "Drift",
+        "Verifier",
         "Service",
         "Policy",
         "Mcp",
@@ -2082,6 +2081,76 @@
         }
       ]
     },
+    "DriftBaselineState": {
+      "description": "Lifecycle of one PSI or SPC Verifier's server-fitted baseline.\n\nRegistration creates it `pending`; the fitter claims it `building` and settles it `ready` with the persisted fitted profile or `failed` with a structured error. A failed fit is retried through the same record while attempts remain, so `failed` is visible without being necessarily final.",
+      "oneOf": [
+        {
+          "description": "Registered and waiting for the fitter.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "Claimed by a fitter that is reading and fitting the baseline Data.",
+          "type": "string",
+          "enum": [
+            "building"
+          ]
+        },
+        {
+          "description": "Fitted and persisted; runs may start.",
+          "type": "string",
+          "enum": [
+            "ready"
+          ]
+        },
+        {
+          "description": "The last fit attempt failed; see the structured error.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        }
+      ]
+    },
+    "DriftBaselineStatus": {
+      "description": "Server-derived fitted-baseline status of a PSI or SPC Drift Verifier.\n\nServed on `card.status.verification.baseline`; it never mutates the authored spec.",
+      "type": "object",
+      "required": [
+        "data",
+        "state"
+      ],
+      "properties": {
+        "data": {
+          "description": "Exact baseline Data Card the profile is fitted from, UID-pinned.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        "error": {
+          "description": "Structured error of the last failed fit attempt, when one failed.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VerificationError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "description": "Current fit lifecycle state.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/DriftBaselineState"
+            }
+          ]
+        }
+      }
+    },
     "DriftCondition": {
       "description": "Fire condition for a drift observation.",
       "oneOf": [
@@ -2194,13 +2263,6 @@
           "enum": [
             "Custom"
           ]
-        },
-        {
-          "description": "Drift method defined externally, with no Vala-side fit or score.",
-          "type": "string",
-          "enum": [
-            "External"
-          ]
         }
       ]
     },
@@ -2251,20 +2313,10 @@
           "description": "SPC profile configuration.",
           "type": "object",
           "required": [
-            "alert_threshold",
             "kind",
-            "sample_size",
-            "weco_rule"
+            "sample_size"
           ],
           "properties": {
-            "alert_threshold": {
-              "description": "Lowest zone that should produce a Drift verdict.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/SpcAlertThreshold"
-                }
-              ]
-            },
             "kind": {
               "type": "string",
               "enum": [
@@ -2272,18 +2324,10 @@
               ]
             },
             "sample_size": {
-              "description": "Sample chunk size for baseline computation. `0` means adaptive default.",
+              "description": "Fixed rational subgroup size; at least two.",
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
-            },
-            "weco_rule": {
-              "description": "WECO rule configuration.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/SpcWecoRule"
-                }
-              ]
             }
           }
         },
@@ -2375,59 +2419,11 @@
               "type": "string"
             }
           }
-        },
-        {
-          "description": "Score stream produced by an Eval card.",
-          "type": "object",
-          "required": [
-            "eval_ref",
-            "kind"
-          ],
-          "properties": {
-            "eval_ref": {
-              "description": "Eval card whose score stream this drift consumes.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                }
-              ]
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "EvalScore"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Measurement from an external system, such as Prometheus or OTel.",
-          "type": "object",
-          "required": [
-            "kind",
-            "source_ref"
-          ],
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "External"
-              ]
-            },
-            "source_ref": {
-              "description": "Source card describing where to read the external measurement.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                }
-              ]
-            }
-          }
         }
       ]
     },
     "DriftSpec": {
-      "description": "DriftCard spec body.",
+      "description": "Drift Verifier implementation spec body.\n\nReached only as `implementation.spec` on a `Verifier` Card; `drift` is an implementation discriminator, never an envelope `kind`.",
       "type": "object",
       "required": [
         "condition",
@@ -2450,13 +2446,6 @@
             "null"
           ]
         },
-        "details": {
-          "description": "Free-form non-secret authoring metadata.",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
-          }
-        },
         "method": {
           "description": "Drift detection method. Drives which `DriftProfile` variant is allowed.",
           "allOf": [
@@ -2466,7 +2455,7 @@
           ]
         },
         "profile": {
-          "description": "Method-specific math configuration. Required for `Psi | Spc | Custom`, forbidden for `External`.",
+          "description": "Method-specific math configuration. Required for every executable method/signal pair and must match `method`.",
           "anyOf": [
             {
               "$ref": "#/definitions/DriftProfile"
@@ -2721,7 +2710,7 @@
       ]
     },
     "EvalSpec": {
-      "description": "The typed spec body for an `Eval` card.\n\nThis struct does not carry a discriminator; the outer `CardBody` enum carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.\n\nAuthors declare: - `dataset` — source data, typically a `Data` card with eval scenarios. - `tasks` — the rubric DAG. - `workflow` — optional declared workflow shape. - `sampling` — optional production sampling policy. - `pass_gate` — optional workflow-level pass criterion. - `context_capture` — durable storage policy for `AssertionResult::actual`.\n\nThis struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.",
+      "description": "The typed spec body of an `eval` Verifier implementation.\n\nThis struct does not carry a discriminator; the enclosing `VerifierImplementation` union supplies the `implementation.kind: eval` and `implementation.spec: { ... }` wire shape on a `Verifier` Card.\n\nAuthors declare: - `dataset` — source data, typically a `Data` card with eval scenarios. - `tasks` — the rubric DAG. - `workflow` — optional declared workflow shape. - `sampling` — optional production sampling policy. - `pass_gate` — optional workflow-level pass criterion. - `context_capture` — durable storage policy for `AssertionResult::actual`.\n\nThis struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.",
       "type": "object",
       "required": [
         "tasks"
@@ -3162,7 +3151,7 @@
       }
     },
     "FeatureName": {
-      "description": "Feature column name referenced by a DriftCard signal.",
+      "description": "Feature column name referenced by a drift Verifier signal.",
       "type": "string"
     },
     "FieldSpec": {
@@ -4492,6 +4481,48 @@
         }
       ]
     },
+    "InlineableRef_for_OperatorSpec": {
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "An embedded child spec.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/OperatorSpec"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
+    },
     "InlineableRef_for_Prompt": {
       "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
       "anyOf": [
@@ -4525,6 +4556,48 @@
           "allOf": [
             {
               "$ref": "#/definitions/Prompt"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
+    },
+    "InlineableRef_for_TriggerSpec": {
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "An embedded child spec.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TriggerSpec"
             }
           ]
         },
@@ -7791,8 +7864,34 @@
         }
       ]
     },
-    "OperatorAction": {
-      "description": "The closed set of actions an Operator can perform.",
+    "OperatorBudget": {
+      "description": "Operator execution limits.",
+      "type": "object",
+      "properties": {
+        "max_tool_calls": {
+          "description": "Maximum tool calls allowed during invocation.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_wall_seconds": {
+          "description": "Maximum wall-clock runtime in seconds.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperatorSpec": {
+      "description": "A server-owned side-effect template.",
+      "type": "object",
       "oneOf": [
         {
           "description": "Dispatch a registered Workflow.",
@@ -7913,48 +8012,8 @@
           },
           "additionalProperties": false
         }
-      ]
-    },
-    "OperatorBudget": {
-      "description": "Operator execution limits.",
-      "type": "object",
-      "properties": {
-        "max_tool_calls": {
-          "description": "Maximum tool calls allowed during invocation.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "max_wall_seconds": {
-          "description": "Maximum wall-clock runtime in seconds.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        }
-      },
-      "additionalProperties": false
-    },
-    "OperatorSpec": {
-      "description": "A server-owned side-effect template.",
-      "type": "object",
-      "required": [
-        "action"
       ],
       "properties": {
-        "action": {
-          "description": "The single action performed when this operator fires.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/OperatorAction"
-            }
-          ]
-        },
         "budget": {
           "description": "Optional execution limits.",
           "anyOf": [
@@ -7973,8 +8032,7 @@
             "null"
           ]
         }
-      },
-      "additionalProperties": false
+      }
     },
     "Origin": {
       "description": "Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation.",
@@ -9499,13 +9557,6 @@
             "$ref": "#/definitions/CredentialRef"
           }
         },
-        "publishes_to": {
-          "description": "Eval and Drift cards that receive observations from this component in this Service.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Ref"
-          }
-        },
         "ref": {
           "description": "Canonical Card reference.",
           "allOf": [
@@ -9524,6 +9575,13 @@
               "type": "null"
             }
           ]
+        },
+        "verified_by": {
+          "description": "Continuous verification bindings owned by this component occurrence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/VerificationBinding"
+          }
         }
       }
     },
@@ -9703,13 +9761,6 @@
             "$ref": "#/definitions/NonSecretValue"
           }
         },
-        "publishes_to": {
-          "description": "Eval and Drift cards that receive observations from this service.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Ref"
-          }
-        },
         "runtime": {
           "description": "Optional server-side runtime declaration.",
           "anyOf": [
@@ -9734,6 +9785,13 @@
             "string",
             "null"
           ]
+        },
+        "verified_by": {
+          "description": "Continuous verification bindings owned by this Service as a whole.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/VerificationBinding"
+          }
         }
       },
       "additionalProperties": false
@@ -10047,52 +10105,6 @@
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
     },
-    "SpcAlertThreshold": {
-      "description": "SPC alert threshold: the lowest zone that produces a Drift verdict.",
-      "oneOf": [
-        {
-          "description": "Zone 1.",
-          "type": "string",
-          "enum": [
-            "Zone1"
-          ]
-        },
-        {
-          "description": "Zone 2.",
-          "type": "string",
-          "enum": [
-            "Zone2"
-          ]
-        },
-        {
-          "description": "Zone 3.",
-          "type": "string",
-          "enum": [
-            "Zone3"
-          ]
-        },
-        {
-          "description": "Zone 4.",
-          "type": "string",
-          "enum": [
-            "Zone4"
-          ]
-        }
-      ]
-    },
-    "SpcWecoRule": {
-      "description": "WECO rule string config.",
-      "type": "object",
-      "required": [
-        "rule_string"
-      ],
-      "properties": {
-        "rule_string": {
-          "description": "Eight whitespace-separated positive `u32`s. Default: `\"8 16 4 8 2 4 1 1\"`.",
-          "type": "string"
-        }
-      }
-    },
     "Spec": {
       "title": "Spec",
       "description": "One typed Wyrd Card spec variant.",
@@ -10116,10 +10128,7 @@
           "$ref": "#/definitions/WorkflowSpec"
         },
         {
-          "$ref": "#/definitions/EvalSpec"
-        },
-        {
-          "$ref": "#/definitions/DriftSpec"
+          "$ref": "#/definitions/VerifierSpec"
         },
         {
           "$ref": "#/definitions/ServiceSpec"
@@ -10512,6 +10521,17 @@
             "null"
           ],
           "format": "date-time"
+        },
+        "verification": {
+          "description": "Server-derived verification state, absent when the Card has none.\n\nRead-side projection only: it never changes the authored `spec`, and a registration request's own `status` is ignored.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VerificationStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -10839,110 +10859,192 @@
         }
       ]
     },
-    "TriggerSchedule": {
-      "description": "Cron schedule for Trigger evaluation.",
+    "TriggerSpec": {
+      "description": "Declarative activation for a bound Verifier.",
       "type": "object",
-      "required": [
-        "cron"
-      ],
-      "properties": {
-        "cron": {
-          "description": "Cron expression.",
-          "type": "string"
-        },
-        "tz": {
-          "description": "Optional IANA timezone; absent means UTC.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "TriggerSource": {
-      "description": "Observation source evaluated by a Trigger.",
       "oneOf": [
         {
-          "description": "Drift observations, optionally limited to one publisher.",
+          "description": "Activate on each due occurrence of a cron schedule.",
           "type": "object",
           "required": [
-            "drift_ref",
+            "cron",
             "kind"
           ],
           "properties": {
-            "drift_ref": {
-              "description": "Drift card to evaluate.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                }
-              ]
+            "cron": {
+              "description": "Cron expression.",
+              "type": "string"
             },
             "kind": {
               "type": "string",
               "enum": [
-                "drift_observation"
+                "schedule"
               ]
             },
-            "subject_filter": {
-              "description": "Optional publisher restriction.",
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                },
-                {
-                  "type": "null"
-                }
+            "tz": {
+              "description": "Optional IANA timezone; absent means UTC.",
+              "type": [
+                "string",
+                "null"
               ]
             }
           },
           "additionalProperties": false
         },
         {
-          "description": "Eval observations, optionally limited to one publisher.",
+          "description": "Activate on each successfully committed observation for the subject.\n\nDeclared as a fieldless struct variant so the enum-level `deny_unknown_fields` applies: a unit variant's internally tagged visitor would silently drain every sibling key, admitting typos and pasted secrets. The authored wire shape stays `{kind: observations_ready}`.",
           "type": "object",
           "required": [
-            "eval_ref",
             "kind"
           ],
           "properties": {
-            "eval_ref": {
-              "description": "Eval card to evaluate.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                }
-              ]
-            },
             "kind": {
               "type": "string",
               "enum": [
-                "eval_observation"
+                "observations_ready"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ],
+      "properties": {
+        "description": {
+          "description": "Optional human-readable purpose.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "VerificationBinding": {
+      "description": "One inline declaration attaching a Verifier to its containing subject.\n\nAuthored on a Service, a Service component occurrence, or a standalone Agent. Registration resolves and UID-pins the Verifier, the effective Trigger, and every effective Operator before the owning Card persists.",
+      "type": "object",
+      "required": [
+        "runs_on",
+        "verifier"
+      ],
+      "properties": {
+        "on_failure": {
+          "description": "Operators dispatched independently after a `failed` verdict.\n\nEmpty means a failed result stays durable with no reaction.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/InlineableRef_for_OperatorSpec"
+          }
+        },
+        "runs_on": {
+          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/InlineableRef_for_TriggerSpec"
+            }
+          ]
+        },
+        "verifier": {
+          "description": "The exact Verifier Card this subject is verified by.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Ref"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "VerificationError": {
+      "description": "Structured, secret-free execution or delivery error.",
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "description": "Stable machine-readable error code.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Bounded human-readable description.",
+          "type": "string"
+        }
+      }
+    },
+    "VerificationStatus": {
+      "description": "Server-derived verification state projected onto `card.status`.\n\nA Service or standalone Agent owning `verified_by` bindings exposes the stable identity of each projected binding here, so a caller can address a binding without a separate listing resource. The field is read-only: it is derived from the tenant's binding projection on every Card read and is never persisted as Card status.",
+      "type": "object",
+      "properties": {
+        "baseline": {
+          "description": "Fitted-baseline readiness of a PSI or SPC Drift Verifier Card version.\n\nAbsent on every other Card, including a Custom Drift Verifier, which scores its authored scalar baseline and is ready without fitting.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DriftBaselineStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "binding_ids": {
+          "description": "Stable identities of this owner Card version's projected bindings, ordered by identity so reordering authored bindings changes nothing.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      }
+    },
+    "VerifierImplementation": {
+      "description": "The closed set of Verifier implementations.\n\nAdjacently tagged so that `implementation.kind` selects the variant and the variant's own typed body lives under `implementation.spec`. An unknown `kind` fails deserialization before validation or persistence, so a future implementation cannot be authored until its variant ships.",
+      "oneOf": [
+        {
+          "description": "Continuous distribution or metric drift over observed records.",
+          "type": "object",
+          "required": [
+            "kind",
+            "spec"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "drift"
               ]
             },
-            "subject_filter": {
-              "description": "Optional publisher restriction.",
-              "anyOf": [
-                {
-                  "$ref": "#/definitions/Ref"
-                },
-                {
-                  "type": "null"
-                }
+            "spec": {
+              "$ref": "#/definitions/DriftSpec"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Task-based evaluation over committed observations.",
+          "type": "object",
+          "required": [
+            "kind",
+            "spec"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "eval"
               ]
+            },
+            "spec": {
+              "$ref": "#/definitions/EvalSpec"
             }
           },
           "additionalProperties": false
         }
       ]
     },
-    "TriggerSpec": {
-      "description": "Declarative schedule and optional observation source for an Operator.",
+    "VerifierSpec": {
+      "description": "Verifier Card spec body.\n\nOne Verifier declares one implementation. Independent judgments are composed by attaching multiple Verifier Cards, never by nesting implementations or introducing a Verifier DAG.",
       "type": "object",
       "required": [
-        "operator_ref",
-        "schedule"
+        "implementation"
       ],
       "properties": {
         "description": {
@@ -10952,30 +11054,11 @@
             "null"
           ]
         },
-        "operator_ref": {
-          "description": "Operator fired when the source matches, or on every tick without a source.",
+        "implementation": {
+          "description": "The single typed implementation this Verifier runs.",
           "allOf": [
             {
-              "$ref": "#/definitions/Ref"
-            }
-          ]
-        },
-        "schedule": {
-          "description": "Required evaluation schedule.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/TriggerSchedule"
-            }
-          ]
-        },
-        "source": {
-          "description": "Optional observation stream to evaluate on each schedule tick.",
-          "anyOf": [
-            {
-              "$ref": "#/definitions/TriggerSource"
-            },
-            {
-              "type": "null"
+              "$ref": "#/definitions/VerifierImplementation"
             }
           ]
         }

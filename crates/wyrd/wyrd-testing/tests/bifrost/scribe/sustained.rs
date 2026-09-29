@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT;
 use vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy;
-use vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT;
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
@@ -30,8 +30,8 @@ const TENANTS: usize = 4;
 /// Batches each tenant sends to each of its two tables.
 ///
 /// Eight per table across eight tables is sixty-four public appends with
-/// distinct batch identities, which is enough repeated routing for the fixed
-/// lane set to be exercised many times over rather than sampled once.
+/// distinct batch identities, enough to keep writable buckets busy across the
+/// whole lifecycle rather than sampling it once.
 const BATCHES_PER_TABLE: usize = 8;
 /// Rows in one batch.
 const ROWS_PER_BATCH: i64 = 16;
@@ -122,7 +122,7 @@ impl Participant {
 /// `vala.traces.spans` through public authenticated clients: disjoint key
 /// ranges so no tenant can be credited another's row, two adjacent hour
 /// partitions so the physical layout is not a single cell, and sixty-four
-/// distinct batch identities so the fixed lane set is routed across repeatedly.
+/// distinct batch identities so ingest is sustained rather than sampled.
 ///
 /// The pod is started with its Scribe child budget at exactly one complete
 /// lifecycle vector. That is what makes the run sustained rather than
@@ -135,7 +135,7 @@ impl Participant {
 ///
 /// Reads then follow the rows through all three authorities: active writable
 /// buckets, durable staged members after the freeze, and committed hot objects
-/// after publication. Each read is the public strict fused query, so it is the
+/// after publication. Each read is the public query, so it is the
 /// Oracle path answering from whichever source currently owns the rows, and it
 /// must not be able to tell which one that was. Tenant isolation is asserted at
 /// the same time by construction: an exact comparison against disjoint expected
@@ -194,25 +194,14 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
          least once; a run with no refusal proves nothing about pressure or retry"
     );
 
-    // Active authority: the rows live in writable buckets across the fixed lane
-    // set and nothing has been staged or published.
+    // Active authority: the rows live in writable buckets on the configured
+    // shards and nothing has been staged or published.
     let active = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
     assert_eq!(
-        active.shard_task_count, SCRIBE_SHARD_COUNT,
-        "sustained multi-tenant ingest must not change the fixed lane topology"
-    );
-    assert!(
-        active
-            .memory_by_shard
-            .iter()
-            .filter(|held| **held > 0)
-            .count()
-            > 1,
-        "sixty-four distinct batch identities must route across more than one \
-         lane: {:?}",
-        active.memory_by_shard
+        active.shard_task_count, DEFAULT_SHARD_COUNT,
+        "sustained multi-tenant ingest must not change the shard topology"
     );
     for participant in &participants {
         participant.assert_exact("active").await;

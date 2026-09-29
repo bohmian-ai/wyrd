@@ -22,9 +22,7 @@ use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, RunningQueryRegistry};
 use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, ScribeResources};
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::scribe::tail_rpc::{
-    FetchLiveTailService, ScribeTailReader, TailFenceConfig,
-};
+use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
 use wyrd_storage::StorageHandle;
@@ -34,7 +32,6 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 use crate::bifrost::gate_audit::PostgresGateAudit;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
-use crate::components::eval::{EvalRuns, new_run_map};
 use crate::components::health::ReadinessSnapshot;
 use crate::config::{
     BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig, GatewayConfig,
@@ -42,6 +39,7 @@ use crate::config::{
 #[cfg(feature = "test-support")]
 use crate::oracle::SilentForwardPeer;
 use crate::postgres::ServerPostgres;
+use crate::verification::health::VerificationHealth;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::BifrostQueryRequest;
@@ -423,10 +421,6 @@ pub struct Scribe {
     lifecycle: RoleLifecycle,
     /// Shared tenant-qualified catalog retained by the selected data subsystem.
     catalog: Arc<BifrostCatalog>,
-    /// One fence reader shared by every local and authenticated tonic tail read.
-    tail_reader: Arc<ScribeTailReader>,
-    /// Optional domain-separated authority for private tail RPCs.
-    tail_authority: Option<Arc<crate::oracle::ScribeTailAuthority>>,
     /// Raw-ticket verifier for Scribe-targeted physical fragments.
     fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Durable security audit for rejected Scribe fragment authority.
@@ -711,7 +705,6 @@ impl Oracle {
             || report.peer_pending != 0
             || report.peer_running != 0
             || report.reserved_memory_bytes != 0
-            || report.reserved_spill_bytes != 0
             || audit != 0
         {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
@@ -869,10 +862,6 @@ impl Scribe {
             ))
             .with_audit(fragment_query_audit.clone()),
         );
-        let tail_reader = Arc::new(ScribeTailReader::new(
-            Arc::clone(&tail_service),
-            TailFenceConfig::default(),
-        ));
         let advertise_ready = Arc::new(AtomicBool::new(true));
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
@@ -893,8 +882,6 @@ impl Scribe {
             registered_role,
             lifecycle: RoleLifecycle::serving(),
             catalog,
-            tail_reader,
-            tail_authority: None,
             fragment_verifier,
             fragment_security_audit,
             fragment_query_audit,
@@ -906,22 +893,6 @@ impl Scribe {
             snapshot_poller_abort,
             advertise_ready,
         }
-    }
-
-    /// Injects the server-owned private Scribe-tail authority.
-    #[must_use]
-    pub fn with_tail_authority(
-        mut self,
-        authority: Arc<crate::oracle::ScribeTailAuthority>,
-    ) -> Self {
-        self.tail_authority = Some(authority);
-        self
-    }
-
-    /// Returns the private tail authority used by the gRPC adapter.
-    #[must_use]
-    pub fn tail_authority(&self) -> Option<Arc<crate::oracle::ScribeTailAuthority>> {
-        self.tail_authority.clone()
     }
 
     /// Borrows the exact Scribe role fence retained by this runtime.
@@ -986,15 +957,9 @@ impl Scribe {
         Arc::clone(&self.fragment_security_audit)
     }
 
-    /// Returns the shared Scribe-owned tail reader mounted only on private paths.
+    /// Returns the exact role-local live source served by this Scribe.
     #[must_use]
-    pub fn tail_reader(&self) -> Arc<ScribeTailReader> {
-        Arc::clone(&self.tail_reader)
-    }
-
-    /// Returns the exact role-local source used by the retained tail reader.
-    #[must_use]
-    pub(crate) fn tail_service(&self) -> Arc<FetchLiveTailService> {
+    pub fn tail_service(&self) -> Arc<FetchLiveTailService> {
         Arc::clone(&self.tail_service)
     }
 
@@ -1046,9 +1011,6 @@ impl Scribe {
     ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
-        if let Some(authority) = &self.tail_authority {
-            authority.clear_replay_state();
-        }
         if !self.ingest.shutdown(deadline).await {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
                 detail: "Scribe shutdown did not flush every retained owner".to_owned(),
@@ -2078,6 +2040,14 @@ pub struct AppState {
     /// merely compiling `test-support` never adds a capability to the catalog.
     #[cfg(feature = "test-support")]
     pub mcp_context_probe: bool,
+    /// Keep this process's audit publisher from starting.
+    ///
+    /// Default `false`. A journey that asserts on `vala.audit_staging` sets it
+    /// through `WyrdTestServerBuilder::without_audit_publication_for_test`,
+    /// because the publisher otherwise retires staged rows on its own cadence
+    /// and races the assertion. Production never sets it.
+    #[cfg(feature = "test-support")]
+    pub audit_publication_disabled: bool,
     /// Telemetry guard (holds the tracer provider).
     pub telemetry: Arc<TelemetryGuard>,
     /// Request-shaping limits for the router middleware stack.
@@ -2101,8 +2071,11 @@ pub struct AppState {
     pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
     /// Retained status of this process's private Bifrost peer listener.
     pub peer_plane: Arc<crate::app::peer_plane::PeerPlaneStatus>,
-    /// Tenant-keyed in-memory eval run/lease/session map. Ephemeral, single-replica.
-    pub eval_runs: EvalRuns,
+    /// Liveness of this process's verification runtime capabilities.
+    ///
+    /// The runtime marks each capability it composes required and up or down;
+    /// the readiness loop reports the server unready while one is absent.
+    pub verification: Arc<VerificationHealth>,
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
@@ -2133,6 +2106,8 @@ impl AppState {
             gateway_tasks: tokio_util::task::TaskTracker::new(),
             #[cfg(feature = "test-support")]
             mcp_context_probe: false,
+            #[cfg(feature = "test-support")]
+            audit_publication_disabled: false,
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
                 wyrd_telemetry::TelemetryConfig::default(),
             )),
@@ -2144,7 +2119,7 @@ impl AppState {
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
-            eval_runs: new_run_map(),
+            verification: Arc::default(),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
             #[cfg(feature = "test-support")]
@@ -2161,6 +2136,18 @@ impl AppState {
     #[must_use]
     pub fn with_mcp_context_probe(mut self, enabled: bool) -> Self {
         self.mcp_context_probe = enabled;
+        self
+    }
+
+    /// Keep the audit publisher from starting when `disabled` is set.
+    ///
+    /// Test servers call this through
+    /// `WyrdTestServerBuilder::without_audit_publication_for_test`; staged
+    /// audit rows then remain in `vala.audit_staging` for the test to read.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_audit_publication_disabled(mut self, disabled: bool) -> Self {
+        self.audit_publication_disabled = disabled;
         self
     }
 
@@ -2369,13 +2356,6 @@ impl AppState {
         self.bifrost.scribe().map(|runtime| runtime.scribe())
     }
 
-    /// Borrow the private Scribe tail reader for observation-only journey checks.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn bifrost_tail_reader_for_test(&self) -> Option<Arc<ScribeTailReader>> {
-        self.bifrost.scribe().map(|runtime| runtime.tail_reader())
-    }
-
     /// Flush the private Scribe runtime for the test harness only.
     #[cfg(feature = "test-support")]
     pub async fn flush_scribe_for_test(
@@ -2423,21 +2403,6 @@ impl AppState {
         runtime
             .scribe()
             .inspection_snapshot()
-            .map_err(|error| error.to_string())
-    }
-
-    /// Return the exact active fence count from this server's Scribe owner.
-    ///
-    /// # Errors
-    /// Returns an error when Scribe is absent or its fence registry cannot be read.
-    #[cfg(feature = "test-support")]
-    pub fn active_scribe_tail_fences_for_test(&self) -> Result<u64, String> {
-        let Some(runtime) = self.bifrost.scribe() else {
-            return Err("Scribe is not configured".to_owned());
-        };
-        runtime
-            .tail_reader()
-            .active_fence_count_for_test()
             .map_err(|error| error.to_string())
     }
 }

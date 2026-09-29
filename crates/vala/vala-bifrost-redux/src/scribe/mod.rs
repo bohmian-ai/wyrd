@@ -15,7 +15,7 @@ pub mod hot_source;
 pub mod hot_stage;
 mod ingress;
 pub mod manifest;
-mod material_plan;
+pub(crate) mod material_plan;
 pub mod member_stager;
 pub mod memory;
 pub mod memtable;
@@ -64,10 +64,7 @@ pub use crate::scribe::memtable::SealTriggerReason;
 pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::FetchLiveTailService;
-pub use crate::scribe::tail_rpc::{
-    LocalTailReadTransport, ScribeTailReader, TailFenceConfig, TailReadTransport,
-    TonicTailReadTransport,
-};
+pub use crate::scribe::tail_rpc::TonicTailReadTransport;
 
 /// Derives the largest replayable Scribe envelope admitted by configured limits.
 ///
@@ -1150,12 +1147,8 @@ impl ScribeImpl {
         let memory = config.resources.clone();
         let memory_ownership =
             memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
-        let wal_breaker = Some(config.wal.disk_full_breaker());
-        let admission = AdmissionController::with_config_memory_and_wal(
-            config.admission,
-            memory.clone(),
-            wal_breaker,
-        )?;
+        let admission =
+            AdmissionController::with_config_and_memory(config.admission, memory.clone())?;
         let ScribeBuildConfig {
             catalog,
             operator,
@@ -1214,7 +1207,7 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
-        Self::install_boot_metrics(wal.bytes_on_disk());
+        Self::install_boot_metrics();
         Ok(Self {
             catalog,
             wal,
@@ -1251,18 +1244,15 @@ impl ScribeImpl {
 
     /// Publish the zero-initialized Scribe boot telemetry.
     ///
-    /// Called once from [`Self::build`] so the ingress-active gauge, every named
-    /// rejection counter, and the WAL disk-bytes gauge exist at value zero (or
-    /// the current WAL residency) before the first request, giving scrapers a
-    /// stable series set from process start. `wal_disk_bytes` is the current
-    /// on-disk WAL byte count read from the freshly recovered writer.
-    fn install_boot_metrics(wal_disk_bytes: u64) {
+    /// Called once from [`Self::build`] so the ingress-active gauge and every
+    /// named rejection counter exist at value zero before the first request,
+    /// giving scrapers a stable series set from process start. Retained WAL
+    /// bytes are the volume governor's `bifrost_resource_current_bytes` series.
+    fn install_boot_metrics() {
         metrics::gauge!("bifrost_scribe_ingress_active").set(0.0);
         for reason in ["in_flight", "memory", "wal", "queue", "closed", "invalid"] {
             metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(0);
         }
-        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
-            .set(wal_disk_bytes.to_f64().unwrap_or(f64::MAX));
     }
 
     /// Construct a stub `ScribeImpl` for tests (memory backend, stub node identity, temp WAL).
@@ -1769,17 +1759,6 @@ impl ScribeImpl {
         }
         self.shards.request_expired_flush(now);
         self.request_pressure_seal_toward_low_water();
-        if self.wal.disk_pressure().soft {
-            let candidates = self
-                .shards
-                .memtable_snapshots()
-                .unwrap_or_default()
-                .into_iter()
-                .flat_map(|snapshot| snapshot.pressure_candidates)
-                .collect::<Vec<_>>();
-            let victim = memtable::Memtable::select_oldest_wal_victim(&candidates);
-            self.shards.request_wal_pressure_flush(victim);
-        }
     }
 
     /// Return the current admission, lane, and shard health metrics.
@@ -1814,8 +1793,8 @@ impl ScribeImpl {
             persistence,
             wal_io,
             shards: crate::scribe::telemetry::ShardHealthSnapshot {
-                shard_tasks: crate::scribe::routing::SCRIBE_SHARD_COUNT,
-                shard_channels: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+                shard_tasks: self.shards.shard_count(),
+                shard_channels: self.shards.shard_count(),
                 pending_items: self.shards.pending_items(),
                 terminal_errors: 0,
             },
@@ -1886,7 +1865,9 @@ impl Scribe for ScribeImpl {
             .await
             .inspect_err(|error| {
                 let reason = match error {
-                    ScribeError::UnsupportedWalVersion { .. } => Some("wal"),
+                    ScribeError::UnsupportedWalVersion { .. } | ScribeError::WalDiskFull => {
+                        Some("wal")
+                    }
                     ScribeError::PayloadTooLarge { .. }
                     | ScribeError::DecodedPayloadTooLarge { .. }
                     | ScribeError::TooManyRows { .. }
@@ -1898,7 +1879,6 @@ impl Scribe for ScribeImpl {
                     | ScribeError::CardUnresolved
                     | ScribeError::StreamMismatch { .. } => Some("invalid"),
                     ScribeError::IngressClosed
-                    | ScribeError::WalDiskFull
                     | ScribeError::IngestBusy { .. }
                     | ScribeError::ObjectStorePutFailed(_)
                     | ScribeError::Internal { .. } => None,
@@ -2088,7 +2068,6 @@ mod constructor_rotation_tests {
         let defaults = crate::gate::limits::IngestLimits::default();
         let ingest_limits = crate::gate::limits::IngestLimits {
             max_frame_bytes: configured_request_bytes,
-            max_decoding_message_size: configured_request_bytes + 64 * 1024,
             otlp: crate::gate::limits::OtlpWireLimits {
                 request_bytes: configured_request_bytes,
                 ..defaults.otlp
@@ -2342,18 +2321,6 @@ impl ScribeImpl {
         }
         stall
     }
-    /// Sum of pending (un-fsynced or un-truncated) WAL bytes on this pod.
-    #[must_use]
-    pub fn wal_pending_bytes(&self) -> u64 {
-        self.wal.bytes_on_disk()
-    }
-
-    /// Return the number of bytes currently retained by this pod's WAL.
-    #[must_use]
-    pub fn wal_bytes_on_disk(&self) -> u64 {
-        self.wal.bytes_on_disk()
-    }
-
     /// Aggregate per-shard memtable state into one pod-level snapshot.
     ///
     /// Pure read: it sums every shard's writable and immutable counters without
@@ -2427,7 +2394,7 @@ impl ScribeImpl {
         for _ in 0..64 {
             let before = self.memory.memory_snapshot();
             let owner_snapshots = self.shards.memtable_snapshots()?;
-            let transient_by_shard = self.memory.shard_snapshot();
+            let transient_by_shard = self.memory.shard_snapshot(self.shards.shard_count());
             let memory = self.memory.memory_snapshot().with_ingress_watermarks(
                 self.pressure_config.ingress_high_water_percent,
                 self.pressure_config.ingress_low_water_percent,
@@ -2437,8 +2404,8 @@ impl ScribeImpl {
                 .flat_map(|snapshot| &snapshot.bucket_memory)
                 .map(|bucket| bucket.writable_bytes.saturating_add(bucket.immutable_bytes))
                 .sum::<usize>();
-            let transient_total = transient_by_shard.into_iter().sum::<usize>();
-            latest = Some((memory, owner_snapshots.clone(), transient_by_shard));
+            let transient_total = transient_by_shard.iter().sum::<usize>();
+            latest = Some((memory, owner_snapshots.clone(), transient_by_shard.clone()));
             if before.total_bytes() == memory.total_bytes()
                 && bucket_total.saturating_add(transient_total) == memory.total_bytes()
             {
@@ -2451,7 +2418,7 @@ impl ScribeImpl {
             coherent.or(latest).ok_or_else(|| ScribeError::Internal {
                 detail: "inspection could not read bucket and shard ownership".to_owned(),
             })?;
-        let mut memory_by_shard = [0_usize; crate::scribe::routing::SCRIBE_SHARD_COUNT];
+        let mut memory_by_shard = vec![0_usize; self.shards.shard_count()];
         let mut memory_by_bucket = Vec::new();
         for (shard, snapshot) in owner_snapshots.into_iter().enumerate() {
             for bucket in snapshot.bucket_memory {
@@ -2468,8 +2435,8 @@ impl ScribeImpl {
             memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
         }
         Ok(ScribeInspectionSnapshot {
-            shard_task_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,
-            shard_channel_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+            shard_task_count: self.shards.shard_count(),
+            shard_channel_count: self.shards.shard_count(),
             open_wal_stream_count: self.wal.open_stream_count(),
             queued_items: self.shards.pending_items(),
             writable_bucket_count: stats.writable_buckets,
@@ -2486,26 +2453,25 @@ impl ScribeImpl {
             ingress_memory_limit: memory.ingress_limit_bytes,
             ingress_high_water_memory: memory.ingress_high_water_bytes,
             ingress_low_water_memory: memory.ingress_low_water_bytes,
-            wal_disk_bytes: self.wal.bytes_on_disk(),
             ingress_lifecycle: self.ingress_lifecycle.snapshot(),
             generation_lifecycle: self.memory_ownership.lifecycle_snapshot(),
         })
     }
 
-    /// Trip the WAL availability breaker for deterministic test-tier probes.
+    /// Makes the WAL's device report no physical free space for test probes.
     ///
-    /// The refusal is held until [`Self::clear_wal_disk_full_injection_for_test`]
-    /// releases it, so a concurrent retirement observing a writable host disk
-    /// cannot end the probe's refusal window early.
+    /// Every new WAL or stage growth is then refused by the volume governor's
+    /// real admission check, before WAL mutation and without ACK, until
+    /// [`Self::clear_wal_disk_full_injection_for_test`] returns the space.
     #[cfg(any(test, feature = "test-support"))]
     pub fn trip_wal_disk_full_for_test(&self) {
-        self.admission.trip_wal_disk_full_injected();
+        self.wal.set_device_full_for_test(true);
     }
 
-    /// Release the held test refusal, leaving the latch to real retirement.
+    /// Returns the injected device's free space so admission resumes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn clear_wal_disk_full_injection_for_test(&self) {
-        self.admission.clear_wal_disk_full_injection();
+        self.wal.set_device_full_for_test(false);
     }
 
     /// Returns the bounded CPU pool used by Scribe's ingest materialization.
@@ -2676,24 +2642,7 @@ impl ScribeImpl {
         Ok(FetchLiveTailService::with_runtime(
             stream,
             Arc::clone(&self.shards),
-            self.memory.clone(),
             Arc::clone(&self.hot_sources),
-        ))
-    }
-
-    /// Construct the bounded, fence-owning Scribe tail reader for new Oracle paths.
-    ///
-    /// The returned reader retains only shallow Arrow snapshots from this Scribe's
-    /// shard runtime and owns the bounded fence protocol used by Oracle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when this Scribe's node identity cannot produce a
-    /// typed stream identity for the reader.
-    pub fn tail_reader(&self) -> Result<ScribeTailReader, ScribeError> {
-        Ok(ScribeTailReader::new(
-            Arc::new(self.tail_service()?),
-            TailFenceConfig::default(),
         ))
     }
 }

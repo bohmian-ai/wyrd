@@ -427,8 +427,8 @@ impl CallCapture {
             }],
             ..Default::default()
         };
-        let (batch, outcome) =
-            project_resource_spans(&[resource], None).map_err(|_| CaptureDrop::Projection)?;
+        let (batch, outcome) = project_resource_spans(&[resource], None, usize::MAX)
+            .map_err(|_| CaptureDrop::Projection)?;
         if outcome.rejected_spans > 0 {
             return Err(CaptureDrop::Projection);
         }

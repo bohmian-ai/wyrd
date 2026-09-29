@@ -1,0 +1,12 @@
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  space: wyrd-team
+  name: churn-classifier-drift-schedule
+  version: "1.0.0"
+spec:
+  # A Trigger declares only *when* a bound Verifier runs. The binding that
+  # references it supplies the Verifier and its failure Operators.
+  kind: schedule
+  cron: "*/5 * * * *"
+  tz: UTC

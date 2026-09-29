@@ -1,8 +1,11 @@
 apiVersion: wyrd/v1
-kind: Eval
+kind: Verifier
 metadata:
   name: quality
   version: 1.0.0
   space: default
 spec:
-  tasks: {}
+  implementation:
+    kind: eval
+    spec:
+      tasks: {}

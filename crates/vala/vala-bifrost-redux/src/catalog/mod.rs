@@ -22,8 +22,8 @@ pub mod tenant_table;
 mod wire;
 
 pub use bifrost_catalog::{
-    BifrostCatalog, CreateTableRequest, PinnedIcebergFile, PinnedSealedTable,
-    PreparedReaderIdentity, TableUid,
+    BifrostCatalog, CreateTableRequest, MAX_PHYSICAL_LEAF_COLUMNS, PinnedIcebergFile,
+    PinnedSealedTable, PreparedReaderIdentity, TableUid,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{

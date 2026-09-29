@@ -202,10 +202,6 @@ pub(super) struct QueryStreamInput {
     pub(super) deadline: Instant,
     /// The same deadline as a nonnegative Unix epoch millisecond, for transports.
     pub(super) deadline_ms: i64,
-    /// Requested visibility contract.
-    pub(super) visibility: VisibilityMode,
-    /// Public freshness policy applied only after aggregate disposition selection.
-    pub(super) freshness_policy: wyrd_spec::vala::api::FreshnessPolicy,
     /// Exact source tiers completed as eligible degraded losses.
     pub(super) degraded_sources: super::DegradedSourceAccumulator,
     /// Production query telemetry retained through terminal emission.
@@ -332,10 +328,6 @@ struct FrameBuildInput {
     admitted: AdmittedQueryGuard,
     /// Absolute stream deadline.
     deadline: Instant,
-    /// Visibility contract for terminal mapping.
-    visibility: VisibilityMode,
-    /// Public freshness policy applied after partition aggregation.
-    freshness_policy: wyrd_spec::vala::api::FreshnessPolicy,
     /// Exact source tiers completed as eligible degraded losses.
     degraded_sources: super::DegradedSourceAccumulator,
     /// Query telemetry guard.
@@ -428,8 +420,6 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         first,
         admitted,
         deadline,
-        visibility,
-        freshness_policy,
         degraded_sources,
         mut query_telemetry,
         gate_lifecycle,
@@ -470,10 +460,9 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                         &mut query_telemetry,
                         &mut row_count,
                     ) {
-                        Err(()) => break failed_terminal_for_visibility(
+                        Err(()) => break failed_terminal_on_path(
                             QueryTerminalErrorCode::QueryExecutionFailed,
                             row_count,
-                            visibility,
                             execution_path,
                         ),
                         Ok(None) => {}
@@ -483,17 +472,15 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                 QueryStreamEvent::Batch(Some(Err(error))) => {
                     let code = terminal_error_code(&error);
                     tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                    break failed_terminal_for_visibility(code, row_count, visibility, execution_path);
+                    break failed_terminal_on_path(code, row_count, execution_path);
                 }
                 QueryStreamEvent::Batch(None) => break exhausted_terminal(
                     &degraded_sources,
-                    visibility,
-                    freshness_policy,
                                 row_count,
                     execution_path,
                 ),
                 QueryStreamEvent::Failed(code) => {
-                    break failed_terminal_for_visibility(code, row_count, visibility, execution_path);
+                    break failed_terminal_on_path(code, row_count, execution_path);
                 }
             }
         };
@@ -510,7 +497,6 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
             query_telemetry: &mut query_telemetry,
             gate_lifecycle: gate_lifecycle.as_ref(),
             running_query: &mut running_query,
-            visibility,
             execution_path,
             row_count,
             reader_protection,
@@ -592,8 +578,6 @@ struct StreamSettlementInputs<'a> {
     gate_lifecycle: Option<&'a Arc<QueryStreamLifecycle>>,
     /// Running-query registry entry retired with the terminal outcome.
     running_query: &'a mut Option<RunningQueryTerminalOwner>,
-    /// Visibility mode governing what a failed terminal may disclose.
-    visibility: VisibilityMode,
     /// Execution path this stream's terminal must name, however it ends.
     execution_path: QueryExecutionPath,
     /// Rows emitted before the terminal, reported on every outcome.
@@ -623,7 +607,6 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         query_telemetry,
         gate_lifecycle,
         running_query,
-        visibility,
         execution_path,
         row_count,
         reader_protection,
@@ -636,6 +619,13 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         stream_cancellation,
     );
     settle_distributed(distributed_settlement, outcome, stream_cancellation).await;
+    // A failed plan's aborted partition tasks drop their reservations only on
+    // a later runtime poll; release must not race that teardown.
+    if outcome == QueryTerminalOutcome::Failed
+        && let Some(admitted) = admitted.as_mut()
+    {
+        admitted.drain_children().await;
+    }
     // A cleanup that could not be confirmed cannot become a success terminal:
     // the graph is retained as draining, so rows this query produced are not
     // provably complete and its owners are not provably returned.
@@ -643,14 +633,13 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
     let candidate = if settlement.clean {
         candidate
     } else {
-        failed_terminal_for_visibility(
+        failed_terminal_on_path(
             QueryTerminalErrorCode::QueryExecutionFailed,
             row_count,
-            visibility,
             execution_path,
         )
     };
-    let candidate = close_ipc_stream(ipc, candidate, visibility, row_count, execution_path);
+    let candidate = close_ipc_stream(ipc, candidate, row_count, execution_path);
     let terminal = release_and_finish_terminal(
         admitted,
         query_telemetry,
@@ -858,8 +847,6 @@ pub(super) async fn settle_analytical(
 /// [`QueryWarning`]: wyrd_spec::vala::api::QueryWarning
 fn exhausted_terminal(
     degraded_sources: &super::DegradedSourceAccumulator,
-    visibility: VisibilityMode,
-    freshness_policy: wyrd_spec::vala::api::FreshnessPolicy,
     row_count: u64,
     execution_path: QueryExecutionPath,
 ) -> QueryTerminalFrame {
@@ -871,71 +858,53 @@ fn exhausted_terminal(
             "Oracle query completed with degraded partitions"
         );
     }
-    successful_terminal(
-        visibility,
-        freshness_policy,
-        &degraded.sources,
-        row_count,
-        execution_path,
-    )
+    successful_terminal(&degraded.sources, row_count, execution_path)
 }
 
 /// Constructs the validated success/degraded terminal for one completed stream.
 ///
-/// Wyrd is a warehouse surface, so a completed stream may only report
-/// `Success` when every source the requested [`VisibilityMode`] reads
-/// contributed its rows. Loss is scoped to the request: a live-tail
-/// degradation is irrelevant to a `PublishedOnly` query, which never opens
-/// the fenced tail interval.
+/// Every query reads the same three source tiers, and two losses are
+/// distinguished because the wire contract admits only one representation for
+/// each:
 ///
-/// Two losses are distinguished because the wire contract admits only one
-/// representation for each:
+/// * A published loss (`Iceberg` or `HotSealed`) always fails. `validate`
+///   requires both published entries to be `Complete`, so there is no way to
+///   report a short answer over persisted data honestly.
+/// * A known live-source loss before rows degrades the result and carries
+///   [`QueryWarning::LiveTailUnavailable`]. Live coverage is best effort, so
+///   a live tier reported `Complete` covers only the selected online sources.
 ///
-/// * A sealed loss (`Iceberg` or `HotSealed`) always fails. `validate`
-///   requires both sealed entries to be `Complete`, so there is no way to
-///   report a short answer over persisted data honestly, and
-///   [`FreshnessPolicy::AllowDegraded`] does not license one.
-/// * A live-tail loss under `Fused` fails under
-///   [`FreshnessPolicy::Strict`] and degrades under
-///   [`FreshnessPolicy::AllowDegraded`], which is the explicit
-///   observability opt-in to a bounded incomplete answer.
+/// [`QueryWarning::LiveTailUnavailable`]: wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable
 fn successful_terminal(
-    visibility: VisibilityMode,
-    freshness_policy: wyrd_spec::vala::api::FreshnessPolicy,
     degraded_sources: &[QuerySource],
     row_count: u64,
     execution_path: QueryExecutionPath,
 ) -> QueryTerminalFrame {
-    let live_tail_lost =
-        visibility == VisibilityMode::Fused && degraded_sources.contains(&QuerySource::LiveTail);
-    let sealed_lost = degraded_sources
+    let live_tail_lost = degraded_sources.contains(&QuerySource::LiveTail);
+    let published_lost = degraded_sources
         .iter()
         .any(|source| *source != QuerySource::LiveTail);
-    if sealed_lost
-        || (live_tail_lost && freshness_policy == wyrd_spec::vala::api::FreshnessPolicy::Strict)
-    {
-        return failed_terminal_for_visibility(
+    if published_lost {
+        return failed_terminal_on_path(
             QueryTerminalErrorCode::QueryVisibilityUnavailable,
             row_count,
-            visibility,
             execution_path,
         );
     }
-    let freshness = if live_tail_lost {
-        QueryFreshness::Degraded
+    let (outcome, live_outcome, warnings) = if live_tail_lost {
+        (
+            QueryTerminalOutcome::Degraded,
+            SourceCompletionOutcome::Unavailable,
+            vec![wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable],
+        )
     } else {
-        QueryFreshness::Complete
+        (
+            QueryTerminalOutcome::Success,
+            SourceCompletionOutcome::Complete,
+            Vec::new(),
+        )
     };
-    let outcome = if live_tail_lost {
-        QueryTerminalOutcome::Degraded
-    } else {
-        QueryTerminalOutcome::Success
-    };
-    let mut warnings = Vec::new();
-    if live_tail_lost {
-        warnings.push(wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable);
-    }
-    let mut source_completion = vec![
+    let source_completion = vec![
         SourceCompletion {
             source: QuerySource::Iceberg,
             outcome: SourceCompletionOutcome::Complete,
@@ -944,20 +913,13 @@ fn successful_terminal(
             source: QuerySource::HotSealed,
             outcome: SourceCompletionOutcome::Complete,
         },
-    ];
-    if visibility == VisibilityMode::Fused {
-        source_completion.push(SourceCompletion {
+        SourceCompletion {
             source: QuerySource::LiveTail,
-            outcome: if live_tail_lost {
-                SourceCompletionOutcome::Unavailable
-            } else {
-                SourceCompletionOutcome::Complete
-            },
-        });
-    }
+            outcome: live_outcome,
+        },
+    ];
     QueryTerminalFrame {
         outcome,
-        freshness,
         execution_path,
         row_count,
         warnings,
@@ -1322,9 +1284,8 @@ fn finish_stream(
     telemetry: &mut QueryTelemetryGuard,
     lifecycle: Option<&Arc<QueryStreamLifecycle>>,
     outcome: &'static str,
-    status: &'static str,
 ) {
-    telemetry.finish(outcome, status);
+    telemetry.finish(outcome);
     if let Some(lifecycle) = lifecycle {
         lifecycle.finish(outcome);
     }
@@ -1340,12 +1301,11 @@ fn finish_stream(
 ///
 /// Because the terminal is the last frame, a failure to close the stream cannot
 /// be reported by emitting one more frame; it degrades the candidate into the
-/// failed terminal for the requested visibility instead, which is also the only
+/// failed terminal instead, which is also the only
 /// representation that legitimately carries no end-of-stream.
 fn close_ipc_stream(
     ipc: &mut QueryIpcEncoder,
     candidate: QueryTerminalFrame,
-    visibility: VisibilityMode,
     row_count: u64,
     execution_path: QueryExecutionPath,
 ) -> QueryTerminalFrame {
@@ -1359,10 +1319,9 @@ fn close_ipc_stream(
         },
         Err(error) => {
             tracing::error!(%error, "Oracle query stream could not close its Arrow IPC stream");
-            failed_terminal_for_visibility(
+            failed_terminal_on_path(
                 QueryTerminalErrorCode::QueryExecutionFailed,
                 row_count,
-                visibility,
                 execution_path,
             )
         }
@@ -1401,12 +1360,7 @@ fn release_and_finish_terminal(
     } else {
         "success"
     };
-    let status = if terminal.outcome == QueryTerminalOutcome::Degraded {
-        "degraded"
-    } else {
-        "complete"
-    };
-    finish_stream(query_telemetry, gate_lifecycle, outcome, status);
+    finish_stream(query_telemetry, gate_lifecycle, outcome);
     terminal
 }
 
@@ -1484,13 +1438,8 @@ impl OracleQueryStream {
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
             deadline_ms: 0,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness_policy: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            query_telemetry: OracleTelemetry::start_query(
-                VisibilityMode::PublishedOnly,
-                QueryClass::Interactive,
-            ),
+            query_telemetry: OracleTelemetry::start_query(QueryClass::Interactive),
             scan_stats,
             gate_lifecycle: None,
             running_query: None,
@@ -1515,8 +1464,6 @@ impl OracleQueryStream {
             admitted,
             deadline,
             deadline_ms,
-            visibility,
-            freshness_policy,
             degraded_sources,
             mut query_telemetry,
             scan_stats,
@@ -1544,8 +1491,6 @@ impl OracleQueryStream {
             first,
             admitted,
             deadline,
-            visibility,
-            freshness_policy,
             degraded_sources,
             query_telemetry,
             gate_lifecycle,
@@ -1644,16 +1589,15 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
-    use wyrd_spec::vala::api::{FreshnessPolicy, QueryExecutionPath, QueryWarning};
+    use wyrd_spec::vala::api::{QueryExecutionPath, QueryWarning};
 
     use super::{OracleQueryStream, QueryStreamInput, QueryStreamLifecycle, successful_terminal};
     use crate::oracle::admission::{active_queries_for_test, admitted_guard_for_test};
     use crate::oracle::exec::OracleQueryScanStats;
-    use crate::oracle::failed_terminal_for_visibility;
+    use crate::oracle::failed_terminal_on_path;
     use crate::oracle::{
-        BifrostError, OracleTelemetry, QueryClass, QueryFreshness, QuerySchemaFrame, QuerySource,
-        QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-        VisibilityMode,
+        BifrostError, OracleTelemetry, QueryClass, QuerySchemaFrame, QuerySource, QueryStreamFrame,
+        QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
@@ -1712,111 +1656,47 @@ mod tests {
         super::close_ipc_stream(
             &mut ipc,
             candidate,
-            VisibilityMode::Fused,
             row_count,
             QueryExecutionPath::Interactive,
         )
     }
 
-    /// Terminal construction scopes every source loss to the requested
-    /// visibility and freshness policy.
+    /// Terminal construction maps each source loss to the one representation
+    /// the contract admits.
     ///
-    /// The matrix pins the three decisions that separate a warehouse answer
-    /// from an observability answer: a requested loss never reports
-    /// `Success`, `AllowDegraded` is the only policy that tolerates one, and
-    /// a source the request never reads is not a loss at all.
+    /// No loss reports `Success`; a known live-source loss degrades with the
+    /// live-tail warning; and a published loss always fails because the wire
+    /// requires both published tiers to be complete.
     #[test]
-    fn successful_terminal_scopes_loss_to_requested_visibility_and_policy() {
-        let complete = successful_terminal(
-            VisibilityMode::Fused,
-            FreshnessPolicy::Strict,
-            &[],
-            3,
-            QueryExecutionPath::Interactive,
-        );
+    fn successful_terminal_maps_source_loss_to_closed_outcomes() {
+        let complete = successful_terminal(&[], 3, QueryExecutionPath::Interactive);
         assert_eq!(complete.outcome, QueryTerminalOutcome::Success);
         closed(complete)
-            .validate(VisibilityMode::Fused)
+            .validate()
             .expect("complete terminal validates");
 
-        // Row 1: Fused + LiveTail loss. Strict fails closed; AllowDegraded
-        // is the explicit opt-in to a bounded incomplete answer.
-        let strict_live = successful_terminal(
-            VisibilityMode::Fused,
-            FreshnessPolicy::Strict,
-            &[QuerySource::LiveTail],
-            2,
-            QueryExecutionPath::Interactive,
-        );
-        assert_eq!(strict_live.outcome, QueryTerminalOutcome::Failed);
-        assert_eq!(
-            strict_live.error.as_ref().map(|error| error.code),
-            Some(QueryTerminalErrorCode::QueryVisibilityUnavailable)
-        );
-        strict_live
-            .validate(VisibilityMode::Fused)
-            .expect("strict live-tail loss fails with the parent terminal contract");
+        let live =
+            successful_terminal(&[QuerySource::LiveTail], 2, QueryExecutionPath::Interactive);
+        assert_eq!(live.outcome, QueryTerminalOutcome::Degraded);
+        assert_eq!(live.warnings, vec![QueryWarning::LiveTailUnavailable]);
+        closed(live)
+            .validate()
+            .expect("known live-source degradation validates");
 
-        let allowed_live = successful_terminal(
-            VisibilityMode::Fused,
-            FreshnessPolicy::AllowDegraded,
-            &[QuerySource::LiveTail],
-            2,
-            QueryExecutionPath::Interactive,
-        );
-        assert_eq!(allowed_live.outcome, QueryTerminalOutcome::Degraded);
-        assert_eq!(allowed_live.freshness, QueryFreshness::Degraded);
-        assert_eq!(
-            allowed_live.warnings,
-            vec![QueryWarning::LiveTailUnavailable]
-        );
-        closed(allowed_live)
-            .validate(VisibilityMode::Fused)
-            .expect("eligible live-tail degradation validates");
-
-        // Row 2: Fused + sealed loss. The wire contract requires both sealed
-        // entries to be Complete, so neither policy may report a short
-        // answer over persisted data.
         for source in [QuerySource::Iceberg, QuerySource::HotSealed] {
-            for policy in [FreshnessPolicy::Strict, FreshnessPolicy::AllowDegraded] {
-                let failed = successful_terminal(
-                    VisibilityMode::Fused,
-                    policy,
-                    &[source],
-                    0,
-                    QueryExecutionPath::Interactive,
-                );
-                assert_eq!(
-                    failed.outcome,
-                    QueryTerminalOutcome::Failed,
-                    "{source:?} loss under {policy:?} must fail"
-                );
-                assert_eq!(
-                    failed.error.as_ref().map(|error| error.code),
-                    Some(QueryTerminalErrorCode::QueryVisibilityUnavailable)
-                );
-                failed
-                    .validate(VisibilityMode::Fused)
-                    .expect("sealed loss fails with the parent terminal contract");
-            }
-        }
-
-        // Row 3: PublishedOnly never opens the fenced tail interval, so a
-        // live-tail degradation is not a loss for that request.
-        for policy in [FreshnessPolicy::Strict, FreshnessPolicy::AllowDegraded] {
-            let unaffected = successful_terminal(
-                VisibilityMode::PublishedOnly,
-                policy,
-                &[QuerySource::LiveTail],
-                4,
-                QueryExecutionPath::Interactive,
+            let failed = successful_terminal(&[source], 0, QueryExecutionPath::Interactive);
+            assert_eq!(
+                failed.outcome,
+                QueryTerminalOutcome::Failed,
+                "{source:?} loss must fail"
             );
-            assert_eq!(unaffected.outcome, QueryTerminalOutcome::Success);
-            assert_eq!(unaffected.freshness, QueryFreshness::Complete);
-            assert!(unaffected.warnings.is_empty());
-            closed(unaffected)
-                .validate(VisibilityMode::PublishedOnly)
-                .expect("unrequested live-tail loss does not affect a published-only terminal");
+            assert_eq!(
+                failed.error.as_ref().map(|error| error.code),
+                Some(QueryTerminalErrorCode::QueryVisibilityUnavailable)
+            );
+            failed
+                .validate()
+                .expect("published loss fails with the parent terminal contract");
         }
     }
 
@@ -1901,40 +1781,26 @@ mod tests {
             super::QueryIpcEncoder::new(schema).expect("empty terminal stream opens");
         let empty_terminal = super::close_ipc_stream(
             &mut empty_terminal_encoder,
-            successful_terminal(
-                VisibilityMode::PublishedOnly,
-                FreshnessPolicy::Strict,
-                &[],
-                0,
-                QueryExecutionPath::Interactive,
-            ),
-            VisibilityMode::PublishedOnly,
+            successful_terminal(&[], 0, QueryExecutionPath::Interactive),
             0,
             QueryExecutionPath::Interactive,
         );
         assert_eq!(empty_terminal.row_count, 0);
         empty_terminal
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .expect("empty logical result has one successful terminal");
 
         let (mut mixed_terminal_encoder, _) =
             super::QueryIpcEncoder::new(schema).expect("mixed terminal stream opens");
         let mixed_terminal = super::close_ipc_stream(
             &mut mixed_terminal_encoder,
-            successful_terminal(
-                VisibilityMode::PublishedOnly,
-                FreshnessPolicy::Strict,
-                &[],
-                5,
-                QueryExecutionPath::Interactive,
-            ),
-            VisibilityMode::PublishedOnly,
+            successful_terminal(&[], 5, QueryExecutionPath::Interactive),
             5,
             QueryExecutionPath::Interactive,
         );
         assert_eq!(mixed_terminal.row_count, 5);
         mixed_terminal
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .expect("mixed stream terminal agrees with emitted rows");
     }
 
@@ -1980,15 +1846,14 @@ mod tests {
         let (dropped, _dropped_schema) =
             super::QueryIpcEncoder::new(schema).expect("failed stream opens");
         drop(dropped);
-        let failed = failed_terminal_for_visibility(
+        let failed = failed_terminal_on_path(
             QueryTerminalErrorCode::QueryExecutionFailed,
             0,
-            VisibilityMode::PublishedOnly,
             QueryExecutionPath::Interactive,
         );
         assert!(failed.arrow_ipc_eos.is_empty());
         failed
-            .validate(VisibilityMode::PublishedOnly)
+            .validate()
             .expect("a failed terminal validates without an end-of-stream");
     }
 
@@ -2140,8 +2005,7 @@ mod tests {
     #[tokio::test]
     async fn success_terminal_requires_completed_local_release() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
-        let telemetry =
-            OracleTelemetry::start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive);
+        let telemetry = OracleTelemetry::start_query(QueryClass::Interactive);
         let (ipc, schema_frame) = empty_schema_ipc("production");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
             execution_path: QueryExecutionPath::Interactive,
@@ -2155,8 +2019,6 @@ mod tests {
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
             deadline_ms: 0,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
             query_telemetry: telemetry,
             scan_stats: OracleQueryScanStats::default(),
@@ -2195,13 +2057,8 @@ mod tests {
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
             deadline_ms: 0,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            query_telemetry: OracleTelemetry::start_query(
-                VisibilityMode::PublishedOnly,
-                QueryClass::Interactive,
-            ),
+            query_telemetry: OracleTelemetry::start_query(QueryClass::Interactive),
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
@@ -2237,13 +2094,8 @@ mod tests {
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
             deadline_ms: 0,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            query_telemetry: OracleTelemetry::start_query(
-                VisibilityMode::PublishedOnly,
-                QueryClass::Interactive,
-            ),
+            query_telemetry: OracleTelemetry::start_query(QueryClass::Interactive),
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,

@@ -6,13 +6,24 @@ metadata:
   version: "1.4.2"
 spec:
   interface:
-    kind: Custom
+    kind: Parquet
     meta:
-      loader_module: fixtures
-      loader_class: ChurnData
-      extra: {}
+      compression: Snappy
   schema:
-    columns: []
+    columns:
+      - name: tenure_months
+        dtype: int32
+      - name: monthly_charges
+        dtype: float64
+      - name: contract_type
+        dtype: string
   stats:
-    byte_count: 0
-    sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    row_count: 100
+    col_count: 3
+    byte_count: 2037
+    sha256: b03e7765aad2342d75590ea3aac7fc01fed59107698f649bc90e205e293583ea
+artifacts:
+  - relative_path: data/data.parquet
+    sha256: sD53ZarSNC11WQ6jqsf8Af7VkQdpj2SbyQ4gXik1g+o=
+    size_bytes: 2037
+    content_type: application/vnd.apache.parquet

@@ -216,7 +216,11 @@ impl Cards {
     pub async fn register_from_path(&self, path: &Path) -> Result<RegistrationReceipt, WyrdError> {
         let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
             message: format!("card tree failed to load: {error}"),
-            details: serde_json::json!({ "path": path, "error": error.to_string() }),
+            // The loader counts its diagnostics in `Display` but carries the
+            // per-file code, span, message, and remediation on the value. An
+            // author who only sees the count cannot fix the tree, so the
+            // structured diagnostics travel in the error details.
+            details: serde_json::json!({ "path": path, "diagnostics": error.diagnostics }),
         })?;
         let input = wyrd_loader::build_registration_input(tree).map_err(|error| {
             WyrdError::RegistryInvalidCardSpec {

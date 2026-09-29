@@ -37,9 +37,7 @@ That one process bundles two Wyrd subsystems. The control plane stores and valid
     ['deployment_profile', 'Config', 'Development or Production, locked at boot'],
     ['shutdown_token', 'Lifecycle', 'Shared CancellationToken for cooperative shutdown'],
     ['grpc_health', 'gRPC', 'Health reporter shared with HTTP readiness'],
-    ['readiness', 'Liveness', 'Cached snapshot published by the readiness worker'],
-    ['eval_runs', 'Eval', 'Tenant-keyed in-memory run map, single replica'],
-    ['eval_audit', 'Eval', 'Sink for eval run open and complete events']
+    ['readiness', 'Liveness', 'Cached snapshot published by the readiness worker']
   ]}
 />
 
@@ -83,7 +81,7 @@ A `SIGINT` or `SIGTERM` is the normal path: the signal watcher exits first, the 
 
 The server is built to be wrapped by a downstream crate (for example an enterprise distribution) without forking core boot. Three seams matter:
 
-- `StateOverrides` lets a caller inject a real `ServerAuthz` (policy hook plus audit writer) and eval audit sink before `production_validate` runs. This is how a production deployment replaces the development stubs that the open-source boot ships.
+- `StateOverrides` lets a caller inject a real `ServerAuthz` (policy hook plus audit writer) before `production_validate` runs. This is how a production deployment replaces the development stubs that the open-source boot ships.
 - `spawn_worker(name, future)` registers a named background task that joins the supervised drain, so custom workers shut down cleanly with everything else.
 - `merge_http_protected(router)` mounts extra HTTP routes behind the exact same edge stack and auth requirement as core `/v1`. A companion `merge_http` mounts deliberately unprotected routes.
 

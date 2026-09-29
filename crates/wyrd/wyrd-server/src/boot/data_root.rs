@@ -57,8 +57,10 @@ pub enum BifrostDataRootError {
 /// process reclaim the same root and replay its WAL under the same identity.
 #[derive(Debug)]
 pub struct BifrostDataRoot {
-    /// Every managed path derived from the root.
+    /// Volume-governed paths derived from the root.
     roots: BifrostVolumeRoots,
+    /// Oracle spill directory; bounded per query by `DataFusion`, not governed.
+    oracle_spill: PathBuf,
     /// Open lock file; the advisory lock lives exactly as long as this handle.
     _lock: File,
 }
@@ -84,13 +86,13 @@ impl BifrostDataRoot {
             wal: root.to_path_buf(),
             scribe_stage: root.join("scribe-stage"),
             scribe_output_scratch: root.join("scribe-output-scratch"),
-            oracle_scratch: root.join("oracle-spill"),
         };
+        let oracle_spill = root.join("oracle-spill");
         for path in [
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
-            &roots.oracle_scratch,
+            &oracle_spill,
         ] {
             std::fs::create_dir_all(path).map_err(|source| BifrostDataRootError::Unusable {
                 path: path.clone(),
@@ -125,7 +127,7 @@ impl BifrostDataRoot {
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
-            &roots.oracle_scratch,
+            &oracle_spill,
         ] {
             let probe = dir.join(PROBE_FILE_NAME);
             probe_write(&probe).map_err(|source| BifrostDataRootError::Unusable {
@@ -133,7 +135,11 @@ impl BifrostDataRoot {
                 source,
             })?;
         }
-        Ok(Self { roots, _lock: lock })
+        Ok(Self {
+            roots,
+            oracle_spill,
+            _lock: lock,
+        })
     }
 
     /// Scribe WAL base, which also holds the stable node identity.
@@ -145,7 +151,7 @@ impl BifrostDataRoot {
     /// Oracle query spill directory.
     #[must_use]
     pub fn oracle_spill(&self) -> &Path {
-        &self.roots.oracle_scratch
+        &self.oracle_spill
     }
 
     /// Managed paths in the shape the Bifrost resource detector registers.
@@ -195,7 +201,7 @@ mod tests {
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
-            &roots.oracle_scratch,
+            prepared.oracle_spill(),
         ] {
             assert!(
                 path.starts_with(&root) && path.is_dir(),

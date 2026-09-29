@@ -10,7 +10,12 @@ authors = { workspace = true }
 [features]
 cloud = ["wyrd-storage/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
-test-support = ["dep:iceberg", "vala-bifrost-redux/test-support", "wyrd-telemetry/test-support"]
+test-support = [
+    "dep:iceberg",
+    "vala-bifrost-redux/test-support",
+    "wyrd-client/test-support",
+    "wyrd-telemetry/test-support",
+]
 
 [[bin]]
 name = "wyrd-server"
@@ -42,6 +47,7 @@ rmcp = { workspace = true, features = [
     "macros",
     "transport-streamable-http-server",
 ] }
+vala-drift = { workspace = true }
 vala-eval = { workspace = true }
 wyrd-telemetry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
@@ -128,10 +134,11 @@ name = "pg_authz_check_route"
 name = "pg_router_smoke"
 
 [[test]]
-name = "pg_merge_http_protected"
+name = "pg_verification_runtime"
+required-features = ["test-support"]
 
 [[test]]
-name = "pg_eval_v1_protocol"
+name = "pg_merge_http_protected"
 
 [[test]]
 name = "storage_e2e"

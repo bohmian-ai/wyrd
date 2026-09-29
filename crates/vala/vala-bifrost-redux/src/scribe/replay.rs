@@ -1425,10 +1425,17 @@ mod tests {
             tenant,
             &keys[0].table,
             uuid::Uuid::from_bytes([0; 16]),
+            crate::scribe::routing::TEST_SHARD_COUNT,
         );
         for candidate in 0_u128..10_000 {
             let id = uuid::Uuid::from_u128(candidate);
-            if crate::scribe::routing::shard_for(tenant, &keys[0].table, id) == target_shard {
+            if crate::scribe::routing::shard_for(
+                tenant,
+                &keys[0].table,
+                id,
+                crate::scribe::routing::TEST_SHARD_COUNT,
+            ) == target_shard
+            {
                 batch_ids.push(*id.as_bytes());
                 if batch_ids.len() == keys.len() {
                     break;
@@ -2128,6 +2135,7 @@ mod tests {
         let (rows, outcome) = crate::tables::traces::project_resource_spans(
             &[span(1, true), span(2, false), span(3, true)],
             None,
+            usize::MAX,
         )
         .expect("canonical trace projection");
         assert_eq!((outcome.accepted_spans, outcome.rejected_spans), (2, 1));
@@ -2425,6 +2433,7 @@ mod tests {
             tenant,
             &seal_key.table,
             uuid::Uuid::nil(),
+            crate::scribe::routing::TEST_SHARD_COUNT,
         ))
         .expect("fixed shard count fits u8");
         let complete_batches = write_writer_ordered_group(&wal, &seal_key, shard_id, tenant);

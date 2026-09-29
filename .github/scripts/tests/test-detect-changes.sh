@@ -58,9 +58,9 @@ check_selection() {
 
 # --- Scenario 1: classified Rust changes select their consumer closure -------
 
-check_selection "leaf crate tests only its owner family" \
-  "full_gate=false changed_packages=vala-drift rust_packages=vala-drift ci_lanes=test:vala" \
-  "crates/vala/vala-drift/src/lib.rs"
+check_selection "leaf crate selects its owner and journey lanes" \
+  "full_gate=false changed_packages=wyrd-mcp rust_packages=wyrd-mcp ci_lanes~test:wyrd ci_lanes~test:bifrost:gate ci_lanes~test:gateway:gate" \
+  "crates/wyrd/wyrd-mcp/src/lib.rs"
 check_selection "leaf crate omits unrelated families" \
   "full_gate=false changed_packages=wyrd-mcp ci_lanes~test:wyrd ci_lanes!test:skald ci_lanes!test:vala ci_lanes!test:shared ci_lanes!test:rust" \
   "crates/wyrd/wyrd-mcp/src/lib.rs"
@@ -71,8 +71,8 @@ check_selection "dev-dependency consumers are tested but not propagated" \
   "full_gate=false rust_packages~wyrd-sdk-rust rust_packages~wyrd-server rust_packages!wyrd-rust-examples" \
   "crates/wyrd/wyrd-testing/src/lib.rs"
 check_selection "rename inside one crate keeps its closure" \
-  "full_gate=false changed_packages=vala-drift ci_lanes=test:vala" \
-  "crates/vala/vala-drift/src/old_name.rs" "crates/vala/vala-drift/src/new_name.rs"
+  "full_gate=false changed_packages=wyrd-mcp rust_packages=wyrd-mcp ci_lanes~test:wyrd ci_lanes~test:bifrost:gate ci_lanes~test:gateway:gate" \
+  "crates/wyrd/wyrd-mcp/src/old_name.rs" "crates/wyrd/wyrd-mcp/src/new_name.rs"
 check_selection "deleted crate path takes the full gate" \
   "full_gate=true" \
   "crates/wyrd/wyrd-retired/src/lib.rs"
@@ -129,9 +129,9 @@ check_selection "storage crate selects the storage matrix" \
   "crates/wyrd/wyrd-storage/src/lib.rs"
 check_selection "client storage selects storage" "storage=true" \
   "crates/shared/wyrd-client/src/storage/mod.rs"
-check_selection "Rust-only leaf skips SDK platforms and journeys" \
+check_selection "Rust-only leaf skips SDK platforms and unrelated journeys" \
   "rust_client=false typescript=false python=false identity=false storage=false ci_lanes!py:test:integration" \
-  "crates/vala/vala-drift/src/lib.rs"
+  "crates/wyrd/wyrd-mcp/src/lib.rs"
 check_selection "Bifrost-only runs the capability gate" \
   "bifrost_only=true full_gate=false ci_lanes=" \
   "crates/vala/vala-bifrost-redux/src/forge/worker.rs"
@@ -225,7 +225,7 @@ fi
 
 check_selection "leaf crate packages nothing" \
   "package_python=false package_typescript=false package_server=false package_crates=false" \
-  "crates/vala/vala-drift/src/lib.rs"
+  "crates/wyrd/wyrd-mcp/src/lib.rs"
 check_selection "shared Skald change packages Python and server" \
   "package_python=true package_server=true package_typescript=false package_crates=false" \
   "crates/skald/skald-cache/src/lib.rs"

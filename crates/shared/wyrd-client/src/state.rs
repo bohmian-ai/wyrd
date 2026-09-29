@@ -7,6 +7,10 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use crate::WyrdClient;
+use crate::bifrost::{Bifrost, QueueConfig, TableConfig};
+use crate::observe::Run;
+use crate::observe::lifecycle::{BifrostLifecycle, StartedBifrost};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -17,7 +21,7 @@ use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::agent::AgentCard;
-use wyrd_spec::card::drift::DriftSpec;
+use wyrd_spec::card::verifier::VerifierSpec;
 use wyrd_spec::card::workflow::WorkflowCard;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
@@ -30,7 +34,6 @@ use wyrd_spec::registry::{
 use wyrd_spec::registry::{
     HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
 };
-use wyrd_spec::vala::eval::EvalSpec;
 
 /// One verified artifact payload in a local `WyrdState` bundle.
 #[derive(Debug, Clone)]
@@ -324,11 +327,17 @@ impl HydratedStateIndex {
     }
 }
 
-/// A complete, local, non-executing Card graph.
+/// A complete, local, non-executing Card graph, and its one Bifrost lifetime.
+///
+/// Cloning a state shares both the hydrated graph and the Bifrost writer: one
+/// runtime-owned writer survives every clone, so a clone handed to a task
+/// cannot start a second transport or strand the first one's pending batches.
 #[derive(Debug, Clone)]
 pub struct WyrdState {
     /// Shared immutable hydrated-state index safe to read across state clones.
     index: Arc<HydratedStateIndex>,
+    /// The one Bifrost lifetime every observation of every run emits through.
+    bifrost: Arc<BifrostLifecycle>,
 }
 
 /// Private filesystem reader for one confined hydrated-bundle root.
@@ -404,7 +413,140 @@ impl WyrdState {
         let index = reader.load_index(manifest)?;
         Ok(Self {
             index: Arc::new(index),
+            bifrost: Arc::new(BifrostLifecycle::default()),
         })
+    }
+
+    /// Connect this state's one Bifrost writer from the ambient environment.
+    ///
+    /// Resolution is [`Bifrost::from_env`]'s: this adds no endpoint or
+    /// credential rule of its own. Startup describes both fixed observation
+    /// tables before reporting success, so a run can never enqueue against a
+    /// missing, unauthorized, or incompatible system table.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_409_BIFROST_ALREADY_STARTED` when this state (or any
+    /// clone of it) already started Bifrost, `WYRD_SDK_409_BIFROST_CLOSED`
+    /// after a successful shutdown, the transport or credential error from the
+    /// connect, and the server's error for either fixed table.
+    ///
+    /// # Cancellation
+    /// Abandoning the future releases the start claim, so a later
+    /// `start_bifrost` on the same state is accepted rather than refused.
+    pub async fn start_bifrost(&self) -> Result<(), WyrdError> {
+        let claim = self.bifrost.claim()?;
+        claim.complete(Bifrost::from_env().await?).await
+    }
+
+    /// Connect this state's one Bifrost writer over an explicit client.
+    ///
+    /// The door every SDK boundary uses when the caller already resolved a
+    /// client. `table` retains its existing Bifrost meaning as the handle's
+    /// active write binding; it does not choose a run's destination and does not
+    /// replace a fixed system table. The queue keeps its default configuration;
+    /// [`WyrdState::start_bifrost_with_config`] is the configured form.
+    ///
+    /// # Errors
+    /// As [`WyrdState::start_bifrost`].
+    ///
+    /// # Cancellation
+    /// As [`WyrdState::start_bifrost`].
+    pub async fn start_bifrost_with(
+        &self,
+        client: &WyrdClient,
+        table: Option<TableConfig>,
+    ) -> Result<(), WyrdError> {
+        self.start_bifrost_with_config(client, table, QueueConfig::default())
+            .await
+    }
+
+    /// Connect this state's one Bifrost writer over an explicit client and queue
+    /// configuration.
+    ///
+    /// Mirrors [`Bifrost::connect_with_config`] under the same start claim:
+    /// `queue` bounds the one producer queue every run of this state shares,
+    /// and `table` keeps the meaning described on
+    /// [`WyrdState::start_bifrost_with`].
+    ///
+    /// # Errors
+    /// As [`WyrdState::start_bifrost`], plus the queue-configuration refusal of
+    /// [`Bifrost::connect_with_config`].
+    ///
+    /// # Cancellation
+    /// As [`WyrdState::start_bifrost`].
+    pub async fn start_bifrost_with_config(
+        &self,
+        client: &WyrdClient,
+        table: Option<TableConfig>,
+        queue: QueueConfig,
+    ) -> Result<(), WyrdError> {
+        let claim = self.bifrost.claim()?;
+        claim
+            .complete(Bifrost::connect_with_config(client, table, queue).await?)
+            .await
+    }
+
+    /// Open one invocation over this state, targeting the root Service Card.
+    ///
+    /// Local only: no network IO, no server-side Run resource, and no Verifier
+    /// execution. The run mints a UUIDv7 `run_id` that every view of it shares.
+    #[must_use]
+    pub fn run(&self) -> Run {
+        Run::new(self.clone())
+    }
+
+    /// Drain every producer of this state's writer without closing it.
+    ///
+    /// The explicit durability barrier a test or a finite job uses; ordinary
+    /// callers drain once at [`WyrdState::shutdown`].
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup,
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown, and the first producer or
+    /// sink failure from the drain.
+    pub async fn flush(&self) -> Result<(), WyrdError> {
+        Ok(self.bifrost.started()?.bifrost.flush().await?)
+    }
+
+    /// Drain every producer of this state's writer and close it to writes.
+    ///
+    /// Graceful shutdown is the durability barrier: queue admission is not a
+    /// Scribe acknowledgement, so an abrupt exit before this resolves can lose
+    /// pending rows. A drain failure is ambiguous, so the writer is kept and
+    /// the caller retries `shutdown` on the same state rather than replacing a
+    /// writer that may still hold batches. A never-started state has nothing to
+    /// drain; it succeeds and closes, so every successful shutdown is terminal.
+    ///
+    /// # Errors
+    /// Returns the first producer or sink failure from the drain.
+    pub async fn shutdown(&self) -> Result<(), WyrdError> {
+        self.bifrost.shutdown().await
+    }
+
+    /// Start Bifrost over an already-assembled writer, for server-free tests.
+    ///
+    /// Takes the same `StartClaim` and runs the same fixed-table describes as
+    /// the public doors, so the lifecycle under test is the production one; only
+    /// the ingest sink is a mock, which is what lets a unit lane prove startup
+    /// without dialling a gRPC channel.
+    ///
+    /// # Errors
+    /// As [`WyrdState::start_bifrost`].
+    #[cfg(test)]
+    pub(crate) async fn adopt_started_bifrost_for_test(
+        &self,
+        bifrost: Bifrost,
+    ) -> Result<(), WyrdError> {
+        self.bifrost.claim()?.complete(bifrost).await
+    }
+
+    /// The started writer and its two described fixed tables.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
+    pub(crate) fn started_bifrost(&self) -> Result<Arc<StartedBifrost>, WyrdError> {
+        self.bifrost.started()
     }
 
     /// Return the exact root Card reference.
@@ -580,28 +722,19 @@ impl WyrdState {
             .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Workflow))
     }
 
-    /// Resolve an alias to the pure Eval spec borrowed from its envelope.
+    /// Resolve an alias to the pure Verifier spec borrowed from its envelope.
+    ///
+    /// The caller matches on `implementation` to reach the Drift or Eval
+    /// payload; there is no separate per-implementation accessor because
+    /// `Verifier` is the only registrable verification kind.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
     /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` for an inconsistent envelope.
-    pub fn eval(&self, alias: &str) -> Result<&EvalSpec, WyrdError> {
-        self.spec_of_kind(alias, &CardKind::Eval, |spec| match spec {
-            Spec::Eval(spec) => Some(spec),
-            _ => None,
-        })
-    }
-
-    /// Resolve an alias to the pure Drift spec borrowed from its envelope.
-    ///
-    /// # Errors
-    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
-    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
-    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` for an inconsistent envelope.
-    pub fn drift(&self, alias: &str) -> Result<&DriftSpec, WyrdError> {
-        self.spec_of_kind(alias, &CardKind::Drift, |spec| match spec {
-            Spec::Drift(spec) => Some(spec),
+    pub fn verifier(&self, alias: &str) -> Result<&VerifierSpec, WyrdError> {
+        self.spec_of_kind(alias, &CardKind::Verifier, |spec| match spec {
+            Spec::Verifier(spec) => Some(spec),
             _ => None,
         })
     }
@@ -1679,7 +1812,7 @@ struct AliasRecord {
 #[cfg(test)]
 /// Exercises local hydrated-bundle loading, typed Card projections, reference
 /// closure, alias identity, and artifact confinement without network access.
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs;
@@ -1695,11 +1828,16 @@ mod tests {
     use wyrd_spec::api_version::ApiVersion;
     use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec};
     use wyrd_spec::card::data::{CustomDataMeta, DataInterface, DataSchema, DataSpec, DataStats};
-    use wyrd_spec::card::drift::{DriftCondition, DriftMethod, DriftSignal, DriftSpec};
+    use wyrd_spec::card::drift::{
+        CustomProfile, DriftCondition, DriftMethod, DriftProfile, DriftSignal, DriftSpec,
+    };
+    use wyrd_spec::card::eval::EvalSpec;
     use wyrd_spec::card::field::FieldSpec;
     use wyrd_spec::card::model::{CustomMeta, ModelInterface, ModelSignature, ModelSpec, TaskType};
     use wyrd_spec::card::prompt::PromptSpec;
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
+    use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
+    use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
     use wyrd_spec::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
     use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
     use wyrd_spec::graph::relationships_from_spec;
@@ -1711,7 +1849,6 @@ mod tests {
 
     use super::WyrdState;
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::vala::eval::EvalSpec;
 
     /// Deterministic payload metadata used to materialize a hydrated artifact
     /// in a temporary bundle fixture.
@@ -1727,7 +1864,7 @@ mod tests {
 
     /// Owns a complete temporary hydrated bundle and the in-memory values used
     /// to rewrite projections while testing validation failures.
-    struct TestBundle {
+    pub(crate) struct TestBundle {
         /// Temporary directory containing metadata, Card projections, aliases,
         /// and verified artifact payloads.
         root: TempDir,
@@ -1745,7 +1882,7 @@ mod tests {
         /// # Panics
         /// Panics if the temporary directory cannot be created or fixture
         /// values cannot be serialized and written.
-        fn complete_service() -> Self {
+        pub(crate) fn complete_service() -> Self {
             let root_ref = test_ref(CardKind::Service, "service", 1);
             let model_ref = test_ref(CardKind::Model, "model", 2);
             let backup_ref = test_ref(CardKind::Model, "backup", 3);
@@ -1754,7 +1891,7 @@ mod tests {
                     ServiceComponent {
                         alias: "model".to_owned(),
                         card_ref: Ref::Ref(model_ref.clone()),
-                        publishes_to: Vec::new(),
+                        verified_by: Vec::new(),
                         source: None,
                         config: BTreeMap::new(),
                         credential_refs: Vec::new(),
@@ -1762,7 +1899,7 @@ mod tests {
                     ServiceComponent {
                         alias: "backup".to_owned(),
                         card_ref: Ref::Ref(backup_ref.clone()),
-                        publishes_to: Vec::new(),
+                        verified_by: Vec::new(),
                         source: None,
                         config: BTreeMap::new(),
                         credential_refs: Vec::new(),
@@ -1869,8 +2006,8 @@ mod tests {
             let inline_prompt_ref = test_ref(CardKind::Agent, "inline", 5);
             let agent_ref = test_ref(CardKind::Agent, "triage", 6);
             let data_ref = test_ref(CardKind::Data, "training", 7);
-            let eval_ref = test_ref(CardKind::Eval, "quality", 8);
-            let drift_ref = test_ref(CardKind::Drift, "model-drift", 9);
+            let eval_ref = test_ref(CardKind::Verifier, "quality", 8);
+            let drift_ref = test_ref(CardKind::Verifier, "model-drift", 9);
             let workflow_ref = test_ref(CardKind::Workflow, "runtime", 10);
 
             bundle.add_card(
@@ -1901,7 +2038,7 @@ mod tests {
                         prompt: InlineableRef::Inline(Box::new(prompt("inline"))),
                         tool_names: Vec::new(),
                         run_config: AgentRunConfigSpec::default(),
-                        publishes_to: Vec::new(),
+                        verified_by: Vec::new(),
                     }),
                     Relationships::default(),
                 ),
@@ -1921,8 +2058,11 @@ mod tests {
                 "quality_eval",
                 card(
                     &eval_ref,
-                    CardKind::Eval,
-                    Spec::Eval(eval_spec()),
+                    CardKind::Verifier,
+                    Spec::Verifier(VerifierSpec {
+                        description: None,
+                        implementation: VerifierImplementation::Eval(eval_spec()),
+                    }),
                     Relationships::default(),
                 ),
                 &[],
@@ -1931,8 +2071,11 @@ mod tests {
                 "model_drift",
                 card(
                     &drift_ref,
-                    CardKind::Drift,
-                    Spec::Drift(drift_spec()),
+                    CardKind::Verifier,
+                    Spec::Verifier(VerifierSpec {
+                        description: Some("fixture drift".to_owned()),
+                        implementation: VerifierImplementation::Drift(drift_spec()),
+                    }),
                     Relationships::default(),
                 ),
                 &[],
@@ -1959,8 +2102,16 @@ mod tests {
                     service_component("agent_inline", &inline_prompt_ref),
                     service_component("runtime_workflow", &workflow_ref),
                 ]);
-                spec.publishes_to
-                    .extend([Ref::Ref(eval_ref), Ref::Ref(drift_ref)]);
+                spec.verified_by.extend([
+                    verification_binding(eval_ref, TriggerActivation::ObservationsReady {}),
+                    verification_binding(
+                        drift_ref,
+                        TriggerActivation::Schedule {
+                            cron: "0 * * * *".to_owned(),
+                            tz: None,
+                        },
+                    ),
+                ]);
             });
             bundle.write();
             bundle
@@ -1985,7 +2136,7 @@ mod tests {
                         },
                         tool_names: Vec::new(),
                         run_config: AgentRunConfigSpec::default(),
-                        publishes_to: Vec::new(),
+                        verified_by: Vec::new(),
                     }))),
                     depends_on: Vec::new(),
                     inputs: BTreeMap::new(),
@@ -2007,7 +2158,7 @@ mod tests {
                     spec.components.push(ServiceComponent {
                         alias: "workflow".to_owned(),
                         card_ref: Ref::Ref(workflow_ref.clone()),
-                        publishes_to: Vec::new(),
+                        verified_by: Vec::new(),
                         source: None,
                         config: BTreeMap::new(),
                         credential_refs: Vec::new(),
@@ -2133,7 +2284,7 @@ mod tests {
         }
 
         /// Return the temporary bundle root used by `WyrdState::from_path`.
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             self.root.path()
         }
 
@@ -2241,7 +2392,7 @@ mod tests {
         ServiceComponent {
             alias: alias.to_owned(),
             card_ref: Ref::Ref(card_ref.clone()),
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
             source: None,
             config: BTreeMap::new(),
             credential_refs: Vec::new(),
@@ -2328,7 +2479,7 @@ mod tests {
             prompt: InlineableRef::Ref(prompt_ref.clone()),
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         })
     }
 
@@ -2372,17 +2523,41 @@ mod tests {
         }
     }
 
-    /// Build a deterministic external Drift spec for typed-state projection tests.
+    /// Build a deterministic Custom metric Drift spec for typed-state projection tests.
+    ///
+    /// # Panics
+    /// This pure constructor does not panic.
     fn drift_spec() -> DriftSpec {
         DriftSpec {
-            description: Some("fixture drift".to_owned()),
-            method: DriftMethod::External,
+            description: None,
+            method: DriftMethod::Custom,
             signal: DriftSignal::Metric {
                 name: "score".to_owned(),
             },
             condition: DriftCondition::Statistical,
-            profile: None,
-            details: BTreeMap::new(),
+            profile: Some(DriftProfile::Custom(CustomProfile {
+                metric_name: "score".to_owned(),
+                baseline_value: 0.5,
+                alert_threshold: 0.1,
+            })),
+        }
+    }
+
+    /// Build a binding that attaches `verifier` with an inline Trigger activation.
+    ///
+    /// # Panics
+    /// This pure constructor does not panic.
+    fn verification_binding(
+        verifier: CardRef,
+        activation: TriggerActivation,
+    ) -> VerificationBinding {
+        VerificationBinding {
+            verifier: Ref::Ref(verifier),
+            runs_on: InlineableRef::Inline(Box::new(TriggerSpec {
+                description: None,
+                activation,
+            })),
+            on_failure: Vec::new(),
         }
     }
 
@@ -2494,7 +2669,7 @@ mod tests {
     }
 
     /// Prove every runtime-relevant typed accessor returns its native Rust
-    /// projection while Eval and Drift remain borrowed envelope specs.
+    /// projection while Verifier implementations remain borrowed envelope specs.
     ///
     /// # Panics
     /// Panics if typed-card loading, alias resolution, or projection assertions fail.
@@ -2522,21 +2697,21 @@ mod tests {
                 .name,
             "runtime"
         );
-        assert!(
-            state
-                .eval("quality_eval")
-                .expect("eval resolves")
-                .tasks
-                .is_empty()
-        );
-        assert_eq!(
-            state
-                .drift("model_drift")
-                .expect("drift resolves")
-                .description
-                .as_deref(),
-            Some("fixture drift")
-        );
+        let eval = state
+            .verifier("quality_eval")
+            .expect("eval verifier resolves");
+        assert!(matches!(
+            &eval.implementation,
+            VerifierImplementation::Eval(spec) if spec.tasks.is_empty()
+        ));
+        let drift = state
+            .verifier("model_drift")
+            .expect("drift verifier resolves");
+        assert_eq!(drift.description.as_deref(), Some("fixture drift"));
+        assert!(matches!(
+            drift.implementation,
+            VerifierImplementation::Drift(_)
+        ));
     }
 
     /// Prove two exact Model Card identities retain distinct native holders.
@@ -2713,7 +2888,7 @@ mod tests {
                 spec.components.push(ServiceComponent {
                     alias: "training".to_owned(),
                     card_ref: Ref::Ref(data_ref.clone()),
-                    publishes_to: Vec::new(),
+                    verified_by: Vec::new(),
                     source: None,
                     config: BTreeMap::new(),
                     credential_refs: Vec::new(),
@@ -2777,8 +2952,7 @@ mod tests {
         assert_wrong_kind!(state.model("agent_triage"));
         assert_wrong_kind!(state.data("agent_triage"));
         assert_wrong_kind!(state.workflow("agent_triage"));
-        assert_wrong_kind!(state.eval("agent_triage"));
-        assert_wrong_kind!(state.drift("agent_triage"));
+        assert_wrong_kind!(state.verifier("agent_triage"));
     }
 
     /// Prove generic Card access remains available for unprojected kinds.
@@ -2791,11 +2965,11 @@ mod tests {
         let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
         assert_eq!(
             state.card("quality_eval").expect("eval card").kind,
-            CardKind::Eval
+            CardKind::Verifier
         );
         assert_eq!(
             state.card("model_drift").expect("drift card").kind,
-            CardKind::Drift
+            CardKind::Verifier
         );
     }
 

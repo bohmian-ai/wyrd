@@ -7,11 +7,9 @@
 //! functions to coordinate one cross-crate transaction; Wyrd-to-Vala effects
 //! are propagated after commit through the future outbox path.
 
-pub mod alerts;
 pub mod anchors;
 pub mod audit_staging;
 pub mod cluster_nodes;
-pub mod drift_alerts;
 pub mod file_list;
 pub mod forge_catalog_operator;
 pub mod forge_operations;

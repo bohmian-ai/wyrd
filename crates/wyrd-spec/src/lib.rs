@@ -33,6 +33,7 @@ pub mod security;
 pub mod storage;
 pub mod trace;
 pub mod vala;
+pub mod verification;
 
 pub use card::agent::{AgentCard, AgentRunConfigSpec, AgentSpec};
 pub use card::data::{
@@ -67,7 +68,7 @@ pub use skald_spec::{MessageNum, Prompt, ProviderRequest, ProviderResponse, Resp
 #[cfg(test)]
 mod foundation_contracts_tests {
     use crate::error::WyrdError;
-    use crate::ids::{CardUid, DataTenantId, SpaceName, TenantSlug};
+    use crate::ids::{BindingId, CardUid, DataTenantId, SpaceName, TenantSlug};
     use crate::request_id::RequestId;
     use crate::trace::TraceContext;
     use wyrd_semver::{VersionBlock, VersionBump, VersionRange};
@@ -107,6 +108,27 @@ mod foundation_contracts_tests {
                 .parse::<DataTenantId>()
                 .is_err()
         );
+    }
+
+    /// Prove a binding identity round-trips its wire form and refuses a
+    /// non-v7 UUID on every construction path.
+    ///
+    /// # Panics
+    /// Panics when a minted id is not v7, fails to round-trip through text or
+    /// JSON, or when a v4 or nil UUID is accepted.
+    #[test]
+    fn binding_id_is_uuid7_backed() {
+        let generated = BindingId::new_v7();
+        assert_eq!(generated.as_uuid().get_version_num(), 7);
+        let parsed: BindingId = generated.to_string().parse().unwrap();
+        assert_eq!(parsed, generated);
+        let decoded: BindingId = serde_json::from_value(serde_json::json!(generated)).unwrap();
+        assert_eq!(decoded, generated);
+
+        assert!(BindingId::new(uuid::Uuid::nil()).is_err());
+        let v4 = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(v4.parse::<BindingId>().is_err());
+        assert!(serde_json::from_value::<BindingId>(serde_json::json!(v4)).is_err());
     }
 
     #[test]

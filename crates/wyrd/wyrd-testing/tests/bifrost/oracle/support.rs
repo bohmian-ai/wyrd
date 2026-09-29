@@ -16,6 +16,7 @@ use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
 use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
+use std::time::Duration;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::{
@@ -31,9 +32,7 @@ use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, FreshnessPolicy, VisibilityMode,
-};
+use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::WyrdTestCluster;
 use wyrd_testing::bifrost::write::BifrostWriter;
@@ -121,6 +120,30 @@ pub(crate) async fn client_from_bootstrap(
         ..ClientConfig::default()
     })?)
 }
+/// Builds one public client against one pod's public HTTP and gRPC listeners.
+///
+/// # Errors
+///
+/// Returns the client configuration error.
+pub(crate) fn public_client(
+    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    api_key: &secrecy::SecretString,
+) -> Result<WyrdClient, JourneyError> {
+    Ok(WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: format!("http://{}", node.grpc_addr()),
+            connect_retries: 0,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: format!("http://{}", node.http_addr()),
+            ..HttpConfig::default()
+        },
+        credential: Some(api_key.clone()),
+        ..ClientConfig::default()
+    })?)
+}
+
 /// The three-column user schema every Oracle journey table registers.
 ///
 /// `unused_payload` is the wide column no narrow query requests; it exists so
@@ -297,19 +320,19 @@ pub(crate) async fn seed_foreign_hot_row(
     conn.commit().await?;
     Ok(())
 }
+
 /// Drain a public query stream and require its terminal row count to match frames.
-pub(crate) async fn query_rows(
-    client: &WyrdClient,
-    table: &str,
-    visibility: VisibilityMode,
-) -> Result<u64, JourneyError> {
+///
+/// # Errors
+///
+/// Returns client or Arrow errors, and an error when the terminal is missing
+/// or its row count differs from the frames received.
+pub(crate) async fn query_rows(client: &WyrdClient, table: &str) -> Result<u64, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql: format!(
                 "SELECT id, filter_key, unused_payload FROM vala.bifrost.{table} ORDER BY id"
             ),
-            visibility,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await?;
@@ -505,15 +528,26 @@ pub(crate) fn unused_payload(id: i64) -> String {
     out
 }
 
-/// How long the fixture drives Forge passes before it gives up on compacting
-/// its first batch.
+/// Bound on how long the fixture drives Forge planning passes before it gives
+/// up on compacting its first batch.
 ///
-/// The bound is time, not a pass count: Forge claims round-robin across
-/// tenants, so every tenant an earlier case in the same lane database left with
-/// ready work takes a pass before this tenant's turn comes around. Generous,
-/// because a pass may also claim nothing, retry, or lose a lease race; finite,
-/// because a stalled Forge must fail the journey rather than hang it.
-const COMPACTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+/// A wall clock rather than a count of passes. The loop waits on the worker
+/// completion observer, and that observer reports every completion the node
+/// makes — including one for a second tenant's table in the same fixture. A
+/// counted budget let those unrelated completions spend all of it in a few
+/// seconds, before this table's own demand was schedulable, so the journey
+/// failed with nothing compacted and no time elapsed. Generous, because a pass
+/// may claim nothing, retry, or lose a lease race; finite, because a stalled
+/// Forge must fail the journey rather than hang it.
+const COMPACTION_BUDGET: Duration = Duration::from_secs(180);
+
+/// Longest one requested pass is waited on before the loop re-reads the truth.
+const COMPACTION_PASS_WAIT: Duration = Duration::from_secs(30);
+
+/// Floor on one loop iteration, so a fixture whose completions return instantly
+/// polls Postgres and nudges the scheduler at a bounded rate instead of
+/// spinning on them for the whole budget.
+const COMPACTION_POLL_FLOOR: Duration = Duration::from_millis(100);
 
 /// Compacts every sealed file already written for `table`, so that a later
 /// query reads them through the Iceberg snapshot rather than the hot manifest.
@@ -532,16 +566,17 @@ const COMPACTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
 ///   `next_eligible_at` back instead of sleeping, leaving the failure
 ///   classification untouched.
 ///
-/// The loop is bounded by [`COMPACTION_DEADLINE`] and its exit condition is the durable `compacted` flag,
-/// not a pass or completion count: a pass that claimed nothing, and a
-/// completion that rewrote some other table, must not be mistaken for this
-/// batch having moved tiers.
+/// The loop is bounded by [`COMPACTION_BUDGET`] and its exit condition is the
+/// durable `compacted` flag, not a pass or completion count: a pass that
+/// claimed nothing, and a completion that rewrote some other table, must not be
+/// mistaken for this batch having moved tiers — nor, since the budget is a wall
+/// clock, allowed to consume the time this batch is waiting for.
 ///
 /// # Errors
 ///
 /// Returns an error when the observer is absent, when the clock cannot be
 /// advanced, when a Postgres probe fails, or when fewer than `expected` inputs
-/// are compacted before the deadline.
+/// are compacted before [`COMPACTION_BUDGET`] elapses.
 pub(crate) async fn compact_sealed_batch(
     cluster: &WyrdTestCluster,
     tenant: wyrd_spec::DataTenantId,
@@ -557,11 +592,18 @@ pub(crate) async fn compact_sealed_batch(
             .advance(chrono::Duration::days(1))
             .map_err(|error| format!("close the written partition: {error}"))?;
     }
-    let deadline = tokio::time::Instant::now() + COMPACTION_DEADLINE;
-    while tokio::time::Instant::now() < deadline {
-        let (compacted, _) = file_tier_counts(cluster, tenant, table).await?;
+    let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
+    loop {
+        let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
         if compacted >= expected {
             return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Forge compacted {compacted} of {expected} sealed inputs within \
+                 {COMPACTION_BUDGET:?} ({hot} still hot)"
+            )
+            .into());
         }
         release_forge_retries(cluster, tenant, table).await?;
         let target = observer.completed().saturating_add(1);
@@ -569,18 +611,10 @@ pub(crate) async fn compact_sealed_batch(
         // A lapsed wait is not a failure on its own: the pass may legitimately
         // have found nothing to claim on this iteration. The durable flag
         // checked at the top of the next iteration is the real verdict.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            observer.wait_for_at_least(target),
-        )
-        .await;
+        let _ =
+            tokio::time::timeout(COMPACTION_PASS_WAIT, observer.wait_for_at_least(target)).await;
+        tokio::time::sleep(COMPACTION_POLL_FLOOR).await;
     }
-    let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
-    Err(format!(
-        "Forge compacted {compacted} of {expected} sealed inputs within \
-         {COMPACTION_DEADLINE:?} ({hot} still hot)"
-    )
-    .into())
 }
 /// Makes every `retryable` Forge task for one table immediately eligible.
 ///

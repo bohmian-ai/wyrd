@@ -16,8 +16,6 @@ use crate::card::agent::AgentSpec;
 use crate::card::artifact::ArtifactSpec;
 use crate::card::audit::AuditSpec;
 use crate::card::data::DataSpec;
-use crate::card::drift::DriftSpec;
-use crate::card::eval::EvalSpec;
 use crate::card::experiment::ExperimentSpec;
 use crate::card::mcp::McpSpec;
 use crate::card::model::ModelSpec;
@@ -27,6 +25,7 @@ use crate::card::prompt::PromptSpec;
 use crate::card::service::ServiceSpec;
 use crate::card::source::SourceSpec;
 use crate::card::trigger::TriggerSpec;
+use crate::card::verifier::{VerificationStatus, VerifierSpec};
 use crate::card::workflow::WorkflowSpec;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
@@ -239,10 +238,8 @@ pub enum Spec {
     Agent(AgentSpec),
     /// Workflow card spec.
     Workflow(WorkflowSpec),
-    /// Eval card spec.
-    Eval(EvalSpec),
-    /// Drift card spec.
-    Drift(DriftSpec),
+    /// Verifier card spec.
+    Verifier(VerifierSpec),
     /// Service card spec.
     Service(ServiceSpec),
     /// Policy card spec.
@@ -264,26 +261,6 @@ pub enum Spec {
 }
 
 #[cfg(feature = "server")]
-fn eval_spec_openapi_schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
-    use utoipa::openapi::schema::{ObjectBuilder, Schema, Type};
-
-    let opaque_object = Schema::Object(ObjectBuilder::new().schema_type(Type::Object).build());
-    utoipa::openapi::RefOr::T(Schema::Object(
-        ObjectBuilder::new()
-            .description(Some("Evaluation Card spec."))
-            .property("dataset", opaque_object.clone())
-            .property("tasks", opaque_object.clone())
-            .property("workflow", opaque_object.clone())
-            .property("sampling", opaque_object.clone())
-            .property("pass_gate", opaque_object.clone())
-            .property("context_capture", opaque_object)
-            .required("tasks")
-            .schema_type(Type::Object)
-            .build(),
-    ))
-}
-
-#[cfg(feature = "server")]
 impl utoipa::PartialSchema for Spec {
     fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
         utoipa::openapi::schema::OneOfBuilder::new()
@@ -293,8 +270,7 @@ impl utoipa::PartialSchema for Spec {
             .item(<PromptSpec as utoipa::PartialSchema>::schema())
             .item(<AgentSpec as utoipa::PartialSchema>::schema())
             .item(<WorkflowSpec as utoipa::PartialSchema>::schema())
-            .item(eval_spec_openapi_schema())
-            .item(<DriftSpec as utoipa::PartialSchema>::schema())
+            .item(<VerifierSpec as utoipa::PartialSchema>::schema())
             .item(<ServiceSpec as utoipa::PartialSchema>::schema())
             .item(<PolicySpec as utoipa::PartialSchema>::schema())
             .item(<McpSpec as utoipa::PartialSchema>::schema())
@@ -336,7 +312,7 @@ impl utoipa::ToSchema for Spec {
         add_schema!(PromptSpec);
         add_schema!(AgentSpec);
         add_schema!(WorkflowSpec);
-        add_schema!(DriftSpec);
+        add_schema!(VerifierSpec);
         add_schema!(ServiceSpec);
         add_schema!(PolicySpec);
         add_schema!(McpSpec);
@@ -361,8 +337,7 @@ impl schemars::JsonSchema for Spec {
             generator.subschema_for::<PromptSpec>(),
             generator.subschema_for::<AgentSpec>(),
             generator.subschema_for::<WorkflowSpec>(),
-            generator.subschema_for::<EvalSpec>(),
-            generator.subschema_for::<DriftSpec>(),
+            generator.subschema_for::<VerifierSpec>(),
             generator.subschema_for::<ServiceSpec>(),
             generator.subschema_for::<PolicySpec>(),
             generator.subschema_for::<McpSpec>(),
@@ -399,8 +374,7 @@ impl Spec {
             Self::Prompt(_) => CardKind::Prompt,
             Self::Agent(_) => CardKind::Agent,
             Self::Workflow(_) => CardKind::Workflow,
-            Self::Eval(_) => CardKind::Eval,
-            Self::Drift(_) => CardKind::Drift,
+            Self::Verifier(_) => CardKind::Verifier,
             Self::Service(_) => CardKind::Service,
             Self::Policy(_) => CardKind::Policy,
             Self::Mcp(_) => CardKind::Mcp,
@@ -494,6 +468,12 @@ pub struct Status {
     /// Last status update timestamp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Server-derived verification state, absent when the Card has none.
+    ///
+    /// Read-side projection only: it never changes the authored `spec`, and
+    /// a registration request's own `status` is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationStatus>,
 }
 
 /// Native Wyrd Card kind plus forward-compatible external catch-all.
@@ -512,10 +492,8 @@ pub enum CardKind {
     Agent,
     /// Workflow Card.
     Workflow,
-    /// Evaluation Card.
-    Eval,
-    /// Drift Card.
-    Drift,
+    /// Verifier Card.
+    Verifier,
     /// Service Card.
     Service,
     /// Policy Card.
@@ -540,9 +518,9 @@ pub enum CardKind {
 
 impl CardKind {
     /// Total v1 Card kind count including `External`.
-    pub const NATIVE_COUNT: usize = 17;
+    pub const NATIVE_COUNT: usize = 16;
     /// Registrable v1 Card kind count (excludes `External`).
-    pub const REGISTRABLE_COUNT: usize = 16;
+    pub const REGISTRABLE_COUNT: usize = 15;
 
     /// Return every native kind including [`CardKind::External`].
     #[must_use]
@@ -554,8 +532,7 @@ impl CardKind {
             Self::Prompt,
             Self::Agent,
             Self::Workflow,
-            Self::Eval,
-            Self::Drift,
+            Self::Verifier,
             Self::Service,
             Self::Policy,
             Self::Mcp,
@@ -578,8 +555,7 @@ impl CardKind {
             Self::Prompt,
             Self::Agent,
             Self::Workflow,
-            Self::Eval,
-            Self::Drift,
+            Self::Verifier,
             Self::Service,
             Self::Policy,
             Self::Mcp,
@@ -601,8 +577,7 @@ impl CardKind {
             Self::Prompt => "Prompt",
             Self::Agent => "Agent",
             Self::Workflow => "Workflow",
-            Self::Eval => "Eval",
-            Self::Drift => "Drift",
+            Self::Verifier => "Verifier",
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
@@ -632,8 +607,7 @@ impl CardKind {
             Self::Prompt => "Prompt",
             Self::Agent => "Agent",
             Self::Workflow => "Workflow",
-            Self::Eval => "Eval",
-            Self::Drift => "Drift",
+            Self::Verifier => "Verifier",
             Self::Service => "Service",
             Self::Policy => "Policy",
             Self::Mcp => "Mcp",
@@ -656,13 +630,16 @@ impl CardKind {
             | Self::Prompt
             | Self::Agent
             | Self::Workflow
-            | Self::Eval
-            | Self::Drift
             | Self::Service
             | Self::Mcp
             | Self::Artifact
             | Self::Source => true,
-            Self::Policy | Self::Audit | Self::Operator | Self::Trigger | Self::External => false,
+            Self::Policy
+            | Self::Audit
+            | Self::Operator
+            | Self::Trigger
+            | Self::Verifier
+            | Self::External => false,
         }
     }
 }
@@ -688,8 +665,7 @@ fn native_from_str(value: &str) -> Option<CardKind> {
         "Prompt" => CardKind::Prompt,
         "Agent" => CardKind::Agent,
         "Workflow" => CardKind::Workflow,
-        "Eval" => CardKind::Eval,
-        "Drift" => CardKind::Drift,
+        "Verifier" => CardKind::Verifier,
         "Service" => CardKind::Service,
         "Policy" => CardKind::Policy,
         "Mcp" => CardKind::Mcp,
@@ -737,8 +713,7 @@ impl Serialize for Spec {
             Self::Prompt(s) => s.serialize(serializer),
             Self::Agent(s) => s.serialize(serializer),
             Self::Workflow(s) => s.serialize(serializer),
-            Self::Eval(s) => s.serialize(serializer),
-            Self::Drift(s) => s.serialize(serializer),
+            Self::Verifier(s) => s.serialize(serializer),
             Self::Service(s) => s.serialize(serializer),
             Self::Policy(s) => s.serialize(serializer),
             Self::Mcp(s) => s.serialize(serializer),
@@ -812,11 +787,8 @@ fn spec_from_kind_value(kind: &CardKind, mut value: serde_json::Value) -> Result
         CardKind::Workflow => serde_json::from_value(value)
             .map(Spec::Workflow)
             .map_err(|e| e.to_string()),
-        CardKind::Eval => serde_json::from_value(value)
-            .map(Spec::Eval)
-            .map_err(|e| e.to_string()),
-        CardKind::Drift => serde_json::from_value(value)
-            .map(Spec::Drift)
+        CardKind::Verifier => serde_json::from_value(value)
+            .map(Spec::Verifier)
             .map_err(|e| e.to_string()),
         CardKind::Service => serde_json::from_value(value)
             .map(Spec::Service)

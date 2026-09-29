@@ -18,7 +18,6 @@ pub mod maintenance;
 pub mod namespaces;
 pub mod oracle;
 mod otlp_contract;
-mod otlp_limits;
 pub mod parquet;
 pub mod provider;
 pub mod resources;
@@ -80,7 +79,7 @@ pub mod partition_fixtures {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    pub(crate) use crate::partition_fixtures::{day_partition, hour_partition};
+    pub(crate) use crate::partition_fixtures::day_partition;
     use std::collections::HashMap;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};

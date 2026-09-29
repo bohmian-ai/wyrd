@@ -731,10 +731,11 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
     // repeated reconciliation, would show up as a counter that outruns the
     // files the table lost.
     let idle = promoted.fixture.live_data_paths().await;
+    promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();
     supervisor.schedule_only().await;
     supervisor.start_worker();
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    await_small_files_settled(&promoted.fixture).await;
     supervisor.shutdown().await;
     let consumed_by_extra_pass = consumed_paths(&idle, &promoted.fixture.live_data_paths().await);
     assert_eq!(
@@ -1152,6 +1153,47 @@ async fn await_small_files_in_state(
          durable tasks are the authority on ownership: {:?}",
         tenant_tasks(fixture).await
     )
+}
+
+/// Polls until no small-files task is owed, retryable, or owned and no rewrite
+/// operation is still `prepared`.
+///
+/// Stopping a worker cancels its in-flight attempt, and a cancelled attempt
+/// whose commit already landed leaves its operation `prepared` and its volume
+/// uncounted until a later owner proves it. A pass is only comparable with the
+/// files the table lost once every attempt it started has settled, so callers
+/// wait here instead of stopping the worker after a fixed delay. A `retryable`
+/// task still owes its work, so a failed pass never reads as settled.
+///
+/// # Panics
+///
+/// Panics when the pass does not settle inside [`ADMISSION_BOUND`], reporting
+/// the durable task and operation rows it observed.
+async fn await_small_files_settled(fixture: &super::support::PromotionIntegrationFixture) {
+    let settled = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let owed = small_files_in_state(
+                fixture,
+                &["ready", "retryable", "claimed", "running", "prepared"],
+            )
+            .await;
+            let open = operation_phases(fixture)
+                .await
+                .into_values()
+                .any(|phase| phase == "prepared");
+            if owed == 0 && !open {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "the small-files pass never settled: tasks {:?}, operations {:?}",
+        tenant_tasks(fixture).await,
+        operation_phases(fixture).await
+    );
 }
 
 /// Publishes both fixture tables and leaves each owing one ready rewrite.

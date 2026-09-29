@@ -72,8 +72,9 @@ pub enum DriftSignal {
 ```
 
 `DriftCondition`, `DriftProfile`, `PsiProfile`, `PsiBinningStrategy`,
-`PsiThreshold`, `SpcProfile`, `SpcWecoRule`, `SpcAlertThreshold`, and
-`CustomProfile` remain as currently defined.
+`PsiThreshold`, and `CustomProfile` remain as currently defined.
+`SpcProfile` carries only `sample_size`, an authored subgroup size of at
+least two; `SpcWecoRule` and `SpcAlertThreshold` are removed.
 
 The only removals from the current contract are:
 

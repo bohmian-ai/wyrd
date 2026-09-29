@@ -118,7 +118,7 @@ impl ScenarioCursor {
 pub struct RunState {
     /// Core run id used by the eval protocol.
     pub run_id: RunId,
-    /// Eval card under execution.
+    /// Eval-backed Verifier Card under execution.
     pub eval_ref: CardRef,
     /// Source for non-scripted user turns.
     pub simulated_user: SimulatedUserMode,

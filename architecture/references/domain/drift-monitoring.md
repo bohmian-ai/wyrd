@@ -1,15 +1,17 @@
 # Drift and monitoring
 
-Load for Drift Cards, versioned baselines, windows, statistical methods,
-thresholds, alert quality, or reactions to observed change.
+Load for Drift-backed Verifiers, versioned baselines, windows, statistical
+methods, thresholds, alert quality, or reactions to observed change.
 
 ## Declare the signal first
 
-A `Drift` Card is reusable and subject-less. It declares one typed signal, one
-method, one resolved condition, and a method-specific profile. Deployment
-`publishes_to` selects it, and runtime observation identity supplies the
-subject. Select statistics only after defining the signal's unit, population,
-sampling grain, completeness, delay, and failure semantics.
+Drift is a `Verifier` implementation (`implementation.kind: drift`), not a
+Card kind. The Verifier is reusable and subject-less and declares one typed
+signal, one method, one resolved condition, and a method-specific profile. A
+deployment `verified_by` binding pairs it with a `schedule` Trigger, and
+runtime observation identity supplies the subject. Select statistics only
+after defining the signal's unit, population, sampling grain, completeness,
+delay, and failure semantics.
 
 - **Data drift** compares a versioned baseline distribution with a bounded
   comparison window. Preserve feature set, bin edges or sketch configuration,
@@ -58,13 +60,15 @@ a new comparable regime and does not rewrite prior observations.
 
 ## Scheduling and reaction
 
-Drift computes and emits an Observation. Trigger owns scheduling and condition
-evaluation. Operator owns one reaction. Keep notification, rollback,
+The binding's `schedule` Trigger decides when a Drift run happens; the Drift
+implementation decides the verdict; only a `failed` verdict creates one
+dispatch per `on_failure` Operator, and each Operator owns one reaction. There
+is no Alert resource or mutable alert state. Keep notification, rollback,
 retraining, and workflow dispatch out of the Drift evaluator.
 
 Reaction policy uses hysteresis, cooldown, minimum consecutive breaches,
 deduplication key, and recovery conditions appropriate to the signal. It
-records the exact Drift observation and rule that caused the action. A drift
+records the exact Verification Result that caused the action. A drift
 finding is evidence for investigation or policy action; it is not an automatic
 diagnosis.
 
@@ -85,7 +89,7 @@ as causality or business impact.
 
 ## Stable Wyrd anchors
 
-- Drift contract: `architecture/wyrd-design.md` §Drift.
+- Drift contract: `architecture/wyrd-design.md` §Verifier (Drift implementation).
 - Drift types: `crates/wyrd-spec/src/vala/drift/`.
 - Trigger and Operator: `architecture/wyrd-design.md` §§Trigger and Operator.
 - Observation store: `crates/vala/`.

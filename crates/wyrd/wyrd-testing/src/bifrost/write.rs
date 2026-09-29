@@ -150,6 +150,13 @@ impl BifrostWriter {
     }
 }
 
+/// Byte budget every clone of one [`RawIngest`] shares.
+///
+/// Holds one frame at the largest wire ceiling a journey configures (48 MiB)
+/// with room to spare, or several default 16 MiB frames from concurrent load
+/// writers. A frame above it is a fixture fault, not a server refusal.
+const RAW_INGEST_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
 /// The client ingest transport under a caller-chosen batch identity.
 ///
 /// Cloning shares the authenticated channel and the byte budget, so concurrent
@@ -171,7 +178,7 @@ impl RawIngest {
             transport: BifrostGrpcTransport::connect(client)
                 .await
                 .map_err(|error| harness_error(&error.to_string()))?,
-            budget: ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT),
+            budget: ClientByteBudget::new(RAW_INGEST_BUDGET_BYTES),
         })
     }
 

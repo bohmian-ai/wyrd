@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::{CredentialRef, NonSecretValue};
+use crate::card::verifier::VerificationBinding;
 use crate::reference::{CardRef, Ref};
 
 /// Composition of cards used by an application or deployment.
@@ -21,9 +22,9 @@ pub struct ServiceSpec {
     /// Alias-bound components.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ServiceComponent>,
-    /// Eval and Drift cards that receive observations from this service.
+    /// Continuous verification bindings owned by this Service as a whole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub publishes_to: Vec<Ref>,
+    pub verified_by: Vec<VerificationBinding>,
     /// Entry point descriptor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_point: Option<String>,
@@ -121,9 +122,9 @@ pub struct ServiceComponent {
     /// Canonical Card reference.
     #[serde(rename = "ref")]
     pub card_ref: Ref,
-    /// Eval and Drift cards that receive observations from this component in this Service.
+    /// Continuous verification bindings owned by this component occurrence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub publishes_to: Vec<Ref>,
+    pub verified_by: Vec<VerificationBinding>,
     /// Optional development-time source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<ComponentSource>,

@@ -181,6 +181,19 @@ impl ResourceEnvelope {
             },
         }
     }
+
+    /// Returns the variable-length payload bytes this envelope adds to each
+    /// row that repeats it, including one 4-byte offset per entity reference.
+    #[must_use]
+    pub fn repeated_bytes(&self) -> usize {
+        self.attributes.len()
+            + self.schema_url.len()
+            + self
+                .entity_refs
+                .iter()
+                .map(|entity| entity.len() + size_of::<i32>())
+                .sum::<usize>()
+    }
 }
 
 /// The canonical instrumentation-scope envelope every signal row repeats.
@@ -225,6 +238,13 @@ impl ScopeEnvelope {
                 schema_url: schema_url.to_owned(),
             },
         }
+    }
+
+    /// Returns the variable-length payload bytes this envelope adds to each
+    /// row that repeats it.
+    #[must_use]
+    pub fn repeated_bytes(&self) -> usize {
+        self.name.len() + self.version.len() + self.attributes.len() + self.schema_url.len()
     }
 }
 
@@ -857,6 +877,67 @@ pub(crate) mod correlation_fixture {
             [CardRef::from_str(WITHOUT_UID).expect("fixture card ref")],
         )
     }
+}
+
+/// Running Arrow output charge for one projected OTLP request.
+///
+/// Each projector charges every accepted row's retained buffer bytes as it is
+/// appended and stops the request once the running total crosses the
+/// expanded-data limit, before any Arrow batch is built. The charge mirrors the
+/// value, offset, and validity buffers `finish` materializes; Scribe re-checks
+/// the assembled batch exactly before the WAL.
+#[derive(Debug)]
+pub(crate) struct OutputBudget {
+    /// Bytes charged so far.
+    used: usize,
+    /// Expanded-data limit in bytes.
+    limit: usize,
+}
+
+impl OutputBudget {
+    /// Starts an empty budget bounded by `limit` bytes.
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    /// Adds `bytes` of appended output to the running total.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::OutputTooLarge`] when the total exceeds the limit
+    /// or overflows `usize`.
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<(), TableError> {
+        self.used = self.used.saturating_add(bytes);
+        if self.used > self.limit {
+            return Err(TableError::OutputTooLarge {
+                bytes: self.used,
+                limit: self.limit,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Returns the fixed-width Arrow bytes one row of `fields` retains.
+///
+/// Counts each value slot (fixed width, or the 4-byte offset of a UTF-8,
+/// binary, or list value), recurses into struct children, and charges one byte
+/// per nullable field for its validity bit. Variable-length payloads and list
+/// elements are charged separately by the projector that appends them.
+pub(crate) fn fixed_row_bytes(fields: &Fields) -> usize {
+    fields
+        .iter()
+        .map(|field| {
+            let value = match field.data_type() {
+                DataType::Utf8 | DataType::Binary | DataType::List(_) => size_of::<i32>(),
+                DataType::Struct(children) => fixed_row_bytes(children),
+                DataType::FixedSizeBinary(width) => usize::try_from(*width).unwrap_or(0),
+                DataType::Boolean => 1,
+                other => other.primitive_width().unwrap_or(size_of::<i64>()),
+            };
+            value + usize::from(field.is_nullable())
+        })
+        .sum()
 }
 
 #[cfg(test)]

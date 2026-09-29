@@ -228,8 +228,6 @@ impl TryFrom<proto::BifrostQueryRequest> for domain::BifrostQueryRequest {
     fn try_from(value: proto::BifrostQueryRequest) -> Result<Self, Self::Error> {
         let request = Self {
             sql: value.sql,
-            visibility: visibility(value.visibility)?,
-            freshness: freshness(value.freshness)?,
             // Above-`i64` wire values stay out of range so validation rejects them.
             deadline_ms: value
                 .deadline_ms
@@ -245,18 +243,6 @@ impl From<domain::BifrostQueryRequest> for proto::BifrostQueryRequest {
     fn from(value: domain::BifrostQueryRequest) -> Self {
         Self {
             sql: value.sql,
-            visibility: match value.visibility {
-                domain::VisibilityMode::PublishedOnly => {
-                    proto::VisibilityMode::PublishedOnly as i32
-                }
-                domain::VisibilityMode::Fused => proto::VisibilityMode::Fused as i32,
-            },
-            freshness: match value.freshness {
-                domain::FreshnessPolicy::Strict => proto::FreshnessPolicy::Strict as i32,
-                domain::FreshnessPolicy::AllowDegraded => {
-                    proto::FreshnessPolicy::AllowDegraded as i32
-                }
-            },
             // Negative contract values stay out of range as zero on the unsigned wire.
             deadline_ms: value
                 .deadline_ms
@@ -290,10 +276,6 @@ impl From<domain::QueryStreamFrame> for proto::QueryStreamFrame {
                             proto::QueryTerminalOutcome::Failed as i32
                         }
                     },
-                    freshness: match value.freshness {
-                        domain::QueryFreshness::Complete => proto::QueryFreshness::Complete as i32,
-                        domain::QueryFreshness::Degraded => proto::QueryFreshness::Degraded as i32,
-                    },
                     row_count: value.row_count,
                     warnings: value.warnings.into_iter().map(proto_warning).collect(),
                     source_completion: value
@@ -319,9 +301,8 @@ impl From<domain::QueryStreamFrame> for proto::QueryStreamFrame {
 }
 
 /// Request-scoped converter for one public query response stream.
+#[derive(Debug, Default)]
 pub struct QueryStreamConverter {
-    /// Visibility admitted from the originating request.
-    visibility: domain::VisibilityMode,
     /// Rows decoded from every accepted batch frame.
     emitted_rows: u64,
     /// Whether the unique initial schema has been accepted.
@@ -331,15 +312,10 @@ pub struct QueryStreamConverter {
 }
 
 impl QueryStreamConverter {
-    /// Constructs conversion state from the admitted request visibility.
+    /// Constructs conversion state for one stream that has emitted nothing.
     #[must_use]
-    pub fn new(visibility: domain::VisibilityMode) -> Self {
-        Self {
-            visibility,
-            emitted_rows: 0,
-            schema_seen: false,
-            terminal_seen: false,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Converts one ordered frame and validates terminal source/row invariants.
@@ -389,7 +365,7 @@ impl QueryStreamConverter {
                 if !self.schema_seen {
                     return Err(QueryConversionError::InvalidFrameOrder);
                 }
-                let terminal = terminal(frame, self.visibility, self.emitted_rows)?;
+                let terminal = terminal(frame, self.emitted_rows)?;
                 self.terminal_seen = true;
                 Ok(domain::QueryStreamFrame::Terminal(terminal))
             }
@@ -479,7 +455,6 @@ fn reject_batch_rows(value: Option<u64>) -> Result<(), QueryConversionError> {
 /// combinations, or a row count unequal to preceding decoded batches.
 fn terminal(
     value: proto::QueryTerminalFrame,
-    visibility: domain::VisibilityMode,
     emitted_rows: u64,
 ) -> Result<domain::QueryTerminalFrame, QueryConversionError> {
     let terminal = domain::QueryTerminalFrame {
@@ -491,15 +466,6 @@ fn terminal(
             proto::QueryTerminalOutcome::Failed => domain::QueryTerminalOutcome::Failed,
             proto::QueryTerminalOutcome::Unspecified => {
                 return Err(QueryConversionError::RequiredEnum("outcome"))
-            }
-        },
-        freshness: match proto::QueryFreshness::try_from(value.freshness)
-            .map_err(|_| QueryConversionError::RequiredEnum("freshness"))?
-        {
-            proto::QueryFreshness::Complete => domain::QueryFreshness::Complete,
-            proto::QueryFreshness::Degraded => domain::QueryFreshness::Degraded,
-            proto::QueryFreshness::Unspecified => {
-                return Err(QueryConversionError::RequiredEnum("freshness"))
             }
         },
         row_count: value.row_count,
@@ -525,7 +491,7 @@ fn terminal(
             }
         },
     };
-    terminal.validate(visibility)?;
+    terminal.validate()?;
     terminal.validate_emitted_rows(emitted_rows)?;
     Ok(terminal)
 }
@@ -654,34 +620,6 @@ fn terminal_error(
     })
 }
 
-/// Decodes required request visibility.
-///
-/// # Errors
-/// Returns [`QueryConversionError::RequiredEnum`] for zero or unknown values.
-fn visibility(value: i32) -> Result<domain::VisibilityMode, QueryConversionError> {
-    match proto::VisibilityMode::try_from(value)
-        .map_err(|_| QueryConversionError::RequiredEnum("visibility"))?
-    {
-        proto::VisibilityMode::PublishedOnly => Ok(domain::VisibilityMode::PublishedOnly),
-        proto::VisibilityMode::Fused => Ok(domain::VisibilityMode::Fused),
-        proto::VisibilityMode::Unspecified => Err(QueryConversionError::RequiredEnum("visibility")),
-    }
-}
-
-/// Decodes required request freshness.
-///
-/// # Errors
-/// Returns [`QueryConversionError::RequiredEnum`] for zero or unknown values.
-fn freshness(value: i32) -> Result<domain::FreshnessPolicy, QueryConversionError> {
-    match proto::FreshnessPolicy::try_from(value)
-        .map_err(|_| QueryConversionError::RequiredEnum("freshness"))?
-    {
-        proto::FreshnessPolicy::Strict => Ok(domain::FreshnessPolicy::Strict),
-        proto::FreshnessPolicy::AllowDegraded => Ok(domain::FreshnessPolicy::AllowDegraded),
-        proto::FreshnessPolicy::Unspecified => Err(QueryConversionError::RequiredEnum("freshness")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,10 +637,10 @@ mod tests {
     /// Arrow-level decode.
     #[test]
     fn query_stream_eos_contract() {
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         prime_schema(&mut converter);
         let domain::QueryStreamFrame::Terminal(decoded) = converter
-            .convert(valid_terminal(false, 0), None)
+            .convert(valid_terminal(0), None)
             .expect("a success terminal with its end-of-stream converts")
         else {
             panic!("terminal frame must decode as a terminal");
@@ -713,25 +651,25 @@ mod tests {
         // decoding it again must reproduce it byte for byte.
         let reencoded =
             proto::QueryStreamFrame::from(domain::QueryStreamFrame::Terminal(decoded.clone()));
-        let mut roundtrip = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut roundtrip = QueryStreamConverter::new();
         prime_schema(&mut roundtrip);
         assert_eq!(
             roundtrip.convert(reencoded, None).expect("round trip"),
             domain::QueryStreamFrame::Terminal(decoded)
         );
 
-        let mut missing = valid_terminal(false, 0);
+        let mut missing = valid_terminal(0);
         if let Some(proto::query_stream_frame::Frame::Terminal(terminal)) = missing.frame.as_mut() {
             terminal.arrow_ipc_eos.clear();
         }
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         prime_schema(&mut converter);
         assert!(matches!(
             converter.convert(missing, None),
             Err(QueryConversionError::Contract(_))
         ));
 
-        let mut failed_with_eos = valid_terminal(false, 0);
+        let mut failed_with_eos = valid_terminal(0);
         if let Some(proto::query_stream_frame::Frame::Terminal(terminal)) =
             failed_with_eos.frame.as_mut()
         {
@@ -741,7 +679,7 @@ mod tests {
                 detail: None,
             });
         }
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         prime_schema(&mut converter);
         assert!(matches!(
             converter.convert(failed_with_eos, None),
@@ -749,25 +687,10 @@ mod tests {
         ));
     }
 
-    /// Required enum zero values fail before reaching a runtime owner.
-    #[test]
-    fn unspecified_request_enum_is_rejected() {
-        let request = proto::BifrostQueryRequest {
-            sql: "SELECT 1".into(),
-            visibility: 0,
-            freshness: proto::FreshnessPolicy::AllowDegraded as i32,
-            deadline_ms: None,
-        };
-        assert!(matches!(
-            domain::BifrostQueryRequest::try_from(request),
-            Err(QueryConversionError::RequiredEnum("visibility"))
-        ));
-    }
-
     /// Missing frame oneofs are rejected.
     #[test]
     fn missing_stream_frame_is_rejected() {
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         assert!(matches!(
             converter.convert(proto::QueryStreamFrame { frame: None }, None),
             Err(QueryConversionError::MissingFrame)
@@ -782,7 +705,6 @@ mod tests {
                 proto::QueryTerminalFrame {
                     execution_path: proto::QueryExecutionPath::Interactive as i32,
                     outcome: 0,
-                    freshness: proto::QueryFreshness::Complete as i32,
                     row_count: 0,
                     warnings: vec![],
                     source_completion: vec![],
@@ -791,7 +713,7 @@ mod tests {
                 },
             )),
         };
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         prime_schema(&mut converter);
         assert!(matches!(
             converter.convert(frame, None),
@@ -804,8 +726,6 @@ mod tests {
     fn public_query_messages_round_trip() {
         let request = domain::BifrostQueryRequest {
             sql: "SELECT 1".into(),
-            visibility: domain::VisibilityMode::Fused,
-            freshness: domain::FreshnessPolicy::Strict,
             deadline_ms: Some(100),
         };
         assert_eq!(
@@ -819,7 +739,7 @@ mod tests {
             schema_fingerprint: "schema-1".into(),
             arrow_ipc_schema: vec![1, 2, 3],
         });
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         assert_eq!(
             converter
                 .convert(proto::QueryStreamFrame::from(frame.clone()), None)
@@ -840,12 +760,17 @@ mod tests {
                 source: proto::QuerySource::HotSealed as i32,
                 outcome: proto::SourceCompletionOutcome::Complete as i32,
             },
+            proto::SourceCompletion {
+                source: proto::QuerySource::LiveTail as i32,
+                outcome: proto::SourceCompletionOutcome::Complete as i32,
+            },
         ];
+        let mut unavailable_live = sealed.clone();
+        unavailable_live[2].outcome = proto::SourceCompletionOutcome::Unavailable as i32;
         for terminal in [
             proto::QueryTerminalFrame {
                 execution_path: proto::QueryExecutionPath::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Failed as i32,
-                freshness: proto::QueryFreshness::Complete as i32,
                 row_count: 0,
                 warnings: vec![],
                 source_completion: sealed.clone(),
@@ -855,17 +780,15 @@ mod tests {
             proto::QueryTerminalFrame {
                 execution_path: proto::QueryExecutionPath::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Success as i32,
-                freshness: proto::QueryFreshness::Degraded as i32,
                 row_count: 0,
-                warnings: vec![],
-                source_completion: sealed.clone(),
+                warnings: vec![proto::QueryWarning::LiveTailUnavailable as i32],
+                source_completion: unavailable_live,
                 error: None,
                 arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
                 execution_path: proto::QueryExecutionPath::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Success as i32,
-                freshness: proto::QueryFreshness::Complete as i32,
                 row_count: 0,
                 warnings: vec![proto::QueryWarning::LiveTailUnavailable as i32],
                 source_completion: sealed.clone(),
@@ -876,7 +799,7 @@ mod tests {
             let frame = proto::QueryStreamFrame {
                 frame: Some(proto::query_stream_frame::Frame::Terminal(terminal)),
             };
-            let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+            let mut converter = QueryStreamConverter::new();
             prime_schema(&mut converter);
             assert!(matches!(
                 converter.convert(frame, None),
@@ -885,23 +808,15 @@ mod tests {
         }
     }
 
-    /// Authoritative PublishedOnly context rejects an injected live source.
+    /// A terminal that omits the live source tier is rejected: every query
+    /// reads the same three tiers, so a two-tier terminal is truncated.
     #[test]
-    fn published_only_rejects_injected_live_tail() {
-        let terminal = valid_terminal(true, 0);
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
-        prime_schema(&mut converter);
-        assert!(matches!(
-            converter.convert(terminal, None),
-            Err(QueryConversionError::Contract(_))
-        ));
-    }
-
-    /// Authoritative Fused context rejects a terminal missing live-tail state.
-    #[test]
-    fn fused_rejects_missing_live_tail() {
-        let terminal = valid_terminal(false, 0);
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::Fused);
+    fn terminal_requires_every_source_tier() {
+        let mut terminal = valid_terminal(0);
+        if let Some(proto::query_stream_frame::Frame::Terminal(frame)) = terminal.frame.as_mut() {
+            frame.source_completion.pop();
+        }
+        let mut converter = QueryStreamConverter::new();
         prime_schema(&mut converter);
         assert!(matches!(
             converter.convert(terminal, None),
@@ -919,18 +834,18 @@ mod tests {
                 },
             )),
         };
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         prime_schema(&mut converter);
         converter.convert(batch, Some(2)).expect("batch converts");
         assert!(matches!(
-            converter.convert(valid_terminal(false, 3), None),
+            converter.convert(valid_terminal(3), None),
             Err(QueryConversionError::Contract(_))
         ));
     }
 
-    /// Builds a valid success terminal for the selected source set.
-    fn valid_terminal(include_live: bool, row_count: u64) -> proto::QueryStreamFrame {
-        let mut source_completion = vec![
+    /// Builds a valid success terminal naming every source tier.
+    fn valid_terminal(row_count: u64) -> proto::QueryStreamFrame {
+        let source_completion = vec![
             proto::SourceCompletion {
                 source: proto::QuerySource::Iceberg as i32,
                 outcome: proto::SourceCompletionOutcome::Complete as i32,
@@ -939,19 +854,16 @@ mod tests {
                 source: proto::QuerySource::HotSealed as i32,
                 outcome: proto::SourceCompletionOutcome::Complete as i32,
             },
-        ];
-        if include_live {
-            source_completion.push(proto::SourceCompletion {
+            proto::SourceCompletion {
                 source: proto::QuerySource::LiveTail as i32,
                 outcome: proto::SourceCompletionOutcome::Complete as i32,
-            });
-        }
+            },
+        ];
         proto::QueryStreamFrame {
             frame: Some(proto::query_stream_frame::Frame::Terminal(
                 proto::QueryTerminalFrame {
                     execution_path: proto::QueryExecutionPath::Interactive as i32,
                     outcome: proto::QueryTerminalOutcome::Success as i32,
-                    freshness: proto::QueryFreshness::Complete as i32,
                     row_count,
                     warnings: vec![],
                     source_completion,
@@ -997,9 +909,9 @@ mod tests {
                 },
             )),
         };
-        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        let mut converter = QueryStreamConverter::new();
         assert!(matches!(
-            converter.convert(valid_terminal(false, 0), None),
+            converter.convert(valid_terminal(0), None),
             Err(QueryConversionError::InvalidFrameOrder)
         ));
         assert!(matches!(
@@ -1012,7 +924,7 @@ mod tests {
             Err(QueryConversionError::InvalidFrameOrder)
         ));
         converter
-            .convert(valid_terminal(false, 0), None)
+            .convert(valid_terminal(0), None)
             .expect("terminal converts");
         assert!(matches!(
             converter.convert(batch(), Some(1)),

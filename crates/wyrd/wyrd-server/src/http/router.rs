@@ -7,8 +7,6 @@ use axum::error_handling::HandleErrorLayer;
 use axum::extract::Request;
 use axum::middleware;
 use tower::ServiceBuilder;
-use tower::limit::ConcurrencyLimitLayer;
-use tower::load_shed::LoadShedLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
 use tracing::Span;
@@ -22,7 +20,6 @@ use crate::components::auth::AuthenticatedPrincipal;
 use crate::components::auth::auth_router;
 use crate::components::authz::authz_router;
 use crate::components::cards::cards_router;
-use crate::components::eval::eval_router;
 use crate::components::gateway::{gateway_ingress_router, gateway_router};
 use crate::components::health::health_router;
 use crate::components::platform::{
@@ -31,6 +28,7 @@ use crate::components::platform::{
 };
 use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
+use crate::components::verification::verification_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::{require_authenticated, require_bifrost_authenticated};
 use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
@@ -66,10 +64,10 @@ pub fn build_router(state: AppState) -> Router {
         ));
     let v1_group = OpenApiRouter::new()
         .merge(storage_router(&state))
-        .merge(eval_router())
         .merge(authz_router())
         .merge(cards_router())
         .merge(principals_router())
+        .merge(verification_router())
         .merge(admin_router())
         .merge(gateway_router())
         .merge(otlp_router())
@@ -168,8 +166,9 @@ fn request_span(request: &Request) -> Span {
 ///   1. attach_request_id — mints/propagates ID; injects instance into errors
 ///   2. CatchPanic — converts panics to 500 before they escape the stack
 ///   3. HandleErrorLayer — maps BoxError (Elapsed, Overloaded) → HTTP response
-///   4. LoadShed — sheds requests when ConcurrencyLimit is not ready
-///   5. ConcurrencyLimitLayer — caps in-flight requests
+///   4. EdgeCapacity (two layers) — load-sheds requests beyond the in-flight
+///      concurrency cap; `POST /v1/query` bypasses both and waits in Oracle's bounded
+///      query queue instead
 ///   6. EdgeTimeout — enforces the per-request deadline; `POST /v1/query`
 ///      hands its remaining wait to the Oracle query deadline after admission
 ///   7. WyrdBodyLimit — enforces max body size
@@ -182,8 +181,11 @@ where
         .layer(HandleErrorLayer::new(
             crate::http::error::map_tower_error_to_wyrd,
         ))
-        .layer(LoadShedLayer::new())
-        .layer(ConcurrencyLimitLayer::new(state.limits.concurrency))
+        .layer(
+            crate::http::middleware::edge_capacity::EdgeCapacityLayer::new(
+                state.limits.concurrency,
+            ),
+        )
         .layer(crate::http::middleware::edge_timeout::EdgeTimeoutLayer::new(state.limits.timeout))
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,

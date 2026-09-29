@@ -4,19 +4,39 @@
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
 
+use std::time::Duration;
+
 use arrow::array::{Array, Int64Array};
-use vala_bifrost_redux::oracle::iceberg_projection_probe;
+use vala_bifrost_redux::oracle::{
+    iceberg_projection_probe, set_live_fragment_batch_bound_for_test,
+};
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
+use wyrd_server::oracle::{
+    ScribeFragmentFault, arm_scribe_fragment_fault_for_test,
+    arm_tail_listing_credential_rejection_for_test, arm_tail_listing_stale_for_test,
+    arm_tail_listing_stall_for_test,
+};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryTerminalErrorCode, QueryTerminalOutcome,
-    VisibilityMode,
+    BifrostQueryRequest, QueryExecutionPath, QueryTerminalErrorCode, QueryTerminalOutcome,
+    QueryWarning,
 };
 use wyrd_spec::vala::error::BifrostError;
+use wyrd_testing::bifrost::process_cluster::{BifrostProcessCluster, ProcessNodeTarget};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use crate::support::*;
+
+/// Bound on polls waiting for the Oracle graph to release every reservation.
+///
+/// Terminal delivery precedes asynchronous graph settlement, so the journey
+/// observes the zero-ownership invariant across this bound instead of sampling
+/// it once at the terminal frame.
+const SETTLEMENT_POLLS: usize = 300;
+
+/// Interval between polls for a settled Oracle graph.
+const SETTLEMENT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Which physical pruning signal a topology's follower cut can actually move.
 enum PruningExpectation {
@@ -122,7 +142,7 @@ async fn prove_selective_predicate_pruning(
         .telemetry()
         .checkpoint()
         .map_err(|error| error.to_string())?;
-    let unfiltered_rows = query_rows(&reader, &table, VisibilityMode::PublishedOnly).await?;
+    let unfiltered_rows = query_rows(&reader, &table).await?;
     if unfiltered_rows != 3 {
         return Err(format!("unfiltered baseline expected 3 rows, saw {unfiltered_rows}").into());
     }
@@ -315,22 +335,21 @@ async fn prove_selective_predicate_pruning(
         .into());
     }
 
-    // A follower settles its cancelled graph, and so its peer permit, on its
-    // own stage-operation path after the leader's terminal frame, so this is a
-    // bounded convergence rather than an instantaneous read.
+    // A terminal response reaches the caller before the graph settles, so the
+    // exact zero-ownership invariant is observed under a bound rather than
+    // sampled once. The final nonzero snapshot is reported on timeout.
     let mut inspection = cluster.oracle_inspection().await?;
-    for _ in 0..CLEAN_NODE_POLLS {
+    for _ in 0..SETTLEMENT_POLLS {
         if inspection.active_queries == 0
             && inspection.queued_queries == 0
             && inspection.reserved_memory_bytes == 0
-            && inspection.reserved_spill_bytes == 0
             && inspection.peer_pending == 0
             && inspection.peer_running == 0
         {
             cluster.shutdown().await?;
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
         inspection = cluster.oracle_inspection().await?;
     }
     Err(format!("Oracle runtime did not settle: {inspection:?}").into())
@@ -360,8 +379,6 @@ async fn query_terminal_either_surface(
     let opened = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await;
@@ -841,8 +858,6 @@ async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journey
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql,
-            visibility: VisibilityMode::PublishedOnly,
-            freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         })
         .await?;
@@ -870,4 +885,965 @@ async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journey
         .into());
     }
     Ok(ids)
+}
+
+/// Appends one journey row carrying a caller-chosen managed event time.
+///
+/// The write door refuses to declare `wyrd_event_time`, but public IPC ingest
+/// accepts a supplied value and Scribe lifts it verbatim into the managed
+/// slot, which is how a live row is placed in a chosen time partition.
+///
+/// # Errors
+///
+/// Returns an error when the client cannot connect or ingest refuses the row.
+async fn append_event_time_row(
+    client: &WyrdClient,
+    table: &str,
+    id: i64,
+    event_time_micros: i64,
+) -> Result<(), JourneyError> {
+    let mut fields = journey_schema()
+        .fields()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    fields.push(std::sync::Arc::new(arrow::datatypes::Field::new(
+        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ),
+        false,
+    )));
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        std::sync::Arc::new(arrow::datatypes::Schema::new(fields)),
+        vec![
+            std::sync::Arc::new(arrow::array::Int64Array::from(vec![id])),
+            std::sync::Arc::new(arrow::array::StringArray::from(vec!["live"])),
+            std::sync::Arc::new(arrow::array::StringArray::from(vec![unused_payload(id)])),
+            std::sync::Arc::new(
+                arrow::array::TimestampMicrosecondArray::from(vec![event_time_micros])
+                    .with_timezone("UTC"),
+            ),
+        ],
+    )?;
+    let mut ipc = Vec::new();
+    let mut ipc_writer =
+        arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())?;
+    ipc_writer.write(&batch)?;
+    ipc_writer.finish()?;
+    drop(ipc_writer);
+    wyrd_testing::bifrost::write::RawIngest::connect(client)
+        .await?
+        .insert(table, uuid::Uuid::now_v7(), ipc)
+        .await?;
+    Ok(())
+}
+
+/// Returns each node's cumulative Scribe fragment executions, in node order.
+///
+/// # Errors
+///
+/// Returns an error when a node in the topology carries no Scribe runtime.
+fn scribe_fragment_executions(cluster: &WyrdTestCluster) -> Result<Vec<u64>, JourneyError> {
+    cluster
+        .servers()
+        .map(|server| {
+            server
+                .state()
+                .bifrost_ingest()
+                .map(|scribe| scribe.fragment_inspection().0)
+                .ok_or_else(|| JourneyError::from("topology node has no Scribe runtime"))
+        })
+        .collect()
+}
+
+/// Subtracts one per-node execution snapshot from a later one.
+fn execution_delta(before: &[u64], after: &[u64]) -> Vec<u64> {
+    after
+        .iter()
+        .zip(before)
+        .map(|(after, before)| after.saturating_sub(*before))
+        .collect()
+}
+
+/// Live rows on two relevant Scribes are read by live fragments sent to
+/// exactly those two owners, while a third Scribe whose only live partition an
+/// event-time predicate excludes executes nothing. A predicate that cannot
+/// prune by event time keeps every reported route.
+///
+/// Nothing is flushed, so every returned row can only have come from a live
+/// Scribe fragment: the query is live-only and still plans, admits, and
+/// succeeds.
+///
+/// # Errors
+///
+/// Returns an error when the cluster, ingest, or query fails, or when rows or
+/// fragment routes differ from the expected owners.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_live_routes");
+    let table_fqn = format!("vala.bifrost.{table}");
+    let first = cluster.server(0).ok_or("missing node 0")?;
+    register_table(first, tenant, &table).await?;
+    let now = chrono::Utc::now();
+    // A week back is inside ingest's accepted window yet in a live partition
+    // the one-hour event-time floor below provably excludes.
+    let stale = (now - chrono::Duration::days(7)).timestamp_micros();
+    let now = now.timestamp_micros();
+    for (index, id, event_time) in [(0_usize, 1_i64, now), (1, 2, now), (2, 3, stale)] {
+        let server = cluster.server(index).ok_or("missing writer node")?;
+        let writer = client(server, &format!("live-writer-{index}")).await?;
+        append_event_time_row(&writer, &table_fqn, id, event_time).await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(first, "live-route-reader").await?;
+    let floor = (chrono::Utc::now() - chrono::Duration::hours(1)).format("%Y-%m-%d %H:%M:%S%.6f");
+
+    let before = scribe_fragment_executions(&cluster)?;
+    let pruned = query_ids(
+        &reader,
+        format!(
+            "SELECT id FROM {table_fqn} WHERE wyrd_event_time >= TIMESTAMP '{floor}' ORDER BY id"
+        ),
+    )
+    .await?;
+    let pruned_delta = execution_delta(&before, &scribe_fragment_executions(&cluster)?);
+    if pruned != vec![1, 2] {
+        return Err(format!("event-time floor expected live ids [1, 2], saw {pruned:?}").into());
+    }
+    if pruned_delta != vec![1, 1, 0] {
+        return Err(format!(
+            "only the two relevant Scribes may execute one live fragment each, saw {pruned_delta:?}"
+        )
+        .into());
+    }
+
+    let before = scribe_fragment_executions(&cluster)?;
+    let unpruned = query_ids(
+        &reader,
+        format!("SELECT id FROM {table_fqn} WHERE id > 0 ORDER BY id"),
+    )
+    .await?;
+    let unpruned_delta = execution_delta(&before, &scribe_fragment_executions(&cluster)?);
+    if unpruned != vec![1, 2, 3] {
+        return Err(
+            format!("unprunable predicate expected ids [1, 2, 3], saw {unpruned:?}").into(),
+        );
+    }
+    if unpruned_delta != vec![1, 1, 1] {
+        return Err(format!(
+            "an unprunable predicate keeps every reported live route, saw {unpruned_delta:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Test-node binary every process-cluster pod runs.
+const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
+
+/// Drains one public grouped count into `(filter_key, matched)` rows and its path.
+///
+/// # Errors
+///
+/// Returns a client or Arrow error, and an error when the stream does not
+/// succeed or a batch does not carry a `Utf8` key and an `Int64` count.
+async fn grouped_counts(
+    client: &WyrdClient,
+    sql: String,
+) -> Result<(Vec<(String, i64)>, QueryExecutionPath), JourneyError> {
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql,
+            deadline_ms: Some(30_000),
+        })
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        let keys = batch
+            .column_by_name("filter_key")
+            .and_then(|column| column.as_any().downcast_ref::<arrow::array::StringArray>())
+            .ok_or("grouped result has no Utf8 filter_key")?;
+        let counts = batch
+            .column_by_name("matched")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or("grouped result has no Int64 matched")?;
+        for index in 0..batch.num_rows() {
+            rows.push((keys.value(index).to_owned(), counts.value(index)));
+        }
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    if terminal.outcome != QueryTerminalOutcome::Success || terminal.error.is_some() {
+        return Err(format!(
+            "query did not succeed: {:?} {:?}",
+            terminal.outcome, terminal.error
+        )
+        .into());
+    }
+    Ok((rows, terminal.execution_path))
+}
+
+/// A filtered aggregate over published files and live rows on two Scribes is
+/// one Analytical plan: published scans run on the Oracle workers while each
+/// Scribe executes exactly one live fragment, and the result counts both.
+///
+/// Published rows alone, or live rows drained anywhere but the two Scribe
+/// fragments, cannot produce these counts and deltas together.
+///
+/// # Errors
+///
+/// Returns an error when the process cluster, ingest, publication, or query
+/// fails, or when counts or per-node fragment deltas differ.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), JourneyError> {
+    /// Oracle pod the public query enters.
+    const COORDINATOR: usize = 0;
+    /// Oracle pods that may run published work.
+    const WORKERS: [usize; 2] = [1, 2];
+    /// Scribe pods that each hold live rows.
+    const SCRIBES: [usize; 2] = [3, 4];
+    let mut cluster = BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+            ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+    let api_key = cluster
+        .provision_public_api_key("live-share-reader")
+        .await?;
+    let table = format!("live_share_{}", uuid::Uuid::now_v7().simple());
+    let nodes = cluster.nodes_mut();
+    nodes[SCRIBES[0]].register_table(&table)?;
+    // Two published objects of ids 0..12 give every group 8 published rows
+    // and the cut real work to split across both workers.
+    nodes[SCRIBES[0]].ingest_rows(&table, 0, 12, 3)?;
+    nodes[SCRIBES[0]].ingest_rows(&table, 0, 12, 3)?;
+    // Six live rows per Scribe add 2 + 2 to every group, plus one negative id
+    // per Scribe that the filter must remove.
+    nodes[SCRIBES[0]].ingest_live_rows(&table, 100, 6, 3)?;
+    nodes[SCRIBES[1]].ingest_live_rows(&table, 200, 6, 3)?;
+    nodes[SCRIBES[0]].ingest_live_rows(&table, -1, 1, 3)?;
+    nodes[SCRIBES[1]].ingest_live_rows(&table, -2, 1, 3)?;
+    for node in nodes.iter_mut() {
+        node.refresh_snapshot()?;
+    }
+    let polls_before = WORKERS
+        .iter()
+        .map(|index| cluster.nodes_mut()[*index].peer_body_polls())
+        .collect::<Result<Vec<_>, _>>()?;
+    let fragments_before = SCRIBES
+        .iter()
+        .map(|index| cluster.nodes_mut()[*index].scribe_fragments())
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let (rows, path) = grouped_counts(
+        &client,
+        format!(
+            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+             WHERE id >= 0 GROUP BY filter_key ORDER BY filter_key"
+        ),
+    )
+    .await?;
+
+    let expected = (0..3)
+        .map(|group| (format!("group_{group}"), 12_i64))
+        .collect::<Vec<_>>();
+    if rows != expected {
+        return Err(
+            format!("published plus live counts expected {expected:?}, saw {rows:?}").into(),
+        );
+    }
+    if path != QueryExecutionPath::Analytical {
+        return Err(
+            format!("the distributed published scan must stay Analytical, saw {path:?}").into(),
+        );
+    }
+    for (offset, index) in WORKERS.into_iter().enumerate() {
+        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
+        if polls <= polls_before[offset] {
+            return Err(format!("published worker {index} admitted no peer work").into());
+        }
+    }
+    let fragments = SCRIBES
+        .iter()
+        .map(|index| cluster.nodes_mut()[*index].scribe_fragments())
+        .collect::<Result<Vec<_>, _>>()?;
+    let delta = execution_delta(&fragments_before, &fragments);
+    if delta != vec![1, 1] {
+        return Err(
+            format!("each Scribe must execute exactly one live fragment, saw {delta:?}").into(),
+        );
+    }
+    cluster.shutdown()?;
+    Ok(())
+}
+
+/// How long the journey keeps one live Scribe producer paused mid-stream.
+///
+/// Past the 30-second window the removed tail-fence expiry enforced, so a
+/// second timeout on the live read would fail the query here.
+const LIVE_HOLD: Duration = Duration::from_secs(31);
+
+/// Deadline of every live query here, well past [`LIVE_HOLD`].
+///
+/// The query deadline is the read's one timeout; the 30-second default would
+/// end the held read on its own.
+const LIVE_DEADLINE_MS: i64 = 120_000;
+
+/// Bound on waiting for a paused, cancelled, or dropped live read to settle.
+const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Reports whether the writer Scribe still holds a follower lease above `baseline`.
+///
+/// A follower lease charges a whole partition grant, orders of magnitude above
+/// the memtable drift a few journey rows cause, so half a grant separates a
+/// held lease from a released one without depending on exact memtable bytes.
+///
+/// # Errors
+///
+/// Returns an error when the node carries no Scribe or its root snapshot fails.
+fn follower_lease_held(cluster: &WyrdTestCluster, baseline: usize) -> Result<bool, JourneyError> {
+    let used = cluster
+        .server(0)
+        .ok_or("missing writer node")?
+        .state()
+        .bifrost_ingest()
+        .ok_or("writer node has no Scribe runtime")?
+        .resources()
+        .snapshot()?
+        .scribe_memory_used_bytes;
+    Ok(used >= baseline + vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES / 2)
+}
+
+/// Waits until no live producer is open, the writer's follower lease is
+/// released, and no Oracle still admits a query or holds query memory.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when any of them still holds after the bound.
+async fn await_live_released(
+    cluster: &WyrdTestCluster,
+    baseline: usize,
+    case: &str,
+) -> Result<(), JourneyError> {
+    let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
+    loop {
+        let producers = vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test();
+        let held = follower_lease_held(cluster, baseline)?;
+        let admitted = cluster.oracle_resource_snapshots()?.iter().any(|snapshot| {
+            snapshot.oracle_active_queries != 0 || snapshot.oracle_query_memory_used_bytes != 0
+        });
+        if producers == 0 && !held && !admitted {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{case}: {producers} live producers open, follower lease held={held}, \
+                 Oracle admission held={admitted}"
+            )
+            .into());
+        }
+        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
+    }
+}
+
+/// Opens one public live query while the Scribe producer pause is armed and
+/// waits until the producer has stopped after its first batch.
+///
+/// # Errors
+///
+/// Returns an error when the query cannot open, the producer never pauses, or
+/// the first batch never reaches the Oracle live source.
+async fn open_paused_live_query(
+    query: &wyrd_client::Bifrost,
+    sql: &str,
+    case: &str,
+) -> Result<wyrd_client::bifrost::QueryResultStream, JourneyError> {
+    let pause = vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test();
+    let reached = vala_bifrost_redux::oracle::live_source_batches_for_test();
+    pause.arm();
+    let stream = query
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(LIVE_DEADLINE_MS),
+        })
+        .await?;
+    tokio::time::timeout(LIVE_SETTLE_TIMEOUT, pause.wait_entered())
+        .await
+        .map_err(|_| format!("{case}: the Scribe producer never paused"))?;
+    let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
+    while vala_bifrost_redux::oracle::live_source_batches_for_test() == reached {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{case}: no batch reached the Oracle live source before the pause"
+            )
+            .into());
+        }
+        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
+    }
+    Ok(stream)
+}
+
+/// A live Scribe read streams batch by batch under backpressure and lives
+/// exactly as long as its query.
+///
+/// Nothing is flushed, so every row is live. The Scribe producer is paused
+/// before its second batch exists: the first batch has already reached the
+/// Oracle live source while production waits, so the read is incremental
+/// rather than a whole-cohort fetch. The pause is held past 30 seconds with
+/// the snapshot and follower lease still held and no further batch produced,
+/// then released, and the query succeeds with every row. Cancelling an open
+/// read and separately dropping a public client stream each release the
+/// producer, its snapshot, and its follower lease.
+///
+/// # Errors
+///
+/// Returns an error when the cluster, ingest, or query fails, or when batch
+/// production, held resources, or their release differ from the contract.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_live_lifetime");
+    let table_fqn = format!("vala.bifrost.{table}");
+    let writer_node = cluster.server(0).ok_or("missing node 0")?;
+    register_table(writer_node, tenant, &table).await?;
+    let writer = client(writer_node, "live-lifetime-writer").await?;
+    let now = chrono::Utc::now().timestamp_micros();
+    for id in 1..=3 {
+        append_event_time_row(&writer, &table_fqn, id, now).await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    let baseline = writer_node
+        .state()
+        .bifrost_ingest()
+        .ok_or("writer node has no Scribe runtime")?
+        .resources()
+        .snapshot()?
+        .scribe_memory_used_bytes;
+    let leader = cluster.server(1).ok_or("missing node 1")?;
+    let reader = client(leader, "live-lifetime-reader").await?;
+    let query = wyrd_client::Bifrost::query_only(&reader);
+    let pause = vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test();
+    let sql = format!("SELECT id FROM {table_fqn}");
+
+    let case = "held past 30 seconds";
+    let reached = vala_bifrost_redux::oracle::live_source_batches_for_test();
+    let stream = open_paused_live_query(&query, &sql, case).await?;
+    let drain = tokio::spawn(async move {
+        let mut stream = stream;
+        let mut ids = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            let column = batch
+                .column_by_name("id")
+                .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                .ok_or("query result id column is not Int64")?;
+            ids.extend(column.iter().flatten());
+        }
+        let terminal = stream.terminal().ok_or("query terminal missing")?;
+        if terminal.outcome != QueryTerminalOutcome::Success {
+            return Err(format!("held live query ended {:?}", terminal.error).into());
+        }
+        Ok::<_, JourneyError>(ids)
+    });
+    tokio::time::sleep(LIVE_HOLD).await;
+    let delivered = vala_bifrost_redux::oracle::live_source_batches_for_test() - reached;
+    if delivered != 1 {
+        return Err(format!("{case}: paused production delivered {delivered} batches").into());
+    }
+    if drain.is_finished() {
+        return Err(format!("{case}: the paused query ended early: {:?}", drain.await?).into());
+    }
+    let producers = vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test();
+    if producers != 1 || !follower_lease_held(&cluster, baseline)? {
+        return Err(format!(
+            "{case}: a paused read must stay open with its snapshot and lease \
+             (producers={producers})"
+        )
+        .into());
+    }
+    pause.release();
+    let mut ids = tokio::time::timeout(LIVE_SETTLE_TIMEOUT, drain).await???;
+    ids.sort_unstable();
+    if ids != vec![1, 2, 3] {
+        return Err(format!("{case}: expected live ids [1, 2, 3], saw {ids:?}").into());
+    }
+    await_live_released(&cluster, baseline, case).await?;
+
+    let case = "cancelled";
+    let stream = open_paused_live_query(&query, &sql, case).await?;
+    let request_id = stream.request_id().clone();
+    query.cancel(&request_id).await?;
+    await_live_released(&cluster, baseline, case).await?;
+    pause.release();
+    drop(stream);
+
+    let case = "client stream dropped";
+    let stream = open_paused_live_query(&query, &sql, case).await?;
+    drop(stream);
+    await_live_released(&cluster, baseline, case).await?;
+    pause.release();
+    Ok(())
+}
+
+/// Returns the writer Scribe's cumulative live fragment footers.
+///
+/// # Errors
+///
+/// Returns an error when node 0 carries no Scribe runtime.
+fn writer_fragment_footers(cluster: &WyrdTestCluster) -> Result<u64, JourneyError> {
+    Ok(cluster
+        .server(0)
+        .ok_or("missing writer node")?
+        .state()
+        .bifrost_ingest()
+        .ok_or("writer node has no Scribe runtime")?
+        .fragment_inspection()
+        .1)
+}
+
+/// Seeds one table with published ids 1..=3 and unflushed live ids 101..=103.
+///
+/// Node 2 writes and publishes the low ids; node 0 appends the high ids and
+/// keeps them in its Scribe, so node 0 is the table's only live source. Oracle
+/// snapshots are refreshed so every reader sees the published cut.
+///
+/// # Errors
+///
+/// Returns cluster, registration, write, flush, or refresh failures.
+async fn seed_published_and_live(
+    cluster: &WyrdTestCluster,
+    prefix: &str,
+) -> Result<String, JourneyError> {
+    let table = unique_table(prefix);
+    let table_fqn = format!("vala.bifrost.{table}");
+    let live_node = cluster.server(0).ok_or("missing node 0")?;
+    let published_node = cluster.server(2).ok_or("missing node 2")?;
+    register_table(live_node, cluster.data_tenant_id(), &table).await?;
+    let published = writer(published_node, "seed-published-writer").await?;
+    for id in 1..=3 {
+        published
+            .write(
+                &table_fqn,
+                &journey_schema(),
+                [journey_row(id, marker_value(id))],
+            )
+            .await?;
+    }
+    published_node.flush_bifrost().await?;
+    let live = client(live_node, "seed-live-writer").await?;
+    let now = chrono::Utc::now().timestamp_micros();
+    for id in 101..=103 {
+        append_event_time_row(&live, &table_fqn, id, now).await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+    Ok(table_fqn)
+}
+
+/// A completed `LIMIT` plan stops an opened live fragment it no longer needs.
+///
+/// Published ids stay below the predicate and live ids 101..=103 sit on one
+/// unflushed Scribe. With the Scribe producer paused after its first batch,
+/// `LIMIT 1` completes from that batch alone: the query succeeds with one
+/// row, the paused fragment is cancelled without a footer, and its producer,
+/// snapshot, and follower lease release without producing the remaining
+/// rows. An ordered limit whose top row exists only live still returns it,
+/// so DataFusion rather than an Oracle early-stop rule decides when a live
+/// child is no longer needed.
+///
+/// # Errors
+///
+/// Returns an error when setup or a query fails, or when the limited result,
+/// fragment cancellation, or resource release differs.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn limit_stops_unneeded_live_fragment_without_footer() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let table_fqn = seed_published_and_live(&cluster, "oracle_live_limit").await?;
+    let live_node = cluster.server(0).ok_or("missing node 0")?;
+    let baseline = live_node
+        .state()
+        .bifrost_ingest()
+        .ok_or("writer node has no Scribe runtime")?
+        .resources()
+        .snapshot()?
+        .scribe_memory_used_bytes;
+    let reader = client(cluster.server(1).ok_or("missing node 1")?, "limit-reader").await?;
+    let query = wyrd_client::Bifrost::query_only(&reader);
+
+    let case = "limit stops a paused live fragment";
+    let footers = writer_fragment_footers(&cluster)?;
+    let mut stream = open_paused_live_query(
+        &query,
+        &format!("SELECT id FROM {table_fqn} WHERE id > 100 LIMIT 1"),
+        case,
+    )
+    .await?;
+    let mut ids = Vec::new();
+    while let Some(batch) = tokio::time::timeout(LIVE_SETTLE_TIMEOUT, stream.next_batch()).await?? {
+        let column = batch
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or("query result id column is not Int64")?;
+        ids.extend(column.iter().flatten());
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    if terminal.outcome != QueryTerminalOutcome::Success || terminal.error.is_some() {
+        return Err(format!("{case}: ended {:?} {:?}", terminal.outcome, terminal.error).into());
+    }
+    // Shard lanes do not preserve append order, so any one live id qualifies.
+    if ids.len() != 1 || !(101..=103).contains(&ids[0]) {
+        return Err(format!("{case}: expected exactly one live id, saw {ids:?}").into());
+    }
+    drop(stream);
+    await_live_released(&cluster, baseline, case).await?;
+    let pause = vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test();
+    pause.release();
+    if writer_fragment_footers(&cluster)? != footers {
+        return Err(format!("{case}: the stopped fragment still wrote a footer").into());
+    }
+
+    let ordered = query_ids(
+        &reader,
+        format!("SELECT id FROM {table_fqn} ORDER BY id DESC LIMIT 2"),
+    )
+    .await?;
+    if ordered != vec![103, 102] {
+        return Err(format!("ordered limit expected live ids [103, 102], saw {ordered:?}").into());
+    }
+    Ok(())
+}
+
+/// How one matrix query ended, as a public client observed it.
+struct ObservedQuery {
+    /// Ids the client received before the stream ended.
+    ids: Vec<i64>,
+    /// Whether the client raised an error instead of ending cleanly.
+    rejected: bool,
+    /// Terminal outcome, `Failed` for an early typed refusal.
+    outcome: QueryTerminalOutcome,
+    /// Terminal warnings; empty for an early refusal.
+    warnings: Vec<QueryWarning>,
+}
+
+/// Runs `sql` to its end and records what the client observed.
+///
+/// An early typed refusal counts as a rejected `Failed` query with no rows. A
+/// stream error after the terminal frame is the client's rejection of a
+/// failed stream and is recorded rather than returned.
+///
+/// # Errors
+///
+/// Returns client or Arrow errors that carry no terminal, and an error when a
+/// cleanly ended stream has no terminal frame.
+async fn observe_query(client: &WyrdClient, sql: &str) -> Result<ObservedQuery, JourneyError> {
+    observe_query_within(client, sql, None).await
+}
+
+/// Runs `sql` under an optional client deadline and records what the client
+/// observed, exactly as [`observe_query`] does.
+///
+/// # Errors
+///
+/// Returns the same errors as [`observe_query`].
+async fn observe_query_within(
+    client: &WyrdClient,
+    sql: &str,
+    deadline_ms: Option<i64>,
+) -> Result<ObservedQuery, JourneyError> {
+    let opened = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms,
+        })
+        .await;
+    let mut stream = match opened {
+        Ok(stream) => stream,
+        Err(BifrostClientError::Transport(WyrdError::Vala { .. })) => {
+            return Ok(ObservedQuery {
+                ids: Vec::new(),
+                rejected: true,
+                outcome: QueryTerminalOutcome::Failed,
+                warnings: Vec::new(),
+            });
+        }
+        Err(other) => return Err(other.into()),
+    };
+    let mut ids = Vec::new();
+    let mut rejected = false;
+    loop {
+        match stream.next_batch().await {
+            Ok(Some(batch)) => {
+                let column = batch
+                    .column_by_name("id")
+                    .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                    .ok_or("query result id column is not Int64")?;
+                ids.extend(column.iter().flatten());
+            }
+            Ok(None) => break,
+            Err(_) if stream.terminal().is_some() => {
+                rejected = true;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    Ok(ObservedQuery {
+        ids,
+        rejected,
+        outcome: terminal.outcome,
+        warnings: terminal.warnings.clone(),
+    })
+}
+
+/// Requires a clean `Degraded` result with only the published ids.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when the outcome, warning, or rows differ.
+fn expect_degraded(case: &str, observed: &ObservedQuery) -> Result<(), JourneyError> {
+    if observed.rejected
+        || observed.outcome != QueryTerminalOutcome::Degraded
+        || observed.warnings != vec![QueryWarning::LiveTailUnavailable]
+        || observed.ids != vec![1, 2, 3]
+    {
+        return Err(format!(
+            "{case}: expected Degraded published-only rows, saw {:?} {:?} rejected={} {:?}",
+            observed.outcome, observed.warnings, observed.rejected, observed.ids
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Requires a `Failed` result the client refused to accept as complete.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when the query did not fail or the client
+/// ended the stream cleanly.
+fn expect_failed(case: &str, observed: &ObservedQuery) -> Result<(), JourneyError> {
+    if observed.outcome != QueryTerminalOutcome::Failed || !observed.rejected {
+        return Err(format!(
+            "{case}: expected a rejected Failed query, saw {:?} rejected={} {:?}",
+            observed.outcome, observed.rejected, observed.ids
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Collects every Parquet file under `root` whose path names `table`.
+///
+/// # Errors
+///
+/// Returns filesystem errors from walking `root`.
+fn table_parquet_files(
+    root: &std::path::Path,
+    table: &str,
+) -> Result<Vec<std::path::PathBuf>, JourneyError> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "parquet")
+                && path.to_string_lossy().contains(table)
+            {
+                found.push(path);
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Every live-read fault reaches exactly one terminal class.
+///
+/// One table holds published ids 1..=3 and live ids 101..=103 on node 0's
+/// Scribe; node 1 reads. Each fault is driven at the boundary that owns it:
+///
+/// - an unavailable stream listing, and a selected Scribe refused before its
+///   first row, each yield `Degraded` with `LiveTailUnavailable` and only the
+///   published rows;
+/// - a listing the ready Scribe refuses for its unverifiable credential fails
+///   rather than degrades, because a trust-boundary refusal is not
+///   availability loss;
+/// - one stale listing restarts the attempt once on a refrozen roster and
+///   returns every row, while a second stale listing on the refrozen roster
+///   degrades rather than mixing cuts;
+/// - a listing held past the query deadline is cancelled with the query, which
+///   fails within the deadline, and the next query succeeds;
+/// - a Scribe lost after its first row, a stream without its footer, a
+///   rejected peer ticket, a refused follower lease, and a real live snapshot
+///   over its signed batch ceiling each yield `Failed`, and the client
+///   rejects the stream instead of accepting preceding rows;
+/// - a Scribe stopped before discovery is absent rather than lost, so the
+///   query succeeds with best-effort coverage and no warning;
+/// - deleting the published data files fails the query rather than hiding
+///   the published loss as a live omission.
+///
+/// # Errors
+///
+/// Returns an error when setup fails or any fault case reaches a terminal
+/// class other than the one listed above.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let table_fqn = seed_published_and_live(&cluster, "oracle_live_faults").await?;
+    let sql = format!("SELECT id FROM {table_fqn} ORDER BY id");
+    {
+        let reader_node = cluster.server(1).ok_or("missing node 1")?;
+        let reader = client(reader_node, "fault-matrix-reader").await?;
+        let complete = observe_query(&reader, &sql).await?;
+        if complete.rejected
+            || complete.outcome != QueryTerminalOutcome::Success
+            || complete.ids != vec![1, 2, 3, 101, 102, 103]
+        {
+            return Err(format!(
+                "baseline: expected every row, saw {:?} rejected={} {:?}",
+                complete.outcome, complete.rejected, complete.ids
+            )
+            .into());
+        }
+
+        reader_node.set_tail_discovery_unavailable_for_test(true);
+        let listing = observe_query(&reader, &sql).await;
+        reader_node.set_tail_discovery_unavailable_for_test(false);
+        expect_degraded("failed stream listing", &listing?)?;
+
+        arm_tail_listing_credential_rejection_for_test();
+        expect_failed(
+            "stream listing refused for its credential",
+            &observe_query(&reader, &sql).await?,
+        )?;
+
+        arm_tail_listing_stale_for_test(1);
+        let restarted = observe_query(&reader, &sql).await?;
+        if restarted.rejected
+            || restarted.outcome != QueryTerminalOutcome::Success
+            || restarted.ids != vec![1, 2, 3, 101, 102, 103]
+        {
+            return Err(format!(
+                "stale listing restart: expected every row, saw {:?} rejected={} {:?}",
+                restarted.outcome, restarted.rejected, restarted.ids
+            )
+            .into());
+        }
+        arm_tail_listing_stale_for_test(2);
+        expect_degraded(
+            "stale listing on the refrozen roster",
+            &observe_query(&reader, &sql).await?,
+        )?;
+
+        arm_tail_listing_stall_for_test();
+        let started = std::time::Instant::now();
+        let stalled = observe_query_within(&reader, &sql, Some(2_000)).await?;
+        expect_failed("listing held past the query deadline", &stalled)?;
+        if started.elapsed() > Duration::from_secs(10) {
+            return Err(format!(
+                "stalled listing outlived its deadline: {:?}",
+                started.elapsed()
+            )
+            .into());
+        }
+        let after_stall = observe_query(&reader, &sql).await?;
+        if after_stall.outcome != QueryTerminalOutcome::Success || after_stall.ids.len() != 6 {
+            return Err(format!(
+                "query after cancelled listing: expected Success, saw {:?} {:?}",
+                after_stall.outcome, after_stall.ids
+            )
+            .into());
+        }
+
+        for (case, fault) in [
+            (
+                "Scribe unavailable before its first row",
+                ScribeFragmentFault::UnavailableBeforeRows,
+            ),
+            (
+                "Scribe lost after its first row",
+                ScribeFragmentFault::UnavailableAfterFirstBatch,
+            ),
+            (
+                "Scribe stream without its footer",
+                ScribeFragmentFault::OmitFooter,
+            ),
+            (
+                "rejected Scribe peer ticket",
+                ScribeFragmentFault::RejectTicket,
+            ),
+            (
+                "Scribe follower capacity refused",
+                ScribeFragmentFault::CapacityRefused,
+            ),
+        ] {
+            arm_scribe_fragment_fault_for_test(fault);
+            let observed = observe_query(&reader, &sql).await?;
+            if fault == ScribeFragmentFault::UnavailableBeforeRows {
+                expect_degraded(case, &observed)?;
+            } else {
+                expect_failed(case, &observed)?;
+            }
+        }
+
+        // Three separate live appends are three memtable batches, so a signed
+        // ceiling of one makes the real bounded snapshot refuse for capacity.
+        set_live_fragment_batch_bound_for_test(Some(1));
+        let over_bound = observe_query(&reader, &sql).await;
+        set_live_fragment_batch_bound_for_test(None);
+        expect_failed("live snapshot over its batch bound", &over_bound?)?;
+    }
+
+    let stopped = cluster.server(0).ok_or("missing node 0")?.node_id();
+    cluster.stop_node(stopped).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let reader = client(
+        cluster.server(1).ok_or("missing node 1")?,
+        "fault-matrix-after-stop",
+    )
+    .await?;
+    let absent = observe_query(&reader, &sql).await?;
+    if absent.rejected
+        || absent.outcome != QueryTerminalOutcome::Success
+        || !absent.warnings.is_empty()
+        || !absent.ids.starts_with(&[1, 2, 3])
+    {
+        return Err(format!(
+            "Scribe absent before discovery: expected Success, saw {:?} {:?} rejected={} {:?}",
+            absent.outcome, absent.warnings, absent.rejected, absent.ids
+        )
+        .into());
+    }
+
+    let table = table_fqn.rsplit('.').next().ok_or("table name missing")?;
+    let files = table_parquet_files(cluster.storage_root(), table)?;
+    if files.is_empty() {
+        return Err("published source fault: no published data file to remove".into());
+    }
+    for file in files {
+        std::fs::remove_file(file)?;
+    }
+    expect_failed(
+        "published data file lost",
+        &observe_query(&reader, &sql).await?,
+    )?;
+    Ok(())
 }

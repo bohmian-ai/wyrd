@@ -6,6 +6,7 @@ use uuid::Uuid;
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::RegisterOutcome;
 use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
 use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 
@@ -818,7 +819,7 @@ struct RecoveryTelemetry {
     output_bytes: u64,
     /// Rows public appends acknowledged inside the journey window.
     acknowledged_rows: u64,
-    /// Rows strict fused public reads really returned inside the window.
+    /// Rows public reads really returned inside the window.
     returned_rows: u64,
 }
 
@@ -1107,7 +1108,7 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
 ///
 /// The route is the shipped one end to end: two tenants register the same table
 /// name, append through authenticated public gRPC, and read back through the
-/// strict fused public query route. The pod's own Scribe publishes their
+/// public query route. The pod's own Scribe publishes their
 /// objects, the pod's own Forge scheduler and worker promote them, and the
 /// settled table then plans its own rewrite. That rewrite's commit is accepted
 /// by the real catalog which then loses the response, so the worker claims
@@ -1117,7 +1118,7 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
 ///
 /// The customer oracle is the public read, and it is exact: at every one of the
 /// four cuts — before promotion, after promotion, across the uncertain commit,
-/// and after recovery — each tenant's strict fused read must return the exact
+/// and after recovery — each tenant's public read must return the exact
 /// `(batch_id, row_ordinal, value)` multiset it acknowledged, with the matching
 /// canonical digest, and the neighbouring tenant's identically named table must
 /// be neither read, rewritten, nor disturbed.
@@ -1779,4 +1780,271 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
             returned_rows: public_rows_returned(),
         },
     );
+}
+
+/// Reads the file target every settled Iceberg rewrite of one table recorded.
+///
+/// The rewrite detail carries the one target the attempt's policy resolved,
+/// so this is the durable evidence of what Forge actually compacted toward.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn rewrite_targets(cluster: &WyrdTestCluster, binding: &TenantTableBinding) -> Vec<u64> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT (current_detail->>'target_file_size_bytes')::bigint \
+         FROM vala.forge_operation_state \
+         WHERE data_tenant_id = $1 AND resource = $2 AND family = 'iceberg_rewrite' \
+           AND phase = 'committed'",
+    )
+    .bind(binding.tenant.as_uuid())
+    .bind(forge_audit_resource(binding))
+    .fetch_all(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge rewrite-target inspection")
+    .into_iter()
+    .map(|bytes| u64::try_from(bytes).expect("a recorded target is positive"))
+    .collect()
+}
+
+/// Drives production passes until every table has a committed rewrite.
+///
+/// Promotion settles first; the rewrite that packs the promoted files is
+/// planned by a later pass. Each iteration waits on a completion notification,
+/// never a sleep, and the durable rewrite rows are the verdict.
+///
+/// # Panics
+///
+/// Panics when a table still has no committed rewrite after the pass budget.
+async fn await_committed_rewrites(
+    cluster: &WyrdTestCluster,
+    observer: &vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
+    bindings: &[&TenantTableBinding],
+) {
+    for _ in 0..DRAIN_PASS_BUDGET {
+        let mut settled = true;
+        for binding in bindings {
+            settled &= !rewrite_targets(cluster, binding).await.is_empty();
+        }
+        if settled {
+            return;
+        }
+        for binding in bindings {
+            release_retries(cluster, binding.tenant).await;
+        }
+        let target = observer.attempts().saturating_add(1);
+        if pending_tasks(cluster).await == 0 {
+            cluster.request_forge_scheduler_pass_for_test();
+        }
+        let _ =
+            tokio::time::timeout(ATTEMPT_BOUND, observer.wait_for_attempts_at_least(target)).await;
+    }
+    panic!(
+        "the pod's own Forge committed no rewrite after {DRAIN_PASS_BUDGET} passes: {:?}",
+        observer.returned_errors()
+    );
+}
+
+/// Reads one table's explicit Iceberg file-target property, if any.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or the property is not a byte count.
+async fn declared_file_target(
+    cluster: &WyrdTestCluster,
+    binding: &TenantTableBinding,
+) -> Option<u64> {
+    cluster
+        .server(0)
+        .expect("the embedded pod is running")
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&binding.table_ident())
+        .await
+        .expect("the journey table loads through the production catalog")
+        .metadata()
+        .properties()
+        .get("write.target-file-size-bytes")
+        .map(|bytes| bytes.parse().expect("the declared target is a byte count"))
+}
+
+/// A caller-declared compaction target is stored, described, fenced, and used
+/// by Forge, while an undeclared table compacts toward the deployment default.
+///
+/// Both tables are registered through the public client. The declared table
+/// carries its target as its only explicit Iceberg property; re-registering it
+/// with the same value or with none is idempotent, and a different value is
+/// refused without changing it. Each table then receives two flushed public
+/// appends, and the pod's own Forge promotes and rewrites them: the declared
+/// table's committed rewrite records the declared target, the undeclared
+/// table's records the approximately 1 GiB deployment default, the rewrite
+/// outputs replace the promoted inputs, and both read back exactly.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, a public call fails or is not refused as
+/// described, Forge leaves work owed, or a target or row set differs.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
+    let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let client = tenant_client(server, tenant).await;
+    let target = 256 * 1024 * 1024_u64;
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let journey_table = |name: &str| JourneyTable {
+        qualified: format!("vala.datasets.{name}"),
+        name: name.to_owned(),
+        binding: TenantTableBinding::resolve((
+            tenant,
+            vala_bifrost_redux::catalog::TableRef::new(
+                vala_bifrost_redux::namespaces::BifrostNamespace::Datasets,
+                name,
+            ),
+        ))
+        .expect("the journey table resolves to its physical binding"),
+    };
+    let declared = journey_table(&unique_table("declared_target"));
+    let undeclared = journey_table(&unique_table("default_target"));
+    let register = |table: &JourneyTable, bytes: Option<u64>| {
+        let config =
+            wyrd_client::bifrost::TableConfig::from_arrow(&table.qualified, schema.clone())
+                .expect("the journey schema is a table config");
+        let config = match bytes {
+            Some(bytes) => config.with_compaction_target_file_size_bytes(bytes),
+            None => config,
+        };
+        let client = &client;
+        async move {
+            wyrd_client::Bifrost::connect_with_table(client, config)
+                .await
+                .expect("the public Bifrost client connects")
+                .register()
+                .await
+        }
+    };
+    assert_eq!(
+        register(&declared, Some(target))
+            .await
+            .expect("declared registration"),
+        RegisterOutcome::Created
+    );
+    assert_eq!(
+        register(&undeclared, None)
+            .await
+            .expect("undeclared registration"),
+        RegisterOutcome::Created
+    );
+    let described = |table: &JourneyTable| {
+        let client = &client;
+        let fqn = table.qualified.clone();
+        async move {
+            wyrd_client::bifrost::TableConfig::describe(client, &fqn)
+                .await
+                .expect("the table describes")
+                .compaction_target_file_size_bytes()
+        }
+    };
+    assert_eq!(described(&declared).await, Some(target));
+    assert_eq!(described(&undeclared).await, None);
+    assert_eq!(
+        declared_file_target(&cluster, &declared.binding).await,
+        Some(target)
+    );
+    assert_eq!(
+        declared_file_target(&cluster, &undeclared.binding).await,
+        None,
+        "an omitted target writes no Iceberg property"
+    );
+    assert_eq!(
+        register(&declared, Some(target))
+            .await
+            .expect("same-value registration"),
+        RegisterOutcome::AlreadyExists
+    );
+    assert_eq!(
+        register(&declared, None)
+            .await
+            .expect("omitted-on-existing registration"),
+        RegisterOutcome::AlreadyExists
+    );
+    let conflict = register(&declared, Some(target * 2))
+        .await
+        .expect_err("a different target is refused");
+    let wyrd_client::bifrost::BifrostClientError::Transport(conflict) = conflict else {
+        panic!("the conflict is a typed server refusal: {conflict}");
+    };
+    assert_eq!(
+        (conflict.code(), conflict.status()),
+        ("WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH", 409),
+        "the conflict is the typed mismatch refusal"
+    );
+    assert_eq!(described(&declared).await, Some(target));
+    assert_eq!(
+        described(&undeclared).await,
+        None,
+        "omission on an existing table leaves it undeclared"
+    );
+
+    let mut expected = BTreeMap::new();
+    for table in [&declared, &undeclared] {
+        let mut rows = Vec::new();
+        for half in 0..2_i64 {
+            let values: Vec<i64> = (half * 8..half * 8 + 8).collect();
+            rows.extend(append_values(&client, &table.qualified, Uuid::now_v7(), &values).await);
+            server
+                .flush_bifrost()
+                .await
+                .expect("the pod publishes its staged rows");
+        }
+        expected.insert(table.name.clone(), canonical_order(rows));
+    }
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    let promoted = [
+        live_cut(&cluster, &declared.binding).await,
+        live_cut(&cluster, &undeclared.binding).await,
+    ];
+    await_committed_rewrites(
+        &cluster,
+        &observer,
+        &[&declared.binding, &undeclared.binding],
+    )
+    .await;
+
+    for ((table, recorded), promoted) in [
+        (&declared, target),
+        (
+            &undeclared,
+            vala_bifrost_redux::forge::ForgeConfig::default().default_target_file_size_bytes,
+        ),
+    ]
+    .into_iter()
+    .zip(promoted)
+    {
+        let targets = rewrite_targets(&cluster, &table.binding).await;
+        assert!(
+            !targets.is_empty() && targets.iter().all(|bytes| *bytes == recorded),
+            "{} rewrites compact toward {recorded}: {targets:?}",
+            table.qualified
+        );
+        assert_ne!(
+            live_cut(&cluster, &table.binding).await.data,
+            promoted.data,
+            "{} rewrite outputs replaced its promoted inputs",
+            table.qualified
+        );
+        assert_public_rows(&client, table, &expected[&table.name], "after compaction").await;
+    }
 }

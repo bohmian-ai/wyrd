@@ -2829,6 +2829,11 @@ async fn batch_deployment(replica: &AppState, tenant: DataTenantId, base_url: &s
 /// or when a status, claim, or provider-request assertion differs.
 #[tokio::test]
 async fn gateway_batch_creations_release_claims_only_without_dispatch() {
+    let _telemetry = wyrd_telemetry::init(wyrd_telemetry::TelemetryConfig {
+        filter: "info,wyrd_server::components::gateway=debug".to_owned(),
+        ..Default::default()
+    })
+    .expect("gateway test tracing installs");
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let upstream = MockServer::start().await;
@@ -2955,6 +2960,9 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
 
     // A denied creation is refused by its one audited decision before any
     // claim exists.
+    drain_gateway(&a).await;
+    drain_gateway(&b).await;
+    drain_gateway(&c).await;
     let decisions = audit_decisions(&fixture, tenant).await.len();
     let denied = super::routes::create_batch(
         State(c.clone()),

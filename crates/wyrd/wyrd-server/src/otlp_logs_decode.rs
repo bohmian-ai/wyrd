@@ -3,6 +3,7 @@
 use std::mem::size_of;
 
 use vala_bifrost_redux::gate::{IngestError, OtlpWireLimits};
+use vala_bifrost_redux::tables::logs::log_row_output_bytes;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
@@ -10,35 +11,24 @@ use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::resource::v1::Resource;
 
+use crate::otlp_decode::{
+    GROUP_FAN_OUT, OtlpDecodePlan, ProjectedOutput, RESOURCE_FAN_OUT, enforce_expanded_ceiling,
+};
+
 /// Maximum deprecated protobuf group nesting accepted by the bounded scanner.
 const MAX_WIRE_GROUP_DEPTH: usize = 8;
-
-/// Exact adapter facts established before generated logs messages are allocated.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OtlpLogsDecodePlan {
-    /// Encoded protobuf bytes inspected by the preflight.
-    pub(crate) wire_bytes: usize,
-    /// Exact live typed-request capacity that the constructor will retain.
-    pub(crate) decode_bytes: usize,
-}
 
 /// Bounded counters accumulated while walking one logs export.
 #[derive(Debug)]
 struct LogsWireFacts {
     /// Immutable limits shared by the adapter and Scribe admission.
     limits: OtlpWireLimits,
-    /// Resource group count.
-    resources: usize,
-    /// Scope group count.
-    scopes: usize,
-    /// Log record count.
-    records: usize,
-    /// Attribute count across resources, scopes, records, and nested values.
-    attributes: usize,
-    /// Retained variable-width bytes across the generated request.
-    value_bytes: usize,
+    /// Fixed Arrow bytes charged per projected log row.
+    row_bytes: usize,
     /// Exact public layout plus retained backing capacity.
     decode_bytes: usize,
+    /// Conservative projected canonical output.
+    output: ProjectedOutput,
 }
 
 impl LogsWireFacts {
@@ -46,37 +36,18 @@ impl LogsWireFacts {
     fn new(limits: OtlpWireLimits) -> Self {
         Self {
             limits,
-            resources: 0,
-            scopes: 0,
-            records: 0,
-            attributes: 0,
-            value_bytes: 0,
+            row_bytes: log_row_output_bytes(),
             decode_bytes: size_of::<ExportLogsServiceRequest>(),
+            output: ProjectedOutput::default(),
         }
     }
 
-    /// Adds one bounded cardinality or byte fact.
+    /// Charges retained variable-width backing.
     ///
     /// # Errors
     ///
-    /// Returns a malformed refusal on arithmetic overflow or limit excess.
-    fn add_count(current: &mut usize, amount: usize, limit: usize) -> Result<(), IngestError> {
-        *current = current
-            .checked_add(amount)
-            .ok_or_else(|| malformed("OTLP protobuf cardinality overflow"))?;
-        if *current > limit {
-            return Err(malformed("OTLP protobuf cardinality limit exceeded"));
-        }
-        Ok(())
-    }
-
-    /// Charges retained variable-width backing to both byte ceilings.
-    ///
-    /// # Errors
-    ///
-    /// Returns a malformed refusal on overflow or configured limit excess.
+    /// Returns a malformed refusal on arithmetic overflow.
     fn add_value_bytes(&mut self, amount: usize) -> Result<(), IngestError> {
-        Self::add_count(&mut self.value_bytes, amount, self.limits.value_bytes)?;
         self.add_decode_bytes(amount)
     }
 
@@ -84,18 +55,21 @@ impl LogsWireFacts {
     ///
     /// # Errors
     ///
-    /// Returns a malformed refusal on overflow or material-limit excess.
+    /// Returns a malformed refusal on arithmetic overflow.
     fn add_decode_bytes(&mut self, amount: usize) -> Result<(), IngestError> {
-        Self::add_count(&mut self.decode_bytes, amount, usize::MAX)
+        self.decode_bytes = self
+            .decode_bytes
+            .checked_add(amount)
+            .ok_or_else(|| malformed("OTLP protobuf capacity overflow"))?;
+        Ok(())
     }
 
     /// Charges one retained key/value element before its nested payload.
     ///
     /// # Errors
     ///
-    /// Returns a malformed refusal when attribute or material limits are exceeded.
+    /// Returns a malformed refusal on arithmetic overflow.
     fn add_attribute(&mut self) -> Result<(), IngestError> {
-        Self::add_count(&mut self.attributes, 1, self.limits.attributes)?;
         self.add_decode_bytes(size_of::<KeyValue>())
     }
 }
@@ -334,7 +308,7 @@ impl<'a> WireFields<'a> {
 pub(crate) fn preflight_logs_protobuf(
     bytes: &[u8],
     limits: OtlpWireLimits,
-) -> Result<OtlpLogsDecodePlan, IngestError> {
+) -> Result<OtlpDecodePlan, IngestError> {
     if bytes.len() > limits.request_bytes {
         return Err(IngestError::PayloadTooLarge {
             bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
@@ -346,17 +320,24 @@ pub(crate) fn preflight_logs_protobuf(
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
             (1, WireValue::Bytes(resource)) => {
-                LogsWireFacts::add_count(&mut facts.resources, 1, limits.resources)?;
+                facts
+                    .output
+                    .open(facts.decode_bytes, size_of::<ResourceLogs>());
                 facts.add_decode_bytes(size_of::<ResourceLogs>())?;
                 visit_resource_logs(resource, &mut facts)?;
+                facts
+                    .output
+                    .close_group(facts.decode_bytes, RESOURCE_FAN_OUT);
             }
             (1, _) => return Err(wrong_wire("logs resource group")),
             _ => {}
         }
     }
-    Ok(OtlpLogsDecodePlan {
+    enforce_expanded_ceiling(facts.decode_bytes, facts.output.bytes(), limits)?;
+    Ok(OtlpDecodePlan {
         wire_bytes: bytes.len(),
         decode_bytes: facts.decode_bytes,
+        projected_bytes: facts.output.bytes(),
     })
 }
 
@@ -375,9 +356,12 @@ fn visit_resource_logs(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), In
         match (tag, value) {
             (1, WireValue::Bytes(_)) | (3, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(scope)) => {
-                LogsWireFacts::add_count(&mut facts.scopes, 1, facts.limits.scopes)?;
+                facts
+                    .output
+                    .open(facts.decode_bytes, size_of::<ScopeLogs>());
                 facts.add_decode_bytes(size_of::<ScopeLogs>())?;
                 visit_scope_logs(scope, facts)?;
+                facts.output.close_group(facts.decode_bytes, GROUP_FAN_OUT);
             }
             (1..=3, _) => return Err(wrong_wire("resource logs")),
             _ => {}
@@ -476,9 +460,14 @@ fn visit_scope_logs(bytes: &[u8], facts: &mut LogsWireFacts) -> Result<(), Inges
         match (tag, value) {
             (1, WireValue::Bytes(scope)) => visit_scope(scope, facts)?,
             (2, WireValue::Bytes(record)) => {
-                LogsWireFacts::add_count(&mut facts.records, 1, facts.limits.records)?;
+                facts
+                    .output
+                    .open(facts.decode_bytes, size_of::<LogRecord>());
                 facts.add_decode_bytes(size_of::<LogRecord>())?;
                 visit_log_record(record, facts)?;
+                facts
+                    .output
+                    .close_record(facts.decode_bytes, facts.row_bytes);
             }
             (3, WireValue::Bytes(_)) => {}
             (1..=3, _) => return Err(wrong_wire("scope logs")),
@@ -1642,26 +1631,13 @@ mod tests {
         assert_fixed_logs_capacity(&decoded);
     }
 
-    /// Proves record cardinality cap and recursive value depth fail at cap plus one.
+    /// Proves recursive value depth fails at the fixed depth plus one.
     ///
     /// # Panics
     ///
     /// Panics if test fixtures cannot encode.
     #[test]
-    fn logs_preflight_enforces_record_and_depth_limits() {
-        let mut limits = vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS;
-        limits.records = 1;
-        let request = ExportLogsServiceRequest {
-            resource_logs: vec![ResourceLogs {
-                scope_logs: vec![ScopeLogs {
-                    log_records: vec![LogRecord::default(), LogRecord::default()],
-                    ..ScopeLogs::default()
-                }],
-                ..ResourceLogs::default()
-            }],
-        };
-        assert!(preflight_logs_protobuf(&request.encode_to_vec(), limits).is_err());
-
+    fn logs_preflight_enforces_depth_limit() {
         for (depth, accepted) in [(8, true), (9, false)] {
             let request = ExportLogsServiceRequest {
                 resource_logs: vec![ResourceLogs {

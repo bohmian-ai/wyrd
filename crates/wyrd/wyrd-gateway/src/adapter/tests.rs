@@ -1273,9 +1273,14 @@ async fn truncation_at_an_event_boundary_ends_in_the_terminal_error() {
     let text = String::from_utf8(bytes).expect("utf-8");
     assert!(!aborted && end.outcome == GatewayCallOutcome::Failed);
     assert!(text.starts_with(CHAT_FRAME), "{text}");
-    assert!(
-        text.ends_with("\"code\":\"WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE\",\"message\":\"the provider stream ended before completing\",\"param\":null,\"type\":\"api_error\"}}\n\ndata: [DONE]\n\n"),
-        "{text}"
+    let terminal = text
+        .strip_suffix("data: [DONE]\n\n")
+        .and_then(|text| text.rsplit_once("data: "))
+        .map(|(_, data)| data.trim_end())
+        .expect("terminal error before DONE");
+    assert_eq!(
+        serde_json::from_str::<Value>(terminal).expect("terminal error JSON"),
+        json!({"error": {"code": "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE", "message": "the provider stream ended before completing", "param": null, "type": "api_error"}})
     );
     let (bytes, aborted, end) = open_stream(
         &dispatch,
@@ -1289,9 +1294,14 @@ async fn truncation_at_an_event_boundary_ends_in_the_terminal_error() {
     .await;
     let text = String::from_utf8(bytes).expect("utf-8");
     assert!(!aborted && end.outcome == GatewayCallOutcome::Failed);
-    assert!(
-        text.ends_with("event: error\ndata: {\"code\":\"WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE\",\"message\":\"the provider stream ended before completing\",\"param\":null,\"type\":\"error\"}\n\n"),
-        "{text}"
+    let terminal = text
+        .strip_suffix("\n\n")
+        .and_then(|text| text.rsplit_once("event: error\ndata: "))
+        .map(|(_, data)| data)
+        .expect("terminal error event");
+    assert_eq!(
+        serde_json::from_str::<Value>(terminal).expect("terminal error JSON"),
+        json!({"code": "WYRD_GATEWAY_502_UPSTREAM_UNAVAILABLE", "message": "the provider stream ended before completing", "param": null, "type": "error"})
     );
 
     let (bytes, aborted, _) = open_stream(
@@ -1310,9 +1320,14 @@ async fn truncation_at_an_event_boundary_ends_in_the_terminal_error() {
     .await;
     let text = String::from_utf8(bytes).expect("utf-8");
     assert!(!aborted);
-    assert!(
-        text.ends_with("event: error\ndata: {\"error\":{\"message\":\"the provider stream ended before completing\",\"type\":\"api_error\"},\"type\":\"error\"}\n\n"),
-        "{text}"
+    let terminal = text
+        .strip_suffix("\n\n")
+        .and_then(|text| text.rsplit_once("event: error\ndata: "))
+        .map(|(_, data)| data)
+        .expect("terminal error event");
+    assert_eq!(
+        serde_json::from_str::<Value>(terminal).expect("terminal error JSON"),
+        json!({"error": {"message": "the provider stream ended before completing", "type": "api_error"}, "type": "error"})
     );
 }
 

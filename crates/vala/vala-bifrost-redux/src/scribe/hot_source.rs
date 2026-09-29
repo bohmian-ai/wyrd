@@ -628,19 +628,21 @@ impl ScribeHotSourceRegistry {
         }))
     }
 
-    /// Returns tenant keys whose staged runs still own readable rows.
+    /// Returns one tenant table's keys whose staged runs still own readable rows.
     ///
     /// # Errors
     /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
-    pub(crate) fn staged_seal_keys_for_tenant(
+    pub(crate) fn staged_seal_keys_for_table(
         &self,
         tenant: wyrd_spec::ids::DataTenantId,
+        table: &crate::catalog::TableRef,
     ) -> Result<Vec<SealKey>, HotSourceError> {
         Ok(self
             .lock()?
             .iter()
             .filter(|(key, authorities)| {
                 key.tenant == tenant
+                    && key.table == *table
                     && authorities
                         .by_generation
                         .values()

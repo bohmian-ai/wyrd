@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::{CardKind, Spec};
 use crate::ids::{CardName, CardUid, SpaceName};
-use crate::refs::{ReferenceSlotVisitor, SlotValue};
+use crate::refs::ReferenceSlotVisitor;
 use wyrd_semver::VersionBlock;
 
 /// Reference to a registered Card by kind, name, version, optional space, and optional UID.
@@ -349,16 +349,8 @@ impl<'de> Deserialize<'de> for CardRefScope {
 pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
     let mut spec = spec.clone();
     let mut references = Vec::new();
-    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
-        SlotValue::Durable(reference) => {
-            references.extend(reference.as_card_ref().cloned());
-        }
-        SlotValue::InlineablePrompt(reference) => {
-            references.extend(reference.as_card_ref().cloned());
-        }
-        SlotValue::InlineableAgent(reference) => {
-            references.extend(reference.as_card_ref().cloned());
-        }
+    ReferenceSlotVisitor::visit(&mut spec, |slot| {
+        references.extend(slot.value.as_card_ref().cloned());
     });
     references
 }
@@ -371,22 +363,8 @@ pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
 pub fn unresolved_card_ref_paths(spec: &Spec) -> Vec<PathBuf> {
     let mut spec = spec.clone();
     let mut paths = Vec::new();
-    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
-        SlotValue::Durable(reference) => {
-            if let Ref::Path(path) = reference {
-                paths.push(path.clone());
-            }
-        }
-        SlotValue::InlineablePrompt(reference) => {
-            if let InlineableRef::Path(path) = reference {
-                paths.push(path.clone());
-            }
-        }
-        SlotValue::InlineableAgent(reference) => {
-            if let InlineableRef::Path(path) = reference {
-                paths.push(path.clone());
-            }
-        }
+    ReferenceSlotVisitor::visit(&mut spec, |slot| {
+        paths.extend(slot.value.as_path().map(std::path::Path::to_path_buf));
     });
     paths
 }
@@ -401,16 +379,8 @@ pub fn unresolved_card_ref_paths(spec: &Spec) -> Vec<PathBuf> {
 pub fn registration_only_sibling_refs(spec: &Spec) -> Vec<CardRef> {
     let mut spec = spec.clone();
     let mut siblings = Vec::new();
-    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
-        SlotValue::Durable(reference) => {
-            siblings.extend(reference.as_sibling().cloned());
-        }
-        SlotValue::InlineablePrompt(reference) => {
-            siblings.extend(reference.as_sibling().cloned());
-        }
-        SlotValue::InlineableAgent(reference) => {
-            siblings.extend(reference.as_sibling().cloned());
-        }
+    ReferenceSlotVisitor::visit(&mut spec, |slot| {
+        siblings.extend(slot.value.as_sibling().cloned());
     });
     siblings
 }
@@ -846,27 +816,43 @@ mod tests {
         assert!(!with_uid.same_identity(&different_space));
     }
 
-    /// Confirm unresolved Service paths include component-local publication bindings.
+    /// Build a verification binding whose Verifier, Trigger, and Operator
+    /// slots are all unresolved authored paths under `dir`.
+    fn path_binding(dir: &str) -> crate::card::verifier::VerificationBinding {
+        crate::card::verifier::VerificationBinding {
+            verifier: Ref::Path(PathBuf::from(format!("{dir}/verifier.yaml"))),
+            runs_on: InlineableRef::Path(PathBuf::from(format!("{dir}/trigger.yaml"))),
+            on_failure: vec![InlineableRef::Path(PathBuf::from(format!(
+                "{dir}/operator.yaml"
+            )))],
+        }
+    }
+
+    /// Confirm unresolved Service paths include component-local and
+    /// Service-level verification binding slots in visit order.
     #[test]
     fn unresolved_card_ref_paths_include_top_level_slots() {
         let mut spec = ServiceSpec::default();
         spec.components.push(ServiceComponent {
             alias: "model".to_owned(),
             card_ref: Ref::Path(PathBuf::from("components/model.yaml")),
-            publishes_to: vec![Ref::Path(PathBuf::from("publishes/model-eval.yaml"))],
+            verified_by: vec![path_binding("component")],
             source: None,
             config: BTreeMap::new(),
             credential_refs: Vec::new(),
         });
-        spec.publishes_to
-            .push(Ref::Path(PathBuf::from("publishes/eval.yaml")));
+        spec.verified_by.push(path_binding("service"));
 
         assert_eq!(
             unresolved_card_ref_paths(&Spec::Service(spec)),
             vec![
                 PathBuf::from("components/model.yaml"),
-                PathBuf::from("publishes/model-eval.yaml"),
-                PathBuf::from("publishes/eval.yaml")
+                PathBuf::from("component/verifier.yaml"),
+                PathBuf::from("component/trigger.yaml"),
+                PathBuf::from("component/operator.yaml"),
+                PathBuf::from("service/verifier.yaml"),
+                PathBuf::from("service/trigger.yaml"),
+                PathBuf::from("service/operator.yaml"),
             ]
         );
     }
@@ -931,7 +917,7 @@ mod tests {
             prompt,
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
         }
     }
 
@@ -968,7 +954,7 @@ mod tests {
             card_ref: Ref::Sibling {
                 sibling: top_level.clone(),
             },
-            publishes_to: Vec::new(),
+            verified_by: Vec::new(),
             source: None,
             config: BTreeMap::new(),
             credential_refs: Vec::new(),
@@ -1000,7 +986,7 @@ mod tests {
             ServiceComponent {
                 alias: "durable".to_owned(),
                 card_ref: Ref::Ref(durable),
-                publishes_to: Vec::new(),
+                verified_by: Vec::new(),
                 source: None,
                 config: BTreeMap::new(),
                 credential_refs: Vec::new(),
@@ -1008,7 +994,7 @@ mod tests {
             ServiceComponent {
                 alias: "path".to_owned(),
                 card_ref: Ref::Path(path),
-                publishes_to: Vec::new(),
+                verified_by: Vec::new(),
                 source: None,
                 config: BTreeMap::new(),
                 credential_refs: Vec::new(),

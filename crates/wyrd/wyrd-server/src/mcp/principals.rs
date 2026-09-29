@@ -97,7 +97,12 @@ fn schema_of<T: JsonSchema>() -> Arc<JsonMap<String, JsonValue>> {
 /// Both schemas come from the shared `wyrd-spec` DTOs the handler below
 /// deserializes and returns, so the advertised contract is the parsed one. A
 /// handwritten schema beside a separate struct is how the two drift.
-fn tool<I, O>(name: &'static str, title: &str, description: &'static str, read_only: bool) -> Tool
+pub(super) fn tool<I, O>(
+    name: &'static str,
+    title: &str,
+    description: &'static str,
+    read_only: bool,
+) -> Tool
 where
     I: JsonSchema,
     O: JsonSchema,
@@ -143,7 +148,7 @@ fn revoke_credential_tool() -> Tool {
 /// # Errors
 /// Returns [`WyrdError::Validation`] when the arguments are absent or do not
 /// match the advertised schema.
-fn parse_args<T: DeserializeOwned>(
+pub(super) fn parse_args<T: DeserializeOwned>(
     arguments: Option<JsonMap<String, JsonValue>>,
     tool: &str,
 ) -> Result<T, WyrdError> {

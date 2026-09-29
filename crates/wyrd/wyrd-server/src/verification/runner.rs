@@ -86,6 +86,45 @@ pub enum Transition {
     Defer(VerificationError),
 }
 
+/// The closed set of engine arms a Verifier run executes through.
+///
+/// One arm exists per [`VerifierImplementation`] variant, so adding a variant
+/// fails to compile until its engine is supplied here.
+pub struct VerifierEngines {
+    /// The Drift arm's engine.
+    drift: DriftEngine,
+    /// The continuous Eval arm.
+    eval: EvalEngine,
+}
+
+impl VerifierEngines {
+    /// Groups the Drift and Eval arms the runner dispatches to.
+    #[must_use]
+    pub const fn new(drift: DriftEngine, eval: EvalEngine) -> Self {
+        Self { drift, eval }
+    }
+
+    /// Executes one claimed run through the arm its implementation names.
+    ///
+    /// Drift reads as the SYSTEM principal scoped to the exact `verifier`;
+    /// Eval executes the run's continuous evaluation for `tenant`. Every
+    /// failure is carried in the returned [`EngineOutcome`], not raised.
+    async fn execute(
+        &self,
+        tenant: DataTenantId,
+        run: &ClaimedRun,
+        verifier: &CardRef,
+        implementation: &VerifierImplementation,
+    ) -> EngineOutcome {
+        match implementation {
+            VerifierImplementation::Drift(spec) => {
+                self.drift.verify(tenant, verifier, run, spec).await
+            }
+            VerifierImplementation::Eval(spec) => self.eval.execute(tenant, run, spec).await,
+        }
+    }
+}
+
 /// Owner of claiming, executing, publishing, and settling Verifier runs.
 pub struct VerifierRunner {
     /// Wyrd Postgres owner that opens every tenant-scoped claim, Card read,
@@ -99,12 +138,10 @@ pub struct VerifierRunner {
     permits: Arc<VerifierPermits>,
     /// Remote result publication.
     publisher: ResultPublisher,
-    /// The Drift arm's engine.
-    drift: DriftEngine,
+    /// The Drift and Eval arms a claimed run dispatches to.
+    engines: VerifierEngines,
     /// Runtime bounds.
     limits: RuntimeLimits,
-    /// The continuous Eval arm.
-    eval: EvalEngine,
     /// Test-only scripted engine outcomes.
     #[cfg(feature = "test-support")]
     script: Option<EngineScript>,
@@ -127,9 +164,8 @@ impl VerifierRunner {
         queue: VerifierRunQueue,
         permits: Arc<VerifierPermits>,
         publisher: ResultPublisher,
-        drift: DriftEngine,
+        engines: VerifierEngines,
         limits: RuntimeLimits,
-        eval: EvalEngine,
     ) -> Self {
         Self {
             postgres,
@@ -137,9 +173,8 @@ impl VerifierRunner {
             queue,
             permits,
             publisher,
-            drift,
+            engines,
             limits,
-            eval,
             #[cfg(feature = "test-support")]
             script: None,
             #[cfg(feature = "test-support")]
@@ -475,9 +510,9 @@ impl VerifierRunner {
 
     /// The one closed dispatch over Verifier implementations.
     ///
-    /// Drift executes through the runner's [`DriftEngine`] for `tenant`,
-    /// reading as the SYSTEM principal scoped to the exact `verifier`. Under
-    /// `test-support` a scripted outcome, when queued, replaces the arm.
+    /// The run executes through [`VerifierEngines`] for `tenant` and the exact
+    /// `verifier`. Under `test-support` a scripted outcome, when queued,
+    /// replaces the arm.
     async fn dispatch(
         &self,
         tenant: DataTenantId,
@@ -491,12 +526,9 @@ impl VerifierRunner {
         {
             return outcome;
         }
-        match implementation {
-            VerifierImplementation::Drift(spec) => {
-                self.drift.verify(tenant, verifier, run, spec).await
-            }
-            VerifierImplementation::Eval(spec) => self.eval.execute(tenant, run, spec).await,
-        }
+        self.engines
+            .execute(tenant, run, verifier, implementation)
+            .await
     }
 
     /// Publish `report` as the run's result and map the attempt to a transition.

@@ -225,8 +225,7 @@ impl ScribeFragmentExecutor {
     ///
     /// # Errors
     /// Returns [`DispatchError::Terminal`] for a fence, context, claims, or
-    /// preflight mismatch, [`DispatchError::Capacity`] when the follower
-    /// lease is refused, and the follower's start classification otherwise.
+    /// preflight mismatch, and the follower's start classification otherwise.
     pub async fn execute(
         &self,
         request: ExecuteFragmentRequest,
@@ -284,8 +283,7 @@ impl ScribeFragmentExecutor {
             .ok()
             .and_then(|tenant| wyrd_spec::DataTenantId::new(tenant).ok())
             .ok_or(DispatchError::Terminal)?;
-        let query_id =
-            uuid::Uuid::from_slice(&claims.query_id).map_err(|_| DispatchError::Terminal)?;
+        uuid::Uuid::from_slice(&claims.query_id).map_err(|_| DispatchError::Terminal)?;
         if claims.protocol_version != PEER_PROTOCOL_VERSION
             || claims.leader_node_id.as_slice() != request.leader_fence.node_id.as_uuid().as_bytes()
             || claims.leader_fence != request.leader_fence.fencing_token
@@ -335,21 +333,13 @@ impl ScribeFragmentExecutor {
             tracing::error!(?error, "Scribe physical follower rejected the request");
             DispatchError::Terminal
         })?;
-        let request_id = wyrd_spec::request_id::RequestId::parse(&query_id.to_string())
-            .map_err(|_| DispatchError::Terminal)?;
-        let lease = scribe
-            .resources()
-            .try_acquire_follower(
-                &request_id,
-                vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
-            )
-            .map_err(|_| DispatchError::Capacity)?;
-        // The Scribe follower is shaped by the lease this node just charged:
-        // one partition, because a hot-tail fragment is a single sequential
-        // cut, and the batch size the granted bytes support.
+        // The Scribe follower is shaped by its pool ceiling: one partition,
+        // because a hot-tail fragment is a single sequential cut, and the batch
+        // size that ceiling supports. Bytes are charged only as it grows.
+        let ceiling = vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES;
         let sessions = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
-            lease.memory_pool(),
-            lease.memory_bytes(),
+            scribe.resources().follower_memory_pool(ceiling),
+            ceiling,
             1,
         );
         let execution = scribe
@@ -367,7 +357,6 @@ impl ScribeFragmentExecutor {
         let plan_fingerprint = request.plan_fingerprint;
         let scribe_owner = Arc::clone(scribe);
         let output = async_stream::stream! {
-            let _lease = lease;
             // Retained through the whole attempt so a Scribe fragment that
             // happens to name a snapshot keeps it protected until it is done.
             let _reader_protection = reader_protection;

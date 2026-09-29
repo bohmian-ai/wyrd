@@ -21,14 +21,11 @@ use std::time::{Duration, Instant};
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::memory_pool::{
-    FairSpillPool, GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
-    TrackConsumersPool,
+    FairSpillPool, MemoryConsumer, MemoryPool, MemoryReservation, TrackConsumersPool,
 };
 use num_traits::ToPrimitive;
 use rustix::fs::statvfs;
 use tokio::sync::Notify;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::QueryClass;
 
 /// One mebibyte in bytes.
@@ -45,7 +42,7 @@ pub const MIN_SCRATCH_FREE_BYTES: u64 = 256 * MIB as u64;
 ///
 /// This is a *cap on a derived grant*, not a reservation. Admission debits no
 /// memory at all; governed bytes are charged only as the query's `DataFusion`
-/// consumers actually grow through the shared Oracle root, and this value bounds
+/// consumers actually grow through the shared memory pool, and this value bounds
 /// how far one query may grow. Treating it as a reservation pinned node
 /// concurrency at `budget / ceiling`, which let a single analytical query hold
 /// 1.25 GiB to scan a handful of 5 KiB Parquet files and shed load at the lowest
@@ -852,7 +849,7 @@ impl OracleWorkerClass {
 /// Attribution never partitions capacity: every holder charges the same total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MemoryHolder {
-    /// Scribe ingress, memtable, staged, and follower leases.
+    /// Scribe ingress, memtable, and staged leases.
     Scribe = 0,
     /// Oracle metadata owners and query `DataFusion` consumers.
     Oracle = 1,
@@ -945,6 +942,9 @@ pub struct BifrostRuntimeResources {
     transport: crate::gate::limits::BifrostTransportAdmission,
     /// Registered Scribe stage and output roots, present on live boot.
     volumes: Option<BifrostVolumeRoots>,
+    /// The one `DataFusion` memory pool every Oracle, Forge, and Scribe
+    /// follower consumer on this pod grows through.
+    memory_root: Arc<GovernedMemoryRoot>,
 }
 
 impl BifrostRuntimeResources {
@@ -1038,6 +1038,7 @@ impl BifrostRuntimeResources {
         )?;
         Ok(Self {
             transport,
+            memory_root: Arc::new(GovernedMemoryRoot::new(root.clone())),
             governor: root,
             volumes,
         })
@@ -1112,24 +1113,18 @@ impl BifrostRuntimeResources {
         let scribe = plan.scribe_enabled.then(|| ScribeResources {
             governor: self.governor.clone(),
             volumes: self.volumes.clone(),
-            follower_permits: Arc::new(Semaphore::new(plan.effective_cpu.max(1))),
+            memory_root: Arc::clone(&self.memory_root),
         });
         Ok(BifrostRoleResources {
             scribe,
             oracle: plan.oracle_enabled.then(|| OracleResources {
                 governor: self.governor.clone(),
-                memory_root: Arc::new(GovernedMemoryRoot::new(
-                    self.governor.clone(),
-                    MemoryHolder::Oracle,
-                )),
+                memory_root: Arc::clone(&self.memory_root),
                 #[cfg(feature = "test-support")]
                 memory_hold: Arc::new(OracleQueryMemoryHold::default()),
             }),
             forge: plan.forge_enabled.then(|| ForgeResources {
-                memory_root: Arc::new(GovernedMemoryRoot::new(
-                    self.governor.clone(),
-                    MemoryHolder::Forge,
-                )),
+                memory_root: Arc::clone(&self.memory_root),
             }),
             governor: self.governor.clone(),
             transport: self.transport.clone(),
@@ -1235,8 +1230,14 @@ pub struct ScribeResources {
     governor: BifrostResourceGovernor,
     /// Registered Scribe stage and output roots, present on live boot.
     volumes: Option<BifrostVolumeRoots>,
-    /// Existing-role bounded concurrency for request-local live-tail followers.
-    follower_permits: Arc<Semaphore>,
+    /// The pod's one governed pool, which live-tail followers grow through.
+    ///
+    /// A follower charges only the bytes its `DataFusion` consumers actually
+    /// hold. It is query execution, so those bytes are attributed to the
+    /// query holder like every other query view, leaving Scribe attribution
+    /// to its categorized ingest and memtable leases. The leader stream that
+    /// dispatched it owns its lifetime, so it takes no slot or permit here.
+    memory_root: Arc<GovernedMemoryRoot>,
 }
 
 impl ScribeResources {
@@ -1245,46 +1246,21 @@ impl ScribeResources {
     pub fn health(&self) -> BifrostResourceHealth {
         self.governor.inner.health.clone()
     }
-    /// Acquires one exact root-accounted quantum for a Scribe-role physical follower.
+    /// Issues the governed `DataFusion` pool for one Scribe-role physical follower.
     ///
-    /// The returned move-only owner holds both one existing Scribe concurrency
-    /// permit and a charge against the shared Bifrost cap until the follower
-    /// stream terminates. This adds no governor or root.
-    ///
-    /// # Errors
-    ///
-    /// Returns the existing root refusal when the requested positive quantum
-    /// cannot be admitted without exceeding the shared cap.
-    pub fn try_acquire_follower(
-        &self,
-        request_id: &RequestId,
-        estimated_bytes: usize,
-    ) -> Result<ScribeFollowerLease, BifrostResourceError> {
-        if estimated_bytes == 0 {
-            return Err(BifrostResourceError::InvalidPlan {
-                detail: "Scribe follower memory must be positive".to_owned(),
-            });
-        }
-        let permit = Arc::clone(&self.follower_permits)
-            .try_acquire_owned()
-            .map_err(|_| BifrostResourceError::Occupied {
-                detail: "Scribe follower concurrency is saturated".to_owned(),
-            })?;
-        let lease = self.governor.try_acquire_scribe_memory(
-            ScribeMemoryRequest {
-                bytes: estimated_bytes,
-                category: crate::scribe::memory::MemoryCategory::Decode,
-                shard: None,
-            },
-            None,
-        )?;
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(estimated_bytes));
-        Ok(ScribeFollowerLease {
-            request_id: request_id.clone(),
-            _permit: permit,
-            lease,
-            pool,
-        })
+    /// The pool holds no bytes and no concurrency slot when issued. It is a
+    /// private view over the pod's one governed pool: each reservation charges
+    /// the shared Bifrost cap as it grows, is refused only when the shared cap
+    /// or `ceiling_bytes` would be exceeded, and returns its bytes on shrink or
+    /// drop. The peer's response stream owns the view, so closing the leader's
+    /// stream drops the work and returns its bytes.
+    #[must_use]
+    pub fn follower_memory_pool(&self, ceiling_bytes: usize) -> Arc<dyn MemoryPool> {
+        self.memory_root.query_view(
+            MemoryHolder::Oracle,
+            ceiling_bytes,
+            &Arc::new(AtomicUsize::new(0)),
+        )
     }
 
     /// Captures the Scribe-compatible projection of authoritative root state.
@@ -1554,7 +1530,7 @@ pub struct OracleResources {
 
 /// Test-tier controller that parks governed memory inside one real query view.
 ///
-/// Journeys need a pod whose shared Oracle root is genuinely occupied while a
+/// Journeys need a pod whose shared memory pool is genuinely occupied while a
 /// second query arrives. Faking that with a counter would prove nothing about
 /// the root, so this arms a byte count, and the next admitted query grows a
 /// named reservation for it through the query view `DataFusion` itself would
@@ -1742,7 +1718,7 @@ impl OracleResources {
     /// Acquires one remote-worker slot quantum alongside other Oracle owners.
     ///
     /// A follower holds concurrency, not resident memory: its bytes are charged
-    /// only as its `DataFusion` consumers grow through the shared Oracle root,
+    /// only as its `DataFusion` consumers grow through the shared memory pool,
     /// exactly as a leader's are. Query, metadata, and sibling worker owners
     /// remain independently attributable in that same root ledger.
     ///
@@ -1783,9 +1759,11 @@ impl OracleResources {
         // A follower is a query too: it takes a private view over the same
         // shared root the leader queries use, never an independent pool whose
         // ceiling could sum above what the pod owns.
-        let memory_pool = self
-            .memory_root
-            .query_view(granted_memory_bytes, &Arc::new(AtomicUsize::new(0)));
+        let memory_pool = self.memory_root.query_view(
+            MemoryHolder::Oracle,
+            granted_memory_bytes,
+            &Arc::new(AtomicUsize::new(0)),
+        );
         // Locality is zero here: a remote worker reads the files the leader
         // dispatched to it, so its partition ceiling comes from the grant it
         // was admitted with rather than from any caller-supplied hint.
@@ -1799,16 +1777,18 @@ impl OracleResources {
         })
     }
 
-    /// Returns the aggregate bytes every live Oracle query holds at the root.
+    /// Returns the aggregate bytes every consumer holds in the pod's one pool.
     ///
-    /// This is the shared figure, not one query's: it is what proves two
-    /// concurrent queries compete beneath one envelope rather than beside it.
+    /// This is the shared figure, not one query's: it proves concurrent
+    /// consumers compete beneath one envelope rather than beside it, and it
+    /// includes infallible overshoot, so it reads zero only once every Oracle,
+    /// Forge, and Scribe follower reservation has been released.
     #[must_use]
     pub fn shared_memory_reserved(&self) -> usize {
         self.memory_root.reserved()
     }
 
-    /// Returns the cooperative maximum the shared Oracle root arbitrates.
+    /// Returns the cooperative maximum the shared memory pool arbitrates.
     #[must_use]
     pub fn shared_memory_limit(&self) -> usize {
         self.memory_root.limit_bytes()
@@ -1938,12 +1918,12 @@ impl OracleResources {
 /// instead of reserving an estimated share in advance.
 #[derive(Debug, Clone)]
 pub struct ForgeResources {
-    /// The one governed `DataFusion` root every Forge rewrite shares.
+    /// The pod's one governed pool every Forge rewrite grows through.
     memory_root: Arc<GovernedMemoryRoot>,
 }
 
 impl ForgeResources {
-    /// Issues one rewrite attempt's pool over the shared Forge root.
+    /// Issues one rewrite attempt's pool over the shared memory pool.
     ///
     /// The view's ceiling is the shared cap itself: Forge has no independent
     /// finite budget. Fallible growth refuses when the shared cap is full, so
@@ -1953,6 +1933,7 @@ impl ForgeResources {
     #[must_use]
     pub fn rewrite_memory_pool(&self) -> Arc<dyn MemoryPool> {
         self.memory_root.query_view(
+            MemoryHolder::Forge,
             self.memory_root.limit_bytes(),
             &Arc::new(AtomicUsize::new(0)),
         )
@@ -2654,7 +2635,7 @@ impl BifrostResourceGovernor {
         Self::validate_oracle_request(plan, request)?;
         // The class quantum is a ceiling and a partition-planning input, not
         // resident memory: what a query actually reserves is charged as its
-        // `DataFusion` consumers grow through the shared Oracle root. Slots are
+        // `DataFusion` consumers grow through the shared memory pool. Slots are
         // the concurrency authority; spill is bytes `DataFusion` actually writes
         // under its own per-query limit, never an admission charge.
         // Slot units are the sole concurrency authority and the sole protector
@@ -2695,7 +2676,11 @@ impl BifrostResourceGovernor {
         record_memory_transition("oracle", "acquired", state.held(MemoryHolder::Oracle));
         record_oracle_capacity(&state, &plan, self.oracle_class_split());
         let memory_peak_bytes = Arc::new(AtomicUsize::new(0));
-        let memory_pool = memory_root.query_view(granted_memory_bytes, &memory_peak_bytes);
+        let memory_pool = memory_root.query_view(
+            MemoryHolder::Oracle,
+            granted_memory_bytes,
+            &memory_peak_bytes,
+        );
         Ok(OracleQueryResources {
             query_class: request.query_class,
             granted_memory_bytes,
@@ -3534,45 +3519,12 @@ impl Drop for OracleSlotCharge {
 pub struct OracleWorkerResources {
     /// Aggregate slot-ledger units this follower holds until it is dropped.
     _slots: OracleSlotCharge,
-    /// Private view over the shared Oracle root this follower allocates from.
+    /// Private view over the shared memory pool this follower allocates from.
     memory_pool: Arc<dyn MemoryPool>,
     /// Trusted grant the bounded pool was sized from.
     granted_memory_bytes: usize,
     /// Partition ceiling admitted for this worker by that same grant.
     admitted_target_partitions: usize,
-}
-
-/// Move-only root-backed owner for one Scribe physical follower quantum.
-#[derive(Debug)]
-pub struct ScribeFollowerLease {
-    /// Typed request identity binding concurrency and memory ownership.
-    request_id: RequestId,
-    /// Existing Scribe-role bounded concurrency permit.
-    _permit: OwnedSemaphorePermit,
-    /// Existing Scribe memory lease retained until follower stream termination.
-    lease: ScribeMemoryLease,
-    /// Exact bounded `DataFusion` pool used by the request-local session.
-    pool: Arc<dyn MemoryPool>,
-}
-
-impl ScribeFollowerLease {
-    /// Returns the exact root-accounted bytes available to the request-local pool.
-    #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        self.lease.bytes
-    }
-
-    /// Returns the typed request identity owning this follower lease.
-    #[must_use]
-    pub fn request_id(&self) -> &RequestId {
-        &self.request_id
-    }
-
-    /// Returns the exact bounded pool retained by this lease.
-    #[must_use]
-    pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
-        Arc::clone(&self.pool)
-    }
 }
 
 impl OracleWorkerResources {
@@ -3623,7 +3575,7 @@ impl OracleMetadataResources {
         Ok(OracleFooterSlotResources { lease })
     }
 
-    /// Reserves exact retained-metadata bytes against the same Oracle root.
+    /// Reserves exact retained-metadata bytes against the same shared pool.
     ///
     /// Distinct from [`Self::try_acquire_footer_slot`] in lifetime, not in
     /// authority: the footer slot is the transient workspace one decode needs,
@@ -3649,7 +3601,7 @@ impl OracleMetadataResources {
 /// Non-cloneable ownership of retained decoded-metadata bytes.
 ///
 /// Held by the cache entry and by every borrower of that entry's metadata
-/// through one shared `Arc`, so the charge returns to the Oracle root only when
+/// through one shared `Arc`, so the charge returns to the shared pool only when
 /// the last of them is gone. That coupling is the point: evicting an entry
 /// whose decoded metadata a running query still holds must not tell the root
 /// those bytes are free, because they are not.
@@ -3704,21 +3656,19 @@ impl GovernedMemoryCharge {
     }
 }
 
-/// The one governed `DataFusion` memory root a holder's pools share.
+/// The pod's one governed `DataFusion` memory pool.
 ///
-/// Oracle has one root for every leader, follower, operator, and exchange
-/// reservation; Forge has one for every rewrite attempt. Each competes beneath
-/// a single tracked [`FairSpillPool`] sized at the shared cap while the
-/// governor keeps the one process ledger, and a per-pool view above it
-/// enforces that query's or attempt's own ceiling.
+/// Every Oracle query, Oracle and Scribe follower, operator, exchange, and
+/// Forge rewrite reservation competes beneath this single tracked
+/// [`FairSpillPool`] sized at the shared cap while the governor keeps the one
+/// process ledger. A per-query or per-attempt view above it enforces that
+/// owner's ceiling and carries the holder its bytes are attributed to.
 #[derive(Debug)]
 pub(crate) struct GovernedMemoryRoot {
     /// Shared spill-fair pool that arbitrates every consumer of this holder.
     pool: Arc<dyn MemoryPool>,
     /// Process ledger charged in lockstep with that pool.
     governor: BifrostResourceGovernor,
-    /// Holder whose attribution every charge through this root lands in.
-    holder: MemoryHolder,
     /// Cooperative maximum: the shared Bifrost cap.
     limit_bytes: usize,
     /// Serializes whole operations so the two ledgers cannot interleave.
@@ -3730,13 +3680,12 @@ pub(crate) struct GovernedMemoryRoot {
 }
 
 impl GovernedMemoryRoot {
-    /// Builds one holder's shared root at the pod's shared Bifrost cap.
-    fn new(governor: BifrostResourceGovernor, holder: MemoryHolder) -> Self {
+    /// Builds the pod's one pool at the shared Bifrost cap.
+    fn new(governor: BifrostResourceGovernor) -> Self {
         let limit_bytes = governor.plan().managed_memory_bytes;
         Self {
             pool: finite_pool(limit_bytes),
             governor,
-            holder,
             limit_bytes,
             operation: Mutex::new(()),
         }
@@ -3747,22 +3696,25 @@ impl GovernedMemoryRoot {
         self.limit_bytes
     }
 
-    /// Returns the aggregate bytes every live Oracle consumer holds.
+    /// Returns the aggregate bytes every consumer of this pool holds.
     pub(crate) fn reserved(&self) -> usize {
         self.pool.reserved()
     }
 
-    /// Issues one query's private view over this shared root.
+    /// Issues one owner's private view over this shared pool.
     ///
-    /// The view owns only a ceiling and its own consumer ledger; it allocates
-    /// nothing of its own, so two views can never sum above the root.
+    /// The view owns only a ceiling, the holder its charges are attributed to,
+    /// and its own consumer ledger; it allocates nothing of its own, so two
+    /// views can never sum above the pool.
     fn query_view(
         self: &Arc<Self>,
+        holder: MemoryHolder,
         ceiling_bytes: usize,
         peak_bytes: &Arc<AtomicUsize>,
     ) -> Arc<dyn MemoryPool> {
         Arc::new(GovernedMemoryView {
             root: Arc::clone(self),
+            holder,
             ceiling_bytes,
             ledger: Mutex::new(GovernedMemoryLedger::default()),
             peak_bytes: Arc::clone(peak_bytes),
@@ -3808,11 +3760,11 @@ impl GovernedMemoryRoot {
         }
         let charge = self
             .governor
-            .try_reserve_pool_memory(self.holder, additional)
+            .try_reserve_pool_memory(view.holder, additional)
             .map_err(|error| root_growth_refusal(&error))?;
         if let Err(error) = self.pool.try_grow(reservation, additional) {
             // Reverse order: the governor charge is the only completed step.
-            let _ = self.governor.release_pool_memory(self.holder, charge);
+            let _ = self.governor.release_pool_memory(view.holder, charge);
             return Err(error);
         }
         ledger.charge(reservation.consumer().id(), charge);
@@ -3839,7 +3791,7 @@ impl GovernedMemoryRoot {
         };
         let remaining_ceiling = view.ceiling_bytes.saturating_sub(ledger.governed);
         let charge = match self.governor.reserve_pool_memory_infallible(
-            self.holder,
+            view.holder,
             additional,
             remaining_ceiling,
         ) {
@@ -3869,7 +3821,7 @@ impl GovernedMemoryRoot {
         };
         self.pool.shrink(reservation, shrink);
         let released = ledger.release(reservation.consumer().id(), shrink);
-        if let Err(error) = self.governor.release_pool_memory(self.holder, released) {
+        if let Err(error) = self.governor.release_pool_memory(view.holder, released) {
             tracing::error!(%error, "Oracle memory release could not be reconciled");
         }
         ledger.total = ledger.total.saturating_sub(shrink);
@@ -3881,7 +3833,7 @@ impl GovernedMemoryRoot {
 struct GovernedMemoryLedger {
     /// Aggregate bytes held by this query, checked against its ceiling.
     total: usize,
-    /// Bytes of `total` charged against the governed Oracle root.
+    /// Bytes of `total` charged against the governed shared pool.
     ///
     /// Infallible growth bounds its governed component by the ceiling this
     /// counter has left, so the remainder becomes explicit process headroom.
@@ -3929,6 +3881,8 @@ impl GovernedMemoryLedger {
 struct GovernedMemoryView {
     /// Shared root that owns the pool and the process ledger.
     root: Arc<GovernedMemoryRoot>,
+    /// Holder every charge through this view is attributed to.
+    holder: MemoryHolder,
     /// Immutable maximum governed bytes this query may hold.
     ceiling_bytes: usize,
     /// This query's consumer split and aggregate counter.
@@ -4080,7 +4034,7 @@ impl Drop for OracleMemoryLease {
 pub struct OracleQueryResources {
     /// Scheduling class charged by this query owner.
     query_class: QueryClass,
-    /// Ceiling this query's view of the shared Oracle root may grow to.
+    /// Ceiling this query's view of the shared memory pool may grow to.
     ///
     /// Derived once at admission by
     /// [`BifrostResourceGovernor::oracle_memory_grant`] and held for the query's
@@ -5067,23 +5021,17 @@ mod tests {
         OracleResourceRequest::for_class(QueryClass::Analytical, local_ratio)
     }
 
-    /// One process governor holds one shared cap that every role and transport
-    /// competes for, with no idle-role partition and no precharge.
+    /// Asserts how the one shared cap resolves from an 8-GiB observation.
     ///
-    /// An 8-GiB observation yields 1-GiB server headroom and a 7-GiB cap; a
-    /// raised minimum or a lower operator cap narrows it; impossible settings
-    /// refuse. Scribe, Oracle, Forge, and transport then charge concurrently
-    /// until the cap refuses one more byte, the refusal retains nothing, and
-    /// release re-admits the same charge.
+    /// The default leaves 1-GiB server headroom and a 7-GiB cap; a raised
+    /// minimum or a lower operator cap narrows it; impossible settings refuse
+    /// boot with [`BifrostResourceError::InvalidPlan`].
     ///
     /// # Panics
     ///
-    /// Panics when a plan resolves differently, a charge is refused below the
-    /// cap, a refusal retains bytes, or release does not restore the baseline.
-    #[test]
-    fn shared_cap_defaults_overrides_and_concurrent_charges() {
+    /// Panics when any combination resolves differently.
+    fn assert_shared_cap_plan_resolution(all: [BifrostRole; 3]) {
         let gib = 1024 * MIB;
-        let all = [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge];
         let mut eight = snapshot(0);
         eight.memory_limit_bytes = 8 * gib;
         let plan = |server: Option<usize>, cap: Option<usize>| {
@@ -5121,7 +5069,25 @@ mod tests {
                 "server {server:?} cap {cap:?} must refuse boot"
             );
         }
+    }
 
+    /// One process governor holds one shared cap that every role and transport
+    /// competes for, with no idle-role partition and no precharge.
+    ///
+    /// An 8-GiB observation yields 1-GiB server headroom and a 7-GiB cap; a
+    /// raised minimum or a lower operator cap narrows it; impossible settings
+    /// refuse. Scribe, Oracle, Forge, and transport then charge concurrently
+    /// until the cap refuses one more byte, the refusal retains nothing, and
+    /// release re-admits the same charge.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan resolves differently, a charge is refused below the
+    /// cap, a refusal retains bytes, or release does not restore the baseline.
+    #[test]
+    fn shared_cap_defaults_overrides_and_concurrent_charges() {
+        let all = [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge];
+        assert_shared_cap_plan_resolution(all);
         let roles = BifrostRuntimeResources::composed_for_test(64 * MIB, 512 * MIB as u64, all);
         let idle = roles.snapshot().expect("idle snapshot");
         assert_eq!(

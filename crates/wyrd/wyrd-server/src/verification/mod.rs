@@ -42,7 +42,7 @@ use self::publisher::PublicationFault;
 use self::publisher::ResultPublisher;
 #[cfg(feature = "test-support")]
 use self::runner::EngineScript;
-use self::runner::VerifierRunner;
+use self::runner::{VerifierEngines, VerifierRunner};
 use self::scheduler::VerificationScheduler;
 
 /// Bounds every runtime loop, lease, and drain obeys.
@@ -418,14 +418,16 @@ impl VerificationRuntimeBuilder<'_> {
                     queue,
                     permits,
                     publisher,
-                    drift,
-                    self.limits,
-                    self::eval::EvalEngine::new(
-                        self.state.clone(),
-                        self.providers
-                            .unwrap_or_else(skald_runtime::default_registry),
-                        self.limits.trace_deadline,
+                    VerifierEngines::new(
+                        drift,
+                        self::eval::EvalEngine::new(
+                            self.state.clone(),
+                            self.providers
+                                .unwrap_or_else(skald_runtime::default_registry),
+                            self.limits.trace_deadline,
+                        ),
                     ),
+                    self.limits,
                 );
                 #[cfg(feature = "test-support")]
                 {

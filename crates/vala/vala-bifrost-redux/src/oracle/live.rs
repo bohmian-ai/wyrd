@@ -48,9 +48,8 @@ const LIVE_FRAGMENT_MAX_BATCHES: u32 = 4096;
 
 /// Largest byte total one Scribe fragment may retain for its cut.
 ///
-/// The Scribe charges one follower lease of exactly this size before it opens
-/// the fragment, so the cut can never ask the source for more than the grant
-/// that backs it.
+/// The Scribe follower's governed pool is capped at exactly this size, so the
+/// cut can never ask the source to retain more than its pool may grow to.
 const LIVE_FRAGMENT_MAX_RETAINED_BYTES: u64 =
     crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64;
 

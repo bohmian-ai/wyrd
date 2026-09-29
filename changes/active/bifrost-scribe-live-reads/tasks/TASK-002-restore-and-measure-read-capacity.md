@@ -2,7 +2,7 @@
 id: TASK-002
 title: Restore Bifrost read capacity and prove it with understandable OLAP benchmarks
 kind: implementation
-status: proposed
+status: superseded
 spec: SPEC-bifrost-scribe-live-reads
 spec_revision: 11
 requirements: [REQ-008, REQ-009]
@@ -10,6 +10,10 @@ invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006]
 acceptance: [AC-009, AC-010, AC-011]
 depends_on: [TASK-001]
 ---
+
+TASK-003 replaces the unfinished work in this task. Committed TASK-002 code and
+benchmark evidence remain the starting point; TASK-002 receives no further
+implementation or closeout verdict.
 
 ## Outcome and Value
 

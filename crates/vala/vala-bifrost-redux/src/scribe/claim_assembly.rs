@@ -379,28 +379,6 @@ mod tests {
         .expect("fixture schema carries the built-in hourly layout")
     }
 
-    /// Registers a governed staging volume rooted at the stage's own root.
-    fn staging_volume(base: &Path, stage_root: &Path) -> crate::resources::StageVolume {
-        let wal = base.join("wal");
-        let scribe_output = base.join("scribe-output-scratch");
-        let forge = base.join("forge");
-        for path in [&wal, &scribe_output, &forge] {
-            std::fs::create_dir_all(path).expect("registered volume root");
-        }
-        crate::resources::BifrostVolumeGovernor::register(
-            crate::resources::BifrostVolumeRoots {
-                wal,
-                scribe_stage: stage_root.to_owned(),
-                scribe_output_scratch: scribe_output,
-            },
-            1024 * 1024 * 1024,
-            crate::resources::BifrostResourceHealth::default(),
-        )
-        .expect("staging volume registration")
-        .capabilities()
-        .scribe_stage
-    }
-
     /// Stages two interleaving members of one key and claims them together.
     ///
     /// Returning the claim rather than the members keeps the test's subject —
@@ -473,8 +451,7 @@ mod tests {
             std::fs::create_dir_all(path).expect("fixture directory");
         }
         let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
-        let stager =
-            ScribeMemberStager::new(Arc::clone(&stage), staging_volume(root.path(), &stage_root));
+        let stager = ScribeMemberStager::new(Arc::clone(&stage));
         let tenant = DataTenantId::new_v7();
         let schema = assembly_schema();
         let layout = assembly_layout(schema.as_ref());

@@ -475,21 +475,14 @@ impl ClaimPublisher {
         members: &[crate::scribe::hot_stage::StagedMember],
     ) -> Result<RecoveredTerminalCleanup, ScribeError> {
         let terminal_facts = TerminalPublicationFacts::collect(members);
-        let mut released_bytes = 0_u64;
         for member in members {
             let Some(plan) = terminal_facts.plan_for(member) else {
                 continue;
             };
             self.retire_terminal_member(key, member.record().member(), plan)
                 .await?;
-            released_bytes = released_bytes
-                .checked_add(member.record().encoded_bytes())
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "recovered published staged-byte total overflow".to_owned(),
-                })?;
         }
         Ok(RecoveredTerminalCleanup {
-            released_bytes,
             terminal_claims: terminal_facts.claim_ids(),
         })
     }
@@ -684,8 +677,6 @@ impl TerminalPublicationFacts {
 
 /// Result of driving all surviving members of terminal claims to retirement.
 pub(crate) struct RecoveredTerminalCleanup {
-    /// Exact surviving staged bytes removed and eligible for release.
-    pub(crate) released_bytes: u64,
     /// Scribe claim identities proven terminal by their durable member state.
     pub(crate) terminal_claims: std::collections::HashSet<String>,
 }

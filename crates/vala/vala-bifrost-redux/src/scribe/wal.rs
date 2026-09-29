@@ -70,10 +70,6 @@ thread_local! {
     static WAL_REPLAY_PAYLOAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_ENCODE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// One-shot failure after record mutation but before provisional ownership transfer.
-    static WAL_FAIL_VOLUME_RETAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// One-shot failure after durable rename and parent fsync but before final open.
-    static WAL_FAIL_SEGMENT_FINAL_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WAL_RECOVERY_SYNC_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// One-shot injection that forces the next `retain_segments` call on this
     /// thread to fail before it mutates any retention refcount. Self-consuming
@@ -1400,8 +1396,6 @@ pub struct WalSegment {
     path: PathBuf,
     file: Mutex<File>,
     header: SegmentHeader,
-    /// Provisional physical-volume growth committed only after segment fsync.
-    volume_growth: Mutex<Vec<crate::resources::WalVolumeGrowth>>,
 }
 
 /// Stable filesystem identity for one closed WAL segment.
@@ -1419,6 +1413,8 @@ struct WalFaults {
     sync_failure: AtomicBool,
     /// Fails the next step after sync and before memtable insertion.
     post_sync_failure: AtomicBool,
+    /// Refuses every append as a full device until cleared.
+    storage_full: AtomicBool,
 }
 
 fn wal_io_error(context: &str, error: &io::Error) -> ScribeError {
@@ -1428,16 +1424,6 @@ fn wal_io_error(context: &str, error: &io::Error) -> ScribeError {
         ScribeError::Internal {
             detail: format!("{context}: {error}"),
         }
-    }
-}
-
-/// Maps root physical-volume refusal into the existing Scribe WAL taxonomy.
-fn resource_volume_error(error: crate::resources::BifrostResourceError) -> ScribeError {
-    match error {
-        crate::resources::BifrostResourceError::Occupied { .. } => ScribeError::WalDiskFull,
-        error => ScribeError::Internal {
-            detail: format!("WAL physical-volume accounting failed: {error}"),
-        },
     }
 }
 
@@ -1474,12 +1460,6 @@ impl WalSegment {
                 .map_err(|error| wal_io_error("failed to fsync WAL segment parent dir", &error))?;
         }
 
-        #[cfg(test)]
-        if WAL_FAIL_SEGMENT_FINAL_OPEN.with(|flag| flag.replace(false)) {
-            return Err(ScribeError::Internal {
-                detail: "injected post-rename WAL segment open failure".to_owned(),
-            });
-        }
         let file = OpenOptions::new()
             .read(true)
             .append(true)
@@ -1490,7 +1470,6 @@ impl WalSegment {
             path: path.to_path_buf(),
             file: Mutex::new(file),
             header,
-            volume_growth: Mutex::new(Vec::new()),
         })
     }
 
@@ -1517,7 +1496,6 @@ impl WalSegment {
             path: path.to_path_buf(),
             file: Mutex::new(file),
             header,
-            volume_growth: Mutex::new(Vec::new()),
         })
     }
 
@@ -1637,42 +1615,7 @@ impl WalSegment {
         });
         record_wal_fsync(&result, started);
         span.record("outcome", if result.is_ok() { "success" } else { "failed" });
-        result?;
-        let growth = {
-            let mut pending = self
-                .volume_growth
-                .lock()
-                .map_err(|_| ScribeError::Internal {
-                    detail: "WAL volume-growth lock poisoned during fsync".to_owned(),
-                })?;
-            std::mem::take(&mut *pending)
-        };
-        for reservation in growth {
-            reservation.commit().map_err(resource_volume_error)?;
-        }
-        Ok(())
-    }
-
-    /// Retains provisional volume growth until this segment is durably synced.
-    fn retain_volume_growth(
-        &self,
-        growth: crate::resources::WalVolumeGrowth,
-    ) -> Result<(), ScribeError> {
-        let Ok(mut pending) = self.volume_growth.lock() else {
-            growth.retain_and_poison();
-            return Err(ScribeError::Internal {
-                detail: "WAL volume-growth lock poisoned during append".to_owned(),
-            });
-        };
-        #[cfg(test)]
-        if WAL_FAIL_VOLUME_RETAIN.with(|flag| flag.replace(false)) {
-            growth.retain_and_poison();
-            return Err(ScribeError::Internal {
-                detail: "injected WAL volume-growth retention failure".to_owned(),
-            });
-        }
-        pending.push(growth);
-        Ok(())
+        result
     }
 
     /// Append a record and force it to stable storage.
@@ -1809,8 +1752,8 @@ pub struct WalWriter {
     /// failed; every later deletion pass retries it, so releasing the last
     /// reference never loses the only record that the file must be removed.
     deferred_deletes: Arc<Mutex<BTreeSet<PathBuf>>>,
-    /// Physical WAL growth capability shared only by this writer's handles.
-    volume: Option<Arc<crate::resources::WalVolume>>,
+    /// Process health poisoned when a failed append cannot be rolled back.
+    health: Option<crate::resources::BifrostResourceHealth>,
 }
 
 #[derive(Debug, Default)]
@@ -1975,12 +1918,13 @@ impl WalHandle {
 }
 
 impl WalWriter {
-    /// Restores segment and volume state after one prepared-record write fails.
+    /// Restores segment state after one prepared-record write fails.
     ///
     /// # Errors
     ///
-    /// Returns the rollback, failed-segment removal, or volume-retirement error
-    /// when physical state cannot be restored to its pre-append boundary.
+    /// Returns the rollback or failed-segment removal error when physical state
+    /// cannot be restored to its pre-append boundary; process health is then
+    /// poisoned because the WAL no longer matches what was acknowledged.
     fn rollback_prepared_append(
         &self,
         state: &mut WalState,
@@ -1989,8 +1933,8 @@ impl WalWriter {
         new_segment_bytes: u64,
     ) -> Result<(), ScribeError> {
         if let Err(error) = segment.rollback_failed_append(prior_file_len) {
-            if let Some(volume) = &self.volume {
-                volume.poison_divergence();
+            if let Some(health) = &self.health {
+                health.poison(crate::resources::BifrostResourcePoisonReason::Volume);
             }
             return Err(error);
         }
@@ -2001,15 +1945,10 @@ impl WalWriter {
         state.current_segment_size = 0;
         state.current_segment_records = 0;
         if let Err(error) = remove_failed_segment(segment.path()) {
-            if let Some(volume) = &self.volume {
-                volume.poison_divergence();
+            if let Some(health) = &self.health {
+                health.poison(crate::resources::BifrostResourcePoisonReason::Volume);
             }
             return Err(error);
-        }
-        if let Some(volume) = &self.volume {
-            volume
-                .retire(new_segment_bytes)
-                .map_err(resource_volume_error)?;
         }
         Ok(())
     }
@@ -2023,30 +1962,26 @@ impl WalWriter {
         writer_epoch: i64,
         config: WalConfig,
     ) -> Result<Self, ScribeError> {
-        Self::new_with_shard_id_and_volume(base_dir, node_id, writer_epoch, 0, config, None)
+        Self::new_with_shard_id_and_health(base_dir, node_id, writer_epoch, 0, config, None)
     }
 
-    /// Creates a WAL writer governed by the registered physical WAL device.
+    /// Creates a WAL writer that poisons process health on failed rollback.
+    ///
+    /// The WAL is not capacity-governed: a full device refuses the append as
+    /// [`ScribeError::WalDiskFull`] through the write's own IO error.
     ///
     /// # Errors
     ///
     /// Returns the same configuration, recovery, and filesystem errors as
-    /// [`Self::new`]. Every later append reserves physical growth before I/O.
-    pub fn new_with_volume(
+    /// [`Self::new`].
+    pub fn new_with_health(
         base_dir: impl AsRef<Path>,
         node_id: [u8; 16],
         writer_epoch: i64,
         config: WalConfig,
-        volume: crate::resources::WalVolume,
+        health: crate::resources::BifrostResourceHealth,
     ) -> Result<Self, ScribeError> {
-        Self::new_with_shard_id_and_volume(
-            base_dir,
-            node_id,
-            writer_epoch,
-            0,
-            config,
-            Some(Arc::new(volume)),
-        )
+        Self::new_with_shard_id_and_health(base_dir, node_id, writer_epoch, 0, config, Some(health))
     }
 
     /// Create one fixed-shard WAL stream.
@@ -2057,17 +1992,17 @@ impl WalWriter {
         shard_id: u8,
         config: WalConfig,
     ) -> Result<Self, ScribeError> {
-        Self::new_with_shard_id_and_volume(base_dir, node_id, writer_epoch, shard_id, config, None)
+        Self::new_with_shard_id_and_health(base_dir, node_id, writer_epoch, shard_id, config, None)
     }
 
-    /// Constructs one shard stream with an optional live physical-volume owner.
-    fn new_with_shard_id_and_volume(
+    /// Constructs one shard stream with an optional process health signal.
+    fn new_with_shard_id_and_health(
         base_dir: impl AsRef<Path>,
         node_id: [u8; 16],
         writer_epoch: i64,
         shard_id: u8,
         config: WalConfig,
-        volume: Option<Arc<crate::resources::WalVolume>>,
+        health: Option<crate::resources::BifrostResourceHealth>,
     ) -> Result<Self, ScribeError> {
         let config = WalConfig::new(config.segment_bytes)?;
         if shard_id >= 16 {
@@ -2088,7 +2023,7 @@ impl WalWriter {
             faults: Arc::default(),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
             deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
-            volume,
+            health,
         };
         writer.initialize_existing_stream()?;
         Ok(writer)
@@ -2134,55 +2069,13 @@ impl WalWriter {
         &self.base_dir
     }
 
-    /// Reserves exact durable growth for a Scribe staged artifact lifecycle.
+    /// Makes every append fail as a full device, or restores normal appends.
     ///
-    /// # Errors
-    ///
-    /// Returns a typed internal refusal when the registered WAL volume cannot
-    /// admit the exact staged bytes.
-    pub(crate) fn reserve_staged_growth(
-        &self,
-        bytes: u64,
-    ) -> Result<Option<crate::resources::WalVolumeGrowth>, ScribeError> {
-        self.volume
-            .as_ref()
-            .map(|volume| {
-                volume
-                    .try_reserve_growth(bytes)
-                    .map_err(|error| ScribeError::Internal {
-                        detail: format!("reserve Scribe staged WAL-volume growth: {error}"),
-                    })
-            })
-            .transpose()
-    }
-
-    /// Releases exact staged occupancy after local removal and directory fsync.
-    ///
-    /// # Errors
-    ///
-    /// Returns poison when registered durable ownership cannot cover the bytes.
-    pub(crate) fn retire_staged_bytes(&self, bytes: u64) -> Result<(), ScribeError> {
-        if let Some(volume) = &self.volume {
-            volume
-                .retire(bytes)
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("retire Scribe staged WAL-volume bytes: {error}"),
-                })?;
-        }
-        Ok(())
-    }
-
-    /// Makes the governed WAL device report no free space, or restores it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when this writer has no governed volume to inject into.
+    /// The refusal happens before any WAL mutation, exactly where a real
+    /// `ENOSPC` from creating a segment would surface.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_device_full_for_test(&self, full: bool) {
-        self.volume
-            .as_ref()
-            .expect("device-full injection requires a governed WAL volume")
-            .set_device_full_for_test(full);
+        self.faults.storage_full.store(full, Ordering::Release);
     }
 
     /// Inject one WAL `sync_data` failure after the record write and before
@@ -2232,7 +2125,7 @@ impl WalWriter {
             faults: Arc::clone(&self.faults),
             retirement_refs: Arc::clone(&self.retirement_refs),
             deferred_deletes: Arc::clone(&self.deferred_deletes),
-            volume: self.volume.clone(),
+            health: self.health.clone(),
         }
     }
 
@@ -2364,19 +2257,10 @@ impl WalWriter {
         } else {
             0
         };
-        let header_growth = self
-            .volume
-            .as_ref()
-            .filter(|_| new_segment_bytes > 0)
-            .map(|volume| volume.try_reserve_growth(new_segment_bytes))
-            .transpose()
-            .map_err(resource_volume_error)?;
-        let record_growth = self
-            .volume
-            .as_ref()
-            .map(|volume| volume.try_reserve_growth(encoded_bytes))
-            .transpose()
-            .map_err(resource_volume_error)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.faults.storage_full.load(Ordering::Acquire) {
+            return Err(ScribeError::WalDiskFull);
+        }
         let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
         prepared.assign_lsn(lsn);
         if rolls_segment {
@@ -2389,19 +2273,7 @@ impl WalWriter {
             u8::try_from(shard_id).map_err(|_| ScribeError::Internal {
                 detail: "invalid WAL shard index".to_owned(),
             })?,
-        );
-        let segment = match segment {
-            Ok(segment) => segment,
-            Err(error) => {
-                if let Some(growth) = header_growth {
-                    growth.retain_and_poison();
-                }
-                return Err(error);
-            }
-        };
-        if let Some(growth) = header_growth {
-            growth.commit().map_err(resource_volume_error)?;
-        }
+        )?;
         let prior_file_len = std::fs::metadata(segment.path())
             .map_err(|error| wal_io_error("failed to measure WAL before append", &error))?
             .len();
@@ -2421,9 +2293,6 @@ impl WalWriter {
                 return Err(error);
             }
         };
-        if let Some(growth) = record_growth {
-            segment.retain_volume_growth(growth)?;
-        }
         state.current_segment_size = state.current_segment_size.saturating_add(encoded_bytes);
         state.current_segment_records = state.current_segment_records.saturating_add(1);
         Ok(WalAppendResult {
@@ -2742,7 +2611,7 @@ impl WalWriter {
     /// touched. Each pass then removes every deferred path that is no longer a
     /// current segment; a still-current path or a failed removal stays
     /// deferred for the next pass, so partial progress never loses a pending
-    /// deletion. Volume and disk accounting shrink only for removed files.
+    /// deletion.
     ///
     /// # Errors
     ///
@@ -2774,7 +2643,7 @@ impl WalWriter {
             if active.iter().any(|active_path| active_path == &path) {
                 continue;
             }
-            match self.delete_segment_file(&path) {
+            match Self::delete_segment_file(&path) {
                 Ok(()) => {
                     self.deferred_deletes
                         .lock()
@@ -2792,28 +2661,22 @@ impl WalWriter {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Removes one closed segment file and returns its bytes to both owners.
+    /// Removes one closed segment file and syncs its parent directory.
     ///
-    /// A missing file is already deleted. The governed WAL volume releases
-    /// the file's bytes as soon as it is unlinked, then the
-    /// parent directory is synced; after a sync failure the next pass finds
-    /// the file gone and clears its deferral without releasing bytes twice.
+    /// A missing file is already deleted; after a sync failure the next pass
+    /// finds the file gone and clears its deferral.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the file cannot be removed or
-    /// its directory cannot be synced, or the volume release error.
-    fn delete_segment_file(&self, path: &Path) -> Result<(), ScribeError> {
+    /// its directory cannot be synced.
+    fn delete_segment_file(path: &Path) -> Result<(), ScribeError> {
         if !path.exists() {
             return Ok(());
         }
-        let file_len = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
         std::fs::remove_file(path).map_err(|error| ScribeError::Internal {
             detail: format!("WAL segment retirement failed: {error}"),
         })?;
-        if let Some(volume) = &self.volume {
-            volume.retire(file_len).map_err(resource_volume_error)?;
-        }
         if let Some(parent) = path.parent() {
             let directory = File::open(parent).map_err(|error| ScribeError::Internal {
                 detail: format!("failed to open retired WAL directory: {error}"),
@@ -3585,8 +3448,8 @@ pub(crate) fn replay_payload_allocations_for_test() -> u64 {
 
 /// Sums the `.wal` segment bytes under `root`, recursing into shard directories.
 ///
-/// Tests compare this physical measurement with the volume governor's WAL
-/// class so a refused or rolled-back append is proven to leave no bytes.
+/// Tests compare this physical measurement before and after a refused or
+/// rolled-back append to prove it left no bytes.
 #[cfg(test)]
 pub(crate) fn wal_file_bytes_for_test(root: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(root) else {
@@ -4810,245 +4673,42 @@ mod tests {
         );
     }
 
-    /// Root volume accounting commits only fsynced WAL bytes and rolls failures back.
+    /// A full device refuses the next append before WAL mutation, and appends
+    /// resume as soon as the device has space again.
+    ///
+    /// There is no WAL-only latch or capacity ledger: the append's own
+    /// filesystem outcome is the only decision.
     ///
     /// # Panics
     ///
-    /// Panics when the deterministic filesystem fixture or WAL lifecycle fails.
+    /// Panics when the refused append is not `WalDiskFull`, leaves WAL bytes
+    /// behind, or the append after space returns is still refused.
     #[test]
-    fn wal_volume_admission_tracks_fsync_rollback_and_retirement_boundaries() {
-        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
+    fn wal_capacity_refusal_is_not_sticky() {
         let directory = TempDir::new().expect("temporary WAL directory");
-        let scribe = directory.path().join("scribe-output-scratch");
-        let stage = directory.path().join("scribe-stage");
-        let forge = directory.path().join("forge");
-        for path in [&scribe, &stage, &forge] {
-            std::fs::create_dir(path).expect("registered volume root");
-        }
-        let governor = crate::resources::BifrostVolumeGovernor::register(
-            crate::resources::BifrostVolumeRoots {
-                wal: directory.path().to_owned(),
-                scribe_stage: stage,
-                scribe_output_scratch: scribe,
-            },
-            64 * 1024 * 1024,
-            crate::resources::BifrostResourceHealth::default(),
-        )
-        .expect("volume registration");
-        let writer = WalWriter::new_with_volume(
-            directory.path(),
-            [27; 16],
-            1,
-            WalConfig::default(),
-            governor.capabilities().wal,
-        )
-        .expect("volume-backed writer");
+        let writer = WalWriter::new(directory.path(), [30; 16], 1, WalConfig::default())
+            .expect("WAL writer");
         let key = test_seal_key(crate::test_support::tenant());
         writer
             .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect("durable append");
-        let durable = wal_file_bytes_for_test(directory.path());
-        assert_eq!(
-            governor
-                .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
-                .expect("committed volume state"),
-            (durable, 0, 0)
-        );
+        let before = wal_file_bytes_for_test(directory.path());
 
-        WAL_PARTIAL_WRITE.with(|flag| flag.set(true));
-        writer
-            .append_and_fsync_for_test(&key, [1; 16], b"data")
-            .expect_err("write failure rolls provisional growth back");
-        assert_eq!(wal_file_bytes_for_test(directory.path()), durable);
-        assert_eq!(
-            governor
-                .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
-                .expect("write rollback volume state"),
-            (durable, 0, 0)
-        );
-
-        writer.trip_sync_failure_for_test();
-        writer
-            .append_and_fsync_for_test(&key, [1; 16], b"data")
-            .expect_err("sync failure remains provisional");
-        let after_failed_sync = wal_file_bytes_for_test(directory.path());
-        assert_eq!(
-            governor
-                .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
-                .expect("provisional sync-failure state"),
-            (durable, after_failed_sync - durable, 0)
-        );
-        writer
-            .append_and_fsync_for_test(&key, [1; 16], b"data")
-            .expect("later fsync commits all pending growth");
-        let committed = wal_file_bytes_for_test(directory.path());
-        assert_eq!(
-            governor
-                .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
-                .expect("recovered volume state"),
-            (committed, 0, 0)
-        );
-
-        let segment = WalReader::open_directory_unfiltered(directory.path())
-            .expect("reader")
-            .segments
-            .first()
-            .expect("segment")
-            .reference();
-        writer
-            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
-            .expect("close segment");
-        writer
-            .retire_segments(std::slice::from_ref(&segment))
-            .expect("unlink and directory-fsync retirement");
-        assert_eq!(
-            governor
-                .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
-                .expect("retired volume state"),
-            (0, 0, 0)
-        );
-    }
-
-    /// A full configured device refuses the next append before WAL mutation,
-    /// and admission resumes as soon as retirement returns the space.
-    ///
-    /// There is no WAL-only latch: the governor's current device state is the
-    /// only decision, so the first append after retirement is admitted without
-    /// any separate clear.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture never fills the volume, a refused append leaves
-    /// WAL bytes or a provisional charge behind, or the post-retirement append
-    /// is still refused.
-    #[test]
-    fn wal_capacity_refusal_is_not_sticky() {
-        let directory = TempDir::new().expect("temporary WAL directory");
-        let [stage, scribe] = ["scribe-stage", "scribe-output-scratch"].map(|name| {
-            let path = directory.path().join(name);
-            std::fs::create_dir(&path).expect("registered volume root");
-            path
-        });
-        let governor = crate::resources::BifrostVolumeGovernor::register(
-            crate::resources::BifrostVolumeRoots {
-                wal: directory.path().to_owned(),
-                scribe_stage: stage,
-                scribe_output_scratch: scribe,
-            },
-            64 * 1024,
-            crate::resources::BifrostResourceHealth::default(),
-        )
-        .expect("volume registration");
-        let writer = WalWriter::new_with_volume(
-            directory.path(),
-            [30; 16],
-            1,
-            WalConfig::default(),
-            governor.capabilities().wal,
-        )
-        .expect("volume-backed writer");
-        let key = test_seal_key(crate::test_support::tenant());
-        let payload = vec![7_u8; 16 * 1024];
-        let mut batch = 0_u8;
-        let refusal = loop {
-            batch += 1;
-            match writer.append_and_fsync_for_test(&key, [batch; 16], &payload) {
-                Ok(_) => assert!(batch < 8, "a 64 KiB volume fills within eight appends"),
-                Err(error) => break error,
-            }
-        };
+        writer.set_device_full_for_test(true);
+        let refusal = writer
+            .append_and_fsync_for_test(&key, [2; 16], b"data")
+            .expect_err("a full device refuses the append");
         assert!(matches!(refusal, ScribeError::WalDiskFull), "{refusal:?}");
-        let physical = wal_file_bytes_for_test(directory.path());
         assert_eq!(
-            governor
-                .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
-                .expect("refused volume state"),
-            (physical, 0, 0),
-            "the refused append wrote and charged nothing"
+            wal_file_bytes_for_test(directory.path()),
+            before,
+            "the refused append wrote nothing"
         );
 
-        let segment = WalReader::open_directory_unfiltered(directory.path())
-            .expect("reader")
-            .segments
-            .first()
-            .expect("segment")
-            .reference();
+        writer.set_device_full_for_test(false);
         writer
-            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
-            .expect("close segment");
-        writer
-            .retire_segments(std::slice::from_ref(&segment))
-            .expect("retirement returns the space");
-        writer
-            .append_and_fsync_for_test(&key, [batch; 16], &payload)
-            .expect("admission resumes once space returns");
-    }
-
-    /// Post-mutation ownership failures retain exact WAL charge and poison health.
-    ///
-    /// # Panics
-    ///
-    /// Panics when injected post-mutation failures do not fail closed.
-    #[test]
-    fn wal_post_mutation_accounting_failures_retain_charge_and_poison() {
-        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
-        for fail_final_open in [true, false] {
-            let directory = TempDir::new().expect("temporary WAL directory");
-            let scribe = directory.path().join("scribe-output-scratch");
-            let stage = directory.path().join("scribe-stage");
-            let forge = directory.path().join("forge");
-            for path in [&scribe, &stage, &forge] {
-                std::fs::create_dir(path).expect("registered volume root");
-            }
-            let health = crate::resources::BifrostResourceHealth::default();
-            let governor = crate::resources::BifrostVolumeGovernor::register(
-                crate::resources::BifrostVolumeRoots {
-                    wal: directory.path().to_owned(),
-                    scribe_stage: stage,
-                    scribe_output_scratch: scribe,
-                },
-                64 * 1024 * 1024,
-                health.clone(),
-            )
-            .expect("volume registration");
-            let writer = WalWriter::new_with_volume(
-                directory.path(),
-                [28; 16],
-                1,
-                WalConfig::default(),
-                governor.capabilities().wal,
-            )
-            .expect("volume-backed writer");
-            if fail_final_open {
-                WAL_FAIL_SEGMENT_FINAL_OPEN.with(|flag| flag.set(true));
-            } else {
-                WAL_FAIL_VOLUME_RETAIN.with(|flag| flag.set(true));
-            }
-            writer
-                .append_and_fsync_for_test(
-                    &test_seal_key(crate::test_support::tenant()),
-                    [1; 16],
-                    b"data",
-                )
-                .expect_err("injected ownership transfer failure");
-            let physical = wal_file_bytes_for_test(directory.path());
-            let (durable, provisional, scratch) = governor
-                .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
-                .expect("retained fail-closed state");
-            assert_eq!(durable + provisional, physical);
-            assert_eq!(scratch, 0);
-            assert_eq!(
-                health.reason(),
-                Some(crate::resources::BifrostResourcePoisonReason::Volume)
-            );
-            assert!(
-                governor
-                    .capabilities()
-                    .scribe_output
-                    .try_acquire(1)
-                    .is_err()
-            );
-        }
+            .append_and_fsync_for_test(&key, [2; 16], b"data")
+            .expect("appends resume once space returns");
     }
 
     /// Torn-tail recovery emits one successful fsync for its one physical repair sync.

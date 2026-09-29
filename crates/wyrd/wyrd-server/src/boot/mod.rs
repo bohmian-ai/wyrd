@@ -627,12 +627,12 @@ pub async fn compose_bifrost(
                 ServerBootError::Scribe("Scribe role fence exceeds the WAL epoch range".to_owned())
             })?),
         );
-        let (wal_volume, scribe_output_volume) = bifrost_resources
+        let scribe_output_volume = bifrost_resources
             .scribe()
-            .and_then(|resources| resources.volume_capabilities())
+            .and_then(|resources| resources.output_scratch())
             .ok_or_else(|| {
                 ServerBootError::Scribe(
-                    "live Scribe role requires registered WAL volume capabilities".to_owned(),
+                    "live Scribe role requires a registered output scratch root".to_owned(),
                 )
             })?;
         let configured_geometry = scribe_config
@@ -647,13 +647,13 @@ pub async fn compose_bifrost(
         let geometry = configured_geometry;
         let wal_segment_bytes = geometry.wal_segment_bytes();
         let wal = Arc::new(
-            WalWriter::new_with_volume(
+            WalWriter::new_with_health(
                 data_root.wal(),
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
                 WalConfig::new(wal_segment_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-                wal_volume,
+                bifrost_resources.health(),
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );

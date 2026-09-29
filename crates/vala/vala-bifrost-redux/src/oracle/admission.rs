@@ -1440,7 +1440,7 @@ impl AdmittedQueryGuard {
             permit.resources.lock().map_or(true, |resources| {
                 resources
                     .as_ref()
-                    .is_none_or(|resources| resources.nested_idle())
+                    .is_none_or(crate::resources::OracleQueryResources::nested_idle)
             })
         })
     }

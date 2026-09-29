@@ -133,7 +133,7 @@ pub struct ParquetEncoded {
 pub struct BoundedParquetArtifactSet {
     /// Contiguous Scribe Parquet artifacts in publication order.
     artifacts: Vec<BoundedParquetArtifact>,
-    /// Exact generation directory whose charge follows the artifacts.
+    /// Exact claim directory the artifacts were written into.
     scratch: Option<ScribeClaimScratch>,
 }
 
@@ -186,7 +186,7 @@ impl BoundedParquetArtifactSet {
     ///
     /// # Errors
     /// Returns an internal error when the bounded scratch cleanup protocol
-    /// exhausts its retries and poisons shared volume health.
+    /// exhausts its retries.
     pub(crate) async fn cleanup(mut self) -> Result<(), ScribeError> {
         let Some(scratch) = self.scratch.take() else {
             return Ok(());
@@ -201,15 +201,13 @@ impl BoundedParquetArtifactSet {
             })
     }
 
-    /// Retains scratch and its charge after an unresolved commit outcome.
+    /// Retains scratch after an unresolved commit outcome.
     ///
-    /// Startup reconciliation owns removal of the exact namespace. Forgetting
-    /// the local scratch owner prevents its ordinary cancellation cleanup from
-    /// deleting evidence that may already be catalog-visible.
+    /// Startup reconciliation owns removal of the exact namespace; dropping
+    /// the owner without cleanup leaves evidence that may already be
+    /// catalog-visible in place.
     pub(crate) fn retain_for_reconciliation(mut self) {
-        if let Some(scratch) = self.scratch.take() {
-            std::mem::forget(scratch);
-        }
+        self.scratch.take();
     }
 }
 

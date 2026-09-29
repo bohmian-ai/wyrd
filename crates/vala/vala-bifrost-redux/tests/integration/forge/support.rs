@@ -2462,9 +2462,9 @@ async fn start_scribe(
     wal_root: &std::path::Path,
     resources: vala_bifrost_redux::resources::ScribeResources,
 ) -> Arc<ScribeImpl> {
-    let (_, output_scratch) = resources
-        .volume_capabilities()
-        .expect("fixture Scribe volumes");
+    let output_scratch = resources
+        .output_scratch()
+        .expect("fixture Scribe output scratch");
     let node_id = vala_bifrost_redux::scribe::stream_identity::NodeId::generate();
     register_scribe_fence(database, node_id).await;
     let wal = Arc::new(

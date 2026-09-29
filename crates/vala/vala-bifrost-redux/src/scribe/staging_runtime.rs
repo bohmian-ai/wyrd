@@ -66,7 +66,7 @@ pub struct AssembleRequest<'a> {
     /// Directory receiving the sealed objects before upload.
     pub scratch_dir: &'a Path,
     /// Move-only footer memory child retained through sealed inspection.
-    pub footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    pub memory: crate::resources::ScribeResources,
 }
 
 /// Owner of one pod's staged members, ready index, and claim lifecycle.
@@ -718,7 +718,7 @@ impl ScribeStagingRuntime {
             scratch_dir: request.scratch_dir,
             object_base: &object_base,
             target_object_bytes: self.target_object_bytes,
-            footer_reservation: request.footer_reservation,
+            memory: request.memory,
         })
     }
 
@@ -1082,7 +1082,7 @@ mod tests {
                         generation: 7,
                         wal: StagedLsnRange { min: 10, max: 19 },
                     },
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 },
                 ClaimContext {
                     schema: Arc::clone(&schema),
@@ -1118,7 +1118,7 @@ mod tests {
                 AssembleRequest {
                     runs: &runs,
                     scratch_dir: &scratch,
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 },
             )
             .expect("claim assembles under its staged context");
@@ -1177,7 +1177,7 @@ mod tests {
                         generation: 11,
                         wal: StagedLsnRange { min: 30, max: 39 },
                     },
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 },
                 ClaimContext {
                     schema: Arc::clone(&schema),
@@ -1267,8 +1267,7 @@ mod tests {
                                 max: u64::from(shard) * 10 + 9,
                             },
                         },
-                        footer_reservation:
-                            crate::scribe::memory::EncodedFooterReservation::for_test(),
+                        memory: crate::resources::ScribeResources::for_test(),
                     },
                     ClaimContext {
                         schema: Arc::clone(&schema),
@@ -1387,7 +1386,7 @@ mod tests {
                         generation: 7,
                         wal: StagedLsnRange { min: 10, max: 19 },
                     },
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 },
                 ClaimContext {
                     schema: Arc::clone(&schema),
@@ -1467,8 +1466,7 @@ mod tests {
                                 max: u64::from(shard) * 10 + 9,
                             },
                         },
-                        footer_reservation:
-                            crate::scribe::memory::EncodedFooterReservation::for_test(),
+                        memory: crate::resources::ScribeResources::for_test(),
                     },
                     ClaimContext {
                         schema: Arc::clone(schema),

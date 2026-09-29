@@ -823,6 +823,16 @@ impl ReservationRegistry {
         entries.insert(reservation_id, entry);
     }
 
+    /// Returns the running slot units of the slot manager this registry charges.
+    ///
+    /// Test-tier readiness inspection reads capacity here because the registry
+    /// is the one owner of the node's slot manager.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn total_slot_units(&self) -> usize {
+        self.slots.total_slot_units()
+    }
+
     /// Returns the greatest number of graphs this node may own at one time.
     ///
     /// Derived from this pod's immutable local slot-unit total against the

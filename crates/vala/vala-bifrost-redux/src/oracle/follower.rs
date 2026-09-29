@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::common::DataFusionError;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -671,14 +670,14 @@ pub struct FixedCohortResolver {
     /// dispatched assignment carries or decode rejects the plan.
     schema: SchemaRef,
     /// Cohort replayed for each resolution, in one partition.
-    batches: Vec<RecordBatch>,
+    batches: Vec<arrow::record_batch::RecordBatch>,
 }
 
 #[cfg(feature = "test-support")]
 impl FixedCohortResolver {
     /// Binds the cohort this resolver replays.
     #[must_use]
-    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+    pub fn new(schema: SchemaRef, batches: Vec<arrow::record_batch::RecordBatch>) -> Self {
         Self { schema, batches }
     }
 }
@@ -1969,7 +1968,6 @@ pub(crate) mod tests {
     use crate::scribe::wal::ScribeAppendMeta;
     use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
     use datafusion::datasource::listing::PartitionedFile;
     use datafusion::datasource::physical_plan::ParquetSource;
     use datafusion::execution::context::SessionContext;
@@ -2805,7 +2803,7 @@ pub(crate) mod tests {
     ) -> (SealKey, Arc<Memtable>) {
         let schema = Arc::clone(schema);
         let batch = |value: &str| {
-            RecordBatch::try_new(
+            arrow::record_batch::RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![Arc::new(StringArray::from(vec![value]))],
             )
@@ -2953,7 +2951,7 @@ pub(crate) mod tests {
         let table = TableRef::parse_fqn("vala.traces.spans").expect("canonical table");
         let key = SealKey::new(tenant_id, table, day);
         let memtable = Arc::new(Memtable::new());
-        let batch = RecordBatch::try_new(
+        let batch = arrow::record_batch::RecordBatch::try_new(
             Arc::clone(schema),
             vec![
                 Arc::new(StringArray::from(vec!["wide-error", "wide-ok"])),

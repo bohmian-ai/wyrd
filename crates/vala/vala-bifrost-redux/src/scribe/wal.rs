@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -58,7 +58,7 @@ fn record_wal_fsync(result: &Result<(), ScribeError>, started: Instant) {
 }
 
 #[cfg(test)]
-static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static WAL_COUNT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
     /// Replay payload allocations observed on this thread.
@@ -1405,11 +1405,11 @@ pub struct WalSegmentRef {
 #[derive(Debug, Default)]
 struct WalFaults {
     /// Fails the next group sync before the durable acknowledgment boundary.
-    sync_failure: AtomicBool,
+    sync_failure: std::sync::atomic::AtomicBool,
     /// Fails the next step after sync and before memtable insertion.
-    post_sync_failure: AtomicBool,
+    post_sync_failure: std::sync::atomic::AtomicBool,
     /// Refuses every append as a full device until cleared.
-    storage_full: AtomicBool,
+    storage_full: std::sync::atomic::AtomicBool,
 }
 
 fn wal_io_error(context: &str, error: &io::Error) -> ScribeError {

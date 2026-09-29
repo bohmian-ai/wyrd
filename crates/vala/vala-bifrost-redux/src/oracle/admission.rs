@@ -9,7 +9,7 @@
 //! callers wait only on their own one-shot channel.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -488,8 +488,6 @@ impl Drop for QueuedWaiter<'_> {
 
 /// Admission owner for bounded local capacity and refreshed membership state.
 pub struct OracleAdmission {
-    /// Existing peer pending/running slot owner.
-    pub(super) slots: Arc<OracleSlotManager>,
     /// Local role identity and fence used for peer dispatch authorization.
     pub(super) local_role: RegisteredRole,
     /// Mutex-owned class, tenant, queue, and byte accounting state.
@@ -540,7 +538,7 @@ pub struct QueryResourceProbe {
     /// This query's own admitted pool, read live rather than sampled on release.
     pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
     /// Peak counter the admitted pool writes after each successful growth.
-    memory_peak_bytes: Option<Arc<AtomicUsize>>,
+    memory_peak_bytes: Option<Arc<std::sync::atomic::AtomicUsize>>,
     /// Park this query claimed at admission, taken once by its frame loop.
     park: std::sync::Mutex<Option<Arc<crate::resources::OracleQueryPark>>>,
     /// Ceiling admission granted this query's own pool.
@@ -656,7 +654,6 @@ impl OracleAdmission {
     /// # Errors
     /// Returns [`BifrostError::Internal`] when called outside a Tokio runtime.
     pub(super) fn with_config(
-        slots: Arc<OracleSlotManager>,
         local_role: RegisteredRole,
         membership_available: bool,
         config: OracleAdmissionConfig,
@@ -691,11 +688,7 @@ impl OracleAdmission {
             shared.resources.capacity_epoch(),
             shared.root_cancel.clone(),
         ));
-        Ok(Self {
-            slots,
-            local_role,
-            shared,
-        })
+        Ok(Self { local_role, shared })
     }
 
     /// Starts the lifecycle task without reconstructing query state.
@@ -1713,14 +1706,8 @@ pub(super) fn admission_owner_for_test(
         ),
     };
     Arc::new(
-        OracleAdmission::with_config(
-            Arc::new(OracleSlotManager::new(1)),
-            role,
-            true,
-            config,
-            resources,
-        )
-        .expect("admission tests run inside a Tokio runtime"),
+        OracleAdmission::with_config(role, true, config, resources)
+            .expect("admission tests run inside a Tokio runtime"),
     )
 }
 
@@ -1811,14 +1798,8 @@ pub(in crate::oracle) mod tests {
             }),
         };
         Arc::new(
-            OracleAdmission::with_config(
-                Arc::new(OracleSlotManager::new(1)),
-                role,
-                true,
-                config,
-                test_resources(),
-            )
-            .expect("the test admission owner starts"),
+            OracleAdmission::with_config(role, true, config, test_resources())
+                .expect("the test admission owner starts"),
         )
     }
 

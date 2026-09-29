@@ -1239,6 +1239,25 @@ pub struct ScribeResources {
 }
 
 impl ScribeResources {
+    /// Builds an isolated Scribe capability over a production-floor test root.
+    ///
+    /// Writer and assembly tests charge their materialized buffers against it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed test root does not compose a Scribe role, which
+    /// would mean the production resource plan regressed.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Scribe],
+        )
+        .scribe()
+        .expect("test root composes a Scribe capability")
+    }
+
     /// Returns the shared process resource-health lifecycle signal.
     #[must_use]
     pub fn health(&self) -> BifrostResourceHealth {
@@ -5169,18 +5188,18 @@ mod tests {
         ));
     }
 
-    /// Scribe in mixed topology admits a generation and producer delta up to
-    /// the whole shared cap, because idle Oracle and Forge roles hold nothing.
+    /// Scribe in mixed topology admits a generation and its sorted candidate up
+    /// to the whole shared cap, because idle Oracle and Forge roles hold nothing.
     ///
     /// This models the production handoff: the immutable generation remains
-    /// charged while the Parquet producer acquires only the complement to the
-    /// cap. Together they consume, but never exceed, the shared cap, and
-    /// dropping both owners returns root attribution to baseline.
+    /// charged while the writer charges its materialized sorted candidate.
+    /// Together they consume, but never exceed, the shared cap, and dropping
+    /// both owners returns root attribution to baseline.
     ///
     /// # Panics
     ///
     /// Panics if exact-floor composition, ingress admission, category transfer,
-    /// producer admission, attribution inspection, or release reconciliation
+    /// candidate charging, attribution inspection, or release reconciliation
     /// violates the Scribe ownership contract.
     #[test]
     fn scribe_shared_cap_admits_generation_and_transfer() {
@@ -5194,11 +5213,8 @@ mod tests {
         assert_eq!(cap, 832 * MIB);
         assert_eq!(scribe.ingress_limit_bytes(), cap);
 
-        // Derive the generation from the projection rather than hard-coding
-        // both sides, so a change to the workspace formula keeps the scenario
-        // exact instead of silently overshooting the cap.
-        let producer_delta = crate::scribe::memory::parquet_candidate_incremental_bytes(72 * MIB)
-            .expect("candidate workspace projection");
+        // One materialized sorted candidate the writer holds while encoding.
+        let producer_delta = 72 * MIB;
         let generation_bytes = cap - producer_delta;
         let mut generation = scribe
             .try_reserve_ingress(ScribeMemoryCategory::Active, generation_bytes)
@@ -5208,7 +5224,7 @@ mod tests {
             .expect("generation ownership must transfer to immutable");
         let producer = scribe
             .try_reserve_maintenance(ScribeMemoryCategory::Persistence, producer_delta)
-            .expect("producer delta must complete the shared cap");
+            .expect("sorted candidate must complete the shared cap");
         // Deriving the generation makes the sum equal the cap by construction,
         // so assert the consequence that is not tautological: the cap is
         // genuinely full and one further byte is refused.
@@ -5217,7 +5233,7 @@ mod tests {
                 scribe.try_reserve_ingress(ScribeMemoryCategory::Active, 1),
                 Err(crate::contracts::ScribeError::IngestBusy { .. })
             ),
-            "generation plus producer workspace must exactly exhaust the shared cap"
+            "generation plus sorted candidate must exactly exhaust the shared cap"
         );
 
         let occupied = scribe.snapshot().expect("occupied Scribe snapshot");

@@ -81,7 +81,7 @@ pub struct AssembleClaimRequest<'a> {
     /// Approximate encoded size at which one object closes and the next opens.
     pub target_object_bytes: u64,
     /// Move-only footer memory child retained through sealed inspection.
-    pub footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    pub memory: crate::resources::ScribeResources,
 }
 
 /// One claim's sealed objects, ready for upload and fenced publication.
@@ -260,7 +260,7 @@ impl ClaimAssembler {
                 first_ordinal: 0,
                 target_object_bytes: request.target_object_bytes,
             },
-            request.footer_reservation,
+            &request.memory,
             merge,
         )?;
         let rows = artifacts.iter().try_fold(0_u64, |sum, artifact| {
@@ -416,7 +416,7 @@ mod tests {
                             max: u64::from(shard) * 100 + 99,
                         },
                     },
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 })
                 .expect("member stages");
             assert_eq!(
@@ -471,7 +471,7 @@ mod tests {
                 scratch_dir: &scratch,
                 object_base: "claims/one",
                 target_object_bytes: 512 * 1024 * 1024,
-                footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                memory: crate::resources::ScribeResources::for_test(),
             })
             .expect("claim assembles");
         assert_eq!(assembled.rows, 2_048);
@@ -503,7 +503,7 @@ mod tests {
                 scratch_dir: &rolled_scratch,
                 object_base: "claims/rolled",
                 target_object_bytes: 4 * 1024,
-                footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                memory: crate::resources::ScribeResources::for_test(),
             })
             .expect("claim assembles under a small target");
         assert!(

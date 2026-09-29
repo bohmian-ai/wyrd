@@ -403,6 +403,7 @@ impl LiveTailBatches {
             let _staged = staged;
             let required_columns: Arc<[String]> = required_columns.into();
             let predicates: Arc<[ScanPredicate]> = predicates.into();
+            #[cfg(feature = "test-support")]
             let mut produced = false;
             for batch in memtable {
                 #[cfg(feature = "test-support")]
@@ -413,7 +414,10 @@ impl LiveTailBatches {
                 if rows.num_rows() == 0 {
                     continue;
                 }
-                produced = true;
+                #[cfg(feature = "test-support")]
+                {
+                    produced = true;
+                }
                 yield rows;
             }
             let reader = StagedTailReader::default();
@@ -432,7 +436,10 @@ impl LiveTailBatches {
                         if produced {
                             scribe_live_production_pause_for_test().hold().await;
                         }
-                        produced = true;
+                        #[cfg(feature = "test-support")]
+                        {
+                            produced = true;
+                        }
                         yield rows;
                     }
                 }

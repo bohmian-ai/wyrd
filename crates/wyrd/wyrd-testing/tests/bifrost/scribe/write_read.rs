@@ -16,7 +16,10 @@ use wyrd_testing::bifrost::{
     WyrdTestCluster,
 };
 
-use super::support::{register_table, start_scribe_server, unique_table};
+use super::support::{
+    append_values, published_rows, register_table, sorted_values, start_scribe_server,
+    tenant_client, unique_table,
+};
 
 /// The complete client-to-server Scribe contract, end to end.
 ///
@@ -1072,4 +1075,157 @@ async fn read_correlation(
     }
     rows.sort_by_key(|(value, _, _)| *value);
     rows
+}
+
+/// Rows in a near-maximum legal request.
+///
+/// Scribe materializes about 200 bytes per `value` row once the managed columns
+/// are added, and refuses a request whose material exceeds the 64-MiB default
+/// ceiling; 300,000 rows stays just inside it.
+const MAX_REQUEST_ROWS: i64 = 300_000;
+
+/// An acknowledged near-maximum request stays readable through stage pressure,
+/// publishes once on retry, retires its WAL, and survives restart.
+///
+/// The acknowledgement is the durable promise: WAL sync and memtable insertion
+/// happen before it, and nothing that follows may retract it. The case fills
+/// the pod's one shared root after the acknowledgement so the stage attempt
+/// cannot charge its sorted candidate. That attempt must settle promptly as a
+/// retained generation and leave the rows where they were — live, unpublished,
+/// and WAL-backed — rather than park on a predicted workspace. Once the root
+/// has room, the retried stage publishes the rows exactly once and retires the
+/// WAL segments that backed the acknowledgement. The pod is then restarted on
+/// the same data root, and a resend of the acknowledged batch must neither
+/// duplicate the rows nor publish them again.
+///
+/// # Panics
+///
+/// Panics when the near-maximum request is refused, when a stage under a full
+/// root publishes or loses rows, when the retry does not publish every row
+/// once, when the acknowledged WAL is not retired, or when restart or a resent
+/// batch changes the rows.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn acknowledged_rows_survive_stage_pressure_and_restart() {
+    let data_root = tempfile::tempdir().expect("durable Bifrost data root");
+    let builder = || {
+        wyrd_testing::WyrdTestServer::builder()
+            .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+    };
+    let server = builder()
+        .start_bound()
+        .await
+        .expect("the pod starts on a durable data root");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("stage_pressure_restart");
+    let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
+    let client = tenant_client(&server, tenant).await;
+
+    let batch_id = uuid::Uuid::now_v7();
+    let rows: Vec<i64> = (0..MAX_REQUEST_ROWS).collect();
+    append_values(&client, &table, batch_id, &rows)
+        .await
+        .expect("the near-maximum legal request is acknowledged");
+    assert_eq!(sorted_values(&client, &table).await, rows);
+    let wal_root = server
+        .scribe_wal_root_for_test()
+        .expect("the pod composes a WAL")
+        .to_path_buf();
+    let acknowledged_segments = wal_segments(&wal_root);
+    let acknowledged_bytes: u64 = acknowledged_segments.iter().map(|(_, bytes)| bytes).sum();
+    assert!(
+        acknowledged_bytes >= (MAX_REQUEST_ROWS as u64) * 8,
+        "the acknowledgement follows WAL sync of the whole request: {acknowledged_bytes} bytes"
+    );
+
+    let occupant = server
+        .state()
+        .bifrost_resources()
+        .and_then(|resources| resources.forge())
+        .expect("the embedded pod hosts Forge")
+        .occupy_root_for_test();
+    tokio::time::timeout(std::time::Duration::from_secs(60), server.flush_bifrost())
+        .await
+        .expect("a stage under a full root settles promptly instead of waiting for bytes")
+        .expect("a refused stage attempt retains its generation rather than failing the pod");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        0,
+        "a failed stage attempt may not publish"
+    );
+    drop(occupant);
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        rows,
+        "the live authority keeps every acknowledged row after a failed stage"
+    );
+
+    server
+        .flush_bifrost()
+        .await
+        .expect("the retried stage publishes the retained rows");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        MAX_REQUEST_ROWS as u64,
+        "publication accounts for every acknowledged row exactly once"
+    );
+    assert_eq!(sorted_values(&client, &table).await, rows);
+    let retained: Vec<_> = acknowledged_segments
+        .iter()
+        .filter(|(path, _)| path.exists())
+        .collect();
+    assert!(
+        retained.is_empty(),
+        "published rows retire the WAL segments that backed them: {retained:?}"
+    );
+
+    let server = server
+        .restart_bound(builder())
+        .await
+        .expect("the pod restarts on its retained data root");
+    let client = tenant_client(&server, tenant).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        rows,
+        "restart serves exactly the acknowledged rows"
+    );
+    let resent = append_values(&client, &table, batch_id, &rows).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        rows,
+        "a resent acknowledged batch may not duplicate its rows: {resent:?}"
+    );
+    server
+        .flush_bifrost()
+        .await
+        .expect("the restarted pod drains its staged work");
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        MAX_REQUEST_ROWS as u64,
+        "a resent acknowledged batch is not published a second time"
+    );
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// Lists every WAL segment file under `root` with its size in bytes.
+///
+/// # Panics
+///
+/// Panics when the WAL tree cannot be walked.
+fn wal_segments(root: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
+    let mut segments = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("the WAL tree is readable") {
+            let entry = entry.expect("a WAL entry is readable");
+            let metadata = entry.metadata().expect("WAL entry metadata");
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if entry.path().extension().is_some_and(|ext| ext == "wal") {
+                segments.push((entry.path(), metadata.len()));
+            }
+        }
+    }
+    segments
 }

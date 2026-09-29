@@ -5,7 +5,7 @@
 //! `(data_tenant_id, wyrd_event_time)` and takes its partition day from the
 //! seal-key (never from row min/max).
 
-use std::io::{BufReader, BufWriter, Read};
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -246,7 +246,7 @@ pub(crate) fn encode_batch(
     scratch_dir: &Path,
     object_base: &str,
     layout: &PhysicalLayout,
-    footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    memory: crate::resources::ScribeResources,
 ) -> Result<ParquetEncoded, ScribeError> {
     ParquetBatchEncoder {
         frozen,
@@ -257,7 +257,7 @@ pub(crate) fn encode_batch(
         scratch_dir,
         object_base,
         layout,
-        footer_reservation,
+        memory,
         target_object_bytes: DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
     }
     .encode()
@@ -302,26 +302,21 @@ pub struct ArtifactPlan<'a> {
 /// the claim produced no rows at all.
 pub fn encode_ordered_claim(
     plan: ArtifactPlan<'_>,
-    footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    memory: &crate::resources::ScribeResources,
     ordered: impl Iterator<Item = Result<RecordBatch, ScribeError>>,
 ) -> Result<(BoundedParquetArtifactSet, Vec<RowGroupStats>), ScribeError> {
-    debug_assert_eq!(
-        footer_reservation.bytes(),
-        crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
-    );
     let mut roller = RollingArtifactWriter::new(plan);
     for batch in ordered {
-        roller.append_ordered_batch(&batch?)?;
+        roller.append_charged_batch(memory, &batch?)?;
     }
     let (artifacts, row_group_stats) = roller.finish()?;
-    drop(footer_reservation);
     Ok((
         BoundedParquetArtifactSet::encoded(artifacts)?,
         row_group_stats,
     ))
 }
 
-/// Owns one bounded Parquet encoding workflow and its footer reservation.
+/// Owns one bounded Parquet encoding workflow and the capability it charges.
 struct ParquetBatchEncoder<'a> {
     /// Immutable generation being encoded.
     frozen: &'a FrozenMemtable,
@@ -339,8 +334,8 @@ struct ParquetBatchEncoder<'a> {
     object_base: &'a str,
     /// Registered physical write recipe governing sort order and Bloom columns.
     layout: &'a PhysicalLayout,
-    /// Move-only memory child retained through footer inspection.
-    footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Scribe capability charged for each sorted candidate while it is held.
+    memory: crate::resources::ScribeResources,
     /// Approximate encoded size at which one artifact closes and the next opens.
     target_object_bytes: u64,
 }
@@ -364,14 +359,10 @@ impl<'a> ParquetBatchEncoder<'a> {
     /// Returns [`ScribeError::Internal`] for an invalid binding, Arrow
     /// materialization failure, or an invalid encoded artifact.
     fn encode(self) -> Result<ParquetEncoded, ScribeError> {
-        debug_assert_eq!(
-            self.footer_reservation.bytes(),
-            crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
-        );
         let mut roller = RollingArtifactWriter::new(self.plan());
         for candidate in &self.candidates {
             let sorted_batch = self.prepare_sorted_candidate(*candidate)?;
-            roller.append_ordered_batch(&sorted_batch)?;
+            roller.append_charged_batch(&self.memory, &sorted_batch)?;
             roller.seal_open_artifact()?;
         }
         let (artifacts, row_group_stats) = roller.finish()?;
@@ -471,6 +462,29 @@ impl<'a> RollingArtifactWriter<'a> {
             artifacts: Vec::new(),
             row_group_stats: Vec::new(),
         }
+    }
+
+    /// Charges one materialized batch's retained bytes while the encoder writes it.
+    ///
+    /// The batch is a Wyrd-owned copy (sorted candidate or merge output), so it
+    /// holds a Scribe lease for exactly its distinct allocations and no more;
+    /// nothing is admitted for encoder or footer bytes it may later need.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the shared root cannot hold the
+    /// batch, which fails this stage attempt for retry, or any
+    /// [`Self::append_ordered_batch`] error.
+    fn append_charged_batch(
+        &mut self,
+        memory: &crate::resources::ScribeResources,
+        batch: &RecordBatch,
+    ) -> Result<(), ScribeError> {
+        let _held = memory.try_reserve_maintenance(
+            crate::scribe::memory::MemoryCategory::Persistence,
+            crate::scribe::memory::retained_arrow_bytes(batch),
+        )?;
+        self.append_ordered_batch(batch)
     }
 
     /// Writes one already ordered batch and rolls if the object target is met.
@@ -864,20 +878,13 @@ fn checksum_file(path: &Path) -> Result<String, ScribeError> {
     let file = std::fs::File::open(path).map_err(|error| ScribeError::Internal {
         detail: format!("open Scribe Parquet artifact for checksum: {error}"),
     })?;
-    let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
-    let mut chunk = vec![0_u8; 8 * 1024 * 1024];
-    loop {
-        let read = reader
-            .read(&mut chunk)
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("read Scribe Parquet artifact for checksum: {error}"),
-            })?;
-        if read == 0 {
-            return Ok(hex::encode(hasher.finalize()));
+    std::io::copy(&mut BufReader::new(file), &mut hasher).map_err(|error| {
+        ScribeError::Internal {
+            detail: format!("read Scribe Parquet artifact for checksum: {error}"),
         }
-        hasher.update(&chunk[..read]);
-    }
+    })?;
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Extract min/max event time from a single row group.
@@ -1150,7 +1157,7 @@ mod tests {
             scratch.path(),
             "s3://bucket/table/day=2026-07-14/scribe-test-0",
             &layout,
-            crate::scribe::memory::EncodedFooterReservation::for_test(),
+            crate::resources::ScribeResources::for_test(),
         )
         .expect("Scribe Parquet encode");
         (scratch, encoded)
@@ -1303,7 +1310,7 @@ mod tests {
             scratch_dir,
             object_base: "tenant/table/incompressible",
             layout: &layout,
-            footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+            memory: crate::resources::ScribeResources::for_test(),
             target_object_bytes,
         }
         .encode()
@@ -1911,7 +1918,7 @@ mod tests {
             mismatch_scratch.path(),
             "tenant/table/member",
             &layout,
-            crate::scribe::memory::EncodedFooterReservation::for_test(),
+            crate::resources::ScribeResources::for_test(),
         )
         .expect_err("mismatched tenant must fail closed");
         assert!(
@@ -2169,7 +2176,7 @@ mod tests {
             scratch.path(),
             "object",
             &layout,
-            crate::scribe::memory::EncodedFooterReservation::for_test(),
+            crate::resources::ScribeResources::for_test(),
         )
         .unwrap_err();
         assert!(
@@ -2201,7 +2208,7 @@ mod tests {
             scratch.path(),
             "object",
             &layout,
-            crate::scribe::memory::EncodedFooterReservation::for_test(),
+            crate::resources::ScribeResources::for_test(),
         )
         .unwrap_err();
         assert!(matches!(error, ScribeError::Internal { detail }
@@ -2317,7 +2324,7 @@ mod tests {
             scratch.path(),
             "object",
             &layout,
-            crate::scribe::memory::EncodedFooterReservation::for_test(),
+            crate::resources::ScribeResources::for_test(),
         )
         .unwrap_err();
         assert!(

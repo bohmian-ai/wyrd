@@ -1783,7 +1783,6 @@ impl<'a> OracleRoleBuilder<'a> {
             operator_pool,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
-            local_slots: slots,
             memory: OracleMemoryResources {
                 resources,
                 reconciliation_limit_bytes,

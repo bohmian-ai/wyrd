@@ -160,8 +160,8 @@ impl BifrostParquetUploader {
     /// A failed or ambiguous PUT is resolved by read-back. Absence is retried once;
     /// contradictory content fails closed. `OpenDAL` requires one owned payload for
     /// each write or range read; every such payload is bounded by `chunk.len()`,
-    /// and producer admission charges both the retained caller chunk and that
-    /// backend-owned buffer. This owner never deletes remote bytes.
+    /// and the caller charges its retained chunk; the backend-owned copy is
+    /// bounded by it. This owner never deletes remote bytes.
     ///
     /// # Errors
     ///
@@ -255,8 +255,7 @@ impl BifrostParquetUploader {
     /// Streams one atomic local-file create through the caller-governed chunk.
     ///
     /// `OpenDAL` takes one owned [`Buffer`] per write. The unavoidable copy is
-    /// bounded by the caller chunk and is the second transfer buffer charged by
-    /// Scribe/Forge producer admission.
+    /// bounded by the caller chunk.
     ///
     /// # Errors
     ///
@@ -316,8 +315,8 @@ impl BifrostParquetUploader {
     /// Reads bounded remote ranges and validates content identity.
     ///
     /// `OpenDAL` returns an owned range buffer rather than filling caller memory.
-    /// The caller chunk therefore provides the authoritative range bound while
-    /// producer admission charges both the retained chunk and one backend buffer.
+    /// The caller chunk therefore provides the authoritative range bound for the
+    /// one backend buffer.
     ///
     /// # Errors
     ///
@@ -604,13 +603,5 @@ mod tests {
             .await
             .expect("bounded upload");
         assert_eq!(uploader.max_backend_payload_bytes(), chunk.len());
-        let candidate = 11_usize;
-        assert_eq!(
-            crate::scribe::memory::parquet_candidate_incremental_bytes(candidate)
-                .expect("workspace projection"),
-            candidate * 2
-                + crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
-                + crate::scribe::memory::PARQUET_TRANSFER_BUFFER_BYTES * 2
-        );
     }
 }

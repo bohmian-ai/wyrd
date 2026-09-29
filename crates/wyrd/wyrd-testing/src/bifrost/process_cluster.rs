@@ -601,7 +601,9 @@ pub struct AnalyticalBaselineEvidence {
 pub struct OracleOwnershipSnapshot {
     /// Leader-side attempts still supervised.
     pub leader_attempts: usize,
-    /// Leader-side graphs still holding a runtime and admitted envelope.
+    /// Graphs registered at this node's supervisor still holding a runtime and
+    /// admitted envelope, counting the graphs it follows as well as those it
+    /// leads.
     pub leader_graphs: usize,
     /// Leader-side graphs retained because their cleanup did not complete.
     pub leader_cleanup_failures: usize,

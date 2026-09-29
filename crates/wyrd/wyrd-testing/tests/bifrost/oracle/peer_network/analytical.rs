@@ -1572,7 +1572,7 @@ async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyE
             .into());
         }
         let placing = cluster.nodes_mut()[RETRY_LEADERS[1]].ownership_snapshot()?;
-        if placing.leader_graphs != 1 || placing.active_queries != 1 {
+        if placing.leader_graphs != placing.follower_graphs + 1 || placing.active_queries != 1 {
             return Err(format!(
                 "the refused leader must keep retrying its admitted graph, held {placing:?}"
             )
@@ -1655,7 +1655,9 @@ async fn await_receiver_membership(
 /// Waits until `leader` has admitted its query and registered its graph.
 ///
 /// Registration precedes participant placement, so from here the graph is
-/// either placing or retrying placement.
+/// either placing or retrying placement. The node's supervisor also registers
+/// every graph it follows, so the one graph it leads is the count beyond its
+/// follower graphs.
 ///
 /// # Errors
 ///
@@ -1666,7 +1668,7 @@ async fn await_leader_placing(
 ) -> Result<(), PeerJourneyError> {
     let mut last = cluster.nodes_mut()[leader].ownership_snapshot()?;
     for _ in 0..CLEAN_LEASE_POLLS {
-        if last.leader_graphs == 1 && last.active_queries == 1 {
+        if last.leader_graphs == last.follower_graphs + 1 && last.active_queries == 1 {
             return Ok(());
         }
         tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;

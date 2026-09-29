@@ -1131,8 +1131,6 @@ pub struct OracleBuildConfig {
     pub cluster: Arc<ClusterRegistry>,
     /// Fenced local Oracle role.
     pub local_role: RegisteredRole,
-    /// Local pending/running slot guards.
-    pub local_slots: Arc<OracleSlotManager>,
     /// Parent memory and spill resources.
     pub memory: OracleMemoryResources,
     /// Process-lifetime owner of pod-local Oracle query scratch.
@@ -1418,7 +1416,9 @@ pub struct Oracle {
     admission: Arc<OracleAdmission>,
     /// Immutable membership registry retained for planning and worker selection.
     cluster: Arc<ClusterRegistry>,
-    /// Reservation owner this node's fragment and graph paths both charge against.
+    /// Reservation owner this node's fragment and graph paths both charge
+    /// against; the engine reads it only for test-tier inspection.
+    #[cfg(feature = "test-support")]
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// One process-local lifecycle registry shared with private controls.
     running_queries: Arc<RunningQueryRegistry>,
@@ -1852,7 +1852,6 @@ impl Oracle {
         let cluster = Arc::clone(&config.cluster);
         let running_queries = Arc::new(RunningQueryRegistry::new());
         let admission = Arc::new(OracleAdmission::with_config(
-            config.local_slots,
             config.local_role,
             !cluster.snapshot().live_oracles().is_empty(),
             admission::OracleAdmissionConfig::from(&config.config),
@@ -1897,6 +1896,7 @@ impl Oracle {
             planner,
             admission,
             cluster,
+            #[cfg(feature = "test-support")]
             reservations: Arc::clone(&config.reservations),
             running_queries,
             reader_authority,
@@ -3132,7 +3132,7 @@ impl Oracle {
         OracleReadinessSnapshot {
             startup_reconciled: self.startup_reconciled(),
             live_oracles: self.cluster.snapshot().live_oracles().len(),
-            total_slot_units: self.admission.slots.total_slot_units(),
+            total_slot_units: self.reservations.total_slot_units(),
         }
     }
 

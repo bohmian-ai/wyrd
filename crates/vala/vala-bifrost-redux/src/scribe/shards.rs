@@ -1614,7 +1614,6 @@ impl ShardOwner {
             states,
             memory,
             identity_memory,
-            identity_owner_bytes,
         } = chunk;
         if self.replay_chunk.is_some() {
             let _ = response.send(Err(ScribeError::Internal {
@@ -1645,8 +1644,7 @@ impl ShardOwner {
             let _ = response.send(Err(error));
             return;
         }
-        let identity = match self.adopt_replay_identity_owner(identity_memory, identity_owner_bytes)
-        {
+        let identity = match self.adopt_replay_identity_owner(identity_memory) {
             Ok(identity) => identity,
             Err(error) => {
                 self.rollback_prepared_replay(&mut prepared);
@@ -1743,10 +1741,6 @@ impl ShardOwner {
 
     /// Moves the current stream's identity lease into replay persistence ownership.
     ///
-    /// `producer_owner_bytes` remains the aggregate identity charge across all
-    /// live replay streams so the producer workspace is bounded by the complete
-    /// Scribe role ownership, not only the stream being persisted.
-    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the lease cannot be transferred between
@@ -1754,13 +1748,9 @@ impl ShardOwner {
     fn adopt_replay_identity_owner(
         &self,
         identity_memory: Option<crate::resources::ScribeMemoryLease>,
-        producer_owner_bytes: usize,
     ) -> Result<Option<crate::scribe::memory::ReplayIdentityOwnership>, ScribeError> {
         identity_memory
-            .map(|lease| {
-                self.memory_ownership
-                    .adopt_replay_identity(lease, producer_owner_bytes)
-            })
+            .map(|lease| self.memory_ownership.adopt_replay_identity(lease))
             .transpose()
     }
 
@@ -2057,11 +2047,18 @@ impl ShardOwner {
 
     /// Flushes every active bucket owned by this shard.
     ///
+    /// Generations a failed stage attempt left retryable are resubmitted first,
+    /// so an explicit flush or shutdown drain re-drives them rather than
+    /// waiting for the next age tick; `submit_front` only ever submits an
+    /// unsubmitted queue front, which keeps FIFO order and never double-submits
+    /// an in-flight generation.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when active bucket selection or generation
     /// preparation fails.
     fn flush_all(&mut self) -> Result<(), ScribeError> {
+        self.retry_pending();
         let keys = self.memtable.active_seal_keys_for_shard(self.id)?;
         self.flush_keys(keys, None)
     }
@@ -3772,16 +3769,8 @@ impl ShardOwner {
             }
             let batch_id = *append.batch_id.as_bytes();
             loop {
-                let slice = match Self::next_prepared_slice(&self.persistence_cpu, append) {
-                    Ok(Some(slice)) => slice,
-                    Ok(None) => break,
-                    Err(error) => {
-                        if let Err(cleanup_error) = self.release_active_reservations(&durable) {
-                            tracing::error!(error = %cleanup_error, "active cleanup failed after slice production error");
-                        }
-                        Self::notify_prepared_error(&mut prepared, &error);
-                        return Err(error);
-                    }
+                let Some(slice) = Self::next_prepared_slice(append) else {
+                    break;
                 };
                 let identity = slice.wal_append.payload_identity()?;
                 match self.memtable.retained_batch_rows(&slice.seal_key, identity) {
@@ -3853,26 +3842,17 @@ impl ShardOwner {
         })
     }
 
-    /// Advances one materialized or lazy prepared-slice source.
+    /// Takes the next prepared slice of one append, in order.
     ///
-    /// Native production runs on the bounded persistence CPU lane and returns
-    /// the producer owner with every result so cancellation cannot orphan its
-    /// retained raw source or decoder state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when the producer owner is missing, the CPU lane
-    /// refuses/fails, or it returns a result for a different operation.
-    fn next_prepared_slice(
-        _persistence_cpu: &crate::scribe::execution_lanes::ScribePersistenceCpuPool,
-        append: &mut PreparedAppend,
-    ) -> Result<Option<PreparedSlice>, ScribeError> {
+    /// Slices are fully materialized before the append reaches the shard, so
+    /// this only pops the next one; `None` means the append has no slices left.
+    fn next_prepared_slice(append: &mut PreparedAppend) -> Option<PreparedSlice> {
         match &mut append.slices {
             PreparedSliceSet::Materialized(slices) => {
                 if slices.is_empty() {
-                    Ok(None)
+                    None
                 } else {
-                    Ok(Some(slices.remove(0)))
+                    Some(slices.remove(0))
                 }
             }
         }
@@ -5019,55 +4999,6 @@ mod tests {
         assert!(cohort.complete_member(12));
     }
 
-    /// Shutdown closes new producer work while accepted incremental ownership
-    /// and the final cohort member both drain to terminal release.
-    ///
-    /// # Panics
-    ///
-    /// Panics if closing admission cancels an accepted producer, releases a
-    /// cohort early, or leaves a waiter or lease after both owners settle.
-    #[tokio::test]
-    async fn shutdown_drains_cohorts_and_incremental_producers() {
-        const MIB: usize = 1024 * 1024;
-        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            512 * MIB,
-            512 * MIB as u64,
-            [crate::resources::BifrostRole::Scribe],
-        );
-        let resources = roles.scribe().expect("Scribe resources");
-        let baseline = resources.memory_snapshot();
-        let admission = crate::scribe::persistence::ProducerAdmission::new(resources.clone());
-        let blocker = admission.acquire(500 * MIB).await.expect("active producer");
-        let accepted = tokio::spawn({
-            let admission = admission.clone();
-            async move { admission.acquire_accepted(32 * MIB).await }
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(admission.queue_len(), 1);
-
-        admission.close();
-        assert!(admission.acquire(1).await.is_err());
-        let mut cohort = ShardRotationCohort {
-            shard_id: 0,
-            wal_segments: Vec::new(),
-            pending_member_seal_ids: BTreeSet::from([71_u64, 72_u64]),
-        };
-        assert!(!cohort.complete_member(71));
-        drop(blocker);
-        let incremental = tokio::time::timeout(std::time::Duration::from_secs(1), accepted)
-            .await
-            .expect("accepted producer drains")
-            .expect("producer task")
-            .expect("incremental lease");
-        assert!(cohort.complete_member(72));
-        drop(incremental);
-        assert_eq!(admission.queue_len(), 0);
-        assert_eq!(
-            resources.memory_snapshot().total_bytes(),
-            baseline.total_bytes()
-        );
-    }
-
     /// Failed replay binding or adoption restores memtable and memory baselines.
     ///
     /// # Panics
@@ -5251,7 +5182,6 @@ mod tests {
             states: HashMap::new(),
             memory: None,
             identity_memory: Some(identity),
-            identity_owner_bytes: 64,
         };
         let stream = StreamIdentity::new(
             crate::scribe::stream_identity::NodeId::generate(),
@@ -5292,6 +5222,63 @@ mod tests {
                 .scribe_memory_used_bytes,
             0
         );
+    }
+
+    /// An explicit flush resubmits a generation a failed stage attempt left
+    /// retryable instead of waiting for the next age tick.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the flush fails or the retained front is not resubmitted.
+    #[tokio::test]
+    async fn flush_all_resubmits_a_retained_generation() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let generation = owner_generation(&key, &frozen, stream, wal_handle.clone());
+        let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        owner.persistence = Some(Arc::new(persistence));
+        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
+            .expect("test binding");
+        owner.pending_generations.insert(
+            key.clone(),
+            VecDeque::from([PendingGeneration {
+                generation: Arc::clone(&generation),
+                binding,
+                submitted: false,
+                retry_scheduled: false,
+                replay_response: None,
+                replay_owned: false,
+            }]),
+        );
+
+        owner.flush_all().expect("explicit flush");
+
+        let front = owner
+            .pending_generations
+            .get(&key)
+            .and_then(VecDeque::front)
+            .expect("retained front");
+        assert!(front.submitted, "the flush resubmits the retained front");
+        let job = persistence_rx.recv().await.expect("resubmitted job");
+        assert_eq!(job.generation.generation_id, generation.generation_id);
     }
 
     /// Replay owns its own retries across persistence-queue backpressure.
@@ -5475,7 +5462,7 @@ mod tests {
             .expect("advance-failure identity lease");
         let advance_identity = owner
             .memory_ownership
-            .adopt_replay_identity(advance_lease, 64)
+            .adopt_replay_identity(advance_lease)
             .expect("advance-failure identity adoption");
         let completion_result = owner.handle_persistence_completion(
             PersistenceCompletion {
@@ -5534,7 +5521,7 @@ mod tests {
             .expect("terminal identity lease");
         let terminal_identity = owner
             .memory_ownership
-            .adopt_replay_identity(terminal_lease, 64)
+            .adopt_replay_identity(terminal_lease)
             .expect("terminal identity adoption");
         let (terminal_response, terminal_rx) = tokio::sync::oneshot::channel();
         owner.replay_chunk = Some(ReplayChunkOwner {
@@ -5614,7 +5601,7 @@ mod tests {
             .expect("lock-failure identity lease");
         let lock_identity = owner
             .memory_ownership
-            .adopt_replay_identity(lock_lease, 64)
+            .adopt_replay_identity(lock_lease)
             .expect("lock-failure identity adoption");
         let (lock_response, lock_rx) = tokio::sync::oneshot::channel();
         owner.replay_chunk = Some(ReplayChunkOwner {
@@ -5748,14 +5735,12 @@ mod tests {
         assert!(retirement_owner.replay_chunk.is_none());
         assert!(retirement_owner.pending_generations.is_empty());
         assert_eq!(retirement_owner.retained_generations.len(), 1);
-        assert_eq!(
+        assert!(
             retirement_owner.retained_generations[&retirement_generation.generation_id.0]
                 .replay_identity
                 .lock()
                 .expect("retained retirement identity")
-                .as_ref()
-                .map(crate::scribe::memory::ReplayIdentityOwnership::bytes),
-            Some(64)
+                .is_some()
         );
         assert_eq!(
             retirement_owner.memory_ownership.immutable_bytes(),
@@ -5870,7 +5855,6 @@ mod tests {
                 retirement_budget
                     .try_reserve_maintenance(MemoryCategory::Decode, 64)
                     .expect("retirement identity lease"),
-                64,
             )
             .expect("retirement identity adoption");
         retirement_owner.fail_next_retirement_release = true;

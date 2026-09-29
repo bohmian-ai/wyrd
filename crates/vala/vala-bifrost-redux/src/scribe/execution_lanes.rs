@@ -1379,8 +1379,8 @@ pub(crate) struct StageMemberOp {
     pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
     /// Shard, epoch, node, and WAL facts describing where the rows came from.
     pub(crate) origin: crate::scribe::member_stager::StagedMemberOrigin,
-    /// Exact pre-writer footer child retained through sealed inspection.
-    pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Scribe capability charged for the batches the writer materializes.
+    pub(crate) memory: crate::resources::ScribeResources,
     /// Pod-level owner of the staged namespace the runs are written into.
     pub(crate) staging: std::sync::Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
 }
@@ -1398,8 +1398,8 @@ pub(crate) struct AssembleClaimOp {
     pub(crate) runs: Box<crate::scribe::claim_assembly::ClaimRuns>,
     /// Claim-owned output directory receiving the sealed objects.
     pub(crate) scratch_dir: std::path::PathBuf,
-    /// Exact pre-writer footer child retained through sealed inspection.
-    pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Scribe capability charged for the batches the writer materializes.
+    pub(crate) memory: crate::resources::ScribeResources,
     /// Pod-level owner holding the schema and layout the claim merges under.
     pub(crate) staging: std::sync::Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
 }
@@ -1481,7 +1481,7 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
         binding,
         layout,
         origin,
-        footer_reservation,
+        memory,
         staging,
     } = operation;
     let context = crate::scribe::staging_runtime::ClaimContext {
@@ -1496,7 +1496,7 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
                 binding: &binding,
                 layout: &layout,
                 origin,
-                footer_reservation,
+                memory,
             },
             context,
         )
@@ -1515,7 +1515,7 @@ fn assemble_claim(operation: AssembleClaimOp) -> Result<ScribePersistenceCpuResu
         claim,
         runs,
         scratch_dir,
-        footer_reservation,
+        memory,
         staging,
     } = operation;
     staging
@@ -1524,7 +1524,7 @@ fn assemble_claim(operation: AssembleClaimOp) -> Result<ScribePersistenceCpuResu
             crate::scribe::staging_runtime::AssembleRequest {
                 runs: &runs,
                 scratch_dir: &scratch_dir,
-                footer_reservation,
+                memory,
             },
         )
         .map(|assembled| ScribePersistenceCpuResult::ClaimAssembled(Box::new(assembled)))

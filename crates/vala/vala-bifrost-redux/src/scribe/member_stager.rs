@@ -27,7 +27,7 @@ use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{ReadyMember, ScribeAssemblyKey, StagedMemberId};
 use crate::scribe::hot_stage::{
-    ScribeHotStage, StagedHotSourceRecordV1, StagedLsnRange, StagedRunFile,
+    RECORD_FILE_NAME, ScribeHotStage, StagedHotSourceRecordV1, StagedLsnRange, StagedRunFile,
 };
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::stream_identity::{NodeId, WriterEpoch};
@@ -63,15 +63,15 @@ pub struct StageMemberRequest<'a> {
     pub layout: &'a PhysicalLayout,
     /// Shard, epoch, node, and WAL facts describing where the rows came from.
     pub origin: StagedMemberOrigin,
-    /// Move-only footer memory child retained through sealed inspection.
-    pub footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Scribe capability charged for the batches the writer materializes.
+    pub memory: crate::resources::ScribeResources,
 }
 
 /// Fsynced, preflighted runs waiting only for their record to be published.
 ///
 /// A value of this type is durable but invisible: recovery ignores a member
-/// directory that holds no record, so dropping it strands files that startup
-/// cleanup removes rather than exposing a partial member.
+/// directory that holds no record, so dropping it strands files that the next
+/// encode of the same member reclaims rather than exposing a partial member.
 #[derive(Debug, Clone)]
 pub struct StagedRuns {
     /// Compatibility scope the member may later be claimed under.
@@ -141,16 +141,20 @@ impl ScribeMemberStager {
     /// bytes that were validated are the bytes the record will name; a scratch
     /// copy afterwards would revalidate a different file. The directory stays
     /// invisible to recovery until [`Self::publish_ready`] renames the record
-    /// in, so a crash here leaves only removable residue.
+    /// in, so a failed or crashed attempt leaves only residue, which the next
+    /// attempt for the same member removes before encoding.
     ///
-    /// Re-encoding an already staged member is refused rather than silently
-    /// overwriting its runs: the record that names them is the authority a WAL
-    /// segment may already have been retired against.
+    /// Re-encoding a member whose record is published is refused rather than
+    /// silently overwriting its runs: the record that names them is the
+    /// authority a WAL segment may already have been retired against. The
+    /// shard submits one encode per member at a time, so reclaiming residue
+    /// never races a live attempt.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the member directory cannot be
-    /// created, a member is already staged, encoding or its footer inspection
+    /// created or its residue removed, a member is already staged, encoding or
+    /// its footer inspection
     /// fails, a run cannot be fsynced or decoded, or a sealed checksum is not
     /// the exact digest the record must carry.
     pub fn encode_runs(&self, request: StageMemberRequest<'_>) -> Result<StagedRuns, ScribeError> {
@@ -165,7 +169,13 @@ impl ScribeMemberStager {
         );
         let member = StagedMemberId::new(request.origin.shard, request.origin.generation);
         let directory = self.stage.member_directory(&key, member);
-        if directory.exists() {
+        let staged = directory
+            .join(RECORD_FILE_NAME)
+            .try_exists()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("inspect the staged member record: {error}"),
+            })?;
+        if staged {
             return Err(ScribeError::Internal {
                 detail: format!(
                     "staged member {}-{} already occupies its durable directory",
@@ -173,6 +183,15 @@ impl ScribeMemberStager {
                     member.generation()
                 ),
             });
+        }
+        match std::fs::remove_dir_all(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ScribeError::Internal {
+                    detail: format!("remove the unrecorded staged member residue: {error}"),
+                });
+            }
         }
         std::fs::create_dir_all(&directory).map_err(|error| ScribeError::Internal {
             detail: format!("create the staged member directory: {error}"),
@@ -184,7 +203,7 @@ impl ScribeMemberStager {
             &directory,
             &run_object_base(&key, member),
             request.layout,
-            request.footer_reservation,
+            request.memory,
         )?;
         let mut runs = Vec::with_capacity(encoded.artifacts.len());
         let mut staged_bytes = 0_u64;
@@ -464,7 +483,7 @@ mod tests {
                 binding: &binding,
                 layout: &layout,
                 origin: origin(),
-                footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                memory: crate::resources::ScribeResources::for_test(),
             })
             .expect("frozen member encodes into local runs");
         assert_eq!(member.member(), StagedMemberId::new(5, 9));
@@ -500,9 +519,9 @@ mod tests {
         }
     }
 
-    /// Re-encoding a member that already owns its durable directory is refused:
-    /// its record may already have authorized retiring the WAL behind it, so
-    /// overwriting the runs it names would remove the only copy of those rows.
+    /// Re-encoding a member whose record is published is refused: the record
+    /// may already have authorized retiring the WAL behind it, so overwriting
+    /// the runs it names would remove the only copy of those rows.
     #[tokio::test]
     async fn restaging_an_existing_member_is_refused() {
         let root = tempfile::tempdir().expect("staged root");
@@ -520,11 +539,16 @@ mod tests {
             binding: &binding,
             layout: &layout,
             origin: origin(),
-            footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+            memory: crate::resources::ScribeResources::for_test(),
         };
-        stager
+        let first = stager
             .encode_runs(request())
             .expect("first staging encodes");
+        let ready_at = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("fixture instant");
+        stager
+            .publish_ready(first, ready_at)
+            .await
+            .expect("first staging publishes its record");
         let refusal = stager
             .encode_runs(request())
             .expect_err("second staging is refused");
@@ -532,5 +556,47 @@ mod tests {
             refusal.to_string().contains("already occupies"),
             "refusal names the durable collision: {refusal}"
         );
+    }
+
+    /// An attempt that never published its record leaves only residue: the
+    /// WAL still owns those rows, so the retry reclaims the directory and
+    /// encodes the member again instead of wedging the generation.
+    #[tokio::test]
+    async fn unrecorded_member_residue_is_reclaimed_by_the_retry() {
+        let root = tempfile::tempdir().expect("staged root");
+        let stage_root = root.path().join("stage");
+        std::fs::create_dir_all(&stage_root).expect("staged namespace");
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let stager = ScribeMemberStager::new(Arc::clone(&stage));
+        let tenant = DataTenantId::new_v7();
+        let frozen = frozen_member(tenant, 64);
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        let layout = member_layout(frozen.schema.as_ref());
+        let request = || StageMemberRequest {
+            frozen: &frozen,
+            binding: &binding,
+            layout: &layout,
+            origin: origin(),
+            memory: crate::resources::ScribeResources::for_test(),
+        };
+        let abandoned = stager
+            .encode_runs(request())
+            .expect("the abandoned attempt encodes");
+        let stray = stage
+            .member_directory(abandoned.key(), abandoned.member())
+            .join("stray.partial");
+        std::fs::write(&stray, b"partial").expect("residue from a failed attempt");
+
+        let retried = stager
+            .encode_runs(request())
+            .expect("the retry reclaims the unrecorded residue");
+        assert!(!stray.exists(), "the retry starts from an empty directory");
+        let ready_at = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("fixture instant");
+        let ready = stager
+            .publish_ready(retried, ready_at)
+            .await
+            .expect("the retried member publishes");
+        assert_eq!(ready.rows(), 64);
     }
 }

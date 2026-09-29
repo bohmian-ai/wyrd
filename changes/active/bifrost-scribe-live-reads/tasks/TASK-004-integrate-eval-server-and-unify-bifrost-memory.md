@@ -697,3 +697,67 @@ not complete this task.
 - Fix site: the test helpers. "Held" is now one open producer plus the leader's admitted query. "Released" is zero producers, zero follower query bytes on the Scribe pod, and zero Oracle admission. The `LiveScribeHolds` control reply carries follower query bytes.
 - Callers checked: `limit_stops_unneeded_live_fragment_without_footer` (same release helper).
 - Verification: all three journeys pass.
+
+**D3 — stale compressed-first-frame test.**
+- Symptom: `grpc::tests::a_compressed_first_frame_is_bounded_as_unknown` expected `Ok(None)` and got `Ok(Some(4))`.
+- Evidence: 61018283a changed the gRPC head's `declared()` to charge flags `0 | 1` alike and removed `try_acquire_unknown`.
+- Cause: the test still expected the pre-change contract. The design says transport charges the encoded wire body (`bifrost-design.md` §admission; this task's memory charge contract), and tonic's decode limit bounds decompression.
+- Fix site: the test only. It is renamed `a_compressed_first_frame_is_bounded_by_its_encoded_length` and asserts `Ok(Some(4))`.
+
+**D4 — explicit peer transport loss in the R13-D fixture** (recorded by the R13-C/D implementor).
+- Symptom: `peer_loss_is_one_terminal_attempt` could not tell transport loss apart from a pre-accept capacity refusal after leader-only retry landed.
+- Cause: the dispatcher fixture had no transport-loss mode.
+- Fix site: the fixture gained an explicit transport-loss mode. Production dispatch is unchanged.
+
+**D5 — a failed stage attempt wedged its member forever** (read-only diagnostician report).
+- Symptom: after an R13-B stage refusal (`ingest busy for table: memory`), restart failed with `WAL recovery failed … staged member 0-1 already occupies its durable directory`.
+- Evidence: `ScribeMemberStager::encode_runs` refused whenever the member directory existed. R13-B moves the memory charge inside `encode_batch`, after `create_dir_all`, so a refusal leaves a directory with no record. `ScribeHotStage::recover` skips record-less directories by contract.
+- Cause: only a published `member.staged.json` authorizes WAL retirement, but the refusal treated record-less residue as authority. Every in-process retry and every WAL-replay rebuild of that member was refused.
+- Fix site: `encode_runs` (`member_stager.rs`). It is the only code that creates member directories and is reached by both live rotation and replay via `staging_runtime::encode_member`. It now refuses only when a record exists and otherwise removes the residue before encoding.
+- Concurrency: the shard submits one encode per member at a time, and retry follows settlement. Recovery is unchanged.
+- Tests:
+  - `restaging_an_existing_member_is_refused` protected a false invariant: it re-encoded without publishing a record. It now publishes the record first.
+  - `unrecorded_member_residue_is_reclaimed_by_the_retry` pins the retry.
+
+**D6 — the two-leader journey miscounted leader graphs** (read-only diagnostician report).
+- Symptom: `two_leaders_retry_preaccept_capacity` failed with "leader 1 never registered its graph", holding `leader_graphs: 2, follower_graphs: 1`.
+- Evidence:
+  - Each node has one `AnalyticalSupervisor`, and follower ingress registers followed graphs there too (`oracle/analytical.rs` `register_graph`).
+  - `leader_graphs` reads `supervisor.live_graphs()`.
+  - Leader 1 follows leader 0's held graph by design (`RETRY_LEADER_SLOTS` doc).
+- Cause: the new test expected `leader_graphs == 1`. The node's own graph is `leader_graphs - follower_graphs`.
+- Fix site: the test's two checks now compare `leader_graphs == follower_graphs + 1`, and the `OracleOwnershipSnapshot::leader_graphs` doc now states what it counts. Production is unchanged. Refused rounds release every remote reservation before waiting.
+- Residual: two leaders with tight per-node limits can starve each other until their deadlines. This is a livelock bounded by the deadline, not a deadlock. It is admission sizing, outside R13.
+
+**D7 — an explicit flush skipped retained generations** (read-only diagnostician report).
+- Symptom: after the root occupant was released, a second `flush_bifrost` published 0 of 300,000 acknowledged rows.
+- Evidence: `fail_persistence_completion` → `mark_front_retryable` leaves the front unsubmitted. `ShardOwner::flush_all` only froze active keys, and the frozen key is neither active nor "strandable". Only `flush_expired` (the age tick) called `retry_pending`.
+- Cause: explicit flush and the shutdown drain could not re-drive what a failed stage attempt left retryable.
+- Fix site: `ShardOwner::flush_all` calls `retry_pending` first.
+  - `submit_front` submits only an unsubmitted front, so FIFO order holds and an in-flight front is never submitted twice.
+  - The pressure flush and replay are unchanged.
+  - The shutdown drain gains one retry inside its deadline.
+- Test: `scribe::shards::tests::flush_all_resubmits_a_retained_generation`.
+- Follow-up (existing gap, not widened): a failed replay-owned front stays queued without its chunk. Recovery fails first today.
+
+**D8 — `lints:default` was red.**
+- Symptom: `cargo clippy --workspace --all-targets -D warnings` failed on `scribe/shards.rs` `next_prepared_slice` (`unnecessary_wraps`). Plain crate builds also warned on 11 items used only by test or test-support code.
+- Cause:
+  - `next_prepared_slice` kept a dead CPU-pool parameter and a `Result`, but only popped a materialized slice.
+  - `OracleAdmission.slots` duplicated the slot manager that boot already hands to `ReservationRegistry`, and only the test readiness snapshot read it.
+- Fix site:
+  - `next_prepared_slice` returns `Option` and drops the dead parameter and the unreachable error branch.
+  - Deleted: `OracleAdmission.slots`, its `with_config` parameter, and `OracleBuildConfig.local_slots`. The readiness snapshot reads `ReservationRegistry::total_slot_units`.
+  - The engine's `reservations`, the staging and metadata snapshots, and the tail `produced` pause flag are gated to their only (test-support) readers.
+  - Imports used only by gated code are path-qualified at the use site.
+
+### Revision 13 acceptance evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R13-A: one Scribe held-byte owner, no secondary ceiling | aacd0bd27 | `scribe::admission::tests::one_root_charge_has_no_secondary_memory_ceiling`, `scribe::ingress::tests::decode_to_memtable_transfers_one_charge` | PASS |
+| R13-B: ACKed rows survive stage pressure, retry, publish once, WAL retires, survive restart without duplicates; no future writer/footer/workspace admission | `parquet_writer::append_charged_batch`, `persistence::publish_claim` (one transfer chunk), `member_stager::encode_runs` (D5), `shards::flush_all` (D7) | `write_read::acknowledged_rows_survive_stage_pressure_and_restart`; `member_stager::tests::*`; `shards::tests::flush_all_resubmits_a_retained_generation` | PASS |
+| R13-C: storage permit waits within the operation deadline; no fixed footer slot | 65da92a03 | `storage::governed_request_tests::{occupied_storage_permit_waits_within_operation_deadline, footer_decode_has_no_fixed_memory_slot}` | PASS |
+| R13-D: only the leader retries pre-accept peer capacity; receiver never exceeds its running slots | 65da92a03, D6 | `oracle::dispatcher::tests::leader_retries_only_preaccept_peer_capacity`; `peer_network::analytical::two_leaders_retry_preaccept_capacity` | PASS |
+| Lint lanes | D8 | `mise run lints:default`, `mise run lints` | PASS |
+| Crate lib suite | — | `vala-bifrost-redux --lib --features test-support`: 848/848 | PASS |

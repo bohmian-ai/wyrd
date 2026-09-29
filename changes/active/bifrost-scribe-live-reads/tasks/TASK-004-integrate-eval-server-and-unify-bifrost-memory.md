@@ -677,3 +677,23 @@ not complete this task.
 - Repository rules: ../../../../AGENTS.md
 - Bifrost architecture: ../../../../architecture/bifrost-design.md
 - Wyrd protocol: ../../../../architecture/wyrd-design.md
+
+## Revision 13 Implementation Evidence
+
+### Diagnoses
+
+**D1 — follower pool poisoned Scribe attribution.**
+- Symptom: `ingest_bounds::forty_mib_row_stages_publishes_and_reads_back_at_48_mib_wire` poisoned the governor.
+- Evidence: `Scribe root attribution does not reconcile to live ownership category_total=41947396 shard_total=0 held_total=83892491 scribe_memory_used_bytes=83892337`.
+- Cause: the one-pool follower view charged `MemoryHolder::Scribe` without a Scribe category, so held Scribe bytes exceeded category attribution.
+- Fix site: `ScribeResources::follower_memory_pool` (`resources.rs`). Follower views are query execution and now charge the query holder like every other query view. Scribe reconciliation is unchanged. The only other caller of the one pool is Forge, which already uses its own holder.
+
+**D2 — the live-lifetime journeys asserted the deleted precharge** (read-only diagnostician report).
+- Symptom: `distributed::live_stream_backpressure_and_query_owned_lifetime` failed with "held past 30 seconds … (producers=1)". `peer_network::analytical::remote_live_scribe_drop_releases_query` failed with "held 1 producers and 13260 bytes over a 13260-byte baseline".
+- Evidence:
+  - `follower_lease_held` / `lease_held` required `scribe_memory_used_bytes >= baseline + ORACLE_PARTITION_MEMORY_BYTES / 2` (`distributed.rs:1215`, `analytical.rs:1403`).
+  - The producer was held in both runs.
+- Cause: the tests encoded the 256 MiB follower precharge that TASK-003/R13 delete. A paused follower legitimately holds about 0 bytes on the one pool.
+- Fix site: the test helpers. "Held" is now one open producer plus the leader's admitted query. "Released" is zero producers, zero follower query bytes on the Scribe pod, and zero Oracle admission. The `LiveScribeHolds` control reply carries follower query bytes.
+- Callers checked: `limit_stops_unneeded_live_fragment_without_footer` (same release helper).
+- Verification: all three journeys pass.

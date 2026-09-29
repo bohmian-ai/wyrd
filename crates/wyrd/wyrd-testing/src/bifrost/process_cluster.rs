@@ -519,8 +519,8 @@ pub enum ControlResponse {
     LiveScribeHolds {
         /// Live producers, with their snapshot references, still open here.
         open_producers: usize,
-        /// Bytes the Scribe role holds at the shared root, follower leases included.
-        memory_used_bytes: usize,
+        /// Query-memory bytes this child's live follower views hold on its one pool.
+        follower_bytes: usize,
     },
     /// Answer to [`ControlRequest::ScribeFragments`].
     ScribeFragments {
@@ -1863,11 +1863,12 @@ impl ProcessNode {
         })
     }
 
-    /// Reads this child's open live producers and Scribe root memory.
+    /// Reads this child's open live producers and follower query memory.
     ///
-    /// A remote live read holds one producer and one follower lease on the
-    /// Scribe that serves it; both returning to their baseline is the only
-    /// proof, from outside that process, that the read was released.
+    /// A remote live read holds one producer on the Scribe that serves it, and
+    /// its follower charges only the bytes its consumers hold on the pod's one
+    /// pool. Both returning to zero is the proof, from outside that process,
+    /// that the leader's stream released the read.
     ///
     /// # Errors
     ///
@@ -1877,8 +1878,8 @@ impl ProcessNode {
         match self.request(&ControlRequest::LiveScribeHolds)? {
             ControlResponse::LiveScribeHolds {
                 open_producers,
-                memory_used_bytes,
-            } => Ok((open_producers, memory_used_bytes)),
+                follower_bytes,
+            } => Ok((open_producers, follower_bytes)),
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected live Scribe holds, received {other:?}"

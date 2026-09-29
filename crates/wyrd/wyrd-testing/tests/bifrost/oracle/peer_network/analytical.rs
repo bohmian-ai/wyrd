@@ -1239,8 +1239,8 @@ const LIVE_RELEASE_POLLS: usize = 300;
 /// fragment over the peer plane. With that Scribe's producer paused after its
 /// first batch, three endings are driven in turn: the client drops its
 /// stream, the leader's deadline expires, and the Scribe process dies after
-/// rows reached the client. Each ending must release the remote producer and
-/// follower lease and every Oracle admission; the deadline ending carries the
+/// rows reached the client. Each ending must release the remote producer, its
+/// follower pool bytes, and every Oracle admission; the deadline ending carries the
 /// typed timeout, and the lost Scribe yields one failed terminal, never a
 /// successful partial result.
 ///
@@ -1283,22 +1283,21 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
     for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
         cluster.nodes_mut()[index].refresh_snapshot()?;
     }
-    let (_, baseline) = cluster.nodes_mut()[SCRIBE].live_scribe_holds()?;
     let client = public_client(&cluster.nodes()[LEADER], &api_key)?;
     let query = wyrd_client::Bifrost::query_only(&client);
     let sql = format!("SELECT id FROM vala.bifrost.{table}");
 
     let case = "client dropped";
     let stream = open_paused_remote_live(&mut cluster, &query, &sql, LIVE_OPEN_DEADLINE_MS).await?;
-    await_remote_live_held(&mut cluster, baseline, case)?;
+    await_remote_live_held(&mut cluster, case)?;
     drop(stream);
-    await_remote_live_released(&mut cluster, baseline, case).await?;
+    await_remote_live_released(&mut cluster, case).await?;
     cluster.nodes_mut()[SCRIBE].release_live_production_pause()?;
 
     let case = "leader deadline";
     let mut stream =
         open_paused_remote_live(&mut cluster, &query, &sql, LIVE_SHORT_DEADLINE_MS).await?;
-    await_remote_live_held(&mut cluster, baseline, case)?;
+    await_remote_live_held(&mut cluster, case)?;
     let failure = loop {
         match stream.next_batch().await {
             Ok(Some(_)) => {}
@@ -1316,13 +1315,13 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
         )
         .into());
     }
-    await_remote_live_released(&mut cluster, baseline, case).await?;
+    await_remote_live_released(&mut cluster, case).await?;
     cluster.nodes_mut()[SCRIBE].release_live_production_pause()?;
 
     let case = "remote Scribe lost";
     let mut stream =
         open_paused_remote_live(&mut cluster, &query, &sql, LIVE_OPEN_DEADLINE_MS).await?;
-    await_remote_live_held(&mut cluster, baseline, case)?;
+    await_remote_live_held(&mut cluster, case)?;
     let first = tokio::time::timeout(CLEAN_LEASE_INTERVAL * 100, stream.next_batch())
         .await
         .map_err(|_| format!("{case}: the first live batch never reached the client"))?
@@ -1373,35 +1372,31 @@ async fn open_paused_remote_live(
         .map_err(|error| PeerJourneyError::from(error.to_string()))
 }
 
-/// Proves the remote Scribe is holding one paused producer and its lease.
+/// Proves the paused remote read is held open by the leader's admitted query.
+///
+/// The remote Scribe holds exactly one paused producer with its snapshot, and
+/// the leader still admits the query that dispatched it. The follower takes no
+/// lease of its own: the leader stream owns its lifetime.
 ///
 /// # Errors
 ///
-/// Returns an error naming `case` when the producer never paused or the
-/// Scribe holds anything other than one producer and a follower lease.
+/// Returns an error naming `case` when the producer never paused, the Scribe
+/// holds other than one producer, or the leader no longer admits the query.
 fn await_remote_live_held(
     cluster: &mut BifrostProcessCluster,
-    baseline: usize,
     case: &str,
 ) -> Result<(), PeerJourneyError> {
     cluster.nodes_mut()[SCRIBE].await_live_production_paused()?;
-    let (producers, used) = cluster.nodes_mut()[SCRIBE].live_scribe_holds()?;
-    if producers != 1 || !lease_held(used, baseline) {
+    let (producers, _) = cluster.nodes_mut()[SCRIBE].live_scribe_holds()?;
+    let admitted = cluster.nodes_mut()[LEADER].ownership_snapshot()?.active_queries;
+    if producers != 1 || admitted == 0 {
         return Err(format!(
-            "{case}: the paused remote read must hold one producer and its lease, \
-             held {producers} producers and {used} bytes over a {baseline}-byte baseline"
+            "{case}: the paused remote read must hold one producer under the leader's \
+             admitted query, held {producers} producers and {admitted} leader queries"
         )
         .into());
     }
     Ok(())
-}
-
-/// Reports whether Scribe root memory still carries a follower lease.
-///
-/// A lease charges a whole partition grant, far above the memtable drift a
-/// few rows cause, so half a grant separates held from released.
-fn lease_held(used: usize, baseline: usize) -> bool {
-    used >= baseline + vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES / 2
 }
 
 /// Waits until the remote Scribe and every Oracle hold nothing for the read.
@@ -1411,13 +1406,12 @@ fn lease_held(used: usize, baseline: usize) -> bool {
 /// Returns an error naming `case` with the last holds when release never lands.
 async fn await_remote_live_released(
     cluster: &mut BifrostProcessCluster,
-    baseline: usize,
     case: &str,
 ) -> Result<(), PeerJourneyError> {
     let mut last = (0, 0);
     for _ in 0..LIVE_RELEASE_POLLS {
         last = cluster.nodes_mut()[SCRIBE].live_scribe_holds()?;
-        if last.0 == 0 && !lease_held(last.1, baseline) {
+        if last == (0, 0) {
             return await_oracles_released(cluster, case).await;
         }
         tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;

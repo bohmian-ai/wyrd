@@ -407,10 +407,10 @@ async fn serve() -> Result<(), ProcessClusterError> {
                 emit(&ControlResponse::PauseReleased)?;
             }
             ControlRequest::LiveScribeHolds => match live_scribe_holds(&server) {
-                Ok((open_producers, memory_used_bytes)) => {
+                Ok((open_producers, follower_bytes)) => {
                     emit(&ControlResponse::LiveScribeHolds {
                         open_producers,
-                        memory_used_bytes,
+                        follower_bytes,
                     })?
                 }
                 Err(error) => emit(&ControlResponse::Failed {
@@ -552,7 +552,7 @@ fn arm_execute_pause(
     Ok(pause)
 }
 
-/// Reads this child's open live producers and Scribe root memory.
+/// Reads this child's open live producers and follower query memory.
 ///
 /// # Errors
 ///
@@ -569,7 +569,7 @@ fn live_scribe_holds(server: &WyrdTestServer) -> Result<(usize, usize), ProcessC
         .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
     Ok((
         vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test(),
-        snapshot.scribe_memory_used_bytes,
+        snapshot.oracle_query_memory_used_bytes,
     ))
 }
 

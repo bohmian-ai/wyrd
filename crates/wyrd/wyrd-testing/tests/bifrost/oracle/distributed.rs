@@ -1203,17 +1203,18 @@ const LIVE_DEADLINE_MS: i64 = 120_000;
 /// Bound on waiting for a paused, cancelled, or dropped live read to settle.
 const LIVE_SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Reports whether the writer Scribe still holds a follower lease above `baseline`.
+/// Returns the query-memory bytes the writer Scribe's follower views hold.
 ///
-/// A follower lease charges a whole partition grant, orders of magnitude above
-/// the memtable drift a few journey rows cause, so half a grant separates a
-/// held lease from a released one without depending on exact memtable bytes.
+/// A follower charges only the bytes its `DataFusion` consumers actually hold
+/// on the pod's one governed pool, attributed to query memory. A paused
+/// follower may legitimately hold almost nothing, so this proves release
+/// (zero) rather than a held amount.
 ///
 /// # Errors
 ///
 /// Returns an error when the node carries no Scribe or its root snapshot fails.
-fn follower_lease_held(cluster: &WyrdTestCluster, baseline: usize) -> Result<bool, JourneyError> {
-    let used = cluster
+fn writer_follower_bytes(cluster: &WyrdTestCluster) -> Result<usize, JourneyError> {
+    Ok(cluster
         .server(0)
         .ok_or("missing writer node")?
         .state()
@@ -1221,25 +1222,42 @@ fn follower_lease_held(cluster: &WyrdTestCluster, baseline: usize) -> Result<boo
         .ok_or("writer node has no Scribe runtime")?
         .resources()
         .snapshot()?
-        .scribe_memory_used_bytes;
-    Ok(used >= baseline + vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES / 2)
+        .oracle_query_memory_used_bytes)
 }
 
-/// Waits until no live producer is open, the writer's follower lease is
-/// released, and no Oracle still admits a query or holds query memory.
+/// Reports whether the leader node still admits the live query.
+///
+/// The leader's admitted query owns the follower work it dispatched, so an
+/// admitted query while the read is paused proves the leader stream, not a
+/// follower-side lease, is what keeps the read open.
+///
+/// # Errors
+///
+/// Returns an error when the leader node has no Bifrost resources or its
+/// snapshot fails.
+fn leader_admits_query(cluster: &WyrdTestCluster) -> Result<bool, JourneyError> {
+    Ok(cluster
+        .server(1)
+        .ok_or("missing leader node")?
+        .state()
+        .bifrost_resources()
+        .ok_or("leader node has no Bifrost resources")?
+        .snapshot()?
+        .oracle_active_queries
+        != 0)
+}
+
+/// Waits until no live producer is open, the writer's follower views hold no
+/// bytes, and no Oracle still admits a query or holds query memory.
 ///
 /// # Errors
 ///
 /// Returns an error naming `case` when any of them still holds after the bound.
-async fn await_live_released(
-    cluster: &WyrdTestCluster,
-    baseline: usize,
-    case: &str,
-) -> Result<(), JourneyError> {
+async fn await_live_released(cluster: &WyrdTestCluster, case: &str) -> Result<(), JourneyError> {
     let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
     loop {
         let producers = vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test();
-        let held = follower_lease_held(cluster, baseline)?;
+        let held = writer_follower_bytes(cluster)? != 0;
         let admitted = cluster.oracle_resource_snapshots()?.iter().any(|snapshot| {
             snapshot.oracle_active_queries != 0 || snapshot.oracle_query_memory_used_bytes != 0
         });
@@ -1248,7 +1266,7 @@ async fn await_live_released(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "{case}: {producers} live producers open, follower lease held={held}, \
+                "{case}: {producers} live producers open, follower bytes held={held}, \
                  Oracle admission held={admitted}"
             )
             .into());
@@ -1301,10 +1319,11 @@ async fn open_paused_live_query(
 /// before its second batch exists: the first batch has already reached the
 /// Oracle live source while production waits, so the read is incremental
 /// rather than a whole-cohort fetch. The pause is held past 30 seconds with
-/// the snapshot and follower lease still held and no further batch produced,
-/// then released, and the query succeeds with every row. Cancelling an open
+/// the producer's snapshot held under the leader's admitted query and no
+/// further batch produced, then released, and the query succeeds with every
+/// row. Cancelling an open
 /// read and separately dropping a public client stream each release the
-/// producer, its snapshot, and its follower lease.
+/// producer, its snapshot, and its follower's pool bytes.
 ///
 /// # Errors
 ///
@@ -1325,13 +1344,6 @@ async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), Journ
         append_event_time_row(&writer, &table_fqn, id, now).await?;
     }
     cluster.refresh_oracle_snapshots().await?;
-    let baseline = writer_node
-        .state()
-        .bifrost_ingest()
-        .ok_or("writer node has no Scribe runtime")?
-        .resources()
-        .snapshot()?
-        .scribe_memory_used_bytes;
     let leader = cluster.server(1).ok_or("missing node 1")?;
     let reader = client(leader, "live-lifetime-reader").await?;
     let query = wyrd_client::Bifrost::query_only(&reader);
@@ -1366,10 +1378,10 @@ async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), Journ
         return Err(format!("{case}: the paused query ended early: {:?}", drain.await?).into());
     }
     let producers = vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test();
-    if producers != 1 || !follower_lease_held(&cluster, baseline)? {
+    if producers != 1 || !leader_admits_query(&cluster)? {
         return Err(format!(
-            "{case}: a paused read must stay open with its snapshot and lease \
-             (producers={producers})"
+            "{case}: a paused read must stay open with its snapshot under the leader's \
+             admitted query (producers={producers})"
         )
         .into());
     }
@@ -1379,20 +1391,20 @@ async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), Journ
     if ids != vec![1, 2, 3] {
         return Err(format!("{case}: expected live ids [1, 2, 3], saw {ids:?}").into());
     }
-    await_live_released(&cluster, baseline, case).await?;
+    await_live_released(&cluster, case).await?;
 
     let case = "cancelled";
     let stream = open_paused_live_query(&query, &sql, case).await?;
     let request_id = stream.request_id().clone();
     query.cancel(&request_id).await?;
-    await_live_released(&cluster, baseline, case).await?;
+    await_live_released(&cluster, case).await?;
     pause.release();
     drop(stream);
 
     let case = "client stream dropped";
     let stream = open_paused_live_query(&query, &sql, case).await?;
     drop(stream);
-    await_live_released(&cluster, baseline, case).await?;
+    await_live_released(&cluster, case).await?;
     pause.release();
     Ok(())
 }
@@ -1457,7 +1469,7 @@ async fn seed_published_and_live(
 /// unflushed Scribe. With the Scribe producer paused after its first batch,
 /// `LIMIT 1` completes from that batch alone: the query succeeds with one
 /// row, the paused fragment is cancelled without a footer, and its producer,
-/// snapshot, and follower lease release without producing the remaining
+/// snapshot, and follower pool bytes release without producing the remaining
 /// rows. An ordered limit whose top row exists only live still returns it,
 /// so DataFusion rather than an Oracle early-stop rule decides when a live
 /// child is no longer needed.
@@ -1471,14 +1483,6 @@ async fn seed_published_and_live(
 async fn limit_stops_unneeded_live_fragment_without_footer() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
     let table_fqn = seed_published_and_live(&cluster, "oracle_live_limit").await?;
-    let live_node = cluster.server(0).ok_or("missing node 0")?;
-    let baseline = live_node
-        .state()
-        .bifrost_ingest()
-        .ok_or("writer node has no Scribe runtime")?
-        .resources()
-        .snapshot()?
-        .scribe_memory_used_bytes;
     let reader = client(cluster.server(1).ok_or("missing node 1")?, "limit-reader").await?;
     let query = wyrd_client::Bifrost::query_only(&reader);
 
@@ -1507,7 +1511,7 @@ async fn limit_stops_unneeded_live_fragment_without_footer() -> Result<(), Journ
         return Err(format!("{case}: expected exactly one live id, saw {ids:?}").into());
     }
     drop(stream);
-    await_live_released(&cluster, baseline, case).await?;
+    await_live_released(&cluster, case).await?;
     let pause = vala_bifrost_redux::scribe::tail_rpc::scribe_live_production_pause_for_test();
     pause.release();
     if writer_fragment_footers(&cluster)? != footers {

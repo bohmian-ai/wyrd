@@ -86,8 +86,6 @@ pub struct OracleShutdownReport {
     /// Actual `DataFusion` reservation, not an admission quantum: an admitted
     /// query that never grew a consumer contributes nothing here.
     pub reserved_memory_bytes: u64,
-    /// Pending peer reservations observed at shutdown.
-    pub peer_pending: u64,
     /// Running peer reservations observed at shutdown.
     pub peer_running: u64,
 }
@@ -780,7 +778,6 @@ impl OracleAdmission {
             queued_queries: u64::from(state.queued),
             reserved_memory_bytes: u64::try_from(self.shared.resources.shared_memory_reserved())
                 .unwrap_or(u64::MAX),
-            peer_pending: self.slots.pending_in_use(),
             peer_running: self.shared.resources.live_slot_units(),
         }
     }
@@ -798,7 +795,6 @@ impl OracleAdmission {
             queued_queries: u64::from(state.queued),
             reserved_memory_bytes: u64::try_from(self.shared.resources.shared_memory_reserved())
                 .unwrap_or(u64::MAX),
-            peer_pending: self.slots.pending_in_use(),
             peer_running: self.shared.resources.live_slot_units(),
         }
     }
@@ -1718,7 +1714,7 @@ pub(super) fn admission_owner_for_test(
     };
     Arc::new(
         OracleAdmission::with_config(
-            Arc::new(OracleSlotManager::new(1, 1)),
+            Arc::new(OracleSlotManager::new(1)),
             role,
             true,
             config,
@@ -1816,7 +1812,7 @@ pub(in crate::oracle) mod tests {
         };
         Arc::new(
             OracleAdmission::with_config(
-                Arc::new(OracleSlotManager::new(1, 1)),
+                Arc::new(OracleSlotManager::new(1)),
                 role,
                 true,
                 config,

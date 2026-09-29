@@ -231,12 +231,6 @@ pub struct BifrostStorage {
     /// Decoded-metadata cache, present only for an Oracle-serving composition
     /// with a nonzero budget.
     metadata_cache: Option<Arc<ParquetMetadataCache>>,
-    /// Oracle memory root funding transient decodes and retained metadata.
-    ///
-    /// Absent for a composition that serves no Oracle role: such a node reads
-    /// no hot footers, so it neither reserves metadata bytes nor holds a
-    /// footer-planning slot.
-    metadata_resources: Option<OracleMetadataResources>,
     /// Node-wide ceiling on concurrent backend requests.
     ///
     /// One ceiling for every role co-located in this process, so a node running
@@ -276,7 +270,6 @@ impl BifrostStorage {
     ) -> Self {
         let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let metadata_cache = metadata_resources
-            .clone()
             .filter(|_| policy.metadata_cache_bytes() > 0)
             .map(|resources| {
                 Arc::new(ParquetMetadataCache::new(
@@ -291,7 +284,6 @@ impl BifrostStorage {
             policy,
             telemetry,
             metadata_cache,
-            metadata_resources,
             requests,
             owner: CancellationToken::new(),
             settlement: RequestSettlement::default(),
@@ -402,9 +394,9 @@ impl BifrostStorage {
     ///
     /// # Errors
     /// Returns the loader's closed [`BifrostStorageError`]:
-    /// [`BifrostStorageError::RateLimited`] when node-wide admission is full,
     /// [`BifrostStorageError::Cancelled`] or [`BifrostStorageError::Deadline`]
-    /// when this caller's bounds elapse, [`BifrostStorageError::Closed`] once
+    /// when this caller's bounds elapse, including while it waits for a
+    /// node-wide request permit, [`BifrostStorageError::Closed`] once
     /// the owner is shutting down, or the backend's own typed failure.
     pub async fn hot_metadata<R, F>(
         &self,
@@ -425,7 +417,7 @@ impl BifrostStorage {
         let Some(cache) = self.metadata_cache.as_ref() else {
             self.telemetry
                 .record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Disabled);
-            let load = self.governed_decode(reader, size);
+            let load = self.governed_decode(reader, size, bound);
             return Self::bounded(load, bound, &cancel, &self.owner)
                 .await
                 .map(RetainedMetadata::unreserved);
@@ -433,7 +425,7 @@ impl BifrostStorage {
         cache
             .get_or_load(
                 key,
-                self.governed_decode(reader, size).boxed(),
+                self.governed_decode(reader, size, bound).boxed(),
                 bound,
                 cancel,
             )
@@ -443,14 +435,31 @@ impl BifrostStorage {
     /// Builds the governed, retrying decode of one object's metadata.
     ///
     /// Owned by the storage owner rather than the cache because everything it
-    /// bounds — the footer-planning slot, node-wide request admission, and the
-    /// retry policy — belongs to the process, not to one cache entry. The cache
-    /// decides *whether* a decode happens; this decides what a decode is
-    /// allowed to spend.
+    /// bounds — node-wide request admission and the retry policy — belongs to
+    /// the process, not to one cache entry. The cache decides *whether* a
+    /// decode happens; this decides what a decode is allowed to spend. A decode
+    /// charges no memory up front: only the metadata a cache retains afterwards
+    /// is charged, at its actual size.
+    ///
+    /// Each attempt waits for one permit of the node's single request
+    /// semaphore rather than refusing when it is occupied. That wait, every
+    /// attempt, and every backoff share the one absolute `bound` the caller
+    /// fixed; the per-attempt request timeout starts only once the permit is
+    /// held, and the permit is dropped when the attempt ends however it ends.
+    /// Caller cancellation drops this future, and with it any queued wait or
+    /// held permit.
+    ///
+    /// # Errors
+    /// The returned future resolves to [`BifrostStorageError::Closed`] when the
+    /// owner shuts down while waiting for a permit,
+    /// [`BifrostStorageError::Deadline`] when `bound` elapses first,
+    /// [`BifrostStorageError::Timeout`] when one attempt exceeds the request
+    /// timeout and no retry remains, or the decode's own classified failure.
     fn governed_decode<R, F>(
         &self,
         reader: F,
         size: u64,
+        bound: Instant,
     ) -> impl std::future::Future<Output = Result<Arc<ParquetMetaData>, BifrostStorageError>>
     + Send
     + 'static
@@ -458,29 +467,13 @@ impl BifrostStorage {
         F: Fn() -> R + Send + Sync + 'static,
         R: AsyncFileReader + Send + 'static,
     {
-        let resources = self.metadata_resources.clone();
         let requests = Arc::clone(&self.requests);
+        let owner = self.owner.clone();
         let policy = self.policy;
         async move {
-            // The footer slot is the transient decode workspace, and taking it
-            // first is what bounds how many decodes a node runs at once: the
-            // Oracle root refuses the slot long before the process is out of
-            // memory to decode into.
-            let _slot = match resources.as_ref() {
-                None => None,
-                Some(resources) => Some(resources.try_acquire_footer_slot().map_err(|_| {
-                    BifrostStorageError::RateLimited {
-                        detail: "the Oracle memory root has no free footer slot".to_owned(),
-                    }
-                })?),
-            };
             let mut attempt = 0_u32;
             loop {
-                let permit = requests.clone().try_acquire_owned().map_err(|_| {
-                    BifrostStorageError::RateLimited {
-                        detail: "node-wide storage request admission is full".to_owned(),
-                    }
-                })?;
+                let permit = Self::acquire_request(&requests, &owner, bound).await?;
                 let decoded = tokio::time::timeout(
                     policy.request_timeout(),
                     Self::decode_metadata(reader(), size),
@@ -561,10 +554,10 @@ impl BifrostStorage {
     /// # Errors
     /// Returns the closed [`BifrostStorageError`] the governed read reached:
     /// [`BifrostStorageError::Closed`] when the owner is shutting down,
-    /// [`BifrostStorageError::RateLimited`] when node-wide admission is full,
     /// [`BifrostStorageError::Timeout`] for one attempt's timeout,
-    /// [`BifrostStorageError::Deadline`] when the fixed retry bound elapses, or
-    /// the backend's own classified failure.
+    /// [`BifrostStorageError::Deadline`] when the fixed retry bound elapses,
+    /// including while waiting for a node-wide request permit, or the
+    /// backend's own classified failure.
     pub async fn exists(&self, key: &str) -> Result<bool, BifrostStorageError> {
         self.run_read(StorageOperation::Exists, || self.operator().exists(key))
             .await
@@ -638,10 +631,11 @@ impl BifrostStorage {
     /// Writes one object's complete bytes as a single, unrepeated effect.
     ///
     /// # Errors
-    /// Returns [`BifrostStorageError::Closed`],
-    /// [`BifrostStorageError::RateLimited`], [`BifrostStorageError::Timeout`],
-    /// or the backend's classified failure. Never retried: a replayed
-    /// publication is how a duplicate data file reaches a snapshot.
+    /// Returns [`BifrostStorageError::Closed`], [`BifrostStorageError::Timeout`],
+    /// [`BifrostStorageError::Deadline`] when the operation bound elapses
+    /// (including while waiting for a request permit), or the backend's
+    /// classified failure. Never retried: a replayed publication is how a
+    /// duplicate data file reaches a snapshot.
     pub async fn write_once(&self, key: &str, bytes: Bytes) -> Result<(), BifrostStorageError> {
         self.run_once(StorageOperation::Write, async {
             self.operator().write(key, bytes).await.map(|_| ())
@@ -713,8 +707,8 @@ impl BifrostStorage {
     /// Runs one idempotent read under the owner's complete governance.
     ///
     /// The absolute bound is fixed once, at entry, so a sequence of attempts
-    /// can never extend its own budget. Each attempt takes its own request
-    /// permit and races, in this precedence, owner cancellation, that fixed
+    /// can never extend its own budget. Each attempt waits within that bound for
+    /// its own request permit and then races, in this precedence, owner cancellation, that fixed
     /// bound, the per-attempt request timeout, and the operation itself; the
     /// losing future is dropped before the method returns or retries, so no
     /// backend work and no permit survives a terminal result. Another attempt
@@ -728,9 +722,9 @@ impl BifrostStorage {
     ///
     /// # Errors
     /// Returns the closed [`BifrostStorageError`] of the last attempt, or
-    /// [`BifrostStorageError::Closed`], [`BifrostStorageError::RateLimited`],
-    /// or [`BifrostStorageError::Deadline`] when the owner refused, admission
-    /// was full, or the fixed bound elapsed.
+    /// [`BifrostStorageError::Closed`] or [`BifrostStorageError::Deadline`]
+    /// when the owner refused or the fixed bound elapsed, including while an
+    /// attempt waited for a request permit.
     async fn run_read<T, Fut>(
         &self,
         operation: StorageOperation,
@@ -799,16 +793,16 @@ impl BifrostStorage {
 
     /// Runs one non-idempotent effect under the owner's governance, once.
     ///
-    /// Same admission, cancellation, and per-attempt timeout as a read, and
-    /// deliberately no absolute retry bound and no second attempt: the owner
+    /// Same admission, cancellation, and per-attempt timeout as a read, bounded
+    /// by the policy's retry-elapsed ceiling in place of a caller bound, and
+    /// deliberately no second attempt: the owner
     /// cannot distinguish an effect that never landed from one whose
     /// acknowledgement was lost, so replaying it is how a duplicate object or a
     /// second delete happens.
     ///
     /// # Errors
-    /// Returns [`BifrostStorageError::Closed`],
-    /// [`BifrostStorageError::RateLimited`], [`BifrostStorageError::Timeout`],
-    /// or the backend's classified failure.
+    /// Returns [`BifrostStorageError::Closed`], [`BifrostStorageError::Timeout`],
+    /// [`BifrostStorageError::Deadline`], or the backend's classified failure.
     async fn run_once<T, Fut>(
         &self,
         operation: StorageOperation,
@@ -839,11 +833,16 @@ impl BifrostStorage {
 
     /// Admits and races exactly one attempt of a governed operation.
     ///
-    /// The race is biased in the fixed precedence order — owner cancellation,
-    /// the absolute read bound when one applies, the per-attempt request
-    /// timeout, then completion — so the absolute bound terminates an in-flight
-    /// attempt even when its own timeout has not elapsed, and a request timeout
-    /// wins only when it truly occurs first. A panic beneath the backend client
+    /// The attempt first waits for one permit of the node's single request
+    /// semaphore under owner cancellation and the absolute bound — the caller's
+    /// `bound`, or the policy's retry-elapsed ceiling when it supplies none —
+    /// so an occupied semaphore delays the attempt instead of refusing it. The
+    /// per-attempt request timeout starts only once the permit is held. The
+    /// race is then biased in the fixed precedence order — owner cancellation,
+    /// the absolute bound, the per-attempt request timeout, then completion —
+    /// so the absolute bound terminates an in-flight attempt even when its own
+    /// timeout has not elapsed, and a request timeout wins only when it truly
+    /// occurs first. The permit is dropped on every exit. A panic beneath the backend client
     /// is caught here and reported as a one-attempt backend failure, because a
     /// panicked effect may already have been durable.
     ///
@@ -859,12 +858,10 @@ impl BifrostStorage {
     where
         Fut: std::future::Future<Output = Result<T, opendal::Error>>,
     {
-        let permit = self.requests.clone().try_acquire_owned().map_err(|_| {
-            AttemptFailure::terminal(BifrostStorageError::RateLimited {
-                detail: "node-wide storage request admission is full".to_owned(),
-            })
-        })?;
         let deadline = bound.unwrap_or_else(|| Instant::now() + self.policy.max_retry_elapsed());
+        let permit = Self::acquire_request(&self.requests, &self.owner, deadline)
+            .await
+            .map_err(AttemptFailure::terminal)?;
         tracing::trace!(
             operation = operation.as_str(),
             "Bifrost storage admitted one governed attempt"
@@ -872,7 +869,7 @@ impl BifrostStorage {
         let raced = tokio::select! {
             biased;
             () = self.owner.cancelled() => Err(AttemptFailure::terminal(BifrostStorageError::Closed)),
-            () = tokio::time::sleep_until(deadline.into()), if bound.is_some() => {
+            () = tokio::time::sleep_until(deadline.into()) => {
                 Err(AttemptFailure::terminal(BifrostStorageError::Deadline))
             }
             () = tokio::time::sleep(self.policy.request_timeout()) => {
@@ -896,6 +893,34 @@ impl BifrostStorage {
         };
         drop(permit);
         raced
+    }
+
+    /// Waits for one permit of the node's single storage-request semaphore.
+    ///
+    /// An occupied semaphore is contention, not refusal: the caller queues in
+    /// the semaphore's own FIFO order until a permit returns, the owner begins
+    /// shutting down, or the operation's absolute `deadline` elapses, in that
+    /// biased precedence. Losing the race drops the queued acquisition, so a
+    /// cancelled or expired waiter leaves nothing behind. Callers start their
+    /// per-attempt request timeout only after this returns.
+    ///
+    /// # Errors
+    /// Returns [`BifrostStorageError::Closed`] when the owner is cancelled or
+    /// the semaphore is closed, and [`BifrostStorageError::Deadline`] when
+    /// `deadline` elapses before a permit is available.
+    async fn acquire_request(
+        requests: &Arc<Semaphore>,
+        owner: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, BifrostStorageError> {
+        tokio::select! {
+            biased;
+            () = owner.cancelled() => Err(BifrostStorageError::Closed),
+            () = tokio::time::sleep_until(deadline.into()) => Err(BifrostStorageError::Deadline),
+            permit = Arc::clone(requests).acquire_owned() => {
+                permit.map_err(|_| BifrostStorageError::Closed)
+            }
+        }
     }
 
     /// Pauses one admitted attempt at an installed deterministic barrier.
@@ -1346,12 +1371,14 @@ mod governed_request_tests {
         assert_reconciled(&storage, StorageRequestOutcome::Backend, 1);
     }
 
-    /// Timeout, refusal, and owner closure each settle their own accounting.
+    /// Timeout, a permit wait that outlives its bound, and owner closure each
+    /// settle their own accounting.
     ///
     /// Split from the attempt-level matrix because every terminal here needs an
     /// owner configured to reach it — a short request timeout, a single request
-    /// slot, and no retries — and because the refusal and closure cases must be
-    /// observed while another request is deliberately held mid-flight.
+    /// slot, and no retries. The queued-wait case holds the owner's only permit
+    /// directly, so the waiter's bound — not the holder's request timeout —
+    /// decides it; the closure case holds a real request mid-flight.
     ///
     /// # Panics
     /// Panics when an expected terminal is not published or the totals do not
@@ -1379,6 +1406,33 @@ mod governed_request_tests {
         assert!(matches!(error, BifrostStorageError::Timeout { .. }));
         assert_reconciled(&timing, StorageRequestOutcome::Timeout, 1);
 
+        let held = Arc::clone(&timing.requests)
+            .acquire_owned()
+            .await
+            .expect("the owner's only permit");
+        let expired = timing
+            .run_read(StorageOperation::Stat, || async { Ok(0_u64) })
+            .await
+            .expect_err("the node's one request slot stays spent past the wait's bound");
+        assert_eq!(expired, BifrostStorageError::Deadline);
+        let expired_snapshot = timing.telemetry_snapshot();
+        assert_eq!(
+            expired_snapshot.request_terminal(StorageRequestOutcome::Deadline),
+            1
+        );
+        assert_eq!(
+            expired_snapshot.active_requests(),
+            0,
+            "the expired waiter settles and leaves nothing admitted"
+        );
+        assert_eq!(
+            timing.available_request_permits(),
+            0,
+            "the expired waiter took no permit"
+        );
+        assert_eq!(expired_snapshot.anomalies(), 0);
+        drop(held);
+
         let barrier = StorageOperationBarrier::new(StorageOperation::Exists);
         timing.install_operation_barrier_for_test(Arc::clone(&barrier));
         let stalled = tokio::spawn({
@@ -1390,23 +1444,6 @@ mod governed_request_tests {
             }
         });
         barrier.wait_until_reached().await;
-        let refused = timing
-            .run_read(StorageOperation::Stat, || async { Ok(0_u64) })
-            .await
-            .expect_err("the node's one request slot is already spent");
-        assert!(matches!(refused, BifrostStorageError::RateLimited { .. }));
-        let refused_snapshot = timing.telemetry_snapshot();
-        assert_eq!(
-            refused_snapshot.request_terminal(StorageRequestOutcome::RateLimited),
-            1
-        );
-        assert_eq!(
-            refused_snapshot.active_requests(),
-            1,
-            "only the stalled read remains admitted while the refusal settles"
-        );
-        assert_eq!(refused_snapshot.anomalies(), 0);
-
         timing.abort().await;
         assert_eq!(
             stalled
@@ -1431,6 +1468,209 @@ mod governed_request_tests {
         assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
         assert_eq!(snapshot.active_requests(), 0);
         assert_eq!(snapshot.anomalies(), 0);
+    }
+
+    /// An occupied storage permit delays a read instead of refusing it, and
+    /// the wait spends the read's one operation bound.
+    ///
+    /// The owner's only permit is held directly, as another in-flight attempt
+    /// would hold it. A read queues behind it and must complete once the permit
+    /// returns inside its bound,
+    /// with its per-attempt request timeout starting only after admission —
+    /// the queued wait is deliberately longer than that timeout. A second read,
+    /// queued under a caller-owned cancellation, must settle as cancelled and
+    /// leave no waiter or permit behind.
+    ///
+    /// # Panics
+    /// Panics when a queued read is refused, times out, completes before the
+    /// permit returns, or leaves a permit or request outstanding.
+    #[tokio::test]
+    async fn occupied_storage_permit_waits_within_operation_deadline() {
+        let root = tempfile::tempdir().expect("warehouse root");
+        let storage = owner(
+            root.path(),
+            BifrostStorageConfig {
+                request_timeout_ms: Some(100),
+                max_retries: Some(0),
+                max_retry_elapsed_ms: Some(30_000),
+                max_concurrent_requests: Some(1),
+                ..BifrostStorageConfig::default()
+            },
+        );
+        let held = Arc::clone(&storage.requests)
+            .acquire_owned()
+            .await
+            .expect("the owner's only permit");
+        assert_eq!(storage.available_request_permits(), 0);
+
+        let mut queued = Box::pin(storage.run_read(StorageOperation::Read, || async {
+            Ok::<Bytes, opendal::Error>(Bytes::from_static(b"rows"))
+        }));
+        assert!(
+            futures_util::poll!(queued.as_mut()).is_pending(),
+            "an occupied permit queues the read rather than refusing it"
+        );
+        let abandoned = CancellationToken::new();
+        let cancelled = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            let abandoned = abandoned.clone();
+            async move {
+                tokio::select! {
+                    () = abandoned.cancelled() => None,
+                    read = storage.run_read(StorageOperation::Stat, || async { Ok(0_u64) }) => {
+                        Some(read)
+                    }
+                }
+            }
+        });
+        wait_until(&storage, |snapshot| snapshot.active_requests() == 2).await;
+        // Outlive the per-attempt timeout while queued: a timeout that began
+        // before admission would now fail the queued read on its first poll
+        // after the permit returns.
+        tokio::time::timeout(Duration::from_millis(300), queued.as_mut())
+            .await
+            .expect_err("the queued read stays pending while the permit is held");
+
+        abandoned.cancel();
+        assert!(
+            cancelled
+                .await
+                .expect("the cancelled waiter joins")
+                .is_none(),
+            "caller cancellation ends the queued wait"
+        );
+        wait_until(&storage, |snapshot| {
+            snapshot.request_terminal(StorageRequestOutcome::Cancelled) == 1
+        })
+        .await;
+
+        drop(held);
+        assert_eq!(
+            queued
+                .await
+                .expect("the queued read completes once the permit returns"),
+            Bytes::from_static(b"rows")
+        );
+        let snapshot = storage.telemetry_snapshot();
+        assert_eq!(snapshot.request_terminal(StorageRequestOutcome::Success), 1);
+        assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
+        assert_eq!(snapshot.active_requests(), 0);
+        assert_eq!(snapshot.anomalies(), 0);
+        assert_eq!(
+            storage.available_request_permits(),
+            1,
+            "success and cancellation both return every permit"
+        );
+    }
+
+    /// A footer decode holds no fixed memory slot: it succeeds while the Oracle
+    /// root has far less than one historical 40 MiB slot free, and the only
+    /// charge it leaves behind is the retained metadata's actual size.
+    ///
+    /// # Panics
+    /// Panics when the decode is refused, the retained metadata is unfunded,
+    /// or the root charge differs from the decoded metadata's own size.
+    #[tokio::test]
+    async fn footer_decode_has_no_fixed_memory_slot() {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        const MIB: usize = 1024 * 1024;
+        let oracle = crate::resources::BifrostRuntimeResources::composed_for_test(
+            512 * MIB,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        )
+        .oracle()
+        .expect("the fixture observation admits Oracle");
+        let used = || {
+            oracle
+                .snapshot()
+                .expect("root snapshot")
+                .oracle_memory_used_bytes
+        };
+        // Drain the root, then return one MiB: the decode must fit in room far
+        // smaller than a fixed 40 MiB slot.
+        let mut held = Vec::new();
+        while let Ok(reservation) = oracle.metadata().try_reserve_metadata(MIB) {
+            held.push(reservation);
+        }
+        assert!(
+            held.pop().is_some(),
+            "the fixture root admits some metadata"
+        );
+        assert!(
+            oracle.metadata().try_reserve_metadata(2 * MIB).is_err(),
+            "the drained root has under two MiB free"
+        );
+        let drained = used();
+
+        let root = tempfile::tempdir().expect("warehouse root");
+        let signer = wyrd_storage::signer::BackendSigner::Local(
+            wyrd_storage::local::LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
+        );
+        let storage = BifrostStorage::new(
+            Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
+            BifrostStoragePolicy::resolve(
+                BifrostStorageConfig {
+                    metadata_cache_bytes: Some(MIB as u64),
+                    ..BifrostStorageConfig::default()
+                },
+                512 * MIB as u64,
+                true,
+            )
+            .expect("the fixture storage policy is valid"),
+            Some(oracle.metadata()),
+        );
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from((0..64).collect::<Vec<i64>>())) as ArrayRef],
+        )
+        .expect("footer fixture batch");
+        let mut buffer = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buffer, schema, None)
+            .expect("footer fixture writer");
+        writer.write(&batch).expect("footer fixture write");
+        writer.close().expect("footer fixture close");
+        let object = Bytes::from(buffer);
+        let key = HotMetadataKey::new(
+            wyrd_spec::ids::DataTenantId::new_v7(),
+            "vala.bifrost.events".to_owned(),
+            "footer.parquet".to_owned(),
+            uuid::Uuid::nil(),
+            [0x40; 32],
+            u64::try_from(object.len()).expect("fixture size fits u64"),
+        );
+        let key_bytes = usize::try_from(key.owned_bytes()).expect("key size fits usize");
+
+        let retained = storage
+            .hot_metadata(
+                key,
+                move || std::io::Cursor::new(object.clone()),
+                Instant::now() + Duration::from_secs(30),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a footer decodes without a fixed memory slot");
+        assert!(
+            retained.is_funded(),
+            "the drained root still funds the actual bytes"
+        );
+        assert_eq!(
+            used() - drained,
+            retained.metadata().memory_size() + key_bytes,
+            "the only charge is the retained metadata and key's actual size"
+        );
+        drop(retained);
+        drop(held);
+        storage.abort().await;
     }
 
     /// An abort cannot report a closed owner while governed work is still admitted.

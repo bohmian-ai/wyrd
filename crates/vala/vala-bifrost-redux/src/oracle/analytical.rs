@@ -3141,11 +3141,19 @@ impl AnalyticalGraphLifecycle {
     /// identities, so a partial cut is never observable and no dispatch can
     /// address a participant that has not agreed to hold the envelope.
     ///
+    /// A participant that explicitly refuses before accepting work ends the
+    /// round: every reservation the round took is released, and once every
+    /// release is acknowledged the leader waits for the refusal's retry hint
+    /// within the graph's deadline and cancellation (see
+    /// [`super::dispatcher::wait_for_peer_capacity`]) and places the graph
+    /// again. Only this leader retries; a participant never waits for it.
+    ///
     /// # Errors
     ///
     /// Returns the accepted-reservation owner unchanged when a participant
-    /// declined or the cut could not be frozen, so the caller releases exactly
-    /// what was taken.
+    /// failed ambiguously, a refusal could not be retried within the deadline
+    /// or cancellation, a round's releases were not all acknowledged, or the
+    /// cut could not be frozen, so the caller releases exactly what was taken.
     async fn reserve(
         &self,
     ) -> Result<AnalyticalParticipantReservations, AnalyticalParticipantReservations> {
@@ -3162,14 +3170,73 @@ impl AnalyticalGraphLifecycle {
             );
             return Err(AnalyticalParticipantReservations::empty());
         };
+        loop {
+            // Held from the first acceptance, so a later participant's refusal
+            // still returns everything already taken rather than stranding the
+            // peers that said yes.
+            let mut reserved = AnalyticalParticipantReservations {
+                transports: Some(Arc::clone(transports)),
+                releases: Vec::with_capacity(self.remote.len()),
+            };
+            let destinations = match self.reserve_round(transports, &mut reserved).await {
+                Ok(destinations) => destinations,
+                Err(None) => return Err(reserved),
+                Err(Some(rejected)) => {
+                    let unacknowledged = reserved.release(self.deadline).await;
+                    if !unacknowledged.is_empty() {
+                        reserved.releases = unacknowledged;
+                        return Err(reserved);
+                    }
+                    if super::dispatcher::wait_for_peer_capacity(
+                        rejected,
+                        self.deadline,
+                        &self.cancel,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    tracing::warn!(
+                        "Oracle analytical graph stopped retrying participant capacity at its deadline or cancellation"
+                    );
+                    return Err(reserved);
+                }
+            };
+            let cut = match AnalyticalParticipantCut::freeze(destinations) {
+                Ok(cut) => cut,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Oracle analytical leader could not freeze its participant cut"
+                    );
+                    return Err(reserved);
+                }
+            };
+            let _ = self.participants.set(Arc::new(cut));
+            return Ok(reserved);
+        }
+    }
+
+    /// Reserves every remote participant once, recording each acceptance.
+    ///
+    /// Every accepted reservation is pushed onto `reserved` as it arrives, so
+    /// whatever ends the round, the caller holds exactly what was taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Some(rejected))` when a participant explicitly refused
+    /// before accepting work, carrying its retry hint, and `Err(None)` for
+    /// cancellation, deadline expiry, or any transport or contract failure,
+    /// none of which is retried as capacity.
+    async fn reserve_round(
+        &self,
+        transports: &super::dispatcher::OraclePeerTransportDirectory,
+        reserved: &mut AnalyticalParticipantReservations,
+    ) -> Result<
+        HashMap<Url, AnalyticalDestination>,
+        Option<wyrd_spec::vala::api::ReservationRejected>,
+    > {
         let mut destinations = HashMap::with_capacity(self.remote.len());
-        // Held from the first acceptance, so a later participant's refusal
-        // still returns everything already taken rather than stranding the
-        // peers that said yes.
-        let mut reserved = AnalyticalParticipantReservations {
-            transports: Some(Arc::clone(transports)),
-            releases: Vec::with_capacity(self.remote.len()),
-        };
         for (url, candidate) in &self.remote {
             // Bounded on both edges: the graph's cancellation ends reservation
             // the moment the attempt is gone, and the envelope's own absolute
@@ -3184,21 +3251,30 @@ impl AnalyticalGraphLifecycle {
                         url = %url,
                         "Oracle analytical graph was cancelled while reserving a participant"
                     );
-                    return Err(reserved);
+                    return Err(None);
                 }
                 answered = tokio::time::timeout_at(
                     self.deadline,
                     transports.reserve_graph(candidate, self.request.clone()),
                 ) => match answered {
-                    Ok(Ok(pending)) => pending,
+                    Ok(Ok(Ok(pending))) => pending,
+                    Ok(Ok(Err(rejected))) => {
+                        tracing::info!(
+                            node_id = ?candidate.node_id,
+                            url = %url,
+                            retry_after_ms = rejected.retry_after_ms,
+                            "Oracle analytical participant refused a graph reservation before accepting work"
+                        );
+                        return Err(Some(rejected));
+                    }
                     Ok(Err(error)) => {
                         tracing::warn!(
                             node_id = ?candidate.node_id,
                             url = %url,
                             error = %error,
-                            "Oracle analytical participant refused a graph reservation"
+                            "Oracle analytical participant failed a graph reservation"
                         );
-                        return Err(reserved);
+                        return Err(None);
                     }
                     Err(_) => {
                         tracing::warn!(
@@ -3206,7 +3282,7 @@ impl AnalyticalGraphLifecycle {
                             url = %url,
                             "Oracle analytical participant did not answer a reservation in time"
                         );
-                        return Err(reserved);
+                        return Err(None);
                     }
                 },
             };
@@ -3230,18 +3306,7 @@ impl AnalyticalGraphLifecycle {
                 },
             );
         }
-        let cut = match AnalyticalParticipantCut::freeze(destinations) {
-            Ok(cut) => cut,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "Oracle analytical leader could not freeze its participant cut"
-                );
-                return Err(reserved);
-            }
-        };
-        let _ = self.participants.set(Arc::new(cut));
-        Ok(reserved)
+        Ok(destinations)
     }
 
     /// Retains every unacknowledged release until it resolves, expires, or the
@@ -4202,7 +4267,7 @@ mod tests {
             let fence = 7;
             let supervisor = Arc::new(AnalyticalSupervisor::new());
             let reservations = Arc::new(ReservationRegistry::new(
-                Arc::new(crate::oracle::OracleSlotManager::new(4, 4)),
+                Arc::new(crate::oracle::OracleSlotManager::new(4)),
                 16,
             ));
             let ingress = AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
@@ -4580,6 +4645,7 @@ mod tests {
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(60);
         let transport = Arc::new(ReservingTransport::new(accepted, expires_at));
+        transport.lose_refused_peers();
         let directory = Arc::new(
             super::super::dispatcher::OraclePeerTransportDirectory::new_for_test(
                 fixture.node_id,
@@ -6675,6 +6741,10 @@ mod tests {
         release_hangs: std::sync::atomic::AtomicBool,
         /// How many reserves are accepted before the rest are refused.
         accepted: usize,
+        /// While set, a refused reserve is a lost peer — a transport failure —
+        /// rather than an explicit pre-accept capacity refusal the leader
+        /// retries.
+        refusals_are_losses: std::sync::atomic::AtomicBool,
         /// While set, every release answers with an unacknowledged failure.
         release_fails: std::sync::atomic::AtomicBool,
         /// Wall-clock expiry every accepted reservation is minted with.
@@ -6691,9 +6761,16 @@ mod tests {
                 reserve_hangs: std::sync::atomic::AtomicBool::new(false),
                 release_hangs: std::sync::atomic::AtomicBool::new(false),
                 accepted,
+                refusals_are_losses: std::sync::atomic::AtomicBool::new(false),
                 release_fails: std::sync::atomic::AtomicBool::new(false),
                 expires_at,
             }
+        }
+
+        /// Makes every later refused reserve fail as a lost peer would.
+        fn lose_refused_peers(&self) {
+            self.refusals_are_losses
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// Makes every later reserve park forever instead of answering.
@@ -6741,6 +6818,14 @@ mod tests {
     #[async_trait]
     impl super::super::dispatcher::OraclePeerTransport for ReservingTransport {
         /// Accepts the first `accepted` reservations and refuses the rest.
+        ///
+        /// A refusal is an explicit capacity rejection unless the transport
+        /// was told to lose refused peers.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`super::super::dispatcher::DispatchError::Unavailable`] for
+        /// a refused reserve once refused peers are lost.
         async fn reserve(
             &self,
             worker: NodeId,
@@ -6758,6 +6843,13 @@ mod tests {
             };
             if self.reserve_hangs.load(std::sync::atomic::Ordering::SeqCst) {
                 std::future::pending::<()>().await;
+            }
+            if ordinal >= self.accepted
+                && self
+                    .refusals_are_losses
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(super::super::dispatcher::DispatchError::Unavailable);
             }
             if ordinal >= self.accepted {
                 return Ok(wyrd_spec::vala::api::ReserveNodeSlotsResponse::Rejected(
@@ -7064,7 +7156,7 @@ mod tests {
         );
     }
 
-    /// A refusal after an acceptance returns exactly what was taken.
+    /// A lost participant after an acceptance returns exactly what was taken.
     ///
     /// # Panics
     ///
@@ -7072,6 +7164,7 @@ mod tests {
     /// a partial cut is published, or when acknowledged cleanup is retained.
     async fn assert_partial_reservation_releases_exactly(expires_at: DateTime<Utc>) {
         let refused = ReservationFixture::start(1, expires_at);
+        refused.transport.lose_refused_peers();
         let error = refused
             .signals
             .publish_participants()
@@ -7097,6 +7190,58 @@ mod tests {
         assert!(
             refused.graph.execution_handle().is_healthy(),
             "an acknowledged release leaves no retained cleanup"
+        );
+    }
+
+    /// An explicit capacity refusal releases the round, waits its hint, and
+    /// places the graph again until the deadline leaves no room.
+    ///
+    /// The first participant accepts and the second refuses with a one-second
+    /// hint; every later reserve is refused. On paused time the leader must
+    /// release the one acceptance before waiting, retry after exactly each
+    /// hint, and stop at the first wake the 2.5-second deadline cannot hold.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the round is not released before the wait, a retry is
+    /// early, late, or missing, or the attempt outlives its deadline.
+    async fn assert_refused_round_retries_within_deadline(expires_at: DateTime<Utc>) {
+        let started = tokio::time::Instant::now();
+        let refused = ReservationFixture::start_bounded(
+            1,
+            expires_at,
+            started + Duration::from_millis(2_500),
+        );
+        let error = refused
+            .signals
+            .publish_participants()
+            .await
+            .expect_err("a participant that stays full exhausts the deadline");
+        assert!(
+            matches!(error, BifrostError::QueryAdmissionRejected),
+            "exhausted capacity is an admission refusal: {error:?}"
+        );
+        assert_eq!(
+            refused.transport.reserves().len(),
+            4,
+            "two participants in the first round, then one refused retry per hint"
+        );
+        assert_eq!(
+            refused.transport.releases(),
+            vec![(
+                refused.remote[0].1.node_id,
+                Uuid::from_u128(200).to_string()
+            )],
+            "the refused round's one acceptance is returned before the wait"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(2),
+            "the leader waits exactly each refusal's hint and no wake past its deadline"
+        );
+        assert!(
+            refused.signals.participants().get().is_none(),
+            "a refused placement publishes no cut"
         );
     }
 
@@ -7182,8 +7327,10 @@ mod tests {
     /// reservation count alone. Nothing is reserved until selection is final.
     /// The graph-owned cut cell stays unset until *every* participant has
     /// accepted, so no channel resolves against a partial cut and none is dialed
-    /// while it is unset. A refusal after earlier acceptances returns exactly
-    /// the reservations that were taken and publishes nothing. And a release
+    /// while it is unset. A loss after earlier acceptances returns exactly
+    /// the reservations that were taken and publishes nothing; an explicit
+    /// capacity refusal also releases its round before the leader waits its
+    /// hint and retries within the deadline. And a release
     /// whose acknowledgement never arrived keeps the graph draining until either
     /// the follower answers or both the follower-stated expiry and a full local
     /// pending TTL have passed.
@@ -7207,6 +7354,7 @@ mod tests {
         assert_reserved_once_and_published(&selected).await;
         drop(selected);
         assert_partial_reservation_releases_exactly(expires_at).await;
+        assert_refused_round_retries_within_deadline(expires_at).await;
         assert_ambiguous_release_retains_until_acknowledged(expires_at).await;
         assert_expiry_needs_both_clocks().await;
     }

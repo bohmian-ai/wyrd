@@ -1947,7 +1947,7 @@ mod tests {
         let mut held = Vec::new();
         // Coarse first, then exact, so the root is drained past the point where
         // even one more entry's worth of bytes is available.
-        for bytes in [crate::resources::ORACLE_METADATA_MEMORY_BYTES, exact] {
+        for bytes in [1024 * 1024, exact] {
             while let Ok(reservation) = oracle.metadata().try_reserve_metadata(bytes) {
                 held.push(reservation);
             }

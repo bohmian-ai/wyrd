@@ -605,8 +605,6 @@ struct OwnershipBaseline {
     spill_files: u64,
     /// Bytes held by retained Oracle spill files.
     spill_file_bytes: u64,
-    /// Pending peer reservations across every node.
-    peer_pending: u64,
     /// Running peer reservations across every node.
     peer_running: u64,
 }
@@ -625,7 +623,6 @@ async fn ownership_baseline(cluster: &WyrdTestCluster) -> Result<OwnershipBaseli
         spill_directories: inspection.spill_directories,
         spill_files: inspection.spill_files,
         spill_file_bytes: inspection.spill_file_bytes,
-        peer_pending: inspection.peer_pending,
         peer_running: inspection.peer_running,
     })
 }

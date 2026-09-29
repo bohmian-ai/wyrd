@@ -1675,10 +1675,7 @@ impl<'a> OracleRoleBuilder<'a> {
         let running_slots = usize::try_from(split.total_units()).map_err(|_| {
             ServerBootError::OraclePeer("Oracle slot count exceeds usize".to_owned())
         })?;
-        let slots = Arc::new(OracleSlotManager::new(
-            config.oracle.admission_waiters,
-            running_slots,
-        ));
+        let slots = Arc::new(OracleSlotManager::new(running_slots));
         // Query concurrency is the single number that decides whether this node
         // serves or queues, and it is derived rather than configured. An
         // operator diagnosing query latency needs it at startup, not inferred

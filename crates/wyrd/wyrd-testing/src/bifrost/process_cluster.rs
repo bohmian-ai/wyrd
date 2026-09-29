@@ -617,8 +617,6 @@ pub struct OracleOwnershipSnapshot {
     pub queued_queries: u64,
     /// Memory bytes reserved by active queries.
     pub reserved_memory_bytes: u64,
-    /// Peer pending reservations held by this Oracle.
-    pub peer_pending: u64,
     /// Peer running reservations held by this Oracle.
     pub peer_running: u64,
     /// Live Oracle query owners at the process resource root.
@@ -2363,6 +2361,33 @@ impl BifrostProcessCluster {
         Ok(self.nodes[index].ready_report())
     }
 
+    /// Joins one child that admits with its own Oracle slot count.
+    ///
+    /// Exactly [`Self::join`], except the new pod replaces its memory-derived
+    /// slot count with `oracle_query_slot_limit` instead of the topology's. A
+    /// journey uses it when one receiving node must saturate before the leaders
+    /// that address it do. The topology's count is restored before returning,
+    /// so every later launch, including a [`Self::restart`] of this pod, uses
+    /// the topology's count again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::join`].
+    pub fn join_with_oracle_query_slot_limit(
+        &mut self,
+        target: ProcessNodeTarget,
+        oracle_query_slot_limit: usize,
+    ) -> Result<&NodeReport, ProcessClusterError> {
+        let index = self.nodes.len();
+        let topology = self
+            .oracle_query_slot_limit
+            .replace(oracle_query_slot_limit);
+        let joined = self.join(target).map(|_| ());
+        self.oracle_query_slot_limit = topology;
+        joined?;
+        Ok(self.nodes[index].ready_report())
+    }
+
     /// Launches one pod whose private peer socket another owner already holds.
     ///
     /// The parent binds the pod's planned peer address first, so the child
@@ -3142,7 +3167,6 @@ mod tests {
             active_queries: 7,
             queued_queries: 8,
             reserved_memory_bytes: 9,
-            peer_pending: 11,
             peer_running: 12,
             root_active_queries: 13,
             root_analytical_queries: 14,

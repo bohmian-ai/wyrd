@@ -1476,7 +1476,6 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         active_queries: 0,
         queued_queries: 0,
         reserved_memory_bytes: 0,
-        peer_pending: 0,
         peer_running: 0,
         root_active_queries: 0,
         root_analytical_queries: 0,

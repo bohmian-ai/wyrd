@@ -216,10 +216,4 @@ impl WalBenchSupport {
             bytes,
         })
     }
-
-    /// Return production WAL bytes currently retained on disk.
-    #[must_use]
-    pub fn bytes_on_disk(&self) -> u64 {
-        self.writer.bytes_on_disk()
-    }
 }

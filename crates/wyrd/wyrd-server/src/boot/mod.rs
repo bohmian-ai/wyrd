@@ -652,8 +652,6 @@ pub async fn compose_bifrost(
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
                 WalConfig::new(wal_segment_bytes)
-                    .map_err(|error| ServerBootError::Scribe(error.to_string()))?
-                    .with_disk_limit(scribe_config.wal_disk_limit_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
                 wal_volume,
             )

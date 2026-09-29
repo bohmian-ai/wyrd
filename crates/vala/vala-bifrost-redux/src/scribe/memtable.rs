@@ -888,29 +888,6 @@ impl Memtable {
         selected
     }
 
-    /// Select exactly one globally oldest writable WAL victim.
-    pub(crate) fn select_oldest_wal_victim(candidates: &[PressureCandidate]) -> Option<SealKey> {
-        candidates
-            .iter()
-            .filter_map(|candidate| {
-                candidate.oldest_wal_lsn.map(|lsn| {
-                    (
-                        lsn,
-                        candidate.first_insert_at,
-                        candidate.seal_key.to_string(),
-                        candidate.seal_key.clone(),
-                    )
-                })
-            })
-            .min_by(|left, right| {
-                left.0
-                    .cmp(&right.0)
-                    .then_with(|| left.1.cmp(&right.1))
-                    .then_with(|| left.2.cmp(&right.2))
-            })
-            .map(|(_, _, _, seal_key)| seal_key)
-    }
-
     /// Return writable and immutable append batches for one exact partition range.
     ///
     /// Structural pruning happens while the memtable locks are held: tenant,
@@ -2801,35 +2778,8 @@ mod tests {
     }
 
     #[test]
-    fn wal_pressure_flushes_exactly_one_global_oldest_bucket() {
-        let first = make_test_seal_key();
-        let second = SealKey::new(
-            first.tenant,
-            first.table.clone(),
-            crate::test_support::day_partition(2026, 7, 15),
-        );
-        let now = Instant::now();
-        let selected = Memtable::select_oldest_wal_victim(&[
-            PressureCandidate {
-                seal_key: first,
-                writable_bytes: 200,
-                first_insert_at: now,
-                oldest_wal_lsn: Some(crate::scribe::wal::WalLsn::new(11)),
-            },
-            PressureCandidate {
-                seal_key: second.clone(),
-                writable_bytes: 100,
-                first_insert_at: now,
-                oldest_wal_lsn: Some(crate::scribe::wal::WalLsn::new(10)),
-            },
-        ]);
-        assert_eq!(selected, Some(second));
-    }
-
-    #[test]
     fn stale_pressure_key_is_a_noop() {
         assert!(Memtable::select_pressure_victims(Vec::new(), 1).is_empty());
-        assert!(Memtable::select_oldest_wal_victim(&[]).is_none());
     }
 
     #[test]

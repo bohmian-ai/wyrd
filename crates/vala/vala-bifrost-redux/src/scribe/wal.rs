@@ -23,11 +23,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
-use num_traits::ToPrimitive;
-use rustix::fs::statvfs;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
@@ -71,7 +69,6 @@ thread_local! {
     /// thread that requested it.
     static WAL_REPLAY_PAYLOAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_ENCODE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static WAL_WALK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// One-shot failure after record mutation but before provisional ownership transfer.
     static WAL_FAIL_VOLUME_RETAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -439,9 +436,6 @@ impl DecodedWalRecordHeader {
 pub struct WalConfig {
     /// Maximum segment bytes before a non-empty segment rolls.
     pub segment_bytes: u64,
-    /// Optional explicit WAL disk budget. Filesystem capacity remains the
-    /// upper bound when this is present.
-    pub disk_limit_bytes: Option<u64>,
 }
 
 impl WalConfig {
@@ -452,21 +446,7 @@ impl WalConfig {
                 detail: "WAL segment_bytes must be greater than zero".to_owned(),
             });
         }
-        Ok(Self {
-            segment_bytes,
-            disk_limit_bytes: None,
-        })
-    }
-
-    /// Apply an explicit WAL disk budget.
-    pub fn with_disk_limit(mut self, disk_limit_bytes: Option<u64>) -> Result<Self, ScribeError> {
-        if disk_limit_bytes == Some(0) {
-            return Err(ScribeError::Internal {
-                detail: "WAL disk_limit_bytes must be greater than zero".to_owned(),
-            });
-        }
-        self.disk_limit_bytes = disk_limit_bytes;
-        Ok(self)
+        Ok(Self { segment_bytes })
     }
 }
 
@@ -474,7 +454,6 @@ impl Default for WalConfig {
     fn default() -> Self {
         Self {
             segment_bytes: 512 * 1024 * 1024,
-            disk_limit_bytes: None,
         }
     }
 }
@@ -1432,376 +1411,14 @@ pub struct WalSegmentRef {
     pub path: PathBuf,
 }
 
-/// WAL disk pressure thresholds from the Scribe contract.
-pub const WAL_SOFT_PRESSURE_PERCENT: u64 = 80;
-/// WAL hard admission threshold from the Scribe contract.
-pub const WAL_HARD_PRESSURE_PERCENT: u64 = 90;
-const WAL_SOFT_FREE_BYTES: u64 = 4 * 64 * 1024 * 1024;
-const WAL_HARD_FREE_BYTES: u64 = 2 * 64 * 1024 * 1024;
-
-/// Deterministic WAL capacity calculation used by admission and inspection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WalDiskPressure {
-    /// Effective capacity after applying the configured and filesystem caps.
-    pub capacity_bytes: u64,
-    /// Current WAL bytes before the proposed append.
-    pub wal_bytes: u64,
-    /// WAL bytes after the proposed append and any new segment header.
-    pub projected_bytes: u64,
-    /// Filesystem free bytes at the last one-second sample.
-    pub filesystem_available_bytes: u64,
-    /// Whether the append crosses the 80% soft pressure boundary.
-    pub soft: bool,
-    /// Whether the append must be rejected before WAL mutation.
-    pub hard: bool,
-}
-
-fn evaluate_disk_pressure(
-    capacity_bytes: u64,
-    wal_bytes: u64,
-    projected_bytes: u64,
-    filesystem_available_bytes: u64,
-) -> WalDiskPressure {
-    let soft_limit = capacity_bytes.saturating_mul(WAL_SOFT_PRESSURE_PERCENT) / 100;
-    let hard_limit = capacity_bytes.saturating_mul(WAL_HARD_PRESSURE_PERCENT) / 100;
-    WalDiskPressure {
-        capacity_bytes,
-        wal_bytes,
-        projected_bytes,
-        filesystem_available_bytes,
-        soft: projected_bytes >= soft_limit || filesystem_available_bytes < WAL_SOFT_FREE_BYTES,
-        hard: projected_bytes >= hard_limit || filesystem_available_bytes < WAL_HARD_FREE_BYTES,
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DiskSample {
-    sampled_at: Instant,
-    filesystem_capacity_bytes: u64,
-    filesystem_available_bytes: u64,
-}
-
-#[derive(Debug)]
-struct WalDiskState {
-    base_dir: PathBuf,
-    configured_limit_bytes: Option<u64>,
-    sample: Mutex<Option<DiskSample>>,
-    /// Pod-wide "the WAL disk is full" latch.
-    ///
-    /// Set on a terminal ENOSPC and cleared by [`WalDiskState::recover_if_drained`]
-    /// once a fresh sample says the condition has passed. Admission reaches the
-    /// same latch through [`WalDiskBreaker`] rather than mirroring it, because a
-    /// second copy could only diverge into a pod that refuses every append with
-    /// nothing left able to clear the refusal.
-    hard_failed: AtomicBool,
-    /// Sticky "the disk is still full" condition owned by a test injection.
-    ///
-    /// A real ENOSPC latch is re-evaluated against the filesystem, and a test
-    /// host's filesystem is never actually full, so an injected trip would be
-    /// cleared by the first retirement that happened to run — including one a
-    /// concurrent background rotation owed from earlier work. This flag stands
-    /// in for the full disk itself: while it is set, re-evaluation reports the
-    /// condition as still present, and only an explicit test clear removes it.
-    #[cfg(any(test, feature = "test-support"))]
-    forced_hard: AtomicBool,
-    accounted_bytes: AtomicU64,
-    #[cfg(test)]
-    forced_sample: Mutex<Option<ForcedSample>>,
-    #[cfg(any(test, feature = "test-support"))]
+/// Test-only WAL sync fault injections shared by every handle of one writer.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+struct WalFaults {
+    /// Fails the next group sync before the durable acknowledgment boundary.
     sync_failure: AtomicBool,
-    #[cfg(any(test, feature = "test-support"))]
+    /// Fails the next step after sync and before memtable insertion.
     post_sync_failure: AtomicBool,
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-enum ForcedSample {
-    Failure,
-    Value((u64, u64)),
-}
-
-/// Pod-wide WAL writability breaker shared with Scribe admission.
-///
-/// Admission has to refuse a full-disk append before the request reaches the
-/// WAL, which means it needs the WAL's own answer rather than a mirrored copy
-/// of it. This handle is that answer: one owner, asked on the admission path,
-/// which both trips on a terminal ENOSPC and clears itself once a fresh
-/// filesystem sample says the pod can write again. Without the clearing half a
-/// single transient ENOSPC would end ingest until the process restarted.
-#[derive(Debug, Clone)]
-pub struct WalDiskBreaker {
-    /// The one disk-state owner this breaker speaks for.
-    disk: Arc<WalDiskState>,
-}
-
-impl WalDiskBreaker {
-    /// Reports whether the WAL disk currently refuses writes.
-    ///
-    /// One atomic load. The latch is cleared by the retirement that actually
-    /// reclaims space, not by asking again: re-evaluating here would clear a
-    /// genuine ENOSPC on the very next request and turn the breaker into a
-    /// no-op.
-    #[must_use]
-    pub fn is_full(&self) -> bool {
-        self.disk.is_hard_failed()
-    }
-
-    /// Trips the breaker after a terminal WAL capacity result.
-    pub fn trip(&self) {
-        self.disk.mark_hard_failed();
-    }
-
-    /// Trips the breaker as a held test condition rather than a sampled one.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn trip_injected(&self) {
-        self.disk.mark_hard_failed_injected();
-    }
-
-    /// Releases a held test condition so retirement can clear the latch.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn clear_injection(&self) {
-        self.disk.clear_injected_hard();
-    }
-}
-
-impl WalDiskState {
-    fn new(base_dir: PathBuf, configured_limit_bytes: Option<u64>) -> Self {
-        Self {
-            base_dir,
-            configured_limit_bytes,
-            sample: Mutex::new(None),
-            hard_failed: AtomicBool::new(false),
-            #[cfg(any(test, feature = "test-support"))]
-            forced_hard: AtomicBool::new(false),
-            accounted_bytes: AtomicU64::new(0),
-            #[cfg(test)]
-            forced_sample: Mutex::new(None),
-            #[cfg(any(test, feature = "test-support"))]
-            sync_failure: AtomicBool::new(false),
-            #[cfg(any(test, feature = "test-support"))]
-            post_sync_failure: AtomicBool::new(false),
-        }
-    }
-
-    fn sample(&self) -> DiskSample {
-        if let Ok(sample) = self.sample.lock()
-            && let Some(sample) = *sample
-            && sample.sampled_at.elapsed() < Duration::from_secs(1)
-        {
-            return sample;
-        }
-        #[cfg(test)]
-        let forced = self
-            .forced_sample
-            .lock()
-            .ok()
-            .and_then(|mut value| value.take());
-        #[cfg(test)]
-        let sampled = match forced {
-            Some(ForcedSample::Value(value)) => Some(value),
-            Some(ForcedSample::Failure) => Some((0, 0)),
-            None => filesystem_space(&self.base_dir),
-        };
-        #[cfg(not(test))]
-        let sampled = None;
-        let (filesystem_capacity_bytes, filesystem_available_bytes) = sampled
-            .or_else(|| filesystem_space(&self.base_dir))
-            .unwrap_or_else(|| {
-            tracing::warn!(path = %self.base_dir.display(), "WAL filesystem capacity probe failed");
-            (u64::MAX, 0)
-        });
-        let sample = DiskSample {
-            sampled_at: Instant::now(),
-            filesystem_capacity_bytes,
-            filesystem_available_bytes,
-        };
-        if let Ok(mut current) = self.sample.lock() {
-            *current = Some(sample);
-        }
-        sample
-    }
-
-    #[cfg(test)]
-    fn force_sample(&self, sample: Option<(u64, u64)>) {
-        if let Ok(mut forced) = self.forced_sample.lock() {
-            *forced = Some(match sample {
-                Some(value) => ForcedSample::Value(value),
-                None => ForcedSample::Failure,
-            });
-        }
-        if let Ok(mut cached) = self.sample.lock() {
-            *cached = None;
-        }
-    }
-
-    fn pressure(&self, wal_bytes: u64, append_bytes: u64) -> WalDiskPressure {
-        let sample = self.sample();
-        let capacity_bytes = self
-            .configured_limit_bytes
-            .unwrap_or(u64::MAX)
-            .min(sample.filesystem_capacity_bytes);
-        evaluate_disk_pressure(
-            capacity_bytes,
-            wal_bytes,
-            wal_bytes.saturating_add(append_bytes),
-            sample.filesystem_available_bytes,
-        )
-    }
-
-    fn bytes(&self) -> u64 {
-        self.accounted_bytes.load(Ordering::Acquire)
-    }
-
-    fn add_bytes(&self, bytes: u64) {
-        self.accounted_bytes.fetch_add(bytes, Ordering::AcqRel);
-    }
-
-    fn subtract_bytes(&self, bytes: u64) {
-        let mut current = self.bytes();
-        loop {
-            let next = current.saturating_sub(bytes);
-            match self.accounted_bytes.compare_exchange(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    fn reconcile(&self) {
-        let measured = directory_bytes(&self.base_dir);
-        let current = self.bytes();
-        if measured > current {
-            self.accounted_bytes.store(measured, Ordering::Release);
-        }
-    }
-
-    fn reject_if_hard(&self, wal_bytes: u64, append_bytes: u64) -> Result<(), ScribeError> {
-        if self.hard_failed.load(Ordering::Acquire) {
-            return Err(ScribeError::WalDiskFull);
-        }
-        if self.pressure(wal_bytes, append_bytes).hard {
-            return Err(ScribeError::WalDiskFull);
-        }
-        Ok(())
-    }
-
-    fn is_hard_failed(&self) -> bool {
-        self.hard_failed.load(Ordering::Acquire)
-    }
-
-    fn mark_hard_failed(&self) {
-        self.hard_failed.store(true, Ordering::Release);
-    }
-
-    /// Marks the disk hard-failed and holds the condition against re-evaluation.
-    ///
-    /// Used by the test injections so a refusal window is not ended by an
-    /// unrelated retirement observing the host's genuinely writable disk.
-    #[cfg(any(test, feature = "test-support"))]
-    fn mark_hard_failed_injected(&self) {
-        self.forced_hard.store(true, Ordering::Release);
-        self.mark_hard_failed();
-    }
-
-    /// Removes the injected condition, leaving the latch to the ordinary
-    /// retirement-driven re-evaluation.
-    #[cfg(any(test, feature = "test-support"))]
-    fn clear_injected_hard(&self) {
-        self.forced_hard.store(false, Ordering::Release);
-    }
-
-    /// Clears the latch once the disk-full condition has actually passed.
-    ///
-    /// The latch exists so a pod stops hammering a disk it cannot write to, not
-    /// so one ENOSPC ends the pod. Re-evaluation measures the current sample and
-    /// byte total with no proposed append, and clears the latch only when that
-    /// measurement is no longer hard; a disk that is still full stays tripped.
-    /// The sample is the same one-second-cached reading every append uses, so a
-    /// pod under sustained pressure does not re-`statfs` per request.
-    ///
-    /// Returns whether the WAL is writable after this evaluation.
-    fn recover_if_drained(&self) -> bool {
-        if !self.hard_failed.load(Ordering::Acquire) {
-            return true;
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        if self.forced_hard.load(Ordering::Acquire) {
-            return false;
-        }
-        if self.pressure(self.bytes(), 0).hard {
-            return false;
-        }
-        self.hard_failed.store(false, Ordering::Release);
-        tracing::info!(
-            wal_bytes = self.bytes(),
-            "WAL disk breaker cleared after retirement reclaimed space"
-        );
-        true
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn trip_sync_failure(&self) {
-        self.sync_failure.store(true, Ordering::Release);
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn trip_post_sync_failure(&self) {
-        self.post_sync_failure.store(true, Ordering::Release);
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn take_sync_failure(&self) -> bool {
-        self.sync_failure.swap(false, Ordering::AcqRel)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn take_post_sync_failure(&self) -> bool {
-        self.post_sync_failure.swap(false, Ordering::AcqRel)
-    }
-}
-
-fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
-    let stats = statvfs(path).ok()?;
-    let block_size = if stats.f_frsize == 0 {
-        stats.f_bsize
-    } else {
-        stats.f_frsize
-    };
-    Some((
-        stats.f_blocks.saturating_mul(block_size),
-        stats.f_bavail.saturating_mul(block_size),
-    ))
-}
-
-fn directory_bytes(path: &Path) -> u64 {
-    #[cfg(test)]
-    if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
-        WAL_WALK_COUNT.with(|count| count.set(count.get() + 1));
-    }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| {
-            let path = entry.path();
-            let Ok(metadata) = entry.metadata() else {
-                return 0;
-            };
-            if metadata.is_dir() {
-                directory_bytes(&path)
-            } else if metadata.is_file() {
-                metadata.len()
-            } else {
-                0
-            }
-        })
-        .sum()
 }
 
 fn wal_io_error(context: &str, error: &io::Error) -> ScribeError {
@@ -2182,7 +1799,9 @@ pub struct WalWriter {
     next_lsn: Arc<AtomicU64>,
     segment_bytes: u64,
     states: Arc<Vec<Mutex<WalState>>>,
-    disk: Arc<WalDiskState>,
+    /// Test-only sync fault injections shared across handles.
+    #[cfg(any(test, feature = "test-support"))]
+    faults: Arc<WalFaults>,
     retirement_refs: Arc<Mutex<HashMap<PathBuf, usize>>>,
     /// Released segments whose deletion has not yet succeeded.
     ///
@@ -2297,15 +1916,7 @@ impl WalHandle {
     }
 
     pub(crate) fn sync_segments(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
-        match self.writer.sync_segments_with_fault(segments) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if matches!(error, ScribeError::WalDiskFull) {
-                    self.writer.disk.mark_hard_failed();
-                }
-                Err(error)
-            }
-        }
+        self.writer.sync_segments_with_fault(segments)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2449,22 +2060,6 @@ impl WalWriter {
         Self::new_with_shard_id_and_volume(base_dir, node_id, writer_epoch, shard_id, config, None)
     }
 
-    /// Chooses the capacity WAL disk pressure is measured against.
-    ///
-    /// A governed volume refuses growth at its configured ceiling, so that
-    /// ceiling bounds any explicit WAL limit; soft pressure then seals the
-    /// oldest buckets before the volume turns appends into disk-full refusals.
-    fn pressure_limit(
-        configured: Option<u64>,
-        volume: Option<&crate::resources::WalVolume>,
-    ) -> Option<u64> {
-        let volume_limit = volume.map(crate::resources::WalVolume::configured_limit_bytes);
-        match (configured, volume_limit) {
-            (Some(configured), Some(volume)) => Some(configured.min(volume)),
-            (configured, volume) => configured.or(volume),
-        }
-    }
-
     /// Constructs one shard stream with an optional live physical-volume owner.
     fn new_with_shard_id_and_volume(
         base_dir: impl AsRef<Path>,
@@ -2474,15 +2069,13 @@ impl WalWriter {
         config: WalConfig,
         volume: Option<Arc<crate::resources::WalVolume>>,
     ) -> Result<Self, ScribeError> {
-        let config =
-            WalConfig::new(config.segment_bytes)?.with_disk_limit(config.disk_limit_bytes)?;
+        let config = WalConfig::new(config.segment_bytes)?;
         if shard_id >= 16 {
             return Err(ScribeError::Internal {
                 detail: format!("WAL shard id must be below 16, got {shard_id}"),
             });
         }
         let base_dir = base_dir.as_ref().to_path_buf();
-        let disk_dir = base_dir.clone();
         let writer = Self {
             base_dir,
             node_id,
@@ -2491,10 +2084,8 @@ impl WalWriter {
             next_lsn: Arc::new(AtomicU64::new(0)),
             segment_bytes: config.segment_bytes,
             states: Arc::new((0..16).map(|_| Mutex::new(WalState::default())).collect()),
-            disk: Arc::new(WalDiskState::new(
-                disk_dir,
-                Self::pressure_limit(config.disk_limit_bytes, volume.as_deref()),
-            )),
+            #[cfg(any(test, feature = "test-support"))]
+            faults: Arc::default(),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
             deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
             volume,
@@ -2516,9 +2107,6 @@ impl WalWriter {
         }
         let mut next_lsn = 0_u64;
         for path in paths {
-            if let Ok(metadata) = std::fs::metadata(&path) {
-                self.disk.add_bytes(metadata.len());
-            }
             let segment = WalSegment::open(&path)?;
             let header = segment.header();
             if header.node_id != self.node_id || header.writer_epoch != self.writer_epoch {
@@ -2584,48 +2172,30 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Returns the pod-wide WAL writability breaker for this writer's disk.
+    /// Makes the governed WAL device report no free space, or restores it.
     ///
-    /// Admission refuses against this handle rather than against a copy of its
-    /// state, so the disk-full condition has exactly one owner and admission
-    /// recovers the moment that owner says the condition has passed.
-    #[must_use]
-    pub fn disk_full_breaker(&self) -> WalDiskBreaker {
-        WalDiskBreaker {
-            disk: Arc::clone(&self.disk),
-        }
-    }
-
-    /// Trip the concrete WAL disk breaker for deterministic failure-path
-    /// tests. This uses the same hard-state check as a real ENOSPC result and
-    /// therefore exercises rejection before LSN allocation or file mutation.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn trip_disk_full_for_test(&self) {
-        self.disk.mark_hard_failed_injected();
-    }
-
-    /// Re-evaluates the disk-full latch the way retirement does.
+    /// # Panics
     ///
-    /// Exposed so a test can drive the recovery half of the breaker without
-    /// having to produce a real segment retirement; the evaluation itself is
-    /// the production one.
+    /// Panics when this writer has no governed volume to inject into.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn recover_disk_for_test(&self) {
-        self.disk.clear_injected_hard();
-        self.disk.recover_if_drained();
+    pub fn set_device_full_for_test(&self, full: bool) {
+        self.volume
+            .as_ref()
+            .expect("device-full injection requires a governed WAL volume")
+            .set_device_full_for_test(full);
     }
 
     /// Inject one WAL `sync_data` failure after the record write and before
     /// the durable acknowledgment boundary.
     #[cfg(any(test, feature = "test-support"))]
     pub fn trip_sync_failure_for_test(&self) {
-        self.disk.trip_sync_failure();
+        self.faults.sync_failure.store(true, Ordering::Release);
     }
 
     /// Inject one failure after WAL sync and before memtable insertion.
     #[cfg(any(test, feature = "test-support"))]
     pub fn trip_post_sync_failure_for_test(&self) {
-        self.disk.trip_post_sync_failure();
+        self.faults.post_sync_failure.store(true, Ordering::Release);
     }
 
     /// Return the single WAL handle owned by one fixed shard task.
@@ -2658,7 +2228,8 @@ impl WalWriter {
             next_lsn: Arc::clone(&self.next_lsn),
             segment_bytes: self.segment_bytes,
             states: Arc::clone(&self.states),
-            disk: Arc::clone(&self.disk),
+            #[cfg(any(test, feature = "test-support"))]
+            faults: Arc::clone(&self.faults),
             retirement_refs: Arc::clone(&self.retirement_refs),
             deferred_deletes: Arc::clone(&self.deferred_deletes),
             volume: self.volume.clone(),
@@ -2793,10 +2364,6 @@ impl WalWriter {
         } else {
             0
         };
-        self.disk.reject_if_hard(
-            self.bytes_on_disk(),
-            encoded_bytes.saturating_add(new_segment_bytes),
-        )?;
         let header_growth = self
             .volume
             .as_ref()
@@ -2851,20 +2418,12 @@ impl WalWriter {
                     prior_file_len,
                     new_segment_bytes,
                 )?;
-                if matches!(error, ScribeError::WalDiskFull) {
-                    self.disk.mark_hard_failed();
-                }
-                drop(state);
-                self.disk.reconcile();
                 return Err(error);
             }
         };
         if let Some(growth) = record_growth {
             segment.retain_volume_growth(growth)?;
         }
-        self.disk.add_bytes(encoded_bytes);
-        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
-            .set(self.bytes_on_disk().to_f64().unwrap_or(f64::MAX));
         state.current_segment_size = state.current_segment_size.saturating_add(encoded_bytes);
         state.current_segment_records = state.current_segment_records.saturating_add(1);
         Ok(WalAppendResult {
@@ -2893,7 +2452,7 @@ impl WalWriter {
     fn sync_segments_with_fault(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
         let _ = self;
         #[cfg(any(test, feature = "test-support"))]
-        if self.disk.take_sync_failure() {
+        if self.faults.sync_failure.swap(false, Ordering::AcqRel) {
             let result = Err(ScribeError::Internal {
                 detail: "injected WAL sync failure".to_owned(),
             });
@@ -3019,7 +2578,7 @@ impl WalWriter {
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn take_post_sync_failure_for_test(&self) -> bool {
-        self.disk.take_post_sync_failure()
+        self.faults.post_sync_failure.swap(false, Ordering::AcqRel)
     }
 
     #[cfg(feature = "bench-support")]
@@ -3036,13 +2595,8 @@ impl WalWriter {
             })?
             .current_segment
             .clone();
-        if let Some(segment) = segment
-            && let Err(error) = segment.sync_data()
-        {
-            if matches!(error, ScribeError::WalDiskFull) {
-                self.disk.mark_hard_failed();
-            }
-            return Err(error);
+        if let Some(segment) = segment {
+            segment.sync_data()?;
         }
         Ok(())
     }
@@ -3235,18 +2789,13 @@ impl WalWriter {
                 }
             }
         }
-        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
-            .set(self.bytes_on_disk().to_f64().unwrap_or(f64::MAX));
-        // Reclaiming segment bytes is the one event that can end a disk-full
-        // condition, so it is the one place the latch is re-evaluated.
-        self.disk.recover_if_drained();
         first_error.map_or(Ok(()), Err)
     }
 
     /// Removes one closed segment file and returns its bytes to both owners.
     ///
-    /// A missing file is already deleted. The disk ledger and governed WAL
-    /// volume release the file's bytes as soon as it is unlinked, then the
+    /// A missing file is already deleted. The governed WAL volume releases
+    /// the file's bytes as soon as it is unlinked, then the
     /// parent directory is synced; after a sync failure the next pass finds
     /// the file gone and clears its deferral without releasing bytes twice.
     ///
@@ -3262,7 +2811,6 @@ impl WalWriter {
         std::fs::remove_file(path).map_err(|error| ScribeError::Internal {
             detail: format!("WAL segment retirement failed: {error}"),
         })?;
-        self.disk.subtract_bytes(file_len);
         if let Some(volume) = &self.volume {
             volume.retire(file_len).map_err(resource_volume_error)?;
         }
@@ -3277,24 +2825,6 @@ impl WalWriter {
                 })?;
         }
         Ok(())
-    }
-
-    /// Return the current on-disk byte footprint of this WAL directory.
-    #[must_use]
-    pub fn bytes_on_disk(&self) -> u64 {
-        self.disk.bytes()
-    }
-
-    /// Return the current WAL disk-pressure state without reserving an append.
-    ///
-    /// The one-second filesystem sample is shared with append admission. A
-    /// soft result is consumed by Scribe's lifecycle scanner to flush the
-    /// oldest unpublished bucket; a hard result rejects the next append.
-    #[must_use]
-    pub fn disk_pressure(&self) -> WalDiskPressure {
-        self.disk.reconcile();
-        let bytes = self.bytes_on_disk();
-        self.disk.pressure(bytes, 0)
     }
 
     /// Returns the current shard segment or creates its next ordered segment.
@@ -3326,7 +2856,6 @@ impl WalWriter {
         let header = SegmentHeader::new(self.node_id, self.writer_epoch, seq, shard_id);
 
         let segment = Arc::new(WalSegment::create(&path, header)?);
-        self.disk.add_bytes(SEGMENT_HEADER_SIZE as u64);
         state.current_segment = Some(Arc::clone(&segment));
 
         // Initialize segment size to header size
@@ -4054,6 +3583,30 @@ pub(crate) fn replay_payload_allocations_for_test() -> u64 {
     WAL_REPLAY_PAYLOAD_ALLOCATIONS.with(std::cell::Cell::get)
 }
 
+/// Sums the `.wal` segment bytes under `root`, recursing into shard directories.
+///
+/// Tests compare this physical measurement with the volume governor's WAL
+/// class so a refused or rolled-back append is proven to leave no bytes.
+#[cfg(test)]
+pub(crate) fn wal_file_bytes_for_test(root: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            match entry.metadata() {
+                Ok(metadata) if metadata.is_dir() => wal_file_bytes_for_test(&path),
+                Ok(metadata) if path.extension().is_some_and(|extension| extension == "wal") => {
+                    metadata.len()
+                }
+                _ => 0,
+            }
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4543,12 +4096,6 @@ mod tests {
                 .get("bifrost_scribe_wal_append_bytes_total")
                 .is_some_and(|bytes| *bytes > 0)
         );
-        assert!(
-            snapshot
-                .gauges
-                .get("bifrost_scribe_wal_disk_bytes")
-                .is_some_and(|bytes| *bytes > 0.0)
-        );
     }
 
     #[test]
@@ -4592,10 +4139,7 @@ mod tests {
             temp_dir.path(),
             node_id,
             1,
-            WalConfig {
-                segment_bytes: 500,
-                disk_limit_bytes: None,
-            },
+            WalConfig { segment_bytes: 500 },
         )
         .expect("writer");
 
@@ -4634,10 +4178,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = [5_u8; 16];
         let tenant_id = crate::test_support::tenant();
-        let config = WalConfig {
-            segment_bytes: 500,
-            disk_limit_bytes: None,
-        };
+        let config = WalConfig { segment_bytes: 500 };
         let key = test_seal_key(tenant_id);
         let data = vec![b'd'; 600];
         let first_lsn = {
@@ -4675,10 +4216,7 @@ mod tests {
             temp_dir.path(),
             [9u8; 16],
             1,
-            WalConfig {
-                segment_bytes: 500,
-                disk_limit_bytes: None,
-            },
+            WalConfig { segment_bytes: 500 },
         )
         .expect("writer");
         // Use a fixed batch_id so all appends route to the same shard and the
@@ -4741,54 +4279,13 @@ mod tests {
     }
 
     #[test]
-    fn disk_pressure_uses_soft_and_hard_boundaries() {
-        let soft = evaluate_disk_pressure(1_000, 799, 800, u64::MAX);
-        assert!(soft.soft);
-        assert!(!soft.hard);
-
-        let hard = evaluate_disk_pressure(1_000, 899, 900, u64::MAX);
-        assert!(hard.hard);
-
-        let low_free = evaluate_disk_pressure(1_000, 0, 1, WAL_HARD_FREE_BYTES - 1);
-        assert!(low_free.hard);
-    }
-
-    #[test]
-    fn configured_disk_limit_rejects_before_creating_a_segment() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let writer = WalWriter::new(
-            temp_dir.path(),
-            [10u8; 16],
-            1,
-            WalConfig {
-                segment_bytes: 500,
-                disk_limit_bytes: Some(100),
-            },
-        )
-        .expect("writer");
-
-        let error = writer
-            .append_and_fsync_for_test(
-                &test_seal_key(crate::test_support::tenant()),
-                [1u8; 16],
-                b"data",
-            )
-            .expect_err("disk hard limit");
-        assert!(matches!(error, ScribeError::WalDiskFull));
-        assert_eq!(writer.bytes_on_disk(), 0);
-    }
-
-    #[test]
     fn segment_retirement_waits_for_every_generation_reference() {
         let temp_dir = TempDir::new().expect("temp dir");
         let writer = WalWriter::new(
             temp_dir.path(),
             [11u8; 16],
             1,
-            WalConfig {
-                segment_bytes: 500,
-                disk_limit_bytes: None,
-            },
+            WalConfig { segment_bytes: 500 },
         )
         .expect("writer");
         // Use a fixed batch_id so all appends route to the same shard and
@@ -5178,61 +4675,6 @@ mod tests {
         assert!(matches!(error, ScribeError::WalDiskFull));
     }
 
-    /// Proves the WAL capacity probe agrees with direct bracketing `statvfs` samples.
-    ///
-    /// The available-space assertion uses the direct samples immediately before
-    /// and after the implementation probe so unrelated filesystem activity cannot
-    /// impose a false monotonic ordering on the three observations.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the temporary filesystem cannot be sampled or when capacity,
-    /// block-size, or observed available-space invariants diverge.
-    #[test]
-    fn statvfs_matches_direct_measurement_without_df() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let before = rustix::fs::statvfs(temp_dir.path()).expect("statvfs before probe");
-        let measured = filesystem_space(temp_dir.path()).expect("filesystem sample");
-        let after = rustix::fs::statvfs(temp_dir.path()).expect("statvfs after probe");
-
-        let before_block_size = if before.f_frsize == 0 {
-            before.f_bsize
-        } else {
-            before.f_frsize
-        };
-        let after_block_size = if after.f_frsize == 0 {
-            after.f_bsize
-        } else {
-            after.f_frsize
-        };
-        assert_ne!(before_block_size, 0, "filesystem block size is nonzero");
-        assert_eq!(before.f_blocks, after.f_blocks, "total blocks are stable");
-        assert_eq!(
-            before_block_size, after_block_size,
-            "filesystem block size is stable"
-        );
-
-        let before_capacity = before.f_blocks.saturating_mul(before_block_size);
-        let after_capacity = after.f_blocks.saturating_mul(after_block_size);
-        assert_eq!(measured.0, before_capacity);
-        assert_eq!(measured.0, after_capacity);
-
-        let before_available = before.f_bavail.saturating_mul(before_block_size);
-        let after_available = after.f_bavail.saturating_mul(after_block_size);
-        let one_block = before_block_size.max(after_block_size);
-        let lower_bound = before_available
-            .min(after_available)
-            .saturating_sub(one_block);
-        let upper_bound = before_available
-            .max(after_available)
-            .saturating_add(one_block);
-        assert!(
-            (lower_bound..=upper_bound).contains(&measured.1),
-            "measured available bytes {} must fall within bracket {lower_bound}..={upper_bound}",
-            measured.1
-        );
-    }
-
     #[test]
     fn prepared_encoded_len_matches_actual_for_payload_boundaries() {
         let key = test_seal_key(crate::test_support::tenant());
@@ -5243,40 +4685,6 @@ mod tests {
             let actual = prepared.record().expect("record").encode().len();
             assert_eq!(prepared.encoded_len().expect("encoded len"), actual);
         }
-    }
-
-    #[test]
-    fn wal_accounting_tracks_nested_state_and_retirement_actual_length() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let key = test_seal_key(crate::test_support::tenant());
-        let writer =
-            WalWriter::new(temp_dir.path(), [21; 16], 1, WalConfig::default()).expect("writer");
-        writer
-            .append_and_fsync_for_test(&key, [2; 16], b"data")
-            .expect("append");
-        let actual = directory_bytes(temp_dir.path());
-        assert_eq!(writer.bytes_on_disk(), actual);
-        drop(writer);
-        let writer =
-            WalWriter::new(temp_dir.path(), [21; 16], 1, WalConfig::default()).expect("reopen");
-        assert_eq!(
-            writer.bytes_on_disk(),
-            actual,
-            "startup accounting must include existing nested shard WAL bytes"
-        );
-        let segment = WalReader::open_directory_unfiltered(temp_dir.path())
-            .expect("reader")
-            .segments
-            .first()
-            .expect("segment")
-            .reference();
-        writer
-            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
-            .expect("close");
-        writer
-            .retire_segments(std::slice::from_ref(&segment))
-            .expect("retire");
-        assert_eq!(writer.bytes_on_disk(), directory_bytes(temp_dir.path()));
     }
 
     /// A released segment survives a skipped or failed deletion and is
@@ -5305,7 +4713,10 @@ mod tests {
         writer
             .retire_segments(std::slice::from_ref(&segment))
             .expect("current segment release");
-        assert!(segment.path.exists(), "the current segment is never deleted");
+        assert!(
+            segment.path.exists(),
+            "the current segment is never deleted"
+        );
         writer
             .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
             .expect("close");
@@ -5319,94 +4730,27 @@ mod tests {
         assert!(segment.path.exists());
         writer.retire_segments(&[]).expect("retry pass");
         assert!(!segment.path.exists(), "the deferred deletion was retried");
-        assert_eq!(writer.bytes_on_disk(), directory_bytes(temp_dir.path()));
     }
 
-    /// Proves production append streams borrowed payloads without frame copies or scans.
+    /// Proves production append streams borrowed payloads without frame copies.
     #[test]
-    fn append_streams_without_frame_encoding_or_unrelated_wal_walks() {
+    fn append_streams_without_frame_encoding() {
         let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
             WalWriter::new(temp_dir.path(), [22; 16], 1, WalConfig::default()).expect("writer");
-        let unrelated_dir = temp_dir.path().join("unrelated");
-        std::fs::create_dir_all(&unrelated_dir).expect("fixture dir");
-        for index in 0..32 {
-            let path = unrelated_dir.join(format!("unrelated-{index}.wal"));
-            std::fs::write(path, [0_u8; 8]).expect("fixture");
-        }
         let key = test_seal_key(crate::test_support::tenant());
         WAL_ENCODE_COUNT.with(|count| count.set(0));
-        WAL_WALK_COUNT.with(|count| count.set(0));
         WAL_COUNT_ACTIVE.store(true, Ordering::Relaxed);
         writer
             .append_and_fsync_for_test(&key, [2; 16], b"data")
             .expect("append");
         assert_eq!(WAL_ENCODE_COUNT.with(std::cell::Cell::get), 0);
-        assert_eq!(WAL_WALK_COUNT.with(std::cell::Cell::get), 0);
-        let _ = writer.disk_pressure();
-        assert!(WAL_WALK_COUNT.with(std::cell::Cell::get) > 0);
         WAL_COUNT_ACTIVE.store(false, Ordering::Relaxed);
     }
 
     #[test]
-    fn reconciliation_repairs_under_count_without_shard_state_lock() {
-        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
-        WAL_PARTIAL_WRITE.with(|flag| flag.set(false));
-        let temp_dir = TempDir::new().expect("temp dir");
-        let writer =
-            WalWriter::new(temp_dir.path(), [23; 16], 1, WalConfig::default()).expect("writer");
-        let key = test_seal_key(crate::test_support::tenant());
-        writer
-            .append_and_fsync_for_test(&key, [3; 16], b"data")
-            .expect("append");
-        let measured = directory_bytes(temp_dir.path());
-        writer.disk.accounted_bytes.store(0, Ordering::Release);
-        let pressure = writer.disk_pressure();
-        assert!(pressure.wal_bytes >= measured);
-        assert!(writer.bytes_on_disk() >= measured);
-    }
-
-    #[test]
-    fn failed_capacity_sample_rejects_before_mutation_then_recovers() {
-        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
-        let temp_dir = TempDir::new().expect("temp dir");
-        let writer =
-            WalWriter::new(temp_dir.path(), [24; 16], 1, WalConfig::default()).expect("writer");
-        let key = test_seal_key(crate::test_support::tenant());
-        let before = writer.bytes_on_disk();
-        let files_before = std::fs::read_dir(temp_dir.path())
-            .expect("list WAL directory")
-            .map(|entry| entry.expect("WAL directory entry").path())
-            .collect::<Vec<_>>();
-        writer.disk.force_sample(None);
-        let error = writer
-            .append_and_fsync_for_test(&key, [4; 16], b"data")
-            .expect_err("forced zero sample must reject");
-        assert!(matches!(error, ScribeError::WalDiskFull));
-        assert_eq!(writer.bytes_on_disk(), before);
-        assert_eq!(directory_bytes(temp_dir.path()), before);
-        let files_after = std::fs::read_dir(temp_dir.path())
-            .expect("list WAL directory")
-            .map(|entry| entry.expect("WAL directory entry").path())
-            .collect::<Vec<_>>();
-        assert_eq!(files_after, files_before);
-        let sample = writer
-            .disk
-            .sample
-            .lock()
-            .expect("disk sample lock")
-            .expect("failed probe is cached");
-        assert_eq!(sample.filesystem_available_bytes, 0);
-        writer.disk.force_sample(Some((u64::MAX, u64::MAX)));
-        assert!(!writer.disk_pressure().hard);
-        writer
-            .append_and_fsync_for_test(&key, [5; 16], b"data")
-            .expect("successful sample recovers");
-    }
-
-    #[test]
-    fn partial_write_reconciles_conservatively_and_allows_later_append() {
+    fn partial_write_rolls_back_and_allows_later_append() {
         let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
         WAL_PARTIAL_WRITE.with(|flag| flag.set(false));
         let temp_dir = TempDir::new().expect("temp dir");
@@ -5418,7 +4762,6 @@ mod tests {
             .append_and_fsync_for_test(&key, [6; 16], b"data")
             .expect_err("partial write must fail");
         assert!(matches!(error, ScribeError::Internal { .. }));
-        assert!(writer.bytes_on_disk() >= directory_bytes(temp_dir.path()));
         writer
             .append_and_fsync_for_test(&key, [7; 16], b"data")
             .expect("state lock and later append remain usable");
@@ -5467,45 +4810,6 @@ mod tests {
         );
     }
 
-    /// WAL disk pressure is measured against the governed volume ceiling.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a volume-backed writer without an explicit WAL limit keeps
-    /// the unbounded filesystem capacity, which lets the volume refuse appends
-    /// before soft pressure ever seals a bucket.
-    #[test]
-    fn wal_pressure_capacity_is_bounded_by_the_governed_volume() {
-        let directory = TempDir::new().expect("temporary WAL directory");
-        let [stage, scribe, oracle] =
-            ["scribe-stage", "scribe-output-scratch", "oracle"].map(|name| {
-                let path = directory.path().join(name);
-                std::fs::create_dir(&path).expect("registered volume root");
-                path
-            });
-        let limit = 64 * 1024 * 1024;
-        let governor = crate::resources::BifrostVolumeGovernor::register(
-            crate::resources::BifrostVolumeRoots {
-                wal: directory.path().to_owned(),
-                scribe_stage: stage,
-                scribe_output_scratch: scribe,
-                oracle_scratch: oracle,
-            },
-            limit,
-            crate::resources::BifrostResourceHealth::default(),
-        )
-        .expect("volume registration");
-        let writer = WalWriter::new_with_volume(
-            directory.path(),
-            [28; 16],
-            1,
-            WalConfig::default(),
-            governor.capabilities().wal,
-        )
-        .expect("volume-backed writer");
-        assert_eq!(writer.disk_pressure().capacity_bytes, limit);
-    }
-
     /// Root volume accounting commits only fsynced WAL bytes and rolls failures back.
     ///
     /// # Panics
@@ -5545,7 +4849,7 @@ mod tests {
         writer
             .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect("durable append");
-        let durable = directory_bytes(directory.path());
+        let durable = wal_file_bytes_for_test(directory.path());
         assert_eq!(
             governor
                 .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
@@ -5557,7 +4861,7 @@ mod tests {
         writer
             .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect_err("write failure rolls provisional growth back");
-        assert_eq!(directory_bytes(directory.path()), durable);
+        assert_eq!(wal_file_bytes_for_test(directory.path()), durable);
         assert_eq!(
             governor
                 .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
@@ -5569,7 +4873,7 @@ mod tests {
         writer
             .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect_err("sync failure remains provisional");
-        let after_failed_sync = directory_bytes(directory.path());
+        let after_failed_sync = wal_file_bytes_for_test(directory.path());
         assert_eq!(
             governor
                 .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
@@ -5579,7 +4883,7 @@ mod tests {
         writer
             .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect("later fsync commits all pending growth");
-        let committed = directory_bytes(directory.path());
+        let committed = wal_file_bytes_for_test(directory.path());
         assert_eq!(
             governor
                 .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
@@ -5605,6 +4909,83 @@ mod tests {
                 .expect("retired volume state"),
             (0, 0, 0)
         );
+    }
+
+    /// A full configured device refuses the next append before WAL mutation,
+    /// and admission resumes as soon as retirement returns the space.
+    ///
+    /// There is no WAL-only latch: the governor's current device state is the
+    /// only decision, so the first append after retirement is admitted without
+    /// any separate clear.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture never fills the volume, a refused append leaves
+    /// WAL bytes or a provisional charge behind, or the post-retirement append
+    /// is still refused.
+    #[test]
+    fn wal_capacity_refusal_is_not_sticky() {
+        let directory = TempDir::new().expect("temporary WAL directory");
+        let [stage, scribe, oracle] =
+            ["scribe-stage", "scribe-output-scratch", "oracle"].map(|name| {
+                let path = directory.path().join(name);
+                std::fs::create_dir(&path).expect("registered volume root");
+                path
+            });
+        let governor = crate::resources::BifrostVolumeGovernor::register(
+            crate::resources::BifrostVolumeRoots {
+                wal: directory.path().to_owned(),
+                scribe_stage: stage,
+                scribe_output_scratch: scribe,
+                oracle_scratch: oracle,
+            },
+            64 * 1024,
+            crate::resources::BifrostResourceHealth::default(),
+        )
+        .expect("volume registration");
+        let writer = WalWriter::new_with_volume(
+            directory.path(),
+            [30; 16],
+            1,
+            WalConfig::default(),
+            governor.capabilities().wal,
+        )
+        .expect("volume-backed writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        let payload = vec![7_u8; 16 * 1024];
+        let mut batch = 0_u8;
+        let refusal = loop {
+            batch += 1;
+            match writer.append_and_fsync_for_test(&key, [batch; 16], &payload) {
+                Ok(_) => assert!(batch < 8, "a 64 KiB volume fills within eight appends"),
+                Err(error) => break error,
+            }
+        };
+        assert!(matches!(refusal, ScribeError::WalDiskFull), "{refusal:?}");
+        let physical = wal_file_bytes_for_test(directory.path());
+        assert_eq!(
+            governor
+                .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
+                .expect("refused volume state"),
+            (physical, 0, 0),
+            "the refused append wrote and charged nothing"
+        );
+
+        let segment = WalReader::open_directory_unfiltered(directory.path())
+            .expect("reader")
+            .segments
+            .first()
+            .expect("segment")
+            .reference();
+        writer
+            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
+            .expect("close segment");
+        writer
+            .retire_segments(std::slice::from_ref(&segment))
+            .expect("retirement returns the space");
+        writer
+            .append_and_fsync_for_test(&key, [batch; 16], &payload)
+            .expect("admission resumes once space returns");
     }
 
     /// Post-mutation ownership failures retain exact WAL charge and poison health.
@@ -5656,7 +5037,7 @@ mod tests {
                     b"data",
                 )
                 .expect_err("injected ownership transfer failure");
-            let physical = directory_bytes(directory.path());
+            let physical = wal_file_bytes_for_test(directory.path());
             let (durable, provisional, scratch) = governor
                 .usage_for_test(crate::resources::BifrostVolumeClass::Wal)
                 .expect("retained fail-closed state");

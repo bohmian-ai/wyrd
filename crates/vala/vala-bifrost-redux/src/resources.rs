@@ -553,6 +553,9 @@ pub struct BifrostVolumeGovernor {
     configured_limit_bytes: u64,
     /// Process lifecycle signal shared with memory accounting.
     health: BifrostResourceHealth,
+    /// Test-only stand-in for a device with no physical free space.
+    #[cfg(any(test, feature = "test-support"))]
+    device_full: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BifrostVolumeGovernor {
@@ -631,6 +634,8 @@ impl BifrostVolumeGovernor {
             devices: Arc::new(Mutex::new(devices)),
             configured_limit_bytes,
             health,
+            #[cfg(any(test, feature = "test-support"))]
+            device_full: Arc::default(),
         };
         for class in [
             BifrostVolumeClass::Wal,
@@ -722,6 +727,10 @@ impl BifrostVolumeGovernor {
                 detail: "volume class is not registered".to_owned(),
             })?;
         debug_assert_eq!(root.class, class);
+        #[cfg(any(test, feature = "test-support"))]
+        if self.device_full.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(0);
+        }
         filesystem_available_bytes(&root.path)?
             .checked_sub(MIN_SCRATCH_FREE_BYTES)
             .ok_or_else(|| BifrostResourceError::Occupied {
@@ -1059,6 +1068,17 @@ pub struct WalVolume {
 }
 
 impl WalVolume {
+    /// Makes this device report no physical free space, or restores it.
+    ///
+    /// Tests use this to drive the real admission refusal without filling the
+    /// host disk; every class on the device is refused while it is set.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_device_full_for_test(&self, full: bool) {
+        self.governor
+            .device_full
+            .store(full, std::sync::atomic::Ordering::Release);
+    }
+
     /// Provisionally admits exact WAL growth before write and fsync.
     ///
     /// # Errors

@@ -959,7 +959,7 @@ mod tests {
         let make_frame = |value: String| decoded_size_frame(tenant, &principal, value);
         let admission_before = scribe.admission_snapshot();
         let memory_before = scribe.memory_snapshot();
-        let wal_before = scribe.wal_bytes_on_disk();
+        let wal_before = crate::scribe::wal::wal_file_bytes_for_test(scribe.wal.base_dir());
         let stats_before = scribe
             .memtable_stats()
             .expect("pre-rejection memtable stats");
@@ -975,7 +975,10 @@ mod tests {
         ));
         assert_eq!(scribe.admission_snapshot(), admission_before);
         assert_eq!(scribe.memory_snapshot(), memory_before);
-        assert_eq!(scribe.wal_bytes_on_disk(), wal_before);
+        assert_eq!(
+            crate::scribe::wal::wal_file_bytes_for_test(scribe.wal.base_dir()),
+            wal_before
+        );
         assert_eq!(
             scribe
                 .memtable_stats()
@@ -986,7 +989,7 @@ mod tests {
             .await
             .expect("sub-limit request remains durably admissible");
         assert_eq!(admission.rows_accepted, 1);
-        assert!(scribe.wal_bytes_on_disk() > wal_before);
+        assert!(crate::scribe::wal::wal_file_bytes_for_test(scribe.wal.base_dir()) > wal_before);
         scribe
             .shutdown(Instant::now() + Duration::from_secs(1))
             .await;

@@ -1147,12 +1147,8 @@ impl ScribeImpl {
         let memory = config.resources.clone();
         let memory_ownership =
             memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
-        let wal_breaker = Some(config.wal.disk_full_breaker());
-        let admission = AdmissionController::with_config_memory_and_wal(
-            config.admission,
-            memory.clone(),
-            wal_breaker,
-        )?;
+        let admission =
+            AdmissionController::with_config_and_memory(config.admission, memory.clone())?;
         let ScribeBuildConfig {
             catalog,
             operator,
@@ -1211,7 +1207,7 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
-        Self::install_boot_metrics(wal.bytes_on_disk());
+        Self::install_boot_metrics();
         Ok(Self {
             catalog,
             wal,
@@ -1248,18 +1244,15 @@ impl ScribeImpl {
 
     /// Publish the zero-initialized Scribe boot telemetry.
     ///
-    /// Called once from [`Self::build`] so the ingress-active gauge, every named
-    /// rejection counter, and the WAL disk-bytes gauge exist at value zero (or
-    /// the current WAL residency) before the first request, giving scrapers a
-    /// stable series set from process start. `wal_disk_bytes` is the current
-    /// on-disk WAL byte count read from the freshly recovered writer.
-    fn install_boot_metrics(wal_disk_bytes: u64) {
+    /// Called once from [`Self::build`] so the ingress-active gauge and every
+    /// named rejection counter exist at value zero before the first request,
+    /// giving scrapers a stable series set from process start. Retained WAL
+    /// bytes are the volume governor's `bifrost_resource_current_bytes` series.
+    fn install_boot_metrics() {
         metrics::gauge!("bifrost_scribe_ingress_active").set(0.0);
         for reason in ["in_flight", "memory", "wal", "queue", "closed", "invalid"] {
             metrics::counter!("bifrost_scribe_rejections_total", "reason" => reason).increment(0);
         }
-        metrics::gauge!("bifrost_scribe_wal_disk_bytes")
-            .set(wal_disk_bytes.to_f64().unwrap_or(f64::MAX));
     }
 
     /// Construct a stub `ScribeImpl` for tests (memory backend, stub node identity, temp WAL).
@@ -1766,17 +1759,6 @@ impl ScribeImpl {
         }
         self.shards.request_expired_flush(now);
         self.request_pressure_seal_toward_low_water();
-        if self.wal.disk_pressure().soft {
-            let candidates = self
-                .shards
-                .memtable_snapshots()
-                .unwrap_or_default()
-                .into_iter()
-                .flat_map(|snapshot| snapshot.pressure_candidates)
-                .collect::<Vec<_>>();
-            let victim = memtable::Memtable::select_oldest_wal_victim(&candidates);
-            self.shards.request_wal_pressure_flush(victim);
-        }
     }
 
     /// Return the current admission, lane, and shard health metrics.
@@ -1883,7 +1865,9 @@ impl Scribe for ScribeImpl {
             .await
             .inspect_err(|error| {
                 let reason = match error {
-                    ScribeError::UnsupportedWalVersion { .. } => Some("wal"),
+                    ScribeError::UnsupportedWalVersion { .. } | ScribeError::WalDiskFull => {
+                        Some("wal")
+                    }
                     ScribeError::PayloadTooLarge { .. }
                     | ScribeError::DecodedPayloadTooLarge { .. }
                     | ScribeError::TooManyRows { .. }
@@ -1895,7 +1879,6 @@ impl Scribe for ScribeImpl {
                     | ScribeError::CardUnresolved
                     | ScribeError::StreamMismatch { .. } => Some("invalid"),
                     ScribeError::IngressClosed
-                    | ScribeError::WalDiskFull
                     | ScribeError::IngestBusy { .. }
                     | ScribeError::ObjectStorePutFailed(_)
                     | ScribeError::Internal { .. } => None,
@@ -2338,18 +2321,6 @@ impl ScribeImpl {
         }
         stall
     }
-    /// Sum of pending (un-fsynced or un-truncated) WAL bytes on this pod.
-    #[must_use]
-    pub fn wal_pending_bytes(&self) -> u64 {
-        self.wal.bytes_on_disk()
-    }
-
-    /// Return the number of bytes currently retained by this pod's WAL.
-    #[must_use]
-    pub fn wal_bytes_on_disk(&self) -> u64 {
-        self.wal.bytes_on_disk()
-    }
-
     /// Aggregate per-shard memtable state into one pod-level snapshot.
     ///
     /// Pure read: it sums every shard's writable and immutable counters without
@@ -2482,26 +2453,25 @@ impl ScribeImpl {
             ingress_memory_limit: memory.ingress_limit_bytes,
             ingress_high_water_memory: memory.ingress_high_water_bytes,
             ingress_low_water_memory: memory.ingress_low_water_bytes,
-            wal_disk_bytes: self.wal.bytes_on_disk(),
             ingress_lifecycle: self.ingress_lifecycle.snapshot(),
             generation_lifecycle: self.memory_ownership.lifecycle_snapshot(),
         })
     }
 
-    /// Trip the WAL availability breaker for deterministic test-tier probes.
+    /// Makes the WAL's device report no physical free space for test probes.
     ///
-    /// The refusal is held until [`Self::clear_wal_disk_full_injection_for_test`]
-    /// releases it, so a concurrent retirement observing a writable host disk
-    /// cannot end the probe's refusal window early.
+    /// Every new WAL or stage growth is then refused by the volume governor's
+    /// real admission check, before WAL mutation and without ACK, until
+    /// [`Self::clear_wal_disk_full_injection_for_test`] returns the space.
     #[cfg(any(test, feature = "test-support"))]
     pub fn trip_wal_disk_full_for_test(&self) {
-        self.admission.trip_wal_disk_full_injected();
+        self.wal.set_device_full_for_test(true);
     }
 
-    /// Release the held test refusal, leaving the latch to real retirement.
+    /// Returns the injected device's free space so admission resumes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn clear_wal_disk_full_injection_for_test(&self) {
-        self.admission.clear_wal_disk_full_injection();
+        self.wal.set_device_full_for_test(false);
     }
 
     /// Returns the bounded CPU pool used by Scribe's ingest materialization.

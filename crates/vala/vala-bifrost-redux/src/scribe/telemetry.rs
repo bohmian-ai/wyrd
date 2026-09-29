@@ -617,8 +617,6 @@ pub struct ScribeInspectionSnapshot {
     pub ingress_high_water_memory: usize,
     /// Low-water byte target that pressure sealing drains toward.
     pub ingress_low_water_memory: usize,
-    /// WAL bytes retained on disk.
-    pub wal_disk_bytes: u64,
     /// Bounded pod-global ingress ownership lifecycle observations.
     pub ingress_lifecycle: ScribeIngressLifecycleSnapshot,
     /// Bounded generation, replay, persistence-transfer, and retirement observations.

@@ -322,9 +322,6 @@ pub struct ScribeRuntimeConfig {
     /// WAL IO worker count.
     #[serde(default = "default_scribe_wal_io_threads")]
     pub wal_io_threads: usize,
-    /// Optional Scribe WAL disk budget. When absent, filesystem capacity is authoritative.
-    #[serde(default)]
-    pub wal_disk_limit_bytes: Option<u64>,
     /// Optional past-window bound (seconds) for caller-supplied `wyrd_event_time` validation.
     ///
     /// A caller-supplied `wyrd_event_time` older than this many seconds before server receipt
@@ -1460,7 +1457,6 @@ impl Default for ScribeRuntimeConfig {
             ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
             persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
             wal_io_threads: default_scribe_wal_io_threads(),
-            wal_disk_limit_bytes: None,
             event_time_past_window_secs: None,
             event_time_future_window_secs: None,
             ingest_request_bytes: default_ingest_request_bytes(),
@@ -1495,11 +1491,6 @@ impl ScribeRuntimeConfig {
         ];
         if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
             return Err(format!("scribe.{name} must be at least 1"));
-        }
-        if let Some(value) = self.wal_disk_limit_bytes
-            && value == 0
-        {
-            return Err("scribe.wal_disk_limit_bytes must be at least 1".to_owned());
         }
         if self.generation_max_age_secs == 0 {
             return Err("scribe.generation_max_age_secs must be at least 1".to_owned());
@@ -4089,7 +4080,6 @@ minimum_slots = 2
             "coordination threads {} must stay within the shard-lane bounds",
             cfg.coordination_threads
         );
-        assert_eq!(cfg.wal_disk_limit_bytes, None);
         assert_eq!(
             cfg.ingest_request_bytes,
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
@@ -4169,7 +4159,6 @@ minimum_slots = 2
         assert_rejected!(ingress_cpu_threads, 0);
         assert_rejected!(persistence_cpu_threads, 0);
         assert_rejected!(wal_io_threads, 0);
-        assert_rejected!(wal_disk_limit_bytes, Some(0));
         assert_rejected!(wal_segment_bytes, 0);
         assert_rejected!(active_generation_budget_bytes, 0);
         assert_rejected!(generation_rotation_ceiling_bytes, 0);

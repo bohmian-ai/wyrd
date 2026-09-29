@@ -407,7 +407,6 @@ pub const MAX_GROUP_ITEMS: usize = 64;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PressureSignal {
     pub(crate) keys: Vec<crate::scribe::seal_key::SealKey>,
-    pub(crate) wal_key: Option<crate::scribe::seal_key::SealKey>,
 }
 
 /// A value that can be scheduled by a Scribe shard.
@@ -1241,24 +1240,6 @@ impl ScribeShardRuntime {
         for sender in &self.pressure_senders {
             sender.send_replace(Some(PressureSignal {
                 keys: keys.to_owned(),
-                wal_key: None,
-            }));
-        }
-    }
-
-    /// Fan out a WAL pressure signal for one victim key to every shard owner.
-    ///
-    /// Under batch-spread routing the victim key may have buckets on any shard
-    /// lane, so the signal is sent to all shards; each shard holding the key
-    /// rotates its whole generation, which is the unit that retires WAL.
-    pub(crate) fn request_wal_pressure_flush(&self, key: Option<crate::scribe::seal_key::SealKey>) {
-        let Some(key) = key else {
-            return;
-        };
-        for sender in &self.pressure_senders {
-            sender.send_replace(Some(PressureSignal {
-                keys: Vec::new(),
-                wal_key: Some(key.clone()),
             }));
         }
     }
@@ -1448,29 +1429,17 @@ impl ShardOwner {
         }
     }
 
-    /// Applies one coalesced memory or WAL pressure signal.
+    /// Applies one coalesced memory pressure signal.
     ///
     /// The primary `flush_keys` call is unconditional — the previous
     /// empty-`keys` short-circuit is removed — so a pressure signal that
     /// selects no victims of its own still reaches `flush_keys` and re-drives
     /// any stranded state-A seals through the entry drain (change 3). An empty
-    /// worked set is a cheap no-op. A WAL victim key held by this shard
-    /// rotates the complete shard generation so its closed segments gain a
-    /// retiring cohort; shards without that key ignore the WAL victim.
+    /// worked set is a cheap no-op.
     fn handle_pressure_signal(&mut self, signal: PressureSignal) {
         if let Err(error) = self.flush_keys(signal.keys, Some(SealTriggerReason::Pressure)) {
             record_seal_failure();
             tracing::warn!(error = %error, shard = self.id, "pressure flush failed");
-        }
-        // Sealing only the victim bucket cannot free a segment that other
-        // active buckets still share, so WAL pressure rotates the whole shard
-        // generation: the closed segment gets a cohort that retires it.
-        if let Some(key) = signal.wal_key
-            && self.wal_segments.contains_key(&key)
-            && let Err(error) = self.rotate_active_generation()
-        {
-            record_seal_failure();
-            tracing::warn!(error = %error, shard = self.id, "WAL pressure rotation failed");
         }
     }
 
@@ -3167,7 +3136,6 @@ impl ShardOwner {
             if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
                 tracing::error!(error = %cleanup_error, "active cleanup failed after group sync error");
             }
-            self.mark_wal_error(&error);
             Self::notify_prepared_error(&mut state.prepared, &error);
             return Err(error);
         }
@@ -3183,7 +3151,6 @@ impl ShardOwner {
             if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
                 tracing::error!(error = %cleanup_error, "active cleanup failed after batch commit error");
             }
-            self.mark_wal_error(&error);
             Self::notify_prepared_error(&mut state.prepared, &error);
             return Err(error);
         }
@@ -3907,7 +3874,6 @@ impl ShardOwner {
                         if let Err(cleanup_error) = self.release_active_reservations(&durable) {
                             tracing::error!(error = %cleanup_error, "active cleanup failed after WAL error");
                         }
-                        self.mark_wal_error(&error);
                         Self::notify_prepared_error(&mut prepared, &error);
                         return Err(error);
                     }
@@ -4446,19 +4412,13 @@ impl ShardOwner {
     fn arm_retirement_release_fault_for_test(&mut self) {
         self.fail_next_retirement_release = true;
     }
-
-    /// Trips the admission breaker when WAL storage is full.
-    fn mark_wal_error(&self, error: &ScribeError) {
-        if matches!(error, ScribeError::WalDiskFull) {
-            self.admission.trip_wal_disk_full();
-        }
-    }
 }
 
 /// Classifies the one expected shard-group capacity boundary.
 ///
-/// WAL exhaustion has already tripped the admission breaker before this
-/// classification. Every other group failure remains an unexpected error.
+/// A full device refuses the append before WAL mutation, so the request fails
+/// without ACK and a later retry can succeed once space returns. Every other
+/// group failure remains an unexpected error.
 fn is_expected_wal_capacity(error: &ScribeError) -> bool {
     matches!(error, ScribeError::WalDiskFull)
 }
@@ -4949,7 +4909,6 @@ mod tests {
 
         owner.handle_pressure_signal(PressureSignal {
             keys: vec![first.clone()],
-            wal_key: None,
         });
 
         assert_eq!(owner.generation_started_at, opened_at);
@@ -6861,26 +6820,6 @@ mod tests {
         assert!(!owner.seal_retry.contains(&key));
     }
 
-    /// WAL pressure rotates the victim's whole shard generation into a cohort.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the victim is sealed alone as a selective member, which
-    /// leaves the shared segment without a retiring owner.
-    #[test]
-    fn wal_pressure_rotates_the_victim_shard_generation() {
-        let key = owner_key();
-        let seed = 1_usize << 20;
-        let (mut owner, _wal, _root) = owner_for_seal_atomicity_test(&key, seed);
-        owner.handle_pressure_signal(PressureSignal {
-            keys: Vec::new(),
-            wal_key: Some(key.clone()),
-        });
-        assert!(!owner.wal_segments.contains_key(&key));
-        assert_eq!(owner.rotation_cohorts.len(), 1, "rotation owns the WAL");
-        assert!(owner.memory_ownership.immutable_bytes() > 0);
-    }
-
     /// A stale retry mark — one whose key is already queued, and one whose key
     /// was never seen — is a safe no-op: the marks are dropped, nothing is
     /// re-sealed, and accounting is unchanged.
@@ -7566,13 +7505,9 @@ mod tests {
             crate::test_support::day_partition(2026, 7, 15),
         );
         let (sender, receiver) = watch::channel(None);
-        sender.send_replace(Some(PressureSignal {
-            keys: vec![first],
-            wal_key: None,
-        }));
+        sender.send_replace(Some(PressureSignal { keys: vec![first] }));
         sender.send_replace(Some(PressureSignal {
             keys: vec![second.clone()],
-            wal_key: None,
         }));
         assert_eq!(
             receiver.borrow().as_ref().map(|signal| &signal.keys),
@@ -8028,7 +7963,7 @@ mod tests {
         let admission_before = owner.admission.snapshot();
         let active_ledger_before = owner.memory_ownership.active_bytes();
         let immutable_ledger_before = owner.memory_ownership.immutable_bytes();
-        let wal_bytes_before = wal.bytes_on_disk();
+        let wal_bytes_before = crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir());
         let wal_files_before = wal_file_snapshot(wal_root.path()).expect("WAL file snapshot");
         let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
         let token_before = owner
@@ -8046,7 +7981,10 @@ mod tests {
             owner.memory_ownership.immutable_bytes(),
             immutable_ledger_before
         );
-        assert_eq!(wal.bytes_on_disk(), wal_bytes_before);
+        assert_eq!(
+            crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()),
+            wal_bytes_before
+        );
         assert_eq!(
             wal_file_snapshot(wal_root.path()).expect("WAL file snapshot"),
             wal_files_before
@@ -8077,7 +8015,7 @@ mod tests {
         let governor_before = budget.accounting_snapshot_for_test();
         let admission_before = owner.admission.snapshot();
         let ledger_before = owner.memory_ownership.immutable_bytes();
-        let wal_before = wal.bytes_on_disk();
+        let wal_before = crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir());
         let wal_files_before = wal_file_snapshot(root.path()).expect("WAL file snapshot");
         let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
         owner.arm_retirement_release_fault_for_test();
@@ -8092,7 +8030,10 @@ mod tests {
         assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
         assert_eq!(owner.admission.snapshot(), admission_before);
         assert_eq!(owner.memory_ownership.immutable_bytes(), ledger_before);
-        assert_eq!(wal.bytes_on_disk(), wal_before);
+        assert_eq!(
+            crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()),
+            wal_before
+        );
         assert_eq!(
             wal_file_snapshot(root.path()).expect("WAL file snapshot"),
             wal_files_before
@@ -8164,7 +8105,7 @@ mod tests {
     async fn retire_committed_callers_preserve_generation_on_error() {
         let (mut owner, generation_id, wal, root, budget) = committed_retirement_owner_for_test();
         let governor_before = budget.accounting_snapshot_for_test();
-        let wal_before = wal.bytes_on_disk();
+        let wal_before = crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir());
         let wal_files_before = wal_file_snapshot(root.path()).expect("WAL file snapshot");
         let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
         owner.arm_retirement_release_fault_for_test();
@@ -8175,7 +8116,10 @@ mod tests {
             .await;
         assert!(owner.retained_generations.contains_key(&generation_id));
         assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
-        assert_eq!(wal.bytes_on_disk(), wal_before);
+        assert_eq!(
+            crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()),
+            wal_before
+        );
         assert_eq!(
             wal_file_snapshot(root.path()).expect("WAL file snapshot"),
             wal_files_before
@@ -8187,7 +8131,7 @@ mod tests {
 
         let (mut owner, generation_id, wal, root, budget) = committed_retirement_owner_for_test();
         let governor_before = budget.accounting_snapshot_for_test();
-        let wal_before = wal.bytes_on_disk();
+        let wal_before = crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir());
         let wal_files_before = wal_file_snapshot(root.path()).expect("WAL file snapshot");
         let retire_submissions_before = owner.wal_io.retire_submissions_for_test();
         owner.arm_retirement_release_fault_for_test();
@@ -8198,7 +8142,10 @@ mod tests {
         assert!(result.await.expect("test retirement response").is_err());
         assert!(owner.retained_generations.contains_key(&generation_id));
         assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
-        assert_eq!(wal.bytes_on_disk(), wal_before);
+        assert_eq!(
+            crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()),
+            wal_before
+        );
         assert_eq!(
             wal_file_snapshot(root.path()).expect("WAL file snapshot"),
             wal_files_before

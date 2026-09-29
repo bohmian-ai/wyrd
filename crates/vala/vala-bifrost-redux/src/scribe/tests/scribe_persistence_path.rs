@@ -7,7 +7,6 @@ use crate::contracts::{
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::ScribeImpl;
 use crate::scribe::admission::EventTimeWindow;
-use crate::scribe::seal_key::SealKey;
 use crate::scribe::staged_tail::tests::unbounded_pool;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
@@ -772,31 +771,6 @@ async fn assert_other_tenant_isolated(
     assert!(other.is_empty(), "hot snapshots must be tenant isolated");
 }
 
-#[test]
-/// A concrete WAL disk fault rejects before mutating the segment.
-fn concrete_wal_disk_failure_rejects_before_file_mutation() {
-    let temp_dir = TempDir::new().expect("WAL temp dir");
-    let writer = WalWriter::new(
-        temp_dir.path(),
-        *Uuid::nil().as_bytes(),
-        1,
-        WalConfig::default(),
-    )
-    .expect("WAL writer");
-    writer.trip_disk_full_for_test();
-    let seal_key = SealKey::new(
-        DataTenantId::new_v7(),
-        TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure"),
-        fixture_event_day(1),
-    );
-
-    let error = writer
-        .append_and_fsync_for_test(&seal_key, [7_u8; 16], b"data")
-        .expect_err("injected WAL disk failure");
-    assert!(matches!(error, ScribeError::WalDiskFull));
-    assert_eq!(writer.bytes_on_disk(), 0);
-}
-
 #[tokio::test]
 /// A shard WAL failure reaches the caller's durable completion boundary.
 async fn shard_wal_failure_reaches_the_durable_completion() {
@@ -818,7 +792,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
         )
         .expect("WAL writer"),
     );
-    wal.trip_disk_full_for_test();
+    wal.trip_sync_failure_for_test();
     let scribe = ScribeImpl::new_for_embedded_with_deps(
         operator,
         Arc::clone(&wal),
@@ -847,7 +821,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
     )
     .await
     .expect_err("WAL failure must fail the durable completion");
-    assert!(matches!(error, ScribeError::WalDiskFull));
+    assert!(matches!(error, ScribeError::Internal { .. }), "{error:?}");
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;

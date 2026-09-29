@@ -406,7 +406,8 @@ Interactive and Analytical paths have separate queues and slot counters.
 One atomic aggregate check prevents their combined occupancy from exceeding
 Oracle capacity. A configured Interactive slot floor cannot be borrowed by
 Analytical work; Interactive work may use idle unreserved capacity. Both paths
-share one elastic memory and scratch root plus one leader/peer capacity counter.
+share the one governed Bifrost memory root, one scratch root, and one
+leader/peer capacity counter.
 `QueryClass` is derived from the one returned physical root and is never a
 caller-controlled hint.
 
@@ -444,19 +445,29 @@ the query lifetime and never recomputed under running operators. Every leader
 and follower query receives a private view over one process-wide Oracle memory
 root, never an independently sized pool: the view refuses growth past that
 query's own ceiling, and the root's single tracked spill-fair pool, bounded by
-the Oracle floor plus the elastic borrow, arbitrates what all live queries hold
-together. Aggregate governed reservations therefore cannot sum above what the
-pod owns.
+the shared Bifrost memory cap that Scribe, Forge, and in-flight transport also
+charge, arbitrates what all live queries hold together. No role holds a fixed
+share or a precharge: an idle role holds nothing, and every charge returns
+when its owner ends. Aggregate governed reservations therefore cannot sum above
+the Bifrost cap.
+
+The cap comes from the detected process or pod memory limit. `wyrd-server`
+keeps at least 1 GiB of that limit outside governed Bifrost memory
+(`WYRD_SERVER_MEMORY_MIN_BYTES` raises the minimum); the cap defaults to the
+limit less that minimum, and `WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower
+it. The minimum is accounting headroom, not preallocated memory and not a
+ceiling on other server work. A plan that cannot leave both the minimum and a
+positive Bifrost cap fails boot, so an 8-GiB pod defaults to a 7-GiB cap.
 
 Only fallible cooperative reservation is hard-limited. Growth DataFusion does
 not let fail is still real memory, so it is charged to an explicit process
-headroom counter that makes later fallible growth refuse sooner. The resource
-plan retains that headroom alongside the unmanaged reserve for dependency
-allocations outside cooperative reservation; the pool is the Oracle safety
-boundary, not a guarantee against operating-system or cgroup OOM.
+headroom counter that makes later fallible growth refuse sooner. Dependency
+allocations outside cooperative reservation fall in the server minimum; the
+pool is the Bifrost safety boundary, not a guarantee against operating-system
+or cgroup OOM.
 
 The guaranteed minimum successful grant fixes one `OracleSessionShape` before
-physical planning: the 32 MiB memory floor, the minimum two execution
+physical planning: the 32 MiB minimum grant, the minimum two execution
 partitions narrowed by available cut work, and the resulting target partitions,
 batch size, spill reservation, and join preference. Oracle retains that exact
 `SessionConfig` with the single physical root. The actual grant chosen after
@@ -642,23 +653,20 @@ guarantee.
 The managed compaction core is the sole owner of candidate selection, grouping,
 bin packing, delete application, sorting, partition fanout, bounded concurrent
 writing, rolling, and output `DataFile` production. After it produces real
-`CompactionPlan` values, Forge estimates each plan's peak heap use from the
-plan, table schema and format version, batch size, prefetch and sort settings,
-delete files, and recommended parallelism.
+`CompactionPlan` values, each Forge worker owns one strict FIFO queue of them.
+The queue starts only its head when running parallelism has room; a later
+smaller plan cannot bypass a blocked head, and pending parallelism bounds the
+queue itself. A plan larger than the worker's total parallelism is refused.
+Memory is not a queue figure and Forge makes no memory estimate.
 
-Each Forge worker owns one strict FIFO queue of those plans. The queue starts
-only its head when both the pod's aggregate estimated-memory budget and running
-parallelism have room. Waiting plans do not consume the running-memory budget,
-and a later smaller plan cannot bypass a blocked head; pending parallelism
-bounds the queue itself. The memory budget is configured per worker or defaults
-to 80 percent of that worker's declared memory. A plan larger than either total
-budget is refused, while a plan that fits the totals waits for running plans to
-release capacity. The budget is an admission estimate, not a `DataFusion`
-allocation ceiling. `DataFusion` runs Forge plans with its default unbounded
-memory pool and without disk spilling; Forge provisions no local scratch
-storage. An underestimated plan can exhaust the pod, after which the durable
-task, lease, and fence recovery path reclaims the lost work. One plan executes
-within one worker; Forge does not split a compaction plan across pods.
+Each rewrite attempt runs `DataFusion` over a fresh view of the shared Bifrost
+memory root, so its reservations are charged against the same cap Scribe,
+Oracle, and transport charge, and return when the attempt's context drops.
+Spillable operators spill beneath the data root's `forge-spill` directory,
+which boot clears of stale files. A refused fallible growth fails only that
+attempt: nothing partial is published, and the durable task retries through
+its ordinary bounded backoff once memory is free. One plan executes within one
+worker; Forge does not split a compaction plan across pods.
 
 The managed core consumes the attempt cancellation tree, output identity, and
 closed physical observer. It never owns tenant authority, leases, SQL, audit,
@@ -760,9 +768,9 @@ No cleanup infers safety from age or path shape alone.
 
 - Every Wyrd-owned queue, mailbox, stream, fanout, task set, buffer, staged
   namespace, and object upload lane is bounded. Scribe scratch and Oracle
-  memory pools, scratch roots, and spill paths remain hard-bounded. Forge uses
-  bounded FIFO admission from estimated plan memory instead of a hard
-  `DataFusion` pool or spill path. A pinned dependency-internal queue may
+  memory pools, scratch roots, and spill paths remain hard-bounded. Forge
+  rewrites charge the shared Bifrost memory root and spill under
+  `forge-spill`. A pinned dependency-internal queue may
   instead provide finite byte backpressure when Wyrd cannot configure its item
   count; architecture must name that exception rather than claim ownership it
   does not have.

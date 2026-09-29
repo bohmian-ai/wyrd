@@ -93,7 +93,9 @@ still duplicate a row across published and live sources.
 
 Interactive and analytical work use separate queues and counters. Analytical
 work cannot borrow the protected interactive slot floor. Both remain beneath
-one total Oracle capacity check and one shared elastic resource root.
+one total Oracle capacity check and the one governed Bifrost memory root that
+Scribe, Forge, and in-flight transport also charge; no role holds a fixed
+share.
 
 ## Admission and failure semantics
 

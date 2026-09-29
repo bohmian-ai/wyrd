@@ -664,12 +664,19 @@ anchor's own Oracle executes nothing. The kind journey checks exactly this.
 
 ## Sizing
 
-The default `all` process needs **at least 3.75 GiB** of memory: the Forge
-compaction budget plus the Scribe, Oracle, and unmanaged floors. It refuses to
-boot below that. The local kind anchor runs at 4 GiB, which only clears the
-floor; it has no headroom for production queries or compaction. Set requests
-equal to limits from load tests, and give the Oracle tier its own measured
-size and scratch.
+Scribe, Oracle, Forge, and in-flight ingest share one Bifrost memory cap. By
+default it is the pod's memory limit less a 1 GiB minimum kept for other
+`wyrd-server` work, so an 8 GiB pod gives Bifrost 7 GiB. Raise that minimum with
+`WYRD_SERVER_MEMORY_MIN_BYTES`, or lower the cap with
+`WYRD_BIFROST_MEMORY_LIMIT_BYTES`. A pod that cannot keep the minimum and still
+give Bifrost memory refuses to boot. No role reserves a fixed share, so an idle
+role costs nothing.
+
+The local kind anchor runs at 4 GiB, a 3 GiB cap: enough for the journey, not
+for production queries or compaction. Set requests equal to limits from load
+tests, and give the Oracle tier its own measured size and scratch. A query that
+exhausts its memory fails alone with `WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED`,
+and SDKs do not retry it automatically.
 
 ## 5. First-use setup and credentials
 

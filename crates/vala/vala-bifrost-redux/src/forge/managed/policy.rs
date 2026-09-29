@@ -100,10 +100,9 @@ impl ForgeTablePolicy {
     /// [`ForgeConfig::default_target_file_size_bytes`]. It is resolved here
     /// once; execution, publication, and audit all read this policy's value.
     ///
-    /// There is no admitted-memory term. Execution is unbounded and admission
-    /// happens against a per-plan estimate in the worker's queue, so a
-    /// row-group target can never be larger than a grant this policy was
-    /// checked against.
+    /// There is no admitted-memory term. Execution charges the shared Bifrost
+    /// memory root as it grows, so a row-group target is never checked
+    /// against a per-plan grant.
     ///
     /// # Errors
     ///

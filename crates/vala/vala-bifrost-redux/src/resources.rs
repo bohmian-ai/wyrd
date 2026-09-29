@@ -479,6 +479,54 @@ impl VolumeDeviceState {
         }
     }
 
+    /// Decides whether one class may add `bytes` to this device.
+    ///
+    /// Two independent checks, each counting every byte once: tracked
+    /// ownership plus the request must fit the configured device capacity, and
+    /// the request alone must fit the physical bytes free above the floor.
+    /// Bytes already on disk are part of `physical_free`'s probe, so adding
+    /// tracked ownership to that comparison would charge them twice. The probe
+    /// is an admission check, not a promise: another writer can consume the
+    /// space before this one writes, and that write then fails on its own IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns occupied naming the class and whether the configured capacity or
+    /// physical free space refused it, and an accounting overflow when the
+    /// device totals cannot be summed.
+    fn admit(
+        &self,
+        class: BifrostVolumeClass,
+        bytes: u64,
+        configured_limit_bytes: u64,
+        physical_free: u64,
+    ) -> Result<(), BifrostResourceError> {
+        let tracked = self
+            .total()?
+            .checked_add(bytes)
+            .ok_or_else(accounting_overflow)?;
+        if tracked > configured_limit_bytes {
+            return Err(BifrostResourceError::Occupied {
+                detail: format!(
+                    "{} volume request refused: configured capacity {configured_limit_bytes} \
+                     cannot add {bytes} to tracked {}",
+                    class.as_str(),
+                    tracked - bytes
+                ),
+            });
+        }
+        if bytes > physical_free {
+            return Err(BifrostResourceError::Occupied {
+                detail: format!(
+                    "{} volume request refused: physical free space {physical_free} above the \
+                     floor cannot hold {bytes}",
+                    class.as_str()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Sums every class's ownership on this device.
     ///
     /// # Errors
@@ -598,7 +646,8 @@ impl BifrostVolumeGovernor {
             )
             .set(configured_limit_bytes.to_f64().unwrap_or(f64::MAX));
         }
-        if governor.available_for(BifrostVolumeClass::Wal)? == 0 {
+        if configured_limit_bytes == 0 || governor.physical_free_for(BifrostVolumeClass::Wal)? == 0
+        {
             return Err(BifrostResourceError::InvalidPlan {
                 detail: "registered Bifrost volume has no usable capacity".to_owned(),
             });
@@ -656,8 +705,16 @@ impl BifrostVolumeGovernor {
         ))
     }
 
-    /// Computes currently grantable bytes after configured and physical floors.
-    fn available_for(&self, class: BifrostVolumeClass) -> Result<u64, BifrostResourceError> {
+    /// Probes the physical bytes still free on a class's device above the floor.
+    ///
+    /// The probe already reflects every byte on the device, including the ones
+    /// this governor tracks, so it is compared with a new request alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns unavailable when the root cannot be probed, and occupied when
+    /// the device already sits below the 256 MiB free-space floor.
+    fn physical_free_for(&self, class: BifrostVolumeClass) -> Result<u64, BifrostResourceError> {
         let root = self
             .roots
             .get(&class)
@@ -665,12 +722,15 @@ impl BifrostVolumeGovernor {
                 detail: "volume class is not registered".to_owned(),
             })?;
         debug_assert_eq!(root.class, class);
-        let available = filesystem_available_bytes(&root.path)?
+        filesystem_available_bytes(&root.path)?
             .checked_sub(MIN_SCRATCH_FREE_BYTES)
             .ok_or_else(|| BifrostResourceError::Occupied {
-                detail: "physical volume cannot preserve the 256 MiB free-space floor".to_owned(),
-            })?;
-        Ok(self.configured_limit_bytes.min(available))
+                detail: format!(
+                    "{} volume request refused: physical volume cannot preserve the 256 MiB \
+                     free-space floor",
+                    class.as_str()
+                ),
+            })
     }
 
     /// Atomically charges one device after a fresh physical free-space probe.
@@ -690,7 +750,7 @@ impl BifrostVolumeGovernor {
                 detail: format!("resource health entered {reason:?}"),
             });
         }
-        let available = self.available_for(class)?;
+        let physical_free = self.physical_free_for(class)?;
         let root = self
             .roots
             .get(&class)
@@ -711,14 +771,10 @@ impl BifrostVolumeGovernor {
                 detail: "a prior physical-volume invariant failed".to_owned(),
             });
         }
-        let used = state.total()?;
-        let next = used.checked_add(bytes).ok_or_else(accounting_overflow)?;
-        if next > self.configured_limit_bytes || next > available {
+        if let Err(refusal) = state.admit(class, bytes, self.configured_limit_bytes, physical_free)
+        {
             record_volume_transition(class, "refused", state.owned(class));
-            return Err(BifrostResourceError::Occupied {
-                detail: "physical-volume request exceeds configured or live-free capacity"
-                    .to_owned(),
-            });
+            return Err(refusal);
         }
         if durable {
             *state.provisional_bytes.entry(class).or_default() += bytes;
@@ -6518,6 +6574,51 @@ mod tests {
                 .expect("released owners")
                 .oracle_memory_used_bytes,
             0
+        );
+    }
+
+    /// Bytes already on the device count once: in tracked ownership against
+    /// the configured capacity, and in the physical probe, never in both.
+    ///
+    /// The device holds retained WAL, scanned stage files, and concurrent
+    /// provisional growth from another class. A request that fits the probe's free space
+    /// must pass even though tracked bytes alone exceed that free space.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the admission decision contradicts either check.
+    #[test]
+    fn volume_growth_counts_existing_bytes_once() {
+        let mut state = VolumeDeviceState::default();
+        state.durable_bytes.insert(BifrostVolumeClass::Wal, 900);
+        state
+            .durable_bytes
+            .insert(BifrostVolumeClass::ScribeStage, 100);
+        state
+            .provisional_bytes
+            .insert(BifrostVolumeClass::ScribeOutput, 60);
+        let physical_free = 50;
+
+        state
+            .admit(BifrostVolumeClass::Wal, 50, 10_000, physical_free)
+            .expect("a request that fits physical free space is admitted once");
+        let physical = state
+            .admit(BifrostVolumeClass::Wal, 51, 10_000, physical_free)
+            .expect_err("a request larger than physical free space is refused");
+        assert!(
+            physical
+                .to_string()
+                .contains("wal volume request refused: physical free space"),
+            "{physical}"
+        );
+        let configured = state
+            .admit(BifrostVolumeClass::ScribeStage, 41, 1_100, physical_free)
+            .expect_err("tracked ownership plus the request exceeds configured capacity");
+        assert!(
+            configured
+                .to_string()
+                .contains("scribe_stage volume request refused: configured capacity"),
+            "{configured}"
         );
     }
 

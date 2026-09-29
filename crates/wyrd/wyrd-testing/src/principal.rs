@@ -5,12 +5,9 @@
 //! carries the credential appropriate to the principal kind it created: a
 //! minted access token for a user, an API key to exchange for a machine.
 
-use axum::http::StatusCode;
 use secrecy::SecretString;
-use wyrd_auth_check::AuthzCheckResponse;
 use wyrd_runtime::PrincipalId;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::request_id::RequestId;
 
 /// Result of a fixture-path principal bootstrap.
 #[derive(Debug, Clone)]
@@ -71,15 +68,4 @@ impl Bootstrap {
             Self::User { .. } => None,
         }
     }
-}
-
-/// Result of an authz-check request.
-#[derive(Debug, Clone)]
-pub struct CheckResult {
-    /// HTTP status returned by `/v1/authz/check`.
-    pub status: StatusCode,
-    /// Request id emitted by the request-id middleware.
-    pub wyrd_request_id: RequestId,
-    /// Parsed authz-check response body when the route returned a valid JSON payload.
-    pub response: Option<AuthzCheckResponse>,
 }

@@ -38,6 +38,12 @@ pub enum TraceUnavailable {
         /// Requested trace id.
         trace_id: TraceId,
     },
+    /// The backing store failed; the same read may succeed on a later attempt.
+    #[error("trace source failed: {reason}")]
+    Failed {
+        /// Store failure detail.
+        reason: String,
+    },
 }
 
 /// Read-only handle from the eval engine into a trace store.

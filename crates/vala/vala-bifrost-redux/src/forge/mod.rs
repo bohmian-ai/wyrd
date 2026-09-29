@@ -150,13 +150,6 @@ pub struct ForgeBuildConfig {
     pub catalog: Arc<dyn Catalog>,
     /// Raw staging operator retained for table-owned producer fixtures.
     pub staging: Arc<opendal::Operator>,
-    /// Whether that staging operator advertises native `list_with_start_after`.
-    ///
-    /// Read once, from the concrete operator, before it is erased behind
-    /// [`ForgeObjectStore`]. Orphan collection resumes a bounded listing by
-    /// cursor, so a worker whose backend cannot do that natively must never
-    /// register, recover, publish ready, or claim.
-    pub staging_lists_by_cursor: bool,
     /// Object-store capability used by rewrites and garbage collection.
     pub object_store: Arc<dyn ForgeObjectStore>,
     /// Bounded advisory Scribe wake-up inbox.
@@ -165,6 +158,14 @@ pub struct ForgeBuildConfig {
     pub config: ForgeConfig,
     /// Delay between complete periodic maintenance ticks.
     pub maintenance_interval: Duration,
+    /// Durable process identity that owns the singleton scheduler fence.
+    ///
+    /// A restarted process that reclaims the same identity reclaims its own
+    /// live lease immediately instead of waiting out the lease TTL on standby,
+    /// which would leave a sole coordinator unready for that whole TTL. The
+    /// identity must never be shared by two live processes, the same
+    /// invariant the worker's claim owner already relies on.
+    pub scheduler_owner: uuid::Uuid,
     /// Concrete wall clock captured once by each Forge work batch.
     pub clock: ForgeClock,
     /// Optional test-only observer of successful supervised task completion.
@@ -199,14 +200,14 @@ pub(crate) struct ForgeCore {
     catalog: Arc<dyn Catalog>,
     /// Raw staging operator retained for the established Forge composition.
     staging: Arc<opendal::Operator>,
-    /// Whether the staging operator natively resumes a listing from a cursor.
-    staging_lists_by_cursor: bool,
     /// Narrow object-store seam used by rewrite and garbage-collection IO.
     object_store: Arc<dyn ForgeObjectStore>,
     /// Validated maintenance and rewrite limits.
     config: ForgeConfig,
     /// Delay between periodic scheduler ticks.
     maintenance_interval: Duration,
+    /// Durable process identity that owns the singleton scheduler fence.
+    scheduler_owner: uuid::Uuid,
     /// Wall clock shared by periodic and hinted maintenance batches.
     clock: ForgeClock,
     /// Optional observer notified only after a supervised worker returns success.
@@ -245,10 +246,10 @@ impl Forge {
             operator_pool: build.operator_pool,
             catalog: build.catalog,
             staging: build.staging,
-            staging_lists_by_cursor: build.staging_lists_by_cursor,
             object_store: build.object_store,
             config: build.config,
             maintenance_interval: build.maintenance_interval,
+            scheduler_owner: build.scheduler_owner,
             clock: build.clock,
             #[cfg(feature = "test-support")]
             completion_observer: build.completion_observer,

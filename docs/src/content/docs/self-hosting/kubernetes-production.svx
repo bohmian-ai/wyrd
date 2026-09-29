@@ -1,0 +1,756 @@
+---
+title: Production server on Kubernetes
+description: Run Wyrd in production on Kubernetes with the hardened profile, backed-up owner-only migrations, a shared object store, a fixed anchor plus an autoscaled Oracle read tier joined over dedicated-CA peer mTLS, and credential capture and rotation.
+pillar: wyrd
+group: Self-hosting
+order: 11
+---
+
+# Production server on Kubernetes
+
+This journey builds on [Development server on Kubernetes](/self-hosting/kubernetes-development/).
+It runs the hardened profile, one fixed `all` anchor, and an Oracle-only read
+tier that a HorizontalPodAutoscaler grows on the reads its Oracles execute. The replicas find each other through
+Postgres membership and talk over a private, mutually authenticated peer port.
+The repository's local proof of this shape is `deploy/kubernetes/kind/`,
+exercised by the `test:server:kind` journey; its values are local and are not
+production defaults.
+
+## Prerequisites
+
+- A Kubernetes cluster with a CNI that enforces NetworkPolicy, a default
+  StorageClass, Prometheus, and prometheus-adapter serving
+  `custom.metrics.k8s.io` (or your provider's equivalent of both).
+- A managed or operated PostgreSQL 16 with point-in-time backups, TLS with a
+  certificate that names its host, the provider's CA certificate, and a login
+  that owns the `wyrd` database.
+- One object-store bucket (S3, GCS, or Azure Blob) and a cloud identity for the
+  Wyrd pods that can read and write it.
+- A service mesh that authenticates and encrypts the hop from your edge to
+  the pods. This page uses [Istio](https://istio.io/) with sidecar injection
+  and the Kubernetes Gateway API CRDs: the edge gateway terminates public TLS
+  and reaches the pods over the mesh's mutual TLS. Another mesh works if it
+  enforces the same policy. A load balancer that forwards plaintext to the
+  pods does not: client tokens and bodies would cross the cluster network
+  unprotected.
+- Two public hostnames with one TLS certificate covering both: one for the
+  API (this page uses `wyrd.example.com`) and one for read-only queries
+  (`wyrd-query.example.com`).
+- `openssl`, `psql` 15 or later, `kubectl`, a `bash` or `zsh` shell, and the `wyrd` CLI on an operator machine.
+
+## The image
+
+No Wyrd image is published yet. Until one is, production acceptance uses the
+official image built from the reviewed commit and pinned by its image ID:
+
+```bash
+git rev-parse HEAD                     # the reviewed commit
+mise run docker:build
+docker image inspect -f '{{.Id}}' wyrd # record the ID with the commit
+```
+
+Push that image to your registry and reference it everywhere **by digest**
+(`registry.example.com/wyrd@sha256:…`), never by a mutable tag. Once a release
+is published, repeat acceptance against the published digest and deploy that.
+
+## Six separate trust materials
+
+Keep these apart. None of them substitutes for another.
+
+| Material | Protects | Held by | Rotation |
+| --- | --- | --- | --- |
+| Public TLS certificate | Client traffic to your hostnames | Secret `wyrd-public-tls`, used only by the edge gateway | Your certificate manager |
+| Mesh workload certificates | The hop from the edge gateway to the pods | The mesh (Istio issues and rotates them) | Automatic |
+| Database logins (`<owner>`, `wyrd_app`, `wyrd_platform_admin`) and the database CA | Postgres, and proof that the pods reach the real server | Secrets `wyrd-owner` (migration Job only), `wyrd-db`, and `wyrd-db-ca` | `ALTER ROLE … PASSWORD`, update the Secret, roll the pods; replace `wyrd-db-ca` before your provider rotates its CA |
+| Wyrd client credentials (`wyrd_global_…`, `wyrd_sk_…`) and the signing key | Wyrd API identity | Your secret manager; the signing key also in Secret `wyrd-signing` | See [Credentials](#credentials) |
+| Object-store identity | The bucket | The provider's workload identity bound to the pods' ServiceAccount | Your cloud IAM |
+| Peer certificates | The private peer port between Wyrd pods | Secret `wyrd-peer-tls` (CA key stays offline) | See [Peer TLS](#peer-tls) |
+
+A peer certificate identifies a Wyrd process in this cluster. It does **not**
+grant tenant identity: every receiver still checks the tenant, query, fence,
+and deadline of each call against its own state, and public authentication is
+unchanged.
+
+## Environment
+
+| Variable | When | Value | Source |
+| --- | --- | --- | --- |
+| `APP_ENV` | Required | `production` | Selects the hardened profile: a real signing key and gRPC reflection off. |
+| `WYRD_DATABASE_URL` in the migration Job | Required, Job only | owner URL ending `?sslmode=verify-full` | Secret `wyrd-owner`. |
+| `WYRD_DATABASE_URL` | Required | `wyrd_app` URL ending `?sslmode=verify-full` | Secret `wyrd-db`. |
+| `WYRD_PLATFORM_DATABASE_URL` | Required | `wyrd_platform_admin` URL ending `?sslmode=verify-full` | Secret `wyrd-db`. |
+| `PGSSLROOTCERT` | Required, Job and pods | `/etc/wyrd/db-ca/ca.crt` | The standard Postgres variable: the CA every connection verifies the server's certificate against. Secret `wyrd-db-ca`. |
+| `WYRD_STORAGE_URL` | Required | `s3://<bucket>`, `gs://<bucket>`, or `az://<container>` | One shared bucket. `file://` is process-local and cannot serve peers. |
+| `AWS_REGION` or provider equivalent | Provider-dependent | your region | See [Storage](/self-hosting/storage/). Credentials come from the provider chain, bound to the pods' ServiceAccount (IRSA, GKE Workload Identity, Azure Workload Identity), not from static keys. |
+| `WYRD_SIGNING_KEY_FILE` | Required | `/run/wyrd/signing.pem` | Stable Ed25519 key, Secret `wyrd-signing`, shared by every replica. |
+| `WYRD_BIFROST_DATA_DIR` | Set by the image | `/var/lib/wyrd/bifrost` | On the anchor, its own persistent volume: Scribe WAL, staging, and stable node identity. On an Oracle pod, ephemeral query scratch. |
+| `WYRD_TARGET` | Required | `all` (anchor), `oracle` (read tier) | Which roles the pod runs. |
+| `POD_IP` | Required | `status.podIP` | Downward API. |
+| `WYRD_PEER_ADDRESS` | Required | `$(POD_IP):50052` | The address other replicas dial. No replica has an authored address. |
+| `WYRD_PEER_TLS_DIR` | Required | `/etc/wyrd/peer` | Secret `wyrd-peer-tls`: `ca.crt`, `tls.crt`, `tls.key`. |
+| `WYRD_METRICS_BIND` | Required for autoscaling | `$(POD_IP):9464` | The Prometheus endpoint scraped for the Oracle read rate. |
+| `WYRD_SEALING_KEY_FILE` | Conditional | `/run/wyrd-sealing/key` | Only if a trusted OIDC issuer carries a client secret. |
+| `WYRD_SERVER_TENANT_SLUG` | Conditional | e.g. `acme` | Only once you configure a trusted issuer or workload binding. The tenant must exist first. See [SSO and OIDC](/self-hosting/sso-and-oidc/). |
+
+## 1. Database roles and Secrets
+
+Every database URL ends in `?sslmode=verify-full`. With it, each connection
+requires TLS, checks that the server's certificate chains to your provider's
+CA, and checks that it names the host in the URL. Without it, a connection can
+reach an impostor or run unencrypted. Get the CA certificate from your
+provider (for example, the RDS or Cloud SQL server CA bundle) and save it as
+`db-ca.crt`:
+
+Load the three passwords into shell variables from your secret manager (for
+example `read -rs OWNER_PW`), using long random URL-safe values such as
+`openssl rand -hex 32`. They never go on a command line: `psql` reads a
+password from `PGPASSWORD`, and `kubectl` reads each URL from a pipe.
+
+```bash
+DB="<db-host>:5432/wyrd?sslmode=verify-full"
+export PGSSLROOTCERT=$PWD/db-ca.crt
+```
+
+Bootstrap the serving roles once as the owner, exactly as in the
+[development guide](/self-hosting/kubernetes-development/)
+but with `"postgresql://<owner>@$DB"`. Then check all three logins. Each line
+must print the role and `t` (encrypted):
+
+```bash
+Q='SELECT current_user, ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()'
+PGPASSWORD="$OWNER_PW" psql "postgresql://<owner>@$DB" -Atc "$Q"
+PGPASSWORD="$APP_PW" psql "postgresql://wyrd_app@$DB" -Atc "$Q"
+PGPASSWORD="$PLATFORM_PW" psql "postgresql://wyrd_platform_admin@$DB" -Atc "$Q"
+```
+
+If the server's certificate does not chain to `db-ca.crt` or does not name
+`<db-host>`, `psql` fails here with a certificate error, and the pods and
+the migration Job would refuse the same connection. Fix the host name or the
+CA file; never lower `sslmode`.
+
+Create the Secrets from your secret manager (External Secrets, CSI secret
+store, or `kubectl create secret` from a trusted machine), never from files
+committed anywhere:
+
+```bash
+kubectl -n wyrd create secret generic wyrd-owner \
+  --from-file=database-url=<(printf %s "postgresql://<owner>:$OWNER_PW@$DB")
+kubectl -n wyrd create secret generic wyrd-db \
+  --from-file=database-url=<(printf %s "postgresql://wyrd_app:$APP_PW@$DB") \
+  --from-file=platform-database-url=<(printf %s "postgresql://wyrd_platform_admin:$PLATFORM_PW@$DB")
+kubectl -n wyrd create secret generic wyrd-db-ca --from-file=ca.crt=db-ca.crt
+kubectl -n wyrd create secret tls wyrd-public-tls --cert=public.crt --key=public.key
+openssl genpkey -algorithm ed25519 -out signing.pem
+kubectl -n wyrd create secret generic wyrd-signing --from-file=signing.pem
+# store signing.pem in your secret manager, then delete the local copy
+```
+
+## Peer TLS
+
+Create one **dedicated** CA for this cluster's peers and one leaf shared by
+every replica, with DNS name `wyrd-peer`. Do this on a trusted machine. The CA
+private key never enters the cluster.
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
+  -subj "/CN=Wyrd peer CA" -keyout ca.key -out ca.crt \
+  -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign,cRLSign
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=wyrd-peer" \
+  -keyout tls.key -out tls.csr
+openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 90 -out tls.crt \
+  -extfile <(printf '%s\n' 'subjectAltName=DNS:wyrd-peer' \
+    'keyUsage=critical,digitalSignature' 'extendedKeyUsage=serverAuth,clientAuth')
+kubectl -n wyrd create secret generic wyrd-peer-tls \
+  --from-file=ca.crt --from-file=tls.crt --from-file=tls.key
+# move ca.key to offline storage; delete tls.key and tls.csr locally
+```
+
+Use a CA made only for this purpose: every certificate it signs is a peer.
+To rotate the leaf, sign a new one from the same CA, replace the Secret, and
+roll the anchor and the Oracle Deployment. If the leaf key is exposed, do the same immediately; if
+the CA key is exposed, create a new CA and leaf and roll every pod.
+
+## 2. Back up, then migrate
+
+Every migration, first install or upgrade, follows the same order:
+
+1. Take a database backup (or confirm a point-in-time recovery point) and
+   **verify it restores**. Record the recovery point with the image digest.
+2. Run the migration Job below with the new image. It is the only workload
+   that receives the owner URL. It is the
+   [development one](/self-hosting/kubernetes-development/)
+   plus the database CA.
+3. On success, roll the anchor StatefulSet and the Oracle Deployment to the
+   same digest.
+
+```yaml
+# migrate.yaml
+apiVersion: batch/v1
+kind: Job
+metadata: {name: wyrd-migrate, namespace: wyrd}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: registry.example.com/wyrd@sha256:…
+          command: [wyrd-server, migrate]
+          env:
+            - name: WYRD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-owner, key: database-url}}
+            - {name: PGSSLROOTCERT, value: /etc/wyrd/db-ca/ca.crt}
+          volumeMounts:
+            - {name: db-ca, mountPath: /etc/wyrd/db-ca, readOnly: true}
+      volumes:
+        - name: db-ca
+          secret: {secretName: wyrd-db-ca}
+```
+
+```bash
+kubectl apply -f migrate.yaml
+kubectl -n wyrd wait --for=condition=complete job/wyrd-migrate --timeout=300s
+kubectl -n wyrd logs job/wyrd-migrate    # -> Wyrd and Vala schemas are migrated and valid.
+kubectl -n wyrd delete job wyrd-migrate
+```
+
+If the Job fails, **stop**. Do not roll the serving pods: pods of the old image
+keep serving only if the schema still matches them, and every pod refuses a
+schema that does not match its binary with `WYRD_SQL_503_SCHEMA_NOT_READY`
+rather than serving it. Read the Job log, repair the cause (connectivity, a
+certificate error, a lock held by another migrator, a failed statement), and rerun the Job; a
+completed `migrate` is idempotent. If the database cannot be repaired, restore
+the verified backup, then rerun the Job.
+
+## 3. Serve: a fixed anchor and an autoscaled Oracle tier
+
+`wyrd-core` is one `all` replica. It owns the only Scribe, Forge coordination,
+and an Oracle, and it serves the whole public API, including Bifrost ingest. A
+second `all` replica would be an unready standby coordinator, so the scalable
+tier is `wyrd-oracle`: pods with `WYRD_TARGET=oracle` that serve public reads
+and execute each read on their own Oracle. They fetch live, not yet published
+rows from the anchor's Scribe over the peer port and published data from the
+shared bucket. They own no Scribe WAL or node identity, so they are a
+Deployment on ephemeral scratch. With no Scribe they refuse Bifrost ingest:
+send ingest to the anchor.
+
+Apply the manifests in this order, each into namespace `wyrd`:
+
+1. `wyrd-netpol.yaml` and `wyrd-mesh.yaml`: the network and mesh policies in
+   [Restrict who reaches the pods](#restrict-who-reaches-the-pods), before any
+   serving pod exists.
+2. `wyrd-sa.yaml`: the ServiceAccount below.
+3. `wyrd-core.yaml`: the anchor Service and StatefulSet, then wait for it.
+4. `wyrd-oracle.yaml`: the Oracle Service and Deployment, then wait for it.
+5. `wyrd-edge.yaml`: the edge gateway and routes in [Public routing](#public-routing).
+6. The scrape job and adapter rule, then `wyrd-oracle-hpa.yaml`, in [Autoscaling](#4-autoscaling).
+
+Both workloads carry the mesh sidecar. Their public ports `8080` and `50051`
+go through it, so only mesh-authenticated callers reach them. The peer port
+`50052` and the metrics port `9464` bypass it: peers already use their own
+mutual TLS, and Prometheus scrapes from outside the mesh.
+
+```yaml
+# wyrd-sa.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wyrd
+  namespace: wyrd
+  # Bind the object-store identity here, for example:
+  # annotations: {eks.amazonaws.com/role-arn: arn:aws:iam::…:role/wyrd}
+```
+
+```yaml
+# wyrd-core.yaml
+apiVersion: v1
+kind: Service
+metadata: {name: wyrd, namespace: wyrd}
+spec:
+  selector: {app: wyrd-core}
+  ports:
+    - {name: http, port: 8080}
+    - {name: grpc, port: 50051}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: wyrd-core, namespace: wyrd}
+spec:
+  serviceName: wyrd
+  replicas: 1
+  selector: {matchLabels: {app: wyrd-core}}
+  template:
+    metadata:
+      labels: {app: wyrd-core, app.kubernetes.io/name: wyrd, sidecar.istio.io/inject: "true"}
+      annotations:
+        wyrd.ai/scrape-port: "9464"
+        traffic.sidecar.istio.io/excludeInboundPorts: "50052,9464"
+        traffic.sidecar.istio.io/excludeOutboundPorts: "50052"
+    spec:
+      serviceAccountName: wyrd
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: wyrd
+          image: registry.example.com/wyrd@sha256:…
+          env:
+            - {name: APP_ENV, value: production}
+            - {name: WYRD_TARGET, value: all}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: WYRD_PEER_ADDRESS, value: "$(POD_IP):50052"}
+            - {name: WYRD_PEER_TLS_DIR, value: /etc/wyrd/peer}
+            - {name: WYRD_METRICS_BIND, value: "$(POD_IP):9464"}
+            - name: WYRD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: database-url}}
+            - name: WYRD_PLATFORM_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: platform-database-url}}
+            - {name: PGSSLROOTCERT, value: /etc/wyrd/db-ca/ca.crt}
+            - {name: WYRD_SIGNING_KEY_FILE, value: /run/wyrd/signing.pem}
+            - {name: WYRD_STORAGE_URL, value: "s3://your-bucket"}
+            - {name: AWS_REGION, value: us-east-1}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: grpc, containerPort: 50051}
+            - {name: peer, containerPort: 50052}
+            - {name: metrics, containerPort: 9464}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          # See "Sizing" below: size from load tests, never below 3.75 GiB.
+          resources:
+            requests: {cpu: "2", memory: 8Gi}
+            limits: {cpu: "4", memory: 8Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/wyrd}
+            - {name: peer-tls, mountPath: /etc/wyrd/peer, readOnly: true}
+            - {name: signing, mountPath: /run/wyrd, readOnly: true}
+            - {name: db-ca, mountPath: /etc/wyrd/db-ca, readOnly: true}
+      volumes:
+        - name: peer-tls
+          secret: {secretName: wyrd-peer-tls}
+        - name: signing
+          secret: {secretName: wyrd-signing}
+        - name: db-ca
+          secret: {secretName: wyrd-db-ca}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 50Gi}}}
+```
+
+The anchor's volume holds its Scribe WAL and node identity. Never replace it
+with `emptyDir`: a lost Scribe volume is node loss, not an empty restart.
+
+```yaml
+# wyrd-oracle.yaml
+apiVersion: v1
+kind: Service
+metadata: {name: wyrd-oracle, namespace: wyrd}
+spec:
+  selector: {app: wyrd-oracle}
+  ports:
+    - {name: http, port: 8080}
+    - {name: grpc, port: 50051}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: wyrd-oracle, namespace: wyrd}
+spec:
+  replicas: 2                         # the HPA owns this once applied
+  selector: {matchLabels: {app: wyrd-oracle}}
+  template:
+    metadata:
+      labels: {app: wyrd-oracle, app.kubernetes.io/name: wyrd, sidecar.istio.io/inject: "true"}
+      annotations:
+        wyrd.ai/scrape-port: "9464"
+        traffic.sidecar.istio.io/excludeInboundPorts: "50052,9464"
+        traffic.sidecar.istio.io/excludeOutboundPorts: "50052"
+    spec:
+      serviceAccountName: wyrd
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: wyrd
+          image: registry.example.com/wyrd@sha256:…   # the anchor's digest
+          env:
+            - {name: APP_ENV, value: production}
+            - {name: WYRD_TARGET, value: oracle}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: WYRD_PEER_ADDRESS, value: "$(POD_IP):50052"}
+            - {name: WYRD_PEER_TLS_DIR, value: /etc/wyrd/peer}
+            - {name: WYRD_METRICS_BIND, value: "$(POD_IP):9464"}
+            - name: WYRD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: database-url}}
+            - name: WYRD_PLATFORM_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: platform-database-url}}
+            - {name: PGSSLROOTCERT, value: /etc/wyrd/db-ca/ca.crt}
+            - {name: WYRD_SIGNING_KEY_FILE, value: /run/wyrd/signing.pem}
+            - {name: WYRD_STORAGE_URL, value: "s3://your-bucket"}
+            - {name: AWS_REGION, value: us-east-1}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: grpc, containerPort: 50051}
+            - {name: peer, containerPort: 50052}
+            - {name: metrics, containerPort: 9464}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources:                  # from load tests; see "Sizing"
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {cpu: "4", memory: 4Gi}
+          volumeMounts:
+            - {name: scratch, mountPath: /var/lib/wyrd}
+            - {name: peer-tls, mountPath: /etc/wyrd/peer, readOnly: true}
+            - {name: signing, mountPath: /run/wyrd, readOnly: true}
+            - {name: db-ca, mountPath: /etc/wyrd/db-ca, readOnly: true}
+      volumes:
+        - name: scratch               # query spill; lost on restart by design
+          emptyDir: {sizeLimit: 20Gi}
+        - name: peer-tls
+          secret: {secretName: wyrd-peer-tls}
+        - name: signing
+          secret: {secretName: wyrd-signing}
+        - name: db-ca
+          secret: {secretName: wyrd-db-ca}
+```
+
+The Oracle pods use the same serving logins, database CA, signing key, bucket
+identity, and peer bundle as the anchor. Write `wyrd-netpol.yaml` and
+`wyrd-mesh.yaml` from [Restrict who reaches the pods](#restrict-who-reaches-the-pods)
+and `wyrd-edge.yaml` from [Public routing](#public-routing) first. Apply the
+policies before any serving pod exists, so no pod ever listens unprotected,
+then the workloads, then the edge:
+
+```bash
+kubectl apply -f wyrd-netpol.yaml -f wyrd-mesh.yaml
+kubectl apply -f wyrd-sa.yaml -f wyrd-core.yaml
+kubectl -n wyrd rollout status statefulset/wyrd-core --timeout=600s
+kubectl apply -f wyrd-oracle.yaml
+kubectl -n wyrd rollout status deployment/wyrd-oracle --timeout=600s
+kubectl apply -f wyrd-edge.yaml
+```
+
+A replica enters ready membership only once its peer listener is serving. One
+that cannot bind or serve its peer port stays out of the ready set, so no other
+replica routes work to it.
+
+### Restrict who reaches the pods
+
+Two layers apply, and both are required. The NetworkPolicy admits the public
+ports `8080`/`50051` only from the edge gateway's pods, the peer port `50052`
+only from pods labelled `app.kubernetes.io/name: wyrd`, and scrapes on `9464`
+only from the `monitoring` namespace where Prometheus runs:
+
+```yaml
+# wyrd-netpol.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: wyrd, namespace: wyrd}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: wyrd}}
+  policyTypes: [Ingress]
+  ingress:
+    - from: [{podSelector: {matchLabels: {gateway.networking.k8s.io/gateway-name: wyrd-edge}}}]
+      ports: [{port: 8080}, {port: 50051}]
+    - from: [{podSelector: {matchLabels: {app.kubernetes.io/name: wyrd}}}]
+      ports: [{port: 50052}]
+    - from: [{namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: monitoring}}}]
+      ports: [{port: 9464}]
+```
+
+The mesh policy makes the gateway-to-pod hop mutual TLS only and accepts it
+only from the edge gateway's mesh identity. A plaintext connection, or one
+from any other workload, is refused even if the network allows it:
+
+```yaml
+# wyrd-mesh.yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata: {name: wyrd, namespace: wyrd}
+spec:
+  selector: {matchLabels: {app.kubernetes.io/name: wyrd}}
+  mtls: {mode: STRICT}
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: wyrd-public, namespace: wyrd}
+spec:
+  selector: {matchLabels: {app.kubernetes.io/name: wyrd}}
+  action: ALLOW
+  rules:
+    - from: [{source: {principals: [cluster.local/ns/wyrd/sa/wyrd-edge-istio]}}]
+      to: [{operation: {ports: ["8080", "50051"]}}]
+```
+
+Check both from an ordinary pod. Each request must fail, not print `200`:
+
+```bash
+POD_IP=$(kubectl -n wyrd get pod wyrd-core-0 -o jsonpath='{.status.podIP}')
+kubectl -n wyrd run probe --rm -i --restart=Never --image=curlimages/curl -- \
+  curl -sS -m 5 -o /dev/null -w '%{http_code}\n' "http://$POD_IP:8080/readyz"
+```
+
+### Public routing
+
+The edge gateway terminates public TLS with Secret `wyrd-public-tls` and is
+the only public entry. Clients derive the gRPC address from the server URL
+(same host, port `50051`), so each hostname listens on `443` for HTTP (API and
+UI) and `50051` for gRPC. `wyrd.example.com` routes to Service `wyrd` (the
+anchor); `wyrd-query.example.com` routes to Service `wyrd-oracle`. Clients
+that only query set `WYRD_SERVER_URL=https://wyrd-query.example.com`;
+everything else, including every Bifrost writer, uses `wyrd.example.com`.
+Nothing routes to `50052`.
+
+The gRPC listener uses `HTTPRoute`s too: gRPC is HTTP/2, and the backend port
+name `grpc` makes the mesh speak HTTP/2 upstream. Do not use `GRPCRoute` here.
+Istio drops a `GRPCRoute` whose hostname matches an `HTTPRoute` on another
+listener, and gRPC then gets `UNIMPLEMENTED` from the gateway.
+
+```yaml
+# wyrd-edge.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: wyrd-edge, namespace: wyrd}
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      tls: {mode: Terminate, certificateRefs: [{name: wyrd-public-tls}]}
+    - name: grpc
+      port: 50051
+      protocol: HTTPS
+      tls: {mode: Terminate, certificateRefs: [{name: wyrd-public-tls}]}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: wyrd, namespace: wyrd}
+spec:
+  parentRefs: [{name: wyrd-edge, sectionName: https}]
+  hostnames: [wyrd.example.com]
+  rules: [{backendRefs: [{name: wyrd, port: 8080}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: wyrd-grpc, namespace: wyrd}
+spec:
+  parentRefs: [{name: wyrd-edge, sectionName: grpc}]
+  hostnames: [wyrd.example.com]
+  rules: [{backendRefs: [{name: wyrd, port: 50051}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: wyrd-query, namespace: wyrd}
+spec:
+  parentRefs: [{name: wyrd-edge, sectionName: https}]
+  hostnames: [wyrd-query.example.com]
+  rules: [{backendRefs: [{name: wyrd-oracle, port: 8080}]}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: wyrd-query-grpc, namespace: wyrd}
+spec:
+  parentRefs: [{name: wyrd-edge, sectionName: grpc}]
+  hostnames: [wyrd-query.example.com]
+  rules: [{backendRefs: [{name: wyrd-oracle, port: 50051}]}]
+```
+
+Istio runs the gateway as Deployment `wyrd-edge-istio` with mesh identity
+`cluster.local/ns/wyrd/sa/wyrd-edge-istio`, the principal the mesh policy
+admits, behind a `LoadBalancer` Service of the same name. Point both
+hostnames' DNS at that Service's external address:
+
+```bash
+kubectl -n wyrd wait --for=condition=programmed gateway/wyrd-edge --timeout=300s
+kubectl -n wyrd get gateway wyrd-edge    # ADDRESS is the public entry
+```
+
+## 4. Autoscaling
+
+The Oracle tier scales on **successful reads its Oracles execute per second**.
+Each Oracle counts its completed reads in the histogram
+`oracle_query_duration_seconds`; its `_count` series with
+`outcome="success"` is that count. HTTP request counts and CPU are not the
+signal: they do not measure Oracle execution.
+
+**Scrape each pod with its namespace and pod labels.** The adapter attributes
+a series to a pod only through those two labels. Add this job to your
+Prometheus configuration (with the Prometheus Operator, a `PodMonitor` on
+`app.kubernetes.io/name: wyrd` with the same relabelings does the same). Its
+ServiceAccount needs `get`, `list`, and `watch` on pods in namespace `wyrd`.
+
+```yaml
+scrape_configs:
+  - job_name: wyrd
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces: {names: [wyrd]}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_wyrd_ai_scrape_port]
+        regex: .+
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_wyrd_ai_scrape_port]
+        regex: (.+);(.+)
+        replacement: $1:$2
+        target_label: __address__
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+```
+
+**Expose the per-pod rate.** Add one prometheus-adapter rule:
+
+```yaml
+rules:
+  - seriesQuery: 'oracle_query_duration_seconds_count{namespace!="",pod!="",outcome="success"}'
+    resources: {overrides: {namespace: {resource: namespace}, pod: {resource: pod}}}
+    name: {matches: ^oracle_query_duration_seconds_count$, as: wyrd_oracle_reads_per_second}
+    metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>,outcome="success"}[1m])) by (<<.GroupBy>>)'
+```
+
+Before applying the autoscaler, confirm the adapter serves a value for every
+Oracle pod:
+
+```bash
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/wyrd/pods/*/wyrd_oracle_reads_per_second?labelSelector=app%3Dwyrd-oracle"
+```
+
+Each item names one `wyrd-oracle-…` pod and its current rate. An empty list or
+a `NotFound` error means the scrape job or relabels are not in place yet; the
+autoscaler would report `FailedGetPodsMetric` and never scale.
+
+**Apply the autoscaler:**
+
+```yaml
+# wyrd-oracle-hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: wyrd-oracle, namespace: wyrd}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: wyrd-oracle}
+  minReplicas: 2
+  maxReplicas: 8                      # cap: from load tests and database capacity
+  metrics:
+    - type: Pods
+      pods:
+        metric: {name: wyrd_oracle_reads_per_second}
+        target: {type: AverageValue, averageValue: "<from load testing>"}
+```
+
+```bash
+kubectl apply -f wyrd-oracle-hpa.yaml
+kubectl -n wyrd get hpa wyrd-oracle    # TARGETS shows a measured value, not <unknown>
+```
+
+The target and cap are yours to measure. Load-test the reads your tenants
+actually issue against your database and object store, and set the target
+below the per-pod Oracle-executed read rate where latency or errors degrade.
+Do **not** copy the kind journey's 10 reads per second: it is a small local
+number chosen so a test scales quickly. Size `maxReplicas` so every replica's
+Postgres connections fit the database.
+
+After a scale-up, prove the join: the new Oracle pod is Ready, it is listed in
+ready membership as `oracle` at its own pod IP, and a strict fused read sent
+through it returns rows the anchor's Scribe just acknowledged while the
+anchor's own Oracle executes nothing. The kind journey checks exactly this.
+
+## Sizing
+
+The default `all` process needs **at least 3.75 GiB** of memory: the Forge
+compaction budget plus the Scribe, Oracle, and unmanaged floors. It refuses to
+boot below that. The local kind anchor runs at 4 GiB, which only clears the
+floor; it has no headroom for production queries or compaction. Set requests
+equal to limits from load tests, and give the Oracle tier its own measured
+size and scratch.
+
+## 5. First-use setup and credentials
+
+Run setup once, through `exec`, so credentials print to your terminal and not
+to any log:
+
+```bash
+kubectl -n wyrd exec wyrd-core-0 -- wyrd-server setup --tenant acme
+```
+
+It prints the platform root credential (`wyrd_global_…`) and the tenant
+`admin_credential: wyrd_sk_…`, each exactly once. Put both in your secret
+manager immediately. Then issue narrower credentials for workloads instead of
+sharing the admin one (`wyrd principal credential create-principal`), and API
+keys bound to a Card with `wyrd auth issue-key` where that fits.
+
+### Credentials
+
+Rotate every Wyrd credential with an overlap: issue the replacement, deploy and
+verify it, then revoke the old one.
+
+```bash
+export WYRD_SERVER_URL=https://wyrd.example.com
+# Tenant and workload credentials (acting with a tenant admin credential):
+wyrd principal credential issue  --principal <principal-id>
+wyrd principal credential revoke --principal <principal-id> --credential-id <old-id>
+# Platform credentials (reads WYRD_PLATFORM_CREDENTIAL):
+wyrd platform credential issue  --principal <platform-principal-id>
+wyrd platform credential revoke --principal <platform-principal-id> --credential-id <old-id>
+```
+
+If every platform credential is lost, `kubectl exec wyrd-core-0 -- wyrd-server recover-root`
+reissues one using the pod's database access. A lost tenant admin credential is
+recovered with `wyrd platform tenant recover-admin`. The full matrix is in
+[Administering the deployment](/self-hosting/running-the-server/#administering-the-deployment).
+Rotating the signing key invalidates issued access tokens; plan it as described
+in [Authentication](/self-hosting/authentication/).
+
+### OIDC
+
+Once the tenant exists, federating identity adds two conditional inputs:
+`WYRD_SERVER_TENANT_SLUG=acme` on every pod, and `WYRD_SEALING_KEY_FILE` (a
+base64 32-byte key in its own Secret) if an issuer carries a client secret.
+See [SSO and OIDC](/self-hosting/sso-and-oidc/).
+
+## 6. Verify
+
+```bash
+curl -s https://wyrd.example.com/readyz       # 200
+export WYRD_API_KEY=wyrd_sk_…
+wyrd apply hello && wyrd list --kind Prompt
+```
+
+Then restart the anchor and the Oracle tier, wait for both, and list again:
+the Card, API keys, issued tokens, and the anchor's volume survive.
+
+```bash
+kubectl -n wyrd delete pod wyrd-core-0
+kubectl -n wyrd rollout restart deployment/wyrd-oracle
+kubectl -n wyrd rollout status statefulset/wyrd-core
+kubectl -n wyrd rollout status deployment/wyrd-oracle
+wyrd list --kind Prompt
+```
+
+## Failure and recovery
+
+| Symptom | Cause | Recovery |
+| --- | --- | --- |
+| Pods exit with `WYRD_SQL_503_SCHEMA_NOT_READY` | Schema and image disagree, or grants or policies drifted. | Run the migration Job for the deployed digest. Never hand-edit the schema. |
+| Migration Job fails | See step 2. | Stop, repair, rerun; restore the verified backup if the database cannot be repaired. |
+| A pod refuses to boot in production | Missing signing key, gRPC reflection on, or a missing required input. | The log names the input. Fix the Secret or env. |
+| A new Oracle never turns Ready | Its peer port cannot bind or serve, or it cannot reach Postgres. | Check the pod log, the peer Secret, and the NetworkPolicy. It stays out of routing until fixed. |
+| The HPA shows `<unknown>` or `FailedGetPodsMetric` | Prometheus does not scrape the pods with `namespace` and `pod` labels, or the adapter rule is missing. | Fix the scrape job and rule, then rerun the custom-metrics check above. |
+| Bifrost ingest to the query hostname fails | Oracle pods have no Scribe to acknowledge rows. | Send ingest to `wyrd.example.com`. |
+| Peer calls fail with TLS errors | A pod mounts a leaf from a different CA, or the leaf expired. | Reissue from the cluster CA, replace `wyrd-peer-tls`, roll the anchor and the Oracle Deployment. |
+| Storage errors | The ServiceAccount lacks the bucket identity. | Fix the workload identity binding; do not add static keys. |
+| The anchor's volume is lost | Scribe node loss, not an empty restart. | Follow the Scribe node or volume loss runbook before readmitting it. |
+
+## Related
+
+- [Configuration](/self-hosting/configuration/#peer-mode): peer-mode variables.
+- [Storage](/self-hosting/storage/): provider credential chains.
+- [Database](/self-hosting/database/): roles, migrations, and readiness checks.
+- [Authentication](/self-hosting/authentication/): signing and sealing keys.

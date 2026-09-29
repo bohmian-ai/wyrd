@@ -256,6 +256,8 @@ pub struct ClusterRegistry {
     snapshot: ArcSwap<ClusterSnapshot>,
     /// Selected production or test-support heartbeat and snapshot cadence.
     role_timing: RegistryRoleTiming,
+    /// Whether published snapshots contain only this node's own roles.
+    process_local: bool,
 }
 
 impl ClusterRegistry {
@@ -270,7 +272,20 @@ impl ClusterRegistry {
                 heartbeat_interval: ROLE_HEARTBEAT_INTERVAL,
                 liveness_cutoff: ROLE_LIVENESS_CUTOFF,
             },
+            process_local: false,
         }
+    }
+
+    /// Restricts every published snapshot to this node's own roles.
+    ///
+    /// Used by a process that serves no private peer listener: co-located
+    /// Scribe and Oracle call each other in-process, and a foreign row sharing
+    /// the database is never offered as a dispatch or tail candidate this
+    /// process has no transport to reach.
+    #[must_use]
+    pub fn process_local(mut self) -> Self {
+        self.process_local = true;
+        self
     }
 
     /// Creates a test-support registry with an explicit heartbeat cadence.
@@ -302,6 +317,7 @@ impl ClusterRegistry {
                 heartbeat_interval: timing.heartbeat_interval,
                 liveness_cutoff: timing.liveness_cutoff,
             },
+            process_local: false,
         }
     }
 
@@ -441,7 +457,11 @@ impl ClusterRegistry {
             .await?;
         conn.commit().await?;
         self.snapshot.store(Arc::new(ClusterSnapshot::new(
-            scribes.into_iter().chain(oracles).collect(),
+            scribes
+                .into_iter()
+                .chain(oracles)
+                .filter(|lease| !self.process_local || lease.key.node_id == self.node_id)
+                .collect(),
         )));
         metrics::gauge!("bifrost_cluster_roles_live", "role" => "scribe").set(
             self.snapshot()

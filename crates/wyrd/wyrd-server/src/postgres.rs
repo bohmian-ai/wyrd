@@ -4,19 +4,7 @@ use sqlx::PgPool;
 use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
-use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
-
-/// Errors raised while making server Postgres handles ready.
-#[derive(Debug, thiserror::Error)]
-pub enum ServerPostgresError {
-    /// Postgres boot failed.
-    #[error(transparent)]
-    Boot(#[from] BootError),
-    /// SQL readiness failed.
-    #[error(transparent)]
-    Sql(#[from] SqlError),
-}
 
 /// Runtime-ready Postgres handles for the Wyrd server.
 #[derive(Clone)]
@@ -26,23 +14,27 @@ pub struct ServerPostgres {
 }
 
 impl ServerPostgres {
-    /// Build Wyrd and Vala Postgres handles from boot configuration.
+    /// Build the serving Wyrd and Vala handles and prove the database is ready.
+    ///
+    /// Serving never migrates: both schema owners validate that `wyrd-server
+    /// migrate` already applied their embedded migrations unchanged and that
+    /// the two serving logins carry exactly their expected authority, so a
+    /// misprovisioned database fails here, before the server reports ready.
     ///
     /// # Errors
-    /// Returns [`ServerPostgresError`] when DSN resolution, migration, or pool
-    /// construction fails.
-    pub async fn connect_from_boot(boot: &PostgresBoot) -> Result<Self, ServerPostgresError> {
-        let dsns = boot.dsns()?;
-        Self::connect_from_dsns(&dsns).await
-    }
-
-    /// Build Wyrd and Vala Postgres handles from resolved role DSNs.
-    ///
-    /// # Errors
-    /// Returns [`ServerPostgresError`] when migration or pool construction fails.
-    pub async fn connect_from_dsns(dsns: &ResolvedDsns) -> Result<Self, ServerPostgresError> {
+    /// Returns [`SqlError::Connect`] when a pool cannot be built, and
+    /// [`SqlError::SchemaNotReady`] or [`SqlError::MigrateChecksum`] when either
+    /// schema is not ready to serve.
+    pub async fn connect_from_dsns(dsns: &ResolvedDsns) -> Result<Self, SqlError> {
         let wyrd = WyrdPostgres::connect_from_dsns(dsns).await?;
-        let vala = ValaPostgres::connect_after_wyrd(dsns).await?;
+        let vala = ValaPostgres::connect_from_dsns(dsns).await?;
+        wyrd.validate_schema().await?;
+        let operator = wyrd
+            .operator_pool()
+            .ok_or_else(|| SqlError::SchemaNotReady {
+                detail: "no wyrd_platform_admin pool is configured".to_owned(),
+            })?;
+        vala.validate_schema(&operator).await?;
         Ok(Self::from_parts(wyrd, vala))
     }
 

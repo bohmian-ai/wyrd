@@ -78,9 +78,9 @@ async fn execute_trace(
     let spans = source
         .fetch(trace_id, fetch_deadline)
         .await
-        .map_err(|error| EvalExecError::TraceUnavailableForTask {
+        .map_err(|source| EvalExecError::TraceUnavailableForTask {
             task_id: task.id.clone(),
-            reason: error.to_string(),
+            source,
         })?;
 
     let started_at = Utc::now();
@@ -278,11 +278,26 @@ mod trace_executor {
         }
     }
 
+    /// Drive `spec` to completion, panicking on an execution error.
     async fn drive(
         spec: EvalSpec,
         source: Arc<dyn crate::TraceSource>,
         trace_id: Option<TraceId>,
     ) -> EvalReport {
+        try_drive(spec, source, trace_id)
+            .await
+            .expect("plan executes")
+    }
+
+    /// Drive `spec` to completion over one fixed record.
+    ///
+    /// # Errors
+    /// Returns whatever execution error the driver propagates.
+    async fn try_drive(
+        spec: EvalSpec,
+        source: Arc<dyn crate::TraceSource>,
+        trace_id: Option<TraceId>,
+    ) -> Result<EvalReport, crate::EvalExecError> {
         let plan = spec.execution_plan().expect("test spec has valid DAG");
         let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry builds");
         let mut cx = ExecutionContext::new(
@@ -294,9 +309,7 @@ mod trace_executor {
         if let Some(trace_id) = trace_id {
             cx = cx.with_trace_id(trace_id);
         }
-        execute_plan(&plan, &cx, &registry, &executors(source))
-            .await
-            .expect("plan executes")
+        execute_plan(&plan, &cx, &registry, &executors(source)).await
     }
 
     fn result<'a>(report: &'a EvalReport, id: &str) -> &'a wyrd_spec::vala::eval::AssertionResult {
@@ -339,10 +352,11 @@ mod trace_executor {
         assert!(result(&report, "trace_name").passed);
     }
 
+    /// A trace task without a trace id is an execution error, not a failure.
     #[tokio::test]
     async fn trace_assertion_trace_id_missing_errors() {
         let source = Arc::new(InMemoryTraceSource::new());
-        let report = drive(
+        let error = try_drive(
             spec_of(vec![trace_task(
                 "trace_missing",
                 "$.spans[0].name",
@@ -352,25 +366,19 @@ mod trace_executor {
             source,
             None,
         )
-        .await;
-        let result = result(&report, "trace_missing");
-        assert!(!result.passed);
-        assert!(
-            result
-                .message
-                .as_deref()
-                .expect("failed result has message")
-                .contains("trace_id")
-        );
+        .await
+        .expect_err("a missing trace id must not produce a result");
+        assert!(error.to_string().contains("trace_id"), "{error}");
     }
 
+    /// An unavailable trace is an execution error, not a subject failure.
     #[tokio::test]
     async fn trace_assertion_unavailable_errors() {
         let trace = trace_id("33333333333333333333333333333333");
         let source = Arc::new(MockTraceSource::new([Err(
             TraceUnavailable::NotYetLanded { trace_id: trace },
         )]));
-        let report = drive(
+        let error = try_drive(
             spec_of(vec![trace_task(
                 "trace_wait",
                 "$.spans[0].name",
@@ -380,13 +388,10 @@ mod trace_executor {
             source,
             Some(trace),
         )
-        .await;
-        let result = result(&report, "trace_wait");
-        let message = result
-            .message
-            .as_deref()
-            .expect("failed result has message");
-        assert!(!result.passed);
+        .await
+        .expect_err("an unavailable trace must not produce a result");
+        assert!(error.awaits_trace(), "{error}");
+        let message = error.to_string();
         assert!(message.contains("not yet landed"));
         assert!(message.contains("trace_wait"));
     }

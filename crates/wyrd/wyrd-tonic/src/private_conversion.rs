@@ -9,12 +9,8 @@ use wyrd_spec::DataTenantId;
 
 use crate::wyrd::v1 as proto;
 
-/// Hard protocol ceiling for opaque signed claims.
+/// Hard protocol ceiling for typed peer-context claims, enforced before decode.
 const MAX_CLAIMS_BYTES: usize = 16 * 1024;
-/// Exact v1 peer signature width.
-const SIGNATURE_BYTES: usize = 64;
-/// Hard protocol ceiling for an ASCII signing-key identifier.
-const MAX_KEY_ID_BYTES: usize = 64;
 
 /// Decodes one required [`proto::TimePartition`] into its validated domain value.
 ///
@@ -419,11 +415,11 @@ fn analytical_graph_ref(
 impl From<domain::ReserveNodeSlotsRequest> for proto::ReserveNodeSlotsRequest {
     /// Encodes a validated Oracle capacity-reservation request.
     ///
-    /// The purpose ticket is deliberately absent here: it binds the digest of
+    /// The typed context is deliberately absent here: it binds the digest of
     /// this encoding, so the leader's transport stamps it after conversion.
     fn from(value: domain::ReserveNodeSlotsRequest) -> Self {
         Self {
-            ticket: None,
+            context: None,
             query_id: value.query_id.as_uuid().as_bytes().to_vec(),
             leader_node_id: value.leader_node_id.as_uuid().to_string(),
             leader_fencing_token: value.leader_fencing_token,
@@ -524,11 +520,11 @@ impl TryFrom<proto::ReleaseNodeSlotsRequest> for domain::ReleaseNodeSlotsRequest
 impl From<domain::ReleaseNodeSlotsRequest> for proto::ReleaseNodeSlotsRequest {
     /// Encodes the complete fenced identity of a reservation release.
     ///
-    /// The purpose ticket is stamped by the leader's transport after this
+    /// The typed context is stamped by the leader's transport after this
     /// conversion, because it binds the digest of this encoding.
     fn from(value: domain::ReleaseNodeSlotsRequest) -> Self {
         Self {
-            ticket: None,
+            context: None,
             reservation_id: value.reservation_id.as_uuid().as_bytes().to_vec(),
             query_id: value.query_id.as_uuid().as_bytes().to_vec(),
             leader_node_id: value.leader_node_id.as_uuid().to_string(),
@@ -537,40 +533,27 @@ impl From<domain::ReleaseNodeSlotsRequest> for proto::ReleaseNodeSlotsRequest {
     }
 }
 
-impl TryFrom<proto::SignedPeerTicket> for domain::SignedPeerTicket {
+impl TryFrom<proto::PeerContext> for domain::PeerContext {
     type Error = PrivateConversionError;
 
-    /// Decodes a signed peer ticket under fixed key, claim, and signature bounds.
+    /// Decodes a typed peer context under the fixed claims-byte bound.
     ///
     /// # Errors
-    /// Returns [`PrivateConversionError`] when the key identifier, claims, or
-    /// signature violates the private protocol's size or encoding rules.
-    fn try_from(value: proto::SignedPeerTicket) -> Result<Self, Self::Error> {
-        if value.key_id.is_empty()
-            || value.key_id.len() > MAX_KEY_ID_BYTES
-            || !value.key_id.is_ascii()
-        {
-            return Err(PrivateConversionError::Invalid { field: "key_id" });
-        }
+    /// Returns [`PrivateConversionError::TooLarge`] when the claims exceed the
+    /// private protocol's bound; nothing is decoded before this check.
+    fn try_from(value: proto::PeerContext) -> Result<Self, Self::Error> {
         bounded(&value.claims_bytes, MAX_CLAIMS_BYTES, "claims_bytes")?;
-        if value.signature.len() != SIGNATURE_BYTES {
-            return Err(PrivateConversionError::Invalid { field: "signature" });
-        }
         Ok(Self {
-            key_id: value.key_id,
             claims_bytes: value.claims_bytes,
-            signature: value.signature,
         })
     }
 }
 
-impl From<domain::SignedPeerTicket> for proto::SignedPeerTicket {
-    /// Encodes an already validated opaque signed peer ticket.
-    fn from(value: domain::SignedPeerTicket) -> Self {
+impl From<domain::PeerContext> for proto::PeerContext {
+    /// Encodes an already bounded typed peer context.
+    fn from(value: domain::PeerContext) -> Self {
         Self {
-            key_id: value.key_id,
             claims_bytes: value.claims_bytes,
-            signature: value.signature,
         }
     }
 }
@@ -1022,7 +1005,7 @@ impl TryFrom<proto::ExecuteFragmentRequest> for domain::ExecuteFragmentRequest {
     /// Decodes one authenticated worker-fragment execution request.
     ///
     /// # Errors
-    /// Returns [`PrivateConversionError`] for a missing or invalid ticket, an
+    /// Returns [`PrivateConversionError`] for a missing or oversized context, an
     /// empty fragment payload, or a malformed reservation identifier.
     fn try_from(value: proto::ExecuteFragmentRequest) -> Result<Self, Self::Error> {
         if value.physical_plan_bytes.is_empty() {
@@ -1032,9 +1015,9 @@ impl TryFrom<proto::ExecuteFragmentRequest> for domain::ExecuteFragmentRequest {
         }
         nonempty(&value.plan_fingerprint, "plan_fingerprint")?;
         Ok(Self {
-            ticket: value
-                .ticket
-                .ok_or(PrivateConversionError::Missing("ticket"))?
+            context: value
+                .context
+                .ok_or(PrivateConversionError::Missing("context"))?
                 .try_into()?,
             physical_plan_bytes: value.physical_plan_bytes,
             reservation_id: domain::ReservationId::new(uuid_bytes(
@@ -1063,7 +1046,7 @@ impl From<domain::ExecuteFragmentRequest> for proto::ExecuteFragmentRequest {
     /// Encodes an authenticated worker-fragment execution request.
     fn from(value: domain::ExecuteFragmentRequest) -> Self {
         Self {
-            ticket: Some(value.ticket.into()),
+            context: Some(value.context.into()),
             physical_plan_bytes: value.physical_plan_bytes,
             reservation_id: value.reservation_id.as_uuid().as_bytes().to_vec(),
             leader_fence: Some(value.leader_fence.into()),
@@ -1460,7 +1443,7 @@ mod tests {
             query_class: 0,
             slot_units: 1,
             expires_at_unix_ms: 1,
-            ticket: None,
+            context: None,
             graph: None,
         };
         assert!(matches!(
@@ -1477,7 +1460,7 @@ mod tests {
             query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
             leader_node_id: uuid::Uuid::now_v7().to_string(),
             leader_fencing_token: 1,
-            ticket: None,
+            context: None,
         };
         assert!(matches!(
             domain::ReleaseNodeSlotsRequest::try_from(request),
@@ -1485,47 +1468,17 @@ mod tests {
         ));
     }
 
-    /// Peer ticket bounds are enforced before opaque claims can be decoded.
+    /// Peer context bounds are enforced before typed claims can be decoded.
     #[test]
-    fn peer_ticket_rejects_field_bound_violations() {
-        let ticket = proto::SignedPeerTicket {
-            key_id: "k".into(),
+    fn peer_context_rejects_oversized_claims() {
+        let context = proto::PeerContext {
             claims_bytes: vec![0; MAX_CLAIMS_BYTES + 1],
-            signature: vec![0; SIGNATURE_BYTES],
         };
         assert!(matches!(
-            domain::SignedPeerTicket::try_from(ticket),
+            domain::PeerContext::try_from(context),
             Err(PrivateConversionError::TooLarge {
                 field: "claims_bytes"
             })
-        ));
-    }
-
-    /// Peer signatures must use the exact v1 Ed25519 byte width.
-    #[test]
-    fn peer_ticket_rejects_wrong_signature_width() {
-        let ticket = proto::SignedPeerTicket {
-            key_id: "k".into(),
-            claims_bytes: vec![],
-            signature: vec![0; SIGNATURE_BYTES - 1],
-        };
-        assert!(matches!(
-            domain::SignedPeerTicket::try_from(ticket),
-            Err(PrivateConversionError::Invalid { field: "signature" })
-        ));
-    }
-
-    /// Peer key identifiers are bounded ASCII.
-    #[test]
-    fn peer_ticket_rejects_non_ascii_key_id() {
-        let ticket = proto::SignedPeerTicket {
-            key_id: "é".into(),
-            claims_bytes: vec![],
-            signature: vec![0; SIGNATURE_BYTES],
-        };
-        assert!(matches!(
-            domain::SignedPeerTicket::try_from(ticket),
-            Err(PrivateConversionError::Invalid { field: "key_id" })
         ));
     }
 
@@ -1721,10 +1674,8 @@ mod tests {
             release
         );
         let execute = domain::ExecuteFragmentRequest {
-            ticket: domain::SignedPeerTicket {
-                key_id: "key-1".into(),
+            context: domain::PeerContext {
                 claims_bytes: vec![1, 2],
-                signature: vec![3; SIGNATURE_BYTES],
             },
             physical_plan_bytes: vec![4, 5],
             reservation_id,

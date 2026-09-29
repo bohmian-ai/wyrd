@@ -1,14 +1,10 @@
 //! One outbound peer transport, and the immutable destinations it may address.
 
 use wyrd_testing::bifrost::process_cluster::{
-    BifrostProcessCluster, PeerProbeCredential, PeerProbePlan, PeerProbeService, ProcessNodeTarget,
-    VolumeAction,
+    BifrostProcessCluster, PeerProbePlan, PeerProbeService, ProcessNodeTarget, VolumeAction,
 };
 
-use super::support::{
-    KeyringSigners, PeerJourneyError, ReservationPlane, polls_at, probe_from, reserve, sign_ticket,
-    stamped,
-};
+use super::support::{PeerJourneyError, ReservationPlane, polls_at, probe_from, reserve, stamped};
 
 /// Path of the compiled child every simulated pod runs.
 const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
@@ -62,8 +58,8 @@ async fn prove_peer_transport_uses_immutable_fenced_destinations() -> Result<(),
 /// transport, from a genuinely different process.
 ///
 /// The two destinations run different roles and answer different adapters, so
-/// a role-specific trust path would show up here as one of them admitting a
-/// body the other refuses. Both are checked by the destination's own body-poll
+/// a role-specific trust path would show up here as one of them refusing the
+/// shared cluster identity. Both are checked by the destination's own body-poll
 /// counter, and the source PID is compared against each destination's so no
 /// case is satisfied by a pod talking to itself.
 ///
@@ -95,20 +91,6 @@ fn one_transport_reaches_every_role(
         )?;
         if polls_at(cluster, index)? == before {
             return Err(format!("{description} admitted no body from the peer transport").into());
-        }
-
-        // Same transport, same destination, an identity the plane must refuse:
-        // a role-specific trust gap would show as one adapter admitting this.
-        let before = polls_at(cluster, index)?;
-        probe_from(
-            cluster,
-            0,
-            &PeerProbePlan::own(&address)
-                .against(service)
-                .presenting(PeerProbeCredential::Invalid),
-        )?;
-        if polls_at(cluster, index)? != before {
-            return Err(format!("{description} admitted an unverifiable bearer").into());
         }
     }
     Ok(())
@@ -159,7 +141,6 @@ fn a_replaced_participant_does_not_inherit_the_frozen_fence(
     cluster: &mut BifrostProcessCluster,
 ) -> Result<(), PeerJourneyError> {
     let frozen = ReservationPlane::observe(cluster)?;
-    let keyring = KeyringSigners::from(cluster.peer_keyring());
 
     cluster.restart(1, VolumeAction::Retain)?;
     let replaced = ReservationPlane::observe(cluster)?;
@@ -189,9 +170,7 @@ fn a_replaced_participant_does_not_inherit_the_frozen_fence(
     // replacement at the same address it inherited.
     let query_id = uuid::Uuid::new_v4();
     let binding = frozen.reserve_binding(query_id);
-    let payload = stamped(replaced.reserve_request(query_id), |digest| {
-        sign_ticket(&keyring.active, &binding, digest)
-    })?;
+    let payload = stamped(replaced.reserve_request(query_id), &binding, |_| {})?;
     let outcome = reserve(cluster, &replaced.destination, payload)?;
     if outcome != "PermissionDenied" && outcome != "Unauthenticated" {
         return Err(format!("a frozen destination fence was answered with {outcome}").into());
@@ -201,9 +180,7 @@ fn a_replaced_participant_does_not_inherit_the_frozen_fence(
     // makes the refusal above attributable to the stale fence alone.
     let query_id = uuid::Uuid::new_v4();
     let binding = replaced.reserve_binding(query_id);
-    let payload = stamped(replaced.reserve_request(query_id), |digest| {
-        sign_ticket(&keyring.active, &binding, digest)
-    })?;
+    let payload = stamped(replaced.reserve_request(query_id), &binding, |_| {})?;
     let outcome = reserve(cluster, &replaced.destination, payload)?;
     if outcome == "PermissionDenied" || outcome == "Unauthenticated" {
         return Err(format!("the live incarnation refused its own fence with {outcome}").into());

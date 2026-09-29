@@ -34,10 +34,6 @@ name = "transport_mock"
 path = "transport_mock.rs"
 
 [[bin]]
-name = "transport_secrets"
-path = "transport_secrets.rs"
-
-[[bin]]
 name = "workflow_anthropic"
 path = "workflow_anthropic.rs"
 

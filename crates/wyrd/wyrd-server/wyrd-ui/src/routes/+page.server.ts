@@ -10,9 +10,10 @@ import {
 import { fail, isHttpError, redirect } from '@sveltejs/kit';
 import { reject, sessionCookie, sessionLifetime, sessions } from '$lib/server/auth/session';
 import { problem, safeProblem } from '$lib/server/problem';
+import { serverReady } from '$lib/server/upstream';
 import type { Actions, PageServerLoad } from './$types';
 
-export const load: PageServerLoad = ({ locals, request }) => {
+export const load: PageServerLoad = async ({ locals, request, fetch }) => {
   // Failed actions render their problem on the chooser instead of redirecting it away.
   const destination = locals.session && sessions.destination(locals.session);
   const reauthentication =
@@ -23,12 +24,14 @@ export const load: PageServerLoad = ({ locals, request }) => {
         )
       : null;
   if (destination && !reauthentication && request.method === 'GET') redirect(302, destination);
+  // Mock data needs no server; otherwise sign-in is useless while Wyrd is down.
+  const upstream = locals.mockData || (await serverReady(fetch)) ? null : problem('upstream');
   return {
     session: locals.session ? sessions.metadata(locals.session) : null,
     problem:
       locals.sessionProblem?.code === 'WYRD_AUTH_401_UNAUTHENTICATED'
-        ? null
-        : locals.sessionProblem,
+        ? upstream
+        : (locals.sessionProblem ?? upstream),
     reauthentication,
     localAuth: localAuthEnabled() && locals.mockData
   };

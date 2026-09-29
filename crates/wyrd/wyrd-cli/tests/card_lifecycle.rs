@@ -592,7 +592,6 @@ mod pg_tests {
                 presign_ttl: std::time::Duration::from_secs(600),
                 part_size_bytes: 16 * 1024 * 1024,
                 multipart_threshold_bytes: 100 * 1024 * 1024,
-                public_base_url: Some(base_url.clone()),
             })
             .start_in_process()
             .await

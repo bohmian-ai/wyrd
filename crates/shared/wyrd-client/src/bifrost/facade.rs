@@ -939,8 +939,9 @@ pub(crate) fn client_from_env() -> Result<WyrdClient, BifrostClientError> {
 /// Assemble a [`WyrdClient`] from optionally-overridden transport values.
 ///
 /// Every argument is optional and every omitted one falls through to the
-/// existing chain exactly once: [`ClientConfig::from_env`] for the two
-/// endpoints, `ClientConfig::resolve_credential` for the credential, whose
+/// existing chain exactly once: [`ClientConfig::from_global_with_overrides`]
+/// for the two endpoints (an omitted gRPC endpoint derives from the effective
+/// `server_url`), `ClientConfig::resolve_credential` for the credential, whose
 /// floor is `~/.config/wyrd/credentials.toml` `[default].api_key`. An explicit
 /// value is written into the config's tier-0 slot, so it wins over the
 /// environment rather than racing it.
@@ -958,13 +959,11 @@ pub fn client_from_options(
     credential: Option<&str>,
     grpc_url: Option<&str>,
 ) -> Result<WyrdClient, BifrostClientError> {
-    let mut config = ClientConfig::from_env();
-    if let Some(server_url) = server_url {
-        config.http.base_url = server_url.trim_end_matches('/').to_owned();
-    }
-    if let Some(grpc_url) = grpc_url {
-        config.grpc.endpoint = grpc_url.to_owned();
-    }
+    let mut config = ClientConfig::from_global_with_overrides(
+        &crate::global_config::GlobalConfig::default(),
+        server_url,
+        grpc_url,
+    );
     if let Some(credential) = credential {
         config.credential = Some(secrecy::SecretString::from(credential.to_owned()));
     }

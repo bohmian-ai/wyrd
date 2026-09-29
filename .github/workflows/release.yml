@@ -485,12 +485,12 @@ jobs:
           path: crates/wyrd/wyrd-server/wyrd-ui/build
 
       - name: Build server
-        run: cargo build -p wyrd-server --release --locked --features cloud
+        run: cargo build -p wyrd-server --profile dist --locked --features cloud
 
       - name: Package binary + UI
         run: |
           mkdir -p release/ui
-          cp target/release/wyrd-server release/
+          cp target/dist/wyrd-server release/
           chmod +x release/wyrd-server
           cp -r crates/wyrd/wyrd-server/wyrd-ui/build release/ui/build
           cp crates/wyrd/wyrd-server/wyrd-ui/package.json release/ui/package.json
@@ -510,7 +510,7 @@ jobs:
           retention-days: 1
 
   publish-docker:
-    name: docker - ${{ matrix.image }} - ${{ matrix.arch }}
+    name: docker - ${{ matrix.arch }}
     if: github.event_name == 'release'
     needs: [qualify, release-commit, build-server]
     runs-on: ubuntu-24.04
@@ -523,17 +523,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: ubuntu
-            arch: amd64
+          - arch: amd64
             artifact: wyrd-server-x86_64-linux
-          - image: ubuntu
-            arch: arm64
-            artifact: wyrd-server-aarch64-linux
-          - image: debian
-            arch: amd64
-            artifact: wyrd-server-x86_64-linux
-          - image: debian
-            arch: arm64
+          - arch: arm64
             artifact: wyrd-server-aarch64-linux
     steps:
       - uses: actions/checkout@v4
@@ -567,21 +559,20 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: docker/official/${{ matrix.image }}/Dockerfile
+          file: docker/official/Dockerfile
           load: true
           platforms: linux/${{ matrix.arch }}
-          build-args: WYRD_SERVER_BINARY=./binary
           tags: |
-            wyrdai/wyrd:${{ matrix.image }}-${{ matrix.arch }}-${{ github.event.release.tag_name }}
-            wyrdai/wyrd:${{ matrix.image }}-${{ matrix.arch }}-latest
+            wyrdai/wyrd:${{ matrix.arch }}-${{ github.event.release.tag_name }}
+            wyrdai/wyrd:${{ matrix.arch }}-latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Smoke-test and push the image
         id: push
         env:
-          IMAGE: wyrdai/wyrd:${{ matrix.image }}-${{ matrix.arch }}-${{ github.event.release.tag_name }}
-          LATEST: wyrdai/wyrd:${{ matrix.image }}-${{ matrix.arch }}-latest
+          IMAGE: wyrdai/wyrd:${{ matrix.arch }}-${{ github.event.release.tag_name }}
+          LATEST: wyrdai/wyrd:${{ matrix.arch }}-latest
         run: |
           docker run --rm --platform linux/${{ matrix.arch }} --entrypoint /usr/local/bin/wyrd-server "$IMAGE" --version
           docker push "$IMAGE"

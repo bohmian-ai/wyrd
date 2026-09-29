@@ -11,7 +11,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::contracts::{
@@ -45,13 +44,13 @@ const PUBLICATION_BATCH_RECORDS: i64 = 512;
 /// Delay between sweeps of the tenant directory.
 const PUBLICATION_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Tenant cycles a single sweep runs at once.
+/// Tenant cycles the publisher runs at once, across overlapping sweeps.
 ///
-/// A sweep publishes tenants concurrently so one tenant waiting on its chain
-/// head, Scribe, or Postgres cannot stall every tenant behind it. The bound is
-/// fixed rather than configurable: it exists to keep one sweep's demand on the
-/// Vala pool and the local Scribe predictable, and a deeper tenant directory
-/// drains over consecutive sweeps instead of opening unbounded work.
+/// Tenants publish concurrently so one tenant waiting on its chain head,
+/// Scribe, or Postgres cannot stall every tenant behind it. The bound is fixed
+/// rather than configurable: it exists to keep the publisher's demand on the
+/// Vala pool and the local Scribe predictable, so a deeper tenant directory
+/// waits for a free slot instead of opening unbounded work.
 const PUBLICATION_TENANT_CONCURRENCY: usize = 8;
 
 /// What one tenant's publication cycle did.
@@ -179,36 +178,46 @@ impl AuditPublisher {
 
     /// Run bounded publication sweeps until cancelled.
     ///
-    /// A failing tenant is logged and retried on the next sweep: its rows stay
+    /// A failing tenant is logged and retried on a later sweep: its rows stay
     /// durable in Postgres and its frozen bound stays set, so a transient
     /// Scribe or Postgres failure delays retained history rather than losing it
     /// or changing the in-flight batch identity.
     ///
-    /// Cancellation is observed only between sweeps, so `shutdown` does not
-    /// interrupt a cycle that has already begun. A sweep dropped mid-flight —
-    /// by process exit rather than by this token — leaves partial progress that
-    /// is safe by construction: every effect is either committed or absent, a
-    /// frozen bound survives to be reused verbatim, and a range appended but
-    /// not settled is republished into Scribe's batch fence on the next sweep.
-    /// Nothing is retried inside one sweep; the next tick is the retry.
+    /// Each tenant cycle runs as its own task in [`TenantCycles`], which
+    /// outlives the sweep that started it. A sweep never waits for a cycle to
+    /// finish, only for a free slot, so a cycle blocked mid-settlement on a
+    /// held chain head or staging row delays its own tenant and nobody else:
+    /// later sweeps keep re-listing the directory and publishing every other
+    /// tenant.
+    ///
+    /// Cancellation is observed between sweeps. Returning drops the in-flight
+    /// cycles, which aborts them; partial progress is safe by construction:
+    /// every effect is either committed or absent, a frozen bound survives to
+    /// be reused verbatim, and a range appended but not settled is republished
+    /// into Scribe's batch fence on the next run. Nothing is retried inside one
+    /// cycle; a later sweep is the retry.
     pub async fn run(self, shutdown: CancellationToken) {
-        let mut ticks = tokio::time::interval(self.interval);
+        let publisher = Arc::new(self);
+        let mut cycles = TenantCycles::new(PUBLICATION_TENANT_CONCURRENCY);
+        let mut ticks = tokio::time::interval(publisher.interval);
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                _ = ticks.tick() => self.sweep().await,
+                _ = ticks.tick() => publisher.sweep(&mut cycles).await,
             }
         }
     }
 
-    /// Publish one bounded batch for every live tenant.
+    /// Start one bounded publication cycle for every live tenant without one.
     ///
     /// Cycles run unordered, at most [`PUBLICATION_TENANT_CONCURRENCY`] at a
-    /// time, so a tenant blocked on its chain head delays only itself: every
-    /// other tenant in the same sweep keeps making progress and the sweep's
-    /// total demand still stays inside one fixed bound. A failing cycle is
-    /// logged and left to the next sweep.
-    async fn sweep(&self) {
+    /// time across sweeps, so total demand on the Vala pool and the local
+    /// Scribe stays inside one fixed bound. A tenant whose previous cycle is
+    /// still running is skipped rather than doubled: it owes the same frozen
+    /// range, which that cycle is already publishing. The sweep returns once
+    /// every listed tenant has a cycle, without waiting for any to finish. A
+    /// failing cycle is logged and left to a later sweep.
+    async fn sweep(self: &Arc<Self>, cycles: &mut TenantCycles) {
         let tenants =
             match wyrd_sql::queries::platform::tenants::list_active_tenant_ids(&self.directory)
                 .await
@@ -219,11 +228,18 @@ impl AuditPublisher {
                     return;
                 }
             };
-        futures_util::stream::iter(tenants)
-            .for_each_concurrent(PUBLICATION_TENANT_CONCURRENCY, |tenant| {
-                self.publish_logged(tenant)
-            })
-            .await;
+        cycles.reap();
+        for tenant in tenants {
+            if cycles.running(tenant) {
+                continue;
+            }
+            cycles.await_slot().await;
+            let publisher = Arc::clone(self);
+            cycles.start(
+                tenant,
+                async move { publisher.publish_logged(tenant).await },
+            );
+        }
     }
 
     /// Run one tenant cycle, reporting a failure instead of propagating it.
@@ -423,6 +439,82 @@ impl AuditPublisher {
     }
 }
 
+/// Tenant publication cycles that are still running, bounded and keyed by tenant.
+///
+/// The publisher's run loop owns it so cycles outlive the sweep that started
+/// them: a sweep waits for a free slot, never for a particular cycle, and so a
+/// cycle blocked on one tenant's locks cannot hold every later sweep. The
+/// tenant map is what lets a sweep skip a tenant that already has a cycle.
+/// Dropping it aborts every cycle still running.
+struct TenantCycles {
+    /// Running cycles; each task yields nothing and logs its own failure.
+    tasks: tokio::task::JoinSet<()>,
+    /// Tenant each running task publishes, keyed by its task id so a panicked
+    /// or aborted task still frees its tenant.
+    tenants: std::collections::HashMap<tokio::task::Id, DataTenantId>,
+    /// Maximum cycles running at once.
+    limit: usize,
+}
+
+impl TenantCycles {
+    /// Build an empty set admitting at most `limit` concurrent cycles.
+    fn new(limit: usize) -> Self {
+        Self {
+            tasks: tokio::task::JoinSet::new(),
+            tenants: std::collections::HashMap::new(),
+            limit,
+        }
+    }
+
+    /// Forget every cycle that has already finished, without waiting.
+    fn reap(&mut self) {
+        while let Some(done) = self.tasks.try_join_next_with_id() {
+            self.forget(done);
+        }
+    }
+
+    /// Whether `tenant` still has a cycle running.
+    fn running(&self, tenant: DataTenantId) -> bool {
+        self.tenants.values().any(|running| *running == tenant)
+    }
+
+    /// Wait until fewer than `limit` cycles are running.
+    ///
+    /// This is the only wait a sweep performs on cycles, and it ends as soon
+    /// as any one cycle finishes; it can stall only when every slot holds a
+    /// blocked tenant, which is the fixed demand bound working as intended.
+    async fn await_slot(&mut self) {
+        while self.tasks.len() >= self.limit {
+            let Some(done) = self.tasks.join_next_with_id().await else {
+                return;
+            };
+            self.forget(done);
+        }
+    }
+
+    /// Spawn `cycle` as the running cycle for `tenant`.
+    fn start(
+        &mut self,
+        tenant: DataTenantId,
+        cycle: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let id = self.tasks.spawn(cycle).id();
+        self.tenants.insert(id, tenant);
+    }
+
+    /// Drop the tenant entry of one joined task, logging a panicked cycle.
+    fn forget(&mut self, done: Result<(tokio::task::Id, ()), tokio::task::JoinError>) {
+        let id = match done {
+            Ok((id, ())) => id,
+            Err(error) => {
+                tracing::warn!(error = %error, "audit publication cycle ended abnormally");
+                error.id()
+            }
+        };
+        self.tenants.remove(&id);
+    }
+}
+
 /// Stable failures raised by one publication cycle.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AuditPublicationError {
@@ -452,4 +544,39 @@ fn publisher_principal(tenant: DataTenantId) -> Principal {
         Vec::new(),
         PermissionSet::new(),
     )
+}
+
+/// Unit coverage for the run loop's cycle bookkeeping.
+#[cfg(test)]
+mod tests {
+    use super::TenantCycles;
+    use wyrd_spec::DataTenantId;
+
+    /// A cycle that never finishes keeps only its own tenant out of a sweep.
+    ///
+    /// The blocked cycle stands in for a settlement parked on a held chain
+    /// head: it must not stop a free slot from being granted, a second
+    /// tenant's cycle from finishing and being reaped, or the blocked tenant
+    /// from being reported as still running.
+    #[tokio::test]
+    async fn a_blocked_cycle_holds_only_its_own_tenant() {
+        let mut cycles = TenantCycles::new(2);
+        let blocked = DataTenantId::new_v7();
+        let healthy = DataTenantId::new_v7();
+        cycles.start(blocked, std::future::pending());
+        cycles.await_slot().await;
+        let (finished, done) = tokio::sync::oneshot::channel();
+        cycles.start(healthy, async move {
+            let _ = finished.send(());
+        });
+        done.await.expect("the healthy cycle runs to completion");
+        tokio::task::yield_now().await;
+        cycles.reap();
+        cycles.await_slot().await;
+        assert!(
+            cycles.running(blocked),
+            "the blocked tenant stays in flight"
+        );
+        assert!(!cycles.running(healthy), "the finished tenant is reaped");
+    }
 }

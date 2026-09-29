@@ -35,7 +35,6 @@ env_shell_expand = false
 jobs = 1
 
 [env]
-WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
 # A panicking test should say where it panicked. Every lane below runs under
 # this, so a failure report never costs a second run to reproduce with
 # backtraces enabled.
@@ -535,10 +534,6 @@ dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
 run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/drift-verification.test.ts"
 
-[tasks."check:bifrost-oracle-deploy"]
-description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
-run = "cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^bifrost::deployment_contract::bifrost_deployment_contract_/)'"
-
 [tasks."check:bifrost-resource-governance"]
 description = "Reject obsolete Bifrost resource ownership"
 run = "bash scripts/checks/bifrost-resource-governance.sh"
@@ -548,7 +543,6 @@ description = "Run formatting, scoped Clippy, and static Bifrost boundary checks
 run = """
 cargo fmt --all -- --check
 cargo clippy --locked -p vala-bifrost-redux -p wyrd-client -p vala-sql -p wyrd-mcp -p wyrd-server -p wyrd-testing --all-targets --features wyrd-server/test-support -- -D warnings
-mise run check:bifrost-oracle-deploy
 mise run check:bifrost-resource-governance
 mise run check:object-store-pin
 mise run check:tenant-isolation
@@ -688,10 +682,27 @@ hide = true
 description = "Build the wyrd-server release binary"
 run = "cargo build --release --locked -p wyrd-server --features cloud"
 
+[tasks."test:server:startup"]
+description = "Official image journey: external Postgres, migrate, setup, nginx HTTP and gRPC, restart, migration refusal and retry"
+run = "bash scripts/server/test-startup.sh"
+
+[tasks."test:server:peer"]
+description = "Peer mode across real server processes: join and remote query, mTLS-only admission, typed-context and incompatible-protocol refusals"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:server:peer:inner'"
+[tasks."test:server:peer:inner"]
+hide = true
+description = "wyrd-testing `oracle` binary, peer_network module only"
+run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --test-threads 1 --run-ignored=all -E 'test(/^peer_network::/)'"
+
 [tasks."docker:build"]
 hide = true
 description = "Build the wyrd-server Docker image"
-run = "docker build -f docker/Dockerfile -t wyrd-server ."
+run = """
+set -eu
+cargo build --locked --release -p wyrd-server --features cloud
+mkdir -p binary && cp target/release/wyrd-server binary/
+docker build -f docker/official/Dockerfile -t wyrd .
+"""
 
 [tasks."check:docs"]
 hide = true
@@ -1196,7 +1207,7 @@ run = [
     WYRD_BIFROST_MEMORY_LIMIT_BYTES="$(sysctl -n hw.memsize)"
     export WYRD_BIFROST_MEMORY_LIMIT_BYTES
   fi
-  WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server
+  scripts/postgres/dev-server.sh
   """,
 ]
 
@@ -1283,7 +1294,7 @@ run = "pnpm dev --host 0.0.0.0 --port ${WYRD_DOCS_PORT:-4321}"
 description = "Run wyrd-server (:8080) and UI (:3000) in parallel"
 run = """
 cargo build -p wyrd-server
-WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server &
+scripts/postgres/dev-server.sh &
 BACKEND_PID=$!
 cd crates/wyrd/wyrd-server/wyrd-ui && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
 FRONTEND_PID=$!
@@ -1295,7 +1306,7 @@ wait $BACKEND_PID $FRONTEND_PID
 description = "Boot wyrd-server and UI on :3000"
 run = """
 cargo build -p wyrd-server
-WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server &
+scripts/postgres/dev-server.sh &
 SERVER_PID=$!
 cd crates/wyrd/wyrd-server/wyrd-ui && pnpm install --frozen-lockfile && pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000} &
 UI_PID=$!
@@ -1552,16 +1563,16 @@ depends = [
 [tasks."db:migrate"]
 hide = true
 description = """Verify wyrd-sql migrations are idempotent against the local docker-compose Postgres.
-Checks that required Postgres roles (wyrd_migrator BYPASSRLS, wyrd_app no-BYPASSRLS,
-wyrd_platform_admin BYPASSRLS) are present before applying DDL.
+Runs as the database owner, as `wyrd-server migrate` does, after checking that the serving
+roles (wyrd_app no-BYPASSRLS, wyrd_platform_admin BYPASSRLS) are present.
 """
 
 run = "scripts/postgres/with-test-postgres.sh -- mise run db:migrate:inner"
 [tasks."db:migrate:inner"]
 hide = true
 description = """Verify wyrd-sql migrations are idempotent against the local docker-compose Postgres.
-Checks that required Postgres roles (wyrd_migrator BYPASSRLS, wyrd_app no-BYPASSRLS,
-wyrd_platform_admin BYPASSRLS) are present before applying DDL.
+Runs as the database owner, as `wyrd-server migrate` does, after checking that the serving
+roles (wyrd_app no-BYPASSRLS, wyrd_platform_admin BYPASSRLS) are present.
 """
 run = "cargo nextest run --locked -p wyrd-sql --test pg_migration migrations_apply_and_are_idempotent"
 
@@ -1611,20 +1622,6 @@ run = "cargo nextest run --locked -p wyrd-spec --no-default-features --features 
 hide = true
 description = "wyrd-client::transport goldens match the generator's output"
 run = "cargo nextest run --locked -p wyrd-client --tests transport schema_drift"
-
-[tasks."dev:pg:nuke"]
-hide = true
-description = "Wipe embedded pg cache used by PostgresBoot"
-run = """
-cache_dir="${WYRD_DEV_PG_CACHE:-$HOME/.local/share/wyrd/pg}"
-case "$cache_dir" in
-  ""|"/")
-    echo "refusing to wipe unsafe WYRD_DEV_PG_CACHE='$cache_dir'" >&2
-    exit 1
-    ;;
-esac
-rm -rf "$cache_dir"
-"""
 
 # --- Isolated Postgres lifecycle verification ---------------------------------
 [tasks."test:postgres:contract"]

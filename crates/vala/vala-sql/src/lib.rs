@@ -10,14 +10,12 @@
 
 #![deny(missing_docs)]
 
-use sqlx::{AssertSqlSafe, PgConnection, PgPool};
-
 pub mod postgres;
 pub mod queries;
 pub mod row_types;
 
 pub use postgres::ValaPostgres;
-pub use wyrd_sql::{OperatorPool, TenantConn, error::SqlError};
+pub use wyrd_sql::{MigrationLease, OperatorPool, SchemaAccess, TenantConn, error::SqlError};
 
 /// Tenant-scoped Vala observability schema owned by `vala-sql`.
 pub const OBSERVABILITY_SCHEMA: &str = "vala";
@@ -25,91 +23,61 @@ pub const OBSERVABILITY_SCHEMA: &str = "vala";
 pub const ICEBERG_CATALOG_SCHEMA: &str = "iceberg_catalog";
 /// Schemas whose migration lifecycle is owned by `vala-sql`.
 pub const OWNED_SCHEMAS: &[&str] = &[OBSERVABILITY_SCHEMA, ICEBERG_CATALOG_SCHEMA];
-/// Search path used only by the boot migrator connection.
+/// Search path used only by the one-off migration connection.
 pub const MIGRATION_SEARCH_PATH: &str = "vala, iceberg_catalog, public";
-const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x0056_5441_4c41_5351;
+/// Schema-qualified ledger in which SQLx records applied Vala migrations.
+pub const MIGRATION_LEDGER: &str = "vala._sqlx_migrations";
+/// Vala migrations embedded in this binary.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-/// Apply embedded Vala SQL migrations against a boot-only migrator pool.
+/// Apply embedded Vala SQL migrations under the migration lease.
 ///
-/// The supplied pool is the same `wyrd_migrator` pool used by
-/// `wyrd_sql::migrate`. Migration runs on one dedicated connection with
-/// `search_path` set to `vala, public`, then the physical connection is closed
-/// so session state cannot return to the pool.
+/// The lease is the same one `wyrd_sql::migrate` ran under, which must run
+/// first because Vala's migrations depend on Wyrd's schemas. Creates the
+/// `vala` and `iceberg_catalog` schemas and runs every Vala migration with
+/// `search_path` set to `vala, iceberg_catalog, public`.
 ///
 /// # Errors
-/// Returns [`SqlError::Connect`] when the connection or bootstrap SQL fails.
-/// Returns [`SqlError::Migrate`] when migration execution fails.
-pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
-    let mut conn = migrator_pool.acquire().await.map_err(SqlError::Connect)?;
-    acquire_migration_advisory_lock(&mut conn).await?;
-
-    let result: Result<(), SqlError> = async {
-        for schema in OWNED_SCHEMAS {
-            sqlx::query(AssertSqlSafe(format!(
-                "CREATE SCHEMA IF NOT EXISTS {schema}"
-            )))
-            .execute(&mut *conn)
-            .await
-            .map_err(SqlError::Connect)?;
-        }
-        sqlx::query(AssertSqlSafe(format!(
-            "SET search_path TO {MIGRATION_SEARCH_PATH}"
-        )))
-        .execute(&mut *conn)
+/// Returns [`SqlError::InsufficientPrivilege`] when the role lacks DDL
+/// privileges, [`SqlError::Connect`] when a bootstrap statement fails, and
+/// [`SqlError::Migrate`] when migration execution fails.
+pub async fn migrate(lease: &mut MigrationLease) -> Result<(), SqlError> {
+    lease
+        .apply(OWNED_SCHEMAS, MIGRATION_SEARCH_PATH, &MIGRATOR)
         .await
-        .map_err(SqlError::Connect)?;
-        sqlx::migrate!("./migrations")
-            .run(&mut *conn)
-            .await
-            .map_err(SqlError::from)
-    }
-    .await;
-
-    let unlock_result = release_migration_advisory_lock(&mut conn).await;
-    if let Err(error) = unlock_result {
-        if result.is_ok() {
-            return Err(error);
-        }
-        tracing::warn!(
-            error = %error,
-            "failed to release vala-sql migration advisory lock after migration error"
-        );
-    }
-
-    if let Err(error) = conn.close().await {
-        tracing::warn!(
-            error = %error,
-            "failed to close vala-sql migration connection cleanly"
-        );
-    }
-
-    result
 }
 
-/// Acquire the Vala SQL migration advisory lock on the current session.
+/// Prove the Vala schema contract holds for serving.
+///
+/// Checks every embedded Vala migration and checksum; that the runtime role
+/// uses `vala` without DDL and cannot reach `iceberg_catalog`, whose metadata
+/// locations are cross-tenant, while the platform role owns that catalog's
+/// DDL; and tenant isolation in `vala`. Serving role attributes belong to
+/// `wyrd_sql::verify_schema`. Read-only.
 ///
 /// # Errors
-/// Returns [`SqlError::Connect`] when Postgres cannot acquire the lock.
-async fn acquire_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), SqlError> {
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(MIGRATION_ADVISORY_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-        .map_err(SqlError::Connect)?;
-    Ok(())
-}
-
-/// Release the Vala SQL migration advisory lock on the current session.
-///
-/// # Errors
-/// Returns [`SqlError::Connect`] when Postgres cannot release the lock.
-async fn release_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), SqlError> {
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(MIGRATION_ADVISORY_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-        .map_err(SqlError::Connect)?;
-    Ok(())
+/// Returns [`SqlError::SchemaNotReady`] for the first failed check,
+/// [`SqlError::MigrateChecksum`] for checksum drift, and [`SqlError::Connect`]
+/// on query failure.
+pub async fn verify_schema(operator: &OperatorPool) -> Result<(), SqlError> {
+    operator
+        .verify_migrations(MIGRATION_LEDGER, &MIGRATOR)
+        .await?;
+    operator
+        .verify_schema_privileges(
+            OBSERVABILITY_SCHEMA,
+            SchemaAccess::Usage,
+            SchemaAccess::Usage,
+        )
+        .await?;
+    operator
+        .verify_schema_privileges(
+            ICEBERG_CATALOG_SCHEMA,
+            SchemaAccess::None,
+            SchemaAccess::UsageCreate,
+        )
+        .await?;
+    operator.verify_tenant_isolation(OBSERVABILITY_SCHEMA).await
 }
 
 #[cfg(test)]

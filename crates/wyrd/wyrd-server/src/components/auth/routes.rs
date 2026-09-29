@@ -66,8 +66,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// Returns a `400` when a token exchange's identity input is malformed or its
 /// delegation would exceed the configured chain depth, a `401` for every
 /// unusable credential — including a reused, revoked, or expired refresh token
-/// and an invalid subject or actor token — a `403` when the invoke policy does
-/// not let the actor act for the subject, a `404` when the actor's principal or
+/// and an invalid subject or actor token — a `404` when the actor's principal or
 /// the presented workload assertion matches no principal, and a `503` when the
 /// auth backend or the audit path is unavailable. The grant and its exchange
 /// audit commit together, so a refusal serves no token.
@@ -88,9 +87,6 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
           or malformed reports that (WYRD_AUTH_401_REFRESH_REVOKED), and a subject token whose \
           delegation chain is already at the limit reports that \
           (WYRD_AUTH_401_DELEGATION_DEPTH_EXCEEDED)", body = WyrdProblem),
-        (status = 403, description = "Both exchange tokens are valid but the invoke policy \
-          does not let the actor act for the subject (WYRD_AUTHZ_403_POLICY_DENIED)",
-          body = WyrdProblem),
         (status = 404, description = "No principal in this tenant matches the token \
           exchange's actor or the presented workload assertion \
           (WYRD_AUTH_404_PRINCIPAL_NOT_FOUND)", body = WyrdProblem),
@@ -197,20 +193,16 @@ async fn token(
                 .map_err(sql_error)?;
             // The exchange commits its own authorization decision, so a
             // refusal after the policy decision is still durably audited.
-            let exchanged = DelegateToken {
-                issuer,
-                verifier,
-                policy: state.authz.policy_hook.clone(),
-            }
-            .execute(
-                conn,
-                SecretString::from(subject_token.expose().to_owned()),
-                SecretString::from(actor_token.expose().to_owned()),
-                audience,
-                req_id,
-            )
-            .await
-            .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
+            let exchanged = DelegateToken { issuer, verifier }
+                .execute(
+                    conn,
+                    SecretString::from(subject_token.expose().to_owned()),
+                    SecretString::from(actor_token.expose().to_owned()),
+                    audience,
+                    req_id,
+                )
+                .await
+                .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
             Ok(Json(exchanged.into_response()))
         }
         TokenRequest::RefreshToken { refresh_token } => {

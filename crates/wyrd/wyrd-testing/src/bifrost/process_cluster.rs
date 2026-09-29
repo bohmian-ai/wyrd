@@ -34,7 +34,6 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::request_id::RequestId;
 
 use crate::bifrost::peer_ca::BifrostPeerCa;
-use crate::bifrost::peer_keyring::TestPeerKeyring;
 use crate::server::TestBifrostPeerTls;
 
 /// Canonical private peer port every simulated pod binds.
@@ -99,22 +98,8 @@ mod env {
     pub const GRPC_BIND: &str = "WYRD_PEER_TEST_GRPC_BIND";
     /// Private peer socket this child binds and advertises.
     pub const PEER_BIND: &str = "WYRD_PEER_TEST_PEER_BIND";
-    /// Path to this child's peer CA trust bundle.
-    pub const PEER_CA_PATH: &str = "WYRD_PEER_TEST_PEER_CA_PATH";
-    /// Path to this child's own dual-EKU leaf chain.
-    pub const PEER_CERT_PATH: &str = "WYRD_PEER_TEST_PEER_CERT_PATH";
-    /// Path to this child's own peer private key.
-    pub const PEER_KEY_PATH: &str = "WYRD_PEER_TEST_PEER_KEY_PATH";
-    /// DNS identity every peer dial in this cluster verifies.
-    pub const PEER_SERVER_NAME: &str = "WYRD_PEER_TEST_PEER_SERVER_NAME";
-    /// Path to the shared peer Service API key file.
-    pub const PEER_API_KEY_PATH: &str = "WYRD_PEER_TEST_PEER_API_KEY_PATH";
-    /// Identifier of the peer ticket key this child signs with.
-    pub const PEER_TICKET_KEY_ID: &str = "WYRD_PEER_TEST_PEER_TICKET_KEY_ID";
-    /// Path to this child's peer ticket signing key.
-    pub const PEER_TICKET_KEY_PATH: &str = "WYRD_PEER_TEST_PEER_TICKET_KEY_PATH";
-    /// Path to the shared published peer ticket verifying manifest.
-    pub const PEER_TICKET_KEYRING_PATH: &str = "WYRD_PEER_TEST_PEER_TICKET_KEYRING_PATH";
+    /// This child's production-layout peer bundle (`ca.crt`, `tls.crt`, `tls.key`).
+    pub const PEER_TLS_DIR: &str = "WYRD_PEER_TEST_PEER_TLS_DIR";
     /// Oracle query slot units each child admits with, when the topology states
     /// one. Absent unless the caller asked for a stated admission capacity.
     pub const ORACLE_QUERY_SLOT_LIMIT: &str = "WYRD_PEER_TEST_ORACLE_QUERY_SLOT_LIMIT";
@@ -244,7 +229,7 @@ pub enum ControlRequest {
     /// The child always presents its configured peer TLS material, so a
     /// success proves the destination admitted this exact process rather than
     /// that the parent could reach the socket. The plan selects which private
-    /// adapter is addressed, which workload credential is presented, and how
+    /// adapter is addressed and how
     /// the first gRPC frame is laid out on the wire.
     PeerProbe(PeerProbePlan),
     /// Report how many request bodies this child's peer plane has polled.
@@ -334,8 +319,6 @@ pub struct PeerProbePlan {
     pub address: String,
     /// Private adapter the probe addresses.
     pub service: PeerProbeService,
-    /// Workload credential the probe presents.
-    pub credential: PeerProbeCredential,
     /// How the probe lays the first gRPC frame onto the wire.
     pub framing: PeerProbeFraming,
     /// Trust the probe dials the destination under.
@@ -357,7 +340,6 @@ impl PeerProbePlan {
         Self {
             address: address.to_owned(),
             service: PeerProbeService::OraclePeer,
-            credential: PeerProbeCredential::Own,
             framing: PeerProbeFraming::Whole,
             transport: PeerProbeTransport::Mutual,
             payload: None,
@@ -393,13 +375,6 @@ impl PeerProbePlan {
     #[must_use]
     pub fn against(mut self, service: PeerProbeService) -> Self {
         self.service = service;
-        self
-    }
-
-    /// Presents `credential` instead of this pod's own peer identity.
-    #[must_use]
-    pub fn presenting(mut self, credential: PeerProbeCredential) -> Self {
-        self.credential = credential;
         self
     }
 
@@ -439,22 +414,6 @@ impl PeerProbeService {
             Self::Path(path) => path.as_str(),
         }
     }
-}
-
-/// Which workload credential a peer probe presents.
-///
-/// The token variant carries a parent-minted API key for a deliberately wrong
-/// principal; the child exchanges it exactly as it would its own.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PeerProbeCredential {
-    /// This pod's own configured peer Service credential.
-    Own,
-    /// No `x-wyrd-access-token` metadata at all.
-    Absent,
-    /// A syntactically invalid bearer that no verifier can accept.
-    Invalid,
-    /// A parent-supplied API key exchanged for a real access token.
-    ApiKey(String),
 }
 
 /// How a peer probe lays its first gRPC frame onto the wire.
@@ -2074,21 +2033,8 @@ struct SharedClusterResources {
     storage_root: tempfile::TempDir,
     /// Peer certificate authority every child's leaf chains to.
     peer_ca: BifrostPeerCa,
-    /// One peer ticket keyring published to every child in this topology.
-    ///
-    /// Peer authority is verified against a published manifest, so a cluster
-    /// whose children each generated their own keyring could not accept one
-    /// another's tickets. Generating it once here is what makes the topology a
-    /// peer plane rather than a set of strangers.
-    peer_keyring: TestPeerKeyring,
     /// Root holding each child's private directory.
     node_roots: tempfile::TempDir,
-    /// API key of the one shared Bifrost peer Service principal.
-    ///
-    /// Provisioned once by the parent because the seeding is not idempotent,
-    /// and delivered to each child as a file under that child's private root
-    /// rather than as an argument or an environment value.
-    peer_api_key: secrecy::SecretString,
 }
 
 /// A Bifrost peer network of independently launched server processes.
@@ -2267,29 +2213,14 @@ impl BifrostProcessCluster {
         oracle_query_slot_limit: Option<usize>,
         benchmark: bool,
     ) -> Result<Self, ProcessClusterError> {
-        let fixture = Arc::new(
-            PgFixture::start()
-                .await
-                .map_err(|error| ProcessClusterError::Resource(error.to_string()))?,
-        );
-        let peer_api_key = crate::server::provision_bifrost_peer_principal(
-            &fixture,
-            crate::server::PeerPrincipalShape::Canonical,
-        )
-        .await
-        .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-        let fixture = Arc::into_inner(fixture).ok_or_else(|| {
-            ProcessClusterError::Resource(
-                "peer principal provisioning retained the fixture".to_owned(),
-            )
-        })?;
+        let fixture = PgFixture::start()
+            .await
+            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         let shared = SharedClusterResources {
             fixture,
-            peer_api_key,
             storage_root: tempfile::tempdir()
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?,
-            peer_keyring: TestPeerKeyring::generate(),
-            peer_ca: BifrostPeerCa::generate("localhost")
+            peer_ca: BifrostPeerCa::generate(wyrd_server::config::PEER_SERVER_NAME)
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?,
             node_roots: tempfile::tempdir()
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?,
@@ -2328,6 +2259,82 @@ impl BifrostProcessCluster {
             }
         }
         Ok(cluster)
+    }
+
+    /// Launches one more child into the running topology and waits for it.
+    ///
+    /// The new pod gets the next label and socket slot, and the same shared
+    /// database, object store, and peer bundle every other pod uses. No running
+    /// pod is restarted or reconfigured, so a journey observes whether existing
+    /// members discover it through Postgres membership alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::start`] for one child. A failed
+    /// launch leaves the running topology unchanged.
+    pub fn join(&mut self, target: ProcessNodeTarget) -> Result<&NodeReport, ProcessClusterError> {
+        let index = self.nodes.len();
+        let plan = LaunchPlan {
+            label: format!("pod-{index}"),
+            target,
+            sockets: self.address_plan.sockets(index)?,
+            defect: PeerTlsDefect::None,
+            volume: VolumeAction::Retain,
+        };
+        let node = self.launch(&plan)?;
+        self.nodes.push(node);
+        Ok(self.nodes[index].ready_report())
+    }
+
+    /// Launches one pod whose private peer socket another owner already holds.
+    ///
+    /// The parent binds the pod's planned peer address first, so the child
+    /// composes every role and then fails to bind its private listener. The
+    /// failed pod is not added to the topology; the next [`Self::join`] reuses
+    /// the same index, address, and data root once the hold is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when the peer address cannot
+    /// be held, or [`ProcessClusterError::Child`] when the pod starts anyway.
+    pub fn join_with_peer_socket_held(
+        &mut self,
+        target: ProcessNodeTarget,
+    ) -> Result<ProcessClusterError, ProcessClusterError> {
+        let index = self.nodes.len();
+        let plan = LaunchPlan {
+            label: format!("pod-{index}"),
+            target,
+            sockets: self.address_plan.sockets(index)?,
+            defect: PeerTlsDefect::None,
+            volume: VolumeAction::Retain,
+        };
+        let _hold = TcpListener::bind(plan.sockets.peer)
+            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
+        match self.launch(&plan) {
+            Ok(_) => Err(ProcessClusterError::Child(
+                "a pod whose peer socket was held reported ready".to_owned(),
+            )),
+            Err(error) => Ok(error),
+        }
+    }
+
+    /// Takes one pod out of the topology so a journey can stop it itself.
+    ///
+    /// The returned node still owns its process and threads; the caller kills
+    /// or shuts it down, and [`Drop`] reaps it if the caller does neither.
+    /// Later indices shift down by one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when no pod has that index.
+    pub fn remove(&mut self, index: usize) -> Result<ProcessNode, ProcessClusterError> {
+        if index >= self.nodes.len() {
+            return Err(ProcessClusterError::Resource(format!(
+                "no process node at index {index}"
+            )));
+        }
+        Ok(self.nodes.remove(index))
     }
 
     /// Returns how this platform assigned each pod its address.
@@ -2427,16 +2434,6 @@ impl BifrostProcessCluster {
         }
     }
 
-    /// Returns the peer ticket keyring every child in this cluster loads.
-    ///
-    /// A journey mints tickets with it directly — under the active key, a
-    /// retired one, or one no manifest publishes — which is the only way to
-    /// drive rotation and independence from outside the nodes.
-    #[must_use]
-    pub fn peer_keyring(&self) -> &TestPeerKeyring {
-        &self.shared.peer_keyring
-    }
-
     /// Returns the authority every child's peer leaf chains to.
     ///
     /// A journey needs it to dial the peer plane itself: to present a trusted
@@ -2502,26 +2499,6 @@ impl BifrostProcessCluster {
         )
         .await
         .map_err(|error| ProcessClusterError::Resource(error.to_string()))
-    }
-
-    /// Seeds one deliberately wrong peer Service principal and returns its key.
-    ///
-    /// A journey uses these to prove the private plane admits exactly one
-    /// configured identity: a different SYSTEM_OWNER service, a service with no
-    /// peer permission, and a data-tenant service that holds it must all be
-    /// refused before the request body is touched.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProcessClusterError::Resource`] when the principal cannot be
-    /// provisioned.
-    pub async fn provision_peer_principal(
-        &self,
-        shape: crate::server::PeerPrincipalShape,
-    ) -> Result<secrecy::SecretString, ProcessClusterError> {
-        crate::server::provision_bifrost_peer_principal(&self.shared.fixture, shape)
-            .await
-            .map_err(|error| ProcessClusterError::Resource(error.to_string()))
     }
 
     /// Launches a throwaway child with damaged peer material and expects it to fail.
@@ -2637,22 +2614,6 @@ impl BifrostProcessCluster {
             .materialize(&root, &label)
             .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         plan.defect.apply(&tls)?;
-        // Same private-root discipline as the certificate: the active signing
-        // key is written under this child's own root and only its path is
-        // published.
-        let keyring = self
-            .shared
-            .peer_keyring
-            .materialize(&root, &label)
-            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-        // Same reasoning as the certificate: the secret lands in a file under
-        // this child's private root and only the path is published.
-        let peer_api_key_path = root.join("peer-api-key");
-        std::fs::write(
-            &peer_api_key_path,
-            secrecy::ExposeSecret::expose_secret(&self.shared.peer_api_key),
-        )
-        .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         let sockets = plan.sockets;
 
         let mut command = Command::new(&self.binary);
@@ -2669,17 +2630,7 @@ impl BifrostProcessCluster {
             .env(env::HTTP_BIND, sockets.http.to_string())
             .env(env::GRPC_BIND, sockets.grpc.to_string())
             .env(env::PEER_BIND, sockets.peer.to_string())
-            .env(env::PEER_CA_PATH, &tls.ca_path)
-            .env(env::PEER_CERT_PATH, &tls.certificate_path)
-            .env(env::PEER_KEY_PATH, &tls.private_key_path)
-            .env(env::PEER_SERVER_NAME, &tls.server_name)
-            .env(env::PEER_API_KEY_PATH, &peer_api_key_path)
-            .env(env::PEER_TICKET_KEY_ID, &keyring.active_key_id)
-            .env(env::PEER_TICKET_KEY_PATH, &keyring.signing_key_path)
-            .env(
-                env::PEER_TICKET_KEYRING_PATH,
-                &keyring.verifying_keyring_path,
-            )
+            .env(env::PEER_TLS_DIR, &tls.dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

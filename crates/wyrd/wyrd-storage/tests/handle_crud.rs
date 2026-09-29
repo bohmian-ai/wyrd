@@ -2,7 +2,7 @@
 //!
 //! [`run_handle_crud`] is the single body exercised against every backend
 //! through the public [`StorageHandle`] surface (`put_object` / `get_object` /
-//! `list_objects` / `delete_object`). It is the server-side direct-CRUD path:
+//! `get_object_bounded` / `list_objects` / `delete_object`). It is the server-side direct-CRUD path:
 //! an agent request resolves a tenant from its JWT, a tenant-scoped
 //! [`ValidatedPath`] is built, and the handle reads/writes/lists/deletes the
 //! object itself (no client presign round-trip).
@@ -27,7 +27,8 @@ use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle, ValidatedPath, ten
 /// returning, so shared cloud buckets stay clean on success.
 ///
 /// # Panics
-/// Panics when any put, get, list, or delete fails, the listing differs, or a
+/// Panics when any put, get, bounded get, list, or delete fails, a bounded
+/// get holds more than one byte past its limit, the listing differs, or a
 /// deleted or missing key is not `ObjectNotFound`. A panic or cancellation
 /// mid-run can leave up to three small objects under that unique prefix.
 async fn run_handle_crud(handle: &StorageHandle) {
@@ -53,6 +54,27 @@ async fn run_handle_crud(handle: &StorageHandle) {
 
     let bytes = handle.get_object(&path("crud/a.bin")).await.expect("get a");
     assert_eq!(bytes, b"aaa", "read content mismatch");
+    let bounded = handle
+        .get_object_bounded(&path("crud/a.bin"), 3)
+        .await
+        .expect("bounded get a");
+    assert_eq!(bounded, b"aaa", "a body within the limit reads whole");
+    let bounded = handle
+        .get_object_bounded(&path("crud/a.bin"), 1)
+        .await
+        .expect("bounded get a past its limit");
+    assert_eq!(
+        bounded, b"aa",
+        "a longer body stops one byte past the limit"
+    );
+    let err = handle
+        .get_object_bounded(&path("crud/never-written.bin"), 1)
+        .await
+        .expect_err("bounded get missing");
+    assert!(
+        matches!(err, StorageError::ObjectNotFound { .. }),
+        "expected ObjectNotFound for a bounded missing read, got {err:?}"
+    );
 
     let listed = handle.list_objects(&path("crud")).await.expect("list crud");
     assert_eq!(

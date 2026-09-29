@@ -7,18 +7,21 @@
 
 #![deny(missing_docs)]
 
-use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
+use std::time::Duration;
+
+use sqlx::migrate::Migrator;
+use sqlx::postgres::PgConnection;
+use sqlx::{AssertSqlSafe, Connection as _};
 
 pub mod dsn;
 pub mod error;
 pub mod operator_pool;
 pub mod pool;
 pub mod postgres;
-#[cfg(feature = "embedded-postgres")]
-pub mod postgres_boot;
 pub mod queries;
 pub mod query;
 pub mod row_types;
+pub mod schema_check;
 pub mod tenant_conn;
 
 pub use error::SqlError;
@@ -26,6 +29,7 @@ pub use operator_pool::OperatorPool;
 pub use pool::PoolConfig;
 pub use postgres::WyrdPostgres;
 pub use row_types::cards::{CardRow, CardStatus, ParsedCardRow};
+pub use schema_check::SchemaAccess;
 pub use tenant_conn::TenantConn;
 
 /// Platform-global schema owned by `wyrd-sql`.
@@ -34,91 +38,135 @@ pub const PLATFORM_SCHEMA: &str = "platform";
 pub const CONTROL_SCHEMA: &str = "wyrd";
 /// Schemas whose migration lifecycle is owned by `wyrd-sql`.
 pub const OWNED_SCHEMAS: &[&str] = &[PLATFORM_SCHEMA, CONTROL_SCHEMA];
-/// Search path used only by the boot migrator connection.
+/// Search path used only by the one-off migration connection.
 pub const MIGRATION_SEARCH_PATH: &str = "wyrd, platform, public";
-const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x0057_5952_4453_514c;
+/// Schema-qualified ledger in which SQLx records applied Wyrd migrations.
+pub const MIGRATION_LEDGER: &str = "wyrd._sqlx_migrations";
+/// Wyrd migrations embedded in this binary.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-/// Apply embedded Wyrd SQL migrations against a boot-only migrator pool.
+/// Longest a one-off migration waits for another migration's lease.
 ///
-/// The supplied pool **must** authenticate as `wyrd_migrator`. Migration runs on
-/// one dedicated connection with `search_path` set to `wyrd, platform, public`,
-/// then the physical connection is closed so session state cannot return to the
-/// pool. Calling with an `wyrd_app`-role DSN will fail on the bootstrap DDL and
-/// return [`SqlError::InsufficientPrivilege`].
-///
-/// # Errors
-/// Returns [`SqlError::Connect`] when the connection itself fails.
-/// Returns [`SqlError::InsufficientPrivilege`] when the role lacks DDL privileges.
-/// Returns [`SqlError::Migrate`] when migration execution fails.
-pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
-    let mut conn = migrator_pool.acquire().await.map_err(SqlError::Connect)?;
-    acquire_migration_advisory_lock(&mut conn).await?;
+/// Two release slots can start `wyrd-server migrate` at once; the loser waits
+/// this long for the winner, then fails instead of queueing indefinitely. A
+/// retry after the winner finishes or fails acquires the lease normally.
+pub const MIGRATION_LEASE_WAIT: Duration = Duration::from_secs(60);
 
-    let result: Result<(), SqlError> = async {
-        sqlx::query("CREATE SCHEMA IF NOT EXISTS platform")
-            .execute(&mut *conn)
+/// Database-wide advisory key serializing every Wyrd and Vala migration.
+const MIGRATION_LEASE_KEY: i64 = 0x0057_5952_4453_514c;
+
+/// One owner session holding the database-wide migration lease.
+///
+/// The one-off migration process acquires this once and runs the ordered Wyrd
+/// migration, the Vala migration, and post-migration validation while holding
+/// it, so no two migrators can interleave stages. The lease is a session-level
+/// advisory lock on one dedicated physical connection: [`Self::release`]
+/// unlocks it and closes the connection, and dropping the lease without
+/// releasing closes the connection too, which ends the session and so releases
+/// the lock — a crashed or cancelled migrator never strands it.
+pub struct MigrationLease {
+    /// Dedicated owner session detached from its pool, holding the lock.
+    session: PgConnection,
+}
+
+impl MigrationLease {
+    /// Apply one crate's embedded migrations under this lease.
+    ///
+    /// Creates the crate's owned `schemas` if absent, sets the session
+    /// `search_path` the crate's migrations expect, and runs `migrator` on the
+    /// lease's own session. Each schema owner calls this through its own
+    /// `migrate` function; Wyrd must run before Vala, whose migrations depend
+    /// on Wyrd's schemas.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::InsufficientPrivilege`] when the login lacks the
+    /// bootstrap DDL privileges, [`SqlError::Connect`] when another bootstrap
+    /// statement fails, and [`SqlError::Migrate`] when a migration fails.
+    pub async fn apply(
+        &mut self,
+        schemas: &[&str],
+        search_path: &str,
+        migrator: &Migrator,
+    ) -> Result<(), SqlError> {
+        for schema in schemas {
+            sqlx::query(AssertSqlSafe(format!(
+                "CREATE SCHEMA IF NOT EXISTS {schema}"
+            )))
+            .execute(&mut self.session)
             .await
             .map_err(classify_bootstrap_error)?;
-        sqlx::query("CREATE SCHEMA IF NOT EXISTS wyrd")
-            .execute(&mut *conn)
+        }
+        sqlx::query(AssertSqlSafe(format!("SET search_path TO {search_path}")))
+            .execute(&mut self.session)
             .await
             .map_err(classify_bootstrap_error)?;
-        sqlx::query("SET search_path TO wyrd, platform, public")
-            .execute(&mut *conn)
-            .await
-            .map_err(classify_bootstrap_error)?;
-        sqlx::migrate!("./migrations")
-            .run(&mut *conn)
+        migrator
+            .run(&mut self.session)
             .await
             .map_err(SqlError::from)
     }
-    .await;
 
-    let unlock_result = release_migration_advisory_lock(&mut conn).await;
-    if let Err(error) = unlock_result {
-        if result.is_ok() {
-            return Err(error);
+    /// Unlock the lease and close its dedicated session.
+    ///
+    /// A failed unlock still closes the session, which releases the lock; the
+    /// failure is returned so the caller does not report a clean release.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Connect`] when the unlock statement fails.
+    pub async fn release(mut self) -> Result<(), SqlError> {
+        let unlocked = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_LEASE_KEY)
+            .execute(&mut self.session)
+            .await
+            .map(|_| ())
+            .map_err(SqlError::Connect);
+        if let Err(error) = self.session.close().await {
+            tracing::warn!(error = %error, "failed to close the migration lease session cleanly");
         }
-        tracing::warn!(
-            error = %error,
-            "failed to release wyrd-sql migration advisory lock after migration error"
-        );
+        unlocked
     }
-
-    if let Err(error) = conn.close().await {
-        tracing::warn!(
-            error = %error,
-            "failed to close wyrd-sql migration connection cleanly"
-        );
-    }
-
-    result
 }
 
-/// Acquire the Wyrd SQL migration advisory lock on the current session.
+/// Apply embedded Wyrd SQL migrations under the migration lease.
+///
+/// Creates the `platform` and `wyrd` schemas and runs every Wyrd migration
+/// with `search_path` set to `wyrd, platform, public`. Calling with a lease
+/// acquired from a serving `wyrd_app` DSN fails on the bootstrap DDL and
+/// returns [`SqlError::InsufficientPrivilege`].
 ///
 /// # Errors
-/// Returns [`SqlError::Connect`] when Postgres cannot acquire the lock.
-async fn acquire_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), SqlError> {
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(MIGRATION_ADVISORY_LOCK_KEY)
-        .execute(&mut *conn)
+/// Returns [`SqlError::InsufficientPrivilege`] when the role lacks DDL
+/// privileges, [`SqlError::Connect`] when a bootstrap statement fails, and
+/// [`SqlError::Migrate`] when migration execution fails.
+pub async fn migrate(lease: &mut MigrationLease) -> Result<(), SqlError> {
+    lease
+        .apply(OWNED_SCHEMAS, MIGRATION_SEARCH_PATH, &MIGRATOR)
         .await
-        .map_err(SqlError::Connect)?;
-    Ok(())
 }
 
-/// Release the Wyrd SQL migration advisory lock on the current session.
+/// Prove the Wyrd schema contract holds for serving.
+///
+/// Checks both serving roles' attributes, every embedded Wyrd migration and
+/// checksum, both roles' privileges on the `platform` and `wyrd` schemas, and
+/// tenant isolation in `wyrd`. The one-off migration runs this after migrating
+/// and serving boot runs it before reporting ready, so both enforce the same
+/// contract. Read-only.
 ///
 /// # Errors
-/// Returns [`SqlError::Connect`] when Postgres cannot release the lock.
-async fn release_migration_advisory_lock(conn: &mut PgConnection) -> Result<(), SqlError> {
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(MIGRATION_ADVISORY_LOCK_KEY)
-        .execute(&mut *conn)
-        .await
-        .map_err(SqlError::Connect)?;
-    Ok(())
+/// Returns [`SqlError::SchemaNotReady`] for the first failed check,
+/// [`SqlError::MigrateChecksum`] for checksum drift, and [`SqlError::Connect`]
+/// on query failure.
+pub async fn verify_schema(operator: &OperatorPool) -> Result<(), SqlError> {
+    operator.verify_serving_roles().await?;
+    operator
+        .verify_migrations(MIGRATION_LEDGER, &MIGRATOR)
+        .await?;
+    for schema in OWNED_SCHEMAS {
+        operator
+            .verify_schema_privileges(schema, SchemaAccess::Usage, SchemaAccess::Usage)
+            .await?;
+    }
+    operator.verify_tenant_isolation(CONTROL_SCHEMA).await
 }
 
 fn classify_bootstrap_error(error: sqlx::Error) -> SqlError {
@@ -132,62 +180,56 @@ fn classify_bootstrap_error(error: sqlx::Error) -> SqlError {
     SqlError::Connect(error)
 }
 
-/// Control-plane Postgres handle.
-///
-/// The store is cloneable because it wraps an internal connection pool.
-#[derive(Clone)]
-pub struct SqlStore {
-    pool: PgPool,
-}
-
-impl SqlStore {
-    /// Connect to Postgres with a bounded pool.
+impl OperatorPool {
+    /// Acquire the migration lease on a dedicated owner connection.
     ///
-    /// This does not run migrations.
+    /// Only the one-off `wyrd-server migrate` calls this, on an operator pool
+    /// it builds from the database-owner DSN; serving pools never hold that
+    /// credential. The connection is detached from the pool so its session
+    /// state, and the lock, never return to it. The wait is bounded by `wait`
+    /// through the session's `lock_timeout`, which is reset once the lock is
+    /// held so migrations run with the server default.
     ///
     /// # Errors
-    /// Returns [`SqlError::Connect`] when another Rustls provider already owns
-    /// the process or the database connection fails. Cancellation may leave
-    /// connections opened by SQLx for the pool to close during drop.
-    pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self, SqlError> {
-        wyrd_tls::install_crypto_provider()
-            .map_err(|error| SqlError::Connect(sqlx::Error::Configuration(Box::new(error))))?;
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(database_url)
+    /// Returns [`SqlError::Conflict`] when another migrator still holds the
+    /// lease after `wait`, and [`SqlError::Connect`] when the connection or a
+    /// session statement fails.
+    pub async fn migration_lease(&self, wait: Duration) -> Result<MigrationLease, SqlError> {
+        let mut session = self
+            .pool()
+            .acquire()
+            .await
+            .map_err(SqlError::Connect)?
+            .detach();
+        sqlx::query(AssertSqlSafe(format!(
+            "SET lock_timeout = '{}ms'",
+            wait.as_millis().max(1)
+        )))
+        .execute(&mut session)
+        .await
+        .map_err(SqlError::Connect)?;
+        let locked = sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_LEASE_KEY)
+            .execute(&mut session)
+            .await;
+        match locked {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
+                return Err(SqlError::Conflict {
+                    detail: format!(
+                        "another migration held the database migration lease for {}s; \
+                         retry after it finishes",
+                        wait.as_secs()
+                    ),
+                });
+            }
+            Err(error) => return Err(SqlError::Connect(error)),
+        }
+        sqlx::query("RESET lock_timeout")
+            .execute(&mut session)
             .await
             .map_err(SqlError::Connect)?;
-        Ok(Self { pool })
-    }
-
-    /// Connect to Postgres with role-specific pool configuration.
-    ///
-    /// This does not run migrations.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::Connect`] when another Rustls provider already owns
-    /// the process, the DSN cannot be parsed, or the database connection fails.
-    /// Cancellation may leave connections opened by SQLx for the pool to close
-    /// during drop.
-    pub async fn connect_with(database_url: &str, config: PoolConfig) -> Result<Self, SqlError> {
-        let pool = pool::connect_pool(database_url, config)
-            .await
-            .map_err(SqlError::Connect)?;
-        Ok(Self { pool })
-    }
-
-    /// Apply embedded SQL migrations.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::Migrate`] when migration execution fails.
-    pub async fn migrate(&self) -> Result<(), SqlError> {
-        migrate(&self.pool).await
-    }
-
-    /// Borrow the underlying Postgres pool.
-    #[must_use]
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+        Ok(MigrationLease { session })
     }
 }
 

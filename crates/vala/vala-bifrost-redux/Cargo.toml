@@ -70,7 +70,9 @@ wyrd-tonic = { workspace = true, features = ["server", "client"] }
 prost = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
-sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }
+# The Iceberg SQL catalog opens its own Postgres pool on this sqlx; without a
+# TLS backend it cannot reach a TLS-only (`sslmode=verify-full`) database.
+sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any", "tls-rustls-aws-lc-rs"] }
 ulid = { workspace = true }
 bytes = "1"
 rayon = { workspace = true }

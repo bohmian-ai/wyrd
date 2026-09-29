@@ -5,7 +5,7 @@ use crate::settings::{BackendConfig, StorageSettings};
 use crate::signer::BackendSigner;
 use crate::tenant_path::ValidatedPath;
 use opendal::{EntryMode, ErrorKind, Operator};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use wyrd_spec::storage::StorageBackendKind;
 
@@ -39,8 +39,6 @@ pub struct StorageHandle {
     presign_ttl: Duration,
     default_part_size_bytes: u64,
     multipart_threshold_bytes: u64,
-    public_base_url: Option<String>,
-    public_base_url_override: Arc<OnceLock<String>>,
 }
 
 impl std::fmt::Debug for StorageHandle {
@@ -61,17 +59,18 @@ impl StorageHandle {
     ///
     /// Intended for tests and local-mode harnesses. The resulting
     /// [`BackendConfig`] is synthesized from the signer alone, so
-    /// optional fields (`region`, `endpoint_url`, `public_base_url`) are
+    /// optional fields (`region`, `endpoint_url`) are
     /// defaulted, `require_encryption` is `false`,
     /// `presign_ttl` is the crate default, and `default_part_size_bytes`
     /// is the crate default. Production paths must use [`Self::from_settings`].
     ///
     /// # Panics
     ///
-    /// Panics if opendal operator construction fails for the synthesized config.
-    /// Safe under opendal 0.57 because operator construction is lazy (no network
-    /// calls or credential loading at build time). Production paths must use
-    /// [`Self::from_settings`].
+    /// Panics if opendal operator or HTTP client construction fails for the
+    /// synthesized config. Operator construction is lazy under opendal 0.57 (no
+    /// network calls or credential loading at build time), and the HTTP client
+    /// fails only when no Rustls crypto provider can be installed. Production
+    /// paths must use [`Self::from_settings`].
     #[must_use]
     pub fn new(signer: BackendSigner) -> Self {
         let backend_config = match &signer {
@@ -99,8 +98,6 @@ impl StorageHandle {
             presign_ttl: Duration::from_secs(u64::from(crate::settings::DEFAULT_PRESIGN_TTL_SECS)),
             default_part_size_bytes: crate::settings::DEFAULT_PART_SIZE_BYTES,
             multipart_threshold_bytes: crate::plan::MULTIPART_THRESHOLD_BYTES,
-            public_base_url: None,
-            public_base_url_override: Arc::new(OnceLock::new()),
         }
     }
 
@@ -143,8 +140,6 @@ impl StorageHandle {
             presign_ttl: settings.presign_ttl,
             default_part_size_bytes: settings.part_size_bytes,
             multipart_threshold_bytes: settings.multipart_threshold_bytes,
-            public_base_url: settings.public_base_url,
-            public_base_url_override: Arc::new(OnceLock::new()),
         }))
     }
 
@@ -205,43 +200,6 @@ impl StorageHandle {
         self.multipart_threshold_bytes
     }
 
-    /// Public base URL configured for local-mode routes.
-    #[must_use]
-    pub fn public_base_url(&self) -> Option<&str> {
-        self.public_base_url_override
-            .get()
-            .map(String::as_str)
-            .or(self.public_base_url.as_deref())
-    }
-
-    /// Bind the public base URL once the embedding server has selected its
-    /// listener address.
-    ///
-    /// This is used by bound test servers whose ephemeral port is not known
-    /// when the storage handle is first assembled. Production callers should
-    /// configure `public_base_url` in [`StorageSettings`].
-    ///
-    /// Repeating the same assignment is harmless. A different assignment is
-    /// rejected because local download plans must retain one public authority
-    /// for the lifetime of this handle.
-    ///
-    /// # Errors
-    /// Returns [`StorageError::PublicBaseUrlConflict`] when another URL was
-    /// previously bound.
-    pub fn set_public_base_url(&self, base_url: String) -> Result<(), StorageError> {
-        let existing = self
-            .public_base_url_override
-            .get_or_init(|| base_url.clone());
-        if existing == &base_url {
-            Ok(())
-        } else {
-            Err(StorageError::PublicBaseUrlConflict {
-                existing: existing.clone(),
-                requested: base_url,
-            })
-        }
-    }
-
     /// Probe the storage backend for liveness.
     ///
     /// For the local backend, attempts a `stat` of the configured storage root
@@ -285,6 +243,70 @@ impl StorageHandle {
             .await
             .map_err(|e| self.map_operator_error(&e, "get_object", &path.full))?;
         Ok(buf.to_vec())
+    }
+
+    /// Read an object's body, holding at most `limit + 1` bytes of it.
+    ///
+    /// The body streams from the backend chunk by chunk through the raw
+    /// accessor and the read stops as soon as `limit + 1` bytes are held. No
+    /// stored metadata sizes the read, so a caller whose earlier
+    /// [`Self::object_len`] check saw a stale or replaced object still learns
+    /// the truth: the returned buffer is longer than `limit` exactly when the
+    /// body is. Callers reject that overflow; this method only bounds the
+    /// allocation. Dropping the reader early abandons the rest of the body.
+    /// The object key is not recorded on the tracing span.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::ObjectNotFound`] when the object is absent, or
+    /// [`StorageError::Backend`] for any other backend failure while opening
+    /// or reading the body.
+    #[tracing::instrument(skip(self, path), fields(backend = ?self.backend()))]
+    pub async fn get_object_bounded(
+        &self,
+        path: &ValidatedPath,
+        limit: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        use opendal::raw::oio::Read as _;
+        use opendal::raw::{Access as _, OpRead, normalize_path};
+
+        let held = usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let failed = |error: opendal::Error| {
+            self.map_operator_error(&error, "get_object_bounded", &path.full)
+        };
+        let (_, mut reader) = self
+            .operator
+            .inner()
+            .read(&normalize_path(&path.full), OpRead::new())
+            .await
+            .map_err(failed)?;
+        let mut body = Vec::new();
+        while body.len() < held {
+            let chunk = reader.read().await.map_err(failed)?.to_bytes();
+            if chunk.is_empty() {
+                break;
+            }
+            let take = chunk.len().min(held - body.len());
+            body.extend_from_slice(&chunk[..take]);
+        }
+        Ok(body)
+    }
+
+    /// Size in bytes of an object, read from its metadata without its body.
+    ///
+    /// Lets a server-side reader bound an object before it loads it.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::ObjectNotFound`] when the object is absent, or
+    /// [`StorageError::Backend`] for any other backend failure.
+    #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
+    pub async fn object_len(&self, path: &ValidatedPath) -> Result<u64, StorageError> {
+        self.operator
+            .stat(&path.full)
+            .await
+            .map(|metadata| metadata.content_length())
+            .map_err(|e| self.map_operator_error(&e, "object_len", &path.full))
     }
 
     /// Write an object's bytes directly to the backend.
@@ -430,6 +452,35 @@ mod tests {
             b"card"
         );
     }
+
+    /// A bounded read returns a body within the limit whole, stops one byte
+    /// past the limit for a longer body, and reports an absent object.
+    #[tokio::test]
+    async fn get_object_bounded_holds_at_most_one_byte_past_the_limit() {
+        let dir = TempDir::new().expect("tempdir");
+        let handle = local_handle(dir.path());
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let card = uuid::Uuid::now_v7().to_string();
+        let path = |name: &str| {
+            crate::tenant_path::validate(&crate::tenant_path::build(tenant, &card, name), tenant)
+                .expect("object path is valid")
+        };
+        handle
+            .put_object(&path("body"), b"0123456789".to_vec())
+            .await
+            .expect("the object writes");
+
+        let whole = handle.get_object_bounded(&path("body"), 10).await;
+        let over = handle.get_object_bounded(&path("body"), 4).await;
+        let absent = handle.get_object_bounded(&path("absent"), 4).await;
+
+        assert_eq!(whole.expect("the body reads"), b"0123456789");
+        assert_eq!(over.expect("the prefix reads"), b"01234");
+        assert!(
+            matches!(absent, Err(StorageError::ObjectNotFound { .. })),
+            "expected ObjectNotFound, got {absent:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -445,7 +496,6 @@ mod from_settings_tests {
         "WYRD_STORAGE_PRESIGN_TTL_SECS",
         "WYRD_STORAGE_PART_SIZE_BYTES",
         "WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES",
-        "WYRD_PUBLIC_BASE_URL",
     ];
 
     #[tokio::test]
@@ -459,23 +509,19 @@ mod from_settings_tests {
         );
         assert_eq!(handle.presign_ttl_secs(), 600);
         assert_eq!(handle.default_part_size_bytes(), 16 * 1024 * 1024);
-        assert_eq!(handle.public_base_url(), Some("https://wyrd.test"));
     }
 
     /// Boot a local handle from a `file:` storage URL over a fresh temp root.
     async fn local_handle() -> (Arc<StorageHandle>, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("temp dir");
-        let vars = vec![
-            (
-                "WYRD_STORAGE_URL",
-                Some(
-                    url::Url::from_file_path(root.path())
-                        .expect("temp dir is absolute")
-                        .to_string(),
-                ),
+        let vars = vec![(
+            "WYRD_STORAGE_URL",
+            Some(
+                url::Url::from_file_path(root.path())
+                    .expect("temp dir is absolute")
+                    .to_string(),
             ),
-            ("WYRD_PUBLIC_BASE_URL", Some("https://wyrd.test".to_owned())),
-        ];
+        )];
         let provided = vars.iter().map(|(key, _)| *key).collect::<Vec<_>>();
         let mut all = ENV_KEYS
             .iter()

@@ -10,9 +10,11 @@ use wyrd_testing::bifrost::process_cluster::{
     BifrostProcessCluster, NodeReport, PeerTlsDefect, ProcessNodeTarget, VolumeAction,
 };
 use wyrd_tonic::tonic::Code;
+use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
+use wyrd_tonic::wyrd::v1::{QueryClass, ReserveNodeSlotsRequest};
 
 use super::support::{
-    DialIdentity, PeerDial, PeerJourneyError, probe_oracle_lifecycle, probe_oracle_peer,
+    DialIdentity, PeerDial, PeerJourneyError, polls_at, probe_oracle_lifecycle, probe_oracle_peer,
     probe_scribe_tail, target_serves_peer_plane, target_serves_public_listener,
 };
 
@@ -62,8 +64,8 @@ async fn prove_peer_listener_isolation() -> Result<(), PeerJourneyError> {
     one_lifecycle_owns_two_isolated_listeners(&cluster)?;
     peer_services_are_absent_from_the_public_listener(&cluster).await?;
     incomplete_peer_material_refuses_to_start(&cluster)?;
-    only_a_member_certificate_completes_the_handshake(&cluster).await?;
-    a_trusted_certificate_alone_authorizes_nothing(&cluster).await?;
+    only_a_member_certificate_completes_the_handshake(&mut cluster).await?;
+    a_trusted_certificate_alone_authorizes_nothing(&mut cluster).await?;
     every_target_mounts_exactly_its_services(&cluster).await?;
     cluster.shutdown()?;
     drop(cluster);
@@ -202,21 +204,45 @@ fn incomplete_peer_material_refuses_to_start(
 /// handshake completes, so a refusal is proved by driving one real RPC rather
 /// than by whether `connect` returned. A member is expected to reach the
 /// application layer and be answered there; an anonymous or foreign identity is
-/// expected to lose the connection instead.
+/// expected to lose the connection instead. A valid leaf from the cluster's own
+/// authority for another name completes the handshake, so it must instead be
+/// refused as unauthenticated before the peer plane polls any request body.
 ///
 /// # Errors
 ///
-/// Returns a failure when an anonymous, foreign, or misnamed client reaches the
-/// application layer, or when a member cannot.
+/// Returns a failure when an anonymous, foreign, expired, misnamed-server, or
+/// misnamed-client identity reaches the application layer, or when a member
+/// cannot.
 async fn only_a_member_certificate_completes_the_handshake(
-    cluster: &BifrostProcessCluster,
+    cluster: &mut BifrostProcessCluster,
 ) -> Result<(), PeerJourneyError> {
-    let node = cluster
+    let index = cluster
         .nodes()
         .iter()
-        .find(|node| target_serves_peer_plane(node.target()))
+        .position(|node| target_serves_peer_plane(node.target()))
         .ok_or("no peer-bearing pod in the topology")?;
-    let address = node.peer_addr();
+    let address = cluster.nodes()[index].peer_addr();
+
+    let before = polls_at(cluster, index)?;
+    let misnamed = PeerDial::member(cluster.peer_ca(), address)
+        .with_identity(DialIdentity::Misnamed)
+        .connect()
+        .await;
+    if let Ok(channel) = misnamed {
+        match probe_oracle_peer(channel).await {
+            Err(status) if status.code() == Code::Unauthenticated => {}
+            Err(status) if !reached_the_application(&status) => {}
+            outcome => {
+                return Err(format!(
+                    "a same-authority leaf for another name was admitted: {outcome:?}"
+                )
+                .into());
+            }
+        }
+    }
+    if polls_at(cluster, index)? != before {
+        return Err("a same-authority leaf for another name reached a peer body".into());
+    }
 
     let member = PeerDial::member(cluster.peer_ca(), address)
         .connect()
@@ -242,6 +268,10 @@ async fn only_a_member_certificate_completes_the_handshake(
         (
             "a foreign authority",
             PeerDial::member(cluster.peer_ca(), address).with_identity(DialIdentity::Foreign),
+        ),
+        (
+            "an expired member certificate",
+            PeerDial::member(cluster.peer_ca(), address).with_identity(DialIdentity::Expired),
         ),
         (
             "a wrong served name",
@@ -288,37 +318,73 @@ fn reached_the_application(status: &wyrd_tonic::tonic::Status) -> bool {
 
 /// Transport admission is not node identity and is not operation authority.
 ///
+/// Every peer-plane pod mounts `OraclePeerService`, so each receives a
+/// well-formed reserve that carries no typed context. An Oracle pod is named
+/// with its own live fence, so the request passes conversion and the fence
+/// check and is refused only for its missing authority. A pod without the
+/// Oracle role has no reservation to authorize and refuses the precondition.
+///
 /// # Errors
 ///
 /// Returns a failure when a peer RPC succeeds for a caller that presented only
-/// a trusted certificate, or when the certificate is treated as a `NodeId`.
+/// a trusted certificate, when it is refused for any other reason, or when the
+/// certificate is treated as a `NodeId`.
 async fn a_trusted_certificate_alone_authorizes_nothing(
-    cluster: &BifrostProcessCluster,
+    cluster: &mut BifrostProcessCluster,
 ) -> Result<(), PeerJourneyError> {
-    for node in cluster.nodes() {
-        if !target_serves_peer_plane(node.target()) {
+    for index in 0..cluster.nodes().len() {
+        let target = cluster.nodes()[index].target();
+        if !target_serves_peer_plane(target) {
             continue;
         }
-        let report = node.ready_report();
+        let report = cluster.nodes()[index].ready_report().clone();
         if report
             .peer_certificate_fingerprint
             .contains(&report.node_id.simple().to_string())
         {
             return Err("the peer certificate encodes the runtime node identity".into());
         }
-        let channel = PeerDial::member(cluster.peer_ca(), node.peer_addr())
+        let channel = PeerDial::member(cluster.peer_ca(), cluster.nodes()[index].peer_addr())
             .connect()
             .await?;
-        match probe_oracle_peer(channel).await {
-            Err(status)
-                if matches!(
-                    status.code(),
-                    Code::Unauthenticated | Code::PermissionDenied | Code::Unimplemented
-                ) => {}
+        let serves_oracle = matches!(target, ProcessNodeTarget::Oracle | ProcessNodeTarget::All);
+        // The ready report can predate the pod's own Oracle lease, so the
+        // fence is read from a live membership cut.
+        let live = cluster.nodes_mut()[index].inspect()?;
+        let fence = live
+            .membership
+            .iter()
+            .find(|entry| entry.node_id == report.node_id && entry.role == "oracle")
+            .map(|own| own.fencing_token);
+        let leader_fencing_token = match (serves_oracle, fence) {
+            (true, Some(fence)) => fence,
+            (true, None) => return Err("an Oracle pod holds no live Oracle lease".into()),
+            (false, _) => 1,
+        };
+        let request = ReserveNodeSlotsRequest {
+            query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            leader_node_id: report.node_id.to_string(),
+            leader_fencing_token,
+            query_class: QueryClass::Interactive as i32,
+            slot_units: 1,
+            expires_at_unix_ms: u64::try_from(
+                (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis(),
+            )?,
+            context: None,
+            graph: None,
+        };
+        match OraclePeerServiceClient::new(channel)
+            .reserve_slots(request)
+            .await
+            .map(|_| ())
+        {
+            Err(status) if serves_oracle && status.code() == Code::Unauthenticated => {}
+            Err(status) if !serves_oracle && status.code() == Code::FailedPrecondition => {}
             Err(status) => {
                 return Err(format!(
-                    "a certificate-only caller was refused as {:?} rather than unauthorized",
-                    status.code()
+                    "a certificate-only caller to {target:?} was refused as {:?}: {}",
+                    status.code(),
+                    status.message()
                 )
                 .into());
             }

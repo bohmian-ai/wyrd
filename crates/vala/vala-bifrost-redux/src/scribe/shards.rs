@@ -3111,6 +3111,11 @@ struct GroupWalState {
     /// time, so insertion releases them instead of inserting them and replay
     /// suppresses them on the same logical-identity rule.
     spent_batch_ids: HashSet<[u8; 16]>,
+    /// Batch identities at least one of whose slices this group made visible.
+    ///
+    /// A batch absent here was a replay: the fence spent it or the memtable
+    /// already retained every slice, so its ACK reports no first commit.
+    inserted_batch_ids: HashSet<[u8; 16]>,
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -3209,21 +3214,30 @@ impl ShardOwner {
         };
         let state = post_commit.into_state();
         let _ = touched_keys;
+        Self::acknowledge_visible(state);
+        Ok(())
+    }
+
+    /// Completes every waiter of a group whose rows are now query-visible.
+    ///
+    /// Each ACK carries the rows its batch accounted for and whether this group
+    /// inserted that batch; a replay suppressed by the fence or the memtable
+    /// identity reports no first commit. Reservations drop with each append.
+    fn acknowledge_visible(state: GroupWalState) {
         for mut append in state.prepared {
             if let Some(lifecycle) = append.lifecycle.as_mut() {
                 lifecycle.succeed();
             }
             if let Some(sender) = append.durable_ack {
-                let rows = state
-                    .rows_by_append
-                    .get(append.batch_id.as_bytes())
-                    .copied()
-                    .unwrap_or(0);
-                let _ = sender.send(Ok(rows));
+                let batch_id = append.batch_id.as_bytes();
+                let rows = state.rows_by_append.get(batch_id).copied().unwrap_or(0);
+                let _ = sender.send(Ok(crate::scribe::preprocess::DurableCompletion {
+                    rows,
+                    first_commit: state.inserted_batch_ids.contains(batch_id),
+                }));
             }
             drop(append.reservation);
         }
-        Ok(())
     }
 
     /// Re-drives the sole WAL/SQL-committed insertion owner before new work.
@@ -3246,20 +3260,7 @@ impl ShardOwner {
             self.retained_commit_ambiguity = Some(state);
             return Err(error);
         }
-        for mut append in state.prepared {
-            if let Some(lifecycle) = append.lifecycle.as_mut() {
-                lifecycle.succeed();
-            }
-            if let Some(sender) = append.durable_ack {
-                let rows = state
-                    .rows_by_append
-                    .get(append.batch_id.as_bytes())
-                    .copied()
-                    .unwrap_or(0);
-                let _ = sender.send(Ok(rows));
-            }
-            drop(append.reservation);
-        }
+        Self::acknowledge_visible(state);
         Ok(())
     }
 
@@ -3914,6 +3915,7 @@ impl ShardOwner {
             touched,
             rows_by_append,
             spent_batch_ids: HashSet::new(),
+            inserted_batch_ids: HashSet::new(),
         })
     }
 
@@ -4143,6 +4145,9 @@ impl ShardOwner {
 
     /// Inserts once-materialized rows after the durable fence.
     ///
+    /// Slices of a spent batch are discarded; every inserted slice records its
+    /// batch in `inserted_batch_ids`, which the ACK reports as a first commit.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when memtable insertion or rotation fails.
@@ -4157,7 +4162,9 @@ impl ShardOwner {
                 self.discard_already_committed_slice(slice, &mut state.rows_by_append)?;
                 continue;
             }
+            let batch_id = slice.batch_id;
             self.insert_committed_slice(slice, &mut state.rows_by_append, &mut touched_keys)?;
+            state.inserted_batch_ids.insert(batch_id);
         }
         Ok(touched_keys)
     }
@@ -6681,7 +6688,7 @@ mod tests {
         batch_ids: &[uuid::Uuid],
     ) -> (
         Vec<PreparedAppend>,
-        Vec<tokio::sync::oneshot::Receiver<Result<u64, ScribeError>>>,
+        Vec<tokio::sync::oneshot::Receiver<Result<crate::scribe::preprocess::DurableCompletion, ScribeError>>>,
     ) {
         batch_ids
             .iter()
@@ -7020,7 +7027,8 @@ mod tests {
 
     /// An injected failure after WAL/SQL durability retains the same material
     /// owner, retries on the serial shard, and acknowledges only after the
-    /// original Arrow buffers are visible from the memtable snapshot.
+    /// original Arrow buffers are visible from the memtable snapshot; that
+    /// retried ACK still reports the batch's first commit.
     #[tokio::test]
     async fn post_commit_insertion_failure_retries_without_black_hole_or_early_ack() {
         let wal_root = tempfile::tempdir().expect("WAL directory");
@@ -7063,12 +7071,17 @@ mod tests {
         owner
             .retry_retained_post_commit()
             .expect("same-owner retry");
+        let completion = ack_rx
+            .await
+            .expect("visible success response")
+            .expect("visible insertion succeeds");
         assert_eq!(
-            ack_rx
-                .await
-                .expect("visible success response")
-                .expect("visible insertion succeeds"),
+            completion.rows,
             u64::try_from(expected_rows).expect("test row count fits u64")
+        );
+        assert!(
+            completion.first_commit,
+            "the retried insertion is the batch's first commit"
         );
         let visible = owner.memtable.stats().expect("query-visible rows");
         assert_eq!(
@@ -7289,7 +7302,8 @@ mod tests {
             ack_rx
                 .await
                 .expect("post-visible ACK")
-                .expect("visible insertion succeeds"),
+                .expect("visible insertion succeeds")
+                .rows,
             u64::try_from(expected_rows).expect("test row count fits u64")
         );
         assert_eq!(

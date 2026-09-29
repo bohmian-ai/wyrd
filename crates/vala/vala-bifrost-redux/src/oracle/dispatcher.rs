@@ -19,14 +19,13 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AnalyticalGraphRef, BifrostSecurityViolationKind, ExecuteFragmentRequest, FencingToken, NodeId,
-    OracleRoleFence, PendingNodeReservation, QueryAuditDigest, QueryClass, QueryId,
+    OracleRoleFence, PeerContext, PendingNodeReservation, QueryAuditDigest, QueryClass, QueryId,
     ReleaseNodeSlotsRequest, ReservationId, ReservationRejected, ReserveNodeSlotsRequest,
     ReserveNodeSlotsResponse, WorkerAttemptFrame, WorkerFooter, WorkerScanStats,
 };
 use wyrd_tonic::prost::Message;
-use wyrd_tonic::tonic::metadata::MetadataValue;
+use wyrd_tonic::tonic::Status;
 use wyrd_tonic::tonic::transport::Channel;
-use wyrd_tonic::tonic::{Request, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
 use super::OracleSlotManager;
@@ -36,9 +35,8 @@ use super::follower::{
     PhysicalPlanFollower, PhysicalPlanFollowerError,
 };
 use super::peer::{
-    PeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketMinter, PeerTicketVerifier,
-    ReservationBinding, ReservationOperationV1, ReservationTicketClaims, ReservationTicketMinter,
-    reservation_body_digest,
+    PeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketVerifier, ReservationBinding,
+    ReservationOperationV1, ReservationTicketClaims, reservation_body_digest,
 };
 #[cfg(feature = "test-support")]
 use super::reader_pins::OracleReaderAuthority;
@@ -48,18 +46,18 @@ use super::telemetry::{
 };
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 
-/// Fixed private peer protocol version carried in signed peer ticket claims.
+/// Fixed private peer protocol version carried in every peer context.
 ///
-/// The minter stamps this value into [`PeerTicketClaims::protocol_version`] and
-/// the verifier requires it exactly, so a ticket minted by a binary speaking a
+/// The leader stamps this value into [`PeerTicketClaims::protocol_version`] and
+/// the receiver requires it exactly, so a context built by a binary speaking a
 /// different peer wire is rejected instead of being decoded against the wrong
 /// claim encoding. Both sides read this one constant, so the check cannot
 /// desynchronize within a build.
 ///
-/// Protocol v4 signs a separate execution deadline so accepted followers can
-/// outlive ticket acceptance expiry. This homogeneous cutover rejects older
-/// claims through [`validated_claim_identifiers`] without a deadline fallback.
-pub const PEER_PROTOCOL_VERSION: u32 = 4;
+/// Protocol v5 replaces signed purpose tickets with unsigned typed contexts
+/// carried over the mTLS peer channel; receivers validate every context field
+/// against their own trusted state. A v4 peer is refused, never downgraded.
+pub const PEER_PROTOCOL_VERSION: u32 = 5;
 /// Pending reservation time to live.
 ///
 /// Shared with the Analytical leader's retained-release bound so a leader that
@@ -1538,14 +1536,14 @@ impl OraclePeerWorker {
         let verified = self
             .verifier
             .verify_peer_ticket(
-                &request.ticket,
+                &request.context,
                 self.worker_node_id,
                 expected_fence,
                 Utc::now(),
             )
             .await
             .map_err(|error| {
-                tracing::error!(?error, "Oracle peer ticket verification failed");
+                tracing::error!(?error, "Oracle peer context verification failed");
                 record_security(SecurityEventClass::Ticket);
                 DispatchError::Terminal
             })?;
@@ -1632,9 +1630,9 @@ impl OraclePeerWorker {
     }
 }
 
-/// Builds the signed peer-ticket claims delivered to one dispatch candidate.
+/// Builds the typed peer-context claims delivered to one dispatch candidate.
 ///
-/// The ticket expires at the earlier of the candidate's pending reservation and
+/// The context expires at the earlier of the candidate's pending reservation and
 /// the query's own absolute deadline, so a peer can never hold work past either
 /// bound. The fragment digest, manifest digest, and projection digest all carry
 /// the same plan fingerprint: the follower validates one sealed fragment, and
@@ -1644,12 +1642,12 @@ impl OraclePeerWorker {
 /// The assignment-authority digest is computed here, over the exact assignments
 /// this fragment will dispatch, so protocol v2 followers can recompute it from
 /// what they physically received and refuse a closure that was altered after
-/// the leader signed it.
+/// the leader built it.
 ///
 /// # Errors
 ///
 /// Returns [`DispatchError::Terminal`] when the fragment's assignments cannot
-/// produce a canonical authority digest; such a fragment must never be signed.
+/// produce a canonical authority digest; such a fragment must never be sent.
 fn peer_ticket_claims(
     candidate: &DispatchCandidate,
     context: &DispatchContext,
@@ -2210,28 +2208,23 @@ impl OraclePeerTransport for LocalOraclePeerTransport {
     }
 }
 
-/// Real tonic client transport resolving Oracle peers from live membership.
-/// Acceptance window for one reservation purpose ticket, in seconds.
+/// Acceptance window for one reservation context, in seconds.
 ///
 /// Short by design: a reservation call is a single round trip on a local
-/// network, so the window only has to cover it. Anything longer widens the
-/// interval in which a captured ticket is still presentable.
-const RESERVATION_TICKET_TTL_SECONDS: i64 = 10;
+/// network, so the window only has to cover it.
+const RESERVATION_CONTEXT_TTL_SECONDS: i64 = 10;
 
+/// Real tonic client transport resolving Oracle peers from live membership.
+///
+/// Every call runs over the mTLS peer channel built from [`BifrostPeerTls`];
+/// no per-call credential exists. Receivers validate the typed context against
+/// their own trusted state.
 pub struct TonicOraclePeerTransport {
     /// Existing registry publishing immutable ready/live membership cuts.
     topology: OraclePeerTopology,
-    /// Optional authenticated service credential attached to private calls.
-    credentials: Arc<dyn OraclePeerCredentials>,
-    /// Optional immutable CA and DNS identity; absent only for local development tests.
-    tls: Option<BifrostPeerTls>,
-    /// Server-owned signer stamping a purpose ticket onto reservation calls.
-    ///
-    /// Absent only where no reservation authority has been injected, in which
-    /// case reserving and releasing capacity fail closed rather than travelling
-    /// unauthorized.
-    reservation_minter: Option<Arc<dyn ReservationTicketMinter>>,
-    /// Established authenticated channel per peer, keyed with what it dialed.
+    /// Immutable peer CA and client identity every channel is dialed with.
+    tls: BifrostPeerTls,
+    /// Established mTLS channel per peer, keyed with what it dialed.
     ///
     /// A channel is reused only while the candidate names the same role fence
     /// and endpoint, so a restarted or relocated peer is dialed and
@@ -2452,119 +2445,25 @@ impl BifrostPeerTls {
     }
 }
 
-/// Supplies short-lived authorization for private Oracle peer RPCs.
-///
-/// The server implementation owns durable credentials and refresh policy; the
-/// Redux transport only requests a current bearer at the network boundary.
-#[async_trait]
-pub trait OraclePeerCredentials: Send + Sync {
-    /// Returns a current access bearer, refreshing when `force_refresh` is true.
-    ///
-    /// # Errors
-    /// Returns a terminal dispatch failure when credentials cannot be exchanged.
-    async fn bearer(&self, force_refresh: bool) -> Result<String, DispatchError>;
-}
-
-/// Deterministic credential provider used by local and transport tests.
-#[derive(Debug)]
-pub struct StaticOraclePeerCredentials {
-    /// Redacted bearer value retained only for deterministic private calls.
-    bearer: secrecy::SecretString,
-}
-
-impl StaticOraclePeerCredentials {
-    /// Creates deterministic credentials from one bearer.
-    #[must_use]
-    pub fn new(bearer: secrecy::SecretString) -> Self {
-        Self { bearer }
-    }
-}
-
-#[async_trait]
-impl OraclePeerCredentials for StaticOraclePeerCredentials {
-    async fn bearer(&self, _force_refresh: bool) -> Result<String, DispatchError> {
-        use secrecy::ExposeSecret;
-        Ok(self.bearer.expose_secret().to_owned())
-    }
-}
-
 impl TonicOraclePeerTransport {
-    /// Creates a development transport over the live cluster registry.
-    ///
-    /// # Errors
-    /// Returns terminal rejection when the bearer value is invalid metadata.
-    #[cfg(feature = "test-support")]
-    pub fn new(
-        addresses: HashMap<NodeId, String>,
-        bearer: Option<&str>,
-    ) -> Result<Self, DispatchError> {
-        let bearer = bearer.unwrap_or_default();
-        Ok(Self {
-            topology: OraclePeerTopology::TestAddresses(addresses),
-            credentials: Arc::new(StaticOraclePeerCredentials::new(
-                secrecy::SecretString::from(bearer.to_owned()),
-            )),
-            tls: None,
-            reservation_minter: None,
-            channels: Mutex::default(),
-        })
-    }
-
-    /// Creates a production transport backed by a refreshing credential owner.
+    /// Creates a production transport over the live cluster registry and the
+    /// mTLS peer identity.
     #[must_use]
-    pub fn with_credentials(
-        registry: Arc<ClusterRegistry>,
-        credentials: Arc<dyn OraclePeerCredentials>,
-    ) -> Self {
+    pub fn with_tls(registry: Arc<ClusterRegistry>, tls: BifrostPeerTls) -> Self {
         Self {
             topology: OraclePeerTopology::Registry(registry),
-            credentials,
-            tls: None,
-            reservation_minter: None,
+            tls,
             channels: Mutex::default(),
         }
     }
 
-    /// Creates a production transport with CA-authenticated TLS.
-    #[must_use]
-    pub fn with_credentials_and_tls(
-        registry: Arc<ClusterRegistry>,
-        credentials: Arc<dyn OraclePeerCredentials>,
-        tls: BifrostPeerTls,
-    ) -> Self {
-        Self {
-            topology: OraclePeerTopology::Registry(registry),
-            credentials,
-            tls: Some(tls),
-            reservation_minter: None,
-            channels: Mutex::default(),
-        }
-    }
-
-    /// Attaches the server-owned signer for reservation purpose tickets.
-    ///
-    /// Kept a separate step because signing authority is owned by the server
-    /// and routing is owned here: a transport composed without it can still
-    /// dial peers, but every reservation call it makes fails closed.
-    #[must_use]
-    pub fn with_reservation_minter(mut self, minter: Arc<dyn ReservationTicketMinter>) -> Self {
-        self.reservation_minter = Some(minter);
-        self
-    }
-
-    /// Creates a TLS transport over an immutable endpoint fixture.
+    /// Creates an mTLS transport over an immutable endpoint fixture.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn with_test_credentials_and_tls(
-        addresses: HashMap<NodeId, String>,
-        credentials: Arc<dyn OraclePeerCredentials>,
-        tls: BifrostPeerTls,
-    ) -> Self {
+    pub fn with_test_tls(addresses: HashMap<NodeId, String>, tls: BifrostPeerTls) -> Self {
         Self {
             topology: OraclePeerTopology::TestAddresses(addresses),
-            credentials,
-            tls: Some(tls),
-            reservation_minter: None,
+            tls,
             channels: Mutex::default(),
         }
     }
@@ -2581,7 +2480,7 @@ impl TonicOraclePeerTransport {
         // stopped serving surfaces as an ordinary connect failure, which is the
         // pre-`do_get` transport-failure path, not a membership verdict.
         if let Some(endpoint) = &candidate.endpoint {
-            if self.tls.is_some() && !endpoint.starts_with("https://") {
+            if !endpoint.starts_with("https://") {
                 return Err(DispatchError::Terminal);
             }
             return Ok(endpoint.clone());
@@ -2591,13 +2490,13 @@ impl TonicOraclePeerTransport {
             let address = addresses
                 .get(&candidate.node_id)
                 .ok_or(DispatchError::StaleObject)?;
-            if self.tls.is_some() && !address.starts_with("https://") {
+            if !address.starts_with("https://") {
                 return Err(DispatchError::Terminal);
             }
             return Ok(address.clone());
         }
         let snapshot = self.snapshot();
-        match resolve_snapshot_candidate(&snapshot, candidate, self.tls.is_some(), Utc::now()) {
+        match resolve_snapshot_candidate(&snapshot, candidate, true, Utc::now()) {
             Ok(address) => Ok(address.to_owned()),
             Err(mismatch) => {
                 tracing::warn!(
@@ -2689,8 +2588,6 @@ impl TonicOraclePeerTransport {
             let started = std::time::Instant::now();
             let channel = self
                 .tls
-                .as_ref()
-                .ok_or(DispatchError::Unavailable)?
                 .endpoint(address.clone())
                 .map_err(|_| DispatchError::Unavailable)?
                 .connect()
@@ -2713,73 +2610,29 @@ impl TonicOraclePeerTransport {
         Ok(OraclePeerServiceClient::new(channel).max_decoding_message_size(usize::MAX))
     }
 
-    /// Stamps a freshly minted reserve ticket onto one request copy.
+    /// Builds the typed reservation context over an already context-free
+    /// request encoding.
     ///
-    /// The digest is taken over the encoding with the ticket field cleared,
-    /// which is exactly what the follower recomputes, so the signed value
-    /// covers every routed identity in the request and nothing about the
-    /// signature itself.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DispatchError::Terminal`] when no reservation authority is
-    /// attached or the ticket cannot be minted; neither is retryable.
-    fn ticketed_reserve(
-        &self,
-        wire: &wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest,
-        binding: &ReservationBinding,
-    ) -> Result<wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest, DispatchError> {
-        let mut stamped = wire.clone();
-        stamped.ticket = None;
-        stamped.ticket = Some(self.reservation_ticket(&stamped, binding)?.into());
-        Ok(stamped)
-    }
-
-    /// Stamps a freshly minted release ticket onto one request copy.
+    /// The body digest is taken over the encoding with the context field
+    /// cleared, which is exactly what the receiver recomputes, so the context
+    /// covers every routed identity in the request.
     ///
     /// # Errors
     ///
-    /// Returns [`DispatchError::Terminal`] when no reservation authority is
-    /// attached or the ticket cannot be minted.
-    fn ticketed_release(
-        &self,
-        wire: &wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest,
+    /// Returns [`DispatchError::Terminal`] when the body exceeds its bound or
+    /// the claims cannot be encoded; a reservation is never sent without its
+    /// context.
+    fn reservation_context<T: wyrd_tonic::prost::Message>(
+        context_free: &T,
         binding: &ReservationBinding,
-    ) -> Result<wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest, DispatchError> {
-        let mut stamped = wire.clone();
-        stamped.ticket = None;
-        stamped.ticket = Some(self.reservation_ticket(&stamped, binding)?.into());
-        Ok(stamped)
-    }
-
-    /// Mints one single-use ticket over an already ticket-free encoding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DispatchError::Terminal`] when no reservation authority is
-    /// attached, the body exceeds its bound, or signing fails. A reservation
-    /// that cannot be authorized is never sent unauthorized.
-    fn reservation_ticket<T: wyrd_tonic::prost::Message>(
-        &self,
-        ticket_free: &T,
-        binding: &ReservationBinding,
-    ) -> Result<wyrd_spec::vala::api::SignedPeerTicket, DispatchError> {
-        let minter = self
-            .reservation_minter
-            .as_ref()
-            .ok_or(DispatchError::Terminal)?;
-        let body_digest = reservation_body_digest(&ticket_free.encode_to_vec())
+    ) -> Result<wyrd_tonic::wyrd::v1::PeerContext, DispatchError> {
+        let body_digest = reservation_body_digest(&context_free.encode_to_vec())
             .map_err(|_| DispatchError::Terminal)?;
-        let expires_at_ms = (Utc::now() + ChronoDuration::seconds(RESERVATION_TICKET_TTL_SECONDS))
+        let expires_at_ms = (Utc::now() + ChronoDuration::seconds(RESERVATION_CONTEXT_TTL_SECONDS))
             .timestamp_millis();
-        let claims = ReservationTicketClaims::for_binding(
-            binding,
-            body_digest,
-            uuid::Uuid::new_v4().as_bytes().to_vec(),
-            expires_at_ms,
-        );
-        minter
-            .mint_reservation_ticket(binding.operation, &claims)
+        ReservationTicketClaims::for_binding(binding, body_digest, expires_at_ms)
+            .to_context(binding.operation)
+            .map(Into::into)
             .map_err(|_| DispatchError::Terminal)
     }
 
@@ -2796,7 +2649,7 @@ impl TonicOraclePeerTransport {
         let leader_node_id = request.leader_node_id;
         let leader_fence = request.leader_fencing_token;
         let query_id = request.query_id.as_uuid();
-        let wire: wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest = request.into();
+        let mut wire: wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest = request.into();
         let binding = ReservationBinding {
             operation: ReservationOperationV1::ReserveSlots,
             source_node_id: leader_node_id,
@@ -2805,26 +2658,14 @@ impl TonicOraclePeerTransport {
             destination_fence: candidate.worker_fence,
             query_id,
         };
+        wire.context = None;
+        wire.context = Some(Self::reservation_context(&wire, &binding)?);
         let mut client = self.client(candidate).await?;
-        // A ticket is single-use, so the one credential retry mints its own
-        // rather than replaying the first attempt's nonce.
-        let response = match client
-            .reserve_slots(
-                self.authenticated(self.ticketed_reserve(&wire, &binding)?, false)
-                    .await?,
-            )
+        let response = client
+            .reserve_slots(wire)
             .await
-        {
-            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
-                .reserve_slots(
-                    self.authenticated(self.ticketed_reserve(&wire, &binding)?, true)
-                        .await?,
-                )
-                .await
-                .map_err(|status| status_error(&status))?,
-            result => result.map_err(|status| status_error(&status))?,
-        }
-        .into_inner();
+            .map_err(|status| status_error(&status))?
+            .into_inner();
         response.try_into().map_err(|error| {
             tracing::warn!(
                 ?error,
@@ -2853,24 +2694,13 @@ impl TonicOraclePeerTransport {
             destination_fence: candidate.worker_fence,
             query_id: request.query_id.as_uuid(),
         };
-        let wire: wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest = request.into();
-        // Same single-use discipline as reserve: the retry mints a fresh nonce.
-        match client
-            .release_slots(
-                self.authenticated(self.ticketed_release(&wire, &binding)?, false)
-                    .await?,
-            )
+        let mut wire: wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest = request.into();
+        wire.context = None;
+        wire.context = Some(Self::reservation_context(&wire, &binding)?);
+        client
+            .release_slots(wire)
             .await
-        {
-            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
-                .release_slots(
-                    self.authenticated(self.ticketed_release(&wire, &binding)?, true)
-                        .await?,
-                )
-                .await
-                .map_err(|status| execution_status_error(&status))?,
-            result => result.map_err(|status| execution_status_error(&status))?,
-        };
+            .map_err(|status| execution_status_error(&status))?;
         Ok(())
     }
 
@@ -2888,7 +2718,7 @@ impl TonicOraclePeerTransport {
         let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
         let opened = std::time::Instant::now();
         let response = client
-            .execute_fragment(self.authenticated(wire, false).await?)
+            .execute_fragment(wire)
             .await
             .inspect(|_| super::QueryPhase::PeerOpen.record(opened))
             .map_err(|status| {
@@ -2918,32 +2748,6 @@ impl TonicOraclePeerTransport {
             super::QueryPhase::PeerTerminal.record(streaming);
         };
         Ok(Box::pin(output))
-    }
-
-    /// Adds workload authorization metadata when configured.
-    async fn authenticated<T>(
-        &self,
-        value: T,
-        force_refresh: bool,
-    ) -> Result<Request<T>, DispatchError> {
-        let mut request = Request::new(value);
-        let bearer = self
-            .credentials
-            .bearer(force_refresh)
-            .await
-            .map_err(|error| {
-                tracing::error!(
-                    ?error,
-                    force_refresh,
-                    "Oracle peer bearer acquisition failed"
-                );
-                error
-            })?;
-        let value: MetadataValue<wyrd_tonic::tonic::metadata::Ascii> = format!("Bearer {bearer}")
-            .parse()
-            .map_err(|_| DispatchError::Unavailable)?;
-        request.metadata_mut().insert("x-wyrd-access-token", value);
-        Ok(request)
     }
 }
 
@@ -3004,6 +2808,8 @@ pub struct OraclePeerTransportDirectory {
 enum RemoteOraclePeerTransport {
     /// Production tonic owner that resolves the exact planned candidate.
     Production(Arc<TonicOraclePeerTransport>),
+    /// Process-local mode: no peer plane exists, so no remote candidate is reachable.
+    Unavailable,
     /// Test-only adapter retaining isolated transport injection.
     #[cfg(test)]
     Injected(Arc<dyn OraclePeerTransport>),
@@ -3011,16 +2817,22 @@ enum RemoteOraclePeerTransport {
 
 impl OraclePeerTransportDirectory {
     /// Creates an unambiguous production directory from concrete local and tonic adapters.
+    ///
+    /// `remote` is absent for a process-local node, which serves no peer plane;
+    /// any non-local candidate then fails terminally rather than being dialed.
     #[must_use]
     pub fn new(
         local_node_id: NodeId,
         local: Arc<LocalOraclePeerTransport>,
-        remote: Arc<TonicOraclePeerTransport>,
+        remote: Option<Arc<TonicOraclePeerTransport>>,
     ) -> Self {
         Self {
             local_node_id,
             local,
-            remote: RemoteOraclePeerTransport::Production(remote),
+            remote: remote.map_or(
+                RemoteOraclePeerTransport::Unavailable,
+                RemoteOraclePeerTransport::Production,
+            ),
         }
     }
 
@@ -3072,6 +2884,7 @@ impl OraclePeerTransportDirectory {
                 RemoteOraclePeerTransport::Production(remote) => {
                     remote.reserve_candidate(candidate, request).await
                 }
+                RemoteOraclePeerTransport::Unavailable => Err(DispatchError::Terminal),
                 #[cfg(test)]
                 RemoteOraclePeerTransport::Injected(remote) => {
                     remote.reserve(candidate.node_id, request).await
@@ -3144,6 +2957,7 @@ impl OraclePeerTransportDirectory {
                 RemoteOraclePeerTransport::Production(remote) => {
                     remote.release_candidate(candidate, request).await
                 }
+                RemoteOraclePeerTransport::Unavailable => Err(DispatchError::Terminal),
                 #[cfg(test)]
                 RemoteOraclePeerTransport::Injected(remote) => {
                     remote.release(candidate.node_id, request).await
@@ -3172,6 +2986,7 @@ impl OraclePeerTransportDirectory {
                 RemoteOraclePeerTransport::Production(remote) => {
                     remote.execute_candidate(candidate, request).await
                 }
+                RemoteOraclePeerTransport::Unavailable => Err(DispatchError::Terminal),
                 #[cfg(test)]
                 RemoteOraclePeerTransport::Injected(remote) => {
                     remote.execute(candidate.node_id, request, None).await
@@ -3356,14 +3171,14 @@ pub struct PhysicalDispatchFragment {
 /// the exact values the ticket claims were minted over, so the worker's
 /// recomputation of the claim binding matches.
 fn fragment_request(
-    ticket: wyrd_spec::vala::api::SignedPeerTicket,
+    peer_context: PeerContext,
     candidate: &DispatchCandidate,
     context: &DispatchContext,
     fragment: &PhysicalDispatchFragment,
     pending: &PendingNodeReservation,
 ) -> ExecuteFragmentRequest {
     ExecuteFragmentRequest {
-        ticket,
+        context: peer_context,
         physical_plan_bytes: fragment.physical_plan_bytes.clone(),
         reservation_id: pending.reservation_id,
         leader_fence: OracleRoleFence {
@@ -3383,8 +3198,6 @@ fn fragment_request(
 
 /// Owns claims construction and one ambiguity-terminal reserve/execute/release cut.
 pub struct FragmentDispatcher {
-    /// Narrow server-owned authority used to mint a fresh ticket per attempt.
-    ticket_minter: Arc<dyn PeerTicketMinter>,
     /// Node-aware directory enforcing in-process leader and tonic remote routing.
     ///
     /// Shared rather than owned: the Analytical leader reserves its graph
@@ -3394,16 +3207,10 @@ pub struct FragmentDispatcher {
 }
 
 impl FragmentDispatcher {
-    /// Creates a dispatcher from narrow authority and transport capabilities.
+    /// Creates a dispatcher over the shared node-aware transport directory.
     #[must_use]
-    pub fn new(
-        ticket_minter: Arc<dyn PeerTicketMinter>,
-        transports: Arc<OraclePeerTransportDirectory>,
-    ) -> Self {
-        Self {
-            ticket_minter,
-            transports,
-        }
+    pub fn new(transports: Arc<OraclePeerTransportDirectory>) -> Self {
+        Self { transports }
     }
 
     /// Reserves one candidate's slots, or reports that it declined.
@@ -3498,18 +3305,8 @@ impl FragmentDispatcher {
                 leader_fencing_token: context.leader_fence,
             };
             let claims = peer_ticket_claims(candidate, context, &fragment, &pending)?;
-            let ticket = if self.transports.runs_in_process(candidate) {
-                // The in-process worker receives `claims` through the grant and
-                // never reads this ticket, so nothing is signed for it.
-                wyrd_spec::vala::api::SignedPeerTicket {
-                    key_id: String::new(),
-                    claims_bytes: Vec::new(),
-                    signature: Vec::new(),
-                }
-            } else if let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) {
-                ticket
-            } else {
-                tracing::error!("Oracle peer ticket mint failed");
+            let Ok(peer_context) = claims.to_context() else {
+                tracing::error!("Oracle peer context encoding failed");
                 if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
                     self.release_pending(candidate, release, context).await;
                 }
@@ -3518,7 +3315,7 @@ impl FragmentDispatcher {
                     reason: DispatchPartialReason::Setup,
                 });
             };
-            let request = fragment_request(ticket, candidate, context, &fragment, &pending);
+            let request = fragment_request(peer_context, candidate, context, &fragment, &pending);
             let result = self
                 .execute_attempt(candidate, request, claims, context, &fragment)
                 .await;
@@ -3664,15 +3461,15 @@ impl FragmentDispatcher {
     ///
     /// Unlike [`Self::execute`], nothing is buffered or retried: the caller
     /// validates frames as they arrive and owns the stream's lifetime, so
-    /// dropping it cancels the fragment on the Scribe. The ticket is minted for
+    /// dropping it cancels the fragment on the Scribe. The peer context names
     /// exactly this candidate's node and writer epoch; a Scribe that restarted
     /// or advanced its epoch refuses it.
     ///
     /// # Errors
     ///
     /// Returns [`DispatchError::Terminal`] when this node is not the local
-    /// leader, the candidate is not the fragment's Scribe target, or the ticket
-    /// cannot be minted, and otherwise the unclassified open failure.
+    /// leader, the candidate is not the fragment's Scribe target, or the peer
+    /// context cannot be encoded, and otherwise the unclassified open failure.
     pub async fn open_stream(
         &self,
         context: &DispatchContext,
@@ -3690,11 +3487,11 @@ impl FragmentDispatcher {
             expires_at: Utc::now() + PENDING_TTL,
         };
         let claims = peer_ticket_claims(candidate, context, fragment, &pending)?;
-        let ticket = self.ticket_minter.mint_peer_ticket(&claims).map_err(|_| {
-            tracing::error!("Oracle live Scribe ticket mint failed");
+        let peer_context = claims.to_context().map_err(|_| {
+            tracing::error!("Oracle live Scribe peer context encoding failed");
             DispatchError::Terminal
         })?;
-        let request = fragment_request(ticket, candidate, context, fragment, &pending);
+        let request = fragment_request(peer_context, candidate, context, fragment, &pending);
         self.open_frames(candidate, request, claims, context).await
     }
 
@@ -3842,6 +3639,7 @@ impl From<PeerSecurityError> for DispatchError {
 #[cfg(test)]
 mod tests {
     use crate::oracle::follower::{FollowerResolutionError, ResolvedFollowerSource};
+    use wyrd_tonic::tonic::Request;
 
     /// Builds one empty attempt buffer for classification-only proofs.
     ///
@@ -3969,7 +3767,7 @@ mod tests {
             )),
             granted_memory_bytes,
             admitted_target_partitions: 1,
-            claims: PeerTicketClaims::decode(request.ticket.claims_bytes.as_slice())
+            claims: PeerTicketClaims::decode(request.context.claims_bytes.as_slice())
                 .unwrap_or_default(),
         }
     }
@@ -3980,7 +3778,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::super::peer::{
-        DeterministicTestSigner, NoopPeerSecurityAudit, VerifiedClaimsBytes, projection_digest,
+        MAX_FRAGMENT_CONTEXT_BYTES, NoopPeerSecurityAudit, VerifiedClaimsBytes, projection_digest,
     };
     use super::*;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
@@ -4083,7 +3881,7 @@ mod tests {
 
     #[async_trait]
     impl PeerTicketVerifier for ClaimsPassthroughVerifier {
-        /// Returns the ticket claims after the test constructs matching audience and fence values.
+        /// Returns the context claims after the test constructs matching audience and fence values.
         ///
         /// # Errors
         ///
@@ -4091,12 +3889,12 @@ mod tests {
         /// validation still runs before reservation transition and fragment IO.
         async fn verify_peer_ticket(
             &self,
-            ticket: &wyrd_spec::vala::api::SignedPeerTicket,
+            context: &wyrd_spec::vala::api::PeerContext,
             _expected_worker: NodeId,
             _expected_worker_fence: u64,
             _now: DateTime<Utc>,
         ) -> Result<VerifiedClaimsBytes, PeerSecurityError> {
-            Ok(VerifiedClaimsBytes(ticket.claims_bytes.clone()))
+            Ok(VerifiedClaimsBytes(context.claims_bytes.clone()))
         }
     }
 
@@ -4285,13 +4083,9 @@ mod tests {
             )
             .expect("deterministic fixture digest"),
         };
-        let ticket = DeterministicTestSigner {
-            key_id: "test".to_owned(),
-        }
-        .mint_peer_ticket(&claims)
-        .expect("deterministic ticket");
+        let context = claims.to_context().expect("deterministic context");
         ExecuteFragmentRequest {
-            ticket,
+            context,
             physical_plan_bytes,
             reservation_id,
             leader_fence: OracleRoleFence {
@@ -4522,23 +4316,6 @@ mod tests {
     struct AmbiguousReserveTransport {
         /// Number of reserve calls observed across distinct candidates.
         reserve_calls: AtomicUsize,
-    }
-
-    /// Ticket minter that fails after a worker has accepted pending capacity.
-    struct FailingTicketMinter;
-
-    impl PeerTicketMinter for FailingTicketMinter {
-        /// Injects one deterministic signing failure.
-        ///
-        /// # Errors
-        ///
-        /// Always returns [`PeerSecurityError::Encoding`].
-        fn mint_peer_ticket(
-            &self,
-            _claims: &PeerTicketClaims,
-        ) -> Result<wyrd_spec::vala::api::SignedPeerTicket, PeerSecurityError> {
-            Err(PeerSecurityError::Encoding)
-        }
     }
 
     /// Transport probe recording cleanup after an accepted pending reservation.
@@ -5057,25 +4834,24 @@ mod tests {
         // Each Scribe-cut partition component is digest-covered.
         assert_partition_components_are_digest_covered(tenant, &fragment);
 
-        // An explicit v2 `protocol_version` ticket is rejected: protocol v3
-        // fully replaced v2 rather than accepting both.
+        // An explicit v4 `protocol_version` context is rejected: protocol v5
+        // fully replaced v4 rather than accepting both.
         {
             let (worker, resolver, mut request) =
                 counting_worker_request(&oracle, &fragment, tenant, 53);
-            let mut claims = PeerTicketClaims::decode(request.ticket.claims_bytes.as_slice())
+            let mut claims = PeerTicketClaims::decode(request.context.claims_bytes.as_slice())
                 .expect("decode fixture claims");
-            claims.protocol_version = 2;
+            claims.protocol_version = 4;
             let mut bytes = Vec::new();
-            claims.encode(&mut bytes).expect("encode v2 claims");
-            request.ticket.claims_bytes = bytes.clone();
-            request.ticket.signature = bytes;
+            claims.encode(&mut bytes).expect("encode v4 claims");
+            request.context.claims_bytes = bytes;
             let grant = test_admitted_grant(&request, 2 * 1024 * 1024);
             let result = worker.execute_local(request, grant).await;
             assert!(matches!(result, Err(DispatchError::Terminal)));
             assert_eq!(
                 resolver.calls.load(Ordering::SeqCst),
                 0,
-                "an explicit v2 protocol_version ticket must never reach the resolver"
+                "an explicit v4 protocol_version context must never reach the resolver"
             );
         }
     }
@@ -5561,16 +5337,12 @@ mod tests {
         let transport = Arc::new(AmbiguousReserveTransport {
             reserve_calls: AtomicUsize::new(0),
         });
-        let dispatcher = FragmentDispatcher::new(
-            Arc::new(DeterministicTestSigner {
-                key_id: "test".to_owned(),
-            }),
-            Arc::new(OraclePeerTransportDirectory::new_for_test(
+        let dispatcher =
+            FragmentDispatcher::new(Arc::new(OraclePeerTransportDirectory::new_for_test(
                 leader,
                 transport.clone(),
                 transport.clone(),
-            )),
-        );
+            )));
         let first = NodeId::new(uuid::Uuid::from_u128(2));
         let second = NodeId::new(uuid::Uuid::from_u128(3));
         let fragment = physical_dispatch_fragment("fragment");
@@ -5615,26 +5387,22 @@ mod tests {
         assert_eq!(transport.reserve_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// A post-reserve ticket-mint failure for a remote Oracle peer releases
-    /// pending capacity before returning.
-    ///
-    /// Only remote peers are minted a ticket; the leader-local worker receives
-    /// its claims in-process.
+    /// A post-reserve context-encoding failure releases pending capacity before
+    /// returning. An oversized permission digest pushes the fragment context
+    /// past its bound after the worker has already accepted pending capacity.
     #[tokio::test]
-    async fn oracle_dispatch_releases_pending_when_ticket_mint_fails() {
+    async fn oracle_dispatch_releases_pending_when_context_encoding_fails() {
         let leader = NodeId::new(uuid::Uuid::from_u128(11));
         let transport = Arc::new(PendingCleanupTransport {
             release_calls: AtomicUsize::new(0),
             execute_calls: AtomicUsize::new(0),
         });
-        let dispatcher = FragmentDispatcher::new(
-            Arc::new(FailingTicketMinter),
-            Arc::new(OraclePeerTransportDirectory::new_for_test(
+        let dispatcher =
+            FragmentDispatcher::new(Arc::new(OraclePeerTransportDirectory::new_for_test(
                 leader,
                 transport.clone(),
                 transport.clone(),
-            )),
-        );
+            )));
         let fragment = physical_dispatch_fragment("fragment");
         let context = DispatchContext {
             query_id: QueryId::new(uuid::Uuid::now_v7()),
@@ -5643,7 +5411,7 @@ mod tests {
             tenant_id: uuid::Uuid::now_v7(),
             query_class: QueryClass::Interactive,
             slot_units: 1,
-            permission_digest: "permission".to_owned(),
+            permission_digest: "p".repeat(MAX_FRAGMENT_CONTEXT_BYTES + 1),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
             query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
@@ -5665,9 +5433,9 @@ mod tests {
                 }],
             )
             .await
-            .expect_err("mint failure is terminal");
+            .expect_err("context encoding failure is terminal");
 
-        // A mint failure is request *setup*, not a rejection by the peer, and the
+        // An encoding failure is request *setup*, not a rejection by the peer, and the
         // ported design degrades setup failures rather than failing the query:
         // when it cannot build the authenticated client for a node it substitutes
         // an empty stream and records a partial error, reserving a terminal for a
@@ -5681,7 +5449,7 @@ mod tests {
             }
         ));
         // The reservation must still be surrendered, and no fragment may be sent
-        // to a peer whose request was never successfully signed.
+        // to a peer whose context was never built.
         assert_eq!(transport.release_calls.load(Ordering::SeqCst), 1);
         assert_eq!(transport.execute_calls.load(Ordering::SeqCst), 0);
     }
@@ -5693,16 +5461,12 @@ mod tests {
         let transport = Arc::new(StalledExecuteTransport {
             release_calls: AtomicUsize::new(0),
         });
-        let dispatcher = FragmentDispatcher::new(
-            Arc::new(DeterministicTestSigner {
-                key_id: "test".to_owned(),
-            }),
-            Arc::new(OraclePeerTransportDirectory::new_for_test(
+        let dispatcher =
+            FragmentDispatcher::new(Arc::new(OraclePeerTransportDirectory::new_for_test(
                 leader,
                 transport.clone(),
                 transport.clone(),
-            )),
-        );
+            )));
         let fragment = physical_dispatch_fragment("stalled");
         let context = DispatchContext {
             query_id: QueryId::new(uuid::Uuid::now_v7()),
@@ -6012,11 +5776,8 @@ mod tests {
         let (first, first_accepts) = counting_peer(&ca_pem, &leaf_pem, &key_pem).await;
         let (second, second_accepts) = counting_peer(&ca_pem, &leaf_pem, &key_pem).await;
         let node = NodeId::new(uuid::Uuid::now_v7());
-        let transport = TonicOraclePeerTransport::with_test_credentials_and_tls(
+        let transport = TonicOraclePeerTransport::with_test_tls(
             HashMap::new(),
-            Arc::new(StaticOraclePeerCredentials::new(
-                secrecy::SecretString::from("peer-bearer".to_owned()),
-            )),
             BifrostPeerTls::new(
                 ca_pem.into_bytes(),
                 PEER_SERVER_NAME.to_owned(),

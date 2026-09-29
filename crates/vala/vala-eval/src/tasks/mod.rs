@@ -12,5 +12,5 @@ pub mod trace;
 pub use agent::AgentTaskExecutor;
 pub use assertion::AssertionTaskExecutor;
 pub use judge::JudgeTaskExecutor;
-pub use media::{EvalMediaBinding, MediaBindings};
+pub use media::MediaBindings;
 pub use trace::TraceTaskExecutor;

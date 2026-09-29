@@ -1,0 +1,294 @@
+---
+title: Development server on Kubernetes
+description: Run one Wyrd server on a development Kubernetes cluster against external Postgres, with a one-off migration Job, persistent state, and first-use setup that keeps credentials out of logs.
+pillar: wyrd
+group: Self-hosting
+order: 10
+---
+
+# Development server on Kubernetes
+
+This journey runs one `all` replica: one pod that serves HTTP, the UI, and
+gRPC and runs every Bifrost role (Scribe, Oracle, Forge) in-process. It is the
+shape to use for a shared development or staging cluster. For several
+replicas, see [Production server on Kubernetes](/self-hosting/kubernetes-production/).
+To run it on your laptop instead, start with [Local development](/self-hosting/local-development/).
+
+## Prerequisites
+
+- A Kubernetes cluster, `kubectl`, and a namespace (this page uses `wyrd`).
+- An external PostgreSQL 16 reachable from the cluster, and a login that owns
+  the `wyrd` database.
+- A default StorageClass for the pod's persistent volume.
+- `openssl`, Docker, and a repository checkout with [`mise`](https://mise.jdx.dev/).
+- A registry the cluster can pull from, or a local cluster (kind, minikube)
+  you can load an image into.
+
+## The image
+
+No Wyrd image is published yet. Build the official image from the commit you
+are deploying and record its immutable image ID:
+
+```bash
+mise run docker:build                  # release build of wyrd-server, tagged `wyrd`
+docker image inspect -f '{{.Id}}' wyrd # sha256:… — record it with the commit
+```
+
+The manifests below take one of two image branches. Both workloads (the
+migration Job and the StatefulSet) must use the same one:
+
+| Cluster | `image:` | `imagePullPolicy:` |
+| --- | --- | --- |
+| Local kind cluster, after `kind load docker-image wyrd --name <cluster>` | `wyrd:latest` | `Never` |
+| A cluster that pulls from your registry, after `docker tag wyrd registry.example.com/wyrd && docker push registry.example.com/wyrd` | `registry.example.com/wyrd@sha256:…` (the pushed digest, not a tag) | omit it |
+
+The manifests show the kind branch. For a registry, replace both lines. With
+`Never`, a node without the loaded image reports `ErrImageNeverPull` instead
+of fetching something else. Once a release is published, pin its published
+digest instead of a local build.
+
+The image listens on `8080` (nginx: API and UI) and `50051` (public gRPC), and
+mounts its state volume at `/var/lib/wyrd`.
+
+## Environment
+
+| Variable | When | Value | Source |
+| --- | --- | --- | --- |
+| `WYRD_DATABASE_URL` in the migration Job | Required, Job only | `postgresql://<owner>:…@<db-host>:5432/wyrd` | The database-owner login. Secret `wyrd-owner`, mounted only by the Job. |
+| `WYRD_DATABASE_URL` | Required | `postgresql://wyrd_app:…@<db-host>:5432/wyrd` | `wyrd_app` password from the role bootstrap. Secret `wyrd-db`. |
+| `WYRD_PLATFORM_DATABASE_URL` | Required | `postgresql://wyrd_platform_admin:…@<db-host>:5432/wyrd` | `wyrd_platform_admin` password from the role bootstrap. Secret `wyrd-db`. |
+| `WYRD_STORAGE_URL` | Required | `file:///var/lib/wyrd/storage` | The pod's persistent volume. An object store (`s3://…`, `gs://…`, `az://…`) also works: see [Storage](/self-hosting/storage/). |
+| `WYRD_BIFROST_DATA_DIR` | Set by the image | `/var/lib/wyrd/bifrost` | Scribe WAL, staging, and stable node identity. It lives on the same persistent volume. |
+| `WYRD_SIGNING_KEY_FILE` | Required for stable tokens | `/run/wyrd/signing.pem` | An Ed25519 key in Secret `wyrd-signing`. Without it a development pod mints an ephemeral key on every start. |
+| `APP_ENV` | Optional | `development` (the default) | Use `staging` to exercise the hardened profile. |
+| `WYRD_TARGET` | Optional | unset (`all`) | One process runs every role. |
+| `WYRD_PEER_ADDRESS`, `WYRD_PEER_TLS_DIR` | Only for peer mode | unset | See [Adding replicas](#adding-replicas). |
+
+## 1. Database roles and Secrets
+
+Passwords never go on a command line, where other users of the machine and
+command auditing can read them. Load the three into shell variables from your
+password manager (for example `read -rs OWNER_PW`), using URL-safe values such
+as `openssl rand -hex 32`. Create the two serving logins once, as the database
+owner, with `psql` 15 or later; `roles.sql` reads both new passwords from the
+environment and `psql` reads the owner's from `PGPASSWORD`:
+
+```bash
+PGPASSWORD="$OWNER_PW" WYRD_APP_PASSWORD="$APP_PW" \
+  WYRD_PLATFORM_ADMIN_PASSWORD="$PLATFORM_PW" \
+  psql "postgresql://<owner>@<db-host>:5432/wyrd" -v ON_ERROR_STOP=1 \
+  < crates/wyrd/wyrd-sql/bootstrap/roles.sql
+```
+
+Generate the signing key and store every credential as a Secret. Each
+`<(printf …)` hands `kubectl` a pipe to read, so the URL never appears in its
+arguments or on disk. Keep a copy of each credential in your password manager;
+the cluster is not the only record.
+
+```bash
+openssl genpkey -algorithm ed25519 -out signing.pem
+kubectl create namespace wyrd
+kubectl -n wyrd create secret generic wyrd-owner \
+  --from-file=database-url=<(printf %s "postgresql://<owner>:$OWNER_PW@<db-host>:5432/wyrd")
+kubectl -n wyrd create secret generic wyrd-db \
+  --from-file=database-url=<(printf %s "postgresql://wyrd_app:$APP_PW@<db-host>:5432/wyrd") \
+  --from-file=platform-database-url=<(printf %s "postgresql://wyrd_platform_admin:$PLATFORM_PW@<db-host>:5432/wyrd")
+kubectl -n wyrd create secret generic wyrd-signing --from-file=signing.pem
+rm signing.pem
+```
+
+## 2. Migrate with a one-off Job
+
+The Job is the only workload that ever mounts the owner URL.
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata: {name: wyrd-migrate, namespace: wyrd}
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: wyrd:latest            # registry: registry.example.com/wyrd@sha256:…
+          imagePullPolicy: Never        # registry: remove this line
+          command: [wyrd-server, migrate]
+          env:
+            - name: WYRD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-owner, key: database-url}}
+```
+
+```bash
+kubectl apply -f migrate.yaml
+kubectl -n wyrd wait --for=condition=complete job/wyrd-migrate --timeout=300s
+kubectl -n wyrd logs job/wyrd-migrate    # -> Wyrd and Vala schemas are migrated and valid.
+kubectl -n wyrd delete job wyrd-migrate
+```
+
+Rerun the Job for each new image. `migrate` is idempotent.
+
+## 3. Serve one `all` replica
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata: {name: wyrd, namespace: wyrd}
+spec:
+  selector: {app: wyrd}
+  ports:
+    - {name: http, port: 8080}
+    - {name: grpc, port: 50051}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: wyrd, namespace: wyrd}
+spec:
+  serviceName: wyrd
+  replicas: 1
+  selector: {matchLabels: {app: wyrd}}
+  template:
+    metadata: {labels: {app: wyrd}}
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: wyrd
+          image: wyrd:latest            # registry: registry.example.com/wyrd@sha256:…
+          imagePullPolicy: Never        # registry: remove this line
+          env:
+            - name: WYRD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: database-url}}
+            - name: WYRD_PLATFORM_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: platform-database-url}}
+            - {name: WYRD_STORAGE_URL, value: "file:///var/lib/wyrd/storage"}
+            - {name: WYRD_SIGNING_KEY_FILE, value: /run/wyrd/signing.pem}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: grpc, containerPort: 50051}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          # The default `all` process needs at least 3.75 GiB.
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {cpu: "2", memory: 4Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/wyrd}
+            - {name: signing, mountPath: /run/wyrd, readOnly: true}
+      volumes:
+        - name: signing
+          secret: {secretName: wyrd-signing}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 10Gi}}}
+```
+
+```bash
+kubectl apply -f wyrd.yaml
+kubectl -n wyrd rollout status statefulset/wyrd --timeout=300s
+```
+
+The pod is Ready once `/readyz` returns 200: the schema matches the binary,
+storage answers, and the Bifrost roles are serving. `/healthz` only says the
+process is up. If the volume mounts root-owned and the pod cannot write it,
+set the pod's `securityContext.fsGroup` to the image's `wyrd` group
+(`docker run --rm <image> id -g`).
+
+### Routing
+
+Clients reach gRPC at the same host as the HTTP URL, on port `50051`. Expose
+both ports on one hostname: a LoadBalancer Service, or an ingress that
+carries HTTP/1.1 and HTTP/2 on `8080` plus a TCP or gRPC route for `50051`.
+For a quick check, forward both:
+
+```bash
+kubectl -n wyrd port-forward svc/wyrd 8080:8080 50051:50051
+```
+
+## 4. First-use setup
+
+Run setup through `kubectl exec`, so the credentials print to your terminal
+and never to the pod's log. Do not run it as a Job: a Job's output is its log.
+
+```bash
+kubectl -n wyrd exec wyrd-0 -- wyrd-server setup --tenant acme
+```
+
+It prints the platform root credential (`wyrd_global_…`) and the tenant's
+`admin_credential: wyrd_sk_…`, each exactly once. Store both in your password
+manager now. Rerunning setup for an existing tenant changes nothing and prints
+no credential.
+
+To create another tenant after the root exists, use the `wyrd` CLI on your
+machine through the port-forward from step 3. Paste the stored root
+credential at the silent prompt, so it stays in your shell and never reaches
+a command line, the Kubernetes API, or a pod:
+
+```bash
+export WYRD_SERVER_URL=http://127.0.0.1:8080
+read -rs WYRD_PLATFORM_CREDENTIAL && export WYRD_PLATFORM_CREDENTIAL
+wyrd platform tenant create --slug beta --display-name "Beta"
+```
+
+It prints `beta`'s administrative credential once. Never pass a credential as
+a `kubectl exec` argument: the API server can record it.
+
+## 5. An authenticated client request
+
+With the port-forward from step 3 running:
+
+```bash
+export WYRD_SERVER_URL=http://127.0.0.1:8080
+export WYRD_API_KEY=wyrd_sk_…     # the admin_credential from setup
+curl -s $WYRD_SERVER_URL/readyz
+wyrd apply hello                  # the Card from Local development, step 5
+wyrd list --kind Prompt
+```
+
+## Restart persistence
+
+```bash
+kubectl -n wyrd delete pod wyrd-0
+kubectl -n wyrd rollout status statefulset/wyrd
+wyrd list --kind Prompt           # the Card is still there; the API key still works
+```
+
+Postgres holds the registry, the volume claim `data-wyrd-0` holds artifacts and
+Bifrost state, and the stable signing key keeps issued tokens valid. Deleting
+the StatefulSet keeps the claim; deleting the claim loses local storage and
+Bifrost data.
+
+## Failure and recovery
+
+| Symptom | Cause | Recovery |
+| --- | --- | --- |
+| The pod exits with `WYRD_SQL_503_SCHEMA_NOT_READY` | The schema is unmigrated, from another image, or its grants or policies drifted. | Run the migration Job for this image, then delete the pod. |
+| The migration Job fails | Bad owner URL, unreachable database, or a failed migration. | Read `kubectl logs job/wyrd-migrate`, fix the cause, delete and reapply the Job. Serving pods keep refusing a mismatched schema rather than serving it. |
+| The pod stays unready | A dependency is down. | `kubectl logs wyrd-0` names the failing check. |
+| The pod is OOM-killed or refuses to boot on its memory budget | The limit is below the `all` floor. | Keep the limit at 3.75 GiB or more. |
+| `setup` asks for `WYRD_PLATFORM_CREDENTIAL` | The platform root already exists. | Create the tenant with `wyrd platform tenant create`, as in step 4. If the root credential is lost, `kubectl exec wyrd-0 -- wyrd-server recover-root`. |
+
+## Adding replicas
+
+A second `all` replica is a standby, not more capacity. To scale out, run
+peer mode, which changes the storage and networking requirements:
+
+- `WYRD_PEER_ADDRESS` on every pod, from its own pod IP, and `WYRD_PEER_TLS_DIR`
+  holding a dedicated CA and one shared `wyrd-peer` leaf.
+- One **shared** object store. `file://` storage is process-local, so peers
+  cannot share it.
+- A persistent volume per Scribe replica for `WYRD_BIFROST_DATA_DIR`.
+- A private peer port (`50052`) reachable only from other Wyrd pods.
+
+[Production server on Kubernetes](/self-hosting/kubernetes-production/) walks
+through that shape.
+
+## Related
+
+- [Configuration](/self-hosting/configuration/): every variable, including peer mode.
+- [Database](/self-hosting/database/): roles, migrations, and readiness checks.
+- [Running the server](/self-hosting/running-the-server/#administering-the-deployment): credential issue, rotation, and recovery.

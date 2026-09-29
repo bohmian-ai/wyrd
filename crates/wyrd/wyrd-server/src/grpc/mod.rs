@@ -16,11 +16,8 @@ mod otlp;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub use otlp::{OtlpCodecActivity, reset_otlp_codec_activity, snapshot_otlp_codec_activity};
-mod peer_auth;
 pub(crate) mod query;
 mod scribe_tail;
-
-pub use peer_auth::{PeerWorkloadAuth, PeerWorkloadAuthLayer, PeerWorkloadIdentity};
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -37,6 +34,7 @@ use wyrd_tonic::tonic::body::Body;
 use wyrd_tonic::tonic::codegen::http::{Request, Response};
 use wyrd_tonic::tonic::server::NamedService;
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
+use wyrd_tonic::tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
 
 use crate::AppState;
@@ -158,6 +156,29 @@ enum TransportPlane {
 }
 
 impl TransportPlane {
+    /// Reports whether this plane admits the connection that carried `request`.
+    ///
+    /// The public plane has no transport identity to check. The peer listener's
+    /// handshake has already verified the client leaf's chain to the dedicated
+    /// cluster CA, its validity, and its usage; this narrows that leaf to the
+    /// fixed [`crate::config::PEER_SERVER_NAME`] identity, so another leaf the
+    /// same CA issued never reaches a body. A request with no recorded peer
+    /// certificate is refused, keeping the check fail-closed.
+    fn admits<B>(self, request: &Request<B>) -> bool {
+        if self == Self::Public {
+            return true;
+        }
+        request
+            .extensions()
+            .get::<TlsConnectInfo<TcpConnectInfo>>()
+            .and_then(TlsConnectInfo::peer_certs)
+            .is_some_and(|chain| {
+                chain.first().is_some_and(|leaf| {
+                    wyrd_tls::certificate_has_dns_name(leaf, crate::config::PEER_SERVER_NAME)
+                })
+            })
+    }
+
     /// Records one private-plane body poll for multi-process probes.
     ///
     /// The counter exists only in test-support builds; a production binary
@@ -250,6 +271,14 @@ where
         let admission = self.admission.clone();
         let plane = self.plane;
         let mut inner = self.inner.clone();
+        if !plane.admits(&request) {
+            return Box::pin(async {
+                Ok(
+                    Status::unauthenticated("peer certificate identity is not admitted")
+                        .into_http(),
+                )
+            });
+        }
         Box::pin(async move {
             let (parts, mut body) = request.into_parts();
             plane.record_body_poll();
@@ -354,22 +383,6 @@ where
         .add_service(bifrost_query.into_server()))
 }
 
-/// Selects the role-owned peer security audit for this process.
-///
-/// Deliberately not an aggregate: a process owns exactly one peer plane, and
-/// whichever role composed it owns the record of what that plane refused.
-fn peer_security_audit(
-    state: &AppState,
-) -> Option<Arc<dyn vala_bifrost_redux::oracle::peer::PeerSecurityAudit>> {
-    if let Some(oracle) = state.bifrost.oracle() {
-        return Some(oracle.peer().security_audit());
-    }
-    state
-        .bifrost
-        .scribe()
-        .map(|scribe| scribe.fragment_security_audit())
-}
-
 /// Build the **private** Bifrost peer router served on the mutually
 /// authenticated peer listener.
 ///
@@ -379,18 +392,21 @@ fn peer_security_audit(
 /// deliberately mounts neither health nor reflection — a private listener
 /// advertises nothing to an unauthenticated caller.
 ///
+/// Transport admission is the dedicated cluster CA: a connection without a
+/// leaf that CA issued for the fixed peer identity never reaches a handler.
+/// That admits a trusted cluster process, not a tenant, so every mounted
+/// service checks its typed context against its own trusted state before any
+/// plan decode or storage IO.
+///
 /// Returns `Ok(None)` when this target selects no private service, which is the
 /// Forge-worker case: it keeps using its durable assignment path and opens no
 /// peer socket.
 ///
 /// # Errors
-/// Returns [`GrpcError::MissingTokenVerifier`] when the Oracle lifecycle
-/// service is selected without a configured token verifier, or
-/// [`GrpcError::Transport`] when tonic rejects the peer TLS material.
+/// Returns [`GrpcError::Transport`] when tonic rejects the peer TLS material.
 pub fn build_peer_grpc(
     state: &AppState,
     tls: wyrd_tonic::server::MutualTlsServerConfig,
-    denial_audit_concurrency: usize,
 ) -> Result<Option<TonicRouter>, GrpcError> {
     let serves_ingest = state.bifrost_ingest().is_some();
     let serves_query = state.bifrost_query().is_some();
@@ -398,34 +414,22 @@ pub fn build_peer_grpc(
         return Ok(None);
     }
     let transport = state.bifrost.transport_admission();
-    // One boundary, composed once and cloned into every mounted service, so no
-    // private adapter can acquire an authentication path of its own.
-    let auth = PeerWorkloadAuthLayer::new(
-        state.bifrost.shared_token_verifier(),
-        state
-            .bifrost
-            .peer_identity()
-            .cloned()
-            .ok_or(GrpcError::MissingPeerIdentity)?,
-        peer_security_audit(state).ok_or(GrpcError::MissingPeerIdentity)?,
-        denial_audit_concurrency,
-    );
     // `OraclePeerService` is the one adapter every peer-bearing target mounts:
     // a Scribe answers fragment operations on it and an Oracle answers query
     // control, so it anchors the router and later services extend it. The
     // protobuf service is never forked by role; an operation whose local
-    // capability is absent fails closed after authentication instead.
-    let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(auth.wrap(
+    // capability is absent fails closed instead.
+    let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(
         GrpcTransportAdmissionService::new_peer(
             crate::oracle::OraclePeerGrpc::new(Arc::clone(&state.bifrost)).into_server(),
             transport.clone(),
         ),
-    ));
+    );
     let router = match state.bifrost_ingest() {
-        Some(scribe) => router.add_service(auth.wrap(GrpcTransportAdmissionService::new_peer(
-            scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_service()).into_server(),
+        Some(scribe) => router.add_service(GrpcTransportAdmissionService::new_peer(
+            scribe_tail::ScribeTailGrpc::new(scribe.tail_service()).into_server(),
             transport.clone(),
-        ))),
+        )),
         None => router,
     };
     let router = match state
@@ -442,31 +446,21 @@ pub fn build_peer_grpc(
                     Arc::clone(&ingress),
                     vala_bifrost_redux::oracle::analytical_transport::UpstreamWorker::into_worker_server,
                 );
-            router.add_service(auth.wrap(GrpcTransportAdmissionService::new_peer(
+            router.add_service(GrpcTransportAdmissionService::new_peer(
                 vala_bifrost_redux::oracle::analytical_transport::AnalyticalStageAuthLayer::new(
                     ingress,
                 )
                 .layer_service(workers),
                 transport.clone(),
-            )))
+            ))
         }
         None => router,
     };
     let router = match state.bifrost_query() {
-        Some(query) => router.add_service(
-            auth.wrap(GrpcTransportAdmissionService::new_peer(
-                crate::oracle::OracleLifecycleGrpc::new(
-                    state
-                        .auth
-                        .token_verifier
-                        .clone()
-                        .ok_or(GrpcError::MissingTokenVerifier)?,
-                    Arc::clone(query),
-                )
-                .into_server(),
-                transport,
-            )),
-        ),
+        Some(query) => router.add_service(GrpcTransportAdmissionService::new_peer(
+            crate::oracle::OracleLifecycleGrpc::new(Arc::clone(query)).into_server(),
+            transport,
+        )),
         None => router,
     };
     Ok(Some(router))

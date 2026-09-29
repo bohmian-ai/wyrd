@@ -7,10 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use secrecy::{ExposeSecret, SecretString};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use wyrd_tonic::tonic::transport::Identity;
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
@@ -62,35 +60,6 @@ fn server_shutdown_result(
     }
 }
 
-/// Boot-loaded gRPC identity whose private key remains redacted until tonic consumes it.
-struct GrpcIdentityMaterial {
-    /// Public certificate-chain PEM bytes.
-    certificate: Vec<u8>,
-    /// Private-key PEM retained in a redacting secret owner.
-    private_key: SecretString,
-}
-
-impl std::fmt::Debug for GrpcIdentityMaterial {
-    /// Formats only the public certificate size and never exposes key material.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("GrpcIdentityMaterial")
-            .field("certificate_bytes", &self.certificate.len())
-            .field("private_key", &"[REDACTED]")
-            .finish()
-    }
-}
-
-impl GrpcIdentityMaterial {
-    /// Moves the public certificate and an explicitly exposed key into tonic's identity boundary.
-    fn into_identity(self) -> Identity {
-        Identity::from_pem(
-            self.certificate,
-            self.private_key.expose_secret().as_bytes(),
-        )
-    }
-}
-
 /// Composable server: seeds core HTTP/gRPC + workers from `AppState`, accepts
 /// enterprise extensions, and drives a supervised lifecycle.
 pub struct WyrdServer {
@@ -137,58 +106,22 @@ impl WyrdServer {
         // Store this reporter in state so readiness drives THIS health service.
         let state = state.with_grpc_health(reporter.clone());
 
-        let tls_identity = match (
-            &config.grpc.certificate_chain_path,
-            &config.grpc.private_key_path,
-        ) {
-            (Some(certificate_path), Some(key_path)) => {
-                let certificate = std::fs::read(certificate_path).map_err(|_| {
-                    ServerBootError::OraclePeer(format!(
-                        "failed to read gRPC certificate chain {}",
-                        certificate_path.display()
-                    ))
-                })?;
-                let key = std::fs::read_to_string(key_path).map_err(|_| {
-                    ServerBootError::OraclePeer(format!(
-                        "failed to read gRPC private key {}",
-                        key_path.display()
-                    ))
-                })?;
-                Some(
-                    GrpcIdentityMaterial {
-                        certificate,
-                        private_key: SecretString::from(key),
-                    }
-                    .into_identity(),
-                )
-            }
-            (None, None) => None,
-            _ => {
-                return Err(ServerBootError::OraclePeer(
-                    "gRPC TLS certificate and private key must be configured together".to_owned(),
-                ));
-            }
-        };
         let grpc_router = build_app_grpc(
             &state,
             health_service,
             GrpcRouterConfig {
                 reflection_enabled: config.grpc.reflection_enabled,
-                tls_identity,
+                tls_identity: None,
             },
         )?;
         let peer_router = match load_peer_tls(&config)? {
-            Some(peer_tls) => build_peer_grpc(
-                &state,
-                peer_tls,
-                config.bifrost.peer.denial_audit_concurrency,
-            )?,
+            Some(peer_tls) => build_peer_grpc(&state, peer_tls)?,
             None => None,
         };
         // Declared from the composed router rather than from the target alone,
         // so a target that should serve the peer plane but composed no private
         // router is reported unready instead of quietly serving nothing.
-        if config.role.serves_peer() {
+        if config.bifrost.peer.is_enabled() {
             state.peer_plane.require();
         }
         let http_router = crate::http::build_router(state.clone());
@@ -227,9 +160,8 @@ impl WyrdServer {
     ///
     /// Guarantees enterprise write routes get the same request-id spine, panic
     /// handling, request limits, and authenticated `Principal` that core `/v1`
-    /// routes get. ABAC/policy decisions still run through the injected
-    /// `ServerAuthz.policy_hook` seam — the authenticated principal established
-    /// here is what the policy hook authorizes.
+    /// routes get. Their handlers authorize the authenticated principal
+    /// established here through Wyrd's own permission checks.
     #[must_use]
     pub fn merge_http_protected(mut self, extra: Router) -> Self {
         // extra is Router<()> (caller-finalized). Apply the edge stack to it
@@ -518,12 +450,7 @@ impl BoundServer {
         if let Some(endpoint) = &self.config.verification.ingest_endpoint {
             builder = builder.ingest_endpoint(endpoint.clone());
         }
-        builder
-            .local_ingest(
-                self.grpc_addr,
-                self.config.grpc.certificate_chain_path.is_some(),
-            )
-            .build()
+        builder.local_ingest(self.grpc_addr).build()
     }
 
     /// The bound gRPC address, or `None` when the mode does not serve gRPC.
@@ -735,9 +662,25 @@ impl BoundServer {
             // Published here rather than at bind time, so readiness reports the
             // plane as up only while the serving task actually holds it.
             let peer_plane = Arc::clone(&self.state.peer_plane);
+            let bifrost = Arc::clone(&self.state.bifrost);
             peer_plane.mark_serving();
             set.spawn(fallible_task(TaskId::BifrostPeer, async move {
-                let served = serve_grpc_with_listener(router, listener, token).await;
+                let serving = serve_grpc_with_listener(router, listener, token);
+                tokio::pin!(serving);
+                // Peer-mode roles were reserved unready at boot; they join
+                // membership only once this task has polled the listener into
+                // service, and a failed activation stops the process.
+                let activated = tokio::select! {
+                    biased;
+                    served = &mut serving => Some(served.map_err(|error| error.to_string())),
+                    activated = bifrost.activate_peer_roles() => {
+                        activated.err().map(|error| Err(error.to_string()))
+                    }
+                };
+                let served = match activated {
+                    Some(result) => result,
+                    None => serving.await.map_err(|error| error.to_string()),
+                };
                 peer_plane.mark_stopped();
                 served
             }));
@@ -907,59 +850,30 @@ impl BoundServer {
     }
 }
 
-/// Loads this process's private peer TLS material, when it serves the peer plane.
+/// Loads the private listener's mTLS material when peer mode is enabled.
 ///
-/// Returns `None` for a target that mounts no private service, so a Forge
-/// worker neither reads certificate files nor opens a peer socket.
+/// Returns `None` for the default in-process deployment, which opens no peer
+/// socket.
 ///
 /// # Errors
 ///
-/// Returns [`ServerBootError::OraclePeer`] when a peer-bearing target has an
-/// incomplete peer configuration or a PEM file cannot be read.
+/// Returns [`ServerBootError::OraclePeer`] when the peer TLS bundle cannot be read.
 fn load_peer_tls(
     config: &WyrdServerConfig,
 ) -> Result<Option<wyrd_tonic::server::MutualTlsServerConfig>, ServerBootError> {
-    let peer = &config.bifrost.peer;
-    if !peer.is_complete() {
-        if config.role.serves_peer() {
-            return Err(ServerBootError::OraclePeer(
-                "Scribe- and Oracle-bearing targets require the complete bifrost.peer identity"
-                    .to_owned(),
-            ));
-        }
-        return Ok(None);
-    }
-    let read = |path: &std::path::Path, label: &str| -> Result<Vec<u8>, ServerBootError> {
-        std::fs::read(path).map_err(|error| {
-            ServerBootError::OraclePeer(format!(
-                "failed to read Bifrost peer {label} {}: {error}",
-                path.display()
-            ))
-        })
-    };
-    let certificate = read(
-        peer.certificate_chain_path
-            .as_ref()
-            .expect("peer completeness guarantees a certificate chain path"),
-        "certificate chain",
-    )?;
-    let key = read(
-        peer.private_key_path
-            .as_ref()
-            .expect("peer completeness guarantees a private key path"),
-        "private key",
-    )?;
-    let ca = read(
-        peer.ca_certificate_path
-            .as_ref()
-            .expect("peer completeness guarantees a CA path"),
-        "CA certificate",
-    )?;
-    Ok(Some(wyrd_tonic::server::MutualTlsServerConfig::from_pem(
-        &certificate,
-        &key,
-        &ca,
-    )))
+    use secrecy::ExposeSecret;
+    Ok(config
+        .bifrost
+        .peer
+        .read_bundle()
+        .map_err(ServerBootError::OraclePeer)?
+        .map(|bundle| {
+            wyrd_tonic::server::MutualTlsServerConfig::from_pem(
+                &bundle.certificate_chain,
+                bundle.private_key.expose_secret().as_bytes(),
+                &bundle.ca_certificate,
+            )
+        }))
 }
 
 #[cfg(test)]
@@ -977,18 +891,6 @@ mod pg_tests {
     use crate::components::auth::ServerAuth;
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
-
-    /// Private gRPC key material is absent from diagnostic formatting.
-    #[test]
-    fn grpc_identity_material_debug_redacts_private_key() {
-        let material = GrpcIdentityMaterial {
-            certificate: b"public certificate".to_vec(),
-            private_key: SecretString::from("private-key-sentinel"),
-        };
-        let debug = format!("{material:?}");
-        assert!(debug.contains("[REDACTED]"));
-        assert!(!debug.contains("private-key-sentinel"));
-    }
 
     async fn test_state_with_auth() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
@@ -1042,7 +944,6 @@ mod pg_tests {
             config.http.bind = "127.0.0.1:0".parse().expect("static bind is valid");
             config.metrics.enabled = false;
             config.shutdown.drain_ms = 1_000;
-            config.bifrost.peer = crate::test_support::test_peer_config();
             // The unit shell composes no Forge, and the default `All` target
             // refuses to run without a retained Forge worker before shutdown
             // is ever reached. `Server` is the serving target that schedules
@@ -1085,7 +986,6 @@ mod pg_tests {
     async fn metrics_disabled_construction_has_no_global_recorder() {
         let mut config = WyrdServerConfig::default();
         config.metrics.enabled = false;
-        config.bifrost.peer = crate::test_support::test_peer_config();
 
         let state1 = test_state_with_auth().await;
         let server1 = WyrdServer::new(config.clone(), state1)

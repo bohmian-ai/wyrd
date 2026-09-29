@@ -71,11 +71,11 @@ use super::analytical_supervisor::{
 use super::analytical_transport::AnalyticalDestination;
 use super::analytical_transport::{
     AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalGraphExchanges,
-    AnalyticalParticipantCut, AnalyticalStageSigning, StageWireIdentity, read_ticket,
+    AnalyticalParticipantCut, AnalyticalStageSigning, StageWireIdentity, read_context,
 };
 use super::dispatcher::{
-    BifrostPeerTls, CommittedGraphActivation, GraphLeaseRequest, OraclePeerCredentials,
-    PendingGraphActivation, ReservationRegistry,
+    BifrostPeerTls, CommittedGraphActivation, GraphLeaseRequest, PendingGraphActivation,
+    ReservationRegistry,
 };
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
@@ -661,18 +661,14 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
 /// and travels signed with every operation, so churn cannot move a destination
 /// out from under an in-flight graph.
 pub struct AnalyticalStageEgress {
-    /// Server-owned authority holding this node's signing key.
-    authority: Arc<dyn OracleStageAuthority>,
-    /// This node's own identity, signed as the source of every outbound ticket.
+    /// This node's own identity, carried as the source of every outbound context.
     node_id: NodeId,
     /// This node's own current Oracle role fence.
     oracle_fence: u64,
     /// Ticket lifetime, kept far shorter than the graph's own deadline.
     ticket_ttl: chrono::Duration,
-    /// Immutable peer identity every outbound channel is dialed through.
+    /// Immutable mTLS peer identity every outbound channel is dialed through.
     peer_tls: BifrostPeerTls,
-    /// Workload credential every outbound peer request presents.
-    peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Per-graph outbound identity recorded when a stage was authorized.
     identities: Mutex<HashMap<AnalyticalGraphKey, AnalyticalEgressIdentity>>,
 }
@@ -722,23 +718,19 @@ impl fmt::Debug for AnalyticalStageEgress {
 }
 
 impl AnalyticalStageEgress {
-    /// Composes the egress owner over this node's authority and peer identity.
+    /// Composes the egress owner over this node's identity and mTLS peer identity.
     #[must_use]
     pub fn new(
-        authority: Arc<dyn OracleStageAuthority>,
         node_id: NodeId,
         oracle_fence: u64,
         ticket_ttl: chrono::Duration,
         peer_tls: BifrostPeerTls,
-        peer_credentials: Arc<dyn OraclePeerCredentials>,
     ) -> Self {
         Self {
-            authority,
             node_id,
             oracle_fence,
             ticket_ttl,
             peer_tls,
-            peer_credentials,
             identities: Mutex::new(HashMap::new()),
         }
     }
@@ -826,13 +818,11 @@ impl AnalyticalStageEgress {
         Ok(Some(AnalyticalChannelResolver::new(
             recorded.identity,
             self.peer_tls.clone(),
-            Arc::clone(&self.peer_credentials),
             // A follower adopts a cut that is already complete, so its cell is
             // published at construction and never observed unset.
             Arc::new(std::sync::OnceLock::from(recorded.cut)),
             recorded.exchanges,
             AnalyticalStageSigning {
-                authority: Arc::clone(&self.authority),
                 absolute_deadline_ms: recorded.deadline_ms,
                 ticket_ttl: self.ticket_ttl,
             },
@@ -1760,11 +1750,11 @@ impl AnalyticalStageIngress {
         }
         let identity =
             StageWireIdentity::read(headers).map_err(|_| BifrostError::QueryPeerSecurity)?;
-        let ticket = read_ticket(headers).map_err(|_| BifrostError::QueryPeerSecurity)?;
+        let context = read_context(headers).map_err(|_| BifrostError::QueryPeerSecurity)?;
         let binding = identity.to_binding(operation, self.node_id, self.oracle_fence);
         let authorized = self
             .authority
-            .authorize_stage(&ticket, &binding, framed_message, now)
+            .authorize_stage(&context, &binding, framed_message, now)
             .await
             .map_err(|error| {
                 tracing::warn!(
@@ -3751,38 +3741,6 @@ mod tests {
         }
         rows
     }
-    /// Authority that signs and authorizes nothing, for egress-free fixtures.
-    #[derive(Debug)]
-    struct RefusingStageAuthority;
-
-    #[async_trait]
-    impl OracleStageAuthority for RefusingStageAuthority {
-        /// Refuses to mint, because no fixture here sends a stage operation.
-        ///
-        /// # Errors
-        /// Always returns [`PeerSecurityError::Operation`].
-        fn mint_stage(
-            &self,
-            _operation: StageOperationV1,
-            _claims: &super::super::peer::StageTicketClaims,
-        ) -> Result<wyrd_spec::vala::api::SignedPeerTicket, PeerSecurityError> {
-            Err(PeerSecurityError::Operation)
-        }
-
-        /// Refuses to authorize, because no fixture here receives one either.
-        ///
-        /// # Errors
-        /// Always returns [`PeerSecurityError::Operation`].
-        async fn authorize_stage(
-            &self,
-            _ticket: &wyrd_spec::vala::api::SignedPeerTicket,
-            _binding: &super::super::peer::StageBinding,
-            _body: &[u8],
-            _now: DateTime<Utc>,
-        ) -> Result<AuthorizedStage, PeerSecurityError> {
-            Err(PeerSecurityError::Operation)
-        }
-    }
 
     /// Builds the egress owner a session fixture needs but never exercises.
     ///
@@ -3791,14 +3749,10 @@ mod tests {
     /// unsigned request.
     fn fixture_egress() -> Arc<AnalyticalStageEgress> {
         Arc::new(AnalyticalStageEgress::new(
-            Arc::new(RefusingStageAuthority),
             NodeId::new(Uuid::from_u128(0)),
             0,
             chrono::Duration::seconds(30),
             BifrostPeerTls::unreachable_for_test(),
-            Arc::new(super::super::dispatcher::StaticOraclePeerCredentials::new(
-                secrecy::SecretString::from("fixture-bearer"),
-            )),
         ))
     }
 
@@ -4051,35 +4005,19 @@ mod tests {
 
     #[async_trait]
     impl OracleStageAuthority for VerifyingStageAuthority {
-        /// Encodes the claims verbatim under a fixture key and signature.
-        ///
-        /// # Errors
-        /// Never fails; the signature is fixture-owned.
-        fn mint_stage(
-            &self,
-            _operation: StageOperationV1,
-            claims: &super::super::peer::StageTicketClaims,
-        ) -> Result<wyrd_spec::vala::api::SignedPeerTicket, PeerSecurityError> {
-            Ok(wyrd_spec::vala::api::SignedPeerTicket {
-                key_id: "fixture".to_owned(),
-                claims_bytes: prost::Message::encode_to_vec(claims),
-                signature: vec![0; 64],
-            })
-        }
-
         /// Verifies the presented claims bind the exact received bytes.
         ///
         /// # Errors
         /// Returns the production refusal for any bound-field mismatch.
         async fn authorize_stage(
             &self,
-            ticket: &wyrd_spec::vala::api::SignedPeerTicket,
+            context: &wyrd_spec::vala::api::PeerContext,
             binding: &super::super::peer::StageBinding,
             body: &[u8],
             _now: DateTime<Utc>,
         ) -> Result<AuthorizedStage, PeerSecurityError> {
             let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
-                ticket.claims_bytes.as_slice(),
+                context.claims_bytes.as_slice(),
             )
             .map_err(|_| PeerSecurityError::Claims)?;
             let digest = super::super::peer::stage_body_digest(body)?;
@@ -4162,8 +4100,6 @@ mod tests {
         absolute_deadline_ms: i64,
         /// Immutable destination participant cut carried by the ticket.
         participants: Vec<super::super::peer::StageParticipantV1>,
-        /// Single-use nonce, varied so two messages are never replays.
-        nonce: Vec<u8>,
     }
 
     /// Everything one graph-lease owner test needs to send authorized stages.
@@ -4400,7 +4336,7 @@ mod tests {
                     ))),
                 )
                 .expect("an idle follower accepts a second graph reservation");
-            let mut message = self.leader_message(StageOperationV1::ExecuteTask, 9);
+            let mut message = self.leader_message(StageOperationV1::ExecuteTask);
             message.graph = graph;
             message.reservation_id = reservation.reservation_id.as_uuid().to_string();
             message.absolute_deadline_ms = deadline.timestamp_millis();
@@ -4435,7 +4371,6 @@ mod tests {
             AnalyticalExecutionHandle::new(
                 AnalyticalExecutionOwners {
                     worker: Arc::clone(&self.ingress),
-                    authority: Arc::new(VerifyingStageAuthority),
                     supervisor: Arc::clone(&self.supervisor),
                     spill: Arc::clone(&self.spill),
                     peer_transports,
@@ -4445,18 +4380,13 @@ mod tests {
                     oracle_fence: self.fence,
                     ticket_ttl: chrono::Duration::seconds(30),
                     peer_tls: BifrostPeerTls::unreachable_for_test(),
-                    peer_credentials: Arc::new(
-                        super::super::dispatcher::StaticOraclePeerCredentials::new(
-                            secrecy::SecretString::from("fixture-bearer"),
-                        ),
-                    ),
                 },
                 fixture_leaf_binding(),
             )
         }
 
         /// Builds the message the reserving leader presents to activate the graph.
-        fn leader_message(&self, operation: StageOperationV1, nonce: u8) -> StageMessage {
+        fn leader_message(&self, operation: StageOperationV1) -> StageMessage {
             StageMessage {
                 operation,
                 source_node_id: self.leader_node_id,
@@ -4474,7 +4404,6 @@ mod tests {
                 permission_digest: "fixture-permissions".to_owned(),
                 absolute_deadline_ms: self.deadline_ms,
                 participants: self.participants.clone(),
-                nonce: vec![nonce],
             }
         }
 
@@ -4509,16 +4438,15 @@ mod tests {
             let claims = super::super::peer::StageTicketClaims::for_binding(
                 &binding,
                 super::super::peer::stage_body_digest(body).expect("fixture body must digest"),
-                message.nonce.clone(),
                 message.absolute_deadline_ms,
                 0,
                 message.participants.clone(),
             );
-            let ticket = VerifyingStageAuthority
-                .mint_stage(message.operation, &claims)
-                .expect("fixture ticket must mint");
-            super::super::analytical_transport::write_ticket(&mut headers, &ticket)
-                .expect("fixture ticket must encode");
+            let context = claims
+                .to_context(message.operation)
+                .expect("fixture context must encode");
+            super::super::analytical_transport::write_context(&mut headers, &context)
+                .expect("fixture context must encode");
             self.ingress
                 .authorize_stage_message(message.operation, &headers, body, now)
                 .await
@@ -5378,7 +5306,7 @@ mod tests {
     async fn follower_graph_release_waits_for_children_and_retains_cleanup_failure() {
         let now = Utc::now();
         let fixture = GraphFixture::new(now);
-        let plan = fixture.leader_message(StageOperationV1::SetPlan, 1);
+        let plan = fixture.leader_message(StageOperationV1::SetPlan);
         let attempt = fixture
             .send(&plan, now)
             .await
@@ -5465,7 +5393,7 @@ mod tests {
         let now = Utc::now();
         let fixture = GraphFixture::new(now);
         let attempt = fixture
-            .send(&fixture.leader_message(StageOperationV1::SetPlan, 1), now)
+            .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
             .await
             .expect("the reserving leader activates the graph");
         let live = fixture
@@ -5478,7 +5406,7 @@ mod tests {
         // task cache, or settling either would wait on the other's plans.
         let sibling = GraphFixture::new(now);
         let sibling_attempt = sibling
-            .send(&sibling.leader_message(StageOperationV1::SetPlan, 1), now)
+            .send(&sibling.leader_message(StageOperationV1::SetPlan), now)
             .await
             .expect("the reserving leader activates the sibling graph");
         let other = sibling
@@ -5583,10 +5511,7 @@ mod tests {
         // The target activates from `ExecuteTask` alone. No coordinator channel
         // is ever opened for it, and its unary request has already returned.
         fixture
-            .send(
-                &fixture.leader_message(StageOperationV1::ExecuteTask, 2),
-                now,
-            )
+            .send(&fixture.leader_message(StageOperationV1::ExecuteTask), now)
             .await
             .expect("the reserving leader activates the graph from ExecuteTask alone");
         assert!(
@@ -5669,7 +5594,7 @@ mod tests {
         );
 
         let attempt = fixture
-            .send(&fixture.leader_message(StageOperationV1::SetPlan, 1), now)
+            .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
             .await
             .expect("the reserving leader activates the graph");
         assert!(
@@ -5724,7 +5649,7 @@ mod tests {
         let now = Utc::now();
         let fixture = GraphFixture::new(now);
         let attempt = fixture
-            .send(&fixture.leader_message(StageOperationV1::SetPlan, 1), now)
+            .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
             .await
             .expect("the reserving leader activates the graph");
         let runtime = fixture
@@ -5762,10 +5687,7 @@ mod tests {
 
         // Shutdown closes admission first, then reports what stayed retained.
         let refused = fixture
-            .send(
-                &fixture.leader_message(StageOperationV1::ExecuteTask, 2),
-                now,
-            )
+            .send(&fixture.leader_message(StageOperationV1::ExecuteTask), now)
             .await;
         let inspection = fixture
             .ingress
@@ -5784,7 +5706,7 @@ mod tests {
         assert!(
             matches!(
                 fixture
-                    .send(&fixture.leader_message(StageOperationV1::SetPlan, 3), now)
+                    .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
                     .await,
                 Err(BifrostError::QueryAdmissionRejected)
             ),
@@ -5811,7 +5733,7 @@ mod tests {
         // A graph runtime that cannot be built inside the process spill limit.
         let now = Utc::now();
         let fixture = GraphFixture::with_pod_spill_limit(now, 1);
-        let message = fixture.leader_message(StageOperationV1::SetPlan, 1);
+        let message = fixture.leader_message(StageOperationV1::SetPlan);
         assert!(
             fixture.send(&message, now).await.is_err(),
             "a graph whose runtime cannot be built is not activated"
@@ -5834,7 +5756,7 @@ mod tests {
         // restored reservation up again and fails for the same real reason.
         assert!(
             fixture
-                .send(&fixture.leader_message(StageOperationV1::SetPlan, 2), now)
+                .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
                 .await
                 .is_err(),
             "the restored reservation is still the one a later message finds"
@@ -5887,7 +5809,7 @@ mod tests {
             .expect("the fixture supervisor accepts one direct registration");
         assert!(
             fixture
-                .send(&fixture.leader_message(StageOperationV1::SetPlan, 1), now)
+                .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
                 .await
                 .is_err(),
             "a graph the supervisor refuses is not activated"
@@ -5905,7 +5827,7 @@ mod tests {
             .release()
             .expect("the direct registration releases cleanly");
         fixture
-            .send(&fixture.leader_message(StageOperationV1::SetPlan, 2), now)
+            .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
             .await
             .expect("a serialized waiter activates the restored reservation");
         assert_eq!(
@@ -5963,7 +5885,7 @@ mod tests {
             let now = Utc::now();
             let fixture = GraphFixture::new(now);
             fixture
-                .send(&fixture.leader_message(first, 1), now)
+                .send(&fixture.leader_message(first), now)
                 .await
                 .expect("the first authorized message activates the graph");
             let activated = fixture
@@ -5971,7 +5893,7 @@ mod tests {
                 .published(fixture.graph)
                 .expect("activation published exactly one owner");
             fixture
-                .send(&fixture.leader_message(second, 2), now)
+                .send(&fixture.leader_message(second), now)
                 .await
                 .expect("the second authorized message reuses the same graph");
             assert!(
@@ -6006,11 +5928,11 @@ mod tests {
         let fixture = Arc::new(GraphFixture::new(now));
         let gate = Arc::new(tokio::sync::Barrier::new(2));
         let racers = (1u8..=2)
-            .map(|nonce| {
+            .map(|_| {
                 let fixture = Arc::clone(&fixture);
                 let gate = Arc::clone(&gate);
                 tokio::spawn(async move {
-                    let message = fixture.leader_message(StageOperationV1::SetPlan, nonce);
+                    let message = fixture.leader_message(StageOperationV1::SetPlan);
                     gate.wait().await;
                     fixture.send(&message, now).await.map(|_| ())
                 })
@@ -6038,7 +5960,7 @@ mod tests {
 
         // A different reservation for the same graph is not a duplicate; it is a
         // competing owner, and it is refused before anything is decoded.
-        let mut mismatched = fixture.leader_message(StageOperationV1::ExecuteTask, 3);
+        let mut mismatched = fixture.leader_message(StageOperationV1::ExecuteTask);
         mismatched.reservation_id = Uuid::from_u128(77).to_string();
         assert!(
             matches!(
@@ -6078,7 +6000,7 @@ mod tests {
 
         // The reserving leader activates the graph even though the destination
         // cut deliberately does not name it.
-        let activate = fixture.leader_message(StageOperationV1::SetPlan, 1);
+        let activate = fixture.leader_message(StageOperationV1::SetPlan);
         fixture
             .send(&activate, now)
             .await
@@ -6099,7 +6021,7 @@ mod tests {
 
         // A middle-stage participant named by the immutable cut is a valid
         // later coordinator for the same graph.
-        let mut participant = fixture.leader_message(StageOperationV1::ExecuteTask, 2);
+        let mut participant = fixture.leader_message(StageOperationV1::ExecuteTask);
         participant.source_node_id = NodeId::new(Uuid::from_u128(4));
         participant.source_fence = 9;
         fixture
@@ -6109,7 +6031,7 @@ mod tests {
 
         // A source in neither authorization branch is refused, and neither
         // branch widens the other.
-        let mut stranger = fixture.leader_message(StageOperationV1::ExecuteTask, 3);
+        let mut stranger = fixture.leader_message(StageOperationV1::ExecuteTask);
         stranger.source_node_id = NodeId::new(Uuid::from_u128(99));
         stranger.source_fence = 1;
         assert!(
@@ -6117,7 +6039,7 @@ mod tests {
             "a coordinator that is neither the reserving leader nor an exact cut \
              participant is refused"
         );
-        let mut restarted = fixture.leader_message(StageOperationV1::ExecuteTask, 4);
+        let mut restarted = fixture.leader_message(StageOperationV1::ExecuteTask);
         restarted.source_node_id = NodeId::new(Uuid::from_u128(4));
         restarted.source_fence = 10;
         assert!(
@@ -6125,7 +6047,7 @@ mod tests {
             "a cut participant presenting a different fence is a different \
              incarnation and is refused"
         );
-        let mut restarted_leader = fixture.leader_message(StageOperationV1::ExecuteTask, 5);
+        let mut restarted_leader = fixture.leader_message(StageOperationV1::ExecuteTask);
         restarted_leader.source_fence = 4;
         assert!(
             fixture.send(&restarted_leader, now).await.is_err(),
@@ -6134,13 +6056,13 @@ mod tests {
 
         // Every immutable field of the first ticket is retained, and mutating
         // any one of them refuses the message.
-        let mut widened_deadline = fixture.leader_message(StageOperationV1::ExecuteTask, 6);
+        let mut widened_deadline = fixture.leader_message(StageOperationV1::ExecuteTask);
         widened_deadline.absolute_deadline_ms += 60_000;
         assert!(
             fixture.send(&widened_deadline, now).await.is_err(),
             "a later message may not extend the graph's absolute deadline"
         );
-        let mut widened_cut = fixture.leader_message(StageOperationV1::ExecuteTask, 7);
+        let mut widened_cut = fixture.leader_message(StageOperationV1::ExecuteTask);
         widened_cut
             .participants
             .push(super::super::peer::StageParticipantV1 {
@@ -7041,13 +6963,9 @@ mod tests {
                     permission_digest: "fixture-permissions".to_owned(),
                 }),
                 BifrostPeerTls::unreachable_for_test(),
-                Arc::new(super::super::dispatcher::StaticOraclePeerCredentials::new(
-                    secrecy::SecretString::from("fixture-bearer"),
-                )),
                 self.signals.participants(),
                 Arc::default(),
                 AnalyticalStageSigning {
-                    authority: Arc::new(VerifyingStageAuthority),
                     absolute_deadline_ms: self.graph.deadline_ms,
                     ticket_ttl: chrono::Duration::seconds(30),
                 },
@@ -7876,8 +7794,6 @@ pub struct AnalyticalExecutionConfig {
     pub ticket_ttl: chrono::Duration,
     /// Immutable peer identity every leader-side channel is dialed through.
     pub peer_tls: BifrostPeerTls,
-    /// Workload credential every leader-side peer request presents.
-    pub peer_credentials: Arc<dyn OraclePeerCredentials>,
 }
 
 /// What one inactive Analytical execution left behind once it drained.
@@ -7948,14 +7864,12 @@ pub struct AnalyticalShutdownInspection {
 ///
 /// Nothing in Oracle's routing constructs or calls this owner; it exists so the
 /// distributed path can be proved end to end before it is ever selectable. It
-/// composes the owners that already exist — the follower ingress, the stage
-/// authority, the node supervisor, the spill owner, and Oracle telemetry — and
+/// composes the owners that already exist — the follower ingress, the node
+/// supervisor, the spill owner, and Oracle telemetry — and
 /// adds only the leader-side session and channel composition.
 pub struct AnalyticalExecutionHandle {
     /// This node's own follower ingress, so a leader can also serve stages.
     worker: Arc<AnalyticalStageIngress>,
-    /// Server-owned authority that mints every outbound stage ticket.
-    authority: Arc<dyn OracleStageAuthority>,
     /// Node-local supervisor owning leader-side graphs and attempts.
     supervisor: Arc<AnalyticalSupervisor>,
     /// Process spill owner bounding every query runtime this handle builds.
@@ -7991,8 +7905,6 @@ impl fmt::Debug for AnalyticalExecutionHandle {
 pub struct AnalyticalExecutionOwners {
     /// This node's follower ingress, which also hosts the upstream worker.
     pub worker: Arc<AnalyticalStageIngress>,
-    /// Server-owned authority every stage operation is signed and checked by.
-    pub authority: Arc<dyn OracleStageAuthority>,
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
     pub supervisor: Arc<AnalyticalSupervisor>,
     /// Process spill owner that bounds each query runtime's disk manager.
@@ -8021,14 +7933,12 @@ impl AnalyticalExecutionHandle {
     ) -> Self {
         let AnalyticalExecutionOwners {
             worker,
-            authority,
             supervisor,
             spill,
             peer_transports,
         } = owners;
         Self {
             worker,
-            authority,
             supervisor,
             spill,
             peer_transports,
@@ -8361,11 +8271,9 @@ impl AnalyticalExecutionHandle {
         let resolver = AnalyticalChannelResolver::new(
             identity,
             self.config.peer_tls.clone(),
-            Arc::clone(&self.config.peer_credentials),
             participants,
             self.supervisor.graph_exchanges(graph)?.unwrap_or_default(),
             AnalyticalStageSigning {
-                authority: Arc::clone(&self.authority),
                 absolute_deadline_ms: deadline_ms,
                 ticket_ttl: self.config.ticket_ttl,
             },

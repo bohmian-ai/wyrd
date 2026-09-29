@@ -910,16 +910,7 @@ impl PromotionIntegrationFixture {
         let scratch_root = tempfile::tempdir().expect("scratch directory");
 
         let storage = local_storage_owner(warehouse.path());
-        // The filesystem service resumes a listing from `start_after` but does
-        // not advertise it, and a Forge worker refuses a staging backend that
-        // cannot resume a bounded orphan scan. The fixture stands in for a
-        // production object store, so it declares the support it actually has.
-        let staging = Arc::new(storage.operator().clone().layer(
-            opendal::layers::CapabilityOverrideLayer::new(|mut capability| {
-                capability.list_with_start_after = true;
-                capability
-            }),
-        ));
+        let staging = Arc::new(storage.operator().clone());
         let catalog = Arc::new(
             BifrostCatalog::new(
                 database.catalog_dsn().expose_secret(),
@@ -1063,15 +1054,11 @@ impl PromotionIntegrationFixture {
                 operator_pool: self.operator_pool.clone(),
                 catalog,
                 staging: Arc::clone(&self.staging),
-                staging_lists_by_cursor: self
-                    .staging
-                    .info()
-                    .full_capability()
-                    .list_with_start_after,
                 object_store,
                 hints,
                 config: self.config.clone(),
                 maintenance_interval,
+                scheduler_owner: Uuid::now_v7(),
                 clock,
                 completion_observer: Some(completion_observer),
                 scheduler_trigger: Some(scheduler_trigger),

@@ -1,18 +1,16 @@
 //! Query-scoped live Scribe discovery over the attempt's frozen Scribe roster.
 //!
-//! Listing returns partition metadata, never rows. It trusts the authenticated
-//! internal peer: the caller presents the shared Bifrost workload bearer over
-//! the mutually authenticated peer channel, and the Scribe checks nothing else.
-//! Row-serving fragments keep their signed, expiring tickets.
+//! Listing returns partition metadata, never rows. It trusts the mutually
+//! authenticated `wyrd-peer` channel alone; row-serving fragments additionally
+//! carry the receiver-validated typed peer context.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
+use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::{
     DiscoveredTailRoute, OracleQueryParticipant, TailStreamDiscovery,
 };
@@ -20,21 +18,6 @@ use vala_bifrost_redux::scribe::tail_rpc::{TailReadError, TonicTailReadTransport
 use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
 use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
-
-/// One-shot switch that sends the next listing with an invalid bearer.
-///
-/// A journey needs a listing the ready Scribe itself refuses for a credential
-/// reason, through its real verifier and status mapping, to prove Oracle fails
-/// rather than degrades on a trust-boundary refusal.
-#[cfg(feature = "test-support")]
-static REJECT_NEXT_LISTING_CREDENTIAL: AtomicBool = AtomicBool::new(false);
-
-/// Arms the next private listing in this process to carry an invalid bearer,
-/// which the receiving Scribe refuses as unauthenticated.
-#[cfg(feature = "test-support")]
-pub fn arm_tail_listing_credential_rejection_for_test() {
-    REJECT_NEXT_LISTING_CREDENTIAL.store(true, Ordering::Release);
-}
 
 /// Count of upcoming listings in this process that answer with a stale identity.
 ///
@@ -72,8 +55,6 @@ pub fn arm_tail_listing_stall_for_test() {
 /// It owns no route registry. Its only state is one reusable tonic channel per
 /// Scribe node, so repeated queries do not pay a TLS handshake per listing.
 pub struct RegistryTailStreamDiscovery {
-    /// Short-lived private service credential provider.
-    credentials: Arc<dyn OraclePeerCredentials>,
     /// Shared Oracle/Scribe private-service trust material.
     tls: Option<BifrostPeerTls>,
     /// Reusable channel per Scribe node, keyed with the endpoint it dials.
@@ -87,11 +68,10 @@ pub struct RegistryTailStreamDiscovery {
 }
 
 impl RegistryTailStreamDiscovery {
-    /// Creates a resolver over the private peer trust and workload credential.
+    /// Creates a resolver over the private mTLS peer trust.
     #[must_use]
-    pub fn new(credentials: Arc<dyn OraclePeerCredentials>, tls: Option<BifrostPeerTls>) -> Self {
+    pub fn new(tls: Option<BifrostPeerTls>) -> Self {
         Self {
-            credentials,
             tls,
             channels: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-support")]
@@ -139,23 +119,6 @@ impl RegistryTailStreamDiscovery {
             .collect()
     }
 
-    /// Returns the workload bearer every listing in one discovery presents.
-    ///
-    /// # Errors
-    /// Returns [`TailReadError::Authorization`] when the credential exchange fails.
-    async fn bearer(&self) -> Result<String, TailReadError> {
-        #[cfg(feature = "test-support")]
-        if REJECT_NEXT_LISTING_CREDENTIAL.swap(false, Ordering::AcqRel) {
-            return Ok("invalid-listing-bearer".to_owned());
-        }
-        self.credentials
-            .bearer(false)
-            .await
-            .map_err(|_| TailReadError::Authorization {
-                detail: "tail credential exchange failed".to_owned(),
-            })
-    }
-
     /// Lists one frozen Scribe and checks every stream against its fence.
     ///
     /// # Errors
@@ -165,13 +128,9 @@ impl RegistryTailStreamDiscovery {
     async fn list_one(
         scribe: &OracleQueryParticipant,
         channel: Channel,
-        bearer: &str,
         binding: &TenantTableBinding,
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
-        let transport = TonicTailReadTransport::new(ScribeTailServiceClient::new(channel), bearer)
-            .map_err(|_| TailReadError::Authorization {
-                detail: "tail credential metadata is invalid".to_owned(),
-            })?;
+        let transport = TonicTailReadTransport::new(ScribeTailServiceClient::new(channel));
         let streams = transport
             .list_active_streams(binding.clone())
             .await
@@ -212,7 +171,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
     /// refuses as unavailable, [`TailReadError::StaleIdentity`] when a listed
     /// stream names another incarnation or epoch than the frozen roster,
     /// [`TailReadError::DeadlineElapsed`] at the deadline, and a fatal
-    /// authorization, binding, or state class for credential, tenant, binding,
+    /// authorization, binding, or state class for peer, tenant, binding,
     /// or malformed-response failures.
     async fn discover(
         &self,
@@ -242,12 +201,11 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(TailReadError::DeadlineElapsed)?;
-        let bearer = self.bearer().await?;
         let listings = futures_util::future::join_all(
             scribes
                 .iter()
                 .zip(channels)
-                .map(|(scribe, channel)| Self::list_one(scribe, channel, &bearer, binding)),
+                .map(|(scribe, channel)| Self::list_one(scribe, channel, binding)),
         );
         #[cfg(feature = "test-support")]
         let listings = async {

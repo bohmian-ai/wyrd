@@ -556,7 +556,7 @@ async fn prove_production_telemetry() -> Result<(), JourneyError> {
         if dispatched <= 0.0 {
             return Err(format!("no dispatched {operation} stage operation was observed").into());
         }
-        for outcome in ["signature", "binding", "body", "expired", "replay"] {
+        for outcome in ["malformed", "binding", "body", "expired"] {
             let refused = labelled_metric(
                 &delta,
                 "bifrost_oracle_analytical_stage_authority_total",

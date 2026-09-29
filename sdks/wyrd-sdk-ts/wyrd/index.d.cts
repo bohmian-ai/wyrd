@@ -496,6 +496,13 @@ export declare class NativeVerification {
 
 /** Node-facing handle to one authenticated [`WyrdClient`]. */
 export declare class NativeWyrdClient {
+  /** Returns the effective HTTP server URL this client sends requests to. */
+  get serverUrl(): string
+  /**
+   * Returns the effective gRPC endpoint: the explicit `grpc_url` when one
+   * was given, else the server URL's scheme and host on port `50051`.
+   */
+  get grpcUrl(): string
   /**
    * Returns a client that acts for the holder of `subject_token`.
    *

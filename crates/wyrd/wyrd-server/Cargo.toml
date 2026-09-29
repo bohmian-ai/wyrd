@@ -38,6 +38,7 @@ shellexpand = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["signal", "net", "fs", "io-util"] }
 tokio-util = { workspace = true }
+bytes = { workspace = true }
 url = { workspace = true }
 axum = { workspace = true }
 # Streamable HTTP MCP server only: `wyrd-server` serves the protocol, it never
@@ -49,6 +50,9 @@ rmcp = { workspace = true, features = [
 ] }
 vala-drift = { workspace = true }
 vala-eval = { workspace = true }
+skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
+skald-spec = { workspace = true }
 wyrd-telemetry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
 base64 = { workspace = true }
@@ -78,10 +82,9 @@ wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
-wyrd-auth-check = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-crypt = { workspace = true }
-wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-postgres"] }
+wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 tower_governor = { workspace = true }
@@ -93,7 +96,6 @@ wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
 wyrd-gateway = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-tls = { workspace = true }
-ed25519-dalek = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
@@ -101,7 +103,6 @@ utoipa-axum = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }
 insta = { workspace = true }
-rcgen = { workspace = true }
 reqwest = { workspace = true }
 wyrd-storage = { workspace = true }
 temp-env = { workspace = true }
@@ -109,7 +110,6 @@ tokio-stream = "0.1"
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
-wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
 wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-cli = { path = "../wyrd-cli", version = "0.0.1" }
@@ -126,9 +126,6 @@ name = "pg_grpc_ingest_smoke"
 # under `vala-bifrost-redux/test-support`; this crate's `test-support` feature
 # forwards it.
 required-features = ["test-support"]
-
-[[test]]
-name = "pg_authz_check_route"
 
 [[test]]
 name = "pg_router_smoke"

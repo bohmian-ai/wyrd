@@ -1,4 +1,4 @@
-//! Authenticated private transport for owner-local Oracle lifecycle controls.
+//! Private mTLS transport for owner-local Oracle lifecycle controls.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,13 +6,12 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use vala_bifrost_redux::cluster::ClusterRegistry;
-use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
+use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::{
     CancelOracleLifecycleRequest, CancelOracleLifecycleResponse, ListOracleLifecyclesRequest,
     OracleLifecycleLookupRequest, RunningQuerySummary,
 };
-use wyrd_tonic::tonic::metadata::MetadataValue;
 use wyrd_tonic::tonic::{Code, Request};
 use wyrd_tonic::wyrd::v1::oracle_lifecycle_service_client::OracleLifecycleServiceClient;
 
@@ -42,49 +41,33 @@ pub struct OracleLifecycleNodeOutcome<T> {
 /// Canonical dependency-owning client for private lifecycle fanout.
 ///
 /// The transport snapshots current membership once per operation, excludes the
-/// local node, obtains its own platform Service credential, and applies one
+/// local node, dials each peer with the cluster mTLS identity, and applies one
 /// deadline per peer. Dropping the returned future cancels outstanding calls;
 /// completed peers are returned without retrying an ambiguous mutation.
 pub struct OracleLifecycleTransport {
     /// Existing authoritative cluster membership owner.
     cluster: Arc<ClusterRegistry>,
-    /// Canonical refreshing platform Service credential owner.
-    credentials: Arc<dyn OraclePeerCredentials>,
     /// Stable local node excluded from remote fanout.
     local_node_id: NodeId,
-    /// Optional immutable peer TLS trust policy.
+    /// Cluster mTLS identity; absent for a process-local node with no peers.
     tls: Option<BifrostPeerTls>,
 }
 
 impl OracleLifecycleTransport {
-    /// Constructs a plaintext development transport from canonical boot owners.
+    /// Constructs the transport from canonical boot owners.
+    ///
+    /// A process-local node passes no TLS: its registry snapshot holds no
+    /// remote Oracle, so no call is ever dialed.
     #[must_use]
     pub fn new(
         cluster: Arc<ClusterRegistry>,
-        credentials: Arc<dyn OraclePeerCredentials>,
         local_node_id: NodeId,
+        tls: Option<BifrostPeerTls>,
     ) -> Self {
         Self {
             cluster,
-            credentials,
             local_node_id,
-            tls: None,
-        }
-    }
-
-    /// Constructs a TLS-authenticated transport from canonical boot owners.
-    #[must_use]
-    pub fn with_tls(
-        cluster: Arc<ClusterRegistry>,
-        credentials: Arc<dyn OraclePeerCredentials>,
-        local_node_id: NodeId,
-        tls: BifrostPeerTls,
-    ) -> Self {
-        Self {
-            cluster,
-            credentials,
-            local_node_id,
-            tls: Some(tls),
+            tls,
         }
     }
 
@@ -92,7 +75,7 @@ impl OracleLifecycleTransport {
     ///
     /// # Errors
     ///
-    /// Individual credential, connection, deadline, and decoding failures are
+    /// Individual connection, deadline, and decoding failures are
     /// redacted into [`OracleLifecycleOutcome::Unavailable`]. Cancellation drops
     /// unfinished calls while retaining no durable partial progress.
     pub async fn list(
@@ -200,27 +183,6 @@ impl OracleLifecycleTransport {
         Ok(OracleLifecycleServiceClient::new(channel))
     }
 
-    /// Builds authenticated metadata solely from the retained credential owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(())` when credential acquisition fails or the returned
-    /// bearer cannot be represented as gRPC metadata. Cancellation can abandon
-    /// an in-progress credential refresh but persists no transport state.
-    async fn authenticated<T>(&self, value: T, force_refresh: bool) -> Result<Request<T>, ()> {
-        let bearer = self
-            .credentials
-            .bearer(force_refresh)
-            .await
-            .map_err(|_| ())?;
-        let metadata: MetadataValue<_> = format!("Bearer {bearer}").parse().map_err(|_| ())?;
-        let mut request = Request::new(value);
-        request
-            .metadata_mut()
-            .insert("x-wyrd-access-token", metadata);
-        Ok(request)
-    }
-
     /// Performs one bounded owner-local list without exposing transport detail.
     async fn list_one(
         &self,
@@ -230,17 +192,11 @@ impl OracleLifecycleTransport {
         let call = async {
             let mut client = self.client(address.to_owned()).await?;
             let wire: wyrd_tonic::wyrd::v1::ListOracleLifecyclesRequest = request.into();
-            let response = match client
-                .list_lifecycles(self.authenticated(wire.clone(), false).await?)
+            let response = client
+                .list_lifecycles(Request::new(wire))
                 .await
-            {
-                Err(status) if status.code() == Code::Unauthenticated => client
-                    .list_lifecycles(self.authenticated(wire, true).await?)
-                    .await
-                    .map_err(|_| ())?,
-                result => result.map_err(|_| ())?,
-            }
-            .into_inner();
+                .map_err(|_| ())?
+                .into_inner();
             wyrd_spec::vala::api::ListOracleLifecyclesResponse::try_from(response).map_err(|_| ())
         };
         match tokio::time::timeout(LIFECYCLE_CALL_TIMEOUT, call).await {
@@ -261,20 +217,7 @@ impl OracleLifecycleTransport {
                 .await
                 .map_err(|()| wyrd_tonic::tonic::Status::unavailable("peer unavailable"))?;
             let wire: wyrd_tonic::wyrd::v1::GetOracleLifecycleRequest = request.into();
-            let request = self
-                .authenticated(wire.clone(), false)
-                .await
-                .map_err(|()| wyrd_tonic::tonic::Status::unavailable("peer unavailable"))?;
-            match client.get_lifecycle(request).await {
-                Err(status) if status.code() == Code::Unauthenticated => {
-                    let request = self
-                        .authenticated(wire, true)
-                        .await
-                        .map_err(|()| wyrd_tonic::tonic::Status::unavailable("peer unavailable"))?;
-                    client.get_lifecycle(request).await
-                }
-                result => result,
-            }
+            client.get_lifecycle(Request::new(wire)).await
         };
         match tokio::time::timeout(LIFECYCLE_CALL_TIMEOUT, call).await {
             Ok(Ok(response)) => match wyrd_spec::vala::api::GetOracleLifecycleResponse::try_from(
@@ -300,20 +243,7 @@ impl OracleLifecycleTransport {
                 .await
                 .map_err(|()| wyrd_tonic::tonic::Status::unavailable("peer unavailable"))?;
             let wire: wyrd_tonic::wyrd::v1::CancelOracleLifecycleRequest = request.into();
-            let request = self
-                .authenticated(wire.clone(), false)
-                .await
-                .map_err(|()| wyrd_tonic::tonic::Status::unavailable("peer unavailable"))?;
-            match client.cancel_lifecycle(request).await {
-                Err(status) if status.code() == Code::Unauthenticated => {
-                    let request = self
-                        .authenticated(wire, true)
-                        .await
-                        .map_err(|()| wyrd_tonic::tonic::Status::unavailable("peer unavailable"))?;
-                    client.cancel_lifecycle(request).await
-                }
-                result => result,
-            }
+            client.cancel_lifecycle(Request::new(wire)).await
         };
         match tokio::time::timeout(LIFECYCLE_CALL_TIMEOUT, call).await {
             Ok(Ok(response)) => {

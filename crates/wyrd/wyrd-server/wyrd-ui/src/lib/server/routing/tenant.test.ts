@@ -4,6 +4,7 @@ import { mockDataEnabled } from '../development';
 import { expect, test, vi } from 'vitest';
 import { LocalSessions, sessions } from '../auth/session';
 import { WyrdClient } from '../wyrd';
+import { problem } from '../problem';
 import { load as homeLoad } from '../../../routes/t/[tenantKey]/+page.server';
 import { load as rootLoad, actions } from '../../../routes/+page.server';
 
@@ -124,12 +125,22 @@ test('real root load and actions handle tenant counts, challenge, and least priv
   const id = sessions.create();
   const { session } = sessions.read(id);
   const request = new Request('http://localhost/', { method: 'GET' });
-  const loadEvent = { locals: { session, sessionProblem: null }, request } as Parameters<
-    typeof rootLoad
-  >[0];
+  const ready = (async () => new Response('ok')) as unknown as typeof fetch;
+  const loadEvent = {
+    locals: { session, sessionProblem: null, mockData: false },
+    request,
+    fetch: ready
+  } as unknown as Parameters<typeof rootLoad>[0];
   try {
     expect(await rootLoad(loadEvent)).toMatchObject({
-      session: { tenants: [{ key: 'acme' }, { key: 'research' }] }
+      session: { tenants: [{ key: 'acme' }, { key: 'research' }] },
+      problem: null
+    });
+    const down = (async () => {
+      throw new TypeError('connection refused');
+    }) as unknown as typeof fetch;
+    expect(await rootLoad({ ...loadEvent, fetch: down })).toMatchObject({
+      problem: { code: problem('upstream').code }
     });
     sessions.principal.memberships[1].requiresReauthentication = true;
     const actionEvent = (action: string) =>
@@ -150,11 +161,9 @@ test('real root load and actions handle tenant counts, challenge, and least priv
       status: 303,
       location: '/t/research'
     });
-    expect(() => rootLoad(loadEvent)).toThrow();
+    await expect(rootLoad(loadEvent)).rejects.toBeDefined();
     session!.memberships.splice(1);
-    expect(() => rootLoad(loadEvent)).toThrow(
-      expect.objectContaining({ status: 302, location: '/t/acme' })
-    );
+    await expect(rootLoad(loadEvent)).rejects.toMatchObject({ status: 302, location: '/t/acme' });
     const wyrd = new WyrdClient(sessions.bind(session!, 'acme'), true);
     session!.memberships[0].permissions = [];
     const denied = new WyrdClient(sessions.bind(session!, 'acme'), true);

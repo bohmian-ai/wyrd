@@ -21,10 +21,9 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
-    BifrostPeerTls, LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTransportDirectory,
-    OraclePeerWorker, OraclePeerWorkerConfig, ReservationRegistry, TonicOraclePeerTransport,
+    BifrostPeerTls, LocalOraclePeerTransport, OraclePeerTransportDirectory, OraclePeerWorker,
+    OraclePeerWorkerConfig, ReservationRegistry, TonicOraclePeerTransport,
 };
-use vala_bifrost_redux::oracle::peer::ReservationTicketMinter;
 use vala_bifrost_redux::oracle::{
     Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
     OracleSlotManager, OracleSpillRuntime,
@@ -42,7 +41,6 @@ use vala_bifrost_redux::scribe::{
 };
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
-use wyrd_runtime::{Permission, PrincipalKind};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
@@ -52,17 +50,14 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{
     NodeId as ClusterNodeId, OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1,
 };
-use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
+use wyrd_sql::dsn::{DsnError, ResolvedDsns};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
-use crate::components::auth::audit_writer::RealAuthzAuditWriter;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
-use crate::oracle::{
-    OraclePeerAuthority, OracleQueryAudit, PostgresPeerSecurityAudit, ServerBifrostPeerCredentials,
-};
+use crate::oracle::{OraclePeerAuthority, OracleQueryAudit, PostgresPeerSecurityAudit};
 use crate::postgres::ServerPostgres;
 use crate::state::{
     AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
@@ -92,6 +87,70 @@ impl OpenDalForgeObjectStore {
     #[must_use]
     fn new(operator: Arc<opendal::Operator>) -> Self {
         Self { operator }
+    }
+
+    /// Page a prefix in ascending key order on a backend without a native cursor.
+    ///
+    /// Each page is one full recursive walk that keeps only the
+    /// [`FORGE_OBJECT_LIST_PAGE_ENTRIES`] smallest file keys strictly after the
+    /// cursor, so memory stays bounded by the page size whatever the prefix
+    /// holds and the walk order the backend happens to use. The last key of a
+    /// page becomes the next cursor; a short page ends the stream. Pages are
+    /// produced lazily, so orphan GC stopping at its page cap stops the walks.
+    // ponytail: one full walk per page (O(pages × objects)); fine for local and
+    // Azure staging prefixes, native cursor backends never take this path.
+    fn emulated_pages(&self, prefix: &str, start_after: Option<&str>) -> ForgeObjectPages {
+        let state = Some((
+            self.clone(),
+            prefix.to_owned(),
+            start_after.map(str::to_owned),
+        ));
+        Box::pin(futures_util::stream::try_unfold(
+            state,
+            |state| async move {
+                let Some((store, prefix, cursor)) = state else {
+                    return Ok(None);
+                };
+                let page = store.smallest_after(&prefix, cursor.as_deref()).await?;
+                let Some(last) = page.last().map(|entry| entry.path().to_owned()) else {
+                    return Ok(None);
+                };
+                let next = (page.len() == FORGE_OBJECT_LIST_PAGE_ENTRIES).then_some((
+                    store,
+                    prefix,
+                    Some(last),
+                ));
+                Ok(Some((page, next)))
+            },
+        ))
+    }
+
+    /// Walk `prefix` once and return its smallest file keys after `cursor`, sorted.
+    ///
+    /// Directory keys are skipped for the same reason as on the native path:
+    /// they are not addressable objects and must not consume the page bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying OpenDAL error when the walk cannot be opened or
+    /// fails part-way.
+    async fn smallest_after(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+    ) -> opendal::Result<Vec<opendal::Entry>> {
+        let mut lister = self.operator.lister_with(prefix).recursive(true).await?;
+        let mut smallest = std::collections::BTreeMap::new();
+        while let Some(entry) = lister.try_next().await? {
+            if !entry.metadata().is_file() || cursor.is_some_and(|cursor| entry.path() <= cursor) {
+                continue;
+            }
+            smallest.insert(entry.path().to_owned(), entry);
+            if smallest.len() > FORGE_OBJECT_LIST_PAGE_ENTRIES {
+                smallest.pop_last();
+            }
+        }
+        Ok(smallest.into_values().collect())
     }
 }
 
@@ -137,29 +196,23 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
     /// so a mid-walk backend error surfaces as a failed page rather than being
     /// silently truncated.
     ///
-    /// Listing is gated on the backend advertising `list_with_start_after`.
-    /// The bounded scan resumes by cursor, and emulating that cursor by
-    /// filtering would relist every earlier page on every attempt — exactly the
-    /// unbounded listing the page cap exists to prevent — so an incapable
-    /// backend is refused before any listing rather than served an
-    /// anti-starvation guarantee this adapter cannot keep.
+    /// A backend with native `list_with_start_after` (S3, GCS) resumes on the
+    /// backend's own cursor. A backend without it (local fs, Azure) is served
+    /// by [`Self::emulated_pages`], which keeps the same ascending, exclusive
+    /// cursor contract and page bound at the cost of one walk per page.
     ///
     /// # Errors
     ///
-    /// Returns [`opendal::ErrorKind::Unsupported`] when the backend cannot
-    /// resume from a cursor, and the underlying OpenDAL error when the lister
-    /// cannot be opened. Errors encountered after the walk begins surface as a
-    /// failed page in the returned stream.
+    /// Returns the underlying OpenDAL error when the native lister cannot be
+    /// opened. Errors encountered after the walk begins, including every
+    /// emulated walk, surface as a failed page in the returned stream.
     async fn list_pages(
         &self,
         prefix: &str,
         start_after: Option<&str>,
     ) -> opendal::Result<ForgeObjectPages> {
         if !self.operator.info().full_capability().list_with_start_after {
-            return Err(opendal::Error::new(
-                opendal::ErrorKind::Unsupported,
-                "Forge orphan listing requires backend list_with_start_after support",
-            ));
+            return Ok(self.emulated_pages(prefix, start_after));
         }
         let mut listing = self.operator.lister_with(prefix).recursive(true);
         if let Some(cursor) = start_after {
@@ -247,13 +300,10 @@ struct ScribeBootParts {
 /// Errors raised while assembling server state.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerBootError {
-    /// Postgres boot or pool construction failed.
+    /// The serving database URLs are missing or invalid.
     #[error(transparent)]
-    Postgres(#[from] BootError),
-    /// Server database readiness failed.
-    #[error(transparent)]
-    Database(#[from] crate::postgres::ServerPostgresError),
-    /// SQL migrations failed.
+    Postgres(#[from] DsnError),
+    /// Pool construction, schema readiness, or a SQL operation failed.
     #[error(transparent)]
     Sql(#[from] wyrd_sql::error::SqlError),
     /// Storage boot failed.
@@ -348,6 +398,12 @@ pub enum ServerBootError {
     /// Oracle peer authority, audit, role, or worker construction failed.
     #[error("Oracle peer runtime construction failed: {0}")]
     OraclePeer(String),
+    /// Peer mode was configured over process-local `file://` object storage.
+    ///
+    /// Peers read one another's committed objects, so a node-local root would
+    /// let two ready members disagree about durable data.
+    #[error("peer mode requires shared object storage; file:// storage is local to one process")]
+    PeerLocalStorage,
 }
 
 /// Resolve the operator `forge` config section into a `ForgeConfig` plus the
@@ -437,17 +493,26 @@ fn validate_scribe_replay_envelope(
 /// Constructs the external dependency graph injected into Bifrost composition.
 ///
 /// # Errors
-/// Returns a boot error when Postgres, storage, catalog, resource detection, or
-/// volume-root preparation fails.
+/// Returns a boot error when Postgres readiness, storage, catalog, resource
+/// detection, or volume-root preparation fails.
 async fn build_bifrost_external_dependencies(
-    boot: &PostgresBoot,
+    dsns: &ResolvedDsns,
     config: &crate::config::BifrostRuntimeConfig,
     target: crate::config::BifrostTarget,
 ) -> Result<BifrostExternalDependencies, ServerBootError> {
     let data_root = BifrostDataRoot::prepare(config.data_dir())?;
-    let dsns = boot.dsns()?;
-    let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
+    let postgres = Arc::new(ServerPostgres::connect_from_dsns(dsns).await?);
     let storage_settings = load_storage_settings()?;
+    // Refused before any role row is reserved, so a misconfigured peer never
+    // appears in membership, even as not-ready.
+    if config.peer.is_enabled()
+        && matches!(
+            storage_settings.backend,
+            wyrd_storage::settings::BackendConfig::Local { .. }
+        )
+    {
+        return Err(ServerBootError::PeerLocalStorage);
+    }
     let storage = StorageHandle::from_settings(storage_settings).await?;
     // A Scribe-bearing target owns durable state keyed by its own node, so it
     // reclaims the identity stored beside that state; a target with no Scribe
@@ -460,15 +525,27 @@ async fn build_bifrost_external_dependencies(
         } else {
             NodeId::generate()
         };
-    let advertise_addr = config
-        .peer
-        .advertise_addr
-        .clone()
-        .unwrap_or_else(|| format!("https://{}", config.peer.bind));
-    let cluster = Arc::new(ClusterRegistry::new(
-        postgres.vala().clone(),
-        ClusterNodeId::new(node_id.as_uuid()),
-    ));
+    // Explicit peer mode publishes its runtime-supplied address. A
+    // process-local node publishes an undialable local marker and filters its
+    // registry to itself, so it never selects a member it has no channel to.
+    let (advertise_addr, cluster) = match config.peer.advertised_uri() {
+        Some(address) => (
+            address,
+            ClusterRegistry::new(
+                postgres.vala().clone(),
+                ClusterNodeId::new(node_id.as_uuid()),
+            ),
+        ),
+        None => (
+            format!("local://{}", node_id.as_uuid()),
+            ClusterRegistry::new(
+                postgres.vala().clone(),
+                ClusterNodeId::new(node_id.as_uuid()),
+            )
+            .process_local(),
+        ),
+    };
+    let cluster = Arc::new(cluster);
     let roles = crate::config::BifrostRoles::for_target(target);
     let resource_roles = roles
         .iter()
@@ -517,7 +594,7 @@ async fn build_bifrost_external_dependencies(
     ));
     let catalog = Arc::new(
         BifrostCatalog::new(
-            dsns.catalog_app.expose_secret(),
+            dsns.catalog().expose_secret(),
             Arc::clone(&bifrost_storage),
             postgres.vala().clone(),
         )
@@ -556,9 +633,7 @@ pub async fn compose_bifrost(
         resources: bifrost_resources,
         cluster: cluster_registry,
         token_verifier,
-        peer_credentials,
         peer_tls,
-        peer_keyring,
         config: bifrost_config,
         forge_config: forge_runtime,
         node_id,
@@ -813,17 +888,25 @@ pub async fn compose_bifrost(
                 "tail service failed before role activation: {error}"
             )));
         }
-        if let Err(error) = cluster_registry.activate(&scribe_role).await {
-            if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
-                tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after activation failure");
+        // A peer-mode Scribe stays reserved but unready until its private
+        // listener serves; the serving owner activates it then.
+        if peer_tls.is_none() {
+            if let Err(error) = cluster_registry.activate(&scribe_role).await {
+                if let Err(cleanup_error) =
+                    cluster_registry.shutdown_role(scribe_role.clone()).await
+                {
+                    tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after activation failure");
+                }
+                return Err(ServerBootError::Scribe(error.to_string()));
             }
-            return Err(ServerBootError::Scribe(error.to_string()));
-        }
-        if let Err(error) = cluster_registry.refresh_snapshot().await {
-            if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
-                tracing::warn!(%cleanup_error, "failed to release active Scribe fence after snapshot failure");
+            if let Err(error) = cluster_registry.refresh_snapshot().await {
+                if let Err(cleanup_error) =
+                    cluster_registry.shutdown_role(scribe_role.clone()).await
+                {
+                    tracing::warn!(%cleanup_error, "failed to release active Scribe fence after snapshot failure");
+                }
+                return Err(ServerBootError::Scribe(error.to_string()));
             }
-            return Err(ServerBootError::Scribe(error.to_string()));
         }
         Some(ScribeBootParts {
             scribe,
@@ -845,10 +928,6 @@ pub async fn compose_bifrost(
             forge_config = config;
         }
         let staging = Arc::new(storage.operator().clone());
-        // Read from the concrete operator before it is erased behind
-        // `ForgeObjectStore`: only the backend itself can answer whether a
-        // bounded orphan listing can resume from a cursor.
-        let staging_lists_by_cursor = staging.info().full_capability().list_with_start_after;
         #[cfg(feature = "test-support")]
         let object_store: Arc<dyn ForgeObjectStore> = test_controls
             .as_ref()
@@ -875,11 +954,11 @@ pub async fn compose_bifrost(
                 }
             },
             staging,
-            staging_lists_by_cursor,
             object_store,
             hints: staging_file_inbox,
             config: forge_config,
             maintenance_interval,
+            scheduler_owner: node_id.as_uuid(),
             clock: {
                 #[cfg(feature = "test-support")]
                 {
@@ -965,13 +1044,9 @@ pub async fn compose_bifrost(
                 .await
                 .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
-        let fragment_authority = Arc::new(
-            crate::oracle::OraclePeerAuthority::from_keyring(
-                Arc::clone(&peer_keyring),
-                fragment_security_audit.clone(),
-            )
-            .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-        );
+        let fragment_authority = Arc::new(crate::oracle::OraclePeerAuthority::new(
+            fragment_security_audit.clone(),
+        ));
         Some(Arc::new(Scribe::new(crate::state::ScribeBuildInputs {
             ingest: parts.scribe,
             catalog: Arc::clone(&bifrost),
@@ -991,6 +1066,7 @@ pub async fn compose_bifrost(
             })?,
             owns_fragment_query_audit: !roles.contains(&BifrostRuntimeRole::Oracle),
             role_shutdown: shutdown.clone(),
+            activated: peer_tls.is_none(),
         })))
     } else {
         None
@@ -999,16 +1075,13 @@ pub async fn compose_bifrost(
         postgres: Arc::clone(&postgres),
         catalog: Arc::clone(&bifrost),
         resources: bifrost_resources.clone(),
-        token_verifier: Arc::clone(&token_verifier),
         config: &bifrost_config,
         target,
         deployment_profile,
-        peer_keyring: Arc::clone(&peer_keyring),
         cluster: Arc::clone(&cluster_registry),
         node_id,
         advertise_addr: &advertise_addr,
         spill_root: data_root.oracle_spill().to_path_buf(),
-        peer_credentials: Arc::clone(&peer_credentials),
         peer_tls: peer_tls.clone(),
         audit: query_audit.clone(),
         shutdown: shutdown.clone(),
@@ -1020,29 +1093,16 @@ pub async fn compose_bifrost(
             .await
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
     );
-    let forwarding_authority = Arc::new(
-        OraclePeerAuthority::from_keyring(Arc::clone(&peer_keyring), forwarding_audit)
-            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-    );
+    let forwarding_authority = Arc::new(OraclePeerAuthority::new(forwarding_audit));
     let query_controls = oracle.as_ref().map_or_else(
         || {
-            let transport = if let Some(tls) = peer_tls.clone() {
-                crate::oracle::OracleLifecycleTransport::with_tls(
-                    Arc::clone(&cluster_registry),
-                    Arc::clone(&peer_credentials),
-                    node_id,
-                    tls,
-                )
-            } else {
-                crate::oracle::OracleLifecycleTransport::new(
-                    Arc::clone(&cluster_registry),
-                    Arc::clone(&peer_credentials),
-                    node_id,
-                )
-            };
             crate::oracle::RunningQueryControls::new(
                 None,
-                Arc::new(transport),
+                Arc::new(crate::oracle::OracleLifecycleTransport::new(
+                    Arc::clone(&cluster_registry),
+                    node_id,
+                    peer_tls.clone(),
+                )),
                 Arc::clone(&cluster_registry),
             )
         },
@@ -1056,7 +1116,6 @@ pub async fn compose_bifrost(
             local_fence: oracle
                 .as_ref()
                 .map(|runtime| runtime.registered_role().fencing_token),
-            credentials: Arc::clone(&peer_credentials),
             tls: peer_tls,
             authority: forwarding_authority,
             config: OracleConfig::default(),
@@ -1078,22 +1137,10 @@ pub async fn compose_bifrost(
     )
     .with_audit(Arc::new(
         crate::bifrost::gate_audit::PostgresGateAudit::new(postgres.as_ref().clone()),
+    ))
+    .with_observation_ack(Arc::new(
+        crate::verification::observations::ObservationEnqueue::new(postgres.wyrd().clone()),
     ));
-    // Resolved from the process's own credential, so the identity a replica
-    // presents on the peer plane and the identity it admits are the same
-    // principal. A peer-serving target that cannot prove it fails to boot.
-    let peer_identity = if target.serves_peer() {
-        Some(
-            crate::grpc::PeerWorkloadIdentity::resolve(
-                peer_credentials.as_ref(),
-                token_verifier.as_ref(),
-            )
-            .await
-            .map_err(ServerBootError::OraclePeer)?,
-        )
-    } else {
-        None
-    };
     Ok(crate::state::ComposedBifrost {
         bifrost: crate::state::Bifrost::assembled(crate::state::BifrostComposition {
             gate,
@@ -1103,7 +1150,6 @@ pub async fn compose_bifrost(
             bifrost_storage,
             transport: bifrost_resources.transport_admission(),
             token_verifier,
-            peer_identity,
             query_forwarder: Some(query_forwarder),
             query_controls: Some(query_controls),
             #[cfg(feature = "test-support")]
@@ -1246,8 +1292,8 @@ pub async fn build_state(
     overrides: StateOverrides,
 ) -> Result<BootedServer, ServerBootError> {
     let shutdown = CancellationToken::new();
-    let boot = PostgresBoot::from_env().await?;
-    let external = build_bifrost_external_dependencies(&boot, &config.bifrost, config.role).await?;
+    let dsns = ResolvedDsns::from_env()?;
+    let external = build_bifrost_external_dependencies(&dsns, &config.bifrost, config.role).await?;
     let sealing_key = build_sealing_key(config)?;
     let signing_key = resolve_signing_key(config)?;
     let auth = install_auth(
@@ -1261,12 +1307,7 @@ pub async fn build_state(
         .token_verifier
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))?;
-    let peer_credentials: Arc<dyn OraclePeerCredentials> = Arc::new(
-        ServerBifrostPeerCredentials::from_configured_key(config.bifrost.peer.api_key.clone())
-            .map_err(ServerBootError::OraclePeer)?,
-    );
-    let peer_tls = build_bifrost_peer_tls(&config.bifrost.peer, config.role)?;
-    let peer_keyring = resolve_peer_ticket_keyring(config)?;
+    let peer_tls = build_bifrost_peer_tls(&config.bifrost.peer)?;
     let crate::state::ComposedBifrost {
         bifrost,
         coordination_runtime,
@@ -1282,9 +1323,7 @@ pub async fn build_state(
         resources: external.resources,
         cluster: Arc::clone(&external.cluster),
         token_verifier: verifier,
-        peer_credentials,
         peer_tls,
-        peer_keyring,
         config: config.bifrost.clone(),
         forge_config: config.forge,
         node_id: external.node_id,
@@ -1315,12 +1354,6 @@ pub async fn build_state(
         return Err(error);
     }
 
-    // Install the real authz audit writer as the OSS default. Callers can
-    // still replace the entire ServerAuthz (policy hook + writer) via overrides.
-    let state = state.with_authz(ServerAuthz {
-        audit_writer: Arc::new(RealAuthzAuditWriter),
-        ..ServerAuthz::default()
-    });
     let state = apply_overrides(state, overrides);
 
     if let Err(error) = state.production_validate() {
@@ -1354,7 +1387,7 @@ async fn rollback_state_roles(state: &AppState) {
 /// Development may generate an ephemeral key so the default mixed-role server
 /// still issues real tokens. Production requires configured key material and
 /// never falls back to an ephemeral authority. This key never authorizes a
-/// Bifrost peer operation; see [`resolve_peer_ticket_keyring`].
+/// Bifrost peer operation; peers are admitted by the cluster mTLS identity.
 ///
 /// # Errors
 ///
@@ -1380,52 +1413,6 @@ fn resolve_signing_key(
          must never be used in production."
     );
     Ok(ephemeral)
-}
-
-/// Resolves the independent Bifrost peer ticket keyring for this process.
-///
-/// Peer authority is deliberately separate from the workload signing key: a
-/// user or API token must never validate as a peer-purpose ticket, and the
-/// peer keyring rotates on its own schedule with retired verification keys
-/// still accepted until their published instant. Configured material is
-/// required in production. Development without configured material generates
-/// an ephemeral single-key keyring so a default mixed-role server still
-/// constructs a real local Oracle; that key is distinct from the workload key
-/// and does not survive a restart.
-///
-/// # Errors
-///
-/// Returns [`ServerBootError::SigningKey`] when production has no complete
-/// peer ticket configuration, when the configured keyring cannot be loaded,
-/// or when development cannot generate an ephemeral Ed25519 key.
-fn resolve_peer_ticket_keyring(
-    config: &crate::config::WyrdServerConfig,
-) -> Result<Arc<crate::oracle::PeerTicketKeyring>, ServerBootError> {
-    let ticket = &config.bifrost.peer.ticket;
-    if ticket.is_complete() {
-        return crate::oracle::PeerTicketKeyring::load(ticket)
-            .map(Arc::new)
-            .map_err(|error| ServerBootError::SigningKey(error.to_string()));
-    }
-    if config.deployment_profile.is_production() {
-        return Err(ServerBootError::SigningKey(
-            "no Bifrost peer ticket keyring configured (set \
-             WYRD_BIFROST_PEER_TICKET_ACTIVE_KEY_ID, \
-             WYRD_BIFROST_PEER_TICKET_SIGNING_KEY_PATH, and \
-             WYRD_BIFROST_PEER_TICKET_VERIFYING_KEYRING_PATH)"
-                .to_owned(),
-        ));
-    }
-    let ephemeral = wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()
-        .map_err(|error| ServerBootError::SigningKey(error.to_string()))?;
-    tracing::warn!(
-        "APP_ENV=development and no Bifrost peer ticket keyring configured; generated an \
-         EPHEMERAL peer keyring. Peer tickets will not survive a restart and this keyring \
-         must never be used in production."
-    );
-    crate::oracle::PeerTicketKeyring::from_signing_key_pem(&ephemeral)
-        .map(Arc::new)
-        .map_err(|error| ServerBootError::SigningKey(error.to_string()))
 }
 
 /// Apply caller overrides to a built state. Factored out for unit testing
@@ -1539,16 +1526,12 @@ struct OracleRoleBuilder<'a> {
     catalog: Arc<BifrostCatalog>,
     /// Root-derived selected-role resource graph.
     resources: BifrostRoleResources,
-    /// Exact boot-constructed token verifier used for peer preflight.
-    token_verifier: Arc<wyrd_auth_verify::TokenVerifier>,
     /// Validated Bifrost configuration borrowed for this activation.
     config: &'a crate::config::BifrostRuntimeConfig,
     /// Closed process target controlling Oracle selection.
     target: crate::config::BifrostTarget,
     /// Deployment posture used for remote TLS validation.
     deployment_profile: crate::config::DeploymentProfile,
-    /// Independent Bifrost peer ticket keyring used to mint and verify tickets.
-    peer_keyring: Arc<crate::oracle::PeerTicketKeyring>,
     /// Cluster registry owning the role fence and readiness publication.
     cluster: Arc<ClusterRegistry>,
     /// Stable node identity advertised to peer services.
@@ -1557,9 +1540,8 @@ struct OracleRoleBuilder<'a> {
     advertise_addr: &'a str,
     /// Oracle spill directory derived from the one Bifrost data root.
     spill_root: std::path::PathBuf,
-    /// Shared outbound peer bearer owner.
-    peer_credentials: Arc<dyn OraclePeerCredentials>,
-    /// Immutable peer TLS trust policy, present only when CA material is configured.
+    /// Cluster mTLS identity; present only in peer mode, where it is the sole
+    /// trust boundary for every private call this Oracle sends or receives.
     peer_tls: Option<BifrostPeerTls>,
     /// Shared query audit used by the leader and role-local tenant tripwires.
     audit: Option<Arc<OracleQueryAudit>>,
@@ -1580,8 +1562,14 @@ impl<'a> OracleRoleBuilder<'a> {
         {
             return Ok(None);
         }
+        // A peer-mode Oracle stays reserved but unready until its private
+        // listener serves; the serving owner activates it then.
+        let activate = self.peer_tls.is_none();
         let built = self.construct().await?;
-        built.start_reconcile_activate_publish().await.map(Some)
+        built
+            .start_reconcile_activate_publish(activate)
+            .await
+            .map(Some)
     }
 
     /// Constructs one Oracle role and retains its reserved fence.
@@ -1594,16 +1582,13 @@ impl<'a> OracleRoleBuilder<'a> {
             postgres,
             catalog,
             resources: roles,
-            token_verifier,
             config,
             target: _,
             deployment_profile,
-            peer_keyring,
             cluster,
             node_id,
             advertise_addr,
             spill_root,
-            peer_credentials,
             peer_tls,
             audit,
             shutdown,
@@ -1619,10 +1604,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 .await
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
-        let authority = Arc::new(
-            OraclePeerAuthority::from_keyring(Arc::clone(&peer_keyring), security_audit.clone())
-                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-        );
+        let authority = Arc::new(OraclePeerAuthority::new(security_audit.clone()));
         let resource_plan = roles.plan();
         let resources = roles.oracle().ok_or_else(|| {
             ServerBootError::OraclePeer(
@@ -1749,62 +1731,19 @@ impl<'a> OracleRoleBuilder<'a> {
                 .filter(|lease| lease.key.node_id != node_id)
                 .map(|lease| lease.address.as_str()),
         )?;
-        let initial_bearer = peer_credentials.bearer(false).await.map_err(|_| {
-            ServerBootError::OraclePeer("Oracle peer credential exchange failed".to_owned())
-        })?;
-        let mut metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
-        let bearer = format!("Bearer {initial_bearer}").parse().map_err(|_| {
-            ServerBootError::OraclePeer("Oracle peer access token is invalid".to_owned())
-        })?;
-        metadata.insert("x-wyrd-access-token", bearer);
-        let authenticated =
-            vala_bifrost_redux::gate::auth::authenticate(token_verifier.as_ref(), &metadata)
-                .map_err(|_| {
-                    ServerBootError::OraclePeer("Oracle peer access token was rejected".to_owned())
-                })?;
-        if !matches!(authenticated.principal.kind, PrincipalKind::Service { .. })
-            || authenticated.principal.tenant_id != DataTenantId::SYSTEM_OWNER
-            || !authenticated
-                .principal
-                .effective_permissions
-                .contains(&Permission::bifrost_peer_invoke())
-        {
-            return Err(ServerBootError::OraclePeer(
-                "Oracle peer credential lacks platform service authority".to_owned(),
-            ));
-        }
-        let remote_transport = Arc::new(
-            if let Some(tls) = tail_tls.clone() {
-                TonicOraclePeerTransport::with_credentials_and_tls(
-                    Arc::clone(&cluster),
-                    Arc::clone(&peer_credentials),
-                    tls,
-                )
-            } else {
-                TonicOraclePeerTransport::with_credentials(
-                    Arc::clone(&cluster),
-                    Arc::clone(&peer_credentials),
-                )
-            }
-            // The same authority that verifies inbound reservation tickets
-            // signs the outbound ones, so a node cannot mint authority it would
-            // not itself accept.
-            .with_reservation_minter(Arc::clone(&authority) as Arc<dyn ReservationTicketMinter>),
-        );
-        let lifecycle_transport = Arc::new(if let Some(tls) = tail_tls.clone() {
-            crate::oracle::OracleLifecycleTransport::with_tls(
+        // Remote Oracle peers exist only in peer mode, which always carries
+        // the cluster mTLS identity; the local `all` target dispatches in-process.
+        let remote_transport = tail_tls.clone().map(|tls| {
+            Arc::new(TonicOraclePeerTransport::with_tls(
                 Arc::clone(&cluster),
-                Arc::clone(&peer_credentials),
-                node_id,
                 tls,
-            )
-        } else {
-            crate::oracle::OracleLifecycleTransport::new(
-                Arc::clone(&cluster),
-                Arc::clone(&peer_credentials),
-                node_id,
-            )
+            ))
         });
+        let lifecycle_transport = Arc::new(crate::oracle::OracleLifecycleTransport::new(
+            Arc::clone(&cluster),
+            node_id,
+            tail_tls.clone(),
+        ));
         let reconciliation_limit_bytes = memory_budget
             .checked_div(4)
             .filter(|limit| *limit > 0)
@@ -1812,14 +1751,11 @@ impl<'a> OracleRoleBuilder<'a> {
                 ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
             })?;
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
-            Arc::clone(&peer_credentials),
             tail_tls,
         ));
         let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
             authority.clone();
         let stage_authority: Arc<dyn vala_bifrost_redux::oracle::peer::OracleStageAuthority> =
-            authority.clone();
-        let peer_ticket_minter: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketMinter> =
             authority.clone();
         let role = cluster
             .reserve_oracle(advertise_addr, capabilities)
@@ -1879,11 +1815,9 @@ impl<'a> OracleRoleBuilder<'a> {
             },
             spill_runtime: Arc::new(spill_runtime),
             audit: audit.clone(),
-            peer_ticket_minter,
             reservations,
             stage_authority: Some(stage_authority),
             peer_tls,
-            peer_credentials: Some(Arc::clone(&peer_credentials)),
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
             config: oracle_config,
@@ -1961,12 +1895,20 @@ struct BuiltOracleRole {
 }
 
 impl BuiltOracleRole {
-    /// Starts reconciliation, activates the role, and publishes query access.
+    /// Starts reconciliation, optionally activates the role, and publishes query access.
+    ///
+    /// With `activate` false the fence stays reserved but unready, so no peer
+    /// routes to this Oracle before its private listener serves; the serving
+    /// owner then calls [`Oracle::activate`]. One-process deployments with no
+    /// private listener activate here.
     ///
     /// # Errors
     /// Returns [`ServerBootError::OraclePeer`] when startup reconciliation,
     /// activation, snapshot refresh, or readiness publication fails.
-    async fn start_reconcile_activate_publish(self) -> Result<Arc<Oracle>, ServerBootError> {
+    async fn start_reconcile_activate_publish(
+        self,
+        activate: bool,
+    ) -> Result<Arc<Oracle>, ServerBootError> {
         let Self {
             catalog,
             oracle,
@@ -1992,23 +1934,25 @@ impl BuiltOracleRole {
                 ));
             }
         }
-        if let Err(error) = cluster.activate(&role).await {
-            oracle.shutdown(std::time::Instant::now()).await;
-            release_failed_oracle_role(&cluster, &role, "activation").await;
-            return Err(ServerBootError::OraclePeer(error.to_string()));
-        }
-        if let Err(error) = cluster.refresh_snapshot().await {
-            oracle.shutdown(std::time::Instant::now()).await;
-            release_failed_oracle_role(&cluster, &role, "snapshot refresh").await;
-            return Err(ServerBootError::OraclePeer(error.to_string()));
-        }
-        oracle.refresh_membership(&cluster.snapshot());
-        if !oracle.is_ready() {
-            oracle.shutdown(std::time::Instant::now()).await;
-            release_failed_oracle_role(&cluster, &role, "readiness publication").await;
-            return Err(ServerBootError::OraclePeer(
-                "Oracle role did not become ready after activation".to_owned(),
-            ));
+        if activate {
+            if let Err(error) = cluster.activate(&role).await {
+                oracle.shutdown(std::time::Instant::now()).await;
+                release_failed_oracle_role(&cluster, &role, "activation").await;
+                return Err(ServerBootError::OraclePeer(error.to_string()));
+            }
+            if let Err(error) = cluster.refresh_snapshot().await {
+                oracle.shutdown(std::time::Instant::now()).await;
+                release_failed_oracle_role(&cluster, &role, "snapshot refresh").await;
+                return Err(ServerBootError::OraclePeer(error.to_string()));
+            }
+            oracle.refresh_membership(&cluster.snapshot());
+            if !oracle.is_ready() {
+                oracle.shutdown(std::time::Instant::now()).await;
+                release_failed_oracle_role(&cluster, &role, "readiness publication").await;
+                return Err(ServerBootError::OraclePeer(
+                    "Oracle role did not become ready after activation".to_owned(),
+                ));
+            }
         }
         let lifecycle_transport = peer.lifecycle_transport();
         let query_runtime = match Oracle::new(crate::state::OracleBuildInputs {
@@ -2021,6 +1965,7 @@ impl BuiltOracleRole {
             resources,
             peer,
             role_shutdown: shutdown,
+            activated: activate,
         }) {
             Ok(runtime) => Arc::new(runtime),
             Err(error) => {
@@ -2255,68 +2200,29 @@ pub fn spawn_maintenance_scheduler(
     Ok(Some(async move { forge.run(shutdown, readiness).await }))
 }
 
-/// Loads the one role-neutral Bifrost peer identity for this process.
+/// Loads the outbound cluster mTLS identity when peer mode is enabled.
 ///
-/// A peer-bearing target fails closed here: an absent or unreadable CA, leaf
-/// chain, or private key is a boot failure rather than a listener that starts
-/// and refuses every connection later. Non-peer targets (Forge workers) load
-/// nothing and return `None`.
+/// The default in-process deployment returns `None` and reads nothing. Peer
+/// mode fails closed here: an unreadable bundle is a boot failure rather than
+/// a transport that refuses every call later.
 ///
 /// # Errors
 ///
-/// Returns [`ServerBootError::OraclePeer`] when a peer-bearing target has an
-/// incomplete peer configuration or any PEM file cannot be read.
+/// Returns [`ServerBootError::OraclePeer`] when the peer TLS bundle cannot be read.
 fn build_bifrost_peer_tls(
     peer: &crate::config::BifrostPeerConfig,
-    target: crate::config::BifrostTarget,
 ) -> Result<Option<BifrostPeerTls>, ServerBootError> {
-    if !peer.is_complete() {
-        if target.serves_peer() {
-            return Err(ServerBootError::OraclePeer(
-                "Scribe- and Oracle-bearing targets require the complete bifrost.peer identity"
-                    .to_owned(),
-            ));
-        }
-        return Ok(None);
-    }
-    let read = |path: &std::path::Path, label: &str| -> Result<Vec<u8>, ServerBootError> {
-        std::fs::read(path).map_err(|error| {
-            ServerBootError::OraclePeer(format!(
-                "failed to read Bifrost peer {label} {}: {error}",
-                path.display()
-            ))
-        })
-    };
-    let ca = read(
-        peer.ca_certificate_path
-            .as_ref()
-            .expect("peer completeness guarantees a CA path"),
-        "CA certificate",
-    )?;
-    let chain = read(
-        peer.certificate_chain_path
-            .as_ref()
-            .expect("peer completeness guarantees a certificate chain path"),
-        "certificate chain",
-    )?;
-    let key = read(
-        peer.private_key_path
-            .as_ref()
-            .expect("peer completeness guarantees a private key path"),
-        "private key",
-    )?;
-    let key = String::from_utf8(key).map_err(|_| {
-        ServerBootError::OraclePeer("Bifrost peer private key is not valid PEM text".to_owned())
-    })?;
-    Ok(Some(BifrostPeerTls::new(
-        ca,
-        peer.server_name
-            .as_ref()
-            .expect("peer completeness guarantees a server name")
-            .clone(),
-        chain,
-        secrecy::SecretString::from(key),
-    )))
+    Ok(peer
+        .read_bundle()
+        .map_err(ServerBootError::OraclePeer)?
+        .map(|bundle| {
+            BifrostPeerTls::new(
+                bundle.ca_certificate,
+                crate::config::PEER_SERVER_NAME.to_owned(),
+                bundle.certificate_chain,
+                bundle.private_key,
+            )
+        }))
 }
 
 /// Ensure production Card recovery can run through the Wyrd operator pool.
@@ -2514,23 +2420,21 @@ mod tests {
         );
     }
 
-    /// Orphan listing refuses a backend that cannot resume from a cursor.
+    /// Orphan listing pages a backend without a native cursor in ascending order.
     ///
-    /// The bounded orphan scan's only anti-starvation mechanism is an exclusive
-    /// `start_after` cursor: without native support a leading page of protected
-    /// objects would be relisted forever and the later pages behind it would
-    /// never be reached. Emulating the cursor by filtering would reintroduce the
-    /// unbounded listing the cap exists to prevent, so the production adapter
-    /// fails closed instead. The filesystem service is the already-installed
-    /// backend that advertises the capability as absent, which makes it the
-    /// exact case this refusal exists for.
+    /// The filesystem service advertises no `list_with_start_after` and walks
+    /// in directory order, so it takes the emulated path. Keys are written in
+    /// reverse so walk order and key order disagree; the pages must still be
+    /// bounded, globally ascending, and complete, and a resume from a mid-page
+    /// cursor must yield exactly the keys after it.
     ///
     /// # Panics
     ///
-    /// Panics when the filesystem operator cannot be built, when it starts
-    /// advertising cursor support, or when listing is permitted anyway.
+    /// Panics when the operator cannot be built or written, when it starts
+    /// advertising cursor support, or when any page is oversized, out of order,
+    /// or skips or repeats a key.
     #[tokio::test]
-    async fn open_dal_forge_listing_refuses_backend_without_start_after() {
+    async fn open_dal_forge_listing_pages_backend_without_start_after() {
         let root = tempfile::tempdir().expect("listing root");
         let operator = opendal::Operator::new(
             opendal::services::Fs::default().root(&root.path().to_string_lossy()),
@@ -2539,33 +2443,60 @@ mod tests {
         .finish();
         assert!(
             !operator.info().full_capability().list_with_start_after,
-            "the filesystem service is the backend this refusal exists for"
+            "the filesystem service is the backend the emulated path exists for"
         );
-        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
-        for cursor in [None, Some("tenants/t/table/data/forge/v1/a.parquet")] {
-            let error = store
-                .list_pages("tenants/t/table/data/forge/v1/", cursor)
+        let prefix = "tenants/t/table/data/forge/v1/";
+        let total = FORGE_OBJECT_LIST_PAGE_ENTRIES * 2 + 3;
+        let mut keys = (0..total)
+            .map(|index| format!("{prefix}{index:06}.parquet"))
+            .collect::<Vec<_>>();
+        for key in keys.iter().rev() {
+            operator
+                .write(key, "orphan")
                 .await
-                .err()
-                .expect("a backend without cursor support cannot be listed");
-            assert_eq!(error.kind(), opendal::ErrorKind::Unsupported);
+                .expect("object is written");
+        }
+        keys.sort();
+        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
+
+        for (cursor, expected) in [(None, &keys[..]), (Some(keys[700].as_str()), &keys[701..])] {
+            let pages = store
+                .list_pages(prefix, cursor)
+                .await
+                .expect("an emulated listing opens")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("every emulated page lists");
+            assert!(
+                pages
+                    .iter()
+                    .all(|page| page.len() <= FORGE_OBJECT_LIST_PAGE_ENTRIES),
+                "every page stays within the page bound"
+            );
+            let listed = pages
+                .iter()
+                .flatten()
+                .map(|entry| entry.path().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed, expected,
+                "pages are ascending, complete, and exclusive"
+            );
         }
     }
 
-    /// A capable lister's directory entries never consume the page bound.
+    /// Directory entries never consume the page bound.
     ///
     /// The production page bound counts addressable objects, because the task
     /// cursor advances over objects only. A chunk of leading directory markers
     /// would otherwise yield an empty page and leave the frontier stationary,
-    /// starving the later object behind it. The filesystem service plus the
-    /// installed capability override is the smallest backend that both yields
-    /// directory entries and advertises cursor support.
+    /// starving the later object behind it. The filesystem service is the
+    /// installed backend that yields directory entries.
     ///
     /// # Panics
     ///
-    /// Panics when the operator cannot be built, when the override does not
-    /// advertise cursor support, when the single page is not exactly the one
-    /// object, or when the stream yields another page.
+    /// Panics when the operator cannot be built, when the single page is not
+    /// exactly the one object, or when the stream yields another page.
     #[tokio::test]
     async fn open_dal_forge_listing_filters_directories_before_page_boundary() {
         let root = tempfile::tempdir().expect("listing root");
@@ -2573,17 +2504,7 @@ mod tests {
             opendal::services::Fs::default().root(&root.path().to_string_lossy()),
         )
         .expect("filesystem operator builds")
-        .layer(opendal::layers::CapabilityOverrideLayer::new(
-            |mut capability| {
-                capability.list_with_start_after = true;
-                capability
-            },
-        ))
         .finish();
-        assert!(
-            operator.info().full_capability().list_with_start_after,
-            "the overridden operator must advertise cursor support"
-        );
         let prefix = "tenants/t/table/data/forge/v1/";
         for index in 0..FORGE_OBJECT_LIST_PAGE_ENTRIES {
             operator
@@ -2601,7 +2522,7 @@ mod tests {
         let mut pages = store
             .list_pages(prefix, None)
             .await
-            .expect("a cursor-capable backend is listable");
+            .expect("the backend is listable");
         let page = pages
             .next()
             .await
@@ -2768,22 +2689,6 @@ mod tests {
             "expected InvalidWorkloadBinding, got {error:?}"
         );
     }
-
-    #[test]
-    fn real_authz_audit_writer_is_not_stub() {
-        use crate::components::auth::audit_writer::{
-            AuthzAuditWriter, NoopAuthzAuditWriter, RealAuthzAuditWriter,
-        };
-
-        assert!(
-            NoopAuthzAuditWriter.is_stub_default(),
-            "noop writer must be a stub"
-        );
-        assert!(
-            !RealAuthzAuditWriter.is_stub_default(),
-            "RealAuthzAuditWriter must not be a stub"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2841,47 +2746,37 @@ pub(crate) mod pg_tests {
 
     use crate::postgres::ServerPostgres;
 
+    /// An authz override replaces the permission evaluator wholesale.
+    ///
+    /// # Panics
+    /// Panics when the patched state does not carry the override's evaluator.
     #[tokio::test(flavor = "current_thread")]
     async fn state_overrides_authz_applied() {
-        use wyrd_auth_check::DenyAllPolicyHook;
-
         let state = make_test_state().await;
-        assert!(state.authz.policy_hook.is_stub_default(), "default is stub");
-
-        let non_stub_authz = ServerAuthz {
-            policy_hook: Arc::new(DenyAllPolicyHook {
-                reason: "test-override".to_owned(),
-            }),
-            ..ServerAuthz::default()
-        };
+        let replacement = ServerAuthz::default();
+        let expected = Arc::clone(&replacement.permission_check);
         let overrides = StateOverrides {
-            authz: Some(non_stub_authz),
+            authz: Some(replacement),
             ..StateOverrides::default()
         };
+
         let patched = apply_overrides(state, overrides);
 
-        assert!(
-            !patched.authz.policy_hook.is_stub_default(),
-            "override replaced stub policy hook"
-        );
+        assert!(Arc::ptr_eq(&patched.authz.permission_check, &expected));
     }
 
+    /// Default overrides leave the assembled permission evaluator in place.
+    ///
+    /// # Panics
+    /// Panics when an empty override changes the evaluator.
     #[tokio::test(flavor = "current_thread")]
     async fn state_overrides_default_is_noop() {
         let state = make_test_state().await;
-        assert!(state.authz.policy_hook.is_stub_default());
-        assert!(state.authz.audit_writer.is_stub_default());
+        let original = Arc::clone(&state.authz.permission_check);
 
         let patched = apply_overrides(state, StateOverrides::default());
 
-        assert!(
-            patched.authz.policy_hook.is_stub_default(),
-            "authz unchanged"
-        );
-        assert!(
-            patched.authz.audit_writer.is_stub_default(),
-            "audit unchanged"
-        );
+        assert!(Arc::ptr_eq(&patched.authz.permission_check, &original));
     }
 
     #[tokio::test(flavor = "current_thread")]

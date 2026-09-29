@@ -338,16 +338,16 @@ struct PreflightRequest {
     assignments: HashMap<String, FollowerScanAssignment>,
 }
 
-/// Authenticated ticket and local-incarnation facts used by IO-free preflight.
+/// Checked peer-context and local-incarnation facts used by IO-free preflight.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedFollowerContext<'a> {
-    /// Tenant recovered only from verified ticket claims.
+    /// Tenant recovered only from checked context claims.
     pub tenant_id: DataTenantId,
-    /// Exact table binding recovered from verified ticket claims.
+    /// Exact table binding recovered from checked context claims.
     pub table_binding: &'a TenantTableBinding,
-    /// Exact pending reservation recovered from the verified ticket.
+    /// Exact pending reservation owned by this receiver for the query.
     pub reservation_id: &'a ReservationId,
-    /// Leader incarnation recovered from verified ticket claims.
+    /// Leader incarnation recovered from checked context claims.
     pub leader_fence: OracleRoleFence,
     /// Role incarnation owned by this receiving process.
     pub local_fence: OracleRoleFence,
@@ -1976,7 +1976,7 @@ pub(crate) mod tests {
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_plan::collect;
     use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
-    use wyrd_spec::vala::api::{PersistedFileAssignment, ScribeProviderCut, SignedPeerTicket};
+    use wyrd_spec::vala::api::{PeerContext, PersistedFileAssignment, ScribeProviderCut};
 
     use super::*;
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
@@ -2233,10 +2233,8 @@ pub(crate) mod tests {
         };
         Ok((
             ExecuteFragmentRequest {
-                ticket: SignedPeerTicket {
-                    key_id: "test".to_owned(),
+                context: PeerContext {
                     claims_bytes: vec![1],
-                    signature: vec![2; 64],
                 },
                 physical_plan_bytes: bytes.clone(),
                 reservation_id: ReservationId::new(uuid::Uuid::now_v7()),

@@ -1,147 +1,20 @@
-//! Narrow peer-ticket authority boundary and replay protection.
+//! Typed peer-context claims and the receiver-side binding checks.
+//!
+//! The private plane authenticates a trusted cluster process with mTLS. The
+//! claims here are unsigned typed context: each receiver compares them with
+//! its own trusted state before it decodes a plan or touches tenant storage.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::Mutex;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::BifrostSecurityViolationKind;
 use wyrd_spec::vala::api::NodeId;
-use wyrd_spec::vala::api::SignedPeerTicket;
+use wyrd_spec::vala::api::PeerContext;
 use wyrd_tonic::prost::Message;
 
-/// The verified workload identity behind one admitted private-plane request.
-///
-/// Produced once per request by the server's peer authentication layer, before
-/// the request body is polled, and attached to the request extensions as the
-/// only identity input an admitted peer handler may read. Both private
-/// adapters — the Oracle peer service and the upstream worker service — take
-/// their caller identity from this one value, so neither can grow a second
-/// authentication path or a synthetic principal of its own.
-///
-/// The context is deliberately narrow. It answers "which configured platform
-/// service is calling, proved how" and nothing else. A data tenant, a space, a
-/// source `NodeId`, and a fence are *operation* authority: they are carried by
-/// a purpose ticket and resolved after this context exists, never asserted by
-/// the caller alongside its credential.
-#[derive(Clone)]
-pub struct AuthenticatedPeerContext {
-    /// Control-plane tenant the peer principal belongs to; always the owner.
-    control_tenant: DataTenantId,
-    /// Stable identity of the verified peer Service principal.
-    principal_id: wyrd_spec::auth::PrincipalId,
-    /// Service card the verified principal is bound to.
-    service_card: wyrd_spec::reference::CardRef,
-    /// Peer permissions the verified token resolved to.
-    permissions: wyrd_runtime::PermissionSet,
-    /// Stable digest of the presented workload credential.
-    credential_digest: String,
-    /// Stable digest of the accepted peer certificate, when the transport
-    /// exposed one.
-    certificate_digest: Option<String>,
-    /// Correlator carried or minted for this request.
-    request_id: wyrd_spec::request_id::RequestId,
-    /// When the credential was verified.
-    authenticated_at: DateTime<Utc>,
-}
-
-impl std::fmt::Debug for AuthenticatedPeerContext {
-    /// Renders identity without rendering the credential it was proved with.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AuthenticatedPeerContext")
-            .field("principal_id", &self.principal_id)
-            .field("service_card", &self.service_card)
-            .field("request_id", &self.request_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl AuthenticatedPeerContext {
-    /// Builds one context from values the authentication layer has verified.
-    ///
-    /// Every argument is already proved: the caller must not construct this
-    /// from wire-asserted values.
-    #[must_use]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each field is a distinct verified fact and collapsing them \
-                  into a struct literal would only move the same arity"
-    )]
-    pub fn new(
-        control_tenant: DataTenantId,
-        principal_id: wyrd_spec::auth::PrincipalId,
-        service_card: wyrd_spec::reference::CardRef,
-        permissions: wyrd_runtime::PermissionSet,
-        credential_digest: String,
-        certificate_digest: Option<String>,
-        request_id: wyrd_spec::request_id::RequestId,
-        authenticated_at: DateTime<Utc>,
-    ) -> Self {
-        Self {
-            control_tenant,
-            principal_id,
-            service_card,
-            permissions,
-            credential_digest,
-            certificate_digest,
-            request_id,
-            authenticated_at,
-        }
-    }
-
-    /// Returns the control-plane tenant this peer principal belongs to.
-    #[must_use]
-    pub const fn control_tenant(&self) -> DataTenantId {
-        self.control_tenant
-    }
-
-    /// Returns the verified peer Service principal's stable identity.
-    #[must_use]
-    pub const fn principal_id(&self) -> wyrd_spec::auth::PrincipalId {
-        self.principal_id
-    }
-
-    /// Returns the Service card the verified principal is bound to.
-    #[must_use]
-    pub const fn service_card(&self) -> &wyrd_spec::reference::CardRef {
-        &self.service_card
-    }
-
-    /// Returns the peer permissions the verified token resolved to.
-    #[must_use]
-    pub const fn permissions(&self) -> &wyrd_runtime::PermissionSet {
-        &self.permissions
-    }
-
-    /// Returns the stable digest of the presented workload credential.
-    #[must_use]
-    pub fn credential_digest(&self) -> &str {
-        &self.credential_digest
-    }
-
-    /// Returns the accepted peer certificate's digest, when one was exposed.
-    #[must_use]
-    pub fn certificate_digest(&self) -> Option<&str> {
-        self.certificate_digest.as_deref()
-    }
-
-    /// Returns the correlator this request is audited and traced under.
-    #[must_use]
-    pub const fn request_id(&self) -> &wyrd_spec::request_id::RequestId {
-        &self.request_id
-    }
-
-    /// Returns when the credential behind this request was verified.
-    #[must_use]
-    pub const fn authenticated_at(&self) -> DateTime<Utc> {
-        self.authenticated_at
-    }
-}
-
-/// Typed claims signed for one worker attempt.
+/// Typed context for one worker attempt, checked against receiver state.
 #[derive(Clone, PartialEq, Message)]
 pub struct PeerTicketClaims {
     /// Fixed private protocol version.
@@ -165,7 +38,7 @@ pub struct PeerTicketClaims {
     /// Authenticated data-tenant UUID bytes.
     #[prost(bytes, tag = "7")]
     pub tenant_id: Vec<u8>,
-    /// Ticket acceptance expiry as Unix milliseconds.
+    /// Context acceptance expiry as Unix milliseconds.
     #[prost(int64, tag = "9")]
     pub expires_at_ms: i64,
     /// Tenant-qualified binding.
@@ -187,18 +60,27 @@ pub struct PeerTicketClaims {
     /// [`wyrd_spec::vala::assignment_authority`]) binding every dispatched
     /// [`wyrd_spec::vala::api::FollowerScanAssignment`]'s identity, files,
     /// schema fingerprint, and closed predicate/projection closure into one
-    /// signed value. The follower recomputes this over its actual received
+    /// value. The follower recomputes this over its actual received
     /// assignments and rejects any mismatch before resolving a provider or
     /// issuing object I/O.
     #[prost(string, tag = "15")]
     pub assignment_authority_digest: String,
-    /// Admitted query execution deadline, independent of ticket acceptance expiry.
+    /// Admitted query execution deadline, independent of context acceptance expiry.
     #[prost(int64, tag = "16")]
     pub execution_deadline_unix_ms: i64,
 }
 
 impl PeerTicketClaims {
-    /// Validates the signed execution deadline without extending ticket acceptance.
+    /// Encodes these claims as one bounded private-plane context.
+    ///
+    /// # Errors
+    /// Returns [`PeerSecurityError::Encoding`] when the claims exceed
+    /// [`MAX_FRAGMENT_CONTEXT_BYTES`].
+    pub fn to_context(&self) -> Result<PeerContext, PeerSecurityError> {
+        encode_context(self, MAX_FRAGMENT_CONTEXT_BYTES)
+    }
+
+    /// Validates the execution deadline without extending context acceptance.
     ///
     /// # Errors
     ///
@@ -220,9 +102,9 @@ impl PeerTicketClaims {
 /// Distributed execution has exactly two coordinator-to-follower operations,
 /// and they are not interchangeable: `SetPlan` installs a stage's subplan and
 /// opens its metrics channel, while `ExecuteTask` asks for a partition range of
-/// an already-installed plan. They carry different signing domains and separate
-/// single-use nonces, so a ticket minted for one can never authorize the other
-/// even if every other bound field matches.
+/// an already-installed plan. The receiver compares the operation in the
+/// context with the entry point it implements, so a context built for one can
+/// never authorize the other even if every other bound field matches.
 ///
 /// The enum is deliberately closed. A third operation is a protocol change, not
 /// a value a peer may present.
@@ -235,7 +117,7 @@ pub enum StageOperationV1 {
 }
 
 impl StageOperationV1 {
-    /// Returns the wire discriminant bound into the signed claims.
+    /// Returns the wire discriminant bound into the context claims.
     ///
     /// Zero is deliberately unused so a zero-valued protobuf field — the value a
     /// truncated or forged message decodes to — never names a real operation.
@@ -260,20 +142,6 @@ impl StageOperationV1 {
         }
     }
 
-    /// Returns this operation's distinct signature domain separator.
-    ///
-    /// Domain separation is what makes the two operations cryptographically
-    /// distinct: a signature produced over the `SetPlan` domain does not verify
-    /// under the `ExecuteTask` domain, so the receiver's own expectation — not
-    /// anything in the presented message — selects which domain is checked.
-    #[must_use]
-    pub const fn domain(self) -> &'static [u8] {
-        match self {
-            Self::SetPlan => b"wyrd.oracle.stage.set-plan.v1\0",
-            Self::ExecuteTask => b"wyrd.oracle.stage.execute-task.v1\0",
-        }
-    }
-
     /// Returns the closed telemetry label for this operation.
     #[must_use]
     pub const fn telemetry(self) -> crate::oracle::telemetry::AnalyticalStageOperation {
@@ -284,9 +152,9 @@ impl StageOperationV1 {
     }
 }
 
-/// Typed claims signed for exactly one Analytical stage operation.
+/// Typed context for exactly one Analytical stage operation.
 ///
-/// Every field is bound by the signature, and the receiver checks each one
+/// The receiver checks every field
 /// against state it derived itself rather than against anything in the
 /// presented message. Both query identities appear because they name different
 /// lifecycles: a sibling distributed graph under the same public query, or a
@@ -323,7 +191,7 @@ pub struct StageTicketClaims {
     /// Pinned catalog snapshot or manifest digest for this attempt's cut.
     #[prost(string, tag = "10")]
     pub snapshot_digest: String,
-    /// Digest of the exact bounded raw body this ticket authorizes.
+    /// Digest of the exact bounded raw body this context authorizes.
     #[prost(string, tag = "11")]
     pub body_digest: String,
     /// Graph-local stage identifier, resolvable only under both parents.
@@ -344,30 +212,27 @@ pub struct StageTicketClaims {
     /// Digest of the leader-authorized permissions for this query.
     #[prost(string, tag = "17")]
     pub permission_digest: String,
-    /// Single-use random nonce, distinct per operation.
-    #[prost(bytes, tag = "18")]
-    pub nonce: Vec<u8>,
     /// Absolute query deadline as Unix milliseconds, identical across attempts.
     #[prost(int64, tag = "19")]
     pub absolute_deadline_ms: i64,
-    /// Short ticket acceptance expiry, distinct from the query deadline.
+    /// Short context acceptance expiry, distinct from the query deadline.
     #[prost(int64, tag = "20")]
     pub expires_at_ms: i64,
-    /// The attempt's frozen participant cut, signed as part of the ticket.
+    /// The attempt's frozen participant cut, carried in the context.
     ///
     /// The receiver cannot derive this the way it derives every other bound
     /// field, so it is adopted rather than compared: a follower that is itself
     /// a coordinator addresses exactly these destinations and no others. That
     /// is what keeps membership churn from moving an in-flight participant —
-    /// the set was frozen by the leader and travels signed with every
+    /// the set was frozen by the leader and travels with every
     /// operation, so no node re-reads live membership mid-attempt.
     #[prost(message, repeated, tag = "21")]
     pub participants: Vec<StageParticipantV1>,
 }
 
-/// One frozen destination a stage ticket authorizes its holder to address.
+/// One frozen destination a stage context authorizes its holder to address.
 ///
-/// Carried inside the signed claims so a follower acting as a coordinator
+/// Carried inside the context so a follower acting as a coordinator
 /// inherits the leader's cut verbatim. The fence is part of the identity: a
 /// destination that restarts under a new fence is a different incarnation and
 /// is not in this attempt's cut, which is what makes a frozen destination fail
@@ -385,16 +250,16 @@ pub struct StageParticipantV1 {
     pub address: String,
     /// Reservation the leader took on this participant for the whole graph.
     ///
-    /// Signed with the rest of the cut, so a coordinator can charge a follower
+    /// Carried with the rest of the cut, so a coordinator can charge a follower
     /// only against the reservation that follower's own leader granted. It
-    /// travels per participant rather than per ticket because each node grants
+    /// travels per participant rather than per context because each node grants
     /// its own reservation, and a follower that becomes a coordinator must
     /// address its peers under their reservations, not its own.
     #[prost(string, tag = "4")]
     pub reservation_id: String,
 }
 
-/// Hard cap on the participants one stage ticket may carry.
+/// Hard cap on the participants one stage context may carry.
 ///
 /// A cut larger than this is not a Bifrost topology, and the cap is checked
 /// before the list is adopted so a forged claim cannot grow a follower's
@@ -407,7 +272,7 @@ pub const MAX_STAGE_PARTICIPANTS: usize = 64;
 /// from its own node identity and fence, the tenant its transport
 /// authenticated, the graph it has an authorized reservation for, and the exact
 /// bytes it received. Verification is then a field-by-field comparison against
-/// the signed claims, which is why a mismatch in any single identity is
+/// the context claims, which is why a mismatch in any single identity is
 /// independently rejectable.
 #[derive(Debug, Clone)]
 pub struct StageBinding {
@@ -454,7 +319,7 @@ pub const MAX_STAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// Both the coordinator (at mint time) and the follower (at verification time)
 /// call this over the same bytes, so a matching digest proves the follower is
-/// about to decode exactly the message the coordinator signed for.
+/// about to decode exactly the message the coordinator described.
 ///
 /// # Errors
 ///
@@ -472,7 +337,7 @@ pub fn stage_body_digest(body: &[u8]) -> Result<String, PeerSecurityError> {
 }
 
 impl StageTicketClaims {
-    /// Builds signable claims from a receiver-shaped binding.
+    /// Builds context claims from a receiver-shaped binding.
     ///
     /// The coordinator constructs the same [`StageBinding`] the follower will
     /// derive, so both sides agree by construction on which fields are bound
@@ -481,7 +346,6 @@ impl StageTicketClaims {
     pub fn for_binding(
         binding: &StageBinding,
         body_digest: String,
-        nonce: Vec<u8>,
         absolute_deadline_ms: i64,
         expires_at_ms: i64,
         participants: Vec<StageParticipantV1>,
@@ -504,18 +368,32 @@ impl StageTicketClaims {
             attempt: binding.attempt,
             reservation_id: binding.reservation_id.clone(),
             permission_digest: binding.permission_digest.clone(),
-            nonce,
             absolute_deadline_ms,
             expires_at_ms,
             participants,
         }
     }
 
+    /// Encodes these claims as one bounded context for `operation`.
+    ///
+    /// # Errors
+    /// Returns [`PeerSecurityError::Operation`] when the claims name a
+    /// different operation and [`PeerSecurityError::Encoding`] when they exceed
+    /// [`MAX_STAGE_CONTEXT_BYTES`].
+    pub fn to_context(
+        &self,
+        operation: StageOperationV1,
+    ) -> Result<PeerContext, PeerSecurityError> {
+        if StageOperationV1::from_u32(self.operation) != Some(operation) {
+            return Err(PeerSecurityError::Operation);
+        }
+        encode_context(self, MAX_STAGE_CONTEXT_BYTES)
+    }
+
     /// Checks every bound field against the receiver's own expectation.
     ///
     /// This is a pure comparison with no IO, no cache access, and no plan
-    /// decoding, so an authority can run it between signature verification and
-    /// nonce consumption. Each mismatch is independently reachable, which is
+    /// decoding, so an authority runs it before anything is decoded. Each mismatch is independently reachable, which is
     /// what lets the authority test reject one identity at a time.
     ///
     /// # Errors
@@ -581,8 +459,8 @@ impl StageTicketClaims {
 /// A leader reserves capacity on a follower and later releases it. The two are
 /// not interchangeable: a replayed release must never cancel a reservation the
 /// leader has since re-taken, and a replayed reserve must never charge a
-/// follower twice. They therefore carry different signing domains and separate
-/// single-use nonces, exactly as the two stage operations do.
+/// follower twice. The receiver therefore compares the operation in the
+/// context with its own entry point, exactly as the two stage operations do.
 ///
 /// The enum is deliberately closed. A third reservation operation is a protocol
 /// change, not a value a peer may present.
@@ -595,7 +473,7 @@ pub enum ReservationOperationV1 {
 }
 
 impl ReservationOperationV1 {
-    /// Returns the wire discriminant bound into the signed claims.
+    /// Returns the wire discriminant bound into the context claims.
     ///
     /// Zero is deliberately unused so a zero-valued protobuf field — the value
     /// a truncated or forged message decodes to — never names a real operation.
@@ -619,27 +497,13 @@ impl ReservationOperationV1 {
             _ => None,
         }
     }
-
-    /// Returns this operation's distinct signature domain separator.
-    ///
-    /// Domain separation is what makes the two operations cryptographically
-    /// distinct: a signature produced over the reserve domain does not verify
-    /// under the release domain, so the receiver's own expectation — not
-    /// anything in the presented message — selects which domain is checked.
-    #[must_use]
-    pub const fn domain(self) -> &'static [u8] {
-        match self {
-            Self::ReserveSlots => b"wyrd.oracle.peer.reserve-slots.v1\0",
-            Self::ReleaseSlots => b"wyrd.oracle.peer.release-slots.v1\0",
-        }
-    }
 }
 
-/// Typed claims signed for exactly one reservation operation.
+/// Typed context for exactly one reservation operation.
 ///
-/// Every field is bound by the signature and checked against state the receiver
+/// Every field is checked against state the receiver
 /// derived itself. The follower's own node identity and fence appear because a
-/// reservation is charged against one incarnation of one node: a ticket minted
+/// reservation is charged against one incarnation of one node: a context built
 /// for a follower that has since restarted must not be honoured by its
 /// successor.
 #[derive(Clone, PartialEq, Message)]
@@ -665,13 +529,10 @@ pub struct ReservationTicketClaims {
     /// Client-visible query UUID bytes owning this reservation.
     #[prost(bytes, tag = "7")]
     pub query_id: Vec<u8>,
-    /// Digest of the exact bounded raw request body this ticket authorizes.
+    /// Digest of the exact bounded raw request body this context authorizes.
     #[prost(string, tag = "8")]
     pub body_digest: String,
-    /// Single-use random nonce, distinct per operation.
-    #[prost(bytes, tag = "9")]
-    pub nonce: Vec<u8>,
-    /// Short ticket acceptance expiry.
+    /// Short context acceptance expiry.
     #[prost(int64, tag = "10")]
     pub expires_at_ms: i64,
 }
@@ -706,10 +567,9 @@ pub const MAX_RESERVATION_BODY_BYTES: usize = 64 * 1024;
 
 /// Computes the canonical digest of one reservation request's raw body.
 ///
-/// Both the leader (at mint time) and the follower (at verification time) call
-/// this over the encoded request with its ticket field cleared, so a matching
-/// digest proves the follower is acting on exactly the request the leader
-/// signed for and not on a substituted one carrying a valid ticket.
+/// Both the leader and the follower call this over the encoded request with
+/// its context field cleared, so a matching digest proves the follower is
+/// acting on exactly the request the leader described.
 ///
 /// # Errors
 ///
@@ -727,7 +587,7 @@ pub fn reservation_body_digest(body: &[u8]) -> Result<String, PeerSecurityError>
 }
 
 impl ReservationTicketClaims {
-    /// Builds signable claims from a receiver-shaped binding.
+    /// Builds context claims from a receiver-shaped binding.
     ///
     /// The leader constructs the same [`ReservationBinding`] the follower will
     /// derive, so both sides agree by construction on which fields are bound
@@ -736,7 +596,6 @@ impl ReservationTicketClaims {
     pub fn for_binding(
         binding: &ReservationBinding,
         body_digest: String,
-        nonce: Vec<u8>,
         expires_at_ms: i64,
     ) -> Self {
         Self {
@@ -748,15 +607,30 @@ impl ReservationTicketClaims {
             destination_fence: binding.destination_fence,
             query_id: binding.query_id.as_bytes().to_vec(),
             body_digest,
-            nonce,
             expires_at_ms,
         }
+    }
+
+    /// Encodes these claims as one bounded context for `operation`.
+    ///
+    /// # Errors
+    /// Returns [`PeerSecurityError::Operation`] when the claims name a
+    /// different operation and [`PeerSecurityError::Encoding`] when they exceed
+    /// [`MAX_RESERVATION_CONTEXT_BYTES`].
+    pub fn to_context(
+        &self,
+        operation: ReservationOperationV1,
+    ) -> Result<PeerContext, PeerSecurityError> {
+        if ReservationOperationV1::from_u32(self.operation) != Some(operation) {
+            return Err(PeerSecurityError::Operation);
+        }
+        encode_context(self, MAX_RESERVATION_CONTEXT_BYTES)
     }
 
     /// Checks every bound field against the receiver's own expectation.
     ///
     /// A pure comparison with no IO and no request decoding, so an authority
-    /// runs it between signature verification and nonce consumption.
+    /// runs it before any reservation state changes.
     ///
     /// # Errors
     ///
@@ -796,70 +670,70 @@ impl ReservationTicketClaims {
     }
 }
 
-/// Server-owned capability minting one reservation purpose ticket.
+/// Hard cap on fragment context bytes, checked before decoding.
+pub const MAX_FRAGMENT_CONTEXT_BYTES: usize = 16 * 1024;
+/// Hard cap on reservation context bytes; a reservation binds two fenced node
+/// identities, one query, and a body digest, so it is the narrowest shape.
+pub const MAX_RESERVATION_CONTEXT_BYTES: usize = 8 * 1024;
+/// Hard cap on stage context bytes; stage claims bind two query identities, a
+/// stage, a task, an attempt, a reservation, and a participant cut.
+pub const MAX_STAGE_CONTEXT_BYTES: usize = 32 * 1024;
+
+/// Encodes one typed claims message as a bounded private-plane context.
 ///
-/// The transport that dials a follower does not own signing material, and the
-/// authority that owns it does not own routing. This narrow seam is how a
-/// leader stamps an authorization onto a reservation call without the transport
-/// holding a key or the authority learning about endpoints.
-pub trait ReservationTicketMinter: Send + Sync {
-    /// Signs one single-use ticket for exactly one reservation operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PeerSecurityError::Operation`] when the claims name a
-    /// different operation than the one requested and
-    /// [`PeerSecurityError::Encoding`] when the claims cannot be encoded within
-    /// their bound.
-    fn mint_reservation_ticket(
-        &self,
-        operation: ReservationOperationV1,
-        claims: &ReservationTicketClaims,
-    ) -> Result<SignedPeerTicket, PeerSecurityError>;
+/// # Errors
+/// Returns [`PeerSecurityError::Encoding`] when encoding fails or the encoded
+/// claims are empty or exceed `max_bytes`.
+fn encode_context<M: Message>(
+    claims: &M,
+    max_bytes: usize,
+) -> Result<PeerContext, PeerSecurityError> {
+    let mut claims_bytes = Vec::new();
+    claims
+        .encode(&mut claims_bytes)
+        .map_err(|_| PeerSecurityError::Encoding)?;
+    if claims_bytes.is_empty() || claims_bytes.len() > max_bytes {
+        return Err(PeerSecurityError::Encoding);
+    }
+    Ok(PeerContext { claims_bytes })
 }
 
-/// Fixed private stage-protocol version bound into every stage ticket.
+/// Fixed private stage-protocol version bound into every stage context.
 pub const STAGE_PROTOCOL_VERSION: u32 = 1;
 
-/// Claims bytes accepted after signature and fence checks.
+/// Claims bytes accepted after bound, audience, and fence checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedClaimsBytes(pub Vec<u8>);
 
-/// Peer-ticket validation failure.
+/// Peer-context validation failure.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PeerSecurityError {
-    /// Ticket names a key other than the one configured deployment key.
-    #[error("peer ticket key identifier is unknown")]
-    UnknownKey,
-    /// Ticket is malformed or does not verify.
-    #[error("peer ticket signature is invalid")]
-    InvalidSignature,
+    /// Context is missing, oversized, or does not decode.
+    #[error("peer context is malformed")]
+    Malformed,
     /// Claims are not addressed to the expected worker.
-    #[error("peer ticket audience is invalid")]
+    #[error("peer context audience is invalid")]
     Audience,
-    /// Claims use a stale leader fence.
-    #[error("peer ticket fence is stale")]
+    /// Claims use a stale role fence.
+    #[error("peer context fence is stale")]
     Fence,
-    /// Ticket is expired or exceeds the configured window.
-    #[error("peer ticket is expired")]
+    /// Context is expired or exceeds the configured window.
+    #[error("peer context is expired")]
     Expired,
-    /// A nonce was already consumed.
-    #[error("peer ticket replay detected")]
-    Replay,
     /// A deterministic claims encoding failed.
     #[error("peer claims encoding failed")]
     Encoding,
-    /// Verified claims do not bind all required attempt identities.
-    #[error("peer ticket claims do not match the attempt")]
+    /// Claims do not bind all required attempt identities.
+    #[error("peer context claims do not match the attempt")]
     Claims,
     /// A required durable security audit could not commit.
     #[error("peer security audit is unavailable")]
     AuditUnavailable,
-    /// The ticket authorizes a different stage operation than the one presented.
-    #[error("peer ticket authorizes a different stage operation")]
+    /// The context names a different operation than the one presented.
+    #[error("peer context names a different operation")]
     Operation,
-    /// The presented raw body does not match the signed digest or exceeds bounds.
-    #[error("peer stage body does not match its signed digest")]
+    /// The presented raw body does not match the context digest or exceeds bounds.
+    #[error("peer body does not match its context digest")]
     Body,
 }
 
@@ -880,7 +754,7 @@ pub trait PeerSecurityAudit: Send + Sync {
         violation: BifrostSecurityViolationKind,
     ) -> Result<(), PeerSecurityAuditError>;
 
-    /// Appends a violation to the cryptographically verified tenant's audit chain.
+    /// Appends a violation to the context-named tenant's audit chain.
     ///
     /// # Errors
     /// Returns [`PeerSecurityAuditError`] when the tenant-scoped row cannot commit.
@@ -921,152 +795,20 @@ impl PeerSecurityAudit for NoopPeerSecurityAudit {
     }
 }
 
-/// Server-owned signing capability consumed by Redux dispatch.
-pub trait PeerTicketMinter: Send + Sync {
-    /// Mints one typed, single-use ticket without exposing key material.
-    ///
-    /// # Errors
-    /// Returns a closed encoding or authority failure.
-    fn mint_peer_ticket(
-        &self,
-        claims: &PeerTicketClaims,
-    ) -> Result<SignedPeerTicket, PeerSecurityError>;
-}
-
-/// Narrow raw-ticket verification capability implemented by the server authority.
+/// Narrow context verification capability implemented by the server authority.
 #[async_trait]
 pub trait PeerTicketVerifier: Send + Sync {
-    /// Verifies raw ticket bytes before decoding claims.
+    /// Checks raw context bytes against receiver state before decoding work.
     ///
     /// # Errors
     /// Returns a closed peer-security failure without exposing key material.
     async fn verify_peer_ticket(
         &self,
-        ticket: &SignedPeerTicket,
+        context: &PeerContext,
         expected_worker: NodeId,
         expected_worker_fence: u64,
         now: DateTime<Utc>,
     ) -> Result<VerifiedClaimsBytes, PeerSecurityError>;
-}
-
-/// One key identifier and nonce pair retained until ticket expiry.
-type ReplayIdentity = (String, Vec<u8>);
-
-/// Worker-local single-use nonce record for mutating peer tickets.
-///
-/// Only operations whose repetition would change state — slot reservations and
-/// Analytical stage operations — consume a nonce. Each identity is kept until
-/// its ticket expires, so the record grows with the admitted operation rate
-/// times the bounded ticket lifetime and never refuses for being full.
-#[derive(Debug, Default)]
-pub struct PeerReplayCache {
-    /// Consumed identities and their expiry, pruned in insertion order.
-    state: Mutex<ReplayState>,
-}
-
-/// Consumed identities plus their insertion order for amortized pruning.
-#[derive(Debug, Default)]
-struct ReplayState {
-    /// Unexpired key-and-nonce identities consumed by this worker role.
-    entries: HashMap<ReplayIdentity, DateTime<Utc>>,
-    /// The same identities in insertion order with their expiry.
-    ///
-    /// Pruning pops expired identities from the front. Expiries are not
-    /// strictly ordered, so an expired identity may wait behind a longer-lived
-    /// one for at most the bounded ticket lifetime; it can never admit a
-    /// replay, because an expired ticket is refused before consumption.
-    order: std::collections::VecDeque<(DateTime<Utc>, ReplayIdentity)>,
-}
-
-impl PeerReplayCache {
-    /// Creates an empty replay record.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Atomically consumes a nonce until its expiry.
-    ///
-    /// Expired identities at the front of the insertion order are pruned
-    /// first, so each call does amortized constant work.
-    ///
-    /// # Errors
-    /// Returns [`PeerSecurityError::Replay`] for a duplicate identity or a
-    /// poisoned record lock.
-    pub fn consume(
-        &self,
-        key_id: &str,
-        nonce: &[u8],
-        expires_at: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) -> Result<(), PeerSecurityError> {
-        let mut state = self.state.lock().map_err(|_| PeerSecurityError::Replay)?;
-        let ReplayState { entries, order } = &mut *state;
-        while order.front().is_some_and(|(expiry, _)| *expiry <= now) {
-            if let Some((_, identity)) = order.pop_front() {
-                entries.remove(&identity);
-            }
-        }
-        let key = (key_id.to_owned(), nonce.to_vec());
-        if entries.contains_key(&key) {
-            return Err(PeerSecurityError::Replay);
-        }
-        entries.insert(key.clone(), expires_at);
-        order.push_back((expires_at, key));
-        Ok(())
-    }
-
-    /// Returns the number of retained nonce identities.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.state.lock().map_or(0, |state| state.entries.len())
-    }
-
-    /// Returns whether no replay identities are currently retained.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Deterministic test signer implementing the same opaque contract.
-#[derive(Debug, Clone)]
-pub struct DeterministicTestSigner {
-    /// Fixed key identifier.
-    pub key_id: String,
-}
-
-impl PeerTicketMinter for DeterministicTestSigner {
-    /// Encodes claims without pretending to provide production key custody.
-    ///
-    /// # Errors
-    /// Returns [`PeerSecurityError::Encoding`] when protobuf encoding fails.
-    fn mint_peer_ticket(
-        &self,
-        claims: &PeerTicketClaims,
-    ) -> Result<SignedPeerTicket, PeerSecurityError> {
-        let mut bytes = Vec::new();
-        claims
-            .encode(&mut bytes)
-            .map_err(|_| PeerSecurityError::Encoding)?;
-        Ok(SignedPeerTicket {
-            key_id: self.key_id.clone(),
-            claims_bytes: bytes.clone(),
-            signature: bytes,
-        })
-    }
-}
-
-/// Builds the stable domain-separated signing preimage for one peer ticket.
-///
-/// The byte order is fixed as `DOMAIN || key_id || claims`. It lives here, next
-/// to the claim shapes, because both the signing authority and any harness that
-/// must produce a ticket under a retired or unpublished key have to agree on it
-/// exactly; two copies of this format would drift silently and only show up as
-/// an unexplained signature refusal.
-#[must_use]
-pub fn peer_signing_input(domain: &[u8], key_id: &str, claims: &[u8]) -> Vec<u8> {
-    [domain, key_id.as_bytes(), claims].concat()
 }
 
 /// Encodes a node identity for claims audience binding.
@@ -1090,10 +832,10 @@ pub fn projection_digest(projection: &[String]) -> String {
 /// Recomputes the canonical assignment-authority digest for one follower's
 /// full set of dispatched scan assignments.
 ///
-/// Both the leader (at mint time) and the follower (at verification time)
-/// call this over the same list, in the same order, so a matching digest
-/// proves the follower's actual assignments are exactly the ones the leader
-/// signed — including every file, schema fingerprint, and closed predicate.
+/// Both the leader and the follower call this over the same list, in the same
+/// order, so a matching digest proves the follower's actual assignments are
+/// exactly the ones the leader described — including every file, schema
+/// fingerprint, and closed predicate.
 ///
 /// # Errors
 /// Returns [`PeerSecurityError::Encoding`] when a schema fingerprint is not
@@ -1126,15 +868,15 @@ pub fn assignment_authority_digest_for(
 ///
 /// Holding this value is the receiver's proof that it may now decode the
 /// operation's body, touch the task cache, construct providers, and issue I/O.
-/// Nothing downstream re-derives the tenant: it is the cryptographically
-/// verified one, carried here so a handler cannot accidentally resolve tenancy
-/// from an unverified field.
+/// Nothing downstream re-derives the tenant: it is the checked context tenant,
+/// carried here so a handler cannot accidentally resolve tenancy from an
+/// unchecked field.
 #[derive(Debug, Clone)]
 pub struct AuthorizedStage {
     /// The verified claims, already matched field-by-field to the receiver's
     /// own [`StageBinding`].
     pub claims: StageTicketClaims,
-    /// The tenant the signature actually bound.
+    /// The tenant the checked context names.
     pub tenant_id: DataTenantId,
 }
 
@@ -1142,32 +884,15 @@ pub struct AuthorizedStage {
 ///
 /// The contract lives here, next to the claims and binding it operates on, so
 /// the Oracle follower ingress can require authorization without depending on
-/// the server crate that owns the signing key. The server implements it on its
-/// existing peer authority; nothing else may.
-///
-/// Both directions are on one trait because they are one protocol: the leader
-/// mints exactly the ticket the follower will re-derive and check.
+/// the server crate that owns the durable security audit. The server
+/// implements it on its existing peer authority.
 #[async_trait]
 pub trait OracleStageAuthority: Send + Sync {
-    /// Signs one single-use ticket for exactly one stage operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PeerSecurityError::Operation`] when `claims` does not carry
-    /// `operation`, and [`PeerSecurityError::Encoding`] when the claims cannot
-    /// be encoded within the implementation's bound.
-    fn mint_stage(
-        &self,
-        operation: StageOperationV1,
-        claims: &StageTicketClaims,
-    ) -> Result<SignedPeerTicket, PeerSecurityError>;
-
     /// Authorizes one stage operation before its body may be decoded or used.
     ///
     /// Holding the returned [`AuthorizedStage`] is the receiver's proof that
-    /// every check ran: signature over the operation's own domain, exact
-    /// body digest, field-by-field binding, deadline, expiry, and single-use
-    /// nonce consumption. A caller that decodes, reads a cache, constructs a
+    /// every check ran: bounds, exact body digest, field-by-field binding,
+    /// deadline, and expiry. A caller that decodes, reads a cache, constructs a
     /// provider, or issues I/O before this returns has broken the contract.
     ///
     /// # Errors
@@ -1177,7 +902,7 @@ pub trait OracleStageAuthority: Send + Sync {
     /// cannot commit. A rejection never returns claims.
     async fn authorize_stage(
         &self,
-        ticket: &SignedPeerTicket,
+        context: &PeerContext,
         binding: &StageBinding,
         body: &[u8],
         now: DateTime<Utc>,
@@ -1186,9 +911,6 @@ pub trait OracleStageAuthority: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
-
     use super::*;
 
     /// Builds one stage binding whose every field is distinguishable.
@@ -1316,10 +1038,9 @@ mod tests {
 
     /// Every bound field is independently load-bearing.
     ///
-    /// Signed claims are only as strong as the weakest field the receiver
+    /// Context claims are only as strong as the weakest field the receiver
     /// actually compares, so this walks one mutation per field and asserts each
-    /// is refused with its own closed error. A field that stops being compared
-    /// would let a peer substitute that value while keeping a valid signature.
+    /// is refused with its own closed error.
     ///
     /// # Panics
     ///
@@ -1328,14 +1049,8 @@ mod tests {
     fn oracle_stage_claims_reject_every_single_field_mutation() {
         let binding = stage_binding();
         let digest = stage_body_digest(b"body").expect("a bounded body digests");
-        let claims = StageTicketClaims::for_binding(
-            &binding,
-            digest.clone(),
-            vec![0; 16],
-            1_000,
-            2_000,
-            Vec::new(),
-        );
+        let claims =
+            StageTicketClaims::for_binding(&binding, digest.clone(), 1_000, 2_000, Vec::new());
         claims
             .verify_binding(&binding, &digest)
             .expect("an unmutated binding verifies");
@@ -1351,22 +1066,17 @@ mod tests {
         }
     }
 
-    /// A `SetPlan` ticket cannot authorize an `ExecuteTask` operation.
+    /// A `SetPlan` context cannot authorize an `ExecuteTask` operation.
     ///
-    /// The two operations carry distinct signing domains, so this is belt and
-    /// braces at the claims layer: even if a signature somehow verified, the
-    /// operation field is compared against the receiving entry point's own
-    /// expectation rather than against anything in the message.
+    /// The operation field is compared against the receiving entry point's own
+    /// expectation rather than against anything in the message, and encoding
+    /// refuses a context for an operation the claims do not name.
     ///
     /// # Panics
     ///
-    /// Panics when a cross-operation ticket is accepted.
+    /// Panics when a cross-operation context is accepted.
     #[test]
-    fn oracle_stage_operations_have_distinct_domains_and_are_not_interchangeable() {
-        assert_ne!(
-            StageOperationV1::SetPlan.domain(),
-            StageOperationV1::ExecuteTask.domain()
-        );
+    fn oracle_stage_operations_are_not_interchangeable() {
         assert_eq!(StageOperationV1::from_u32(0), None);
         assert_eq!(StageOperationV1::from_u32(3), None);
 
@@ -1374,19 +1084,17 @@ mod tests {
         binding.operation = StageOperationV1::SetPlan;
         binding.task_id = None;
         let digest = stage_body_digest(b"plan").expect("a bounded body digests");
-        let claims = StageTicketClaims::for_binding(
-            &binding,
-            digest.clone(),
-            vec![0; 16],
-            1_000,
-            2_000,
-            Vec::new(),
-        );
+        let claims =
+            StageTicketClaims::for_binding(&binding, digest.clone(), 1_000, 2_000, Vec::new());
 
         let mut executing = binding.clone();
         executing.operation = StageOperationV1::ExecuteTask;
         assert_eq!(
             claims.verify_binding(&executing, &digest),
+            Err(PeerSecurityError::Operation)
+        );
+        assert_eq!(
+            claims.to_context(StageOperationV1::ExecuteTask),
             Err(PeerSecurityError::Operation)
         );
     }
@@ -1407,69 +1115,6 @@ mod tests {
             stage_body_digest(b"ab").expect("a bounded body digests"),
             stage_body_digest(b"abc").expect("a bounded body digests")
         );
-    }
-
-    /// Concurrent duplicate nonce consumption admits exactly one caller.
-    #[test]
-    fn oracle_peer_replay_cache_consumes_nonce_atomically() {
-        let cache = Arc::new(PeerReplayCache::new());
-        let barrier = Arc::new(Barrier::new(3));
-        let now = Utc::now();
-        let handles = (0..2)
-            .map(|_| {
-                let cache = Arc::clone(&cache);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    cache.consume(
-                        "kid",
-                        b"0123456789abcdef",
-                        now + chrono::Duration::seconds(1),
-                        now,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        let results = handles
-            .into_iter()
-            .map(|handle| handle.join().expect("replay thread"))
-            .collect::<Vec<_>>();
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(
-            results
-                .iter()
-                .filter(|result| matches!(result, Err(PeerSecurityError::Replay)))
-                .count(),
-            1
-        );
-    }
-
-    /// Expiry reclaims a consumed nonce and the record never refuses as full.
-    #[test]
-    fn oracle_peer_replay_cache_is_unbounded_and_expiry_reclaims() {
-        let cache = PeerReplayCache::new();
-        let now = Utc::now();
-        for index in 0_u32..4_096 {
-            cache
-                .consume(
-                    "kid",
-                    &index.to_be_bytes(),
-                    now + chrono::Duration::seconds(1),
-                    now,
-                )
-                .expect("a fresh nonce is consumed at any count");
-        }
-        assert_eq!(cache.len(), 4_096);
-        cache
-            .consume(
-                "kid",
-                b"later",
-                now + chrono::Duration::seconds(2),
-                now + chrono::Duration::seconds(1),
-            )
-            .expect("expired nonces are reclaimed");
-        assert_eq!(cache.len(), 1);
     }
 
     /// Projection digest is ordered and domain-separated.

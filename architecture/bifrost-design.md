@@ -910,7 +910,8 @@ Bifrost does not provide:
 
 `DataTenantId::SYSTEM_OWNER` is the durable platform tenant for security events
 that cannot safely be attributed to caller-controlled tenant data, including
-peer tickets rejected before verified claim decoding. Its canonical row is UUID
+peer refusals made before the receiver's own query, reservation, or stage state
+binds a tenant. Its canonical row is UUID
 `00000000-0000-7000-8000-000000000000`, slug `wyrd-system`, display name
 `Wyrd System`, status `active`, and `deleted_at IS NULL`. Provisioning and boot
 verification fail closed on conflicting identity or attributes. Unverified

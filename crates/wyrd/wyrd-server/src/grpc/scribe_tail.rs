@@ -1,14 +1,15 @@
-//! Authenticated private tonic adapter for Scribe active-stream discovery.
+//! Private tonic adapter for Scribe active-stream discovery.
 //!
-//! Listing is metadata-only and trusts the authenticated internal peer: a
-//! workload service bearer over the mutually authenticated peer channel. The
-//! shared system-owner workload may list any tenant's table; any other
-//! workload may list only its own tenant. No ticket or replay record exists.
+//! Mounted only on the mutually authenticated peer listener, so every caller
+//! already presented the cluster `wyrd-peer` certificate. That admits a
+//! trusted cluster process, not a tenant. Listing returns partition metadata,
+//! never rows; user and table authorization happen at Oracle before any
+//! listing is issued, and each live fragment is checked against this Scribe's
+//! own state by the Oracle peer service.
 
 use std::sync::Arc;
 
 use vala_bifrost_redux::scribe::tail_rpc::{FetchLiveTailService, TailReadError};
-use wyrd_runtime::PrincipalKind;
 use wyrd_tonic::private_conversion::PrivateConversionError;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::scribe_tail_service_server::{
@@ -16,12 +17,8 @@ use wyrd_tonic::wyrd::v1::scribe_tail_service_server::{
 };
 use wyrd_tonic::wyrd::v1::{self as proto, ListActiveStreamsRequest, ListActiveStreamsResponse};
 
-use crate::AppState;
-
-/// Private gRPC adapter that validates a workload caller before listing live streams.
+/// Private gRPC adapter listing this process's live Scribe streams.
 pub struct ScribeTailGrpc {
-    /// Server auth state used to derive the tenant from verified metadata.
-    state: AppState,
     /// Scribe-owned live source whose active partitions are listed.
     source: Arc<FetchLiveTailService>,
 }
@@ -29,35 +26,14 @@ pub struct ScribeTailGrpc {
 impl ScribeTailGrpc {
     /// Creates the adapter around the server's Scribe live source.
     #[must_use]
-    pub fn new(state: AppState, source: Arc<FetchLiveTailService>) -> Self {
-        Self { state, source }
+    pub fn new(source: Arc<FetchLiveTailService>) -> Self {
+        Self { source }
     }
 
     /// Returns the generated service wrapper for application-router mounting.
     #[must_use]
     pub fn into_server(self) -> ScribeTailServiceServer<Self> {
         ScribeTailServiceServer::new(self)
-    }
-
-    /// Authenticates a service workload and returns its server-derived tenant.
-    async fn authenticated_tenant(
-        &self,
-        metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
-    ) -> Result<wyrd_spec::DataTenantId, Status> {
-        let verifier = self
-            .state
-            .auth
-            .token_verifier
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("auth backend not configured"))?;
-        let auth = vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), metadata)
-            .map_err(|error| Status::unauthenticated(error.to_string()))?;
-        if !matches!(auth.principal.kind, PrincipalKind::Service { .. }) {
-            return Err(Status::permission_denied(
-                "private Scribe tail requires a workload service identity",
-            ));
-        }
-        Ok(auth.tenant)
     }
 }
 
@@ -68,18 +44,10 @@ impl ScribeTailService for ScribeTailGrpc {
         &self,
         request: Request<ListActiveStreamsRequest>,
     ) -> Result<Response<ListActiveStreamsResponse>, Status> {
-        let tenant = self.authenticated_tenant(request.metadata()).await?;
         let binding = request
             .into_inner()
             .binding
             .ok_or_else(|| Status::invalid_argument("tail binding is required"))?;
-        if tenant != wyrd_spec::DataTenantId::SYSTEM_OWNER
-            && binding.tenant_id != tenant.as_uuid().to_string()
-        {
-            return Err(Status::permission_denied(
-                "tail binding tenant does not match caller",
-            ));
-        }
         let binding = wyrd_spec::vala::api::TenantTableBinding::try_from(binding)
             .map_err(conversion_status)?;
         let streams = self

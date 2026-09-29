@@ -19,18 +19,15 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
 use vala_bifrost_redux::oracle::OraclePreparationPause;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::config::BifrostTarget;
 
 use super::{
-    ControlRequest, ControlResponse, MembershipEntry, NodeReport, PeerProbeCredential,
-    PeerProbeFraming, PeerProbePlan, PeerProbeTransport, ProcessClusterError, ProcessNodeTarget,
-    env,
+    ControlRequest, ControlResponse, MembershipEntry, NodeReport, PeerProbeFraming, PeerProbePlan,
+    PeerProbeTransport, ProcessClusterError, ProcessNodeTarget, env,
 };
-use crate::bifrost::peer_keyring::TestPeerKeyringPaths;
 use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 
 /// Fixed process-visible resources every simulated pod boots under.
@@ -134,7 +131,7 @@ async fn serve() -> Result<(), ProcessClusterError> {
         wyrd_telemetry::TestTraceCapture::default(),
     );
     let fingerprint = config.certificate_fingerprint()?;
-    let (server, credentials, fixture) = config.start().await?;
+    let (server, _fixture) = config.start().await?;
     let report = await_ready(&server, &config, fingerprint).await?;
     emit(&ControlResponse::Ready(report.clone()))?;
 
@@ -248,17 +245,12 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: error.to_string(),
                 })?,
             },
-            ControlRequest::PeerProbe(plan) => {
-                match config
-                    .peer_probe(&plan, credentials.as_ref(), &fixture)
-                    .await
-                {
-                    Ok(outcome) => emit(&ControlResponse::Probed { outcome })?,
-                    Err(error) => emit(&ControlResponse::Failed {
-                        detail: error.to_string(),
-                    })?,
-                }
-            }
+            ControlRequest::PeerProbe(plan) => match config.peer_probe(&plan).await {
+                Ok(outcome) => emit(&ControlResponse::Probed { outcome })?,
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
             ControlRequest::PhysicalBuildEvidence => {
                 let (total, latest_cut_fingerprint) =
                     vala_bifrost_redux::oracle::physical_build_observation_for_test();
@@ -594,10 +586,6 @@ struct ChildConfig {
     peer_bind: SocketAddr,
     /// This child's own peer identity material.
     peer_tls: TestBifrostPeerTls,
-    /// Path to the shared peer Service API key.
-    peer_api_key_path: PathBuf,
-    /// Paths of the shared peer ticket keyring published to this child.
-    peer_keyring: TestPeerKeyringPaths,
     /// Oracle query slot units this child admits with, when the topology states
     /// one. `None` keeps the memory-derived count every pod ran on before a
     /// journey needed to saturate an admission class deterministically.
@@ -689,18 +677,7 @@ impl ChildConfig {
             http_bind: socket(env::HTTP_BIND)?,
             grpc_bind: socket(env::GRPC_BIND)?,
             peer_bind: socket(env::PEER_BIND)?,
-            peer_tls: TestBifrostPeerTls {
-                certificate_path: PathBuf::from(read(env::PEER_CERT_PATH)?),
-                private_key_path: PathBuf::from(read(env::PEER_KEY_PATH)?),
-                ca_path: PathBuf::from(read(env::PEER_CA_PATH)?),
-                server_name: read(env::PEER_SERVER_NAME)?,
-            },
-            peer_api_key_path: PathBuf::from(read(env::PEER_API_KEY_PATH)?),
-            peer_keyring: TestPeerKeyringPaths {
-                active_key_id: read(env::PEER_TICKET_KEY_ID)?,
-                signing_key_path: PathBuf::from(read(env::PEER_TICKET_KEY_PATH)?),
-                verifying_keyring_path: PathBuf::from(read(env::PEER_TICKET_KEYRING_PATH)?),
-            },
+            peer_tls: TestBifrostPeerTls::from_dir(PathBuf::from(read(env::PEER_TLS_DIR)?)),
             // Optional: a topology that does not state a slot count keeps the
             // memory-derived one, which is what every pod ran on before any
             // journey needed a saturating class.
@@ -773,19 +750,10 @@ impl ChildConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`ProcessClusterError::Resource`] when the fixture, storage, or
-    /// peer credentials cannot be attached, and [`ProcessClusterError::Child`]
+    /// Returns [`ProcessClusterError::Resource`] when the fixture or storage
+    /// cannot be attached, and [`ProcessClusterError::Child`]
     /// when the server cannot be composed or bound.
-    async fn start(
-        &self,
-    ) -> Result<
-        (
-            WyrdTestServer,
-            Arc<dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials>,
-            Arc<PgFixture>,
-        ),
-        ProcessClusterError,
-    > {
+    async fn start(&self) -> Result<(WyrdTestServer, Arc<PgFixture>), ProcessClusterError> {
         let fixture = Arc::new(
             PgFixture::attach(
                 self.database.clone(),
@@ -795,16 +763,6 @@ impl ChildConfig {
             .await
             .map_err(|error| ProcessClusterError::Resource(error.to_string()))?,
         );
-        let api_key = SecretString::from(
-            std::fs::read_to_string(&self.peer_api_key_path)
-                .map_err(|error| ProcessClusterError::Resource(error.to_string()))?
-                .trim()
-                .to_owned(),
-        );
-        let credentials =
-            crate::server::oracle_peer_credentials_from_key(Arc::clone(&fixture), api_key)
-                .await
-                .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         let storage = crate::server::fixture_storage_handle(wyrd_storage::StorageSettings {
             backend: wyrd_storage::BackendConfig::Local {
                 root: self.storage_root.clone(),
@@ -813,7 +771,6 @@ impl ChildConfig {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await
         .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
@@ -821,7 +778,6 @@ impl ChildConfig {
             .with_bifrost_target_for_test(self.server_target())
             .with_forge_process_role_for_test(self.server_target())
             .with_peer_tls(self.peer_tls.clone())
-            .with_peer_keyring_paths(self.peer_keyring.clone())
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_data_root(self.data_root.clone())
@@ -834,7 +790,6 @@ impl ChildConfig {
             None => server,
         };
         let server = server
-            .with_oracle_peer_credentials(Arc::clone(&credentials))
             .with_storage_handle(Arc::clone(&storage))
             .start_with_resources(Arc::clone(&fixture), Arc::clone(&storage), None)
             .await
@@ -842,7 +797,7 @@ impl ChildConfig {
             .bind()
             .await
             .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
-        Ok((server, credentials, fixture))
+        Ok((server, fixture))
     }
 
     /// Registers one Bifrost table through this child's own catalog.
@@ -1402,21 +1357,15 @@ impl ChildConfig {
     /// The probe is issued as a raw HTTP/2 request over this child's own
     /// mutually authenticated channel rather than through a generated client,
     /// because the claim under test is about the bytes on the wire: which
-    /// adapter is addressed, which workload credential accompanies it, and how
+    /// adapter is addressed, which transport identity carries it, and how
     /// the first gRPC frame is split or coalesced. A refusal is an outcome, not
     /// an error; only failing to reach the destination is an error.
     ///
     /// # Errors
     ///
     /// Returns [`ProcessClusterError::Child`] when the endpoint cannot be
-    /// built, the handshake fails, the credential cannot be obtained, or the
-    /// destination never answered.
-    async fn peer_probe(
-        &self,
-        plan: &PeerProbePlan,
-        own: &dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials,
-        fixture: &Arc<PgFixture>,
-    ) -> Result<String, ProcessClusterError> {
+    /// built, the handshake fails, or the destination never answered.
+    async fn peer_probe(&self, plan: &PeerProbePlan) -> Result<String, ProcessClusterError> {
         let child = |error: String| ProcessClusterError::Child(error);
         let read = |path: &std::path::Path| -> Result<Vec<u8>, ProcessClusterError> {
             std::fs::read(path).map_err(|error| ProcessClusterError::Resource(error.to_string()))
@@ -1444,62 +1393,17 @@ impl ChildConfig {
             .connect()
             .await
             .map_err(|error| child(error.to_string()))?;
-        let bearer = self.probe_bearer(&plan.credential, own, fixture).await?;
-        let mut request = http::Request::builder()
+        let request = http::Request::builder()
             .method(http::Method::POST)
             .uri(plan.service.path())
             .header(http::header::CONTENT_TYPE, "application/grpc")
-            .header("te", "trailers");
-        if let Some(bearer) = bearer {
-            request = request.header("x-wyrd-access-token", bearer);
-        }
-        let request = request
+            .header("te", "trailers")
             .body(probe_body(plan.framing, plan.payload.as_deref()))
             .map_err(|error| child(error.to_string()))?;
         let response = tower::ServiceExt::oneshot(&mut channel, request)
             .await
             .map_err(|error| child(error.to_string()))?;
         Ok(probe_outcome(response).await)
-    }
-
-    /// Resolves the bearer value a probe presents, if it presents one.
-    ///
-    /// An API-key credential is exchanged through the same middleware a real
-    /// peer uses, so a probe for a deliberately wrong principal is refused by
-    /// authorization rather than by a malformed token.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProcessClusterError::Child`] when the exchange fails.
-    async fn probe_bearer(
-        &self,
-        credential: &PeerProbeCredential,
-        own: &dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials,
-        fixture: &Arc<PgFixture>,
-    ) -> Result<Option<String>, ProcessClusterError> {
-        let child = |error: String| ProcessClusterError::Child(error);
-        match credential {
-            PeerProbeCredential::Absent => Ok(None),
-            PeerProbeCredential::Invalid => Ok(Some("Bearer not-a-real-token".to_owned())),
-            PeerProbeCredential::Own => own
-                .bearer(false)
-                .await
-                .map(|bearer| Some(format!("Bearer {bearer}")))
-                .map_err(|error| child(error.to_string())),
-            PeerProbeCredential::ApiKey(key) => {
-                let credentials = crate::server::oracle_peer_credentials_from_key(
-                    Arc::clone(fixture),
-                    SecretString::from(key.clone()),
-                )
-                .await
-                .map_err(|error| child(error.to_string()))?;
-                credentials
-                    .bearer(false)
-                    .await
-                    .map(|bearer| Some(format!("Bearer {bearer}")))
-                    .map_err(|error| child(error.to_string()))
-            }
-        }
     }
 }
 
@@ -1600,13 +1504,20 @@ async fn await_ready(
             // role never came up.
             return Err(ProcessClusterError::Timeout(format!(
                 "child pid {} readiness: postgres={:?} storage={:?} scribe={:?} oracle={:?} \
-                 peer={:?} peer_required={} peer_serving={}",
+                 peer={:?} forge_coordinator={:?} forge_worker={:?} verification={:?} \
+                 peer_required={} peer_serving={}",
                 std::process::id(),
                 snapshot.postgres.reason,
                 snapshot.storage.reason,
                 snapshot.scribe.reason,
                 snapshot.oracle.reason,
                 snapshot.peer.reason,
+                snapshot
+                    .forge_coordinator
+                    .as_ref()
+                    .map(|probe| &probe.reason),
+                snapshot.forge_worker.as_ref().map(|probe| &probe.reason),
+                snapshot.verification.as_ref().map(|probe| &probe.reason),
                 server.state().peer_plane.is_required(),
                 server.state().peer_plane.is_serving(),
             )));

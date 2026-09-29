@@ -11,8 +11,9 @@ use skald_runtime::ProviderRegistry;
 use tokio::sync::Mutex;
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::reference::{CardRef, InlineableRef};
+use wyrd_spec::vala::eval::media::MediaRef as EvalMediaRef;
 
-use crate::{JudgeError, JudgeInvoker};
+use crate::{JudgeError, JudgeInvoker, MediaBindings};
 
 /// Resolves a durable Agent card into its pure Agent spec.
 #[async_trait]
@@ -28,11 +29,28 @@ pub trait PromptCardResolver: Send + Sync {
     async fn resolve(&self, prompt_ref: &CardRef) -> Result<Prompt, JudgeError>;
 }
 
+/// Reads the authorized object behind an Eval media descriptor.
+///
+/// The server owns storage and tenancy, so it supplies the implementation; the
+/// invoker only binds what the resolver returns.
+#[async_trait]
+pub trait MediaResolver: Send + Sync {
+    /// Resolve `media` to provider-native inline content.
+    ///
+    /// # Errors
+    /// Returns [`JudgeError::Terminal`] for missing, unauthorized,
+    /// unsupported, or oversized media and [`JudgeError::Retryable`] for a
+    /// transient storage failure.
+    async fn resolve(&self, media: &EvalMediaRef) -> Result<skald_spec::MediaRef, JudgeError>;
+}
+
 /// Skald-backed invoker for one constrained Agent judge per Eval run.
 pub struct SkaldJudgeInvoker {
     providers: Arc<ProviderRegistry>,
     agents: Arc<dyn AgentCardResolver>,
     prompts: Arc<dyn PromptCardResolver>,
+    /// Resolver for record media; `None` refuses any media-bearing call.
+    media: Option<Arc<dyn MediaResolver>>,
     cached_agent: Mutex<Option<(InlineableRef<AgentSpec>, Arc<Agent>)>>,
     /// Per-attempt outer deadline.
     pub call_deadline: Duration,
@@ -50,9 +68,47 @@ impl SkaldJudgeInvoker {
             providers,
             agents,
             prompts,
+            media: None,
             cached_agent: Mutex::new(None),
             call_deadline: Duration::from_secs(60),
         }
+    }
+
+    /// Resolve record media through `resolver` before binding it.
+    #[must_use]
+    pub fn with_media_resolver(mut self, resolver: Arc<dyn MediaResolver>) -> Self {
+        self.media = Some(resolver);
+        self
+    }
+
+    /// Return a per-call copy of `prompt` with every record media binding
+    /// bound to its resolved provider-native content.
+    ///
+    /// The cached Agent's prompt is never mutated, so concurrent calls for
+    /// different records cannot see each other's media.
+    ///
+    /// # Errors
+    /// Returns [`JudgeError::Terminal`] when media is present without a
+    /// resolver or a binding id names no `${media:id}` placeholder in the
+    /// Prompt, and any error the resolver returns.
+    async fn bind_media(
+        &self,
+        prompt: &Prompt,
+        media: &MediaBindings,
+    ) -> Result<Prompt, JudgeError> {
+        let resolver = self.media.as_ref().ok_or_else(|| JudgeError::Terminal {
+            reason: "record media requires a media resolver".to_owned(),
+        })?;
+        let mut native = prompt.native().clone();
+        for descriptor in media.iter() {
+            let resolved = resolver.resolve(descriptor).await?;
+            native
+                .bind_media_mut(descriptor.id.as_str(), &resolved)
+                .map_err(|error| JudgeError::Terminal {
+                    reason: format!("media binding `{}`: {error}", descriptor.id.as_str()),
+                })?;
+        }
+        Ok(Prompt::from_native(native))
     }
 
     async fn agent_for(
@@ -130,14 +186,22 @@ impl JudgeInvoker for SkaldJudgeInvoker {
         &self,
         judge: &InlineableRef<AgentSpec>,
         context: Value,
+        media: &MediaBindings,
     ) -> Result<Value, JudgeError> {
         let agent = self.agent_for(judge).await?;
-        let vars = context_variables(agent.prompt().as_ref(), &context);
+        let bound;
+        let prompt = if media.is_empty() {
+            agent.prompt().as_ref()
+        } else {
+            bound = self.bind_media(agent.prompt(), media).await?;
+            &bound
+        };
+        let vars = context_variables(prompt, &context);
         let borrowed = borrowed_pairs(&vars);
 
         let run = tokio::time::timeout(
             self.call_deadline,
-            agent.run_prompt(self.providers.as_ref(), agent.prompt(), &borrowed, None),
+            agent.run_prompt(self.providers.as_ref(), prompt, &borrowed, None),
         )
         .await
         .map_err(|_| JudgeError::Timeout {

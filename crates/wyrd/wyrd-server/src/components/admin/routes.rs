@@ -1824,7 +1824,6 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await.with_authz(ServerAuthz {
             permission_check: Arc::new(DenyAllCheck),
-            ..ServerAuthz::default()
         });
         seed_issuer(&fixture, tenant).await;
 

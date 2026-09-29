@@ -1179,8 +1179,6 @@ pub struct OracleBuildConfig {
     pub spill_runtime: Arc<OracleSpillRuntime>,
     /// Read/security audit collaborator.
     pub audit: Arc<dyn OracleAudit>,
-    /// Server-owned narrow peer-ticket authority.
-    pub peer_ticket_minter: Arc<dyn peer::PeerTicketMinter>,
     /// Reservation owner this node's fragment and graph paths both charge against.
     ///
     /// One registry per node, shared with the peer worker that accepts
@@ -1194,20 +1192,12 @@ pub struct OracleBuildConfig {
     /// a node without it has no follower ingress to mount and no leader handle
     /// to execute through.
     pub stage_authority: Option<Arc<dyn peer::OracleStageAuthority>>,
-    /// Immutable Bifrost peer identity every east-west Oracle channel dials with.
+    /// Immutable mTLS peer identity every east-west Oracle channel dials with.
     ///
-    /// Absent only on a deployment whose target does not serve the peer plane.
-    /// The Analytical owners are composed only when it is present, because a
-    /// coordinator that cannot present the peer client identity cannot reach a
-    /// follower at all.
+    /// Absent unless the node runs in explicit peer mode. The Analytical owners
+    /// are composed only when it is present, because a coordinator that cannot
+    /// present the peer client certificate cannot reach a follower at all.
     pub peer_tls: Option<dispatcher::BifrostPeerTls>,
-    /// Workload credential this node presents on every east-west peer request.
-    ///
-    /// Absent only on a deployment whose target does not serve the peer plane.
-    /// The private listener authenticates the workload credential before it
-    /// polls a request body, so a coordinator without one cannot reach a
-    /// follower even when it holds a valid peer certificate.
-    pub peer_credentials: Option<Arc<dyn dispatcher::OraclePeerCredentials>>,
     /// Query-scoped live Scribe discovery owner.
     pub tail_discovery: Option<Arc<dyn tail_discovery::TailStreamDiscovery>>,
     /// Optional node-aware local/tonic directory used for immutable sealed leaves.
@@ -1721,8 +1711,6 @@ struct AnalyticalCompositionInputs {
     spill: Arc<OracleSpillRuntime>,
     /// Immutable peer identity every east-west channel is dialed through.
     peer_tls: dispatcher::BifrostPeerTls,
-    /// Workload credential every east-west request presents.
-    peer_credentials: Arc<dyn dispatcher::OraclePeerCredentials>,
 }
 
 /// Builds one node's Analytical execution handle from its composed owners.
@@ -1746,7 +1734,6 @@ fn compose_analytical_handle(
         peer_transports,
         spill,
         peer_tls,
-        peer_credentials,
     } = inputs;
     let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
     let leaf = codec::AnalyticalLeafBinding::new(
@@ -1756,12 +1743,10 @@ fn compose_analytical_handle(
         Some(reader_authority),
     );
     let egress = Arc::new(analytical::AnalyticalStageEgress::new(
-        Arc::clone(&authority),
         node_id,
         fence,
         ANALYTICAL_STAGE_TICKET_TTL,
         peer_tls.clone(),
-        Arc::clone(&peer_credentials),
     ));
     let worker =
         analytical::AnalyticalStageIngress::new(analytical::AnalyticalStageIngressConfig {
@@ -1777,7 +1762,6 @@ fn compose_analytical_handle(
     Arc::new(analytical::AnalyticalExecutionHandle::new(
         analytical::AnalyticalExecutionOwners {
             worker: Arc::clone(&worker),
-            authority,
             supervisor,
             spill,
             peer_transports,
@@ -1787,18 +1771,16 @@ fn compose_analytical_handle(
             oracle_fence: fence,
             ticket_ttl: ANALYTICAL_STAGE_TICKET_TTL,
             peer_tls,
-            peer_credentials,
         },
         leaf,
     ))
 }
 
-/// Lifetime of every Analytical stage ticket this node mints.
+/// Lifetime of every Analytical stage context this node sends.
 ///
-/// Short enough that a captured ticket is useless long before a query's own
-/// deadline, and long enough to cover one coordinator-to-follower dispatch on a
-/// loaded cluster. Ticket expiry is checked in addition to the query deadline,
-/// never instead of it.
+/// Long enough to cover one coordinator-to-follower dispatch on a loaded
+/// cluster. Context expiry is checked in addition to the query deadline, never
+/// instead of it.
 const ANALYTICAL_STAGE_TICKET_TTL: chrono::Duration = chrono::Duration::seconds(30);
 
 impl Oracle {
@@ -1929,22 +1911,17 @@ impl Oracle {
         )
         .await?;
         let fragment_dispatcher = config.peer_transports.as_ref().map(|transports| {
-            Arc::new(dispatcher::FragmentDispatcher::new(
-                Arc::clone(&config.peer_ticket_minter),
-                Arc::clone(transports),
-            ))
+            Arc::new(dispatcher::FragmentDispatcher::new(Arc::clone(transports)))
         });
         // Both owners are required together: the authority proves a stage
         // operation, and the peer identity is the only way to deliver one.
         let analytical = config
             .stage_authority
             .zip(config.peer_tls)
-            .zip(config.peer_credentials)
-            .map(|((authority, peer_tls), peer_credentials)| {
+            .map(|(authority, peer_tls)| {
                 compose_analytical_handle(AnalyticalCompositionInputs {
                     authority,
                     peer_tls,
-                    peer_credentials,
                     node_id: admission.local_role.key.node_id,
                     fence: admission.local_role.fencing_token,
                     catalog: Arc::clone(&config.catalog),

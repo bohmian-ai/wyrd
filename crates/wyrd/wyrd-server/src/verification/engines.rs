@@ -5,16 +5,15 @@
 //! implementation spec and returns an [`EngineOutcome`]. Arms never read or
 //! write run rows, claim work, publish results, or create dispatches; the
 //! runner turns every outcome into exactly one fenced lifecycle transition.
-//! Drift runs through [`DriftEngine`](super::drift::DriftEngine); Eval lands
-//! by replacing the body of [`eval`] only.
-
-use std::future::Future;
+//! Drift runs through [`DriftEngine`](super::drift::DriftEngine); Eval runs
+//! through [`EvalEngine`](super::eval::EvalEngine).
 
 use vala_drift::{DriftReport, DriftVerdict};
+use vala_eval::EvalExecError;
 use vala_eval::executor::EvalReport;
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
-use wyrd_sql::queries::verifier_runs::{ClaimedRun, TerminalStatus};
+use wyrd_sql::queries::verifier_runs::TerminalStatus;
 
 /// Stable error code of an implementation whose engine has not shipped.
 pub const IMPLEMENTATION_UNAVAILABLE: &str = "implementation_unavailable";
@@ -47,6 +46,30 @@ impl VerifierReport {
         }
     }
 
+    /// Map a scored one-record Eval report onto the common Eval result.
+    ///
+    /// Applies the spec's context capture first, the single capture point
+    /// before persistence. At least one attesting task with an authored gate
+    /// maps the gate's pass/fail; no gate, or nothing attesting (every task
+    /// skipped), is inconclusive regardless of the gate.
+    ///
+    /// # Errors
+    /// Returns the capture failure when an observed value cannot be hashed.
+    pub fn eval(report: EvalReport, spec: &EvalSpec) -> Result<Self, EvalExecError> {
+        let report = report.captured(spec.context_capture)?;
+        let verdict = match &spec.pass_gate {
+            Some(gate) if report.ran().next().is_some() => {
+                if report.pass_gate(gate).passed {
+                    VerificationVerdict::Passed
+                } else {
+                    VerificationVerdict::Failed
+                }
+            }
+            _ => VerificationVerdict::Inconclusive,
+        };
+        Ok(Self::Eval { report, verdict })
+    }
+
     /// The common verdict of this result.
     ///
     /// Drift maps its own verdict (`no_drift` passes, `drift` fails,
@@ -70,13 +93,22 @@ impl VerifierReport {
 ///
 /// The runner maps each variant to exactly one transition: `Completed`
 /// publishes and then completes, `Retry` reschedules the same run and input
-/// within its attempt budget, and `Terminal` settles without a verdict.
+/// within its attempt budget, `AwaitingTrace` requeues without charging an
+/// attempt until the trace deadline, `Deferred` requeues after one poll
+/// interval without charging an attempt, and `Terminal` settles without a
+/// verdict.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineOutcome {
     /// The engine produced a verdict and its report.
     Completed(VerifierReport),
     /// A transient failure; the same run and frozen input may be attempted again.
     Retry(VerificationError),
+    /// The Eval record's trace has not landed; wait and try again.
+    AwaitingTrace(VerificationError),
+    /// Bifrost refused an input read at admission. That is backpressure from
+    /// shared query capacity, not a failure of this run, so the run waits one
+    /// poll interval and tries again without spending an attempt.
+    Deferred(VerificationError),
     /// A terminal failure that carries no verdict.
     Terminal(TerminalStatus, VerificationError),
 }
@@ -99,24 +131,15 @@ impl EngineOutcome {
     }
 }
 
-/// Eval arm of the closed Verifier dispatch.
-///
-/// Receives the claimed run (its frozen input record) and the exact
-/// Verifier's typed Eval spec. Until the continuous Eval engine ships this
-/// returns the terminal `implementation_unavailable` outcome; it never
-/// fabricates a verdict.
-pub fn eval(
-    _run: &ClaimedRun,
-    _spec: &EvalSpec,
-) -> impl Future<Output = EngineOutcome> + Send + 'static {
-    std::future::ready(EngineOutcome::implementation_unavailable("eval"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
+    use vala_eval::executor::{SkipReason, TaskRunOutcome};
     use wyrd_spec::card::drift::DriftMethod;
+    use wyrd_spec::vala::eval::{
+        AssertionResult, ComparisonOperator, EvalContextCapture, EvalPassGate, TaskId,
+    };
 
     use super::*;
 
@@ -145,6 +168,81 @@ mod tests {
             let report = VerifierReport::Drift(drift.map(drift_report));
             assert_eq!(report.verdict(), expected, "{drift:?}");
             assert_eq!(report.implementation(), "drift");
+        }
+    }
+
+    /// One Eval outcome: `Some(passed)` ran with that result, `None` skipped.
+    fn outcome(id: &str, passed: Option<bool>) -> TaskRunOutcome {
+        let task_id = TaskId::new(id).expect("task id");
+        match passed {
+            Some(passed) => TaskRunOutcome::Ran(Box::new(AssertionResult {
+                task_id,
+                passed,
+                actual: Some(serde_json::json!("observed")),
+                expected: serde_json::json!("observed"),
+                operator: ComparisonOperator::Equals,
+                message: None,
+                stage: 0,
+                started_at: chrono::Utc::now(),
+                duration_ms: 1,
+            })),
+            None => TaskRunOutcome::Skipped {
+                task_id,
+                reason: SkipReason::ConditionFalse,
+            },
+        }
+    }
+
+    /// The Eval terminal matrix: an authored gate over at least one attesting
+    /// task decides pass/fail; no gate or nothing attesting is inconclusive;
+    /// capture strips stored evidence without changing the verdict.
+    #[test]
+    fn eval_reports_map_to_the_common_verdict_after_capture() {
+        let gate = Some(EvalPassGate::AllPass);
+        let cases = [
+            (
+                gate.clone(),
+                vec![Some(true), None],
+                VerificationVerdict::Passed,
+            ),
+            (
+                gate.clone(),
+                vec![Some(false), None],
+                VerificationVerdict::Failed,
+            ),
+            (None, vec![Some(false)], VerificationVerdict::Inconclusive),
+            (gate, vec![None, None], VerificationVerdict::Inconclusive),
+        ];
+        for (pass_gate, outcomes, expected) in cases {
+            let spec = EvalSpec {
+                dataset: None,
+                tasks: BTreeMap::new(),
+                workflow: None,
+                sampling: None,
+                pass_gate,
+                context_capture: Some(EvalContextCapture::Redact),
+            };
+            let report = EvalReport {
+                outcomes: outcomes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, passed)| outcome(&format!("t{index}"), *passed))
+                    .collect(),
+            };
+            let mapped = VerifierReport::eval(report, &spec).expect("capture applies");
+            assert_eq!(mapped.verdict(), expected, "{outcomes:?}");
+            let VerifierReport::Eval { report, .. } = mapped else {
+                panic!("an Eval report maps to an Eval result");
+            };
+            assert_eq!(
+                report.outcomes.len(),
+                outcomes.len(),
+                "every outcome is kept"
+            );
+            assert!(
+                report.ran().all(|result| result.actual.is_none()),
+                "redacted"
+            );
         }
     }
 

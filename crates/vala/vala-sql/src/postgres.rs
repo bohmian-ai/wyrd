@@ -9,8 +9,10 @@ use secrecy::ExposeSecret;
 use sqlx::PgPool;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
+use wyrd_sql::dsn::WYRD_APP_ROLE;
 use wyrd_sql::pool::build_pool;
-use wyrd_sql::{PoolConfig, SqlError, TenantConn};
+use wyrd_sql::schema_check::verify_login_name;
+use wyrd_sql::{OperatorPool, PoolConfig, SqlError, TenantConn};
 
 /// Drop-safe telemetry for one Vala runtime-pool acquisition.
 struct PoolAcquireLifecycle<'a> {
@@ -61,60 +63,55 @@ impl Drop for PoolAcquireLifecycle<'_> {
 
 /// Runtime-ready Vala Postgres handle.
 ///
-/// Construction applies Wyrd's prerequisite migrations, then Vala migrations,
-/// through the boot-only migrator role. The returned pool is a dedicated
-/// Vala/Bifrost runtime pool against the same database.
+/// Holds the dedicated Vala/Bifrost runtime pool (the `wyrd_app` login).
+/// Construction never migrates; serving boot calls [`Self::validate_schema`]
+/// before it reports ready.
 #[derive(Clone)]
 pub struct ValaPostgres {
     pool: PgPool,
 }
 
 impl ValaPostgres {
-    /// Apply prerequisite migrations and build the Vala runtime pool.
+    /// Build the Vala runtime pool from the serving `wyrd_app` DSN.
+    ///
+    /// No DDL runs and nothing is validated; call [`Self::validate_schema`]
+    /// before serving.
     ///
     /// # Errors
-    /// Returns [`SqlError`] when migration or pool construction fails.
+    /// Returns [`SqlError::Connect`] when the pool cannot be built.
     pub async fn connect_from_dsns(dsns: &ResolvedDsns) -> Result<Self, SqlError> {
-        let migrator = build_pool(
-            dsns.migrator.expose_secret(),
-            PoolConfig::migrator_from_env(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
-
-        let migration_result = async {
-            wyrd_sql::migrate(&migrator).await?;
-            crate::migrate(&migrator).await
-        }
-        .await;
-        migrator.close().await;
-        migration_result?;
-
-        connect_runtime_pool(dsns).await
+        let pool = build_pool(dsns.app.expose_secret(), vala_pool_config())
+            .await
+            .map_err(SqlError::Connect)?;
+        Ok(Self { pool })
     }
 
-    /// Apply Vala migrations after Wyrd SQL readiness has already completed.
+    /// Prove the database is ready for serving Vala and Bifrost traffic.
+    ///
+    /// Checks that the runtime pool logs in, and acts, as exactly `wyrd_app`,
+    /// then the Vala schema contract ([`crate::verify_schema`]) through the
+    /// deployment's `operator` capability: every embedded Vala migration and
+    /// checksum, schema privileges — including no runtime access to the
+    /// cross-tenant Iceberg catalog — and tenant isolation policies. Read-only;
+    /// no DDL runs.
     ///
     /// # Errors
-    /// Returns [`SqlError`] when migration or pool construction fails.
-    pub async fn connect_after_wyrd(dsns: &ResolvedDsns) -> Result<Self, SqlError> {
-        let migrator = build_pool(
-            dsns.migrator.expose_secret(),
-            PoolConfig::migrator_from_env(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
-
-        let migration_result = crate::migrate(&migrator).await;
-        migrator.close().await;
-        migration_result?;
-
-        connect_runtime_pool(dsns).await
+    /// Returns [`SqlError::SchemaNotReady`] for the first failed check,
+    /// [`SqlError::MigrateChecksum`] for checksum drift, and
+    /// [`SqlError::Connect`] on query failure.
+    pub async fn validate_schema(&self, operator: &OperatorPool) -> Result<(), SqlError> {
+        let (session, current): (String, String) =
+            sqlx::query_as("SELECT session_user::text, current_user::text")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(SqlError::Connect)?;
+        verify_login_name(WYRD_APP_ROLE, &session, &current)?;
+        crate::verify_schema(operator).await
     }
 
     /// Wrap pre-built pools into a handle. Migrations assumed already applied
     /// elsewhere. Used only by DB-free unit tests; production and DB-backed tests
-    /// use `connect_from_dsns` / `connect_after_wyrd`. Gated behind
+    /// use `connect_from_dsns`. Gated behind
     /// `testing` / `cfg(test)`.
     #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
@@ -161,13 +158,6 @@ pub fn vala_pool_config() -> PoolConfig {
         },
         "_VALA",
     )
-}
-
-async fn connect_runtime_pool(dsns: &ResolvedDsns) -> Result<ValaPostgres, SqlError> {
-    let pool = build_pool(dsns.app.expose_secret(), vala_pool_config())
-        .await
-        .map_err(SqlError::Connect)?;
-    Ok(ValaPostgres { pool })
 }
 
 #[cfg(test)]

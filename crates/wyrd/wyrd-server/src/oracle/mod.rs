@@ -13,8 +13,6 @@ pub(crate) mod lifecycle_service;
 mod lifecycle_transport;
 mod peer_audit;
 mod peer_authority;
-mod peer_credentials;
-mod peer_keyring;
 mod peer_service;
 mod query_audit;
 mod tail_discovery;
@@ -29,18 +27,13 @@ pub use lifecycle_transport::{
 };
 pub use peer_audit::PostgresPeerSecurityAudit;
 pub use peer_authority::OraclePeerAuthority;
-pub use peer_credentials::ServerBifrostPeerCredentials;
-pub use peer_keyring::{PeerKeyringError, PeerTicketKeyring};
 pub use peer_service::OraclePeerGrpc;
 #[cfg(feature = "test-support")]
 pub use peer_service::{ScribeFragmentFault, arm_scribe_fragment_fault_for_test};
 pub use query_audit::OracleQueryAudit;
 pub use tail_discovery::RegistryTailStreamDiscovery;
 #[cfg(feature = "test-support")]
-pub use tail_discovery::{
-    arm_tail_listing_credential_rejection_for_test, arm_tail_listing_stale_for_test,
-    arm_tail_listing_stall_for_test,
-};
+pub use tail_discovery::{arm_tail_listing_stale_for_test, arm_tail_listing_stall_for_test};
 
 /// Closes the local serving latch once this Oracle's reader epoch is lost.
 ///
@@ -73,9 +66,9 @@ pub struct OraclePeerRuntime {
     worker: Arc<OraclePeerWorker>,
     /// Verified writer retained for the full peer-service lifetime.
     security_audit: Arc<PostgresPeerSecurityAudit>,
-    /// Canonical authenticated client retained for lifecycle control fanout.
+    /// Canonical mTLS client retained for lifecycle control fanout.
     lifecycle_transport: Arc<OracleLifecycleTransport>,
-    /// Peer ticket authority verifying reservation purpose tickets.
+    /// Receiver-side authority checking reservation and stage contexts.
     authority: Arc<OraclePeerAuthority>,
 }
 
@@ -96,7 +89,7 @@ impl OraclePeerRuntime {
         }
     }
 
-    /// Returns the authority the private adapter verifies purpose tickets with.
+    /// Returns the authority the private adapter checks peer contexts with.
     #[must_use]
     pub fn authority(&self) -> &Arc<OraclePeerAuthority> {
         &self.authority
@@ -116,7 +109,7 @@ impl OraclePeerRuntime {
         Arc::clone(&self.security_audit)
     }
 
-    /// Returns the one authenticated lifecycle transport built at boot.
+    /// Returns the one lifecycle transport built at boot.
     #[must_use]
     pub fn lifecycle_transport(&self) -> Arc<OracleLifecycleTransport> {
         Arc::clone(&self.lifecycle_transport)

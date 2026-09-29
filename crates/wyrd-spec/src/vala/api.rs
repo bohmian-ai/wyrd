@@ -1737,7 +1737,7 @@ pub struct ReservationRejected {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ReserveNodeSlotsResponse {
-    /// Slots are pending ticket-bound execution.
+    /// Slots are pending context-bound execution.
     Pending(PendingNodeReservation),
     /// Node lacked capacity.
     Rejected(ReservationRejected),
@@ -1757,16 +1757,17 @@ pub struct ReleaseNodeSlotsRequest {
     pub leader_fencing_token: FencingToken,
 }
 
-/// Signed opaque peer ticket verified before claims decoding.
+/// Unsigned typed operation context carried on the private peer plane.
+///
+/// The mTLS cluster identity establishes that a trusted Wyrd process sent it;
+/// the receiver validates every claim against its own trusted state (local
+/// node and role fence, reservations, deadlines, and bounds) before it decodes
+/// a plan or touches tenant storage. The bytes are bounded before decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct SignedPeerTicket {
-    /// ASCII signing-key identifier, at most 64 bytes.
-    pub key_id: String,
-    /// Opaque signed claims, at most 16 KiB.
+pub struct PeerContext {
+    /// Encoded typed claims, at most 16 KiB for a fragment.
     pub claims_bytes: Vec<u8>,
-    /// Exact 64-byte signature.
-    pub signature: Vec<u8>,
 }
 
 /// One signed persisted object a leader assigned to a follower.
@@ -1850,7 +1851,7 @@ impl PersistedFileDescriptor {
     ///
     /// A zero-row file is valid: an empty object still participates in residual
     /// execution. Whether the object exists, belongs to the tenant, or matches
-    /// the schema is decided by the binding and ticket checks that run before
+    /// the schema is decided by the binding and context checks that run before
     /// this value is used, not here.
     #[must_use]
     pub fn is_valid(&self) -> bool {
@@ -2093,26 +2094,26 @@ pub struct FollowerScanAssignment {
     pub predicates: Vec<crate::vala::assignment_authority::ScanPredicate>,
 }
 
-/// Ticket-bound worker request carrying one serialized physical subtree.
+/// Context-bound worker request carrying one serialized physical subtree.
 ///
 /// This is the sole domain projection of the private
 /// `wyrd.v1.ExecuteFragmentRequest` peer message. The leader mints it per
-/// follower after splitting the admitted plan; the follower verifies the
-/// ticket, both fences, and the assignment-authority digest before it
+/// follower after splitting the admitted plan; the follower checks the
+/// context, both fences, and the assignment-authority digest before it
 /// deserializes `physical_plan_bytes` and substitutes each remote placeholder
 /// with its role-local source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ExecuteFragmentRequest {
-    /// Opaque signed ticket.
-    pub ticket: SignedPeerTicket,
+    /// Typed fragment context validated before plan decode.
+    pub context: PeerContext,
     /// Runtime-bounded physical-plan bytes.
     pub physical_plan_bytes: Vec<u8>,
     /// Pending reservation identity.
     pub reservation_id: ReservationId,
-    /// Signed request-local leader incarnation.
+    /// Request-local leader incarnation.
     pub leader_fence: OracleRoleFence,
-    /// Signed target follower incarnation.
+    /// Target follower incarnation.
     pub target_fence: OracleRoleFence,
     /// Complete scan-keyed role-local assignment set.
     pub assignments: Vec<FollowerScanAssignment>,

@@ -1,10 +1,14 @@
 ---
 id: SPEC-tenant-oidc-federation
 revision: 2
-status: draft
+status: superseded
 ---
 
 # Tenant-owned OIDC federation
+
+Superseded by [`SPEC-oidc-production-readiness`](../oidc-production-readiness/spec.md),
+which covers the tenant federation model and the complete production UI, CLI,
+workload, and hosted signup journeys.
 
 ## Human intent and user value
 

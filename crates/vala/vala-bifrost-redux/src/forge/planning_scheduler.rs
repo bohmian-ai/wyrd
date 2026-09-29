@@ -157,10 +157,13 @@ struct SchedulerDemandRefreshGate {
 impl<'forge> ForgeScheduler<'forge> {
     /// Constructs one scheduler over the established Forge dependency graph.
     ///
+    /// The lease owner is the Forge's durable scheduler owner, so a restarted
+    /// process on the same identity reclaims its live fence at once.
+    ///
     /// # Errors
     /// Returns invalid configuration when the demand page bound is invalid.
     pub fn new(forge: &'forge Forge) -> Result<Self, ForgeError> {
-        Ok(Self::with_owner(forge, Uuid::now_v7()))
+        Ok(Self::with_owner(forge, forge.core.scheduler_owner))
     }
 
     /// Constructs a scheduler with a stable fixture owner across bounded passes.

@@ -231,7 +231,7 @@ AS $$
      WHERE node_id = p_node_id AND fencing_token = p_fencing_token
 $$;
 
-ALTER FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) OWNER TO wyrd_migrator;
+ALTER FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) OWNER TO wyrd_platform_admin;
 REVOKE ALL ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) TO wyrd_app;
 GRANT EXECUTE ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) TO wyrd_platform_admin;

@@ -140,7 +140,9 @@ impl GrpcConnection {
 /// Build and configure an [`Endpoint`] from [`GrpcConfig`].
 ///
 /// Applies per-call timeout, connect timeout, HTTP/2 keepalive settings, and
-/// TLS when the endpoint scheme is `https://`.
+/// TLS when the endpoint scheme is `https://`. TLS verifies the server against
+/// the platform trust roots, which honor the standard `SSL_CERT_FILE` and
+/// `SSL_CERT_DIR` overrides.
 ///
 /// Kept separate so the retry loop in [`GrpcConnection::connect`] can reuse
 /// it without repeating validation logic.
@@ -149,7 +151,8 @@ impl GrpcConnection {
 ///
 /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
 /// already owns the process, the endpoint URI is invalid, or its TLS
-/// configuration cannot be constructed.
+/// configuration cannot be constructed. Missing platform roots surface at dial
+/// time from [`GrpcConnection::connect`].
 fn build_endpoint(config: &GrpcConfig) -> Result<Endpoint, WyrdClientError> {
     wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
         transport: "grpc".to_owned(),
@@ -176,7 +179,7 @@ fn build_endpoint(config: &GrpcConfig) -> Result<Endpoint, WyrdClientError> {
 
     if config.endpoint.starts_with("https://") {
         endpoint
-            .tls_config(ClientTlsConfig::new())
+            .tls_config(ClientTlsConfig::new().with_native_roots())
             .map_err(|err| WyrdClientError::TransportDown {
                 transport: "grpc".to_owned(),
                 message: format!("TLS config error: {err}"),

@@ -1085,6 +1085,19 @@ export class WyrdClient {
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
 
+  /** The effective HTTP server URL this client sends requests to. */
+  get serverUrl(): string {
+    return this.#native.serverUrl;
+  }
+
+  /**
+   * The effective gRPC endpoint: the explicit `grpcUrl` when one was given,
+   * else the server URL's scheme and host on the public gRPC port `50051`.
+   */
+  get grpcUrl(): string {
+    return this.#native.grpcUrl;
+  }
+
   /**
    * Return a client that acts for the holder of `subjectToken` (RFC 8693).
    *

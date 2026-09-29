@@ -10,8 +10,6 @@ use secrecy::SecretString;
 use serde_json::Value;
 use url::Url;
 use uuid::Uuid;
-use wyrd_auth_check::AuthzCheckRequest;
-use wyrd_auth_check::response::AuthzCheckDecision;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_cli::auth::trusted_issuer::{self, AddArgs as TrustedIssuerAddArgs, TrustedIssuerCommand};
@@ -141,36 +139,51 @@ async fn post_jwt_bearer_for_tenant(
     .expect("jwt-bearer call completes")
 }
 
-fn authz_check_request(target: &Bootstrap, action: &str) -> AuthzCheckRequest {
-    AuthzCheckRequest {
-        target: target
-            .card_ref()
-            .expect("machine target carries a card_ref")
-            .clone(),
-        action: action.to_owned(),
-        context: serde_json::json!({}),
-    }
-}
-
-/// Drive a delegated token to a real authenticated `/v1/authz/check` `200`.
+/// Register a fresh `probe` Service Card as `jwt` and return the HTTP status.
 ///
-/// `subject_jwt` is the token of a principal holding `writer`. A freshly
-/// seeded `writer` service exchanges it as the RFC 8693 actor, then runs the
-/// check on its own Card — the proven guard-passing terminal (delegated chain,
-/// eligible actor, `card_write` in the subject/actor intersection).
-///
-/// Returns the actor's principal id. That exchange is a qualifying machine
-/// API-key exchange, so it is the one runtime activation this helper causes,
-/// and a journey asserting on activity names the ids it returned rather than
-/// expecting none.
+/// Card registration is a `card_write`-guarded Wyrd API write, so the status
+/// is the server's own permission decision for the token: `201` when the
+/// token carries `card_write`, `403` when it does not, and `401` when the token
+/// no longer verifies.
 ///
 /// # Panics
-/// Panics when bootstrap, exchange, or the check fails, or the check is not `200`.
-async fn assert_v1_authz_check_ok(
+/// Panics when the request cannot be built or the route does not respond.
+async fn card_write_status(srv: &WyrdTestServer, jwt: &str, label: &str) -> StatusCode {
+    let name = format!("{label}-probe-{}", Uuid::new_v4().simple());
+    let body = serde_json::json!({ "submissions": [{
+        "apiVersion": "wyrd/v1", "kind": "Service",
+        "metadata": { "name": name, "version": "1.0.0", "space": "probe" },
+        "spec": {},
+        "artifacts": []
+    }] });
+    srv.oneshot_authenticated(
+        jwt,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/cards")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("Idempotency-Key", name)
+            .body(Body::from(body.to_string()))
+            .expect("probe registration request builds"),
+    )
+    .await
+    .expect("probe registration responds")
+    .status()
+}
+
+/// Exchange `subject_jwt` through a fresh `writer` actor into a delegated token.
+///
+/// Returns the delegated token and the actor. The actor's API-key exchange is
+/// a qualifying machine exchange, so it is the one runtime activation this
+/// helper causes.
+///
+/// # Panics
+/// Panics when bootstrap, key exchange, or delegation fails.
+async fn delegate_through_writer(
     srv: &WyrdTestServer,
     subject_jwt: &str,
     label: &str,
-) -> PrincipalId {
+) -> (String, Bootstrap) {
     let actor = srv
         .bootstrap_service(&format!("{label}-actor"), &["writer"])
         .await
@@ -183,19 +196,31 @@ async fn assert_v1_authz_check_ok(
         .delegate(subject_jwt, &actor_jwt, TokenAudience::Wyrd)
         .await
         .expect("delegation succeeds");
-    let result = srv
-        .authz_check(&delegated, authz_check_request(&actor, "card_write"))
-        .await
-        .expect("authz-check completes");
+    (delegated, actor)
+}
+
+/// Drive a delegated token to a real authorized Wyrd API write.
+///
+/// `subject_jwt` is the token of a principal holding `writer`. A freshly
+/// seeded `writer` service exchanges it as the RFC 8693 actor, then registers
+/// a Card with the delegated token, which Wyrd authorizes only when
+/// `card_write` survives the subject/actor intersection.
+///
+/// Returns the actor's principal id, so a journey asserting on activity names
+/// the one activation this helper causes.
+///
+/// # Panics
+/// Panics when bootstrap, exchange, or delegation fails, or the write is not
+/// `201`.
+async fn assert_v1_delegated_write_ok(
+    srv: &WyrdTestServer,
+    subject_jwt: &str,
+    label: &str,
+) -> PrincipalId {
+    let (delegated, actor) = delegate_through_writer(srv, subject_jwt, label).await;
     assert_eq!(
-        result.status,
-        StatusCode::OK,
-        "{label}: /v1/authz/check returns 200, got {}",
-        result.status
-    );
-    assert_eq!(
-        result.response.map(|response| response.decision),
-        Some(AuthzCheckDecision::Allow),
+        card_write_status(srv, &delegated, label).await,
+        StatusCode::CREATED,
         "{label}: the subject/actor intersection allows card_write"
     );
     actor.id()
@@ -380,13 +405,13 @@ async fn workload_token_wrong_aud_absent_keycloak() {
 ///      a server-owned Service `card_ref`; a principal is seeded under it.
 ///   3. `POST /auth/token {jwt-bearer}` exchanges the assertion for a Wyrd
 ///      Service token.
-///   4. The Service token delegates and reaches a real `/v1/authz/check` `200`.
+///   4. The Service token delegates and reaches a real `/v1/cards` `200`.
 ///
 /// # Panics
 /// Panics when the Keycloak token has no `sub`, the server fails to boot or
 /// seed the bound principal, the jwt-bearer exchange is not `200`, the grant
-/// omits `access_token` or issues a refresh token, or the delegated authz
-/// check does not return `200`.
+/// omits `access_token` or issues a refresh token, or the delegated
+/// write does not return `201`.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn workload_jwt_bearer_journey_keycloak() {
@@ -443,7 +468,7 @@ async fn workload_jwt_bearer_journey_keycloak() {
         "a workload grant issues no refresh token: {token_body}"
     );
 
-    assert_v1_authz_check_ok(&srv, wyrd_token, "workload").await;
+    assert_v1_delegated_write_ok(&srv, wyrd_token, "workload").await;
 }
 
 /// An unbound subject (issuer trusted, no matching binding) returns
@@ -653,7 +678,7 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
 
 // ─── TTL expiry journey ───────────────────────────────────────────────────────
 
-/// Mint a short-lived access token, reach a real `/v1/authz/check` `200`, sleep
+/// Mint a short-lived access token, reach a real `/v1/cards` `200`, sleep
 /// past `exp`, then assert the same token is rejected `401` on `/v1`.
 ///
 /// # Panics
@@ -686,31 +711,22 @@ async fn ttl_expiry_journey() {
         .expect("api key exchange succeeds");
 
     // Valid before expiry → real authenticated /v1 200.
-    assert_v1_authz_check_ok(&srv, &access_token, "ttl").await;
+    assert_v1_delegated_write_ok(&srv, &access_token, "ttl").await;
 
     // Sleep past access_ttl (2s) with margin for second-granular `exp`.
     tokio::time::sleep(StdDuration::from_secs(3)).await;
 
     // Expired token is rejected on /v1 (verify fails before the delegation guard).
-    let callee = srv
-        .bootstrap_service("ttl-after-callee", &["writer"])
-        .await
-        .expect("callee bootstraps");
-    let result = srv
-        .authz_check(&access_token, authz_check_request(&callee, "card_write"))
-        .await
-        .expect("post-expiry call completes");
     assert_eq!(
-        result.status,
+        card_write_status(&srv, &access_token, "ttl-after").await,
         StatusCode::UNAUTHORIZED,
-        "expired token rejected on /v1: {}",
-        result.status
+        "expired token rejected on /v1"
     );
 }
 
 // ─── Revocation journey ───────────────────────────────────────────────────────
 
-/// Mint a token, reach a real `/v1/authz/check` `200`, revoke the principal via
+/// Mint a token, reach a real `/v1/cards` `200`, revoke the principal via
 /// admin, and show revocation governs issuance: the principal's durable key can
 /// no longer exchange, while the token it already holds keeps its immutable
 /// authority until its short expiry.
@@ -748,7 +764,7 @@ async fn revocation_journey() {
         .expect("target api key exchange succeeds");
 
     // Valid before revocation → real authenticated /v1 200.
-    assert_v1_authz_check_ok(&srv, &target_token, "revoke").await;
+    assert_v1_delegated_write_ok(&srv, &target_token, "revoke").await;
 
     // Admin revokes the target principal, naming its kind and the reason.
     let revoke_resp = srv
@@ -783,7 +799,7 @@ async fn revocation_journey() {
 
     // The token minted before revocation is a self-contained snapshot, so it
     // keeps authorizing until it expires rather than being introspected.
-    assert_v1_authz_check_ok(&srv, &target_token, "revoke-window").await;
+    assert_v1_delegated_write_ok(&srv, &target_token, "revoke-window").await;
 }
 
 /// Non-admin cannot revoke a principal — must return 403.
@@ -846,12 +862,12 @@ async fn revocation_requires_admin_permission() {
 ///      SA's `service_account.id` — the direct assertion that the relaxed FK
 ///      (commit 01) accepts a non-user issuer (pre-migration this would 500).
 ///   5. Issued key → `POST /auth/token` → access token.
-///   6. `assert_v1_authz_check_ok` → `/v1/authz/check 200`.
+///   6. `assert_v1_delegated_write_ok` → `POST /v1/cards 201`.
 ///
 /// # Panics
 /// Panics when bootstrap or either key exchange fails, `/auth/issue-key` does
 /// not return `200` with a non-nil `key_id`, or the issued key's token does not
-/// reach `/v1/authz/check` `200`.
+/// reach `/v1/cards` `200`.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
 async fn service_account_issuer_full_chain() {
@@ -926,9 +942,9 @@ async fn service_account_issuer_full_chain() {
         .await
         .expect("issued key exchange succeeds");
 
-    // Terminal: /v1/authz/check 200 — proves the issued token is valid and the
+    // Terminal: /v1/cards 200 — proves the issued token is valid and the
     // full chain succeeds with a service-account issuer.
-    assert_v1_authz_check_ok(&srv, &issued_token, "sa-chain").await;
+    assert_v1_delegated_write_ok(&srv, &issued_token, "sa-chain").await;
 }
 
 // ─── Human OIDC login journey (Keycloak) ──────────────────────────────────────
@@ -1097,7 +1113,7 @@ fn principal_id_of(access_token: &str) -> String {
 ///   2. `GET /auth/login` → authorization URL + state,
 ///   3. `OidcIssuerFixture::human_login` authenticates alice → code + state,
 ///   4. `GET /auth/callback` → Wyrd access token,
-///   5. the human token reaches a real `/v1/authz/check` `200` via delegation,
+///   5. the human token reaches a real `/v1/cards` `200` via delegation,
 ///   6. the refresh token rotates, replay is refused and contained, and none
 ///      of login, refresh, or delegation records machine runtime activity.
 ///
@@ -1125,7 +1141,7 @@ async fn human_oidc_login_journey() {
     assert!(!access_token.is_empty(), "access token is non-empty");
 
     // Step 4: human token reaches a real authenticated /v1 200 via delegation.
-    let first_actor = assert_v1_authz_check_ok(&srv, access_token, "human-sso").await;
+    let first_actor = assert_v1_delegated_write_ok(&srv, access_token, "human-sso").await;
 
     // Step 5: the human session carries a refresh token. Only human sessions
     // do; a machine client re-exchanges its durable credential instead.
@@ -1154,7 +1170,8 @@ async fn human_oidc_login_journey() {
 
     // Step 7: the successor reaches the same protected /v1 200, proving the
     // renewed session kept the authority the provider asserted at login.
-    let second_actor = assert_v1_authz_check_ok(&srv, &rotated_access, "human-sso-rotated").await;
+    let second_actor =
+        assert_v1_delegated_write_ok(&srv, &rotated_access, "human-sso-rotated").await;
 
     // Neither the human login, its refresh rotation, nor the delegations the
     // checks drove are a qualifying machine exchange. The only activations are
@@ -1259,7 +1276,7 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
         .to_owned();
 
     // The live session works before anyone revokes it.
-    assert_v1_authz_check_ok(&srv, &access_token, "human-revoke").await;
+    assert_v1_delegated_write_ok(&srv, &access_token, "human-revoke").await;
 
     // An administrator revokes the human principal by id and kind.
     let admin = srv
@@ -1298,7 +1315,7 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
     );
 
     // The access token is a self-contained snapshot and lapses at expiry.
-    assert_v1_authz_check_ok(&srv, &access_token, "human-revoke-window").await;
+    assert_v1_delegated_write_ok(&srv, &access_token, "human-revoke-window").await;
 
     // The refresh half is retired in the same transaction, so rotation is
     // refused and mints no successor for the session to continue under.
@@ -1332,7 +1349,7 @@ async fn revoking_a_human_kills_the_session_refresh_authority() {
 /// Panics when the server or actor bootstrap fails, a login yields no access
 /// token, the granted session stops reaching `200` after an unchanged
 /// re-login, delegation from the reduced session fails, or the reduced
-/// session's delegated `card_write` check is not `Deny`. A panic skips the
+/// session's delegated `card_write` write is not refused `403`. A panic skips the
 /// membership restore and leaves the shared realm altered.
 #[tokio::test]
 #[ignore = "requires the Keycloak and Dex identity lane"]
@@ -1359,12 +1376,12 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .as_str()
         .expect("access_token present")
         .to_owned();
-    assert_v1_authz_check_ok(&srv, &granted_token, "roles-granted").await;
+    assert_v1_delegated_write_ok(&srv, &granted_token, "roles-granted").await;
 
     // A second login asserting the same groups changes nothing, so the first
     // session keeps working: re-authenticating must not log a user out.
     let _unchanged = human_login(&srv, &keycloak, "alice", "alice-password").await;
-    assert_v1_authz_check_ok(&srv, &granted_token, "roles-unchanged").await;
+    assert_v1_delegated_write_ok(&srv, &granted_token, "roles-unchanged").await;
 
     // The provider withdraws the group; the next login persists the reduced set.
     keycloak
@@ -1376,28 +1393,13 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .expect("access_token present")
         .to_owned();
 
-    let actor = srv
-        .bootstrap_service("roles-withdrawn-actor", &["writer"])
-        .await
-        .expect("actor bootstraps");
-    let actor_jwt = srv
-        .exchange_api_key(actor.api_key().expect("actor has key"))
-        .await
-        .expect("actor key exchanges");
-
     // The successor the same login issued carries the reduced authority: it can
     // still be a subject, but the intersection no longer holds card_write.
-    let delegated = srv
-        .delegate(&reduced_token, &actor_jwt, TokenAudience::Wyrd)
-        .await
-        .expect("the reduced session is still a valid subject");
-    let result = srv
-        .authz_check(&delegated, authz_check_request(&actor, "card_write"))
-        .await
-        .expect("authz-check completes");
+    let (delegated, _actor) =
+        delegate_through_writer(&srv, &reduced_token, "roles-withdrawn").await;
     assert_eq!(
-        result.response.map(|response| response.decision),
-        Some(AuthzCheckDecision::Deny),
+        card_write_status(&srv, &delegated, "roles-withdrawn").await,
+        StatusCode::FORBIDDEN,
         "the reduced session cannot write through its actor"
     );
 
@@ -1418,7 +1420,7 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
 ///   3. the `(issuer, subject)` binding is authored via the CLI, resolving to a
 ///      server-owned Service card a principal is seeded under,
 ///   4. `POST /auth/token {jwt-bearer}` exchanges the Keycloak assertion → 200,
-///   5. the exchanged Service token reaches a real `/v1/authz/check` 200,
+///   5. the exchanged Service token reaches a real `/v1/cards` 200,
 ///   6. the production `wyrd-client` middleware caches one exchange, reuses the
 ///      cached token while fresh, and re-exchanges on `force_refresh`.
 ///
@@ -1539,8 +1541,8 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
         .as_str()
         .expect("access_token present");
 
-    // Terminal: the exchanged Service token reaches a real /v1/authz/check 200.
-    assert_v1_authz_check_ok(&srv, wyrd_token, "cloud-journey").await;
+    // Terminal: the exchanged Service token reaches a real /v1/cards 200.
+    assert_v1_delegated_write_ok(&srv, wyrd_token, "cloud-journey").await;
 
     // Client lifecycle: the production wyrd-client middleware caches one
     // exchange, reuses it while fresh, and re-exchanges on force_refresh.
@@ -1611,7 +1613,7 @@ async fn assert_client_workload_lifecycle(srv: &WyrdTestServer, assertion: &str)
     );
 
     // The exchanged token is a real Wyrd access token usable on /v1.
-    assert_v1_authz_check_ok(srv, refreshed.expose(), "cloud-journey-client").await;
+    assert_v1_delegated_write_ok(srv, refreshed.expose(), "cloud-journey-client").await;
 }
 
 // ─── Same-issuer two-tenant isolation ─────────────────────────────────────────

@@ -37,6 +37,7 @@ mod pg_tests {
     use wyrd_sql::queries::platform::principals::{
         insert_platform_principal, platform_principal_by_id,
     };
+    use wyrd_sql::{MIGRATION_LEASE_WAIT, OperatorPool};
 
     /// Skip when no database is configured, matching the sibling Postgres suites.
     fn database_url() -> Option<String> {
@@ -992,9 +993,14 @@ mod pg_tests {
                 .execute(&pool)
                 .await
                 .expect("migration ledger row removes");
-            wyrd_sql::migrate(&pool)
+            let mut lease = OperatorPool::from(pool.clone())
+                .migration_lease(MIGRATION_LEASE_WAIT)
+                .await
+                .expect("migration lease acquires");
+            wyrd_sql::migrate(&mut lease)
                 .await
                 .expect("upgrade migration replays");
+            lease.release().await.expect("migration lease releases");
             backfilled.push(read_writers().await);
         }
 

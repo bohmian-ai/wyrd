@@ -1,19 +1,16 @@
 //! API-key exchange and RFC 8693 delegation entry paths.
 //!
 //! Each verifies only its own grant-specific evidence — the presented API key,
-//! or the subject and actor access tokens plus the invoke-policy decision —
-//! then mints through the shared [`TenantTokenIssuer`].
+//! or the subject and actor access tokens — then mints through the shared [`TenantTokenIssuer`].
 
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use wyrd_auth_check::{AuthzCheckContext, AuthzCheckRequest, PolicyHook};
 use wyrd_auth_verify::{
     ActClaim, AuthError, TokenAudience, TokenPrincipalRef, TokenVerifier, VerifiedToken,
 };
 use wyrd_runtime::{DelegationStep, PrincipalRef, RoleRef};
 use wyrd_spec::auth::PrincipalKindTag;
-use wyrd_spec::card::policy::PolicyDecision;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::{
@@ -21,17 +18,11 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::{SqlError, TenantConn};
 
-use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, audit_request_id, auth_event};
+use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
 use crate::credential_verify::verify_presented;
 use crate::error::auth_error_to_wyrd;
 use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
 use crate::issue_api_key::WyrdApiKey;
-
-/// Invoke-policy action evaluated for an A-to-B token exchange.
-///
-/// The policy is asked whether the subject may invoke the actor's Card, and
-/// the answer decides whether the actor may act on the subject's behalf.
-pub const DELEGATION_POLICY_ACTION: &str = "invoke";
 
 /// API-key exchange service.
 #[derive(Clone, Debug)]
@@ -48,9 +39,6 @@ pub struct DelegateToken {
     pub issuer: TenantTokenIssuer,
     /// Wyrd access-token verifier for the subject and actor tokens.
     pub verifier: std::sync::Arc<TokenVerifier>,
-    /// Cross-service invoke policy deciding whether the actor may act for the
-    /// subject.
-    pub policy: std::sync::Arc<dyn PolicyHook>,
 }
 
 impl std::fmt::Debug for DelegateToken {
@@ -124,9 +112,6 @@ pub enum DelegateError {
     /// The actor's principal is missing or inactive at issuance.
     #[error("actor principal not found")]
     ActorNotFound,
-    /// The invoke policy refused to let the actor act for the subject.
-    #[error("invoke policy denied the exchange: {0}")]
-    PolicyDenied(String),
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
@@ -238,11 +223,9 @@ impl DelegateToken {
     /// Both tokens are verified locally for the connection's tenant, so a
     /// cross-tenant pair fails verification; unverifiable or malformed
     /// identity input is refused before any decision and records nothing.
-    /// The invoke policy is then asked whether the subject may invoke the
-    /// actor's Card for `audience`, and exactly one canonical audit row is
-    /// committed: a denial commits its denied row; an allowance that mints
-    /// commits the issuer's token-exchange row with the token; an allowance
-    /// followed by an issuance refusal commits an allowed row with no effect.
+    /// Exactly one canonical audit row is then committed: an exchange that
+    /// mints commits the issuer's token-exchange row with the token; an
+    /// issuance refusal commits an allowed row with no effect.
     /// The issued token names the subject as principal, the actor as its
     /// outermost `act` with the subject token's earlier actors nested inside,
     /// and carries the actor's current permissions narrowed to the subject's.
@@ -252,8 +235,7 @@ impl DelegateToken {
     /// Returns [`DelegateError::InvalidSubjectToken`] or
     /// [`DelegateError::InvalidActorToken`] for an unverifiable token,
     /// [`DelegateError::MalformedIdentity`] for input that cannot name one
-    /// actor acting for one subject, [`DelegateError::PolicyDenied`] when the
-    /// invoke policy refuses, [`DelegateError::ActorNotFound`] for a missing or
+    /// actor acting for one subject, [`DelegateError::ActorNotFound`] for a missing or
     /// inactive actor, [`DelegateError::Issuance`] when issuance or an audit
     /// append fails, [`DelegateError::Database`] when a read fails, and
     /// [`DelegateError::Commit`] when the decision cannot be committed.
@@ -280,24 +262,7 @@ impl DelegateToken {
             .verifier
             .verify(&actor_token, &tenant)
             .map_err(DelegateError::InvalidActorToken)?;
-        let context = policy_context(&subject, &actor, audience, request_id)?;
-        let decision = self.policy.evaluate(&context).await;
-        if !matches!(decision, PolicyDecision::Allow) {
-            record_decision(
-                &mut conn,
-                &context,
-                &actor,
-                audience,
-                AuditOutcome::Denied,
-                request_id,
-            )
-            .await?;
-            conn.commit().await?;
-            return Err(DelegateError::PolicyDenied(match decision {
-                PolicyDecision::Deny { reason } => reason,
-                _ => "unsupported_decision".to_owned(),
-            }));
-        }
+        let chain = delegation_chain(&subject, &actor)?;
         let grant = TenantGrant::Delegation {
             subject: Box::new(TokenPrincipalRef::from(&subject.principal)),
             subject_roles: subject.principal.roles.clone(),
@@ -318,15 +283,7 @@ impl DelegateToken {
             }
             Err(error) if error.is_store_failure() => Err(error),
             Err(error) => {
-                record_decision(
-                    &mut conn,
-                    &context,
-                    &actor,
-                    audience,
-                    AuditOutcome::Allowed,
-                    request_id,
-                )
-                .await?;
+                record_refusal(&mut conn, &subject, &chain, &actor, audience, request_id).await?;
                 conn.commit().await?;
                 Err(error)
             }
@@ -334,8 +291,7 @@ impl DelegateToken {
     }
 }
 
-/// Build the invoke-policy question for one exchange: may the subject invoke
-/// the actor's Card for `audience`?
+/// Validate the exchange identity and build its actor chain, earliest first.
 ///
 /// The actor must present a direct token for a Card-bound Service or Agent,
 /// and must not be the subject itself; the subject's earlier actors precede
@@ -344,84 +300,61 @@ impl DelegateToken {
 /// # Errors
 /// Returns [`DelegateError::MalformedIdentity`] for a delegated actor token,
 /// an actor without a Service or Agent Card, or a self-exchange.
-fn policy_context(
+fn delegation_chain(
     subject: &VerifiedToken,
     actor: &VerifiedToken,
-    audience: TokenAudience,
-    request_id: &str,
-) -> Result<AuthzCheckContext, DelegateError> {
+) -> Result<Vec<DelegationStep>, DelegateError> {
     if !actor.delegation_chain.is_empty() {
         return Err(DelegateError::MalformedIdentity("actor_token_is_delegated"));
     }
     if actor.principal.id == subject.principal.id {
         return Err(DelegateError::MalformedIdentity("actor_is_subject"));
     }
-    let Some(target) = actor.principal.card_ref().cloned() else {
+    if actor.principal.card_ref().is_none() {
         return Err(DelegateError::MalformedIdentity("actor_not_card_bound"));
-    };
-    let actor_ref = PrincipalRef::from_principal(&actor.principal);
-    let chain = subject
+    }
+    Ok(subject
         .delegation_chain
         .iter()
-        .map(|step| step.principal.clone())
-        .chain(std::iter::once(actor_ref.clone()))
-        .collect();
-    Ok(AuthzCheckContext {
-        subject: subject.principal.clone(),
-        actor: actor_ref,
-        chain,
-        request: AuthzCheckRequest {
-            target,
-            action: DELEGATION_POLICY_ACTION.to_owned(),
-            context: json!({ "audience": audience.as_str() }),
-        },
-        metadata: None,
-        request_id: audit_request_id(request_id),
-    })
+        .cloned()
+        .chain(std::iter::once(DelegationStep {
+            principal: PrincipalRef::from_principal(&actor.principal),
+        }))
+        .collect())
 }
 
-/// Append the exchange decision for an exchange that minted no token.
+/// Append the exchange decision for an exchange whose issuance refused.
 ///
 /// A minted token's decision is the issuer's token-exchange row, so this is
-/// only for a policy denial or an allowance whose issuance then refused. Like
-/// every delegated request, the row is recorded under the subject with the
-/// full actor chain, targets the requested audience, and attaches the
-/// credential that authenticated the actor. Its permission is the invoke
-/// action the policy evaluated, so the row names the decision it records.
+/// only for an issuance refusal. Like every delegated request, the row is
+/// recorded under the subject with the full actor chain, targets the requested
+/// audience, and attaches the credential that authenticated the actor.
 ///
 /// # Errors
 /// Returns [`DelegateError::Issuance`] carrying the audit-unavailable error
 /// when the append fails.
-async fn record_decision(
+async fn record_refusal(
     conn: &mut TenantConn<'_>,
-    context: &AuthzCheckContext,
+    subject: &VerifiedToken,
+    chain: &[DelegationStep],
     actor: &VerifiedToken,
     audience: TokenAudience,
-    outcome: AuditOutcome,
     request_id: &str,
 ) -> Result<(), DelegateError> {
-    let subject = &context.subject;
-    let chain: Vec<DelegationStep> = context
-        .chain
-        .iter()
-        .map(|principal| DelegationStep {
-            principal: principal.clone(),
-        })
-        .collect();
+    let subject = &subject.principal;
     let mut event = auth_event(
         request_id,
         TOKEN_EXCHANGE_OPERATION,
         subject.id,
         subject.kind.tag(),
         subject.card_ref().cloned(),
-        outcome,
+        AuditOutcome::Allowed,
         AuditDetail::DelegationAttribution {
-            delegation_chain: wyrd_runtime::audit_delegation_chain(&chain),
+            delegation_chain: wyrd_runtime::audit_delegation_chain(chain),
         },
     )
     .with_credential_id(actor.principal.credential_id);
     audience.as_str().clone_into(&mut event.resource);
-    context.request.action.clone_into(&mut event.permission);
     append_auth_audit(conn, &event)
         .await
         .map_err(|error| DelegateError::Issuance(IssuanceError::Wyrd(error)))
@@ -574,10 +507,6 @@ impl From<DelegateError> for WyrdError {
                 message: "actor principal not found in tenant".to_owned(),
                 details: json!({}),
             },
-            DelegateError::PolicyDenied(reason) => WyrdError::PolicyDenied {
-                message: "invoke policy denied the token exchange".to_owned(),
-                details: json!({ "reason": reason }),
-            },
             DelegateError::Database(error) => IssuanceError::Database(error).into(),
             DelegateError::Issuance(error) => error.into(),
             DelegateError::Commit(error) => {
@@ -603,7 +532,6 @@ mod pg_tests {
     use serde_json::Value as JsonValue;
     use sqlx::types::Json;
     use uuid::Uuid;
-    use wyrd_auth_check::{DenyAllPolicyHook, PolicyHook, RecordingPolicyHook};
     use wyrd_auth_issue::{AccessGrant, IssuingKey};
     use wyrd_auth_verify::{
         ActClaim, AuthError, Kid, TokenAudience, TokenPrincipalRef, TokenVerifier,
@@ -675,12 +603,11 @@ mod pg_tests {
         }
     }
 
-    /// Build an exchange service whose verifier trusts the test signing key and
-    /// whose invoke policy is `policy`.
+    /// Build an exchange service whose verifier trusts the test signing key.
     ///
     /// # Panics
     /// Panics when the static test public key or key id fails to load.
-    fn delegate_service(policy: Arc<dyn PolicyHook>) -> DelegateToken {
+    fn delegate_service() -> DelegateToken {
         let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
         let mut decoding_keys = HashMap::new();
         decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
@@ -691,7 +618,6 @@ mod pg_tests {
                 "wyrd",
                 WyrdAuthVerifySettings::default(),
             )),
-            policy,
         }
     }
 
@@ -1530,7 +1456,7 @@ mod pg_tests {
         )
     }
 
-    /// Exchange `subject` and `actor` tokens for a Bifrost token under `policy`.
+    /// Exchange `subject` and `actor` tokens for a Bifrost token.
     ///
     /// # Errors
     /// Returns the [`DelegateError`] the exchange refuses with, unchanged.
@@ -1539,12 +1465,11 @@ mod pg_tests {
     /// Panics when the tenant connection cannot be opened.
     async fn exchange(
         fixture: &PgFixture,
-        policy: Arc<dyn PolicyHook>,
         subject: String,
         actor: String,
     ) -> Result<super::ExchangedToken, DelegateError> {
         let conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        delegate_service(policy)
+        delegate_service()
             .execute(
                 conn,
                 SecretString::from(subject),
@@ -1594,72 +1519,13 @@ mod pg_tests {
             .collect()
     }
 
-    /// The invoke policy that allows every exchange.
-    fn allow() -> Arc<dyn PolicyHook> {
-        Arc::new(RecordingPolicyHook::default())
-    }
-
-    /// A policy-denied actor is refused and the denial commits under the
-    /// subject, naming the actor as the current actor and its credential.
-    ///
-    /// # Panics
-    /// Panics when the exchange is not policy-denied with the hook's reason, or
-    /// when anything other than one denied decision naming the subject, the
-    /// actor's credential, and a one-step actor chain commits.
-    #[tokio::test]
-    async fn a_policy_denied_exchange_commits_one_denied_decision() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let actor = seed_actor(&fixture, serde_json::json!([])).await;
-        let subject = Uuid::new_v4();
-        let deny = Arc::new(DenyAllPolicyHook {
-            reason: "a_may_not_invoke_b".to_owned(),
-        });
-
-        let result = exchange(
-            &fixture,
-            deny,
-            mint(
-                service_ref(subject, tenant, "test-service"),
-                PermissionSet::new(),
-                None,
-                None,
-            ),
-            actor_token(actor, tenant),
-        )
-        .await;
-
-        assert!(
-            matches!(&result, Err(DelegateError::PolicyDenied(reason)) if reason == "a_may_not_invoke_b"),
-            "{result:?}"
-        );
-        let decisions = exchange_decisions(&fixture).await;
-        let [(outcome, permission, principal, credential, detail)] = decisions.as_slice() else {
-            panic!("exactly one decision commits, got {decisions:?}");
-        };
-        assert_eq!(outcome, "denied");
-        assert_eq!(permission, super::DELEGATION_POLICY_ACTION);
-        assert_eq!(*principal, subject);
-        assert_eq!(*credential, Some(ACTOR_CREDENTIAL));
-        let AuditDetail::DelegationAttribution { delegation_chain } = detail else {
-            panic!("a denial carries the actor chain, got {detail:?}");
-        };
-        assert_eq!(
-            delegation_chain
-                .iter()
-                .map(|step| step.principal_id.as_uuid())
-                .collect::<Vec<_>>(),
-            [actor]
-        );
-    }
-
     /// An allowed exchange whose actor no longer exists keeps its allowance
     /// with no effect.
     ///
     /// # Panics
     /// Panics when the exchange does not fail with
     /// [`DelegateError::ActorNotFound`] or anything other than one allowed
-    /// invoke decision commits.
+    /// token-exchange decision commits.
     #[tokio::test]
     async fn an_allowed_exchange_for_a_missing_actor_commits_one_allowed_decision() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1667,7 +1533,6 @@ mod pg_tests {
 
         let result = exchange(
             &fixture,
-            allow(),
             subject_token(tenant, PermissionSet::new()),
             actor_token(Uuid::new_v4(), tenant),
         )
@@ -1679,20 +1544,17 @@ mod pg_tests {
         );
         assert_eq!(
             exchange_outcomes(&fixture).await,
-            [(
-                "allowed".to_owned(),
-                super::DELEGATION_POLICY_ACTION.to_owned()
-            )],
-            "one allowance names the evaluated invoke action"
+            [("allowed".to_owned(), TOKEN_EXCHANGE_OPERATION.to_owned())],
+            "one allowance names the token-exchange operation"
         );
     }
 
     /// Unverifiable, cross-tenant, or malformed identity input is refused
-    /// before the policy decides and records nothing.
+    /// before issuance and records nothing.
     ///
     /// # Panics
-    /// Panics when a case is not refused with its expected early error, the
-    /// policy is consulted, or any decision commits.
+    /// Panics when a case is not refused with its expected early error or any
+    /// decision commits.
     #[tokio::test]
     async fn invalid_or_malformed_identity_input_records_no_decision() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1720,7 +1582,6 @@ mod pg_tests {
             None,
         );
         let foreign_actor = actor_token(actor, DataTenantId::new_v7());
-        let policy = Arc::new(RecordingPolicyHook::default());
 
         let cases: [(&str, String, String); 6] = [
             (
@@ -1735,7 +1596,7 @@ mod pg_tests {
             ("self exchange", subject.clone(), subject),
         ];
         for (label, subject, actor) in cases {
-            let result = exchange(&fixture, policy.clone(), subject, actor).await;
+            let result = exchange(&fixture, subject, actor).await;
             let refused_early = match label {
                 "invalid subject" => matches!(result, Err(DelegateError::InvalidSubjectToken(_))),
                 "invalid actor" => matches!(result, Err(DelegateError::InvalidActorToken(_))),
@@ -1750,20 +1611,18 @@ mod pg_tests {
                 "{label} must be refused early, got {result:?}"
             );
         }
-        assert!(policy.calls().is_empty(), "no refusal reaches the policy");
         assert!(exchange_outcomes(&fixture).await.is_empty());
     }
 
     /// A successful exchange names the subject as principal and the actor as
     /// the outer `act` with earlier actors nested in RFC order, carries only
     /// authority both parties hold at the narrower scope, is Bifrost-only,
-    /// asks the policy the directed A-to-B question, commits one allowed
-    /// decision naming both parties, and issues no refresh token.
+    /// commits one allowed decision naming both parties, and issues no refresh token.
     ///
     /// # Panics
     /// Panics when the exchange fails, the token verifies on the general Wyrd
     /// audience, the principal, chain, or narrowed permissions differ, a
-    /// refresh token is issued, the policy question differs, or the single
+    /// refresh token is issued, or the single
     /// committed decision does not name both parties.
     #[tokio::test]
     async fn an_exchange_names_subject_and_actor_and_carries_only_the_intersection() {
@@ -1808,18 +1667,11 @@ mod pg_tests {
                 act: None,
             })),
         );
-        let policy = Arc::new(RecordingPolicyHook::default());
+        let exchanged = exchange(&fixture, subject, actor_token(actor, tenant))
+            .await
+            .expect("exchange succeeds");
 
-        let exchanged = exchange(
-            &fixture,
-            policy.clone(),
-            subject,
-            actor_token(actor, tenant),
-        )
-        .await
-        .expect("exchange succeeds");
-
-        let verifier = delegate_service(allow()).verifier;
+        let verifier = delegate_service().verifier;
         assert!(
             verifier.verify(&exchanged.access_token, &tenant).is_err(),
             "a Bifrost token is refused on a general Wyrd surface"
@@ -1846,19 +1698,12 @@ mod pg_tests {
         assert_eq!(delegated.principal.credential_id, None);
         assert!(exchanged.refresh_token.is_none());
 
-        let asked = policy.last().expect("the policy decided");
-        assert_eq!(asked.subject.id.as_uuid(), subject_id);
-        assert_eq!(asked.actor.id.as_uuid(), actor);
-        assert_eq!(asked.request.target, named_service_card_ref(ACTOR_CARD));
-        assert_eq!(asked.request.action, super::DELEGATION_POLICY_ACTION);
-        assert_eq!(asked.request.context["audience"], "bifrost");
-
         let decisions = exchange_decisions(&fixture).await;
         let [(outcome, permission, principal, credential, detail)] = decisions.as_slice() else {
             panic!("exactly one decision commits, got {decisions:?}");
         };
         assert_eq!(outcome, "allowed");
-        assert_eq!(permission, super::DELEGATION_POLICY_ACTION);
+        assert_eq!(permission, TOKEN_EXCHANGE_OPERATION);
         assert_eq!(*principal, subject_id);
         assert_eq!(*credential, Some(ACTOR_CREDENTIAL));
         let AuditDetail::TokenExchange {
@@ -1892,7 +1737,6 @@ mod pg_tests {
 
         let result = exchange(
             &fixture,
-            allow(),
             subject_token(tenant, PermissionSet::new()),
             actor_token(actor, tenant),
         )

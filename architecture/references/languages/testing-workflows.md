@@ -63,7 +63,9 @@ Use the narrowest `mise` task that covers the touched surface:
 
 `wyrd-dev-fixtures::PgFixture` owns one isolated ephemeral database per test.
 The least-privilege `wyrd_test_admin` role alone creates and drops databases;
-`wyrd_migrator` owns and migrates schemas but cannot create or drop databases.
+it also owns and migrates each fixture database, as `wyrd-server migrate` does,
+while the serving `wyrd_app` and `wyrd_platform_admin` logins cannot create or
+drop databases.
 `PgFixture::attach` lets child processes reuse the parent-created database
 without remigration, reseeding, or cleanup authority. Attached fixtures are
 non-owning and cannot destroy the parent database.

@@ -1,0 +1,192 @@
+# Wyrd workloads for the kind autoscaling journey. Apply after `infra.yaml`,
+# the `wyrd-secrets` and `wyrd-peer-tls` Secrets, and the migrate Job.
+#
+# `wyrd-core` is one fixed `all` replica: it owns the only Scribe and Forge
+# coordination. A second `all` replica would be a standby Forge coordinator,
+# which is unready by design, so the autoscaled tier is `wyrd-oracle`: the
+# `oracle` target serves the public API and executes reads on its own Oracle,
+# fetching live rows from the anchor's Scribe tail over mTLS. It owns no Scribe
+# WAL or node identity, so it is a Deployment on ephemeral scratch. The
+# HorizontalPodAutoscaler grows it from one replica to two on its measured
+# successful Oracle-executed read rate.
+#
+# Both templates inject their own pod IP through the Downward API and
+# advertise `$(POD_IP):50052`; no replica has an individually authored address.
+apiVersion: v1
+kind: Service
+metadata: {name: wyrd-core, namespace: wyrd-kind}
+spec:
+  clusterIP: None
+  selector: {app: wyrd-core}
+  ports: [{name: http, port: 8080}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: wyrd-core, namespace: wyrd-kind}
+spec:
+  serviceName: wyrd-core
+  replicas: 1
+  selector: {matchLabels: {app: wyrd-core}}
+  template:
+    metadata:
+      labels: {app: wyrd-core}
+      annotations: {wyrd.ai/scrape-port: "9464"}
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: wyrd
+          image: wyrd:kind
+          imagePullPolicy: Never
+          env:
+            - {name: WYRD_TARGET, value: all}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: WYRD_PEER_ADDRESS, value: "$(POD_IP):50052"}
+            - {name: WYRD_PEER_TLS_DIR, value: /etc/wyrd/peer}
+            - {name: WYRD_METRICS_BIND, value: "$(POD_IP):9464"}
+            - name: WYRD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-secrets, key: database-url}}
+            - name: WYRD_PLATFORM_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-secrets, key: platform-database-url}}
+            - {name: WYRD_SIGNING_KEY_FILE, value: /run/wyrd/signing.pem}
+            - {name: WYRD_STORAGE_URL, value: "s3://wyrd-kind"}
+            - {name: WYRD_STORAGE_ENDPOINT_URL, value: "http://rustfs.wyrd-kind.svc:9000"}
+            - {name: AWS_REGION, value: us-east-1}
+            - {name: AWS_ACCESS_KEY_ID, value: wyrd-kind-key}
+            - {name: AWS_SECRET_ACCESS_KEY, value: wyrd-kind-secret}
+            - {name: WYRD_LOG, value: "info"}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: grpc, containerPort: 50051}
+            - {name: peer, containerPort: 50052}
+            - {name: metrics, containerPort: 9464}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+            failureThreshold: 3
+          # `all` adds the default four-fifths Forge compaction budget to the
+          # 768 MiB of Scribe, Oracle, and unmanaged floors, so it needs at
+          # least 3.75 GiB; 3 GiB refuses to boot.
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {cpu: "2", memory: 4Gi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/wyrd}
+            - {name: peer-tls, mountPath: /etc/wyrd/peer, readOnly: true}
+            - {name: signing, mountPath: /run/wyrd, readOnly: true}
+      volumes:
+        - name: peer-tls
+          secret: {secretName: wyrd-peer-tls}
+        - name: signing
+          secret: {secretName: wyrd-secrets, items: [{key: signing.pem, path: signing.pem}]}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 2Gi}}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: wyrd-oracle, namespace: wyrd-kind}
+spec:
+  selector: {app: wyrd-oracle}
+  ports:
+    - {name: http, port: 8080}
+    - {name: grpc, port: 50051}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: wyrd-oracle, namespace: wyrd-kind}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: wyrd-oracle}}
+  template:
+    metadata:
+      labels: {app: wyrd-oracle}
+      annotations: {wyrd.ai/scrape-port: "9464"}
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: wyrd
+          image: wyrd:kind
+          imagePullPolicy: Never
+          env:
+            - {name: WYRD_TARGET, value: oracle}
+            - name: POD_IP
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - {name: WYRD_PEER_ADDRESS, value: "$(POD_IP):50052"}
+            - {name: WYRD_PEER_TLS_DIR, value: /etc/wyrd/peer}
+            - {name: WYRD_METRICS_BIND, value: "$(POD_IP):9464"}
+            - name: WYRD_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-secrets, key: database-url}}
+            - name: WYRD_PLATFORM_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-secrets, key: platform-database-url}}
+            - {name: WYRD_SIGNING_KEY_FILE, value: /run/wyrd/signing.pem}
+            - {name: WYRD_STORAGE_URL, value: "s3://wyrd-kind"}
+            - {name: WYRD_STORAGE_ENDPOINT_URL, value: "http://rustfs.wyrd-kind.svc:9000"}
+            - {name: AWS_REGION, value: us-east-1}
+            - {name: AWS_ACCESS_KEY_ID, value: wyrd-kind-key}
+            - {name: AWS_SECRET_ACCESS_KEY, value: wyrd-kind-secret}
+            - {name: WYRD_LOG, value: "info"}
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: grpc, containerPort: 50051}
+            - {name: peer, containerPort: 50052}
+            - {name: metrics, containerPort: 9464}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {cpu: "2", memory: 3Gi}
+          volumeMounts:
+            - {name: scratch, mountPath: /var/lib/wyrd}
+            - {name: peer-tls, mountPath: /etc/wyrd/peer, readOnly: true}
+            - {name: signing, mountPath: /run/wyrd, readOnly: true}
+      volumes:
+        - name: scratch
+          emptyDir: {sizeLimit: 2Gi}
+        - name: peer-tls
+          secret: {secretName: wyrd-peer-tls}
+        - name: signing
+          secret: {secretName: wyrd-secrets, items: [{key: signing.pem, path: signing.pem}]}
+---
+# Illustrative local target, not a production default: about ten successful
+# Oracle-executed reads per second per Oracle pod, capped at two replicas.
+# Scale-down is held for the length of the journey so the second Oracle stays
+# for the remote-read proof.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: wyrd-oracle, namespace: wyrd-kind}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: wyrd-oracle}
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+    - type: Pods
+      pods:
+        metric: {name: wyrd_oracle_reads_per_second}
+        target: {type: AverageValue, averageValue: "10"}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{type: Pods, value: 1, periodSeconds: 15}]
+    scaleDown:
+      stabilizationWindowSeconds: 600
+---
+# Probe client: holds the peer bundle so the script can check the peer port's
+# client-certificate requirement from inside the pod network.
+apiVersion: v1
+kind: Pod
+metadata: {name: probe, namespace: wyrd-kind}
+spec:
+  containers:
+    - name: probe
+      image: curlimages/curl@sha256:83a505ba2ba62f208ed6e410c268b7b9aa48f0f7b403c8108b9773b44199dbba
+      command: [sleep, "3600"]
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {cpu: 200m, memory: 64Mi}
+      volumeMounts: [{name: peer-tls, mountPath: /etc/wyrd/peer, readOnly: true}]
+  volumes:
+    - name: peer-tls
+      secret: {secretName: wyrd-peer-tls}

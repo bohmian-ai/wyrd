@@ -1,4 +1,8 @@
-//! Authenticated generated-tonic adapter for private Oracle peer execution.
+//! Generated-tonic adapter for private Oracle peer execution.
+//!
+//! Mounted only on the mTLS peer listener, which admits cluster members by
+//! certificate. Each handler checks its typed context against this receiver's
+//! own identity, fence, clock, and received bytes before any decode or IO.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -130,8 +134,8 @@ impl OraclePeerGrpc {
 
     /// Authorizes one reservation operation before any capacity state changes.
     ///
-    /// The ticket is detached from the request first, so the digest is taken
-    /// over exactly the encoding the leader signed: the request with its ticket
+    /// The context is detached from the request first, so the digest is taken
+    /// over exactly the encoding the leader bound: the request with its context
     /// field cleared. Everything the follower compares against — its own node
     /// identity, its own current fence, the leader identity the cluster
     /// confirmed live — is derived here rather than read from the message.
@@ -139,15 +143,15 @@ impl OraclePeerGrpc {
     /// # Errors
     ///
     /// Returns `FailedPrecondition` when no Oracle role owns this node's
-    /// reservation authority, `Unauthenticated` when no ticket is presented,
-    /// and `PermissionDenied` for a ticket that is malformed, misbound,
-    /// expired, or replayed. The refusal is durably audited before it returns;
+    /// reservation authority, `Unauthenticated` when no context is presented,
+    /// and `PermissionDenied` for a context that is malformed, misbound,
+    /// or expired. The refusal is durably audited before it returns;
     /// an audit that cannot commit surfaces as `Unavailable`.
     async fn authorize_reservation<T: Message>(
         &self,
         operation: ReservationOperationV1,
-        ticket_free: &T,
-        ticket: Option<proto::SignedPeerTicket>,
+        context_free: &T,
+        context: Option<proto::PeerContext>,
         leader_node_id: wyrd_spec::vala::api::NodeId,
         leader_fence: u64,
         query_id: uuid::Uuid,
@@ -156,15 +160,16 @@ impl OraclePeerGrpc {
             .bifrost
             .oracle()
             .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?;
-        let Some(ticket) = ticket else {
+        let Some(context) = context else {
             self.audit_denial(BifrostSecurityViolationKind::PeerSignature)
                 .await?;
             return Err(Status::unauthenticated(
-                "Bifrost peer reservation ticket is absent",
+                "Bifrost peer reservation context is absent",
             ));
         };
-        let ticket = wyrd_spec::vala::api::SignedPeerTicket::try_from(ticket)
-            .map_err(|_| Status::permission_denied("Bifrost peer reservation ticket is invalid"))?;
+        let context = wyrd_spec::vala::api::PeerContext::try_from(context).map_err(|_| {
+            Status::permission_denied("Bifrost peer reservation context is invalid")
+        })?;
         let registered = oracle.registered_role();
         let binding = ReservationBinding {
             operation,
@@ -178,9 +183,9 @@ impl OraclePeerGrpc {
             .peer()
             .authority()
             .verify_reservation(
-                &ticket,
+                &context,
                 &binding,
-                &ticket_free.encode_to_vec(),
+                &context_free.encode_to_vec(),
                 chrono::Utc::now(),
             )
             .await
@@ -236,18 +241,18 @@ impl OraclePeerGrpc {
         let verifier: Arc<dyn PeerTicketVerifier> = scribe.fragment_verifier();
         let verified = verifier
             .verify_peer_ticket(
-                &request.ticket,
+                &request.context,
                 local_role.key.node_id,
                 local_role.fencing_token,
                 chrono::Utc::now(),
             )
             .await
             .map_err(|error| {
-                tracing::error!(?error, "Scribe peer ticket verification failed");
+                tracing::error!(?error, "Scribe peer context verification failed");
                 DispatchError::Terminal
             })?;
         let claims = PeerTicketClaims::decode(verified.0.as_slice()).map_err(|error| {
-            tracing::error!(?error, "Scribe peer ticket claims decode failed");
+            tracing::error!(?error, "Scribe peer context claims decode failed");
             DispatchError::Terminal
         })?;
         let tenant_id = uuid::Uuid::from_slice(&claims.tenant_id)
@@ -277,10 +282,9 @@ impl OraclePeerGrpc {
             tracing::error!("Scribe peer physical claims validation failed");
             return Err(DispatchError::Terminal);
         }
-        // Recomputed last, before any provider or tail I/O: a valid
-        // signature only proves the claims were not tampered with in
-        // transit, not that the signed closed-predicate/projection closure
-        // matches what this Scribe worker actually received.
+        // Recomputed last, before any provider or tail I/O: the context names
+        // the closed-predicate/projection closure the leader intended, and
+        // this proves it matches what this Scribe worker actually received.
         match vala_bifrost_redux::oracle::peer::assignment_authority_digest_for(
             &request.assignments,
         ) {
@@ -389,48 +393,27 @@ impl OraclePeerGrpc {
     }
 }
 
-/// Reads the peer identity the authentication layer established for a request.
-///
-/// The layer runs before the body is polled, so an admitted handler always
-/// finds this present. Its absence means the service was mounted outside the
-/// peer boundary, which is refused rather than reconstructed here: a handler
-/// that could rebuild identity from metadata would be a second authentication
-/// path, and the plane is required to have exactly one.
-///
-/// # Errors
-///
-/// Returns `Unauthenticated` when no context is attached.
-fn peer_context<T>(
-    request: &Request<T>,
-) -> Result<&vala_bifrost_redux::oracle::peer::AuthenticatedPeerContext, Status> {
-    request
-        .extensions()
-        .get::<vala_bifrost_redux::oracle::peer::AuthenticatedPeerContext>()
-        .ok_or_else(|| Status::unauthenticated("Bifrost peer identity is absent"))
-}
-
 #[wyrd_tonic::tonic::async_trait]
 impl OraclePeerService for OraclePeerGrpc {
     /// Worker attempt stream retaining the running slot until EOF or cancellation.
     type ExecuteFragmentStream =
         Pin<Box<dyn Stream<Item = Result<proto::WorkerAttemptFrame, Status>> + Send>>;
-    /// Authenticated public-query frames proxied from the selected local Oracle.
+    /// Public-query frames proxied from the selected local Oracle.
     type ForwardQueryStream = crate::grpc::query::QueryGrpcStream;
 
-    /// Reserves one bounded pending slot after workload authentication.
+    /// Reserves one bounded pending slot after its context is checked.
     ///
     /// # Errors
-    /// Returns an authentication, conversion, or worker rejection status.
+    /// Returns a context, conversion, or worker rejection status.
     async fn reserve_slots(
         &self,
         request: Request<ReserveNodeSlotsRequest>,
     ) -> Result<Response<proto::ReserveNodeSlotsResponse>, Status> {
-        peer_context(&request)?;
         let mut wire = request.into_inner();
-        let ticket = wire.ticket.take();
+        let context = wire.context.take();
         let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(wire.clone())
             .map_err(conversion_status)?;
-        // Fence liveness first, then the purpose ticket, and only then any
+        // Fence liveness first, then the typed context, and only then any
         // capacity change: an unauthorized reserve must not charge the
         // follower even transiently.
         if self
@@ -449,7 +432,7 @@ impl OraclePeerService for OraclePeerGrpc {
         self.authorize_reservation(
             ReservationOperationV1::ReserveSlots,
             &wire,
-            ticket,
+            context,
             request.leader_node_id,
             request.leader_fencing_token,
             request.query_id.as_uuid(),
@@ -463,17 +446,16 @@ impl OraclePeerService for OraclePeerGrpc {
         Ok(Response::new(worker.reserve(&request).await.into()))
     }
 
-    /// Releases one matching reservation idempotently after workload authentication.
+    /// Releases one matching reservation idempotently after its context is checked.
     ///
     /// # Errors
-    /// Returns an authentication or conversion status.
+    /// Returns a context or conversion status.
     async fn release_slots(
         &self,
         request: Request<ReleaseNodeSlotsRequest>,
     ) -> Result<Response<proto::ReleaseNodeSlotsResponse>, Status> {
-        peer_context(&request)?;
         let mut wire = request.into_inner();
-        let ticket = wire.ticket.take();
+        let context = wire.context.take();
         let request = wyrd_spec::vala::api::ReleaseNodeSlotsRequest::try_from(wire.clone())
             .map_err(conversion_status)?;
         // A release is state-changing, so it is authorized on exactly the same
@@ -482,7 +464,7 @@ impl OraclePeerService for OraclePeerGrpc {
         self.authorize_reservation(
             ReservationOperationV1::ReleaseSlots,
             &wire,
-            ticket,
+            context,
             request.leader_node_id,
             request.leader_fencing_token,
             request.query_id.as_uuid(),
@@ -499,12 +481,11 @@ impl OraclePeerService for OraclePeerGrpc {
     /// Executes verified immutable work and streams a footer-terminated attempt.
     ///
     /// # Errors
-    /// Returns an authentication, conversion, security, or execution status.
+    /// Returns a conversion, security, or execution status.
     async fn execute_fragment(
         &self,
         request: Request<proto::ExecuteFragmentRequest>,
     ) -> Result<Response<Self::ExecuteFragmentStream>, Status> {
-        peer_context(&request)?;
         let request =
             ExecuteFragmentRequest::try_from(request.into_inner()).map_err(conversion_status)?;
         let WorkerExecution { mut stream } = match request.target_fence.role {
@@ -523,25 +504,21 @@ impl OraclePeerService for OraclePeerGrpc {
         Ok(Response::new(Box::pin(output)))
     }
 
-    /// Verifies one authenticated forwarding envelope and executes its exact local leader cut.
+    /// Checks one forwarding context and executes its exact local leader cut.
     ///
     /// # Errors
-    /// Returns authentication, signature, policy, fence, deadline, or query status before a
+    /// Returns context, policy, fence, deadline, or query status before a
     /// response stream is published.
     async fn forward_query(
         &self,
         request: Request<ForwardQueryRequest>,
     ) -> Result<Response<Self::ForwardQueryStream>, Status> {
-        peer_context(&request)?;
-        let envelope = request
+        let context = request
             .into_inner()
-            .envelope
-            .ok_or_else(|| Status::invalid_argument("forwarding envelope is required"))?;
-        let ticket = wyrd_spec::vala::api::SignedPeerTicket {
-            key_id: envelope.key_id,
-            claims_bytes: envelope.claims_bytes,
-            signature: envelope.signature,
-        };
+            .context
+            .ok_or_else(|| Status::invalid_argument("forwarding context is required"))?;
+        let context = wyrd_spec::vala::api::PeerContext::try_from(context)
+            .map_err(|_| Status::invalid_argument("forwarding context is invalid"))?;
         self.bifrost
             .gate()
             .ensure_query_open()
@@ -554,7 +531,7 @@ impl OraclePeerService for OraclePeerGrpc {
         #[cfg(feature = "test-support")]
         forwarder.silent_peer_for_test().hold_if_armed().await;
         let stream = forwarder
-            .accept(ticket)
+            .accept(context)
             .await
             .map_err(|error| crate::grpc::query::query_status(error.into()))?;
         Ok(crate::grpc::query::query_stream_response(stream))

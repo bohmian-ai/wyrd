@@ -4,7 +4,7 @@ mod pg_tests {
     //! Skipped automatically when env vars are unset so the default test suite
     //! remains credential-free. Run with:
     //!   WYRD_DATABASE_URL=postgres://wyrd_app:<pw>@localhost/wyrd \
-    //!   WYRD_DATABASE_MIGRATOR_PASSWORD=<migrator_pw> \
+    //!   WYRD_TEST_DATABASE_ADMIN_URL=postgres://<owner>:<pw>@localhost/wyrd \
     //!   cargo test -p wyrd-sql --all-features --test migration_pg
 
     use sqlx::PgPool;
@@ -26,9 +26,143 @@ mod pg_tests {
     use wyrd_sql::queries::auth::insert_trusted_issuer as insert_trusted_issuer_query;
     use wyrd_sql::queries::auth::insert_workload_binding as insert_workload_binding_query;
     use wyrd_sql::queries::storage;
-    use wyrd_sql::{SqlError, SqlStore, TenantConn};
+    use wyrd_sql::{MIGRATION_LEASE_WAIT, OperatorPool, PoolConfig, SqlError, TenantConn};
 
     const SYSTEM_TENANT_MIGRATION_VERSION: i64 = 20260601000015;
+
+    /// Opens an owner-login [`OperatorPool`] on `url`, as the one-off
+    /// `wyrd-server migrate` does, so tests migrate and inspect through the
+    /// same handle and lease path.
+    ///
+    /// # Errors
+    /// Returns the pool construction or connection failure.
+    async fn owner_pool(url: &str) -> Result<OperatorPool, sqlx::Error> {
+        wyrd_sql::pool::build_pool(url, PoolConfig::migrator_defaults())
+            .await
+            .map(OperatorPool::from)
+    }
+
+    /// Migrates Wyrd under a freshly acquired migration lease, as the one-off
+    /// `wyrd-server migrate` does, releasing the lease whatever the outcome.
+    ///
+    /// # Errors
+    /// Returns the lease or migration failure unchanged.
+    async fn migrate_under_lease(pool: &PgPool) -> Result<(), SqlError> {
+        let mut lease = OperatorPool::from(pool.clone())
+            .migration_lease(MIGRATION_LEASE_WAIT)
+            .await?;
+        let result = wyrd_sql::migrate(&mut lease).await;
+        let released = lease.release().await;
+        result.and(released)
+    }
+
+    /// Competing migrators are serialized by one bounded database-wide lease.
+    ///
+    /// While one migrator holds the lease, a second waits no longer than its
+    /// bound and fails with a conflict instead of entering any stage; once the
+    /// holder fails (its session ends) or releases normally, a retry acquires
+    /// the lease and migrates.
+    #[tokio::test]
+    async fn migration_lease_serializes_and_bounds_competing_migrators() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("fixture starts");
+        let store = OperatorPool::from(fixture.superuser_pool().await.expect("owner pool"));
+        let bound = Duration::from_millis(300);
+
+        let holder = store
+            .migration_lease(bound)
+            .await
+            .expect("first migrator takes the lease");
+        let started = std::time::Instant::now();
+        let competing = store.migration_lease(bound).await;
+        assert!(
+            matches!(competing, Err(SqlError::Conflict { .. })),
+            "a competing migrator must be refused while the lease is held"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the competing migrator waited {:?}, beyond its bound",
+            started.elapsed()
+        );
+
+        drop(holder);
+        let mut retry = store
+            .migration_lease(MIGRATION_LEASE_WAIT)
+            .await
+            .expect("a retry takes the lease after the holder's session ends");
+        wyrd_sql::migrate(&mut retry)
+            .await
+            .expect("the retry migrates under the lease");
+        retry.release().await.expect("the retry releases the lease");
+        store
+            .migration_lease(bound)
+            .await
+            .expect("the lease is free after a normal release")
+            .release()
+            .await
+            .expect("the lease releases");
+    }
+
+    /// A tenant policy keyed on the wrong column fails both readiness checks.
+    ///
+    /// Rewriting `wyrd.auth_users`' named `tenant_isolation` policy to compare
+    /// the row's own `id` keeps its name, role, command, permissiveness, and
+    /// RLS flags valid, so only the exact expression check can catch it. The
+    /// owner post-migration check `wyrd-server migrate` runs and the serving
+    /// validation boot runs must both refuse it, and both pass once the
+    /// approved `data_tenant_id` expression is restored.
+    #[tokio::test]
+    async fn tenant_policy_on_another_column_fails_readiness() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("fixture starts");
+        let owner_pool = fixture.superuser_pool().await.expect("owner pool");
+        let owner = wyrd_sql::OperatorPool::from(owner_pool.clone());
+        let serving = fixture.wyrd_postgres();
+        let set_policy_column = |column: &'static str| {
+            let owner_pool = owner_pool.clone();
+            async move {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "ALTER POLICY tenant_isolation ON wyrd.auth_users \
+                     USING ({column} = wyrd.current_tenant()) \
+                     WITH CHECK ({column} = wyrd.current_tenant())"
+                )))
+                .execute(&owner_pool)
+                .await
+                .expect("owner rewrites the policy");
+            }
+        };
+
+        set_policy_column("id").await;
+        for (check, result) in [
+            (
+                "owner post-migration",
+                wyrd_sql::verify_schema(&owner).await,
+            ),
+            ("serving", serving.validate_schema().await),
+        ] {
+            assert!(
+                matches!(&result, Err(SqlError::SchemaNotReady { detail }) if detail.contains("wyrd.auth_users")),
+                "{check} validation must refuse a policy keyed on id, got {result:?}"
+            );
+        }
+
+        set_policy_column("data_tenant_id").await;
+        wyrd_sql::verify_schema(&owner)
+            .await
+            .expect("owner post-migration validation passes once restored");
+        serving
+            .validate_schema()
+            .await
+            .expect("serving validation passes once restored");
+    }
 
     /// The system-owner seed is exact, repeatable, and rejects ambiguous ownership.
     #[tokio::test]
@@ -66,7 +200,7 @@ mod pg_tests {
             )
         );
 
-        wyrd_sql::migrate(&pool)
+        migrate_under_lease(&pool)
             .await
             .expect("repeat migration is idempotent");
         sqlx::query("DELETE FROM wyrd._sqlx_migrations WHERE version = $1")
@@ -74,7 +208,7 @@ mod pg_tests {
             .execute(&pool)
             .await
             .expect("remove migration ledger for compatible-state proof");
-        wyrd_sql::migrate(&pool)
+        migrate_under_lease(&pool)
             .await
             .expect("exact compatible preexistence is accepted");
 
@@ -93,7 +227,7 @@ mod pg_tests {
             .await
             .expect("remove migration ledger for conflict proof");
         assert!(
-            wyrd_sql::migrate(&pool).await.is_err(),
+            migrate_under_lease(&pool).await.is_err(),
             "incompatible system tenant attributes must fail"
         );
         let display_name: (String,) =
@@ -113,7 +247,7 @@ mod pg_tests {
         .execute(&pool)
         .await
         .expect("restore exact sentinel");
-        wyrd_sql::migrate(&pool)
+        migrate_under_lease(&pool)
             .await
             .expect("restored exact sentinel migrates");
 
@@ -138,7 +272,7 @@ mod pg_tests {
             .await
             .expect("remove migration ledger for slug conflict proof");
         assert!(
-            wyrd_sql::migrate(&pool).await.is_err(),
+            migrate_under_lease(&pool).await.is_err(),
             "canonical slug ownership by another tenant must fail"
         );
         let owner: (Uuid,) = sqlx::query_as(
@@ -158,14 +292,13 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&url, 2)
-            .await
-            .expect("connects to postgres");
+        let store = owner_pool(&url).await.expect("connects to postgres");
         assert_required_roles(store.pool()).await;
 
-        store.migrate().await.expect("first migration run succeeds");
-        store
-            .migrate()
+        migrate_under_lease(store.pool())
+            .await
+            .expect("first migration run succeeds");
+        migrate_under_lease(store.pool())
             .await
             .expect("second migration run is idempotent");
 
@@ -227,11 +360,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&url, 2)
-            .await
-            .expect("connects to postgres");
+        let store = owner_pool(&url).await.expect("connects to postgres");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let row: (bool,) = sqlx::query_as(
             "SELECT EXISTS (
@@ -260,11 +393,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&url, 2)
-            .await
-            .expect("connects to postgres");
+        let store = owner_pool(&url).await.expect("connects to postgres");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let pool = store.pool();
         let tenant_a = DataTenantId::new_v7();
@@ -311,11 +444,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&migrator_url, 2)
-            .await
-            .expect("migrator connects");
+        let store = owner_pool(&migrator_url).await.expect("migrator connects");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
         let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
 
         let tenant = DataTenantId::new_v7();
@@ -380,11 +513,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&migrator_url, 2)
-            .await
-            .expect("migrator connects");
+        let store = owner_pool(&migrator_url).await.expect("migrator connects");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
         let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
 
         let tenant_a = DataTenantId::new_v7();
@@ -455,11 +588,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&url, 2)
-            .await
-            .expect("connects to postgres");
+        let store = owner_pool(&url).await.expect("connects to postgres");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let pool = store.pool();
         let active_id = DataTenantId::new_v7();
@@ -532,11 +665,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&migrator_url, 2)
-            .await
-            .expect("migrator connects");
+        let store = owner_pool(&migrator_url).await.expect("migrator connects");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
 
@@ -588,11 +721,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&migrator_url, 2)
-            .await
-            .expect("migrator connects");
+        let store = owner_pool(&migrator_url).await.expect("migrator connects");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
         let tenant = DataTenantId::new_v7();
@@ -727,11 +860,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&migrator_url, 2)
-            .await
-            .expect("migrator connects");
+        let store = owner_pool(&migrator_url).await.expect("migrator connects");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
         let tenant_a = DataTenantId::new_v7();
@@ -786,11 +919,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&url, 2)
-            .await
-            .expect("connects to postgres");
+        let store = owner_pool(&url).await.expect("connects to postgres");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let tenant = DataTenantId::new_v7();
         let slug = format!("stor-admin-{}", tenant.as_uuid());
@@ -858,11 +991,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&url, 2)
-            .await
-            .expect("connects to postgres");
+        let store = owner_pool(&url).await.expect("connects to postgres");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let pool = store.pool();
 
@@ -912,11 +1045,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&url, 2)
-            .await
-            .expect("connects to postgres");
+        let store = owner_pool(&url).await.expect("connects to postgres");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let pool = store.pool();
         let tenant = DataTenantId::new_v7();
@@ -978,11 +1111,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&url, 2)
-            .await
-            .expect("connects to postgres");
+        let store = owner_pool(&url).await.expect("connects to postgres");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let pool = store.pool();
         let tenant = DataTenantId::new_v7();
@@ -1059,11 +1192,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&migrator_url, 2)
-            .await
-            .expect("migrator connects");
+        let store = owner_pool(&migrator_url).await.expect("migrator connects");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
 
@@ -1139,11 +1272,11 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&migrator_url, 2)
-            .await
-            .expect("migrator connects");
+        let store = owner_pool(&migrator_url).await.expect("migrator connects");
         assert_required_roles(store.pool()).await;
-        store.migrate().await.expect("migrations apply");
+        migrate_under_lease(store.pool())
+            .await
+            .expect("migrations apply");
 
         let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
 
@@ -1303,10 +1436,10 @@ mod pg_tests {
             return;
         };
 
-        let store = SqlStore::connect(&migrator_url, 2)
+        let store = owner_pool(&migrator_url).await.expect("migrator connects");
+        migrate_under_lease(store.pool())
             .await
-            .expect("migrator connects");
-        store.migrate().await.expect("migrations apply");
+            .expect("migrations apply");
         let app_pool = build_app_pool(&app_url).await.expect("app pool connects");
 
         let tenant = DataTenantId::new_v7();
@@ -1552,13 +1685,9 @@ mod pg_tests {
         .expect("workload binding inserts");
     }
 
+    /// Database-owner URL that runs migrations, as `wyrd-server migrate` does.
     fn database_url() -> Option<String> {
-        let app_url = std::env::var("WYRD_DATABASE_URL").ok()?;
-        let migrator_password = std::env::var("WYRD_DATABASE_MIGRATOR_PASSWORD").ok()?;
-        let mut url = url::Url::parse(&app_url).ok()?;
-        url.set_username("wyrd_migrator").ok()?;
-        url.set_password(Some(&migrator_password)).ok()?;
-        Some(url.into())
+        std::env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok()
     }
 
     fn app_database_url() -> Option<String> {
@@ -1569,7 +1698,7 @@ mod pg_tests {
         let rows: Vec<(String, bool)> = sqlx::query_as(
             "SELECT rolname, rolbypassrls
          FROM pg_roles
-         WHERE rolname IN ('wyrd_migrator', 'wyrd_app', 'wyrd_platform_admin')
+         WHERE rolname IN ('wyrd_app', 'wyrd_platform_admin')
          ORDER BY rolname",
         )
         .fetch_all(pool)
@@ -1580,7 +1709,6 @@ mod pg_tests {
             rows,
             vec![
                 ("wyrd_app".to_owned(), false),
-                ("wyrd_migrator".to_owned(), true),
                 ("wyrd_platform_admin".to_owned(), true),
             ],
             "Wyrd Postgres roles must exist with locked BYPASSRLS bits before migrations run"

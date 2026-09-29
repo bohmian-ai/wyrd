@@ -106,9 +106,9 @@ message CancelOracleLifecycleResponse { string request_id = 1; bool cancellation
 message ReserveNodeSlotsRequest {
   bytes query_id = 1; string leader_node_id = 2; uint64 leader_fencing_token = 3;
   QueryClass query_class = 4; uint32 slot_units = 5; uint64 expires_at_unix_ms = 6;
-  // Single-use reservation purpose ticket. The follower verifies it over the
-  // encoded request with this field cleared, before any capacity changes.
-  SignedPeerTicket ticket = 7;
+  // Typed reservation context. The follower checks it against the encoded
+  // request with this field cleared, before any capacity changes.
+  PeerContext context = 7;
   // Present only when the reservation is taken for one distributed Analytical
   // graph. Absent for a fragment reservation, which charges a worker quantum
   // rather than a whole query envelope.
@@ -121,13 +121,14 @@ message PendingNodeReservation { bytes reservation_id = 1; uint64 expires_at_uni
 message ReservationRejected { uint32 retry_after_ms = 1; }
 message ReleaseNodeSlotsRequest {
   bytes reservation_id = 1; bytes query_id = 2; string leader_node_id = 3; uint64 leader_fencing_token = 4;
-  // Single-use release purpose ticket, verified exactly as the reserve ticket
-  // is and under its own distinct signing domain.
-  SignedPeerTicket ticket = 5;
+  // Typed release context, checked exactly as the reserve context is.
+  PeerContext context = 5;
 }
 message ReleaseNodeSlotsResponse {}
-message SignedPeerTicket { string key_id = 1; bytes claims_bytes = 2; bytes signature = 3; }
-message ForwardQueryRequest { SignedPeerTicket envelope = 1; }
+// Unsigned typed operation context on the mTLS-authenticated private plane.
+// The receiver validates every field against its own trusted state.
+message PeerContext { reserved 1, 3; reserved "key_id", "signature"; bytes claims_bytes = 2; }
+message ForwardQueryRequest { PeerContext context = 1; }
 message PersistedFileAssignment {
   reserved 1;
   reserved "files";
@@ -190,7 +191,7 @@ message FollowerScanAssignment {
   FollowerReaderCut reader_cut = 8;
 }
 message ExecuteFragmentRequest {
-  SignedPeerTicket ticket = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;
+  PeerContext context = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;
   OracleRoleFence leader_fence = 4; OracleRoleFence target_fence = 5;
   repeated FollowerScanAssignment assignments = 6; string plan_fingerprint = 7;
 }

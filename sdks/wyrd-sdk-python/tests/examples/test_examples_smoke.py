@@ -20,7 +20,6 @@ sys.path.insert(0, str(EXAMPLES_DIR))
         "transport_grpc",
         "transport_http",
         "transport_mock",
-        "transport_secrets",
     ],
 )
 def test_example_runs(module_name: str) -> None:

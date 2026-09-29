@@ -134,6 +134,13 @@ impl std::fmt::Debug for HttpTransport {
 }
 
 impl HttpTransport {
+    /// The HTTP base URL every request path is joined to, without a trailing
+    /// slash.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Clone the shared reqwest client for a capability that must reuse this
     /// transport's connection and TLS pools.
     #[must_use]

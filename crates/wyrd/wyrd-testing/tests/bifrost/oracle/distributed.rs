@@ -14,8 +14,7 @@ use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_server::oracle::{
     ScribeFragmentFault, arm_scribe_fragment_fault_for_test,
-    arm_tail_listing_credential_rejection_for_test, arm_tail_listing_stale_for_test,
-    arm_tail_listing_stall_for_test,
+    arm_tail_listing_stale_for_test, arm_tail_listing_stall_for_test,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -1682,9 +1681,6 @@ fn table_parquet_files(
 /// - an unavailable stream listing, and a selected Scribe refused before its
 ///   first row, each yield `Degraded` with `LiveTailUnavailable` and only the
 ///   published rows;
-/// - a listing the ready Scribe refuses for its unverifiable credential fails
-///   rather than degrades, because a trust-boundary refusal is not
-///   availability loss;
 /// - one stale listing restarts the attempt once on a refrozen roster and
 ///   returns every row, while a second stale listing on the refrozen roster
 ///   degrades rather than mixing cuts;
@@ -1728,12 +1724,6 @@ async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
         let listing = observe_query(&reader, &sql).await;
         reader_node.set_tail_discovery_unavailable_for_test(false);
         expect_degraded("failed stream listing", &listing?)?;
-
-        arm_tail_listing_credential_rejection_for_test();
-        expect_failed(
-            "stream listing refused for its credential",
-            &observe_query(&reader, &sql).await?,
-        )?;
 
         arm_tail_listing_stale_for_test(1);
         let restarted = observe_query(&reader, &sql).await?;

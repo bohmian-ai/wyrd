@@ -6,13 +6,10 @@
 
 use std::net::SocketAddr;
 
-use ed25519_dalek::{Signer as _, SigningKey};
 use vala_bifrost_redux::oracle::peer::{
-    ReservationBinding, ReservationOperationV1, ReservationTicketClaims, peer_signing_input,
-    reservation_body_digest,
+    ReservationBinding, ReservationOperationV1, ReservationTicketClaims, reservation_body_digest,
 };
 use wyrd_spec::vala::api::NodeId;
-use wyrd_testing::bifrost::peer_keyring::TestPeerKeyring;
 use wyrd_testing::bifrost::process_cluster::{
     BifrostProcessCluster, MembershipEntry, PeerProbePlan,
 };
@@ -38,7 +35,8 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 ///
 /// Modelled as a closed set because these are exactly the trust outcomes the
 /// listener must distinguish: a member of its own authority, a well-formed
-/// identity from a foreign authority, and no identity at all.
+/// identity from a foreign authority, an expired member, a same-authority leaf
+/// for another name, and no identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DialIdentity {
     /// A leaf issued by the cluster's own peer authority.
@@ -47,6 +45,11 @@ pub(crate) enum DialIdentity {
     Foreign,
     /// No client certificate, leaving the transport server-authenticated only.
     Anonymous,
+    /// A leaf from the cluster's own authority whose validity window has closed.
+    Expired,
+    /// A valid leaf from the cluster's own authority for a name other than the
+    /// fixed peer identity.
+    Misnamed,
 }
 
 /// One dial against a child's private peer socket.
@@ -138,6 +141,13 @@ impl<'a> PeerDial<'a> {
                 Ok(Some(foreign.issue_leaf("journey-foreign")?))
             }
             DialIdentity::Anonymous => Ok(None),
+            DialIdentity::Expired => {
+                Ok(Some(self.authority.issue_expired_leaf("journey-expired")?))
+            }
+            DialIdentity::Misnamed => Ok(Some(
+                self.authority
+                    .issue_misnamed_leaf("journey-misnamed", "not-wyrd-peer.invalid")?,
+            )),
         }
     }
 }
@@ -300,7 +310,7 @@ impl ReservationPlane {
         })
     }
 
-    /// Returns the binding a correct reserve ticket must carry.
+    /// Returns the binding a correct reserve context must carry.
     pub(crate) fn reserve_binding(&self, query_id: uuid::Uuid) -> ReservationBinding {
         ReservationBinding {
             operation: ReservationOperationV1::ReserveSlots,
@@ -312,7 +322,7 @@ impl ReservationPlane {
         }
     }
 
-    /// Returns the ticket-free reserve request the leader would send.
+    /// Returns the context-free reserve request the leader would send.
     pub(crate) fn reserve_request(&self, query_id: uuid::Uuid) -> proto::ReserveNodeSlotsRequest {
         proto::ReserveNodeSlotsRequest {
             query_id: query_id.as_bytes().to_vec(),
@@ -324,94 +334,66 @@ impl ReservationPlane {
                 (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis(),
             )
             .unwrap_or_default(),
-            ticket: None,
+            context: None,
             graph: None,
         }
     }
 }
 
-/// The signing keys one journey can present, by rotation state.
-///
-/// Held as raw signing keys rather than through the server authority because
-/// the point of the table is to present keys the server would never issue: a
-/// retired one, an expired one, one no manifest publishes, and the workload
-/// key that must never be interchangeable with any of them.
-pub(crate) struct KeyringSigners {
-    /// Currently issuing key; every correct ticket is signed with it.
-    pub(crate) active: (String, SigningKey),
-    /// Retired key still inside its published verification window.
-    pub(crate) retired_valid: (String, SigningKey),
-    /// Retired key whose verification window has closed.
-    pub(crate) retired_expired: (String, SigningKey),
-    /// Well-formed key that appears in no manifest.
-    pub(crate) unpublished: (String, SigningKey),
-}
-
-impl KeyringSigners {
-    /// Copies every rotation-state key out of the cluster's shared keyring.
-    pub(crate) fn from(keyring: &TestPeerKeyring) -> Self {
-        let pair = |key: &wyrd_testing::bifrost::peer_keyring::TestPeerTicketKey| {
-            (key.key_id().to_owned(), key.signing_key().clone())
-        };
-        Self {
-            active: pair(keyring.active()),
-            retired_valid: pair(keyring.retired_valid()),
-            retired_expired: pair(keyring.retired_expired()),
-            unpublished: pair(keyring.unpublished()),
-        }
-    }
-}
-
-/// Signs one reservation ticket with an arbitrary key.
-///
-/// Mirrors what the server authority does, but takes the key as an argument so
-/// a scenario can present a retired, expired, unpublished, or foreign key
-/// without the server ever agreeing to mint it.
-pub(crate) fn sign_ticket(
-    key: &(String, SigningKey),
+/// Attaches the leader's context for `binding` and `body_digest` to `request`.
+pub(crate) fn proto_with_context(
+    request: proto::ReserveNodeSlotsRequest,
     binding: &ReservationBinding,
     body_digest: String,
-) -> proto::SignedPeerTicket {
-    let claims = ReservationTicketClaims::for_binding(
-        binding,
-        body_digest,
-        uuid::Uuid::new_v4().as_bytes().to_vec(),
-        (chrono::Utc::now() + chrono::Duration::seconds(10)).timestamp_millis(),
-    );
-    let claims_bytes = claims.encode_to_vec();
-    let signature = key
-        .1
-        .sign(&peer_signing_input(
-            binding.operation.domain(),
-            &key.0,
-            &claims_bytes,
-        ))
-        .to_bytes()
-        .to_vec();
-    proto::SignedPeerTicket {
-        key_id: key.0.clone(),
-        claims_bytes,
-        signature,
-    }
+) -> proto::ReserveNodeSlotsRequest {
+    with_claims(
+        request,
+        &ReservationTicketClaims::for_binding(binding, body_digest, context_expiry()),
+    )
 }
 
-/// Encodes one reserve request with `ticket` stamped onto it.
+/// Encodes one reserve request carrying the leader's context for `binding`.
 ///
-/// The digest is always taken over the ticket-free encoding, which is exactly
-/// what the follower recomputes.
+/// The digest is taken over the context-free encoding, exactly what the
+/// follower recomputes. `deviate` edits the claims after they are built so a
+/// scenario can present an expired or incompatible context the leader would
+/// never send.
 ///
 /// # Errors
 ///
 /// Returns the digest failure unchanged.
 pub(crate) fn stamped(
     mut request: proto::ReserveNodeSlotsRequest,
-    ticket: impl FnOnce(String) -> proto::SignedPeerTicket,
+    binding: &ReservationBinding,
+    deviate: impl FnOnce(&mut ReservationTicketClaims),
 ) -> Result<Vec<u8>, PeerJourneyError> {
-    request.ticket = None;
+    request.context = None;
     let digest = reservation_body_digest(&request.encode_to_vec())
         .map_err(|error| format!("reserve body digest: {error}"))?;
-    request.ticket = Some(ticket(digest));
-    Ok(request.encode_to_vec())
+    let mut claims = ReservationTicketClaims::for_binding(binding, digest, context_expiry());
+    deviate(&mut claims);
+    Ok(with_claims(request, &claims).encode_to_vec())
+}
+
+/// Returns the acceptance expiry a freshly built context carries.
+fn context_expiry() -> i64 {
+    (chrono::Utc::now() + chrono::Duration::seconds(10)).timestamp_millis()
+}
+
+/// Encodes `claims` as the request's context for the binding's operation.
+///
+/// Encoded directly rather than through `to_context`, which refuses claims
+/// whose operation differs from the one named: a scenario presenting a
+/// context built for another operation needs exactly those bytes on the wire.
+///
+fn with_claims(
+    mut request: proto::ReserveNodeSlotsRequest,
+    claims: &ReservationTicketClaims,
+) -> proto::ReserveNodeSlotsRequest {
+    request.context = Some(proto::PeerContext {
+        claims_bytes: claims.encode_to_vec(),
+    });
+    request
 }
 
 /// Sends one reserve payload from the leader and returns the follower's verdict.

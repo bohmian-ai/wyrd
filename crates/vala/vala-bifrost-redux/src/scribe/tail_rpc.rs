@@ -1,16 +1,15 @@
 //! Typed, pod-local live-tail reads over writable and immutable memtable data.
 //!
 //! The Scribe live source owns no WAL or SQL access. Oracle discovers the
-//! partitions a Scribe serves through the authenticated private
-//! `ListActiveStreams` RPC and reads them as lazily produced live batches.
+//! partitions a Scribe serves through the mTLS private `ListActiveStreams`
+//! RPC and reads them as lazily produced live batches.
 
 use std::sync::Arc;
 
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api as tail;
 use wyrd_spec::vala::assignment_authority::ScanPredicate;
-use wyrd_tonic::tonic::metadata::MetadataValue;
-use wyrd_tonic::tonic::{Code, Request, transport::Channel};
+use wyrd_tonic::tonic::{Code, transport::Channel};
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
 use crate::catalog::TenantTableBinding;
@@ -33,13 +32,14 @@ pub struct ActiveTailStream {
     pub stream: tail::TailStreamIdentity,
 }
 
-/// Private tonic client for authenticated active-stream discovery on one Scribe.
+/// Private tonic client for active-stream discovery on one Scribe.
+///
+/// The channel is the mTLS peer channel; the peer certificate is the only
+/// credential, so requests carry no per-call bearer.
 #[derive(Debug, Clone)]
 pub struct TonicTailReadTransport {
     /// Cloneable tonic client over one configured private Scribe endpoint.
     client: ScribeTailServiceClient<Channel>,
-    /// Already-issued service-workload bearer sent on every private RPC.
-    access_token: MetadataValue<wyrd_tonic::tonic::metadata::Ascii>,
 }
 
 impl TonicTailReadTransport {
@@ -56,11 +56,9 @@ impl TonicTailReadTransport {
     ) -> Result<Vec<ActiveTailStream>, TailReadError> {
         let mut client = self.client.clone();
         let response = client
-            .list_active_streams(self.authenticated_request(
-                wyrd_tonic::wyrd::v1::ListActiveStreamsRequest {
-                    binding: Some(binding.into()),
-                },
-            ))
+            .list_active_streams(wyrd_tonic::wyrd::v1::ListActiveStreamsRequest {
+                binding: Some(binding.into()),
+            })
             .await
             .map_err(|status| tonic_error(&status))?;
         response
@@ -91,35 +89,10 @@ impl TonicTailReadTransport {
             .collect()
     }
 
-    /// Creates a remote transport using the authenticated private Scribe channel.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TailReadError::State`] when the bearer cannot be represented as
-    /// gRPC metadata.
-    pub fn new(
-        client: ScribeTailServiceClient<Channel>,
-        bearer: &str,
-    ) -> Result<Self, TailReadError> {
-        let access_token =
-            MetadataValue::try_from(format!("Bearer {bearer}").as_str()).map_err(|_| {
-                TailReadError::State {
-                    detail: "tail bearer cannot be represented as gRPC metadata".to_owned(),
-                }
-            })?;
-        Ok(Self {
-            client,
-            access_token,
-        })
-    }
-
-    /// Adds the required private workload credential before a remote lookup.
-    fn authenticated_request<T>(&self, message: T) -> Request<T> {
-        let mut request = Request::new(message);
-        request
-            .metadata_mut()
-            .insert("x-wyrd-access-token", self.access_token.clone());
-        request
+    /// Creates a remote transport over the mTLS private Scribe channel.
+    #[must_use]
+    pub fn new(client: ScribeTailServiceClient<Channel>) -> Self {
+        Self { client }
     }
 }
 

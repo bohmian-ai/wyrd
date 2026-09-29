@@ -22,8 +22,7 @@ plane's credential or token is accepted by the other.
 This page is the map. The three pages it links to hold the detail:
 
 - [Authentication](/concepts/authentication/): how each caller obtains a token.
-- [Authorization](/concepts/authorization/): how permissions and the policy
-  extension gate an action.
+- [Authorization](/concepts/authorization/): how permissions gate an action.
 - [Cloud identity](/concepts/cloud-identity/): trusted issuers and workload
   bindings for machine identity.
 
@@ -48,8 +47,7 @@ This page is the map. The three pages it links to hold the detail:
     ['act chain', 'RFC 8693 delegation record embedded in a token: the ordered list of principals that delegated down to the callee.'],
     ['Trusted issuer', 'An external OIDC issuer whose JWTs Wyrd will verify, scoped to one tenant.'],
     ['Workload binding', 'Server-owned mapping (issuer, subject, audience) → CardRef that names which Service/Agent a workload assertion represents.'],
-    ['RBAC', 'Role-based access control. A principal\'s roles resolve to an effective permission set of { resource, action, scope } entries.'],
-    ['PolicyHook', 'Pluggable policy-evaluation seam that gates the /v1/authz/check endpoint before RBAC.']
+    ['RBAC', 'Role-based access control. A principal\'s roles resolve to an effective permission set of { resource, action, scope } entries.']
   ]}
 />
 
@@ -129,9 +127,9 @@ object scope — against it.
 Service-to-service calls add a second layer. Service B can exchange Service
 A's token, together with its own, for a **delegated** token that acts for A: A
 is the principal, B is recorded in the `act` chain, and the permissions are
-the ones both hold. Only delegated tokens reach `POST /v1/authz/check`, the policy-extension
-endpoint backed by `PolicyHook`. Both layers must pass: the `PolicyHook` first,
-then RBAC. See [Authorization](/concepts/authorization/).
+the ones both hold. Exchange consults no policy; every later request still
+runs the same RBAC check against the delegated principal. See
+[Authorization](/concepts/authorization/).
 
 ## Development vs production auth
 
@@ -146,8 +144,7 @@ Ed25519 key at boot so auth works on a fresh local run. Those tokens do not surv
 a restart, and the key must never appear in staging or production.
 
 In **production** (staging or production), boot fails closed without
-`WYRD_SIGNING_KEY_FILE` or `WYRD_SIGNING_KEY_PEM`. It also refuses to boot with
-the default `StubAllowPolicyHook` or the no-op audit writer still mounted.
+`WYRD_SIGNING_KEY_FILE` or `WYRD_SIGNING_KEY_PEM`.
 
 <DataTable
   columns={[
@@ -177,8 +174,6 @@ settings there.
 ## Related
 
 - [Authentication](/concepts/authentication/): per-grant token flows.
-- [Authorization](/concepts/authorization/): RBAC, delegation, and the
-  `/v1/authz/check` policy extension, including the request contract, hook context,
-  and how to implement, register, and mesh-integrate a `PolicyHook`.
+- [Authorization](/concepts/authorization/): RBAC and delegation.
 - [Cloud identity](/concepts/cloud-identity/): trusted issuers, workload bindings,
   and the sealing key.

@@ -121,7 +121,6 @@ fn local_settings(root: &Path) -> StorageSettings {
         presign_ttl: Duration::from_secs(600),
         part_size_bytes: PLANNED_PART_BYTES,
         multipart_threshold_bytes: LOW_THRESHOLD_BYTES,
-        public_base_url: Some(String::new()),
     }
 }
 

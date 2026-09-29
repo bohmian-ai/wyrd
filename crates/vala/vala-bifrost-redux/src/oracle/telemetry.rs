@@ -363,35 +363,32 @@ impl AnalyticalStageOperation {
 
 /// Closed outcome of one stage-operation authority decision.
 ///
-/// `Authorized` is emitted only after every binding, body digest, deadline, and
-/// replay check has passed, so the ratio of these series is what tells an
+/// `Authorized` is emitted only after every bound, binding, body digest, and
+/// deadline check has passed, so the ratio of these series is what tells an
 /// operator whether follower work is being refused before it can decode a plan,
 /// touch the task cache, or issue object I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalyticalStageAuthorityOutcome {
     /// The stage operation is authorized to proceed to decode and execution.
     Authorized,
-    /// The ticket did not authenticate against the deployment key.
-    Signature,
+    /// The context was absent, oversized, or did not decode.
+    Malformed,
     /// A bound identity, node, fence, stage, task, attempt, or digest mismatched.
     Binding,
     /// The bounded raw body did not match its signed digest, or exceeded bounds.
     Body,
-    /// The absolute deadline or the ticket's own expiry had elapsed.
+    /// The absolute deadline or the context's own expiry had elapsed.
     Expired,
-    /// The single-use nonce had already been consumed.
-    Replay,
 }
 
 impl AnalyticalStageAuthorityOutcome {
     /// Every authority outcome, used to pre-register series at zero.
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Authorized,
-        Self::Signature,
+        Self::Malformed,
         Self::Binding,
         Self::Body,
         Self::Expired,
-        Self::Replay,
     ];
 
     /// Returns the canonical low-cardinality metric label.
@@ -399,11 +396,10 @@ impl AnalyticalStageAuthorityOutcome {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Authorized => "authorized",
-            Self::Signature => "signature",
+            Self::Malformed => "malformed",
             Self::Binding => "binding",
             Self::Body => "body",
             Self::Expired => "expired",
-            Self::Replay => "replay",
         }
     }
 }

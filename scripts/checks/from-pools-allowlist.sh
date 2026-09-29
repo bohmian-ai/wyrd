@@ -34,4 +34,4 @@ set -e
     --glob '!crates/wyrd/wyrd-server/src/app/server.rs' \
     --glob '!crates/wyrd/wyrd-server/src/oracle/lifecycle_service.rs' \
     --glob '!crates/vala/vala-bifrost-redux/tests/pg_scribe_seal.rs' \
-    crates/ python/
+    crates/ sdks/

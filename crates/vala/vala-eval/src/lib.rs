@@ -49,6 +49,7 @@ pub mod judge;
 pub mod operators;
 pub mod orchestrator;
 pub mod results;
+pub mod sampling;
 pub mod scenario;
 pub mod store;
 pub mod tasks;
@@ -79,5 +80,5 @@ pub use scenario::{
     ScenarioExecutionResults, execute_scenario, load_scenario_collection,
 };
 pub use store::{EvalTaskKind, JudgeOutcome, TaskRegistry};
-pub use tasks::{EvalMediaBinding, MediaBindings};
+pub use tasks::MediaBindings;
 pub use trace_source::{InMemoryTraceSource, MockTraceSource, TraceSource, TraceUnavailable};

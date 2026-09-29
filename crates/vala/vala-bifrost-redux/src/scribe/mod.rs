@@ -334,6 +334,11 @@ pub struct ScribeImpl {
     /// zero selects the production active-bucket target.
     #[cfg(any(test, feature = "test-support"))]
     decoded_request_limit_for_test: AtomicUsize,
+    /// Microseconds added to every later transport-frame receipt instant, so a
+    /// bounded test can replay a batch on a later receipt day; zero in
+    /// production construction.
+    #[cfg(any(test, feature = "test-support"))]
+    receipt_offset_micros_for_test: std::sync::atomic::AtomicI64,
 }
 
 /// Scribe is accepting work and no shutdown owner exists.
@@ -1157,11 +1162,10 @@ impl ScribeImpl {
             coordination_runtime,
             execution_pools,
             persistence: persistence_config,
-            admission: _,
-            resources: _,
             ingest_limits,
             geometry,
             staging_file_publisher,
+            ..
         } = config;
         let seal_max_age = geometry.generation_max_age();
         let ScribeExecutionPools {
@@ -1239,6 +1243,8 @@ impl ScribeImpl {
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             decoded_request_limit_for_test: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            receipt_offset_micros_for_test: std::sync::atomic::AtomicI64::new(0),
         })
     }
 

@@ -230,6 +230,16 @@ pub struct FrameAdmission {
     pub batch_id: uuid::Uuid,
     /// Number of rows durably admitted into the active ingest pipeline.
     pub rows_accepted: u64,
+    /// Server receipt instant, in epoch microseconds, Scribe stamped as
+    /// `wyrd_event_time` on every row whose caller supplied none.
+    pub receipt_micros: i64,
+    /// Whether this attempt is the one that made the batch query-visible.
+    ///
+    /// `false` for a replay Scribe suppressed because the same batch identity
+    /// was already committed: the ACK is an idempotent success, but its
+    /// `receipt_micros` is not the instant stamped on the stored rows, so
+    /// post-ACK consumers must act only on the first commit.
+    pub first_commit: bool,
 }
 
 /// Scribe-layer errors per CONTRACTS §10.

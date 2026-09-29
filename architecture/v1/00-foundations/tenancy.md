@@ -14,9 +14,11 @@ The role split is:
 
 | Role | Purpose |
 |---|---|
-| `wyrd_migrator` | Boot-only DDL and migrations. Has `BYPASSRLS`; migration connections are closed after use. |
 | `wyrd_app` | Runtime request, MCP, worker, and tenant-scoped maintenance queries. RLS applies. |
-| `wyrd_platform_admin` | Audited cross-tenant support and the platform control plane: initialization, the tenant directory, provisioning, and tenant-admin recovery. Has `BYPASSRLS`. |
+| `wyrd_platform_admin` | Audited cross-tenant support and the platform control plane: initialization, the tenant directory, provisioning, and tenant-admin recovery; owns the Bifrost Iceberg catalog. Has `BYPASSRLS`. |
+
+DDL runs only in the one-off `wyrd-server migrate` process under the
+database-owner login, which no serving process holds.
 
 Deployment modes share the same code path:
 

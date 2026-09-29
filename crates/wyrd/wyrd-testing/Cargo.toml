@@ -74,7 +74,6 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_jcs = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["postgres"] }
 tempfile = { workspace = true }
@@ -90,7 +89,6 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost-redux = { workspace = true, features = ["bench-support", "test-support"] }
 vala-sql = { workspace = true }
 wyrd-auth = { workspace = true }
-wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
@@ -112,6 +110,11 @@ wiremock = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# The continuous Eval journey builds its native judge Prompt and points the
+# production judge at a local OpenAI-compatible provider.
+skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
+skald-spec = { workspace = true }
 metrics = { workspace = true }
 # Local provider upstream of the native gateway ingress journey.
 wiremock = { workspace = true }

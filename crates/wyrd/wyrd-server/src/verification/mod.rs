@@ -12,7 +12,9 @@
 pub mod drift;
 pub mod engines;
 pub mod fitter;
+pub mod eval;
 pub mod health;
+pub mod observations;
 pub mod permits;
 pub mod publisher;
 pub mod results;
@@ -66,12 +68,18 @@ pub struct RuntimeLimits {
     pub poll_interval: Duration,
     /// Wait before a crashed capability task is restarted.
     pub restart_backoff: Duration,
+    /// Wait before an Eval run whose trace has not landed is tried again.
+    pub trace_poll: Duration,
+    /// How long after its creation an Eval run waits for its trace before it
+    /// settles `timed_out`.
+    pub trace_deadline: Duration,
 }
 
 impl Default for RuntimeLimits {
     /// Production bounds: 16 global and 4 per-tenant executions, a ten-minute
     /// lease over a five-minute execution and one-minute publication, and a
-    /// thirty-second drain.
+    /// thirty-second drain; Eval traces are polled every five seconds for up
+    /// to five minutes.
     fn default() -> Self {
         Self {
             global_permits: 16,
@@ -82,6 +90,8 @@ impl Default for RuntimeLimits {
             drain_grace: Duration::from_secs(30),
             poll_interval: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(1),
+            trace_poll: Duration::from_secs(5),
+            trace_deadline: Duration::from_secs(300),
         }
     }
 }
@@ -174,6 +184,7 @@ impl VerificationRuntime {
         VerificationRuntimeBuilder {
             state,
             limits: RuntimeLimits::default(),
+            providers: None,
             ingest_endpoint: None,
             #[cfg(feature = "test-support")]
             publication_fault: None,
@@ -254,6 +265,8 @@ pub struct VerificationRuntimeBuilder<'a> {
     state: &'a AppState,
     /// Runtime bounds.
     limits: RuntimeLimits,
+    /// Model providers Eval judges call; the process default when `None`.
+    providers: Option<Arc<skald_runtime::ProviderRegistry>>,
     /// Scribe-bearing gRPC endpoint results are published through.
     ingest_endpoint: Option<String>,
     /// Test-only publication faults.
@@ -275,6 +288,14 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
+    /// Judge Eval runs through `providers` instead of the process default
+    /// registry built from the environment.
+    #[must_use]
+    pub fn providers(mut self, providers: Arc<skald_runtime::ProviderRegistry>) -> Self {
+        self.providers = Some(providers);
+        self
+    }
+
     /// Publish results through `endpoint`, a Scribe-bearing gRPC URL.
     #[must_use]
     pub fn ingest_endpoint(mut self, endpoint: String) -> Self {
@@ -284,13 +305,13 @@ impl VerificationRuntimeBuilder<'_> {
 
     /// Publish results through this process's own gRPC listener at `addr`.
     ///
-    /// Applies only when no explicit endpoint was configured, this process
-    /// hosts a Scribe, and its gRPC listener is plaintext; otherwise the
-    /// runner stays uncomposed unless an explicit endpoint is set.
+    /// Applies only when no explicit endpoint was configured and this process
+    /// hosts a Scribe; the listener is always plaintext because public TLS
+    /// terminates at the edge. Otherwise the runner stays uncomposed unless an
+    /// explicit endpoint is set.
     #[must_use]
-    pub fn local_ingest(mut self, addr: Option<SocketAddr>, tls: bool) -> Self {
+    pub fn local_ingest(mut self, addr: Option<SocketAddr>) -> Self {
         if self.ingest_endpoint.is_none()
-            && !tls
             && self.state.bifrost_ingest().is_some()
             && let Some(mut addr) = addr
         {
@@ -399,6 +420,12 @@ impl VerificationRuntimeBuilder<'_> {
                     publisher,
                     drift,
                     self.limits,
+                    self::eval::EvalEngine::new(
+                        self.state.clone(),
+                        self.providers
+                            .unwrap_or_else(skald_runtime::default_registry),
+                        self.limits.trace_deadline,
+                    ),
                 );
                 #[cfg(feature = "test-support")]
                 {

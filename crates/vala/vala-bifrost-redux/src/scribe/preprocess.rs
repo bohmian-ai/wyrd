@@ -28,6 +28,19 @@ use crate::scribe::seal_key::{
 use crate::scribe::wal::PreparedWalAppend;
 use wyrd_spec::ids::DataTenantId;
 
+/// The successful terminal a shard owner sends to one admitted append's waiter.
+///
+/// Sent only after the append's rows are query-visible, or after the durable
+/// fence suppressed them as an already-committed replay of the same batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableCompletion {
+    /// Rows the append carried, whether inserted now or already visible.
+    pub rows: u64,
+    /// Whether this append's group inserted the batch rather than suppressing
+    /// a replay the fence or memtable identity showed was already committed.
+    pub first_commit: bool,
+}
+
 /// A complete request accepted by pod-global admission.
 #[derive(Debug)]
 pub(crate) struct AdmittedAppend {
@@ -46,7 +59,7 @@ pub(crate) struct AdmittedAppend {
     /// Registered partition granularity every slice of this append is bucketed to.
     pub partition_granularity: TimeGranularity,
     pub queued_at: Instant,
-    pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
+    pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
     pub lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
 }
@@ -106,7 +119,7 @@ pub(crate) struct PreparedAppend {
     pub exact_material: ExactMaterialFacts,
     /// Maximum root envelope checked again with exact grouped-candidate facts.
     pub maximum_scribe_envelope_bytes: usize,
-    pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
+    pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
     pub lifecycle: Option<crate::scribe::telemetry::ScribeIngressLifecycleOwner>,
 }
@@ -935,7 +948,7 @@ fn encode_ipc_fixed(
 }
 
 fn notify_completion(
-    completion: &mut Option<oneshot::Sender<Result<u64, ScribeError>>>,
+    completion: &mut Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     error: &ScribeError,
 ) {
     if let Some(sender) = completion.take() {

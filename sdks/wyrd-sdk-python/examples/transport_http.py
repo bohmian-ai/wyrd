@@ -14,10 +14,6 @@ def secret_env(name: str) -> dict[str, str]:
     return {"source": "env", "name": name}
 
 
-def secret_file(path: str) -> dict[str, str]:
-    return {"source": "file", "path": path}
-
-
 def without_none(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: without_none(item) for key, item in value.items() if item is not None}
@@ -29,13 +25,6 @@ def main() -> None:
         {
             "base_url": "https://wyrd-ingest.example.com",
             "timeout_ms": 30_000,
-            "tls": {
-                "ca_cert": secret_file("/etc/ssl/ca.pem"),
-                "client_cert": None,
-                "client_key": None,
-                "server_name_override": None,
-                "insecure_skip_verify": False,
-            },
             "auth": secret_env("WYRD_API_KEY"),
             "compression": True,
         }

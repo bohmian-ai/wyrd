@@ -62,8 +62,14 @@ pub enum EvalExecError {
     TraceUnavailable { trace_id: String, reason: String },
 
     /// `TraceSource` returned `TraceUnavailable` for this task's record.
-    #[error("trace_assertion task {task_id:?}: trace unavailable: {reason}")]
-    TraceUnavailableForTask { task_id: TaskId, reason: String },
+    ///
+    /// Keeps the typed source so a continuous caller can tell a trace that has
+    /// not landed yet (wait) from a failing source (retry).
+    #[error("trace_assertion task {task_id:?}: trace unavailable: {source}")]
+    TraceUnavailableForTask {
+        task_id: TaskId,
+        source: crate::trace_source::TraceUnavailable,
+    },
 
     /// A trace task ran without a trace id on the current snapshot.
     #[error("trace_assertion task {task_id:?}: no trace_id on record")]
@@ -156,6 +162,23 @@ pub enum EvalExecError {
     /// Context capture hashing could not canonicalize a JSON value.
     #[error("failed to canonicalize context value for hashing: {reason}")]
     ContextHashFailed { reason: String },
+}
+
+impl EvalExecError {
+    /// True when a trace task's trace has not landed yet.
+    ///
+    /// This is the only execution error that is a wait rather than a failure:
+    /// a continuous caller requeues the record until its trace deadline.
+    #[must_use]
+    pub const fn awaits_trace(&self) -> bool {
+        matches!(
+            self,
+            Self::TraceUnavailableForTask {
+                source: crate::trace_source::TraceUnavailable::NotYetLanded { .. },
+                ..
+            }
+        )
+    }
 }
 
 /// Errors raised while loading an offline scenario collection.
@@ -433,11 +456,11 @@ impl From<EvalExecError> for EvalError {
                     "reason": reason,
                 }),
             },
-            EvalExecError::TraceUnavailableForTask { task_id, reason } => Self::TraceUnavailable {
+            EvalExecError::TraceUnavailableForTask { task_id, source } => Self::TraceUnavailable {
                 message,
                 details: serde_json::json!({
                     "task_id": task_id.as_str(),
-                    "reason": reason,
+                    "reason": source.to_string(),
                 }),
             },
             EvalExecError::TraceIdMissing { task_id } => Self::TraceUnavailable {

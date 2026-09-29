@@ -839,6 +839,32 @@ async fn retryable_engine_failures_exhaust_to_errored() {
     runtime.stop().await;
 }
 
+/// Input-admission deferrals are backpressure, not failed attempts: a run
+/// deferred more times than its attempt budget still completes on its first
+/// charged attempt.
+///
+/// # Panics
+/// Panics when the run does not complete or a deferral was charged.
+#[tokio::test]
+async fn deferred_engine_admission_requeues_without_spending_attempts() {
+    let harness = Harness::start().await;
+    let script = EngineScript::default();
+    for _ in 0..4 {
+        script.push(EngineOutcome::Deferred(VerificationError {
+            code: "input_admission_refused".to_owned(),
+            message: "the input read was refused at admission".to_owned(),
+        }));
+    }
+    script.push(EngineOutcome::Completed(drifting_report()));
+    let runtime = harness.spawn(Harness::limits(), &script);
+    let run = harness.enqueue().await;
+
+    let row = harness.wait_run(run, status("completed")).await;
+    assert_eq!(row.attempts, 1, "no deferral is charged an attempt");
+    assert_eq!(row.error_code, None);
+    runtime.stop().await;
+}
+
 /// An engine cancellation settles `cancelled`, and an execution past its
 /// deadline settles `timed_out`; neither carries a verdict.
 ///

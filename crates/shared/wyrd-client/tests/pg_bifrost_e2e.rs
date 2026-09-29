@@ -1,6 +1,6 @@
 //! Rust e2e mirror for the happy-path and backpressure/drain journeys.
 //!
-//! These tests require a live `WyrdTestServer` (embedded Postgres + real server
+//! These tests require a live `WyrdTestServer` (repository-managed Postgres + real server
 //! socket), so they live in `mod pg_tests`: the fast family lane skips them via
 //! `--skip pg_tests`; `mise run test:e2e` (Postgres up) runs them.
 //!

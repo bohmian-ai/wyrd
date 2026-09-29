@@ -1168,7 +1168,7 @@ fn user_columns(rows: &RecordBatch, server_owned: &[&str]) -> Vec<ArrayRef> {
 /// type, or when a row supplies a present reference and the principal carries
 /// no signed scope, the reference is malformed, its identity lies outside the
 /// signed scope, or the matching signed member carries no UID.
-fn resolve_card_uids(
+pub(crate) fn resolve_card_uids(
     rows: &RecordBatch,
     principal: &Principal,
     row_count: usize,

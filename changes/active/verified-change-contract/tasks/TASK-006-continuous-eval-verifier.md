@@ -198,3 +198,51 @@ or any path that treats an execution error as subject failure.
 - `changes/active/verified-change-contract/architecture/logic/table_schema.md`
 - `architecture/references/domain/evaluation.md`
 - `AGENTS.md`
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Full `eval.md` terminal matrix passes | `wyrd-server/src/verification/eval.rs` (`EvalEngine`), `engines.rs` (`VerifierReport::eval`), `runner.rs` (`Transition::AwaitTrace`) | `eval_verification::continuous_eval_runs_the_terminal_matrix` (gate pass, gate fail + 1 dispatch, ungated, all-skipped, sampled-out with 0 items, missing context and cross-tenant media retried to `errored` with no result, trace lands after `AwaitingTrace` requeue, missing trace `timed_out` with no result); `verification::engines::tests::eval_reports_map_to_the_common_verdict_after_capture` | PASS |
+| Existing Eval engine and judge path are the only execution path | `EvalEngine::score` drives `ScenarioScoring` + `SkaldJudgeInvoker`; no second engine/judge | Journey judge calls reach the local provider through `SkaldJudgeInvoker`; five focused `vala-eval` regressions | PASS |
+| Post-ACK enqueue is best-effort; cannot delay or roll back ingest | `verification/observations.rs` (tracked task, outside Scribe's transaction, no outbox) | Journey: forced insert failure (fault trigger) keeps the acknowledged `vala.eval.observations` row, logs `acknowledged Eval observation did not enqueue verification runs`, creates no run/dispatch; `pg_verifier_runs::observation_enqueue_targets_active_ready_bindings_once` (replay, inactive owner, non-ready binding) | PASS |
+| AC-014 through real server/provider seams | SDK `observe.eval` → Gate/Scribe → post-ACK enqueue → runtime → `vala.verification.results` + `vala.eval.result_items` | Journey asserts the run's frozen `record_id` and `wyrd_event_time` equal the committed row, skipped items persist beside ran items, gate fail dispatches exactly one Operator. `created_at` on a different UTC day was not exercised: the SDK sets `created_at` when the record is emitted. The reader prunes only by the frozen `wyrd_event_time` day. | PASS (see limit) |
+| AC-016 continuous Eval matrix, retry-to-`errored`, restart recovery | Runtime restart between phases; runs enqueued with no runtime running | Journey: 16 runs pending with no runtime, then completed after start; runtime stopped and a new one started for the trace phase; `pg_verifier_runs::trace_wait_requeues_until_deadline_then_times_out` | PASS |
+| AC-027 media reaches the provider natively; refusals are execution errors | `TenantMedia` (scheme, tenant prefix, MIME, size, bytes → base64); `wyrd-storage::StorageHandle::object_len` | Journey: provider request bodies carry the image base64 and no `file://` URI; cross-tenant media → `errored`, no result/dispatch; `verification::eval::tests::media_resolves_only_authorized_bounded_supported_objects` (unsupported MIME, foreign scheme, cross-tenant, absent, oversized) | PASS |
+
+Root causes fixed while proving the journey:
+
+- **Hydrated bundle YAML.** Hydrated bundles wrote externally tagged enums as YAML tags, so a native judge Prompt with `response_type: json_schema` could not be read back. Fix: `write_yaml` now serializes through the JSON data model. Test: `cards::hydrate::bundle::tests::tagged_enums_are_written_as_mappings`.
+- **Missing span table.** A tenant's `vala.traces.spans` table does not exist until its first span is exported. The engine now treats `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND` as a trace that has not landed yet, rather than as a source error.
+- **Retry diagnostics.** A retried attempt now logs its code and message.
+
+Verification (all exit 0 in this session):
+
+- The five focused `vala-eval` commands.
+- `mise run test:vala`
+- `mise run test:sql`
+- `mise run test:wyrd` (2122 passed)
+- `mise run test:bifrost`, which includes the new journey in `wyrd-testing::server`
+- `mise run test:wyrdstate:journey`
+- `mise run fmt`
+- `mise run lints`
+- `git diff --check`
+- The new focused tests:
+  - `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=verification::eval::tests::media_resolves_only_authorized_bounded_supported_objects)'`
+  - `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=cards::hydrate::bundle::tests::tagged_enums_are_written_as_mappings)'`
+
+Non-goals confirmed excluded:
+
+- No outbox.
+- No join to Scribe's batch transaction.
+- No Bifrost polling as a queue.
+- No synthesized `passed:false`.
+- No online-only judge.
+- No offline dataset execution.
+- No provider file lifecycle.
+- No private URI in provider text.
+
+Material limits:
+
+- **Tenant routing of the enqueue.** It is enforced by the tenant-scoped RLS connection. No cross-tenant journey was added.
+- **Query admission under load.** On a busy pod, query admission rejection (`WYRD_VALA_429`) uses up bounded retry attempts.

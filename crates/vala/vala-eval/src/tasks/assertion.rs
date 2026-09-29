@@ -112,10 +112,7 @@ fn evaluate_single(
     let message = if verdict.passed {
         None
     } else {
-        Some(format!(
-            "operator {:?} returned false for observed={observed}",
-            task.operator
-        ))
+        Some(format!("operator {:?} returned false", task.operator))
     };
     Ok((
         verdict.passed,
@@ -314,6 +311,20 @@ mod assertion_stage {
         drive_with_executors(spec, base, executors())
     }
 
+    /// Drive `spec` over `base` with the default executors.
+    ///
+    /// # Errors
+    /// Returns whatever execution error the driver propagates.
+    fn try_drive(spec: EvalSpec, base: Value) -> Result<EvalReport, crate::EvalExecError> {
+        let plan = spec.execution_plan().expect("test spec has valid dag");
+        let registry = registry_for(&spec, &plan);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime builds");
+        rt.block_on(execute_plan(&plan, &context(base), &registry, &executors()))
+    }
+
     fn drive_with_executors(spec: EvalSpec, base: Value, executors: Executors) -> EvalReport {
         let plan = spec.execution_plan().expect("test spec has valid dag");
         let registry = registry_for(&spec, &plan);
@@ -324,6 +335,30 @@ mod assertion_stage {
             .expect("tokio runtime builds");
         rt.block_on(execute_plan(&plan, &cx, &registry, &executors))
             .expect("plan executes")
+    }
+
+    /// A false comparison is a normal Failed result whose message never echoes
+    /// the observed value, so redacted or hashed capture cannot leak it.
+    #[test]
+    fn false_comparison_message_omits_observed_value() {
+        let spec = spec_of(vec![assertion(
+            "secret",
+            Some("$.ssn"),
+            ComparisonOperator::Equals,
+            json!("expected"),
+            &[],
+            None,
+        )]);
+        let report = drive(spec, json!({ "ssn": "123-45-6789" }));
+        let TaskRunOutcome::Ran(result) = &report.outcomes[0] else {
+            panic!("a false comparison must run");
+        };
+        assert!(!result.passed);
+        let message = result
+            .message
+            .as_deref()
+            .expect("failed result has message");
+        assert!(!message.contains("123-45-6789"), "{message}");
     }
 
     #[test]
@@ -497,8 +532,9 @@ mod assertion_stage {
         }
     }
 
+    /// Missing required context is an execution error, not a failed result.
     #[test]
-    fn missing_jsonpath_surfaces_typed_error_as_failed_result() {
+    fn missing_jsonpath_propagates_typed_error() {
         let spec = spec_of(vec![assertion(
             "broken",
             Some("$.does_not_exist"),
@@ -507,25 +543,14 @@ mod assertion_stage {
             &[],
             None,
         )]);
-        let report = drive(spec, json!({ "score": 1.0 }));
-        assert_eq!(report.outcomes.len(), 1);
-        match &report.outcomes[0] {
-            TaskRunOutcome::Ran(result) => {
-                assert!(!result.passed);
-                assert!(
-                    result
-                        .message
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("extract path")
-                );
-            }
-            other => panic!("expected Ran(Failed), got {other:?}"),
-        }
+        let error = try_drive(spec, json!({ "score": 1.0 }))
+            .expect_err("missing context must not produce a result");
+        assert!(error.to_string().contains("extract path"), "{error}");
     }
 
+    /// An operator type mismatch is an execution error, not a failed result.
     #[test]
-    fn operator_type_mismatch_surfaces_typed_error_as_failed_result() {
+    fn operator_type_mismatch_propagates_typed_error() {
         let spec = spec_of(vec![assertion(
             "mismatch",
             Some("$.response"),
@@ -534,22 +559,12 @@ mod assertion_stage {
             &[],
             None,
         )]);
-        let report = drive(spec, json!({ "response": "not a number" }));
-        assert_eq!(report.outcomes.len(), 1);
-        match &report.outcomes[0] {
-            TaskRunOutcome::Ran(result) => {
-                assert!(!result.passed);
-                assert!(
-                    result
-                        .message
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains("operator")
-                );
-            }
-            other => panic!("expected Ran(Failed), got {other:?}"),
-        }
+        let error = try_drive(spec, json!({ "response": "not a number" }))
+            .expect_err("an operator type mismatch must not produce a result");
+        assert!(
+            error.to_string().to_lowercase().contains("operator"),
+            "{error}"
+        );
     }
 
     #[test]

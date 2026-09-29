@@ -14,9 +14,9 @@
 //! 4. Maintains a single-threaded [`RunLedger`] for per-run state (skip set
 //!    plus outcome stream). [`crate::store::TaskRegistry`] stays immutable.
 //!
-//! Per-task errors are folded into a Failed `AssertionResult` so the run
-//! keeps walking the DAG. Plan-level invariants (`EvalExecError::DagInvalid`)
-//! bubble out and abort the run.
+//! An executor error aborts the run and propagates to the caller: an error is
+//! an execution failure, never a subject failure, so it is never recorded as a
+//! Failed `AssertionResult`. Only a completed comparison produces a result.
 //!
 //! The four-bucket fan-out shape keeps task kinds concurrent within a stage.
 //! Executors return outputs rather than writing into shared state, so no locks
@@ -26,13 +26,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
-use serde_json::Value;
 use tokio::task::JoinSet;
 
 use wyrd_spec::vala::eval::{
-    AssertionResult, ComparisonOperator, ConditionCombinator, EvalCondition, EvalTask,
-    ExecutionPlan, Stage, TaskId,
+    AssertionResult, ConditionCombinator, EvalCondition, EvalTask, ExecutionPlan, Stage, TaskId,
 };
 
 use crate::context::{
@@ -168,8 +165,8 @@ pub trait TaskExecutor: Send + Sync {
     ///
     /// # Errors
     /// Returns [`EvalExecError`] when the task cannot produce an output.
-    /// Per-task errors are folded into a Failed `AssertionResult` by the
-    /// driver; only plan-level invariants abort the run.
+    /// The driver propagates every error and aborts the run; an error is never
+    /// recorded as a Failed `AssertionResult`.
     async fn execute(
         &self,
         task: &EvalTask,
@@ -198,8 +195,8 @@ pub struct Executors {
 ///
 /// # Errors
 /// Returns [`EvalExecError::DagInvalid`] when a plan references a task absent
-/// from the registry, or any condition-evaluation error that the driver
-/// cannot fold into a Failed result.
+/// from the registry, and any condition-evaluation or task-executor error
+/// unchanged; no error is converted into a Failed result.
 pub async fn execute_plan(
     plan: &ExecutionPlan,
     cx: &ExecutionContext,
@@ -385,6 +382,28 @@ fn order_stage_outcomes(
     (ordered, new_outputs)
 }
 
+/// Run every task of one task-kind bucket concurrently on its shared executor.
+///
+/// [`fan_out_all_buckets`] calls this once per kind (assertion, judge, trace,
+/// agent) for one stage. Each task gets its own Tokio task on a `JoinSet`
+/// sharing `snapshot` and `executor`; outputs are collected in completion
+/// order, and [`order_stage_outcomes`] later restores declaration order. An
+/// empty bucket returns immediately without spawning.
+///
+/// # Errors
+/// Returns the first error observed in completion order: the executor's own
+/// [`EvalExecError`] unchanged, so an executor failure aborts the run rather
+/// than becoming a failed result, or [`EvalExecError::DagInvalid`] when a
+/// spawned task panicked or was cancelled.
+///
+/// # Cancellation
+/// Returning early drops the `JoinSet`, which aborts every sibling task of
+/// this bucket still running; their outputs, and any already collected, are
+/// discarded, so the stage yields no partial results. Dropping this future
+/// (including when `tokio::try_join!` in [`fan_out_all_buckets`] short-circuits
+/// on another bucket's error) aborts the bucket's tasks the same way. Work an
+/// aborted executor already performed, such as a provider call, is not
+/// rolled back.
 async fn fan_out_bucket(
     tasks: Vec<EvalTask>,
     snapshot: Arc<ContextSnapshot>,
@@ -400,12 +419,8 @@ async fn fan_out_bucket(
         let snapshot = Arc::clone(&snapshot);
         let executor = Arc::clone(&executor);
         set.spawn(async move {
-            let task_id = task.id().clone();
-            let outcome = match executor.execute(&task, &snapshot, stage).await {
-                Ok(output) => output,
-                Err(error) => TaskOutput::Assertion(synthesize_failed_result(&task, stage, &error)),
-            };
-            Ok((task_id, outcome))
+            let output = executor.execute(&task, &snapshot, stage).await?;
+            Ok((task.id().clone(), output))
         });
     }
 
@@ -483,39 +498,6 @@ fn evaluate_condition(
     Ok(acc.unwrap_or(true))
 }
 
-fn synthesize_failed_result(task: &EvalTask, stage: u32, error: &EvalExecError) -> AssertionResult {
-    let started_at = Utc::now();
-    AssertionResult {
-        task_id: task.id().clone(),
-        passed: false,
-        actual: None,
-        expected: expected_of(task),
-        operator: operator_of(task),
-        message: Some(error.to_string()),
-        stage,
-        started_at,
-        duration_ms: 0,
-    }
-}
-
-fn expected_of(task: &EvalTask) -> Value {
-    match task {
-        EvalTask::Assertion(task) => task.expected.clone(),
-        EvalTask::LlmJudge(task) => task.expected.clone(),
-        EvalTask::TraceAssertion(task) => task.expected.clone(),
-        EvalTask::AgentAssertion(task) => task.expected.clone(),
-    }
-}
-
-fn operator_of(task: &EvalTask) -> ComparisonOperator {
-    match task {
-        EvalTask::Assertion(task) => task.operator.clone(),
-        EvalTask::LlmJudge(task) => task.operator.clone(),
-        EvalTask::TraceAssertion(task) => task.operator.clone(),
-        EvalTask::AgentAssertion(task) => task.operator.clone(),
-    }
-}
-
 fn outcome_task_id(outcome: &TaskRunOutcome) -> &TaskId {
     match outcome {
         TaskRunOutcome::Ran(result) => &result.task_id,
@@ -528,7 +510,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use uuid::Uuid;
     use wyrd_spec::vala::eval::{
         AssertionTask, ComparisonOperator, EvalTask, JsonPath, RecordId, RunId,
@@ -621,6 +603,77 @@ mod tests {
         let task_c = tid("c")?;
         let task = registry.get(&task_c).expect("task c registered");
         assert_eq!(first_skipped_dependency(task, &ledger), Some(tid("a")?));
+        Ok(())
+    }
+
+    /// Executor that fails every task with a transient trace error.
+    struct UnavailableExecutor;
+
+    #[async_trait]
+    impl TaskExecutor for UnavailableExecutor {
+        /// Fail with [`EvalExecError::TraceUnavailableForTask`].
+        ///
+        /// # Errors
+        /// Always returns the trace-unavailable error.
+        async fn execute(
+            &self,
+            task: &EvalTask,
+            _snapshot: &ContextSnapshot,
+            _stage: u32,
+        ) -> Result<TaskOutput, EvalExecError> {
+            Err(EvalExecError::TraceUnavailableForTask {
+                task_id: task.id().clone(),
+                source: crate::TraceUnavailable::Failed {
+                    reason: "source down".to_owned(),
+                },
+            })
+        }
+    }
+
+    /// Run a single `Equals true` assertion over `record` with `assertion_executor`.
+    ///
+    /// # Errors
+    /// Returns plan validation errors and whatever the driver propagates.
+    async fn run_single(
+        record: Value,
+        assertion_executor: Arc<dyn TaskExecutor>,
+    ) -> Result<EvalReport, Box<dyn Error>> {
+        let map: BTreeMap<_, _> = [assertion("a", &[])?]
+            .into_iter()
+            .map(|task| (task.id().clone(), task))
+            .collect();
+        let plan = wyrd_spec::vala::eval::validate_dag(&map)?;
+        let registry = TaskRegistry::from_plan(&plan, map)?;
+        let unused: Arc<dyn TaskExecutor> = Arc::new(UnavailableExecutor);
+        let executors = Executors {
+            assertion: assertion_executor,
+            judge: Arc::clone(&unused),
+            trace: Arc::clone(&unused),
+            agent: unused,
+        };
+        let cx = ExecutionContext::new(
+            record,
+            RunId::from_string("run-unit".to_owned()),
+            RecordId(Uuid::nil()),
+            None,
+        );
+        Ok(execute_plan(&plan, &cx, &registry, &executors).await?)
+    }
+
+    /// An executor error aborts the run instead of becoming a Failed result,
+    /// while a completed false comparison stays a Failed result.
+    #[tokio::test]
+    async fn executor_error_propagates_and_false_comparison_fails() -> Result<(), Box<dyn Error>> {
+        let error = run_single(json!(true), Arc::new(UnavailableExecutor))
+            .await
+            .expect_err("an executor error must not produce a report");
+        assert!(error.to_string().contains("trace unavailable"), "{error}");
+
+        let assertion = Arc::new(crate::tasks::AssertionTaskExecutor::new());
+        let report = run_single(json!(false), assertion).await?;
+        let ran: Vec<_> = report.ran().collect();
+        assert_eq!(ran.len(), 1);
+        assert!(!ran[0].passed, "a false comparison is a subject failure");
         Ok(())
     }
 }

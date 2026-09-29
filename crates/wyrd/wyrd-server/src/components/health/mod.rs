@@ -325,6 +325,12 @@ fn probe_scribe(state: &AppState) -> ProbeOutcome {
     outcome
 }
 
+/// Checks Postgres readiness by acquiring an app-pool connection and running
+/// `SELECT 1` within `probe_timeout`.
+///
+/// A failure is logged at `warn` with its class and the driver's full error
+/// text, so an operator can see why `/readyz` failed; the HTTP report carries
+/// only the coarse [`ProbeReason`].
 async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutcome {
     let started = std::time::Instant::now();
     let result = timeout(probe_timeout, async {
@@ -351,6 +357,7 @@ async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutco
             tracing::warn!(
                 reason = ?reason,
                 error_class = sqlx_error_class(&error),
+                error = %error,
                 elapsed_ms,
                 "readiness: postgres probe failed"
             );
@@ -394,6 +401,12 @@ fn sqlx_error_class(error: &sqlx::Error) -> &'static str {
     }
 }
 
+/// Checks object-storage readiness through the storage handle's health probe
+/// within `probe_timeout`.
+///
+/// A failure is logged at `warn` with its class and the backend's full error
+/// text, so an operator can see why `/readyz` failed; the HTTP report carries
+/// only the coarse [`ProbeReason`].
 async fn probe_storage(state: &AppState, probe_timeout: Duration) -> ProbeOutcome {
     let started = std::time::Instant::now();
     let result = timeout(probe_timeout, state.storage.health_probe()).await;
@@ -408,6 +421,7 @@ async fn probe_storage(state: &AppState, probe_timeout: Duration) -> ProbeOutcom
             tracing::warn!(
                 reason = ?ProbeReason::BackendError,
                 error_class = storage_health_error_class(&error),
+                error = %error,
                 elapsed_ms,
                 "readiness: storage probe failed"
             );

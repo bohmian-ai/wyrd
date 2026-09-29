@@ -143,10 +143,10 @@ not a passive integration or inventory product.
       inside `Permission` is the sanctioned model — see
       `v1/00-foundations/permission-model.md`.
     - **Policy** gates card states (`classify` at register-time, `gate` at
-      deploy-time) and cross-service invokes (`invoke` at runtime). Runtime
-      invoke evaluation is centralized at `POST /v1/authz/check`, called
-      transparently by the service mesh's ext_authz filter or by the SDK
-      middleware in non-mesh shops.
+      deploy-time). There is no runtime cross-service invoke gate: the
+      `PolicyAction::Invoke` enum member and the `POST /v1/authz/check`
+      runtime evaluation surface it referenced were removed and have no
+      replacement in this design.
 
     Runtime identity is a `Principal { id: PrincipalId, kind: PrincipalKind,
     tenant_id, roles, effective_permissions, credential_id }`. `PrincipalId`
@@ -204,11 +204,10 @@ not a passive integration or inventory product.
     intersection of both. On cross-service calls the SDK puts that delegated
     Wyrd JWT in the `X-Wyrd-Access-Token` header. The application's own
     `Authorization` header is never touched. `Wyrd-Caller-Identity` is
-    rejected legacy — do not reintroduce. The mesh's ext_authz filter (or
-    the SDK middleware) forwards `X-Wyrd-Access-Token`, `Wyrd-Request-Id`,
-    and `X-Original-*` to `/v1/authz/check`; the body is empty. Both subject
-    and actor identities are server-verified from one signed delegated
-    JWT — no enforcement-point JWT, no SPIFFE/mTLS actor derivation.
+    rejected legacy — do not reintroduce. Both subject and actor identities
+    are server-verified from one signed delegated JWT — no enforcement-point
+    JWT, no SPIFFE/mTLS actor derivation. Delegated exchange consults no
+    policy; it records `auth.token.exchange` as its audit permission.
 19. **Reference slots use exactly `Ref` or `InlineableRef<T>`.** `Ref` carries
     durable identity or an authored `Path`; `InlineableRef<T>` additionally
     permits an inline child body. `Path` is loader-only. During composite
@@ -449,11 +448,10 @@ rule shape; the `action` field on each rule says when it fires:
   - `gate`     (deploy-time):   rule allows/denies the card's deploy-time
                                 credential issuance (`wyrd auth issue-key`),
                                 and thus its emit eligibility. Blocks when Deny.
-  - `invoke`   (runtime, per cross-service call): evaluated by
-                                `POST /v1/authz/check`. Returns Allow/Deny to
-                                the mesh ext_authz filter or the SDK
-                                middleware. Developers never write enforcement
-                                code.
+  - `invoke`   (runtime, per cross-service call): declared but unenforced.
+                                The runtime evaluation surface this action
+                                referenced (`POST /v1/authz/check`) was
+                                removed with no replacement gate.
 
 Composition: `org_global ∪ service_local`, deny-overrides. Service-local can
 only tighten. CEL parse and evaluation are owned by the Policy engine;
@@ -580,16 +578,15 @@ Content-Type: application/json
 #### Request correlator — `Wyrd-Request-Id`
 
 A Wyrd-owned, request-scoped opaque ID that joins every hop of a logical
-request. It is the sole correlator for policy ancestry and audit replay —
+request. It is the sole correlator for request ancestry and audit replay —
 Wyrd does not depend on `traceparent`, mesh tracing, or any external
 propagation contract.
 
 Contract:
 
-- Opaque UUIDv7 minted by Wyrd at first sighting (no inbound
-  `Wyrd-Request-Id` at `/v1/authz/check`).
-- Propagated unchanged by Wyrd SDK middleware and ext_authz on outbound
-  calls. Never mutated, never re-minted mid-request.
+- Opaque UUIDv7 minted by Wyrd at first sighting.
+- Propagated unchanged by Wyrd SDK middleware on outbound calls. Never
+  mutated, never re-minted mid-request.
 - Every Wyrd-emitted observation carries it as a label.
 - Ancestry of any request (service1 → service2 → service3) is
   reconstructable by joining observations on this ID; per-hop caller
@@ -709,87 +706,6 @@ Consequences, stated so they stop drifting:
   version and matching component `card_ref`. Verification routing is resolved
   later from that subject's `verified_by` bindings; authorization still
   reduces to the one subject `card_ref` on the row.
-
-### Runtime authz: `POST /v1/authz/check`
-
-The single CEL evaluation surface for `PolicyAction::Invoke`. Two delivery
-paths, identical semantics:
-
-- **Service mesh (ext_authz).** The mesh's local Envoy/Istio sidecar
-  intercepts the inbound request transparently (iptables redirect, standard
-  k8s/Istio behavior), and the configured ext_authz filter calls Wyrd's
-  `/v1/authz/check`. Application code makes a normal HTTP call. One-time
-  platform-team filter config covers every workload — no per-team
-  middleware is required. The mesh is configured to forward exactly the
-  Wyrd-defined headers via `includeRequestHeadersInCheck`, e.g.
-
-  ```yaml
-  apiVersion: install.istio.io/v1alpha1
-  kind: IstioOperator
-  spec:
-    meshConfig:
-      extensionProviders:
-        - name: wyrd-authz
-          envoyExtAuthzHttp:
-            service: wyrd-server.wyrd-system.svc.cluster.local
-            port: "8080"
-            pathPrefix: /v1/authz/check
-            includeRequestHeadersInCheck:
-              - x-wyrd-access-token
-              - wyrd-request-id
-              - x-original-method
-              - x-original-path
-              - x-original-host
-  ```
-- **SDK middleware (non-mesh).** Identical semantics in-process. One-line
-  developer install (`app.add_middleware(PolicyMiddleware)`). The middleware
-  reads `X-Wyrd-Access-Token` from the inbound request and calls the same
-  `/v1/authz/check` route.
-
-The check is **headers-only**. Body is empty. All inputs are headers, which
-matches how Envoy's ext_authz filter natively forwards data — zero
-translation logic on either end.
-
-```
-POST /v1/authz/check HTTP/1.1
-Host: wyrd.acme.com
-X-Wyrd-Access-Token: Bearer <delegated Wyrd JWT — principal=subject, act=actor chain>
-Wyrd-Request-Id:     <UUIDv7 — forwarded from inbound, or absent on first hop>
-X-Original-Method:   POST
-X-Original-Path:     /charge
-X-Original-Host:     billing-svc.acme.svc.cluster.local
-Content-Length: 0
-```
-
-Wyrd:
-1. Verifies `X-Wyrd-Access-Token`. Rejects with `403 Forbidden` if the JWT
-   is not a **delegated** token — i.e. if the `act` chain is empty, or if
-   the current actor's kind ∉ {Service, Agent} or it has no `card_ref`.
-   `/v1/authz/check` will not authorize on a direct (non-delegated) token.
-2. Derives `subject = verified.principal` (the party acted for, carrying
-   the attenuated permissions) and `actor = verified.delegation_chain.last()`
-   (the calling Service/Agent); the full chain is retained for policy
-   bindings and audit. There is no enforcement-point JWT and no SPIFFE/mTLS
-   actor derivation — one delegated token carries both sides.
-3. Reads `X-Original-Method` / `X-Original-Path` / `X-Original-Host`
-   → builds `request`.
-4. Reads `Wyrd-Request-Id` if present; mints a fresh UUIDv7 if absent and
-   echoes it back so the middleware/sidecar can inject it on the outbound
-   call.
-5. Assembles `AuthzCheckContext { subject, actor, chain, request, metadata,
-   request_id }`.
-6. Evaluates the invoke policy for the actor acting for the subject
-   (org-global ∪ service-local, deny-overrides), then checks the required
-   permission against the subject's attenuated permissions.
-7. Returns `200 OK` (Allow) or `403 Forbidden` with `PolicyDecision::Deny { reason }`.
-8. Asynchronously emits one `PolicyInvokeDecision` observation per check,
-   labeled with `Wyrd-Request-Id` (emitted under Wyrd's internal authority —
-   server-authored, not caller-signed). Every allow and every deny is
-   audited automatically; no developer wiring.
-
-Identity is server-verified from one signed delegated JWT. The pod cannot
-self-assert its identity — no env var, no body field, no header carries
-identity data the pod authored.
 
 ### Audit
 Immutable case file. Records the result of an investigation against the

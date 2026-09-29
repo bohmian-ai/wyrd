@@ -301,7 +301,6 @@ mod pg_tests {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await
         .expect("local storage handle");
@@ -402,7 +401,7 @@ mod pg_tests {
         }
     }
 
-    // These tests drive the shared embedded-Postgres pool, whose connections
+    // These tests drive the shared repository-managed Postgres pool, whose connections
     // take reactor affinity from the runtime that establishes them. They run on
     // the process-wide persistent runtime (not a per-test `#[tokio::test]`
     // runtime) so the shared pool is never poisoned by a runtime that dies at

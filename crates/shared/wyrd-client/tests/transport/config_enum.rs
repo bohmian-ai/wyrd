@@ -55,7 +55,6 @@ fn transport_config_name_matches_tag() {
             TransportConfig::Http(HttpConfig {
                 base_url: "https://example.com".to_string(),
                 timeout_ms: 5_000,
-                tls: None,
                 compression: false,
             }),
         ),
@@ -85,7 +84,6 @@ fn transport_config_all_variants_round_trip() {
         TransportConfig::Http(HttpConfig {
             base_url: "https://example.com".to_string(),
             timeout_ms: 30_000,
-            tls: None,
             compression: false,
         }),
         TransportConfig::Mock(MockConfig {

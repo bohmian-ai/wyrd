@@ -1369,15 +1369,11 @@ impl ForgeFixture {
                 operator_pool: self.operator_pool.clone(),
                 catalog,
                 staging: Arc::clone(&self.staging),
-                staging_lists_by_cursor: self
-                    .staging
-                    .info()
-                    .full_capability()
-                    .list_with_start_after,
                 object_store,
                 hints: inbox,
                 config,
                 maintenance_interval: std::time::Duration::from_secs(60),
+                scheduler_owner: uuid::Uuid::now_v7(),
                 clock: self.forge.clock_for_test(),
                 completion_observer: supervision.completion_observer,
                 scheduler_trigger: supervision.scheduler_trigger,

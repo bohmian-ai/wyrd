@@ -9,105 +9,73 @@ events {
 http {
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
-
     access_log off;
-    error_log /dev/stderr;
+    server_tokens off;
 
     client_body_temp_path /tmp/client_temp;
-    proxy_temp_path /tmp/proxy_temp_path;
+    proxy_temp_path /tmp/proxy_temp;
     fastcgi_temp_path /tmp/fastcgi_temp;
     uwsgi_temp_path /tmp/uwsgi_temp;
     scgi_temp_path /tmp/scgi_temp;
 
     sendfile on;
-    tcp_nopush on;
     tcp_nodelay on;
     keepalive_timeout 65;
-    types_hash_max_size 2048;
-    server_tokens off;
 
-    client_max_body_size 32M;
-    client_body_buffer_size 128k;
-    proxy_buffering on;
-    proxy_buffer_size 16k;
-    proxy_buffers 8 16k;
-
-    gzip on;
-    gzip_vary on;
-    gzip_min_length 1024;
-    gzip_comp_level 6;
-    gzip_types
-        text/plain
-        text/css
-        application/json
-        application/javascript
-        text/xml
-        application/xml
-        application/xml+rss
-        text/javascript
-        application/wasm;
-
-    upstream wyrd_api {
-        server 127.0.0.1:8080 max_fails=3 fail_timeout=30s;
+    upstream wyrd_http {
+        server ${WYRD_SERVER_BIND};
         keepalive 32;
     }
 
-    upstream sveltekit {
-        server 127.0.0.1:3000 max_fails=3 fail_timeout=30s;
+    upstream wyrd_ui {
+        server 127.0.0.1:3000;
         keepalive 32;
+    }
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        '' '';
     }
 
     server {
-        listen ${NGINX_PORT};
+        listen 8080;
         server_name _;
 
-        add_header X-Frame-Options "SAMEORIGIN" always;
-        add_header X-Content-Type-Options "nosniff" always;
-        add_header X-XSS-Protection "1; mode=block" always;
-        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
 
-        location /api/ {
-            proxy_pass http://wyrd_api/api/;
-            proxy_http_version 1.1;
+        # Rust owns these paths verbatim; nothing is rewritten. Bodies stream
+        # through unbuffered so artifact uploads and MCP streams are not held
+        # or size-capped here; the server enforces its own limits.
+        location ~ ^/(v1|auth|platform|mcp)(/|$)|^/(openapi\.json|healthz|readyz)$ {
+            proxy_pass http://wyrd_http;
             proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection 'upgrade';
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_set_header Cookie $http_cookie;
-            proxy_pass_header Set-Cookie;
-            proxy_cache_bypass $http_upgrade;
-            proxy_read_timeout 86400;
-            proxy_send_timeout 86400;
-        }
-
-        location /health {
-            proxy_pass http://wyrd_api/api/v1/health;
-            proxy_http_version 1.1;
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_set_header Cookie $http_cookie;
-            proxy_pass_header Set-Cookie;
-            access_log off;
+            proxy_set_header Connection $connection_upgrade;
+            client_max_body_size 0;
+            proxy_request_buffering off;
+            proxy_buffering off;
+            proxy_read_timeout 1h;
+            proxy_send_timeout 1h;
         }
 
         location / {
-            proxy_pass http://sveltekit;
-            proxy_http_version 1.1;
-            proxy_set_header Upgrade $http_upgrade;
-            proxy_set_header Connection 'upgrade';
-            proxy_set_header Host $host;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_set_header Cookie $http_cookie;
-            proxy_pass_header Set-Cookie;
-            proxy_cache_bypass $http_upgrade;
-            proxy_read_timeout 86400;
-            proxy_send_timeout 86400;
+            proxy_pass http://wyrd_ui;
+            proxy_set_header Connection "";
+        }
+    }
+
+    server {
+        listen 50051 http2;
+        server_name _;
+
+        location / {
+            grpc_pass grpc://${WYRD_GRPC_BIND};
+            client_max_body_size 0;
+            grpc_read_timeout 1h;
+            grpc_send_timeout 1h;
         }
     }
 }

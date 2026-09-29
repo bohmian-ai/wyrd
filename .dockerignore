@@ -6,6 +6,12 @@ node_modules/
 *.pem
 **/*.pem
 
+# Local SDK environments and native builds; no image copies them.
+.venv/
+**/.venv/
+**/*.so
+**/*.node
+
 # Local secrets and credentials
 .env
 .env.*

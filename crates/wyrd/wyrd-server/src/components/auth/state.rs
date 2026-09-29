@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_crypt::SecretKey;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
@@ -9,7 +8,6 @@ use wyrd_auth::issuance::{TenantTokenIssuer, TokenExchangeSettings};
 use wyrd_auth_verify::{ExternalVerifier, TokenVerifier};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
-use crate::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 
 /// Authentication handles: token issuance + verification + issuer/binding resolution.
 #[derive(Clone, Default)]
@@ -46,26 +44,17 @@ impl ServerAuth {
     }
 }
 
-/// Authorization handles: policy decision + RBAC evaluation + decision audit.
+/// Authorization handles: RBAC evaluation.
 #[derive(Clone)]
 pub struct ServerAuthz {
     /// RBAC permission evaluator. Defaults to `RbacCheck`.
     pub permission_check: Arc<dyn PermissionCheck>,
-    /// Policy hook called after RBAC for additional allow/deny logic. Defaults to
-    /// `StubAllowPolicyHook`; must be replaced in production
-    /// (enforced by `AppState::production_validate`).
-    pub policy_hook: Arc<dyn PolicyHook>,
-    /// Audit writer for authorization decisions. Defaults to `NoopAuthzAuditWriter`;
-    /// must be replaced in production (enforced by `AppState::production_validate`).
-    pub audit_writer: Arc<dyn AuthzAuditWriter>,
 }
 
 impl Default for ServerAuthz {
     fn default() -> Self {
         Self {
             permission_check: Arc::new(RbacCheck),
-            policy_hook: Arc::new(StubAllowPolicyHook),
-            audit_writer: Arc::new(NoopAuthzAuditWriter),
         }
     }
 }

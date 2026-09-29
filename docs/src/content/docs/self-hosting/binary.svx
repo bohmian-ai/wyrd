@@ -3,7 +3,7 @@ title: Binary
 description: Deploy the compiled server to a host or VM.
 pillar: wyrd
 group: Self-hosting
-order: 11
+order: 13
 ---
 
 # Binary

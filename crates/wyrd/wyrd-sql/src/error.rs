@@ -179,9 +179,9 @@ pub enum SqlError {
         code = "WYRD_SQL_500_INSUFFICIENT_PRIVILEGE",
         status = 500,
         title = "Insufficient database privileges",
-        remediation = "Ensure WYRD_DATABASE_URL authenticates as wyrd_app for runtime queries, \
-                       and WYRD_DATABASE_MIGRATOR_PASSWORD matches the wyrd_migrator role used \
-                       by migrate()."
+        remediation = "Run `wyrd-server migrate` with WYRD_DATABASE_URL set to the database-owner \
+                       login; a serving WYRD_DATABASE_URL authenticates as wyrd_app and never \
+                       runs DDL."
     )]
     #[error("insufficient database privileges: {detail}")]
     InsufficientPrivilege {
@@ -198,6 +198,22 @@ pub enum SqlError {
     )]
     #[error("stored tenant identifier violated Wyrd's UUIDv7 contract: {0}")]
     InvalidDataTenantId(#[source] wyrd_spec::ids::IdError),
+
+    /// The serving database is unmigrated or its roles, grants, or row-level
+    /// security do not match what serving Wyrd requires.
+    #[wyrd_error(
+        code = "WYRD_SQL_503_SCHEMA_NOT_READY",
+        status = 503,
+        title = "Database schema is not ready for serving",
+        remediation = "Run `wyrd-server migrate` with the database-owner login, and serve with \
+                       WYRD_DATABASE_URL as wyrd_app and WYRD_PLATFORM_DATABASE_URL as \
+                       wyrd_platform_admin."
+    )]
+    #[error("database schema is not ready for serving: {detail}")]
+    SchemaNotReady {
+        /// The first readiness check that failed.
+        detail: String,
+    },
 }
 
 impl SqlError {

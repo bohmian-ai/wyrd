@@ -40,7 +40,8 @@ impl PoolConfig {
         }
     }
 
-    /// Defaults for the boot-only `wyrd_migrator` pool.
+    /// Defaults for the one-off migration pool opened with the database-owner
+    /// login by `wyrd-server migrate`.
     #[must_use]
     pub fn migrator_defaults() -> Self {
         Self {
@@ -54,7 +55,7 @@ impl PoolConfig {
         }
     }
 
-    /// Defaults for the optional `wyrd_platform_admin` pool.
+    /// Defaults for the `wyrd_platform_admin` pool.
     #[must_use]
     pub fn platform_admin_defaults() -> Self {
         Self {
@@ -74,7 +75,7 @@ impl PoolConfig {
         Self::from_env_with_suffix(Self::app_defaults(), "")
     }
 
-    /// Migrator pool config from `WYRD_DB_*_MIGRATOR` env vars.
+    /// Migration owner pool config from `WYRD_DB_*_MIGRATOR` env vars.
     #[must_use]
     pub fn migrator_from_env() -> Self {
         Self::from_env_with_suffix(Self::migrator_defaults(), "_MIGRATOR")
@@ -138,16 +139,6 @@ pub async fn build_pool(database_url: &str, config: PoolConfig) -> Result<PgPool
 /// report pool construction or connection failures.
 pub async fn build_app_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     build_pool(database_url, PoolConfig::app_from_env()).await
-}
-
-/// Build the boot-only `wyrd_migrator` pool from `WYRD_DB_*_MIGRATOR` tuning.
-///
-/// # Errors
-/// Returns [`sqlx::Error::Configuration`] when another Rustls provider already
-/// owns the process or the DSN cannot be parsed. Other [`sqlx::Error`] variants
-/// report pool construction or connection failures.
-pub async fn build_migrator_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
-    build_pool(database_url, PoolConfig::migrator_from_env()).await
 }
 
 /// Build the audited `wyrd_platform_admin` pool from

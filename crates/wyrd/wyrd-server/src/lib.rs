@@ -39,5 +39,5 @@ pub use boot::{
 pub use config::BifrostTarget;
 pub use config::{ServeMode, WyrdServerConfig};
 pub use http::build_router;
-pub use postgres::{ServerPostgres, ServerPostgresError};
+pub use postgres::ServerPostgres;
 pub use state::AppState;

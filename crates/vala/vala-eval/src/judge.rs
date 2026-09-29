@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::reference::InlineableRef;
 
+use crate::tasks::MediaBindings;
+
 /// Failures returned by one judge invocation attempt.
 #[derive(Debug, thiserror::Error)]
 pub enum JudgeError {
@@ -48,16 +50,19 @@ pub trait JudgeInvoker: Send + Sync {
     /// Invoke the judge once.
     ///
     /// `judge` is a durable or inline Agent reference. `context` is the JSON object the
-    /// engine prepared from the task's dependencies, optional context path, and
-    /// per-record media bindings.
+    /// engine prepared from the task's dependencies and optional context path.
+    /// `media` carries the record's named media descriptors; an implementation
+    /// binds each as provider-native content into the judge Prompt's matching
+    /// `${media:id}` placeholder and never renders a descriptor as text.
     ///
     /// # Errors
-    /// Returns [`JudgeError`] when the invocation fails or returns invalid
-    /// structured output.
+    /// Returns [`JudgeError`] when the invocation fails, media cannot be
+    /// resolved or bound, or the judge returns invalid structured output.
     async fn invoke(
         &self,
         judge: &InlineableRef<AgentSpec>,
         context: Value,
+        media: &MediaBindings,
     ) -> Result<Value, JudgeError>;
 }
 
@@ -65,6 +70,8 @@ pub trait JudgeInvoker: Send + Sync {
 pub struct MockJudgeInvoker {
     scripted: Mutex<VecDeque<Result<Value, JudgeError>>>,
     seen: Mutex<Vec<(InlineableRef<AgentSpec>, Value)>>,
+    /// Media bindings received by each call, in invocation order.
+    seen_media: Mutex<Vec<MediaBindings>>,
 }
 
 impl MockJudgeInvoker {
@@ -74,12 +81,18 @@ impl MockJudgeInvoker {
         Arc::new(Self {
             scripted: Mutex::new(scripted.into_iter().collect()),
             seen: Mutex::new(Vec::new()),
+            seen_media: Mutex::new(Vec::new()),
         })
     }
 
     /// Captured `(judge_ref, context)` calls in invocation order.
     pub async fn calls(&self) -> Vec<(InlineableRef<AgentSpec>, Value)> {
         self.seen.lock().await.clone()
+    }
+
+    /// Media bindings passed to each call, in invocation order.
+    pub async fn media_calls(&self) -> Vec<MediaBindings> {
+        self.seen_media.lock().await.clone()
     }
 }
 
@@ -89,7 +102,9 @@ impl JudgeInvoker for MockJudgeInvoker {
         &self,
         judge: &InlineableRef<AgentSpec>,
         context: Value,
+        media: &MediaBindings,
     ) -> Result<Value, JudgeError> {
+        self.seen_media.lock().await.push(media.clone());
         self.seen
             .lock()
             .await

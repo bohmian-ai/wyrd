@@ -59,7 +59,6 @@ wyrd-queue = { path = "crates/shared/wyrd-queue", version = "0.0.1" }
 wyrd-auth-issue = { path = "crates/shared/wyrd-auth-issue", version = "0.0.1" }
 wyrd-auth-oidc = { path = "crates/shared/wyrd-auth-oidc", version = "0.0.1" }
 wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" }
-wyrd-auth-check = { path = "crates/shared/wyrd-auth-check", version = "0.0.1" }
 wyrd-auth = { path = "crates/wyrd/wyrd-auth", version = "0.0.1" }
 wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures", version = "0.0.1" }
 wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.0.1" }
@@ -147,7 +146,6 @@ zeroize = "1"
 governor = "0.10"
 tower_governor = { version = "0.8", features = ["axum"] }
 rand = "0.9"
-pg-embed = { version = "1.0.0", default-features = false, features = ["rt_tokio"] }
 url = { version = "2", features = ["serde"] }
 urlencoding = "2"
 httpdate = "1"
@@ -259,3 +257,13 @@ module_name_repetitions = "allow"
 # Workspace crates keep full debug info.
 [profile.dev.package."*"]
 debug = "line-tables-only"
+
+# Published release binaries (`cargo build --profile dist`): whole-program LTO
+# and one codegen unit for the fastest, smallest server, at the cost of a much
+# slower build. Local image builds and test lanes stay on `release`.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
+debug = false

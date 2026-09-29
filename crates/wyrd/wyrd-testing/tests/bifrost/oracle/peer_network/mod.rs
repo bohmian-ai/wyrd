@@ -8,6 +8,7 @@
 //! per pod, and membership addresses another pod can actually dial.
 
 mod analytical;
+mod join;
 mod listener;
 mod security;
 mod support;

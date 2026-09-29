@@ -33,7 +33,8 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, RetryOutcome, RunInput, Settlement, TerminalStatus, VerifierRunQueue,
+    ClaimedRun, RetryOutcome, RunInput, Settlement, TerminalStatus, TraceWaitOutcome,
+    VerifierRunQueue,
 };
 use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
 
@@ -41,7 +42,8 @@ use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
 use super::CapabilityCrash;
 use super::RuntimeLimits;
 use super::drift::DriftEngine;
-use super::engines::{self, EngineOutcome, VerifierReport};
+use super::engines::{EngineOutcome, VerifierReport};
+use super::eval::EvalEngine;
 #[cfg(feature = "test-support")]
 use super::health::RuntimeCapability;
 use super::permits::{VerifierPermit, VerifierPermits};
@@ -73,10 +75,15 @@ pub enum Transition {
     },
     /// Try the same run and input again within its attempt budget.
     Retry(VerificationError),
+    /// Requeue the Eval run, attempt refunded, until its trace deadline.
+    AwaitTrace(VerificationError),
     /// Settle without a verdict.
     Terminate(TerminalStatus, VerificationError),
     /// Return the run to its queue with its attempt refunded.
     Release,
+    /// Return the run to its queue with its attempt refunded, due after one
+    /// poll interval, because an input read met admission backpressure.
+    Defer(VerificationError),
 }
 
 /// Owner of claiming, executing, publishing, and settling Verifier runs.
@@ -96,6 +103,8 @@ pub struct VerifierRunner {
     drift: DriftEngine,
     /// Runtime bounds.
     limits: RuntimeLimits,
+    /// The continuous Eval arm.
+    eval: EvalEngine,
     /// Test-only scripted engine outcomes.
     #[cfg(feature = "test-support")]
     script: Option<EngineScript>,
@@ -120,6 +129,7 @@ impl VerifierRunner {
         publisher: ResultPublisher,
         drift: DriftEngine,
         limits: RuntimeLimits,
+        eval: EvalEngine,
     ) -> Self {
         Self {
             postgres,
@@ -129,6 +139,7 @@ impl VerifierRunner {
             publisher,
             drift,
             limits,
+            eval,
             #[cfg(feature = "test-support")]
             script: None,
             #[cfg(feature = "test-support")]
@@ -356,7 +367,10 @@ impl VerifierRunner {
                 "settlement_failed"
             }
         };
-        if outcome != "completed" && outcome != "released" {
+        if !matches!(
+            outcome,
+            "completed" | "released" | "awaiting_trace" | "deferred"
+        ) {
             metrics::counter!(
                 crate::app::metrics::VERIFICATION_RUN_FAILURES_TOTAL,
                 "implementation" => implementation,
@@ -404,6 +418,8 @@ impl VerifierRunner {
                     .await
             }
             EngineOutcome::Retry(error) => Transition::Retry(error),
+            EngineOutcome::AwaitingTrace(error) => Transition::AwaitTrace(error),
+            EngineOutcome::Deferred(error) => Transition::Defer(error),
             EngineOutcome::Terminal(status, error) => Transition::Terminate(status, error),
         }
     }
@@ -419,26 +435,32 @@ impl VerifierRunner {
         tenant: DataTenantId,
         run: &ClaimedRun,
     ) -> Result<(CardRef, VerifierImplementation), Transition> {
-        let unavailable = |message: String| failure(VERIFIER_UNAVAILABLE, &message);
+        let unavailable = |cause: &dyn std::fmt::Display| {
+            tracing::warn!(run_id = %run.lease.run_id, %cause, "loading the Verifier Card failed");
+            failure(VERIFIER_UNAVAILABLE, "the Verifier Card cannot be loaded")
+        };
         let mut conn = self
             .postgres
             .tenant_conn(tenant)
             .await
-            .map_err(|error| Transition::Retry(unavailable(error.to_string())))?;
+            .map_err(|error| Transition::Retry(unavailable(&error)))?;
         let card = get_card_by_uid(&mut conn, &run.verifier_uid)
             .await
             .map_err(|error| {
                 if error.status() >= 500 {
-                    Transition::Retry(unavailable(error.to_string()))
+                    Transition::Retry(unavailable(&error))
                 } else {
-                    Transition::Terminate(TerminalStatus::Errored, unavailable(error.to_string()))
+                    Transition::Terminate(TerminalStatus::Errored, unavailable(&error))
                 }
             })?;
         drop(conn);
         let Spec::Verifier(spec) = card.spec else {
             return Err(Transition::Terminate(
                 TerminalStatus::Errored,
-                unavailable(format!("card {} is not a Verifier", run.verifier_uid)),
+                failure(
+                    VERIFIER_UNAVAILABLE,
+                    &format!("card {} is not a Verifier", run.verifier_uid),
+                ),
             ));
         };
         let verifier = CardRef {
@@ -473,7 +495,7 @@ impl VerifierRunner {
             VerifierImplementation::Drift(spec) => {
                 self.drift.verify(tenant, verifier, run, spec).await
             }
-            VerifierImplementation::Eval(spec) => engines::eval(run, spec).await,
+            VerifierImplementation::Eval(spec) => self.eval.execute(tenant, run, spec).await,
         }
     }
 
@@ -511,9 +533,10 @@ impl VerifierRunner {
         {
             Ok(payload) => payload,
             Err(error) => {
+                tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
                 return Transition::Terminate(
                     TerminalStatus::Errored,
-                    failure(RESULT_INVALID, &error.to_string()),
+                    failure(RESULT_INVALID, "the verification result cannot be encoded"),
                 );
             }
         };
@@ -529,7 +552,10 @@ impl VerifierRunner {
             },
             Ok(Err(error)) => {
                 tracing::warn!(run_id = %run.lease.run_id, %error, "verification result publication failed");
-                Transition::Retry(failure(RESULT_PUBLICATION_FAILED, &error.to_string()))
+                Transition::Retry(failure(
+                    RESULT_PUBLICATION_FAILED,
+                    "result publication was not acknowledged",
+                ))
             }
             Err(_) => Transition::Retry(failure(
                 RESULT_PUBLICATION_FAILED,
@@ -541,8 +567,9 @@ impl VerifierRunner {
     /// Apply `transition` to `run` in one tenant transaction.
     ///
     /// Returns the stable outcome label: `completed`, `retrying`,
-    /// `exhausted`, `cancelled`, `timed_out`, `errored`, `released`, or
-    /// `stale_lease` when another claim already holds the run.
+    /// `exhausted`, `awaiting_trace`, `cancelled`, `timed_out`, `errored`,
+    /// `released`, `deferred`, or `stale_lease` when another claim already
+    /// holds the run.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the transaction fails; nothing is applied
@@ -562,18 +589,62 @@ impl VerifierRunner {
                     .await?,
                 "completed",
             ),
-            Transition::Retry(error) => match self.queue.retry(&mut conn, lease, &error).await? {
-                RetryOutcome::Scheduled(_) => "retrying",
-                RetryOutcome::Exhausted => "exhausted",
-                RetryOutcome::StaleLease => "stale_lease",
-            },
+            Transition::Retry(error) => {
+                tracing::warn!(
+                    run_id = %lease.run_id,
+                    code = %error.code,
+                    message = %error.message,
+                    "verification attempt failed"
+                );
+                match self.queue.retry(&mut conn, lease, &error).await? {
+                    RetryOutcome::Scheduled(_) => "retrying",
+                    RetryOutcome::Exhausted => "exhausted",
+                    RetryOutcome::StaleLease => "stale_lease",
+                }
+            }
+            Transition::AwaitTrace(error) => {
+                let (poll, deadline) = (
+                    chrono::Duration::from_std(self.limits.trace_poll)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(5)),
+                    chrono::Duration::from_std(self.limits.trace_deadline)
+                        .unwrap_or_else(|_| chrono::Duration::minutes(5)),
+                );
+                match self
+                    .queue
+                    .await_trace(&mut conn, lease, poll, deadline, &error)
+                    .await?
+                {
+                    TraceWaitOutcome::Requeued(_) => "awaiting_trace",
+                    TraceWaitOutcome::TimedOut => "timed_out",
+                    TraceWaitOutcome::StaleLease => "stale_lease",
+                }
+            }
             Transition::Terminate(status, error) => settled(
                 self.queue
                     .terminate(&mut conn, lease, status, &error)
                     .await?,
                 terminal_label(status),
             ),
-            Transition::Release => settled(self.queue.release(&mut conn, lease).await?, "released"),
+            Transition::Release => settled(
+                self.queue
+                    .release(&mut conn, lease, chrono::Duration::zero())
+                    .await?,
+                "released",
+            ),
+            Transition::Defer(error) => {
+                tracing::info!(
+                    run_id = %lease.run_id,
+                    code = %error.code,
+                    message = %error.message,
+                    "verification input read deferred by admission backpressure"
+                );
+                let delay = chrono::Duration::from_std(self.limits.poll_interval)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(1));
+                settled(
+                    self.queue.release(&mut conn, lease, delay).await?,
+                    "deferred",
+                )
+            }
         };
         conn.commit().await?;
         Ok(outcome)
@@ -621,7 +692,10 @@ const fn input_implementation(input: &RunInput) -> &'static str {
     }
 }
 
-/// A run failure with a stable `code` and diagnostic `message`.
+/// A run failure with a stable `code` and fixed public `message`.
+///
+/// The error is persisted and exposed in run status, so `message` names only
+/// the failed operation; dependency causes go to the diagnostic log instead.
 fn failure(code: &str, message: &str) -> VerificationError {
     VerificationError {
         code: code.to_owned(),

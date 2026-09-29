@@ -563,12 +563,12 @@ mod tests {
         // report its real status, not collapse onto UpstreamFailure's 502. Here
         // a 403 code must surface as status 403.
         let body = serde_json::json!({
-            "code": "WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN",
-            "detail": "delegated-token guard failed",
+            "code": "WYRD_PERMISSION_403_DENIED_RBAC",
+            "detail": "permission denied",
             "details": {},
         });
         let err = from_problem_json(&body);
-        assert_eq!(err.code(), "WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN");
+        assert_eq!(err.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
         assert_eq!(
             err.status(),
             403,

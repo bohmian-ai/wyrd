@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-single-data-root
-revision: 2
+revision: 3
 status: approved
 ---
 
@@ -23,8 +23,9 @@ without configuration.
 - Make `WYRD_BIFROST_DATA_DIR` the sole environment override for that root.
 - Default the root to `.wyrd/bifrost` when the override is absent.
 - Remove the independent `WYRD_SCRIBE_WAL_DIR` configuration surface.
-- Align local/test startup, checked-in Kubernetes manifests, deployment
-  contract checks, and architecture/operations documentation.
+- Align local/test startup, the deployed Kubernetes manifests
+  (`deploy/kubernetes/kind` and the production guide), and
+  architecture/operations documentation.
 
 ## Non-goals
 
@@ -192,13 +193,12 @@ spill path. Covers REQ-003 and REQ-005.
 
 ### AC-004 — One-mount deployment contract
 
-Semantic deployment tests prove checked-in mixed and role-separated Kubernetes
-examples implement the platform-neutral contract with the current
-`WYRD_TARGET` vocabulary, one `WYRD_BIFROST_DATA_DIR`/mount pairing, persistent
-per-pod filesystems for recovery-capable targets, and no subsystem-specific
-path. Negative fixtures reject an ephemeral root presented as recovery-capable,
-a mismatched mount, and a shared writable filesystem across replicas. Covers
-REQ-004 and REQ-006.
+The deployed Kubernetes manifests (`deploy/kubernetes/kind/wyrd.yaml` and the
+production guide) implement the platform-neutral contract with the current
+`WYRD_TARGET` vocabulary: one `WYRD_BIFROST_DATA_DIR` mount per pod, a per-pod
+persistent claim for the recovery-capable anchor, an ephemeral root only for
+Oracle pods, and no subsystem-specific path. `mise run test:server:kind`
+deploys them and proves anchor restart recovery. Covers REQ-004 and REQ-006.
 
 ### AC-005 — Focused Bifrost verification
 
@@ -220,6 +220,10 @@ existing durable formats and lifecycle owners.
 
 ## Revision history
 
+- 2026-09-25 — Revision 3 approved explicitly by the user ("delete it. it
+  doesnt earn its place"): the undeployed `deploy/kubernetes/bifrost`
+  example manifests and their YAML contract check are deleted. AC-004 is now
+  proven by the deployed kind manifests and the production guide.
 - 2026-09-07 — Revision 2 approved explicitly by the user: the deployment
   contract is one durable Bifrost filesystem root, not a PVC or any other
   platform-specific volume product. Ephemeral backing remains valid only when

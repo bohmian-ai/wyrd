@@ -9,5 +9,5 @@
 mod observations;
 mod result_items;
 
-pub use observations::ObservationsTable;
+pub use observations::{AcknowledgedObservation, ObservationsTable};
 pub use result_items::ResultItemsTable;

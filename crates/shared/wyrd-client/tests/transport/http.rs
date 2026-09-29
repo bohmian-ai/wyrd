@@ -8,14 +8,12 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::{HTTP_DEFAULT_BASE_URL, HTTP_DEFAULT_TIMEOUT_MS, HttpConfig};
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::security::{SecretRef, TlsConfig};
 
 #[test]
 fn http_default_values() {
     let h = HttpConfig::default();
     assert_eq!(h.base_url, HTTP_DEFAULT_BASE_URL);
     assert_eq!(h.timeout_ms, HTTP_DEFAULT_TIMEOUT_MS);
-    assert!(h.tls.is_none());
     assert!(!h.compression);
 }
 
@@ -46,7 +44,6 @@ fn http_config_round_trips() {
     let h = HttpConfig {
         base_url: "https://wyrd-ingest.example.com".to_string(),
         timeout_ms: 10_000,
-        tls: None,
         compression: true,
     };
     let s = serde_json::to_string(&h).unwrap();
@@ -59,7 +56,6 @@ fn http_compression_false_round_trips() {
     let h = HttpConfig {
         base_url: "https://wyrd.example.com".to_string(),
         timeout_ms: 30_000,
-        tls: None,
         compression: false,
     };
     let s = serde_json::to_string(&h).unwrap();
@@ -72,7 +68,6 @@ fn http_validate_rejects_empty_base_url() {
     let h = HttpConfig {
         base_url: String::new(),
         timeout_ms: 5_000,
-        tls: None,
         compression: false,
     };
     let err = h.validate().unwrap_err();
@@ -84,7 +79,6 @@ fn http_validate_accepts_non_empty_base_url() {
     let h = HttpConfig {
         base_url: "https://example.com".to_string(),
         timeout_ms: 5_000,
-        tls: None,
         compression: false,
     };
     assert!(h.validate().is_ok());
@@ -95,7 +89,6 @@ fn http_validate_rejects_remote_cleartext() {
     let h = HttpConfig {
         base_url: "http://wyrd.example.com".to_string(),
         timeout_ms: 5_000,
-        tls: None,
         compression: false,
     };
     let err = h.validate().unwrap_err();
@@ -111,7 +104,6 @@ fn http_validate_rejects_zero_timeout() {
     let h = HttpConfig {
         base_url: "https://example.com".to_string(),
         timeout_ms: 0,
-        tls: None,
         compression: false,
     };
     let err = h.validate().unwrap_err();
@@ -119,23 +111,10 @@ fn http_validate_rejects_zero_timeout() {
 }
 
 #[test]
-fn http_with_full_tls_round_trips() {
+fn http_with_compression_round_trips() {
     let h = HttpConfig {
         base_url: "https://wyrd.example.com".to_string(),
         timeout_ms: 5_000,
-        tls: Some(TlsConfig {
-            ca_cert: Some(SecretRef::File {
-                path: "/etc/ssl/ca.pem".to_string(),
-            }),
-            client_cert: Some(SecretRef::Vault {
-                key: "wyrd/tls/cert".to_string(),
-            }),
-            client_key: Some(SecretRef::Vault {
-                key: "wyrd/tls/key".to_string(),
-            }),
-            server_name_override: Some("ingest.internal".to_string()),
-            insecure_skip_verify: false,
-        }),
         compression: true,
     };
     let s = serde_json::to_string(&h).unwrap();

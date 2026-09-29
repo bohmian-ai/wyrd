@@ -5,7 +5,7 @@ use crate::contracts::{FrameAdmission, IngressPayload, ScribeError, ScribeIngres
 use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
 use crate::scribe::material_plan::{MaterialPlan, MaximumEnvelopeDecision, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
-use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows};
+use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows, PreparedAppend};
 use crate::tables::AuditLogTable;
 
 use std::time::Instant;
@@ -393,7 +393,7 @@ impl ScribeImpl {
             expected_schema_fingerprint,
             partition_granularity,
         } = self.resolve_logical_frame(frame).await?;
-        let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()?;
+        let receipt_micros = self.receipt_micros()?;
         let binding_facts =
             crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
                 .map_err(|_| ScribeError::InvalidFrame)?;
@@ -488,6 +488,27 @@ impl ScribeImpl {
                 .unwrap_or_default(),
             &table.name,
         )
+    }
+
+    /// Preprocess one admitted append on the persistence CPU lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the lane refuses the work or answers with a
+    /// result other than a prepared append.
+    async fn preprocess(&self, admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
+        match self
+            .persistence_cpu
+            .submit(ScribePersistenceCpuOp::Preprocess(Box::new(admitted)))
+            .await?
+        {
+            ScribePersistenceCpuResult::Prepared(value) => Ok(*value),
+            ScribePersistenceCpuResult::MemberStaged(_)
+            | ScribePersistenceCpuResult::ClaimAssembled(_)
+            | ScribePersistenceCpuResult::ReplayRestored(_) => Err(ScribeError::Internal {
+                detail: "persistence lane returned the wrong preparation result".to_owned(),
+            }),
+        }
     }
 
     /// Prepares one request and dispatches its owned packet to its fixed shard.
@@ -585,30 +606,19 @@ impl ScribeImpl {
             lifecycle,
         };
         let planned_rows_accepted = u64::try_from(material_plan.rows).unwrap_or(u64::MAX);
-        let prepared = match self
-            .persistence_cpu
-            .submit(ScribePersistenceCpuOp::Preprocess(Box::new(admitted)))
-            .await?
-        {
-            ScribePersistenceCpuResult::Prepared(value) => *value,
-            ScribePersistenceCpuResult::MemberStaged(_)
-            | ScribePersistenceCpuResult::ClaimAssembled(_)
-            | ScribePersistenceCpuResult::ReplayRestored(_) => {
-                return Err(ScribeError::Internal {
-                    detail: "persistence lane returned the wrong preparation result".to_owned(),
-                });
-            }
-        };
+        let prepared = self.preprocess(admitted).await?;
         self.shards
             .try_send(prepared)
             .inspect_err(|_| super::record_scribe_rejection("queue"))?;
-        durable_rx.await.map_err(|_| ScribeError::Internal {
+        let completion = durable_rx.await.map_err(|_| ScribeError::Internal {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;
         record_accepted_frame(planned_rows_accepted, append_started.elapsed());
         Ok(FrameAdmission {
             batch_id: frame.batch_id,
             rows_accepted: planned_rows_accepted,
+            receipt_micros,
+            first_commit: completion.first_commit,
         })
     }
 
@@ -625,6 +635,41 @@ impl ScribeImpl {
             }
         }
         self.memory.ingress_limit_bytes()
+    }
+
+    /// Captures the one receipt instant a transport frame is admitted under.
+    ///
+    /// Production reads the system clock; a test-support owner adds the
+    /// offset installed by [`Self::shift_receipt_clock_for_test`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the system clock precedes the
+    /// UNIX epoch or exceeds Arrow's signed microsecond range.
+    fn receipt_micros(&self) -> Result<i64, ScribeError> {
+        let now = crate::scribe::execution_lanes::current_receipt_micros()?;
+        #[cfg(any(test, feature = "test-support"))]
+        let now = now.saturating_add(
+            self.receipt_offset_micros_for_test
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        Ok(now)
+    }
+
+    /// Moves the receipt instant of every later transport frame `ahead`.
+    ///
+    /// Lets a bounded journey replay an already-committed batch on a later
+    /// receipt day without waiting for one. Frames already admitted keep their
+    /// receipt; the shift replaces, rather than accumulates, any earlier one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ahead` does not fit in signed microseconds.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shift_receipt_clock_for_test(&self, ahead: std::time::Duration) {
+        let micros = i64::try_from(ahead.as_micros()).expect("receipt shift fits i64 micros");
+        self.receipt_offset_micros_for_test
+            .store(micros, std::sync::atomic::Ordering::Release);
     }
 
     /// Overrides the decoded-request ceiling for one bounded test owner.

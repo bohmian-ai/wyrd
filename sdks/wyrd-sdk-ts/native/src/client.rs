@@ -70,6 +70,19 @@ pub fn connect_wyrd_client(
 
 #[napi]
 impl NativeWyrdClient {
+    /// Returns the effective HTTP server URL this client sends requests to.
+    #[napi(getter)]
+    pub fn server_url(&self) -> String {
+        self.client.server_url().to_owned()
+    }
+
+    /// Returns the effective gRPC endpoint: the explicit `grpc_url` when one
+    /// was given, else the server URL's scheme and host on port `50051`.
+    #[napi(getter)]
+    pub fn grpc_url(&self) -> String {
+        self.client.grpc_url().to_owned()
+    }
+
     /// Returns a client that acts for the holder of `subject_token`.
     ///
     /// This client's credential is the actor. The first exchange runs here so a

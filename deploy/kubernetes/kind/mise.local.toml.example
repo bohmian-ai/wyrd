@@ -1,0 +1,10 @@
+# Copy to the repository root as `mise.local.toml` (gitignored) to run the
+# local Kubernetes autoscaling journey. It needs Docker, and it creates and
+# deletes its own kind cluster named `wyrd-autoscale`. It is not a CI gate.
+[tools]
+kind = "0.33.0"
+kubectl = "1.37.1"
+
+[tasks."test:server:kind"]
+description = "Official image on kind: Oracle read-rate HPA grows the Oracle tier 1 -> 2, the new Oracle joins by its Downward-API address and reads the anchor Scribe tail over mTLS"
+run = "bash scripts/server/test-kind-autoscale.sh"

@@ -200,7 +200,7 @@ def check_migration_drift(failures: list[str]) -> None:
     if platform_path is not None:
         platform_normalized = normalize_sql(platform_path.read_text())
         required_patterns = {
-            "wyrd_migrator BYPASSRLS role assertion": r"rolname\s*=\s*'wyrd_migrator'\s+AND\s+rolbypassrls\s*=\s*true",
+            "migration login BYPASSRLS assertion": r"rolname\s*=\s*current_user\s+AND\s+\(rolbypassrls\s+OR\s+rolsuper\)",
             "wyrd_app non-BYPASSRLS role assertion": r"rolname\s*=\s*'wyrd_app'\s+AND\s+rolbypassrls\s*=\s*false",
             "wyrd_platform_admin BYPASSRLS role assertion": r"rolname\s*=\s*'wyrd_platform_admin'\s+AND\s+rolbypassrls\s*=\s*true",
             "wyrd.current_tenant helper": r"CREATE\s+FUNCTION\s+wyrd\.current_tenant\(\)\s+RETURNS\s+uuid",

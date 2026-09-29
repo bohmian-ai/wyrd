@@ -16,7 +16,7 @@
       seq: true,
       nodes: [
         { t: 'load config' },
-        { t: 'PostgresBoot', s: '+ migrations' },
+        { t: 'postgres', s: 'validate migrated schema' },
         { t: 'assemble', s: 'pools · storage · OLAP' },
         { t: 'install auth', s: 'signing key · verifier' },
         { t: 'seed federation', s: 'issuers · bindings' },

@@ -580,13 +580,16 @@ fn commit_failures(metrics: &metrics_exporter_prometheus::PrometheusHandle) -> u
 /// wait on the slowest: a tenant whose chain head is held by an unrelated
 /// transaction would stall the whole directory behind it. The journey seeds a
 /// second tenant, appends a decision in each, then holds the boot tenant's
-/// chain-head row so its cycle cannot even freeze. The second tenant must still
-/// reach retained history and drain inside the bounded wait, which only a
-/// concurrent sweep can do. Releasing the fence must then let the stalled
+/// chain-head row. A cycle that reaches that tenant afterwards cannot freeze;
+/// one that froze and appended before the fence landed blocks in settlement
+/// until the fence is released. The second tenant must still reach retained
+/// history and drain inside the bounded wait — including the read decisions the
+/// polling itself stages after its first publication — which only a publisher
+/// whose later sweeps never wait on a blocked cycle can do. Releasing the fence must then let the stalled
 /// tenant finish as well, proving the fence delayed rather than lost its work.
 ///
-/// Only unordered progress is proven here. The sweep's ceiling is the literal
-/// `PUBLICATION_TENANT_CONCURRENCY` handed to `for_each_concurrent`; proving it
+/// Only unordered progress is proven here. The publisher's ceiling is the
+/// literal `PUBLICATION_TENANT_CONCURRENCY` bounding its running cycles; proving it
 /// end to end would need more fenced tenants than the test pool can hold.
 ///
 /// # Errors

@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Task Review"
   short_description: "Run independent Wyrd task reviews and validate findings"
-  default_prompt: "Use $wyrd-task-review for independent implementation, standards, maintainer, and domain reviews, source validation, and the verdict with any remediation task."
+  default_prompt: "Use $wyrd-task-review for independent implementation, system-resilience, standards, maintainer, and domain reviews, source validation, and the verdict with any remediation task."

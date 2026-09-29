@@ -1,6 +1,6 @@
 ---
 name: wyrd-task-review
-description: Review one immutable cumulative Wyrd task through independent implementation passes, standards and domain audits, source validation, and root-cause remediation.
+description: Review one immutable cumulative Wyrd task through independent implementation, system-resilience, standards, and domain audits, source validation, and root-cause remediation.
 ---
 
 # Wyrd Task Review
@@ -46,11 +46,11 @@ Run independent discovery, conditional follow-up, and validation:
 
 1. **Independent discovery, in parallel:** always spawn two task implementation
    reviewers (`behavior-rev` and `invariant-rev`), a repository-standards
-   reviewer (`repo-rev`), and a maintainer specialist (`maintainer-rev`). Also
-   spawn one domain reviewer (`domain-rev`) for each materially changed
-   sensitive domain, including security/RBAC, tenancy,
-   concurrency, durability, persistent data, or another boundary whose
-   correctness needs domain expertise.
+   reviewer (`repo-rev`), a maintainer specialist (`maintainer-rev`), and a
+   system-resilience reviewer (`system-rev`). Also spawn one domain reviewer
+   (`domain-rev`) for each materially changed sensitive domain, including
+   security/RBAC, tenancy, concurrency, durability, persistent data, or another
+   boundary whose correctness needs domain expertise.
 2. **Compare claims:** after discovery reports are complete, group findings by
    violated behavior or invariant rather than line number. Agreement is useful
    corroboration, not proof; unique findings still require validation. If
@@ -182,6 +182,38 @@ when available. Personal preference without a concrete cost is not a blocking
 finding; record uncertain preferences separately for calibration. Incomplete
 coverage blocks this review.
 
+## Independent system-resilience review (`system-rev`)
+
+Give this specialist the immutable subject, complete diff, deployment and
+process topology from applicable architecture and source, and available
+verification results. Do not provide other reviewers' conclusions or an
+intended verdict. Its starting premise is that processes crash, dependencies
+become unavailable, messages are delayed, and recovery follows interruption.
+It reviews how the candidate changes the deployed system, not just whether the
+changed component works in isolation.
+
+Trace each material changed runtime path across its owner, shared process or
+pod, dependent services, and user-facing capabilities. Select credible failure
+and recovery paths for that topology: component failure, process restart,
+dependency outage, timeout, cancellation, or rolling replacement as relevant.
+For each, establish what stops, what remains available, whether retries or
+health checks amplify the fault, what state survives, and how service resumes.
+Inspect the actual callers, lifecycle ownership, and failure propagation before
+accepting a local fix. A recommendation to fail closed must name its boundary:
+request, component, process, or service. Refuse unsafe work, but do not treat a
+component error as permission to crash a shared server or take unrelated
+capabilities offline unless approved authority requires that result. Do not
+demand availability that would violate integrity, and do not report speculative
+hardening outside the approved task or a reachable regression.
+
+Return `system-review.md` with deployed-path and failure-path evidence,
+affected capabilities, recovery and proof assessment, material proposed
+findings, and one overall `PASS`, `FAIL`, or `BLOCKED` result. If the candidate
+has no runtime or deployment effect, establish that from the diff and callers.
+Each finding needs a source-local ID, violated obligation or regression
+boundary, exact location, observable system consequence, and testable
+correction. A healthy-path test alone cannot prove a changed recovery path.
+
 ## Independent sensitive domain review (`domain-rev`)
 
 Spawn a separate `domain-rev` for each sensitive domain materially changed by
@@ -215,7 +247,7 @@ predetermined count or obtain agreement.
 Always spawn a fresh `ponytail-rev` after discovery and any follow-up are
 complete, even when their proposed finding union is empty. Give it the
 immutable subject, applicable authorities, complete diff, both task-review
-reports, `standards-review.md`, `maintainer-review.md`, every
+reports, `standards-review.md`, `maintainer-review.md`, `system-review.md`, every
 `domain-review-<domain>.md`, and any `followup-review.md`, but no intended verdict.
 
 The `ponytail-rev` independently inspects the actual source, validates every
@@ -247,7 +279,8 @@ finding the `ponytail-rev` must:
    the task explicitly requires them;
 3. distinguish the requested behavior from bundled adjacent behavior and reject
    a correction that moves, duplicates, or weakens unrelated lifecycle,
-   admission, durability, security, or resource ownership;
+   admission, durability, security, resource ownership, or sibling service
+   availability;
 4. ask whether the finding or remediation can be deleted, whether existing
    behavior already satisfies the task, and whether the proposed proof is the
    smallest credible check without a new dependency or test harness;
@@ -282,7 +315,8 @@ blocks the review. Preserve its final ledger and recommendations as
 ## Verdict and remediation task
 
 In the established review directory, preserve both task-review reports,
-`standards-review.md`, `maintainer-review.md`, every `domain-review-<domain>.md`,
+`standards-review.md`, `maintainer-review.md`, `system-review.md`, every
+`domain-review-<domain>.md`,
 any `followup-review.md`, and `findings-validation.md`, then write `verdict.md`
 containing the immutable subject, reconciled acceptance matrix, independent
 review results, the follow-up decision, validated finding ledger, verification

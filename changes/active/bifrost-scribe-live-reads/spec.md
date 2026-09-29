@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 13
+revision: 14
 status: approved
 ---
 
@@ -327,6 +327,26 @@ immediately when every permit is occupied. No independent storage wait
 timeout, query queue, or memory reservation is added. A genuine deadline,
 cancellation, or backend failure retains its existing terminal semantics.
 
+### REQ-012 — Useful production telemetry without shadow state
+
+Scribe, Oracle, and Forge telemetry must let an operator, human maintainer, or
+agent follow a write, query, or maintenance attempt through its actual terminal
+outcome. Traces describe work that really occurred and span its real lifetime,
+including streamed query work and remote fragments. Normal high-rate internal
+transitions do not each produce production-level success events. A failure has
+one clear event with its reason and correlation context.
+
+Prometheus reports operational demand, backlog, active work, latency, physical
+data flow, and real failures from their production owners. Telemetry does not
+maintain a second resource, cache, staging, or query state machine merely to
+reconcile its own counters. Zero-only or no-op signals, impossible label
+combinations, duplicate measurements of one event, and work performed solely
+to manufacture a metric are removed. Tenant, table, query, task, and object
+identities remain out of metric labels and may appear only as scrubbed trace
+context. Keep Forge's earned closed metric catalog and existing tracing,
+Prometheus, and OTLP infrastructure; introduce no new exporter or sampler.
+Operational metrics remain usable when trace sampling is configured.
+
 ## Invariants and boundaries
 
 - **INV-001:** Write acknowledgment, WAL durability, publication order, and
@@ -357,6 +377,10 @@ cancellation, or backend failure retains its existing terminal semantics.
   charges. Accepted peer reservations retain actual receiving-node slots;
   storage-I/O waits and leader retries remain within the original operation
   or query deadline. Write ACK and query terminal rules are unchanged.
+- **INV-009:** Removing telemetry cannot change authorization, durability,
+  capacity decisions, query results, cancellation, or maintenance settlement.
+  Traces and metrics observe actual owner state; they do not become a second
+  authority or an extra read, write, or queue on a hot path.
 
 ## Scope and non-goals
 
@@ -450,10 +474,19 @@ Do not add new persisted state or change write ACK timing.
   deadline, while ambiguous work is never replayed. Focused ownership tests,
   real-server write/read and peer journeys, and the standard mixed benchmark
   prove the rule.
+- **AC-014:** Captured success and failure traces for a Scribe write and
+  publication, an Oracle streamed local or peer query, and a Forge task show
+  the actual parent operation, relevant child work, one terminal outcome, and
+  the identities needed for human or agent diagnosis. Production metric
+  snapshots contain no zero-only, impossible, or duplicate series identified
+  by the telemetry audit. Scribe staging, shared storage, and Oracle pruning
+  do not keep or scan shadow state for telemetry. Existing journey results
+  and the standard read/write benchmark remain valid after the cleanup.
 
 ## Open material decisions
 
-None. Revision 13's capacity-owner clarification was explicitly approved by
+None. Revision 14's telemetry simplification was explicitly approved by the
+user on 2026-09-29. Revision 13's capacity-owner clarification was explicitly approved by
 the user on 2026-09-29. Revision 12's memory redesign was explicitly approved by the user on
 2026-09-29. The peer wording follows approved `SPEC-verified-change-contract`
 revision 44. Revision 3 was explicitly approved by the user on 2026-09-26. The user
@@ -514,6 +547,10 @@ on 2026-09-28.
   narrow opaque-decoder charge, and distinguishes receiving-node running
   slots and storage-I/O backpressure from duplicate query admission.
   Approved by the user on 2026-09-29.
+- Revision 14 (2026-09-29): Requires production telemetry to describe actual
+  owner state and operation lifetimes, removes duplicate and misleading
+  signals, and keeps traces readable by humans and agents. Approved by the
+  user on 2026-09-29.
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

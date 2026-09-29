@@ -104,7 +104,7 @@ pub fn router() -> OpenApiRouter<AppState> {
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
-          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
           WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)",
@@ -153,7 +153,7 @@ pub(crate) async fn list_running_queries(
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
-          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
           WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)",
@@ -210,7 +210,7 @@ pub(crate) async fn get_running_query(
           WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
-          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
           WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)",
@@ -276,7 +276,7 @@ pub(crate) async fn cancel_running_query(
           WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
-          stable code (WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
+          stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
           WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
           WYRD_VALA_500_AUDIT_UNAVAILABLE)",

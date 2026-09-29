@@ -2305,7 +2305,9 @@ fn classify_error(error: &BifrostClientError) -> ShortQueryOutcome {
         };
     }
     match wyrd_spec::error::WyrdError::from(error).code() {
-        "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => ShortQueryOutcome::AdmissionRefused,
+        "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" | "WYRD_VALA_429_QUERY_QUEUE_FULL" => {
+            ShortQueryOutcome::AdmissionRefused
+        }
         "WYRD_VALA_504_QUERY_TIMEOUT" => ShortQueryOutcome::Deadline,
         "WYRD_VALA_403_QUERY_PEER_SECURITY" => ShortQueryOutcome::SecurityRefused,
         _ => ShortQueryOutcome::TransportError,

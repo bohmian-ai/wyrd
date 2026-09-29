@@ -140,7 +140,7 @@ async fn prepare_expiration(
 #[tokio::test]
 async fn reader_and_expiration_claim_have_one_table_local_winner() {
     let fixture = AuthorityFixture::start().await;
-    let (authority, _terminator) = fixture.authority(8).await;
+    let (authority, _terminator) = fixture.authority().await;
     let tenant = fixture.tenant().await;
     let events = fixture.table(tenant, "events").await;
     let orders = fixture.table(tenant, "orders").await;

@@ -1875,10 +1875,8 @@ impl Oracle {
 
     /// Acquires this process's one reader epoch for the local Oracle role.
     ///
-    /// Separated from construction because the epoch's queue bound is derived,
-    /// not configured: every plan reserves a release before admission, so the
-    /// bound must cover every plan that can exist at once rather than only the
-    /// admitted ones.
+    /// The epoch protects snapshots and joins its readers at loss; it takes no
+    /// part in query capacity, which admission and the pod governor own.
     ///
     /// # Errors
     /// Returns the acquisition, fence, or audit failure from
@@ -1887,17 +1885,13 @@ impl Oracle {
         vala: &vala_sql::ValaPostgres,
         operator_pool: &vala_sql::OperatorPool,
         local_role: &RegisteredRole,
-        config: OracleConfig,
         shutdown: &CancellationToken,
     ) -> Result<Arc<reader_pins::OracleReaderAuthority>, BifrostError> {
-        let capacity =
-            (config.interactive_slots + config.analytical_slots + config.queue_capacity) as usize;
         reader_pins::OracleReaderAuthority::start(reader_pins::OracleReaderAuthorityConfig {
             vala: vala.clone(),
             operator_pool: operator_pool.clone(),
             node_id: local_role.key.node_id.as_uuid(),
             fencing_token: local_role.fencing_token,
-            max_concurrent_queries: capacity.max(1),
             terminator: Arc::new(reader_pins::AbortingEpochTerminator),
             shutdown: shutdown.clone(),
         })
@@ -1921,20 +1915,16 @@ impl Oracle {
             !cluster.snapshot().live_oracles().is_empty(),
             admission::OracleAdmissionConfig::from(&config.config),
             config.memory.resources.clone(),
-        ));
+        )?);
         admission.refresh(&cluster.snapshot());
         let shutdown = config.shutdown;
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
-        // Every plan reserves a release before admission, so the epoch's bound
-        // is every plan that can exist at once: the running classes plus the
-        // queue behind them, never just the admitted ones.
         let reader_authority = Self::start_reader_authority(
             &config.vala,
             &operator_pool,
             &admission.local_role,
-            config.config,
             &shutdown,
         )
         .await?;
@@ -5588,15 +5578,24 @@ mod tests {
     ///
     /// Ordering is the point: the governed root is filled by real fallible
     /// growth so a later growth is refused by the pod rather than by a query's
-    /// own ceiling, the filler is then released so the first query's infallible
-    /// growth can only be recorded as process headroom, and one Analytical cut
-    /// records its bounded worker selection.
+    /// own ceiling, the filler is then released and the first query grows
+    /// infallibly past its grant, and one Analytical cut records its bounded
+    /// worker selection. Returns `memory_used` read from `recorder` immediately
+    /// before and after that infallible growth.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot admit a query, when a growth the pod can
     /// still fund is refused, or when a growth beyond the root is admitted.
-    fn drive_local_capacity_series() {
+    fn drive_local_capacity_series(recorder: &wyrd_bench::BenchmarkRecorder) -> (f64, f64) {
+        let memory_used = || {
+            recorder
+                .snapshot()
+                .gauges
+                .get("bifrost_oracle_local_bytes{kind=\"memory_used\"}")
+                .copied()
+                .unwrap_or_default()
+        };
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
             768 * 1024 * 1024,
             8 * 1024 * 1024 * 1024,
@@ -5654,9 +5653,11 @@ mod tests {
         drop(filler);
 
         // The first query has already governed its whole grant, so the path
-        // DataFusion does not let fail can only record the excess as real
-        // process headroom.
+        // DataFusion does not let fail charges the excess as infallible bytes,
+        // which `memory_used` still counts.
+        let before_infallible = memory_used();
         consumer.grow(admitted.granted_memory_bytes);
+        let after_infallible = memory_used();
 
         // One real Analytical cut is what records the selected-worker count.
         let now = Utc::now();
@@ -5687,19 +5688,20 @@ mod tests {
 
         drop(consumer);
         drop(admitted);
+        (before_infallible, after_infallible)
     }
 
     /// Oracle capacity metrics describe this pod only, with closed labels.
     ///
     /// A real admitted query is what publishes them, so this drives one through
-    /// the shared root and asserts the local memory, headroom, scratch, and slot
-    /// families appear with the exact `kind` domain the emitter owns — and that
-    /// no series claims a cluster-wide quota or a delegated, leased, renewed, or
-    /// overdrawn allocation.
+    /// the shared root and asserts exactly the four local memory and slot
+    /// series the emitter owns appear — and that no series claims a
+    /// cluster-wide quota or a delegated, leased, renewed, or overdrawn
+    /// allocation.
     ///
     /// The three signals an operator diagnosing saturation actually needs are
-    /// driven rather than assumed: a governed refusal, nonzero process headroom
-    /// from the infallible path, and the selected-worker count of a real
+    /// driven rather than assumed: a governed refusal, `memory_used` rising
+    /// through the infallible path, and the selected-worker count of a real
     /// Analytical cut. A registered-but-never-exercised series would look
     /// identical to one that can no longer be produced.
     ///
@@ -5710,25 +5712,25 @@ mod tests {
     #[test]
     fn oracle_metrics_describe_only_local_capacity() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
-        metrics::with_local_recorder(&recorder, || {
-            drive_local_capacity_series();
-        });
+        let (before_infallible, after_infallible) =
+            metrics::with_local_recorder(&recorder, || drive_local_capacity_series(&recorder));
         let snapshot = recorder.snapshot();
-        let expected = [
+        let expected = std::collections::BTreeSet::from([
             "bifrost_oracle_local_bytes{kind=\"memory_limit\"}",
             "bifrost_oracle_local_bytes{kind=\"memory_used\"}",
-            "bifrost_oracle_local_bytes{kind=\"memory_headroom\"}",
             "bifrost_oracle_local_slot_units{kind=\"limit\"}",
             "bifrost_oracle_local_slot_units{kind=\"used\"}",
-            "bifrost_oracle_local_slot_units{kind=\"analytical_used\"}",
-            "bifrost_oracle_local_slot_units{kind=\"interactive_floor\"}",
-        ];
-        for series in expected {
-            assert!(
-                snapshot.gauges.contains_key(series),
-                "missing local capacity series {series}: {snapshot:?}"
-            );
-        }
+        ]);
+        let exported: std::collections::BTreeSet<&str> = snapshot
+            .gauges
+            .keys()
+            .map(String::as_str)
+            .filter(|series| {
+                series.starts_with("bifrost_oracle_local_bytes{")
+                    || series.starts_with("bifrost_oracle_local_slot_units{")
+            })
+            .collect();
+        assert_eq!(exported, expected, "exactly four local capacity series");
         assert!(
             snapshot.counters.keys().any(|series| {
                 series.starts_with("bifrost_resource_acquisitions_total{")
@@ -5738,11 +5740,8 @@ mod tests {
             "a governed memory refusal must be counted: {snapshot:?}"
         );
         assert!(
-            snapshot
-                .gauge_peaks
-                .get("bifrost_oracle_local_bytes{kind=\"memory_headroom\"}")
-                .is_some_and(|peak| *peak > 0.0),
-            "infallible growth above the grant must publish process headroom: {snapshot:?}"
+            after_infallible > before_infallible,
+            "infallible growth must raise memory_used: {before_infallible} -> {after_infallible}"
         );
         let workers = snapshot
             .histograms

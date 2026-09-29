@@ -2016,6 +2016,7 @@ fn is_retryable_read_error(error: &BifrostClientError) -> bool {
     [
         // Transient saturation: the server refused or could not finish in time.
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+        "WYRD_VALA_429_QUERY_QUEUE_FULL",
         "WYRD_VALA_429_INGEST_BUSY",
         "WYRD_VALA_504_QUERY_TIMEOUT",
         "WYRD_VALA_500_QUERY_EXECUTION_FAILED",

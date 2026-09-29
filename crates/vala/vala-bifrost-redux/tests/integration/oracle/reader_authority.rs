@@ -108,7 +108,6 @@ impl AuthorityFixture {
     /// Panics when acquisition or activation fails.
     pub(crate) async fn authority(
         &self,
-        concurrency: usize,
     ) -> (Arc<OracleReaderAuthority>, Arc<RecordingEpochTerminator>) {
         let terminator = Arc::new(RecordingEpochTerminator::default());
         let authority = OracleReaderAuthority::start(OracleReaderAuthorityConfig {
@@ -116,7 +115,6 @@ impl AuthorityFixture {
             operator_pool: self.database.operator_pool().clone(),
             node_id: self.node_id,
             fencing_token: self.fence,
-            max_concurrent_queries: concurrency,
             terminator: Arc::clone(&terminator) as Arc<_>,
             shutdown: self.shutdown.clone(),
         })
@@ -691,7 +689,7 @@ async fn admit_opposite_table_orders(
 #[tokio::test]
 async fn process_global_authority_aggregates_and_releases_conservatively() {
     let fixture = AuthorityFixture::start().await;
-    let (authority, _terminator) = fixture.authority(8).await;
+    let (authority, _terminator) = fixture.authority().await;
     let tenant = fixture.tenant().await;
     let other_tenant = fixture.tenant().await;
     let events = fixture.table(tenant, "events").await;
@@ -772,7 +770,7 @@ async fn assert_live_epoch_accounting(
 #[tokio::test]
 async fn epoch_lifecycle_self_fences_and_retires_in_order() {
     let fixture = AuthorityFixture::start().await;
-    let (authority, terminator) = fixture.authority(2).await;
+    let (authority, terminator) = fixture.authority().await;
     let tenant = fixture.tenant().await;
     let events = fixture.table(tenant, "events").await;
 
@@ -886,7 +884,7 @@ async fn epoch_deadline_exhaustion_terminates_and_retains_protection() {
 /// durable protection, epoch state, or audit edge moves past the stalled read.
 async fn stalled_loss_verification_terminates_at_the_caller_deadline() {
     let fixture = AuthorityFixture::start().await;
-    let (authority, terminator) = fixture.authority(2).await;
+    let (authority, terminator) = fixture.authority().await;
     let tenant = fixture.tenant().await;
     let events = fixture.table(tenant, "events").await;
 
@@ -986,7 +984,7 @@ async fn stalled_loss_verification_terminates_at_the_caller_deadline() {
 /// continues past it.
 async fn blocked_loss_settlement_terminates_at_the_caller_deadline() {
     let fixture = AuthorityFixture::start().await;
-    let (authority, terminator) = fixture.authority(2).await;
+    let (authority, terminator) = fixture.authority().await;
     let tenant = fixture.tenant().await;
     let events = fixture.table(tenant, "events").await;
 
@@ -1078,7 +1076,7 @@ async fn blocked_loss_settlement_terminates_at_the_caller_deadline() {
 /// deadline, or when retirement continues past it.
 async fn unjoined_descendants_terminate_at_the_caller_deadline() {
     let fixture = AuthorityFixture::start().await;
-    let (authority, terminator) = fixture.authority(2).await;
+    let (authority, terminator) = fixture.authority().await;
     let tenant = fixture.tenant().await;
     let events = fixture.table(tenant, "events").await;
 
@@ -1205,7 +1203,6 @@ async fn oracle_epoch(
         operator_pool: fixture.operator_pool.clone(),
         node_id,
         fencing_token: fence,
-        max_concurrent_queries: 4,
         terminator: Arc::new(RecordingEpochTerminator::default()) as Arc<_>,
         shutdown: CancellationToken::new(),
     })
@@ -1691,7 +1688,6 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
         operator_pool: fixture.database.operator_pool().clone(),
         node_id: fixture.node_id,
         fencing_token: fixture.fence,
-        max_concurrent_queries: 1,
         terminator: Arc::clone(&terminator) as Arc<_>,
         shutdown: fixture.shutdown.clone(),
     })
@@ -1773,7 +1769,7 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
 #[tokio::test]
 async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
     let fixture = AuthorityFixture::start().await;
-    let (authority, _terminator) = fixture.authority(2).await;
+    let (authority, _terminator) = fixture.authority().await;
     let tenant = fixture.tenant().await;
     let events = fixture.table(tenant, "events").await;
 

@@ -79,6 +79,19 @@ pub enum BifrostError {
     )]
     QueryAdmissionRejected,
 
+    /// Every waiting place in this pod's Oracle query queue is taken.
+    ///
+    /// Retryable overload: the query was refused immediately and holds no
+    /// place, so a retry after capacity returns can succeed.
+    #[error("query queue full")]
+    #[wyrd_error(
+        code = "WYRD_VALA_429_QUERY_QUEUE_FULL",
+        status = 429,
+        title = "Query queue full",
+        remediation = "Retry after capacity becomes available."
+    )]
+    QueryQueueFull,
+
     /// One indivisible query memory request exceeds its governing ceiling.
     #[error("query memory request too large")]
     #[wyrd_error(

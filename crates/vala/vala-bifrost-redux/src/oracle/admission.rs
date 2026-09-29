@@ -1,8 +1,12 @@
 //! Pod-local Oracle query admission and stream-owned resource cleanup.
 //!
-//! Admission is deliberately local to one process.  Class, tenant, memory,
-//! and spill accounting share one synchronous mutex so a grant is one atomic
-//! decision; asynchronous callers wait only on their own one-shot channel.
+//! Admission is deliberately local to one process and owns only queue order:
+//! one tenant-fair FIFO per class, per-tenant fairness counts, and one bounded
+//! set of waiting places. Execution capacity belongs to the pod governor; a
+//! waiter is granted only when the governor grants its slot charge, and that
+//! query's final resource release returns the slot and the tenant charge
+//! together before one capacity wake reconsiders the queue. Asynchronous
+//! callers wait only on their own one-shot channel.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -128,22 +132,18 @@ struct Waiter {
     deadline: Instant,
     /// Fraction of pinned sealed bytes available from the local hot tier.
     local_ratio: f64,
-    /// One-shot notification carrying the granted resource amounts.
-    tx: tokio::sync::oneshot::Sender<Grant>,
-}
-
-/// Resource amounts atomically granted while the admission mutex is held.
-struct Grant {
-    /// Class counter charged by the grant.
-    class: AdmissionClass,
-    /// Tenant counter charged by the grant.
-    tenant: DataTenantId,
-    /// Complete memory and slot envelope transferred to the stream guard.
-    resources: Option<crate::resources::OracleQueryResources>,
+    /// One-shot notification carrying the granted query resources.
+    tx: tokio::sync::oneshot::Sender<crate::resources::OracleQueryResources>,
 }
 
 /// One winner notification held until the admission mutex is unlocked.
-type GrantNotification = (tokio::sync::oneshot::Sender<Grant>, Grant);
+///
+/// The resources already carry the tenant charge, so a failed send needs no
+/// rollback: dropping them returns the slot and the charge together.
+type GrantNotification = (
+    tokio::sync::oneshot::Sender<crate::resources::OracleQueryResources>,
+    crate::resources::OracleQueryResources,
+);
 
 /// FIFO waiters and active count for one locally contending tenant.
 struct TenantQueue {
@@ -153,12 +153,11 @@ struct TenantQueue {
     active: u32,
 }
 
-/// Mutex-owned counters and tenant ring for one query class.
+/// Mutex-owned tenant ring and fairness counts for one query class.
+///
+/// Holds no class slot count: whether a class can seat another query is the
+/// pod governor's answer, asked at grant time.
 struct ClassState {
-    /// Maximum slot units this class may hold locally.
-    capacity: u32,
-    /// Slot units currently granted to this class.
-    used: u32,
     /// Fixed pod-local per-tenant slot-unit cap inside this class.
     tenant_slot_limit: u32,
     /// Stable first-enqueue tenant ring.
@@ -168,15 +167,13 @@ struct ClassState {
 }
 
 impl ClassState {
-    /// Creates empty slot-unit counters for one class.
+    /// Creates an empty tenant ring for one class.
     ///
-    /// A zero `capacity` is a valid disabled class: an Analytical maximum below
-    /// one query's two-unit cost admits nothing and is rejected before
-    /// queueing, so it must not be silently raised to one.
+    /// The tenant cap is clamped to the class maximum `capacity`, because a
+    /// tenant can never hold more of a class than the governor lets the class
+    /// hold. A zero `capacity` is a valid disabled class.
     fn new(capacity: u32, tenant_slot_limit: u32) -> Self {
         Self {
-            capacity,
-            used: 0,
             tenant_slot_limit: tenant_slot_limit.min(capacity),
             tenants: Vec::new(),
             cursor: 0,
@@ -253,14 +250,10 @@ impl ClassState {
 
 /// Complete mutable admission state protected by one synchronous mutex.
 struct AdmissionState {
-    /// Interactive class state.
+    /// Interactive tenant ring.
     interactive: ClassState,
-    /// Analytical class state.
+    /// Analytical tenant ring.
     analytical: ClassState,
-    /// Total local slot units shared by both classes.
-    total_slot_units: u32,
-    /// Protected Interactive slot units granted before any class comparison.
-    interactive_floor_units: u32,
     /// Maximum number of queued waiters.
     queue_capacity: u32,
     /// Current queued waiter count.
@@ -271,17 +264,16 @@ struct AdmissionState {
     closed: bool,
     /// Whether a live Oracle membership exists for new admissions.
     membership_available: bool,
-    /// Number of active local query grants.
+    /// Number of leader-local queries whose tenant charge is still held.
     active_queries: u64,
 }
 
 impl AdmissionState {
-    /// Builds the mutex-owned scheduler state from one pod-local configuration.
+    /// Builds the mutex-owned queue state from one pod-local configuration.
     ///
-    /// The two class capacities are slot-unit maxima that deliberately overlap:
-    /// Interactive may borrow the whole local total, Analytical is capped at its
-    /// own share, and the aggregate is bounded by `total_slot_units`. That is
-    /// what protects the Interactive floor while staying work-conserving.
+    /// Interactive may borrow the whole local total, so its tenant cap is
+    /// clamped to that total; Analytical is clamped to its own maximum. The
+    /// slot limits themselves are enforced by the governor, not here.
     fn new(config: OracleAdmissionConfig, membership_available: bool) -> Self {
         let total_slot_units = config
             .interactive_slots
@@ -289,8 +281,6 @@ impl AdmissionState {
         Self {
             interactive: ClassState::new(total_slot_units, config.tenant_interactive_slots),
             analytical: ClassState::new(config.analytical_slots, config.tenant_analytical_slots),
-            total_slot_units,
-            interactive_floor_units: config.interactive_slots,
             queue_capacity: config.queue_capacity.max(1),
             queued: 0,
             generation: 0,
@@ -308,24 +298,19 @@ impl AdmissionState {
         }
     }
 
-    /// Reports whether this class can seat one more query right now.
+    /// Closes the queue and drops every waiter's grant channel.
     ///
-    /// Both bounds must hold: the class's own slot-unit maximum, and the shared
-    /// local total across classes. Checking only the class maximum would let
-    /// Interactive borrowing and Analytical capacity together exceed the pod.
-    fn class_fits(&self, kind: AdmissionClass) -> bool {
-        let cost = kind.slot_units();
-        let class = match kind {
-            AdmissionClass::Interactive => &self.interactive,
-            AdmissionClass::Analytical => &self.analytical,
-        };
-        class.used.saturating_add(cost) <= class.capacity
-            && self
-                .interactive
-                .used
-                .saturating_add(self.analytical.used)
-                .saturating_add(cost)
-                <= self.total_slot_units
+    /// A dropped channel is what a waiting future observes as refusal, so this
+    /// needs no per-waiter wake.
+    fn close_queue(&mut self) {
+        self.closed = true;
+        for (_, tenant) in &mut self.interactive.tenants {
+            tenant.waiters.clear();
+        }
+        for (_, tenant) in &mut self.analytical.tenants {
+            tenant.waiters.clear();
+        }
+        self.queued = 0;
     }
 }
 
@@ -345,79 +330,104 @@ pub(super) struct AdmissionShared {
     resources: crate::resources::OracleResources,
 }
 
-/// Synchronous local permit released by the aggregate query guard.
-struct LocalPermit {
-    /// Shared counters released by this permit.
-    shared: Arc<AdmissionShared>,
-    /// Class counter charged by this permit.
-    class: AdmissionClass,
-    /// Tenant counter charged by this permit.
-    tenant: DataTenantId,
-    /// Complete resource envelope released before queued work is reconsidered.
-    resources: Mutex<Option<crate::resources::OracleQueryResources>>,
-    /// Read-only projection of the envelope, retained after it moves away.
-    shape: Option<RetainedQuerySessionShape>,
-    /// Exactly-once release latch.
-    released: AtomicBool,
-}
-
-/// The parts of an admitted envelope a query still needs after it moves.
-///
-/// An Analytical lease transfers this query's [`OracleQueryResources`] into the
-/// graph that owns it, because exactly one owner may return the envelope to the
-/// governor. Dispatch, session construction, and tail drain still have to name
-/// the same memory pool and the same admitted shape afterwards, so the permit
-/// keeps this borrow-equivalent copy. Holding the pool handle charges nothing:
-/// it is the same tracked pool the envelope owns, not a second reservation.
-#[derive(Clone)]
-struct RetainedQuerySessionShape {
-    /// The tracked pool every operator of this query allocates from.
-    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
-    /// The peak counter that pool records into, shared with the envelope.
-    memory_peak_bytes: Arc<AtomicUsize>,
-    /// The memory ceiling admission granted this query.
-    granted_memory_bytes: usize,
-    /// Adaptive partition count derived from that grant.
-    target_partitions: usize,
-    /// Most bytes `DataFusion` may spill for this query; a limit, not a charge.
-    spill_limit_bytes: u64,
-}
-
-impl LocalPermit {
-    /// Releases all local counters exactly once and wakes queued waiters.
-    fn release_inner(&self) {
-        if self.released.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let Ok(mut state) = self.shared.state.lock() else {
-            tracing::error!("Oracle admission state lock poisoned during release");
-            return;
-        };
-        let release = Grant {
-            class: self.class,
-            tenant: self.tenant,
-            resources: None,
-        };
-        if let Err(error) = rollback_counts(&mut state, &release) {
-            tracing::error!(%error, "Oracle admission permit release failed");
-            return;
-        }
-        let resources = self
-            .resources
+impl AdmissionShared {
+    /// Re-runs the grant pass under the admission lock and notifies winners.
+    ///
+    /// The single capacity waker calls this once per governor capacity change,
+    /// whichever pod-local owner — leader or remote follower — returned slots.
+    /// Tenant FIFO order and the rotation cursor are untouched: this is the
+    /// same pass an enqueue runs, not a second admission path.
+    fn regrant(self: &Arc<Self>) {
+        let notifications = self
+            .state
             .lock()
-            .map_or(None, |mut resources| resources.take());
-        drop(resources);
-        let notifications = grant_waiters(&self.shared, &mut state);
-        drop(state);
-        notify_grants(&self.shared, notifications);
-        self.shared.notify.notify_waiters();
+            .map_or_else(|_| Vec::new(), |mut state| grant_waiters(self, &mut state));
+        notify_grants(notifications);
+    }
+
+    /// Wakes queued admission once for every governor capacity change.
+    ///
+    /// This is the queue's only capacity wake. It holds the owner weakly and
+    /// stops on admission close, so it never keeps a dropped owner alive. A
+    /// poisoned governor can grant nothing again, so the queue is closed and
+    /// every waiter is refused rather than left to its deadline. `epoch` is
+    /// read before the task is spawned, so a release that lands before the
+    /// task's first poll is still observed as a change.
+    async fn wake_on_capacity(
+        shared: std::sync::Weak<Self>,
+        resources: crate::resources::OracleResources,
+        mut epoch: u64,
+        stop: CancellationToken,
+    ) {
+        loop {
+            let changed = tokio::select! {
+                () = stop.cancelled() => return,
+                changed = resources.wait_for_capacity_change(epoch) => changed,
+            };
+            let Some(owner) = shared.upgrade() else {
+                return;
+            };
+            match changed {
+                Ok(next) => {
+                    epoch = next;
+                    owner.regrant();
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Oracle admission closed its queue on a poisoned governor");
+                    if let Ok(mut state) = owner.state.lock() {
+                        state.close_queue();
+                    }
+                    owner.notify.notify_waiters();
+                    return;
+                }
+            }
+        }
     }
 }
 
-impl Drop for LocalPermit {
-    /// Performs synchronous release when the aggregate guard is dropped.
+/// One leader-local query's tenant fairness charge.
+///
+/// Attached to the query's [`crate::resources::OracleQueryResources`] at grant
+/// time, so it is returned by that owner's final release — after its slot
+/// units and before the governor's capacity wake — wherever the owner has
+/// moved, including into an Analytical graph. It is the only thing admission
+/// charges a running query; slot capacity stays with the governor.
+struct TenantCharge {
+    /// Admission owner whose tenant ring holds the charge.
+    shared: Arc<AdmissionShared>,
+    /// Class whose tenant ring is charged.
+    class: AdmissionClass,
+    /// Tenant charged by the grant.
+    tenant: DataTenantId,
+}
+
+impl Drop for TenantCharge {
+    /// Returns the tenant count and the active-query count exactly once.
+    ///
+    /// Runs no grant pass: the governor's capacity wake that follows this drop
+    /// is the one reconsideration. An underflow is accounting corruption and
+    /// is logged rather than panicking inside a drop.
     fn drop(&mut self) {
-        self.release_inner();
+        let Ok(mut state) = self.shared.state.lock() else {
+            tracing::error!("Oracle admission state lock poisoned during tenant release");
+            return;
+        };
+        let cost = self.class.slot_units();
+        let class = state.class_mut(self.class);
+        if let Some((_, queue)) = class.tenants.iter_mut().find(|(id, _)| *id == self.tenant) {
+            if let Some(active) = queue.active.checked_sub(cost) {
+                queue.active = active;
+            } else {
+                tracing::error!("Oracle admission tenant release underflow");
+            }
+        }
+        if let Some(active) = state.active_queries.checked_sub(1) {
+            state.active_queries = active;
+        } else {
+            tracing::error!("Oracle admission active-query release underflow");
+        }
+        drop(state);
+        self.shared.notify.notify_waiters();
     }
 }
 
@@ -446,7 +456,7 @@ struct PreparedWaiter {
     /// Fixed absolute deadline selected before queue insertion.
     wait_deadline: Instant,
     /// One-shot grant notification owned by the waiting future.
-    receiver: tokio::sync::oneshot::Receiver<Grant>,
+    receiver: tokio::sync::oneshot::Receiver<crate::resources::OracleQueryResources>,
 }
 
 /// Owns one queued place until the waiting future takes its grant.
@@ -537,24 +547,21 @@ pub struct QueryResourceProbe {
 
 #[cfg(feature = "test-support")]
 impl QueryResourceProbe {
-    /// Creates the probe after local admission and before stream construction.
+    /// Creates the probe at admission, while the guard still holds its resources.
     ///
-    /// `shape` is the query's retained envelope projection; it is absent only
-    /// for a synthetic guard that never held an admitted envelope, and the
-    /// grant, current, and peak observations are then all zero.
+    /// Created before any Analytical transfer so the probe names the query's
+    /// own pool and peak counter for its whole life. `resources` is absent
+    /// only for a synthetic guard that never held an admitted envelope, and
+    /// the grant, current, and peak observations are then all zero.
     #[must_use]
-    fn new(
-        query_id: QueryId,
-        memory_bytes: u64,
-        slot_units: u64,
-        shape: Option<&RetainedQuerySessionShape>,
-    ) -> Self {
+    fn new(query_id: QueryId, resources: Option<&crate::resources::OracleQueryResources>) -> Self {
+        let slot_units = u64::from(resources.is_some());
         let (snapshot, _) = tokio::sync::watch::channel(QueryResourceSnapshot {
             admission_slots: slot_units,
-            memory_bytes,
+            memory_bytes: 0,
             peer_slots: slot_units,
-            granted_memory_bytes: shape.map_or(0, |shape| {
-                u64::try_from(shape.granted_memory_bytes).unwrap_or(u64::MAX)
+            granted_memory_bytes: resources.map_or(0, |resources| {
+                u64::try_from(resources.granted_memory_bytes).unwrap_or(u64::MAX)
             }),
             pool_current_bytes: 0,
             pool_peak_bytes: 0,
@@ -562,8 +569,9 @@ impl QueryResourceProbe {
         Self {
             query_id,
             snapshot,
-            pool: shape.map(|shape| Arc::clone(&shape.pool)),
-            memory_peak_bytes: shape.map(|shape| Arc::clone(&shape.memory_peak_bytes)),
+            pool: resources.map(crate::resources::OracleQueryResources::memory_pool),
+            memory_peak_bytes: resources
+                .map(crate::resources::OracleQueryResources::memory_peak_bytes),
         }
     }
     /// Returns the existing Oracle query identity.
@@ -616,15 +624,24 @@ impl std::fmt::Debug for OracleAdmission {
 }
 
 impl OracleAdmission {
-    /// Creates a process-local owner with explicit class, tenant, and byte budgets.
-    #[must_use]
+    /// Creates a process-local owner and starts its single capacity waker.
+    ///
+    /// The waker is the queue's only reaction to returned capacity; it runs
+    /// until [`Self::close`] and holds the owner weakly.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::Internal`] when called outside a Tokio runtime.
     pub(super) fn with_config(
         slots: Arc<OracleSlotManager>,
         local_role: RegisteredRole,
         membership_available: bool,
         config: OracleAdmissionConfig,
         resources: crate::resources::OracleResources,
-    ) -> Self {
+    ) -> Result<Self, BifrostError> {
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| BifrostError::Internal {
+                detail: "Oracle admission requires an active Tokio runtime".to_owned(),
+            })?;
         let root_cancel = CancellationToken::new();
         // Admission and the governor must agree on one class split. Installing
         // it here makes that true by construction: the ledger that both leader
@@ -636,18 +653,25 @@ impl OracleAdmission {
             analytical_max_units: config.analytical_slots,
         });
         let state = AdmissionState::new(config, membership_available);
-        Self {
+        let shared = Arc::new(AdmissionShared {
+            state: Mutex::new(state),
+            notify: tokio::sync::Notify::new(),
+            root_cancel,
+            max_queue_wait: config.max_queue_wait,
+            next_waiter: AtomicU64::new(1),
+            resources,
+        });
+        runtime.spawn(AdmissionShared::wake_on_capacity(
+            Arc::downgrade(&shared),
+            shared.resources.clone(),
+            shared.resources.capacity_epoch(),
+            shared.root_cancel.clone(),
+        ));
+        Ok(Self {
             slots,
             local_role,
-            shared: Arc::new(AdmissionShared {
-                state: Mutex::new(state),
-                notify: tokio::sync::Notify::new(),
-                root_cancel,
-                max_queue_wait: config.max_queue_wait,
-                next_waiter: AtomicU64::new(1),
-                resources,
-            }),
-        }
+            shared,
+        })
     }
 
     /// Starts the lifecycle task without reconstructing query state.
@@ -675,11 +699,12 @@ impl OracleAdmission {
     /// Reports whether a live Oracle role and local class capacity are available.
     #[must_use]
     pub fn is_available(&self) -> bool {
-        self.shared.state.lock().is_ok_and(|state| {
-            state.membership_available
-                && !state.closed
-                && (state.interactive.capacity > 0 || state.analytical.capacity > 0)
-        })
+        self.shared.resources.class_split().total_units() > 0
+            && self
+                .shared
+                .state
+                .lock()
+                .is_ok_and(|state| state.membership_available && !state.closed)
     }
 
     /// Applies a membership/config generation to future grants without revoking guards.
@@ -691,21 +716,14 @@ impl OracleAdmission {
         } else {
             Vec::new()
         };
-        notify_grants(&self.shared, notifications);
+        notify_grants(notifications);
         self.shared.notify.notify_waiters();
     }
 
-    /// Closes future admissions and cancels queued waiters synchronously.
+    /// Closes future admissions, refuses queued waiters, and stops the waker.
     pub(crate) fn close(&self) {
         if let Ok(mut state) = self.shared.state.lock() {
-            state.closed = true;
-            for (_, tenant) in &mut state.interactive.tenants {
-                tenant.waiters.clear();
-            }
-            for (_, tenant) in &mut state.analytical.tenants {
-                tenant.waiters.clear();
-            }
-            state.queued = 0;
+            state.close_queue();
         }
         self.shared.root_cancel.cancel();
         self.shared.notify.notify_waiters();
@@ -759,12 +777,13 @@ impl OracleAdmission {
         }
     }
 
-    /// Acquires one class/tenant/memory/spill aggregate with a fixed absolute wait deadline.
+    /// Waits in the tenant-fair queue for one governor slot grant.
     ///
     /// # Errors
-    /// Returns admission rejection when the queue is full, closed, or cancelled,
-    /// and [`BifrostError::QueryTimeout`] when the absolute wait deadline
-    /// expires before a grant.
+    /// Returns [`BifrostError::QueryQueueFull`] when every waiting place is
+    /// taken, admission rejection when closed or cancelled, and
+    /// [`BifrostError::QueryTimeout`] when the absolute wait deadline expires
+    /// before a grant.
     #[cfg(test)]
     #[tracing::instrument(name = "bifrost.oracle.admission", skip_all)]
     pub(super) async fn admit(
@@ -775,6 +794,9 @@ impl OracleAdmission {
     }
 
     /// Acquires admission while preserving an ingress-fixed participant-cut identity.
+    ///
+    /// # Errors
+    /// Returns the same refusals as the common admission path.
     pub(super) async fn admit_for_attempt(
         self: &Arc<Self>,
         request: PreparedAdmission,
@@ -784,6 +806,11 @@ impl OracleAdmission {
     }
 
     /// Applies the common bounded admission path with an optional fixed identity.
+    ///
+    /// # Errors
+    /// Returns the enqueue refusal, the waiting refusal or timeout, or
+    /// [`BifrostError::OracleRoleUnavailable`] when the role was fenced out
+    /// after the grant.
     async fn admit_with_attempt_id(
         self: &Arc<Self>,
         request: PreparedAdmission,
@@ -802,7 +829,7 @@ impl OracleAdmission {
         let waiter_telemetry = OracleTelemetry::start_admission_waiter(query_class);
         let waiter =
             self.enqueue_waiter(tenant, class_kind, local_ratio, wait_deadline, query_class)?;
-        let grant = self
+        let resources = self
             .wait_for_grant(waiter, cancellation.clone(), query_class)
             .await?;
         OracleTelemetry::record_admission(
@@ -812,15 +839,21 @@ impl OracleAdmission {
         );
         let mut waiter_telemetry = waiter_telemetry;
         waiter_telemetry.finish("class", "acquired");
-        self.build_admitted_guard(grant, cancellation, attempt_id)
+        self.build_admitted_guard(tenant, resources, cancellation, attempt_id)
     }
 
     /// Enqueues one waiter and immediately grants any newly eligible requests.
     ///
+    /// This is the one capacity refusal: a full queue returns
+    /// [`BifrostError::QueryQueueFull`] immediately. Nothing ahead of it
+    /// reserves or waits for a place.
+    ///
     /// # Errors
-    /// Returns an internal error when the admission state lock is poisoned, or
-    /// a query-admission rejection when shutdown or queue capacity prevents
-    /// insertion.
+    /// Returns an internal error when the admission state lock is poisoned,
+    /// [`BifrostError::OracleRoleUnavailable`] without live membership,
+    /// query-admission rejection when the class is disabled or admission is
+    /// closed, and [`BifrostError::QueryQueueFull`] when every waiting place is
+    /// taken.
     fn enqueue_waiter(
         &self,
         tenant: DataTenantId,
@@ -852,7 +885,7 @@ impl OracleAdmission {
             // here keeps a caller from waiting out its whole deadline, and keeps
             // a query view and every peer contact off the path.
             if class_kind == AdmissionClass::Analytical
-                && state.analytical.capacity < AdmissionClass::Analytical.slot_units()
+                && !self.shared.resources.class_split().admits_analytical()
             {
                 OracleTelemetry::record_admission(
                     query_class,
@@ -861,31 +894,29 @@ impl OracleAdmission {
                 );
                 return Err(BifrostError::QueryAdmissionRejected);
             }
-            if state.closed || state.queued >= state.queue_capacity {
-                let reason = if state.closed {
-                    OracleAdmissionReason::Shutdown
-                } else {
-                    OracleAdmissionReason::QueueFull
-                };
+            if state.closed {
                 OracleTelemetry::record_admission(
                     query_class,
                     OracleAdmissionOutcome::Rejected,
-                    reason,
+                    OracleAdmissionReason::Shutdown,
                 );
-                if !state.closed {
-                    tracing::warn!(
-                        reason = "queue_full",
-                        queued = state.queued,
-                        capacity = state.queue_capacity,
-                        "Oracle refused a query because every waiting place is taken"
-                    );
-                }
                 return Err(BifrostError::QueryAdmissionRejected);
             }
-            let class = match class_kind {
-                AdmissionClass::Interactive => &mut state.interactive,
-                AdmissionClass::Analytical => &mut state.analytical,
-            };
+            if state.queued >= state.queue_capacity {
+                OracleTelemetry::record_admission(
+                    query_class,
+                    OracleAdmissionOutcome::Rejected,
+                    OracleAdmissionReason::QueueFull,
+                );
+                tracing::warn!(
+                    reason = "queue_full",
+                    queued = state.queued,
+                    capacity = state.queue_capacity,
+                    "Oracle refused a query because every waiting place is taken"
+                );
+                return Err(BifrostError::QueryQueueFull);
+            }
+            let class = state.class_mut(class_kind);
             let index = class.tenant_index(tenant);
             class.tenants[index].1.waiters.push_back(Waiter {
                 id: waiter_id,
@@ -896,7 +927,7 @@ impl OracleAdmission {
             state.queued += 1;
             grant_waiters(&self.shared, &mut state)
         };
-        notify_grants(&self.shared, notifications);
+        notify_grants(notifications);
         Ok(PreparedWaiter {
             class_kind,
             tenant,
@@ -911,7 +942,9 @@ impl OracleAdmission {
     /// The queued place is owned by a [`QueuedWaiter`] guard, so every exit
     /// that does not take the grant — deadline, cancellation, shutdown, or the
     /// caller dropping this future when its client disconnects — removes the
-    /// waiter and returns any grant that raced the exit.
+    /// waiter and returns any grant that raced the exit. Returned capacity is
+    /// not watched here: the owner's single capacity waker runs the grant pass
+    /// and this future only receives its outcome.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryTimeout`] when the earlier of the queue
@@ -922,109 +955,62 @@ impl OracleAdmission {
         waiter: PreparedWaiter,
         cancellation: CancellationToken,
         query_class: QueryClass,
-    ) -> Result<Grant, BifrostError> {
+    ) -> Result<crate::resources::OracleQueryResources, BifrostError> {
         let wait_deadline = waiter.wait_deadline;
         let mut queued = QueuedWaiter {
             admission: self,
             waiter,
             armed: true,
         };
-        loop {
-            // Followers release governor slot units outside this queue, so the
-            // capacity a queued leader is waiting for can appear without any local
-            // release. Re-running the scheduler on the shared resource-change epoch
-            // is what turns that into a grant without a polling loop.
-            let epoch = self.shared.resources.capacity_epoch();
-            let refusal = tokio::select! {
-                resource_change = self.shared.resources.wait_for_capacity_change(epoch) => {
-                    if resource_change.is_ok() {
-                        self.regrant();
-                        continue;
-                    }
-                    (OracleAdmissionReason::Shutdown, BifrostError::QueryAdmissionRejected)
-                }
-                grant = &mut queued.waiter.receiver => {
-                    queued.armed = false;
-                    return grant.map_err(|_| BifrostError::QueryAdmissionRejected);
-                }
-                () = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_deadline)) => {
-                    // The earlier of the queue limit and the total deadline has
-                    // passed: a timeout, not a capacity refusal to retry.
-                    (OracleAdmissionReason::QueueDeadline, BifrostError::QueryTimeout)
-                }
-                () = cancellation.cancelled() => {
-                    (OracleAdmissionReason::Shutdown, BifrostError::QueryAdmissionRejected)
-                }
-                () = self.shared.root_cancel.cancelled() => {
-                    (OracleAdmissionReason::Shutdown, BifrostError::QueryAdmissionRejected)
-                }
-            };
-            drop(queued);
-            let (reason, error) = refusal;
-            OracleTelemetry::record_admission(
-                query_class,
-                OracleAdmissionOutcome::Rejected,
-                reason,
-            );
-            return Err(error);
-        }
+        let (reason, error) = tokio::select! {
+            grant = &mut queued.waiter.receiver => {
+                queued.armed = false;
+                return grant.map_err(|_| BifrostError::QueryAdmissionRejected);
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_deadline)) => {
+                // The earlier of the queue limit and the total deadline has
+                // passed: a timeout, not a capacity refusal to retry.
+                (OracleAdmissionReason::QueueDeadline, BifrostError::QueryTimeout)
+            }
+            () = cancellation.cancelled() => {
+                (OracleAdmissionReason::Shutdown, BifrostError::QueryAdmissionRejected)
+            }
+            () = self.shared.root_cancel.cancelled() => {
+                (OracleAdmissionReason::Shutdown, BifrostError::QueryAdmissionRejected)
+            }
+        };
+        drop(queued);
+        OracleTelemetry::record_admission(query_class, OracleAdmissionOutcome::Rejected, reason);
+        Err(error)
     }
 
-    /// Re-runs the local scheduler under the admission lock and notifies winners.
+    /// Removes a canceled waiter and releases any raced grant.
     ///
-    /// Used when capacity changed outside this queue. Tenant FIFO order and the
-    /// rotation cursor are untouched: this is the same scheduling pass a local
-    /// release runs, not a second admission path.
-    fn regrant(&self) {
-        let notifications = self.shared.state.lock().map_or_else(
-            |_| Vec::new(),
-            |mut state| grant_waiters(&self.shared, &mut state),
-        );
-        notify_grants(&self.shared, notifications);
-    }
-
-    /// Removes a canceled waiter and returns any raced grant to the pool.
+    /// A raced grant is simply dropped: its resources carry the tenant charge,
+    /// so the drop returns the slot and the charge and wakes the queue.
     fn rollback_waiter(
         &self,
         class_kind: AdmissionClass,
         tenant: DataTenantId,
         waiter_id: u64,
-        receiver: &mut tokio::sync::oneshot::Receiver<Grant>,
+        receiver: &mut tokio::sync::oneshot::Receiver<crate::resources::OracleQueryResources>,
     ) {
         self.cancel_waiter(class_kind, tenant, waiter_id);
-        if let Ok(grant) = receiver.try_recv() {
-            self.rollback_grant(grant);
-        }
+        drop(receiver.try_recv());
     }
 
-    /// Converts one granted aggregate into the stream-owned lifecycle guard.
+    /// Converts one granted resource owner into the stream-owned lifecycle guard.
     ///
     /// # Errors
     /// Returns [`BifrostError::OracleRoleUnavailable`] when this role was fenced
-    /// out after local admission; the aggregate permit is released on that path.
+    /// out after local admission; the resources are released on that path.
     fn build_admitted_guard(
         &self,
-        mut grant: Grant,
+        tenant: DataTenantId,
+        resources: crate::resources::OracleQueryResources,
         cancellation: CancellationToken,
         attempt_id: Option<QueryId>,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
-        let permit = LocalPermit {
-            shared: Arc::clone(&self.shared),
-            class: grant.class,
-            tenant: grant.tenant,
-            shape: grant
-                .resources
-                .as_ref()
-                .map(|resources| RetainedQuerySessionShape {
-                    pool: resources.memory_pool(),
-                    memory_peak_bytes: resources.memory_peak_bytes(),
-                    granted_memory_bytes: resources.granted_memory_bytes,
-                    target_partitions: resources.target_partitions,
-                    spill_limit_bytes: resources.spill_limit_bytes,
-                }),
-            resources: Mutex::new(grant.resources.take()),
-            released: AtomicBool::new(false),
-        };
         let local_node = self.local_role.key.node_id;
         let membership_available = self
             .shared
@@ -1032,25 +1018,29 @@ impl OracleAdmission {
             .lock()
             .is_ok_and(|state| state.membership_available);
         if !membership_available {
-            drop(permit);
+            drop(resources);
             return Err(BifrostError::OracleRoleUnavailable);
         }
         let query_id = attempt_id.unwrap_or_else(|| QueryId::new(uuid::Uuid::now_v7()));
         Ok(AdmittedQueryGuard {
             analytical: None,
             query_id,
+            tenant,
             leader: AdmittedLeader {
                 node_id: local_node,
                 fencing_token: self.local_role.fencing_token,
             },
             physical_projections: Vec::new(),
-            local_permit: Some(permit),
+            #[cfg(feature = "test-support")]
+            resource_probe: Some(Arc::new(QueryResourceProbe::new(
+                query_id,
+                Some(&resources),
+            ))),
+            resources: Some(resources),
             live_reservations: Vec::new(),
             cancellation: self.shared.root_cancel.child_token(),
             request_cancellation: cancellation,
             distributed_settlement: Arc::new(DistributedQuerySettlement::default()),
-            #[cfg(feature = "test-support")]
-            resource_probe: None,
         })
     }
 
@@ -1059,13 +1049,13 @@ impl OracleAdmission {
         self.shared.max_queue_wait
     }
 
-    /// Removes one canceled waiter and immediately re-runs grant scheduling.
+    /// Removes one canceled waiter from its tenant FIFO.
+    ///
+    /// Runs no grant pass: a departing waiter frees a queue place, not
+    /// execution capacity.
     fn cancel_waiter(&self, class_kind: AdmissionClass, tenant: DataTenantId, waiter_id: u64) {
-        let notifications = if let Ok(mut state) = self.shared.state.lock() {
-            let class = match class_kind {
-                AdmissionClass::Interactive => &mut state.interactive,
-                AdmissionClass::Analytical => &mut state.analytical,
-            };
+        if let Ok(mut state) = self.shared.state.lock() {
+            let class = state.class_mut(class_kind);
             if let Some((_, queue)) = class.tenants.iter_mut().find(|(id, _)| *id == tenant)
                 && let Some(index) = queue
                     .waiters
@@ -1075,28 +1065,7 @@ impl OracleAdmission {
                 queue.waiters.remove(index);
                 state.queued = state.queued.saturating_sub(1);
             }
-            grant_waiters(&self.shared, &mut state)
-        } else {
-            Vec::new()
-        };
-        notify_grants(&self.shared, notifications);
-        self.shared.notify.notify_waiters();
-    }
-
-    /// Returns a raced notification grant to the mutex-owned counters.
-    fn rollback_grant(&self, mut grant: Grant) {
-        drop(grant.resources.take());
-        let notifications = if let Ok(mut state) = self.shared.state.lock() {
-            if let Err(error) = rollback_counts(&mut state, &grant) {
-                tracing::error!(%error, "Oracle admission rollback failed");
-                return;
-            }
-            grant_waiters(&self.shared, &mut state)
-        } else {
-            Vec::new()
-        };
-        notify_grants(&self.shared, notifications);
-        self.shared.notify.notify_waiters();
+        }
     }
 }
 
@@ -1110,14 +1079,16 @@ impl OracleAdmission {
 ///    never be granted; this runs on each iteration against a freshly read
 ///    instant, so both an entry uncovered by a prior grant and an entry that
 ///    expired while an earlier grant in the same pass was decided are checked;
-/// 2. ready Interactive work is granted until the protected floor is satisfied;
-/// 3. otherwise the older of the two eligible class heads wins, compared by the
-///    monotonic waiter identity, so neither a continuously ready class starves
-///    the other nor an idle Analytical queue strands capacity.
+/// 2. the older of the two eligible class heads is offered first, compared by
+///    the monotonic waiter identity, so neither a continuously ready class
+///    starves the other nor an idle Analytical queue strands capacity;
+/// 3. the pod governor decides whether that class can run. It alone enforces
+///    the Interactive floor, Interactive borrowing, and the Analytical maximum
+///    for leaders and remote followers alike.
 ///
-/// A class whose governor acquisition refuses is not retried in this pass: the
-/// refusal is a shared-ledger condition, not a queue-order condition, and the
-/// waiter is woken again when the resource-change epoch advances.
+/// A class the governor refuses is not retried in this pass: the refusal is a
+/// shared-ledger condition, not a queue-order condition, and the next capacity
+/// wake re-runs the pass.
 fn grant_waiters(
     shared: &Arc<AdmissionShared>,
     state: &mut AdmissionState,
@@ -1160,76 +1131,76 @@ fn grant_waiters_with_clock(
                     .interactive
                     .next_eligible(AdmissionClass::Interactive.slot_units())
             })
-            .flatten()
-            .filter(|_| state.class_fits(AdmissionClass::Interactive));
+            .flatten();
         let analytical = (!refused[1])
             .then(|| {
                 state
                     .analytical
                     .next_eligible(AdmissionClass::Analytical.slot_units())
             })
-            .flatten()
-            .filter(|_| state.class_fits(AdmissionClass::Analytical));
-        let kind = match (interactive, analytical) {
-            (Some(_), _) if state.interactive.used < state.interactive_floor_units => {
-                AdmissionClass::Interactive
-            }
+            .flatten();
+        let (kind, index) = match (interactive, analytical) {
             (Some(index), Some(other)) => {
                 if state.interactive.head_waiter_id(index) <= state.analytical.head_waiter_id(other)
                 {
-                    AdmissionClass::Interactive
+                    (AdmissionClass::Interactive, index)
                 } else {
-                    AdmissionClass::Analytical
+                    (AdmissionClass::Analytical, other)
                 }
             }
-            (Some(_), None) => AdmissionClass::Interactive,
-            (None, Some(_)) => AdmissionClass::Analytical,
+            (Some(index), None) => (AdmissionClass::Interactive, index),
+            (None, Some(index)) => (AdmissionClass::Analytical, index),
             (None, None) => break,
         };
-        let index = match kind {
-            AdmissionClass::Interactive => interactive,
-            AdmissionClass::Analytical => analytical,
-        }
-        .expect("the selected class named an eligible tenant");
-        let cost = kind.slot_units();
-        let waiter = {
-            let class = state.class_mut(kind);
-            class.tenants[index]
-                .1
-                .waiters
-                .pop_front()
-                .expect("an eligible tenant has a FIFO head")
-        };
-        let Ok(resources) = acquire_waiter_resources(shared, kind, waiter.local_ratio) else {
-            state.class_mut(kind).tenants[index]
-                .1
-                .waiters
-                .push_front(waiter);
+        let local_ratio = state.class_mut(kind).tenants[index]
+            .1
+            .waiters
+            .front()
+            .expect("an eligible tenant has a FIFO head")
+            .local_ratio;
+        let Ok(resources) = acquire_waiter_resources(shared, kind, local_ratio) else {
             refused[usize::from(kind == AdmissionClass::Analytical)] = true;
             continue;
         };
+        let waiter = state.class_mut(kind).tenants[index]
+            .1
+            .waiters
+            .pop_front()
+            .expect("an eligible tenant has a FIFO head");
         state.queued = state.queued.saturating_sub(1);
-        state.active_queries += 1;
+        let resources = charge_tenant(shared, state, kind, index, resources);
         let class = state.class_mut(kind);
-        let tenant = class.tenants[index].0;
-        class.used += cost;
-        class.tenants[index].1.active += cost;
         // Advance past the tenant that just took a grant, never past the whole
         // ring, so the next grant goes to the following eligible tenant.
         class.cursor = (index + 1) % class.tenants.len();
-        notifications.push((
-            waiter.tx,
-            Grant {
-                class: kind,
-                tenant,
-                resources: Some(resources),
-            },
-        ));
+        notifications.push((waiter.tx, resources));
     }
     notifications
 }
 
-/// Acquires the root ownership one queued admission class must hold to run.
+/// Charges one tenant for a governor grant and attaches that charge to it.
+///
+/// The charge is attached to the query's own resource owner, so its return is
+/// the owner's final release and cannot happen early or twice.
+fn charge_tenant(
+    shared: &Arc<AdmissionShared>,
+    state: &mut AdmissionState,
+    kind: AdmissionClass,
+    index: usize,
+    mut resources: crate::resources::OracleQueryResources,
+) -> crate::resources::OracleQueryResources {
+    state.active_queries += 1;
+    let class = state.class_mut(kind);
+    class.tenants[index].1.active += kind.slot_units();
+    resources.attach_admission_charge(Box::new(TenantCharge {
+        shared: Arc::clone(shared),
+        class: kind,
+        tenant: class.tenants[index].0,
+    }));
+    resources
+}
+
+/// Asks the pod governor for one queued admission class's slot charge.
 ///
 /// What is acquired is slot units; the class memory quantum
 /// is validated for shape but reserves nothing. Governed memory is charged later,
@@ -1256,57 +1227,14 @@ fn acquire_waiter_resources(
         ))
 }
 
-/// Notifies winners after releasing the admission mutex and repairs canceled sends.
-fn notify_grants(shared: &Arc<AdmissionShared>, mut notifications: Vec<GrantNotification>) {
-    let mut pending: VecDeque<GrantNotification> = notifications.drain(..).collect();
-    while let Some((sender, grant)) = pending.pop_front() {
-        if let Err(mut grant) = sender.send(grant) {
-            drop(grant.resources.take());
-            let next = if let Ok(mut state) = shared.state.lock() {
-                match rollback_counts(&mut state, &grant) {
-                    Ok(()) => grant_waiters(shared, &mut state),
-                    Err(error) => {
-                        tracing::error!(%error, "Oracle admission notification rollback failed");
-                        Vec::new()
-                    }
-                }
-            } else {
-                Vec::new()
-            };
-            pending.extend(next);
-        }
+/// Notifies winners after the admission mutex is released.
+///
+/// A winner whose future already left returns its grant by dropping it; the
+/// resources' release returns the slot and tenant charge and wakes the queue.
+fn notify_grants(notifications: Vec<GrantNotification>) {
+    for (sender, resources) in notifications {
+        drop(sender.send(resources));
     }
-}
-
-/// Reverses one grant's class, tenant, and active counters.
-fn rollback_counts(state: &mut AdmissionState, grant: &Grant) -> Result<(), BifrostError> {
-    let class = match grant.class {
-        AdmissionClass::Interactive => &mut state.interactive,
-        AdmissionClass::Analytical => &mut state.analytical,
-    };
-    let cost = grant.class.slot_units();
-    if let Some((_, tenant)) = class.tenants.iter_mut().find(|(id, _)| *id == grant.tenant) {
-        tenant.active = tenant
-            .active
-            .checked_sub(cost)
-            .ok_or_else(|| BifrostError::Internal {
-                detail: "Oracle admission tenant rollback underflow".to_owned(),
-            })?;
-    }
-    class.used = class
-        .used
-        .checked_sub(cost)
-        .ok_or_else(|| BifrostError::Internal {
-            detail: "Oracle admission class rollback underflow".to_owned(),
-        })?;
-    state.active_queries =
-        state
-            .active_queries
-            .checked_sub(1)
-            .ok_or_else(|| BifrostError::Internal {
-                detail: "Oracle admission active-query rollback underflow".to_owned(),
-            })?;
-    Ok(())
 }
 
 /// Stream-owned local capacity cleanup.
@@ -1315,13 +1243,17 @@ pub(super) struct AdmittedQueryGuard {
     pub(super) query_id: QueryId,
     /// Fenced leader selected at admission time.
     pub(super) leader: AdmittedLeader,
+    /// Tenant whose fairness charge the resources carry.
+    tenant: DataTenantId,
     /// Physical table projections charged to this query's admitted pool.
     physical_projections: Vec<
         crate::catalog::PhysicalTableProjection<crate::resources::OracleQueryMemoryReservation>,
     >,
-    /// Aggregate leader-local class, tenant, memory, and spill permit.
-    local_permit: Option<LocalPermit>,
-    /// Canonical local slot-use gauge retained with the running permit.
+    /// The governor's slot charge with this query's tenant charge attached.
+    ///
+    /// `None` once an Analytical graph has taken it; the graph's final release
+    /// then returns both charges.
+    resources: Option<crate::resources::OracleQueryResources>,
     /// Parent reservations retaining drained live batches through stream cleanup.
     pub(super) live_reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
     /// Inactive Analytical graph and attempt ownership retained until cleanup.
@@ -1388,14 +1320,8 @@ impl Drop for AdmittedQueryGuard {
         self.cancellation.cancel();
         self.live_reservations.clear();
         self.physical_projections.clear();
-        // Before the permit: an Analytical graph owns this query's envelope, and
-        // the permit's release wakes queued waiters. Returning the envelope
-        // second would let the next query be admitted while this one's capacity
-        // is still charged to the governor.
         self.analytical.take();
-        if let Some(permit) = self.local_permit.take() {
-            permit.release_inner();
-        }
+        drop(self.resources.take());
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
@@ -1436,13 +1362,9 @@ impl AdmittedQueryGuard {
     /// A released, moved, or poisoned envelope reports idle so the caller
     /// proceeds to release, which owns reporting those states.
     fn children_idle(&self) -> bool {
-        self.local_permit.as_ref().is_none_or(|permit| {
-            permit.resources.lock().map_or(true, |resources| {
-                resources
-                    .as_ref()
-                    .is_none_or(crate::resources::OracleQueryResources::nested_idle)
-            })
-        })
+        self.resources
+            .as_ref()
+            .is_none_or(crate::resources::OracleQueryResources::nested_idle)
     }
 
     /// Takes the inactive Analytical ownership so the stream can settle it.
@@ -1468,14 +1390,7 @@ impl AdmittedQueryGuard {
         &mut self,
         resources: crate::resources::OracleQueryResources,
     ) {
-        let permit = self
-            .local_permit
-            .as_ref()
-            .expect("a test guard always holds its local permit");
-        *permit
-            .resources
-            .lock()
-            .expect("fixture permit resources lock is uncontended") = Some(resources);
+        self.resources = Some(resources);
     }
 
     /// Takes this query's admitted envelope so its Analytical graph can own it.
@@ -1484,36 +1399,30 @@ impl AdmittedQueryGuard {
     /// already holds one, so the graph is registered with *this* envelope rather
     /// than a fresh acquisition. Taking rather than sharing keeps a single
     /// owner: from here the graph releases it, and this guard's own drop only
-    /// returns the admission counters.
+    /// carries nothing: the tenant charge travels inside the envelope.
     ///
-    /// Returns `None` when the query has no live local permit, which is the
+    /// Returns `None` when the envelope was already taken, which is the
     /// refusal path — a query about to be rejected has no envelope to lend.
     pub(super) fn take_query_resources(
         &mut self,
     ) -> Option<crate::resources::OracleQueryResources> {
-        self.local_permit
-            .as_ref()
-            .and_then(|permit| permit.resources.lock().ok())
-            .and_then(|mut resources| resources.take())
+        self.resources.take()
     }
 
-    /// Returns a taken envelope to the same permit it was taken from.
+    /// Returns a taken envelope to the guard it was taken from.
     ///
     /// Only the graph-registration refusal uses this: registration hands the
     /// envelope back instead of consuming it, and the guard is still the
     /// query's owner at that point, so putting it back is what lets the
-    /// ordinary terminal release return the grant. A permit that is already
-    /// holding an envelope, or that is gone, drops the returned one rather
-    /// than overwriting a live owner.
+    /// ordinary terminal release return the grant. A guard that is already
+    /// holding an envelope drops the returned one rather than overwriting a
+    /// live owner.
     pub(super) fn restore_query_resources(
         &mut self,
         resources: crate::resources::OracleQueryResources,
     ) {
-        if let Some(permit) = self.local_permit.as_ref()
-            && let Ok(mut held) = permit.resources.lock()
-            && held.is_none()
-        {
-            *held = Some(resources);
+        if self.resources.is_none() {
+            self.resources = Some(resources);
         }
     }
 
@@ -1560,21 +1469,14 @@ impl AdmittedQueryGuard {
         &mut self,
         bindings: impl ExactSizeIterator<Item = &'a crate::catalog::TenantTableBinding>,
     ) -> Result<(), BifrostError> {
-        let permit = self
-            .local_permit
-            .as_ref()
-            .ok_or(BifrostError::QueryAdmissionRejected)?;
-        let resources = permit
+        let resources = self
             .resources
-            .lock()
-            .map_err(|_| BifrostError::QueryAdmissionRejected)?;
-        let resources = resources
             .as_ref()
             .ok_or(BifrostError::QueryAdmissionRejected)?;
         let mut projections = Vec::with_capacity(bindings.len());
         for binding in bindings {
             let logical = crate::catalog::LogicalTableIdentity::try_new(
-                &permit.tenant,
+                &self.tenant,
                 &binding.tenant,
                 &binding.table_ref,
             )
@@ -1597,52 +1499,54 @@ impl AdmittedQueryGuard {
     }
 
     /// Returns the most bytes `DataFusion` may spill for this admitted query.
+    ///
+    /// Reads the guard's own envelope, so it is meaningful only before an
+    /// Analytical graph takes it; every caller runs before that transfer.
     #[must_use]
     pub(super) fn spill_limit_bytes(&self) -> u64 {
-        self.local_permit
+        self.resources
             .as_ref()
-            .and_then(|permit| permit.shape.as_ref())
-            .map_or(0, |shape| shape.spill_limit_bytes)
+            .map_or(0, |resources| resources.spill_limit_bytes)
     }
 
-    /// Builds the tracked greedy pool owned by this query's exact envelope.
+    /// Returns the tracked pool owned by this query's exact envelope.
+    ///
+    /// `None` once the envelope has moved to an Analytical graph.
     #[must_use]
     pub(super) fn memory_pool(
         &self,
     ) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
-        self.local_permit
+        self.resources
             .as_ref()
-            .and_then(|permit| permit.shape.as_ref())
-            .map(|shape| Arc::clone(&shape.pool))
+            .map(crate::resources::OracleQueryResources::memory_pool)
     }
 
     /// Returns the memory ceiling admission granted this query.
     ///
-    /// Falls back to the working-memory floor when the permit is absent, which
-    /// is the same conservative direction every other accessor here takes: a
-    /// query with no live permit is about to be refused, and a floor-sized
-    /// session shape cannot over-commit memory on its way out.
+    /// Falls back to the working-memory floor when the envelope is absent,
+    /// which is the same conservative direction every other accessor here
+    /// takes: a floor-sized session shape cannot over-commit memory.
     #[must_use]
     pub(super) fn granted_memory_bytes(&self) -> usize {
-        self.local_permit
-            .as_ref()
-            .and_then(|permit| permit.shape.as_ref())
-            .map_or(
-                crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-                |shape| shape.granted_memory_bytes,
-            )
+        self.resources.as_ref().map_or(
+            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+            |resources| resources.granted_memory_bytes,
+        )
     }
 
     /// Returns adaptive target partitions calculated with the admitted grant.
     #[must_use]
     pub(super) fn target_partitions(&self) -> usize {
-        self.local_permit
+        self.resources
             .as_ref()
-            .and_then(|permit| permit.shape.as_ref())
-            .map_or(1, |shape| shape.target_partitions)
+            .map_or(1, |resources| resources.target_partitions)
     }
 
-    /// Attaches exact query-keyed ownership after live-tail drain completes.
+    /// Returns the query-keyed ownership probe after live-tail drain completes.
+    ///
+    /// The probe was created at admission so it names this query's own pool
+    /// even after an Analytical transfer; this records the live-tail bytes the
+    /// guard retains now.
     #[cfg(feature = "test-support")]
     pub(super) fn attach_resource_probe(&mut self) -> Arc<QueryResourceProbe> {
         let memory_bytes = self
@@ -1650,31 +1554,23 @@ impl AdmittedQueryGuard {
             .iter()
             .map(|reservation| reservation.bytes() as u64)
             .sum();
-        let slot_units = self.local_permit.as_ref().map_or(0_u64, |_| 1_u64);
-        let probe = Arc::new(QueryResourceProbe::new(
-            self.query_id,
-            memory_bytes,
-            slot_units,
-            self.local_permit
-                .as_ref()
-                .and_then(|permit| permit.shape.as_ref()),
-        ));
-        self.resource_probe = Some(Arc::clone(&probe));
+        let query_id = self.query_id;
+        let probe = self
+            .resource_probe
+            .get_or_insert_with(|| Arc::new(QueryResourceProbe::new(query_id, None)));
         probe
+            .snapshot
+            .send_modify(|snapshot| snapshot.memory_bytes = memory_bytes);
+        Arc::clone(probe)
     }
 
     /// Cancels the query and releases all local resources synchronously.
     pub(super) fn release(mut self) {
         self.cancellation.cancel();
-        // Before the permit: the Analytical graph holds this query's envelope,
-        // and returning admission counters first would let a queued waiter be
-        // admitted while the envelope it needs is still charged.
         self.analytical.take();
         self.live_reservations.clear();
         self.physical_projections.clear();
-        if let Some(permit) = self.local_permit.take() {
-            permit.release_inner();
-        }
+        drop(self.resources.take());
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
@@ -1684,24 +1580,27 @@ impl AdmittedQueryGuard {
 
 #[cfg(test)]
 /// Builds one real stream-owned guard for lifecycle tests without a cluster dependency.
+///
+/// The guard holds a real governor slot grant with its tenant charge attached,
+/// exactly as a queued grant would, so releasing it drives the production
+/// return path.
+///
+/// # Panics
+/// Panics when the fixture governor cannot grant one Interactive slot.
 pub(super) fn admitted_guard_for_test()
 -> (AdmittedQueryGuard, Arc<AdmissionShared>, CancellationToken) {
     let shared = Arc::new(AdmissionShared {
-        state: Mutex::new({
-            let mut state = AdmissionState::new(
-                OracleAdmissionConfig {
-                    interactive_slots: 1,
-                    analytical_slots: 0,
-                    tenant_interactive_slots: 1,
-                    tenant_analytical_slots: 0,
-                    queue_capacity: 1,
-                    max_queue_wait: Duration::from_secs(1),
-                },
-                true,
-            );
-            state.active_queries = 1;
-            state
-        }),
+        state: Mutex::new(AdmissionState::new(
+            OracleAdmissionConfig {
+                interactive_slots: 1,
+                analytical_slots: 0,
+                tenant_interactive_slots: 1,
+                tenant_analytical_slots: 0,
+                queue_capacity: 1,
+                max_queue_wait: Duration::from_secs(1),
+            },
+            true,
+        )),
         notify: tokio::sync::Notify::new(),
         root_cancel: CancellationToken::new(),
         max_queue_wait: Duration::from_secs(1),
@@ -1715,36 +1614,41 @@ pub(super) fn admitted_guard_for_test()
         .expect("composition must enable the Oracle capability"),
     });
     let tenant = DataTenantId::new_v7();
+    let granted = acquire_waiter_resources(&shared, AdmissionClass::Interactive, 1.0)
+        .expect("the fixture governor grants one Interactive slot");
     let mut state = shared.state.lock().expect("state");
     let index = state.interactive.tenant_index(tenant);
-    state.interactive.used = 1;
-    state.interactive.tenants[index].1.active = 1;
+    let resources = charge_tenant(
+        &shared,
+        &mut state,
+        AdmissionClass::Interactive,
+        index,
+        granted,
+    );
     drop(state);
     let cancellation = shared.root_cancel.child_token();
     let request_cancellation = CancellationToken::new();
+    let query_id = QueryId::new(uuid::Uuid::now_v7());
     (
         AdmittedQueryGuard {
             analytical: None,
-            query_id: QueryId::new(uuid::Uuid::now_v7()),
+            query_id,
+            tenant,
             leader: AdmittedLeader {
                 node_id: NodeId::new(uuid::Uuid::now_v7()),
                 fencing_token: 1,
             },
             physical_projections: Vec::new(),
-            local_permit: Some(LocalPermit {
-                shared: Arc::clone(&shared),
-                class: AdmissionClass::Interactive,
-                tenant,
-                resources: Mutex::new(None),
-                shape: None,
-                released: AtomicBool::new(false),
-            }),
+            #[cfg(feature = "test-support")]
+            resource_probe: Some(Arc::new(QueryResourceProbe::new(
+                query_id,
+                Some(&resources),
+            ))),
+            resources: Some(resources),
             live_reservations: Vec::new(),
             cancellation: cancellation.clone(),
             request_cancellation: request_cancellation.clone(),
             distributed_settlement: Arc::new(DistributedQuerySettlement::default()),
-            #[cfg(feature = "test-support")]
-            resource_probe: None,
         },
         shared,
         request_cancellation,
@@ -1782,13 +1686,16 @@ pub(super) fn admission_owner_for_test(
             },
         ),
     };
-    Arc::new(OracleAdmission::with_config(
-        Arc::new(OracleSlotManager::new(1, 1)),
-        role,
-        true,
-        config,
-        resources,
-    ))
+    Arc::new(
+        OracleAdmission::with_config(
+            Arc::new(OracleSlotManager::new(1, 1)),
+            role,
+            true,
+            config,
+            resources,
+        )
+        .expect("admission tests run inside a Tokio runtime"),
+    )
 }
 
 #[cfg(test)]
@@ -1838,7 +1745,18 @@ pub(in crate::oracle) mod tests {
         })
     }
 
-    /// Builds the production admission owner without a database-backed registry.
+    /// Returns the governor slot units each class holds: `(interactive, analytical)`.
+    ///
+    /// Slot capacity is the governor's alone, so tests read it from the
+    /// governor rather than from any admission counter.
+    fn charged_units(shared: &AdmissionShared) -> (u32, u32) {
+        let snapshot = shared.resources.snapshot().expect("resource snapshot");
+        (
+            snapshot.oracle_interactive_queries,
+            snapshot.oracle_analytical_queries * ANALYTICAL_QUERY_SLOT_UNITS,
+        )
+    }
+
     /// Builds an admission owner over a specific Oracle resource capability.
     fn owner_with_resources(
         config: OracleAdmissionConfig,
@@ -1866,13 +1784,16 @@ pub(in crate::oracle) mod tests {
                 max_workers_per_query: 1,
             }),
         };
-        Arc::new(OracleAdmission::with_config(
-            Arc::new(OracleSlotManager::new(1, 1)),
-            role,
-            true,
-            config,
-            test_resources(),
-        ))
+        Arc::new(
+            OracleAdmission::with_config(
+                Arc::new(OracleSlotManager::new(1, 1)),
+                role,
+                true,
+                config,
+                test_resources(),
+            )
+            .expect("the test admission owner starts"),
+        )
     }
 
     /// Creates an immutable live Oracle snapshot for owner refresh tests.
@@ -2003,9 +1924,9 @@ pub(in crate::oracle) mod tests {
             });
         state.queued = 1;
         let notifications = grant_waiters(&shared, &mut state);
-        assert_eq!(state.interactive.used, 1);
+        assert_eq!(charged_units(&shared).0, 1);
         drop(state);
-        notify_grants(&shared, notifications);
+        notify_grants(notifications);
         assert!(rx.try_recv().is_ok());
     }
 
@@ -2037,7 +1958,7 @@ pub(in crate::oracle) mod tests {
             state.queued += 1;
         }
         let notifications = grant_waiters(&shared, &mut state);
-        assert_eq!(state.interactive.used, 2);
+        assert_eq!(charged_units(&shared).0, 2);
         assert!(
             state
                 .interactive
@@ -2046,7 +1967,7 @@ pub(in crate::oracle) mod tests {
                 .all(|(_, queue)| queue.active <= 1)
         );
         drop(state);
-        notify_grants(&shared, notifications);
+        notify_grants(notifications);
         assert_eq!(
             receivers
                 .into_iter()
@@ -2123,11 +2044,11 @@ pub(in crate::oracle) mod tests {
             });
         state.queued += 1;
         let notifications = grant_waiters(&shared, &mut state);
-        assert_eq!(state.interactive.used, 3);
+        assert_eq!(charged_units(&shared).0, 3);
         assert_eq!(state.interactive.tenants[0].1.active, 2);
         assert_eq!(state.interactive.tenants[1].1.active, 1);
         drop(state);
-        notify_grants(&shared, notifications);
+        notify_grants(notifications);
         assert_eq!(
             receivers
                 .into_iter()
@@ -2137,7 +2058,8 @@ pub(in crate::oracle) mod tests {
         );
     }
 
-    /// A canceled winner rolls back every charged counter before the next grant pass.
+    /// A winner that left before its grant returns every charge by drop, and the
+    /// next grant pass seats the waiter behind it.
     #[test]
     fn local_admission_failed_notification_rolls_back_and_regrants() {
         let shared = shared(OracleAdmissionConfig {
@@ -2164,11 +2086,12 @@ pub(in crate::oracle) mod tests {
         }
         let notifications = grant_waiters(&shared, &mut state);
         drop(state);
-        notify_grants(&shared, notifications);
-        let _ = live_rx.try_recv().expect("replacement waiter grant");
-        let state = shared.state.lock().expect("state");
-        assert_eq!(state.interactive.used, 1);
-        assert_eq!(state.active_queries, 1);
+        notify_grants(notifications);
+        shared.regrant();
+        let grant = live_rx.try_recv().expect("replacement waiter grant");
+        assert_eq!(charged_units(&shared).0, 1);
+        assert_eq!(shared.state.lock().expect("state").active_queries, 1);
+        drop(grant);
     }
 
     /// The admission queue never grants beyond its configured waiter bound.
@@ -2195,7 +2118,7 @@ pub(in crate::oracle) mod tests {
         assert_eq!(owner.shared.state.lock().expect("state").queued, 1);
         assert!(matches!(
             owner.admit(request()).await,
-            Err(BifrostError::QueryAdmissionRejected)
+            Err(BifrostError::QueryQueueFull)
         ));
         drop(first);
         owner.close();
@@ -2520,28 +2443,40 @@ pub(in crate::oracle) mod tests {
         drop(root);
     }
 
-    /// A failed aggregate grant restores every local counter synchronously.
+    /// A granted query's tenant charge returns exactly once, with its slot.
+    ///
+    /// The charge rides on the governor's resource owner, so dropping that
+    /// owner is the only release and returns both the slot and the tenant
+    /// counts together.
     #[test]
-    fn local_admission_partial_acquire_rolls_back() {
+    fn tenant_charge_returns_with_its_resources() {
         let shared = shared(OracleAdmissionConfig::default());
         let tenant = DataTenantId::new_v7();
-        let mut state = shared.state.lock().expect("state");
-        let index = state.interactive.tenant_index(tenant);
-        state.interactive.used = 1;
-        state.interactive.tenants[index].1.active = 1;
-        state.active_queries = 1;
-        rollback_counts(
-            &mut state,
-            &Grant {
-                class: AdmissionClass::Interactive,
-                tenant,
-                resources: None,
-            },
-        )
-        .expect("seeded grant counters must roll back exactly");
-        assert_eq!(state.interactive.used, 0);
-        assert_eq!(state.interactive.tenants[index].1.active, 0);
+        let resources = acquire_waiter_resources(&shared, AdmissionClass::Interactive, 0.0)
+            .expect("the governor seats one Interactive query");
+        let resources = {
+            let mut state = shared.state.lock().expect("state");
+            let index = state.interactive.tenant_index(tenant);
+            charge_tenant(
+                &shared,
+                &mut state,
+                AdmissionClass::Interactive,
+                index,
+                resources,
+            )
+        };
+        {
+            let state = shared.state.lock().expect("state");
+            assert_eq!(state.interactive.tenants[0].1.active, 1);
+            assert_eq!(state.active_queries, 1);
+        }
+        assert_eq!(charged_units(&shared), (1, 0));
+        drop(resources);
+        let state = shared.state.lock().expect("state");
+        assert_eq!(state.interactive.tenants[0].1.active, 0);
         assert_eq!(state.active_queries, 0);
+        drop(state);
+        assert_eq!(charged_units(&shared), (0, 0));
     }
 
     /// A permit release is idempotent and immediately converges queued work.
@@ -2562,9 +2497,8 @@ pub(in crate::oracle) mod tests {
             .await
             .expect("analytical admission");
         guard.release();
-        let state = owner.shared.state.lock().expect("state");
-        assert_eq!(state.analytical.used, 0);
-        assert_eq!(state.active_queries, 0);
+        assert_eq!(charged_units(&owner.shared).1, 0);
+        assert_eq!(owner.shared.state.lock().expect("state").active_queries, 0);
     }
 
     /// The queue stores the precomputed absolute deadline rather than extending it on wakeups.
@@ -2577,8 +2511,8 @@ pub(in crate::oracle) mod tests {
     }
 
     /// Generation increments are the only refresh effect on running local state.
-    #[test]
-    fn membership_refresh_creates_future_generation() {
+    #[tokio::test]
+    async fn membership_refresh_creates_future_generation() {
         let owner = owner(OracleAdmissionConfig::default());
         let before = owner.shared.state.lock().expect("state").generation;
         owner.refresh(&ClusterSnapshot::default());
@@ -2613,21 +2547,22 @@ pub(in crate::oracle) mod tests {
         assert_eq!(clean.queued_queries, 0);
     }
 
-    /// One grant pass is fair, floor-first, and work-conserving.
+    /// One grant pass is fair and work-conserving.
     ///
-    /// Pins the whole local scheduling rule in a single pass: the protected
-    /// Interactive floor is satisfied before anything else, eligible tenants
-    /// rotate one grant at a time with equal weight, a tenant's own requests
-    /// stay in arrival order, and remaining capacity goes to whichever class
-    /// head carries the older waiter identity. Releasing one grant must then
-    /// immediately hand that capacity to the queued waiter rather than idle.
+    /// Pins the whole local scheduling rule in a single pass: the older class
+    /// head is offered first, the governor alone decides whether it runs and
+    /// still leaves the Interactive floor to Interactive work, eligible tenants
+    /// rotate one grant at a time with equal weight, and a tenant's own
+    /// requests stay in arrival order. Releasing one grant must then hand that
+    /// capacity to the queued waiter through the single capacity wake rather
+    /// than leave it idle.
     ///
     /// # Panics
     ///
     /// Panics when a grant is misordered, withheld while capacity is free, or
-    /// issued beyond the local class capacity.
-    #[test]
-    fn local_admission_is_fair_and_work_conserving() {
+    /// issued beyond the governor's capacity.
+    #[tokio::test]
+    async fn local_admission_is_fair_and_work_conserving() {
         // Six slot units of memory must actually exist, or a memory refusal
         // would masquerade as a scheduling decision.
         let owner = owner_with_resources(
@@ -2653,8 +2588,8 @@ pub(in crate::oracle) mod tests {
         let tenant_c = DataTenantId::new_v7();
 
         // Arrival order is the waiter identity: the two analytical requests are
-        // the oldest work in the queue, so only the Interactive floor may
-        // outrank them.
+        // the oldest work in the queue, so they are offered first and fill the
+        // Analytical maximum, leaving the Interactive floor to the rest.
         let mut analytical_head = push_waiter(
             &shared,
             AdmissionClass::Analytical,
@@ -2679,7 +2614,7 @@ pub(in crate::oracle) mod tests {
 
         let first_head_grant = first_tenant_head
             .try_recv()
-            .expect("the protected interactive floor is satisfied before any other class");
+            .expect("the protected interactive floor seats interactive work");
         let peer_head_grant = peer_tenant_head
             .try_recv()
             .expect("the tenant cursor rotates to a peer tenant before it repeats one");
@@ -2693,33 +2628,29 @@ pub(in crate::oracle) mod tests {
         let analytical_tail_grant = analytical_tail
             .try_recv()
             .expect("remaining capacity keeps going to the oldest eligible class head");
-        {
-            let state = shared.state.lock().expect("state");
-            assert_eq!(state.interactive.used, 2, "the floor is exactly two units");
-            assert_eq!(
-                state.analytical.used,
-                2 * ANALYTICAL_QUERY_SLOT_UNITS,
-                "both analytical grants charge their two-unit cost"
-            );
-            assert_eq!(state.queued, 1, "only the rotation-deferred request waits");
-        }
+        assert_eq!(
+            charged_units(&shared),
+            (2, 2 * ANALYTICAL_QUERY_SLOT_UNITS),
+            "the floor is exactly two units and both analytical grants charge two"
+        );
+        assert_eq!(
+            shared.state.lock().expect("state").queued,
+            1,
+            "only the rotation-deferred request waits"
+        );
 
-        // Work conservation: the freed units must reach the queued waiter on the
-        // release itself, without a poll, a timer, or a second arrival.
-        owner.rollback_grant(analytical_tail_grant);
-        let first_tail_grant = first_tenant_tail
-            .try_recv()
-            .expect("released capacity is granted immediately rather than left idle");
+        // Work conservation: the release's capacity wake alone must hand the
+        // freed units to the queued waiter, without a second arrival.
+        drop(analytical_tail_grant);
+        let first_tail_grant = await_grant(&mut first_tenant_tail).await;
         assert_eq!(shared.state.lock().expect("state").queued, 0);
 
-        owner.rollback_grant(first_head_grant);
-        owner.rollback_grant(peer_head_grant);
-        owner.rollback_grant(first_tail_grant);
-        owner.rollback_grant(analytical_head_grant);
-        let state = shared.state.lock().expect("state");
-        assert_eq!(state.interactive.used, 0);
-        assert_eq!(state.analytical.used, 0);
-        assert_eq!(state.active_queries, 0);
+        drop(first_head_grant);
+        drop(peer_head_grant);
+        drop(first_tail_grant);
+        drop(analytical_head_grant);
+        assert_eq!(charged_units(&shared), (0, 0));
+        assert_eq!(shared.state.lock().expect("state").active_queries, 0);
     }
 
     /// A follower worker release wakes the queued leader in arrival order.
@@ -2812,7 +2743,7 @@ pub(in crate::oracle) mod tests {
         tenant: DataTenantId,
         id: u64,
         deadline: Instant,
-    ) -> tokio::sync::oneshot::Receiver<Grant> {
+    ) -> tokio::sync::oneshot::Receiver<crate::resources::OracleQueryResources> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut state = shared.state.lock().expect("state");
         let class = match class_kind {
@@ -2836,7 +2767,21 @@ pub(in crate::oracle) mod tests {
             let mut state = shared.state.lock().expect("state");
             grant_waiters(shared, &mut state)
         };
-        notify_grants(shared, notifications);
+        notify_grants(notifications);
+    }
+
+    /// Awaits a queued waiter's grant delivered by the owner's capacity wake.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no grant arrives within five seconds.
+    async fn await_grant(
+        receiver: &mut tokio::sync::oneshot::Receiver<crate::resources::OracleQueryResources>,
+    ) -> crate::resources::OracleQueryResources {
+        tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("the capacity wake grants the queued waiter")
+            .expect("the grant channel stays open")
     }
 
     /// A waiter that expired behind a live FIFO head is never granted, even when
@@ -2848,8 +2793,8 @@ pub(in crate::oracle) mod tests {
     /// leaves two Interactive units free so one pass can issue two grants, and
     /// proves the exposed expired entry is dropped rather than given slot
     /// ownership. Live work queued afterwards still progresses.
-    #[test]
-    fn expired_waiter_behind_a_live_head_is_never_granted() {
+    #[tokio::test]
+    async fn expired_waiter_behind_a_live_head_is_never_granted() {
         let resources = test_resources();
         let config = OracleAdmissionConfig {
             interactive_slots: 2,
@@ -2889,7 +2834,7 @@ pub(in crate::oracle) mod tests {
             let state = shared.state.lock().expect("state");
             assert_eq!(state.queued, 0, "both waiters left the queue");
             assert_eq!(state.active_queries, 1, "only the live head is active");
-            assert_eq!(state.interactive.used, 1, "only one slot unit is charged");
+            assert_eq!(charged_units(&shared).0, 1, "only one slot unit is charged");
             assert_eq!(
                 state.interactive.tenants[0].1.active, 1,
                 "the tenant owns exactly the live head's units"
@@ -2941,8 +2886,8 @@ pub(in crate::oracle) mod tests {
     /// intervening grant actually takes. It proves the expired tail acquires no
     /// slot, active-query, or tenant ownership and receives no
     /// notification, and that live work queued afterwards still progresses.
-    #[test]
-    fn waiter_expiring_between_grant_decisions_is_never_granted() {
+    #[tokio::test]
+    async fn waiter_expiring_between_grant_decisions_is_never_granted() {
         let resources = test_resources();
         let config = OracleAdmissionConfig {
             interactive_slots: 2,
@@ -2984,7 +2929,7 @@ pub(in crate::oracle) mod tests {
                 }
             })
         };
-        notify_grants(&shared, notifications);
+        notify_grants(notifications);
 
         let head_grant = live_head.try_recv().expect("the live head must be granted");
         assert!(
@@ -2995,7 +2940,7 @@ pub(in crate::oracle) mod tests {
             let state = shared.state.lock().expect("state");
             assert_eq!(state.queued, 0, "both waiters left the queue");
             assert_eq!(state.active_queries, 1, "only the live head is active");
-            assert_eq!(state.interactive.used, 1, "only one slot unit is charged");
+            assert_eq!(charged_units(&shared).0, 1, "only one slot unit is charged");
             assert_eq!(
                 state.interactive.tenants[0].1.active, 1,
                 "the tenant owns exactly the live head's units"
@@ -3048,8 +2993,8 @@ pub(in crate::oracle) mod tests {
     /// Rejection is checked against the same process root so a refused request is
     /// proven to leave class, tenant, memory, and slot ownership exactly
     /// where it found it.
-    #[test]
-    fn analytical_saturation_preserves_interactive_floor_and_rotates_tenants() {
+    #[tokio::test]
+    async fn analytical_saturation_preserves_interactive_floor_and_rotates_tenants() {
         let resources = test_resources();
         let config = OracleAdmissionConfig {
             interactive_slots: 2,
@@ -3086,28 +3031,24 @@ pub(in crate::oracle) mod tests {
             tenant_a_tail.try_recv().is_err(),
             "the shared slot ceiling holds tenant A's second interactive request"
         );
+        assert_eq!(charged_units(&shared), (2, ANALYTICAL_QUERY_SLOT_UNITS));
         {
             let state = shared.state.lock().expect("state");
-            assert_eq!(state.analytical.used, ANALYTICAL_QUERY_SLOT_UNITS);
-            assert_eq!(state.interactive.used, 2);
             assert_eq!(state.interactive.tenants[0].1.active, 1);
             assert_eq!(state.interactive.tenants[1].1.active, 1);
             assert_eq!(state.queued, 1);
         }
 
-        owner.rollback_grant(peer_grant);
-        let tail_grant = tenant_a_tail
-            .try_recv()
-            .expect("tenant A's queued request is granted once the peer tenant releases");
+        drop(peer_grant);
+        let tail_grant = await_grant(&mut tenant_a_tail).await;
         assert_eq!(shared.state.lock().expect("state").queued, 0);
 
-        owner.rollback_grant(head_grant);
-        owner.rollback_grant(tail_grant);
-        owner.rollback_grant(analytical_grant);
+        drop(head_grant);
+        drop(tail_grant);
+        drop(analytical_grant);
+        assert_eq!(charged_units(&shared), (0, 0));
         {
             let state = shared.state.lock().expect("state");
-            assert_eq!(state.interactive.used, 0);
-            assert_eq!(state.analytical.used, 0);
             assert_eq!(state.active_queries, 0);
             assert!(
                 state
@@ -3124,7 +3065,7 @@ pub(in crate::oracle) mod tests {
             "every granted envelope returns to the process root"
         );
 
-        prove_rejection_charges_nothing(config, &resources, tenant_a, deadline);
+        prove_rejection_charges_nothing(config, &resources, tenant_a, deadline).await;
         assert_eq!(
             resources.snapshot().expect("final root"),
             baseline,
@@ -3137,7 +3078,7 @@ pub(in crate::oracle) mod tests {
     /// Deliberately run against the same root the granting owner used: a
     /// refusal that quietly charged the root would be invisible to an owner
     /// checked only against its own class counters.
-    fn prove_rejection_charges_nothing(
+    async fn prove_rejection_charges_nothing(
         config: OracleAdmissionConfig,
         resources: &crate::resources::OracleResources,
         tenant: DataTenantId,
@@ -3179,13 +3120,10 @@ pub(in crate::oracle) mod tests {
             deadline,
             QueryClass::Interactive,
         );
-        assert!(matches!(
-            rejected,
-            Err(BifrostError::QueryAdmissionRejected)
-        ));
+        assert!(matches!(rejected, Err(BifrostError::QueryQueueFull)));
+        assert_eq!(charged_units(&rejecting.shared).0, 1);
         {
             let state = rejecting.shared.state.lock().expect("state");
-            assert_eq!(state.interactive.used, 1);
             assert_eq!(state.queued, 1);
             assert_eq!(state.active_queries, 1);
         }
@@ -3196,12 +3134,8 @@ pub(in crate::oracle) mod tests {
         );
 
         let held_grant = held.receiver.try_recv().expect("held interactive grant");
-        rejecting.rollback_grant(held_grant);
-        let waiting_grant = waiting
-            .receiver
-            .try_recv()
-            .expect("the queued request is granted by the release");
-        rejecting.rollback_grant(waiting_grant);
+        drop(held_grant);
+        drop(await_grant(&mut waiting.receiver).await);
     }
 
     /// Places in the production queue, shared by both query classes.
@@ -3254,8 +3188,17 @@ pub(in crate::oracle) mod tests {
     }
 
     /// Waits for the queue to report `expected` waiters without sleeping.
+    ///
+    /// Bounded by wall time rather than a yield count: a thousand spawned
+    /// waiters on two workers need an unpredictable number of yields to all
+    /// enqueue when the host is busy, so a fixed iteration budget fails a
+    /// correct queue.
+    ///
+    /// # Panics
+    /// Panics when the queue does not reach `expected` within ten seconds.
     async fn await_queued(owner: &Arc<OracleAdmission>, expected: u32) {
-        for _ in 0..10_000 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
             if owner.shared.state.lock().expect("state").queued == expected {
                 return;
             }
@@ -3371,7 +3314,7 @@ pub(in crate::oracle) mod tests {
                 CancellationToken::new(),
             ))
             .await,
-            Err(BifrostError::QueryAdmissionRejected)
+            Err(BifrostError::QueryQueueFull)
         ));
         cancellations[0].cancel();
         await_queued(&full, 999).await;
@@ -3399,6 +3342,83 @@ pub(in crate::oracle) mod tests {
         for waiter in waiters {
             let _ = waiter.await;
         }
+    }
+
+    /// Only a full queue is the queue-full refusal.
+    ///
+    /// A disabled class and a closed queue keep the admission rejection, and a
+    /// queued waiter that reaches its deadline is a timeout; none of them may be
+    /// reported as [`BifrostError::QueryQueueFull`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when any refusal carries the wrong error.
+    #[tokio::test]
+    async fn queue_full_is_distinct_from_timeout() {
+        let owner = owner(OracleAdmissionConfig {
+            interactive_slots: 1,
+            analytical_slots: 0,
+            tenant_analytical_slots: 0,
+            queue_capacity: 1,
+            max_queue_wait: Duration::from_secs(30),
+            ..Default::default()
+        });
+        let request = |query_class: QueryClass, wait: Duration| PreparedAdmission {
+            tenant: DataTenantId::new_v7(),
+            query_class,
+            local_ratio: 0.0,
+            deadline: Instant::now() + wait,
+            cancellation: CancellationToken::new(),
+        };
+        let long = Duration::from_secs(30);
+        let held = owner
+            .admit(request(QueryClass::Interactive, long))
+            .await
+            .expect("the one slot unit is granted");
+        assert!(
+            matches!(
+                owner.admit(request(QueryClass::Analytical, long)).await,
+                Err(BifrostError::QueryAdmissionRejected)
+            ),
+            "a disabled class is not a full queue"
+        );
+
+        let queued_owner = Arc::clone(&owner);
+        let queued = tokio::spawn(async move {
+            queued_owner
+                .admit(request(QueryClass::Interactive, long))
+                .await
+        });
+        wait_for_queued(&owner, 1).await;
+        assert!(
+            matches!(
+                owner.admit(request(QueryClass::Interactive, long)).await,
+                Err(BifrostError::QueryQueueFull)
+            ),
+            "the next query after the last waiting place is queue-full"
+        );
+        queued.abort();
+        assert!(queued.await.is_err(), "the queued waiter was aborted");
+        wait_for_queued(&owner, 0).await;
+
+        assert!(
+            matches!(
+                owner
+                    .admit(request(QueryClass::Interactive, Duration::from_millis(20)))
+                    .await,
+                Err(BifrostError::QueryTimeout)
+            ),
+            "a waiter that reaches its deadline times out"
+        );
+        owner.close();
+        assert!(
+            matches!(
+                owner.admit(request(QueryClass::Interactive, long)).await,
+                Err(BifrostError::QueryAdmissionRejected)
+            ),
+            "a closed queue is shutdown, not a full queue"
+        );
+        drop(held);
     }
 
     /// Local probe release remains idempotent through its watch state.

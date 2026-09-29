@@ -1241,6 +1241,9 @@ const REFUSAL_SORT_KEY_BYTES: usize = 15_000_000;
 /// Stable error code a query refused for capacity must carry.
 const QUERY_ADMISSION_REJECTED_CODE: &str = "WYRD_VALA_429_QUERY_ADMISSION_REJECTED";
 
+/// Stable error code a query refused because every waiting place is taken must carry.
+const QUERY_QUEUE_FULL_CODE: &str = "WYRD_VALA_429_QUERY_QUEUE_FULL";
+
 /// A memory refusal under a fully occupied Oracle root leaves the pod healthy
 /// and its next query serviceable.
 ///
@@ -1471,13 +1474,11 @@ const SCHEDULING_GROUPS: i64 = 4;
 /// Concurrent Interactive queries the lowest supported Oracle rung seats.
 ///
 /// The rung derives four slot units from two effective CPUs and protects one
-/// of them for Interactive work. Slot units are not what binds here: every
-/// admitted query leases 256 MiB of scratch per unit against this rung's
-/// 768 MiB scratch capacity, so the fourth concurrent Interactive query is
-/// refused for scratch while a slot unit is still free. Three is still three
-/// times the one unit the rung protects, so seating them is only possible by
-/// borrowing idle Analytical capacity.
-const SCHEDULING_HOLDS: usize = 3;
+/// of them for Interactive work. Disk is provisioned rather than leased, so
+/// slot units are the only binding resource and four holds saturate the pod.
+/// Four is four times the one unit the rung protects, so seating them is only
+/// possible by borrowing every idle Analytical unit.
+const SCHEDULING_HOLDS: usize = 4;
 
 /// Contention rounds run while exactly one slot unit remains free.
 ///
@@ -1561,7 +1562,7 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
     let borrowed = class_gauge(&cluster, "interactive")?;
     #[expect(
         clippy::cast_precision_loss,
-        reason = "three concurrent queries is exact in f64"
+        reason = "four concurrent queries is exact in f64"
     )]
     let expected = SCHEDULING_HOLDS as f64;
     if (borrowed - expected).abs() > f64::EPSILON {
@@ -1587,7 +1588,7 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
     for (index, envelope) in held.into_iter().enumerate() {
         #[expect(
             clippy::cast_precision_loss,
-            reason = "at most three concurrent queries is exact in f64"
+            reason = "at most four concurrent queries is exact in f64"
         )]
         let remaining = (SCHEDULING_HOLDS - 2 - index) as f64;
         release_envelope(&cluster, envelope, "interactive", remaining).await?;
@@ -1727,8 +1728,7 @@ async fn prove_saturated_pod_queues_until_deadline(
 /// Proves one free slot unit is rotated between two concurrently asking tenants.
 ///
 /// Every round both tenants submit at the same moment against a single free
-/// unit, so one is served first and the other either waits for the unit or,
-/// when the scratch it needs is still leased, receives the retryable code.
+/// unit, so one is served first and the other waits for the unit.
 /// A rotation that ignored a tenant would show as that tenant never being
 /// served across every round.
 ///
@@ -2322,6 +2322,145 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     for envelope in held {
         envelope.abort();
         let _ = envelope.await;
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Queue places the overflow journey boots its Oracle pods with.
+///
+/// Small enough to fill with real queued requests in one journey, and more
+/// than one so a refusal proves the bound rather than a single-waiter special
+/// case.
+const OVERFLOW_QUEUE_PLACES: usize = 2;
+
+/// Longest an overflow refusal may take through the public path.
+///
+/// A full queue refuses before waiting, so the probe must return well inside
+/// its own much longer deadline; a probe that is parked anywhere on the way to
+/// admission instead runs into that deadline.
+const OVERFLOW_REFUSAL_BOUND: Duration = Duration::from_secs(5);
+
+/// A full queue refuses the next query immediately and keeps its waiters.
+///
+/// # Panics
+///
+/// Panics when the overflow request waits, succeeds, or is refused with
+/// anything but the retryable admission code, or when the refusal disturbs a
+/// queued waiter.
+// The parked holders, the queued waiters, and the pods' own heartbeats all need
+// to run at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn full_queue_refuses_the_next_query_immediately() {
+    prove_full_queue_refuses_overflow()
+        .await
+        .expect("full Oracle queue overflow journey");
+}
+
+/// Drives the queue-overflow journey over one live cluster.
+///
+/// Every slot unit is parked, [`OVERFLOW_QUEUE_PLACES`] requests are enqueued
+/// and confirmed through inspection, and one more request is then sent through
+/// the public client with a long deadline. It must come back as
+/// `WYRD_VALA_429_QUERY_ADMISSION_REJECTED` within
+/// [`OVERFLOW_REFUSAL_BOUND`] while every queued waiter is still queued, and
+/// the waiters must still complete once the holders release.
+///
+/// # Errors
+///
+/// Returns the first saturation, enqueue, refusal, or completion claim that
+/// broke.
+async fn prove_full_queue_refuses_overflow() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::three_oracles_one_scribe()
+            .with_system_resources(oracle_queue_observation())
+            .with_oracle_runtime_for_test(wyrd_server::config::OracleRuntimeConfig {
+                admission_waiters: OVERFLOW_QUEUE_PLACES,
+                ..wyrd_server::config::OracleRuntimeConfig::default()
+            }),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let ingest = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing ingest node")?;
+    let server = cluster.server(0).ok_or("missing query node")?;
+    let table = format!("overflow_{}", uuid::Uuid::now_v7().simple());
+    seed_fixture_table(ingest, tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+    let client = client_for_tenant(server, tenant, &format!("overflow-{table}")).await?;
+    cluster.refresh_oracle_snapshots().await?;
+    let sql = scheduling_interactive_sql(&table);
+    drain_query(&wyrd_client::Bifrost::query_only(&client), &sql)
+        .await
+        .map_err(|refusal| format!("the warm-up query was refused: {refusal}"))?;
+
+    let mut held = Vec::new();
+    for index in 0..QUEUE_HOLDS {
+        held.push(
+            hold_envelope(server, &client, &sql)
+                .await
+                .map_err(|error| format!("saturation hold {index}: {error}"))?,
+        );
+    }
+    let mut waiters = Vec::new();
+    for _ in 0..OVERFLOW_QUEUE_PLACES {
+        let query = wyrd_client::Bifrost::query_only(&client);
+        let sql = sql.clone();
+        waiters.push(tokio::spawn(async move {
+            drain_query_within(&query, &sql, QUEUED_QUERY_DEADLINE_MS).await
+        }));
+        wait_for_queued(server, waiters.len()).await?;
+    }
+
+    let started = std::time::Instant::now();
+    let overflow = tokio::time::timeout(
+        OVERFLOW_REFUSAL_BOUND,
+        drain_query_within(
+            &wyrd_client::Bifrost::query_only(&client),
+            &sql,
+            QUEUED_QUERY_DEADLINE_MS,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "the overflow request was not refused within {OVERFLOW_REFUSAL_BOUND:?}; queued \
+             {:?}",
+            server
+                .oracle_runtime_inspection()
+                .map(|inspection| inspection.queued_queries)
+        )
+    })?;
+    if !matches!(&overflow, Err(refusal) if refusal.contains(QUERY_QUEUE_FULL_CODE)) {
+        return Err(format!(
+            "the overflow request ended with {overflow:?} after {:?}, not \
+             {QUERY_QUEUE_FULL_CODE}",
+            started.elapsed()
+        )
+        .into());
+    }
+    let queued = server.oracle_runtime_inspection()?.queued_queries;
+    if queued != u64::try_from(OVERFLOW_QUEUE_PLACES)? {
+        return Err(format!(
+            "the refusal left {queued} waiters queued, not {OVERFLOW_QUEUE_PLACES}"
+        )
+        .into());
+    }
+
+    for envelope in held {
+        envelope.abort();
+        let _ = envelope.await;
+    }
+    let expected = u64::try_from(SCHEDULING_ROWS)?;
+    for waiter in waiters {
+        let rows = waiter
+            .await?
+            .map_err(|refusal| format!("a queued waiter ended with {refusal}"))?;
+        if rows != expected {
+            return Err(format!("a queued waiter returned {rows} rows, not {expected}").into());
+        }
     }
     cluster.shutdown().await?;
     Ok(())

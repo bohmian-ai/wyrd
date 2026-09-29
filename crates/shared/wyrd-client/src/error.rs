@@ -281,6 +281,7 @@ fn bifrost_error_from_code(
                 .to_owned(),
         },
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
+        "WYRD_VALA_429_QUERY_QUEUE_FULL" => BifrostError::QueryQueueFull,
         "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE" => BifrostError::QueryMemoryRequestTooLarge,
         "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => BifrostError::QueryExecutionFailed,
         // Every remaining closed query terminal. Without these a caller cannot
@@ -486,6 +487,14 @@ mod tests {
         assert_eq!(admission.status(), 429);
         assert_eq!(admission.code(), "WYRD_VALA_429_QUERY_ADMISSION_REJECTED");
 
+        let queue_full = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_429_QUERY_QUEUE_FULL",
+            "detail": "query queue full",
+            "details": {},
+        }));
+        assert_eq!(queue_full.status(), 429);
+        assert_eq!(queue_full.code(), "WYRD_VALA_429_QUERY_QUEUE_FULL");
+
         let oversized = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE",
             "detail": "query memory request too large",
@@ -654,6 +663,11 @@ mod tests {
             for (code, status, grpc_code) in [
                 (
                     "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+                    429,
+                    Code::ResourceExhausted,
+                ),
+                (
+                    "WYRD_VALA_429_QUERY_QUEUE_FULL",
                     429,
                     Code::ResourceExhausted,
                 ),

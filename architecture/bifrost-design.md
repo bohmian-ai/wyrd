@@ -484,7 +484,9 @@ deadline (`WYRD_BIFROST_ORACLE_DEFAULT_QUERY_DEADLINE_MS`) that a valid caller
 `deadline_ms` replaces. A waiter stops at the earlier of queue entry plus the
 queue limit and the leader's total deadline, with `QueryTimeout`; queue wait
 consumes total time and dequeue starts no new timer. Only the 1,001st waiter is
-refused, as a retryable query-admission overload with reason `queue_full`. A
+refused, immediately, with the retryable `QueryQueueFull`
+(`WYRD_VALA_429_QUERY_QUEUE_FULL`, reason `queue_full`); nothing ahead of the
+queue reserves or waits for a place. A
 class with no executable capacity on the pod is refused immediately. Public
 HTTP queries bypass the server's global load-shed and request-concurrency
 layers so they reach this queue; gRPC reaches it directly.
@@ -516,8 +518,9 @@ through `oracle_audit_commit_failures_total`, and shutdown waits for pending
 commits. One logical query produces one read-audit event; distributed stages
 produce none.
 
-Query streams are length-delimited, terminal-safe frames. Slot/queue refusal
-before framing is `QueryAdmissionRejected`; governed memory, scratch, or
+Query streams are length-delimited, terminal-safe frames. A full queue before
+framing is `QueryQueueFull`; any other admission refusal before framing is
+`QueryAdmissionRejected`; governed memory, scratch, or
 exchange exhaustion after framing is `QueryResourcesExhausted`. Cancellation,
 deadline, peer loss, and execution failure have typed terminal outcomes. A
 stream never represents partial rows as success.

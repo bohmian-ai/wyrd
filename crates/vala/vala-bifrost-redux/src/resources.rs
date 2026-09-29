@@ -319,34 +319,45 @@ fn record_memory_transition(role: &'static str, result: &'static str, current_by
     .set(current_bytes.to_f64().unwrap_or(f64::MAX));
 }
 
-/// Emits the pod-local Oracle capacity gauges from one locked ledger read.
+/// Emits the four pod-local Oracle capacity gauges from one locked ledger read.
 ///
-/// Every series is local: the cooperative memory root, the headroom holding
-/// `DataFusion`'s infallible growth, and the aggregate slot ledger with
-/// its protected Interactive floor. Labels come from a closed `kind` domain and
-/// never carry tenant, query, node, or table identity, and nothing here claims a
-/// cluster-wide quota. It is called wherever an Oracle owner is admitted or
-/// released, so an Oracle-only pod that never runs the Scribe tick still
-/// exports live occupancy.
+/// `memory_limit` is the governed Oracle budget, `memory_used` is Oracle query
+/// memory (see [`record_oracle_memory`]), and the slot series are the aggregate
+/// slot ledger's limit and occupancy. Labels come from a closed `kind` domain
+/// and never carry tenant, query, node, or table identity, and nothing here
+/// claims a cluster-wide quota. It is called wherever an Oracle owner is
+/// admitted or released, so an Oracle-only pod that never runs the Scribe tick
+/// still exports live occupancy. Per-growth reservations and releases call
+/// only [`record_oracle_memory`], because the limit and slot series cannot
+/// change there.
 fn record_oracle_capacity(state: &ResourceState, plan: &ResourcePlan, split: OracleClassSplit) {
-    let bytes = |kind: &'static str, value: usize| {
-        metrics::gauge!("bifrost_oracle_local_bytes", "kind" => kind)
-            .set(value.to_f64().unwrap_or(f64::MAX));
-    };
-    bytes(
-        "memory_limit",
+    metrics::gauge!("bifrost_oracle_local_bytes", "kind" => "memory_limit").set(
         plan.oracle_floor_bytes
-            .saturating_add(plan.elastic_memory_bytes),
+            .saturating_add(plan.elastic_memory_bytes)
+            .to_f64()
+            .unwrap_or(f64::MAX),
     );
-    bytes("memory_used", state.oracle_query_memory_used_bytes);
-    bytes("memory_headroom", state.oracle_infallible_bytes);
-    let slot_units = |kind: &'static str, value: u32| {
-        metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => kind).set(f64::from(value));
-    };
-    slot_units("limit", split.total_units());
-    slot_units("used", state.oracle_query_slot_units);
-    slot_units("analytical_used", state.oracle_analytical_slot_units);
-    slot_units("interactive_floor", split.interactive_floor_units);
+    record_oracle_memory(state);
+    metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => "limit")
+        .set(f64::from(split.total_units()));
+    metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => "used")
+        .set(f64::from(state.oracle_query_slot_units));
+}
+
+/// Emits `memory_used`, the one capacity series a query's growth changes.
+///
+/// The value is Oracle query memory, not pod RAM: governed query bytes plus
+/// the infallible bytes `DataFusion` grew past what the root could govern,
+/// both read from the same locked state. Because the infallible share is real
+/// memory the process holds, `memory_used` may exceed `memory_limit`.
+fn record_oracle_memory(state: &ResourceState) {
+    metrics::gauge!("bifrost_oracle_local_bytes", "kind" => "memory_used").set(
+        state
+            .oracle_query_memory_used_bytes
+            .saturating_add(state.oracle_infallible_bytes)
+            .to_f64()
+            .unwrap_or(f64::MAX),
+    );
 }
 
 /// Name prefix of the scratch directory one assembly claim merges into.
@@ -2602,6 +2613,7 @@ impl BifrostResourceGovernor {
             memory_peak_bytes,
             governor: self.clone(),
             released: false,
+            admission_charge: None,
         })
     }
 
@@ -2692,7 +2704,7 @@ impl BifrostResourceGovernor {
         state.oracle_memory_used_bytes = next;
         state.elastic_memory_used_bytes = next_elastic;
         state.oracle_query_memory_used_bytes = next_query;
-        record_oracle_capacity(&state, &plan, self.oracle_class_split());
+        record_oracle_memory(&state);
         Ok(OracleMemoryCharge {
             governed_bytes: bytes,
             headroom_bytes: 0,
@@ -2754,7 +2766,7 @@ impl BifrostResourceGovernor {
             .checked_add(headroom)
             .ok_or_else(accounting_overflow)?;
         state.oracle_memory_used_bytes = next;
-        record_oracle_capacity(&state, &plan, self.oracle_class_split());
+        record_oracle_memory(&state);
         Ok(OracleMemoryCharge {
             governed_bytes: governed,
             headroom_bytes: headroom,
@@ -2798,7 +2810,7 @@ impl BifrostResourceGovernor {
         state.oracle_memory_used_bytes -= charge.governed_bytes;
         state.oracle_query_memory_used_bytes -= charge.governed_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
-        record_oracle_capacity(&state, &plan, self.oracle_class_split());
+        record_oracle_memory(&state);
         drop(state);
         self.inner.memory_changed.notify_waiters();
         Ok(())
@@ -4017,9 +4029,26 @@ pub struct OracleQueryResources {
     memory_peak_bytes: Arc<AtomicUsize>,
     governor: BifrostResourceGovernor,
     released: bool,
+    /// Leader-local admission charge returned with this owner's slots.
+    ///
+    /// Opaque on purpose: the governor never inspects it, it only drops it
+    /// after the slot units return and before the capacity wake, so a queued
+    /// leader woken by that wake sees the slot and its tenant charge free
+    /// together. A remote follower's owner carries none.
+    admission_charge: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl OracleQueryResources {
+    /// Attaches the leader-local admission charge this owner returns on release.
+    ///
+    /// Oracle admission calls this once, under its own lock, immediately after
+    /// the governor grants the slot charge. The charge's drop is its release:
+    /// it runs exactly once, after the slot units return and before queued
+    /// admission is woken. A later call replaces and drops the earlier charge.
+    pub(crate) fn attach_admission_charge(&mut self, charge: Box<dyn std::any::Any + Send + Sync>) {
+        self.admission_charge = Some(charge);
+    }
+
     /// Builds the tracked first-come, first-served query-local `DataFusion` pool.
     #[must_use]
     pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
@@ -4077,6 +4106,11 @@ impl OracleQueryResources {
 
     /// Releases the query envelope only after every nested child is gone.
     ///
+    /// Slot units return under the governor lock; the attached admission
+    /// charge is then dropped outside it, and only after both is the Oracle
+    /// capacity wake sent, so queued admission is reconsidered once with the
+    /// whole query's capacity already free.
+    ///
     /// # Errors
     ///
     /// Returns a poison error while retaining root capacity when nested memory
@@ -4125,6 +4159,11 @@ impl OracleQueryResources {
         );
         self.released = true;
         drop(state);
+        // After the slots return and before the wake: the admission charge
+        // takes the admission lock, which is ordered before the governor lock,
+        // so it must not run under the state lock above; and the wake below is
+        // what reconsiders queued work, so the charge must already be free.
+        drop(self.admission_charge.take());
         self.governor.inner.memory_changed.notify_waiters();
         self.governor.notify_oracle_capacity();
         Ok(())
@@ -6081,6 +6120,66 @@ mod tests {
             "release restores every counter exactly"
         );
         assert!(oracle.health().reason().is_none());
+    }
+
+    /// `memory_used` follows a running query's growth and shrink.
+    ///
+    /// Owner grant and release refresh every capacity series, but a query's
+    /// memory moves between those two points. This holds one admitted query
+    /// while its pool grows fallibly, shrinks, and then grows infallibly past
+    /// its grant, reading `memory_used` at each step: a gauge that only moved at
+    /// grant or release would show zero while bytes are held, and one that
+    /// counted only governed bytes would stop at the grant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when admission or growth fails or `memory_used` disagrees with
+    /// the bytes the running query holds.
+    #[test]
+    fn oracle_memory_gauges_track_growth_while_a_query_is_held() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            let roles = BifrostRuntimeResources::composed_for_test(
+                768 * MIB,
+                512 * MIB as u64,
+                [BifrostRole::Oracle],
+            );
+            let oracle = roles.oracle().expect("Oracle capability");
+            let query = oracle
+                .try_acquire_query(interactive_query(0.0))
+                .expect("query owner");
+            let gauge = |kind: &str| {
+                recorder
+                    .snapshot()
+                    .gauges
+                    .get(&format!("bifrost_oracle_local_bytes{{kind=\"{kind}\"}}"))
+                    .copied()
+            };
+            let pool = query.memory_pool();
+            let bytes = MemoryConsumer::new("gauge-growth").register(&pool);
+
+            bytes.try_grow(8 * MIB).expect("fallible growth is funded");
+            assert_eq!(gauge("memory_used"), (8 * MIB).to_f64());
+            bytes.shrink(8 * MIB);
+            assert_eq!(
+                gauge("memory_used"),
+                Some(0.0),
+                "shrink lowers the gauge while the query is still held"
+            );
+
+            bytes.grow(2048 * MIB);
+            let grant = query
+                .granted_memory_bytes
+                .to_f64()
+                .expect("grant is representable");
+            assert!(
+                gauge("memory_used").is_some_and(|value| value > grant),
+                "infallible growth counts past the query's grant"
+            );
+            drop(bytes);
+            drop(query);
+            assert_eq!(gauge("memory_used"), Some(0.0));
+        });
     }
 
     /// Query memory children nest under the admitted owner and charge the shared root.

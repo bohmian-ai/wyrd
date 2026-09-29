@@ -446,8 +446,14 @@ mod tests {
     /// Retry metadata is emitted only for transient query capacity.
     #[test]
     fn grpc_retry_metadata_only_for_retryable_capacity() {
-        let retryable = query_status(BifrostError::QueryAdmissionRejected.into());
-        assert_eq!(retryable.metadata().get("retry-after-ms").unwrap(), "1000");
+        for error in [
+            BifrostError::QueryAdmissionRejected,
+            BifrostError::QueryQueueFull,
+        ] {
+            let retryable = query_status(error.into());
+            assert_eq!(retryable.code(), Code::ResourceExhausted);
+            assert_eq!(retryable.metadata().get("retry-after-ms").unwrap(), "1000");
+        }
         for error in [
             BifrostError::QueryMemoryRequestTooLarge,
             BifrostError::QueryExecutionFailed,
@@ -470,6 +476,7 @@ mod tests {
     fn grpc_query_errors_carry_the_canonical_problem_envelope() {
         for error in [
             BifrostError::QueryAdmissionRejected,
+            BifrostError::QueryQueueFull,
             BifrostError::QueryMemoryRequestTooLarge,
             BifrostError::QueryExecutionFailed,
         ] {

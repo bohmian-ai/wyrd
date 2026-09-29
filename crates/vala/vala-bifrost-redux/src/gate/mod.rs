@@ -735,8 +735,13 @@ impl<A: GateAudit + 'static> Gate<A> {
             ))
             .await
             .map(|stream| stream.with_gate_lifecycle(Arc::clone(&lifecycle)));
-        if matches!(&result, Err(BifrostError::QueryAdmissionRejected)) {
-            record_gate_rejection("query", "oracle_admission");
+        let rejection = match &result {
+            Err(BifrostError::QueryAdmissionRejected) => Some("oracle_admission"),
+            Err(BifrostError::QueryQueueFull) => Some("oracle_queue_full"),
+            _ => None,
+        };
+        if let Some(reason) = rejection {
+            record_gate_rejection("query", reason);
             lifecycle.finish("rejected");
             request_lifecycle.complete("rejected");
         } else if result.is_err() {

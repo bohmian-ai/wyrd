@@ -274,7 +274,6 @@ async fn reader_authority(
         operator_pool: fixture.database.operator_pool().clone(),
         node_id,
         fencing_token: row.lease.fencing_token,
-        max_concurrent_queries: 4,
         terminator: Arc::new(RecordingEpochTerminator::default()) as Arc<_>,
         shutdown: shutdown.clone(),
     })

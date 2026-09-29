@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema};
+use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
 use iceberg::{Catalog as _, TableCreation};
@@ -303,7 +304,23 @@ pub struct BifrostCatalog {
     storage: Arc<BifrostStorage>,
     /// Backend properties every built `FileIO` must share with the catalog.
     storage_properties: std::collections::HashMap<String, String>,
+    /// Node-wide decoded manifest and manifest-list cache shared by every
+    /// permit-scoped read table, so the snapshot pin and `plan_files` decode
+    /// each immutable manifest once per node instead of once per consumer per
+    /// query. Seeded lazily because iceberg only builds a cache with a table.
+    manifest_cache: Arc<std::sync::OnceLock<Arc<ObjectCache>>>,
 }
+
+/// Estimated-weight eviction limit of the node-wide decoded manifest cache.
+///
+/// Manifest and manifest-list paths embed a commit UUID, so entries are
+/// immutable and never need invalidation; eviction is size-only LRU over
+/// iceberg's estimated entry weight. This is not a hard memory ceiling: a
+/// query still holding an evicted `Arc`, or loads in flight, can briefly
+/// exceed it. It sits outside the Oracle memory root because decoded
+/// manifests are small and shared across every query. A cache hit performs no
+/// storage IO and therefore consults no reader IO permit.
+const MANIFEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Catalog pins observed by production code paths during serialized tests.
 ///
@@ -528,8 +545,10 @@ impl BifrostCatalog {
     /// # Errors
     /// Returns [`BifrostCatalogError::MetadataMismatch`] when the table moved
     /// under the prepared identity, [`BifrostCatalogError::AmbiguousPublication`]
-    /// or [`BifrostCatalogError::UnstableCut`] from the underlying cut, and a
-    /// catalog or SQL error when the manifest or hot cut cannot be read.
+    /// or [`BifrostCatalogError::UnstableCut`] from the underlying cut, a
+    /// catalog or SQL error when the manifest or hot cut cannot be read, and
+    /// [`BifrostCatalogError::Iceberg`] when the permit no longer authorizes
+    /// exposing the cut.
     pub async fn materialize_reader_cut(
         &self,
         prepared: PreparedReaderIdentity,
@@ -549,6 +568,12 @@ impl BifrostCatalog {
         let (iceberg_table, pinned, cut) = self
             .acquire_stable_cut_from(gated, &binding, tenant)
             .await?;
+        // A cut served wholly from the node-wide manifest cache opened nothing
+        // through the gated `FileIO`, so the permit is checked once more before
+        // the cut is exposed: an epoch that lost authority returns no cut.
+        permit
+            .expose_result()
+            .map_err(|error| crate::catalog::iceberg_storage::permit_error(&error))?;
         let snapshot_id = pinned.snapshot_id;
         let iceberg_file_paths = pinned.file_paths;
         let iceberg_files = pinned.files;
@@ -649,7 +674,10 @@ impl BifrostCatalog {
     /// Uses the prepared metadata document rather than reloading it, so this
     /// step opens nothing: the table it returns is the same immutable metadata
     /// with a `FileIO` that refuses every object read the permit no longer
-    /// authorizes.
+    /// authorizes. The table shares the node-wide manifest cache; a cache miss
+    /// still reads through this table's gated `FileIO`, and a hit can only be a
+    /// manifest under this tenant's own table prefix because cache keys are
+    /// full object paths.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::Iceberg`] when the table cannot be built
@@ -661,16 +689,50 @@ impl BifrostCatalog {
         metadata_location: Option<String>,
         permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<iceberg::table::Table, BifrostCatalogError> {
-        let file_io = self.gated_file_io(permit);
+        let manifest_cache = self.manifest_cache(identifier, &metadata)?;
         let mut builder = iceberg::table::Table::builder()
-            .file_io(file_io)
+            .file_io(self.gated_file_io(permit))
             .metadata(metadata)
             .identifier(identifier.clone())
-            .runtime(iceberg::Runtime::current());
+            .runtime(iceberg::Runtime::current())
+            .disable_cache();
         if let Some(location) = metadata_location {
             builder = builder.metadata_location(location);
         }
-        builder.build().map_err(BifrostCatalogError::from)
+        Ok(builder.build()?.with_object_cache(manifest_cache))
+    }
+
+    /// Returns the node-wide manifest cache, seeding it on first use.
+    ///
+    /// iceberg only constructs an `ObjectCache` as part of a table, so the
+    /// first caller builds a throwaway table over the catalog's ungated
+    /// `FileIO` with [`MANIFEST_CACHE_BYTES`] and keeps its cache. The seed's
+    /// `FileIO` is never used for reads: every consumer attaches the entries
+    /// with `Table::with_object_cache`, which rebinds misses to that table's
+    /// own gated `FileIO`. A racing first caller builds a redundant seed and
+    /// discards it.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::Iceberg`] when the seed table cannot be
+    /// built from the supplied identity and metadata.
+    fn manifest_cache(
+        &self,
+        identifier: &iceberg::TableIdent,
+        metadata: &iceberg::spec::TableMetadataRef,
+    ) -> Result<Arc<ObjectCache>, BifrostCatalogError> {
+        if let Some(cache) = self.manifest_cache.get() {
+            return Ok(Arc::clone(cache));
+        }
+        let seed = iceberg::table::Table::builder()
+            .file_io(self.file_io.clone())
+            .metadata(Arc::clone(metadata))
+            .identifier(identifier.clone())
+            .runtime(iceberg::Runtime::current())
+            .cache_size_bytes(MANIFEST_CACHE_BYTES)
+            .build()?;
+        Ok(Arc::clone(
+            self.manifest_cache.get_or_init(|| seed.object_cache()),
+        ))
     }
 
     /// Acquires one stable Iceberg/SQL/Iceberg cut for a tenant table.
@@ -757,9 +819,14 @@ impl BifrostCatalog {
                 })
             })
             .transpose()?;
-        let manifests = iceberg_table.manifest_list_reader(snapshot).load().await?;
+        // Read through the table's shared cache so the `plan_files` that
+        // follows reuses these decoded manifests instead of decoding again.
+        let cache = iceberg_table.object_cache();
+        let manifests = cache
+            .get_manifest_list(snapshot, &iceberg_table.metadata_ref())
+            .await?;
         for manifest_file in manifests.entries() {
-            let manifest = manifest_file.load_manifest(iceberg_table.file_io()).await?;
+            let manifest = cache.get_manifest(manifest_file).await?;
             // Resolved from the manifest's own writer schema, once per manifest.
             // A file committed under an older schema keeps that schema's field
             // ids, so resolving against the table's current schema would read
@@ -870,6 +937,7 @@ impl BifrostCatalog {
             file_io,
             storage,
             storage_properties,
+            manifest_cache: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -2231,6 +2299,67 @@ mod production_pin_tests {
         });
     }
 
+    /// Deletes every Avro manifest and manifest-list object under `root`.
+    ///
+    /// Removing them after a pin leaves the node-wide manifest cache as the
+    /// only source a later plan can decode from.
+    ///
+    /// # Panics
+    /// Panics when the warehouse cannot be listed, an object cannot be
+    /// removed, or no manifest object exists to remove.
+    fn delete_manifest_objects(root: &std::path::Path) {
+        let mut deleted = 0_usize;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).expect("warehouse directory lists") {
+                let path = entry.expect("warehouse entry reads").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "avro") {
+                    std::fs::remove_file(path).expect("manifest object deletes");
+                    deleted += 1;
+                }
+            }
+        }
+        assert!(deleted > 0, "the append wrote manifests");
+    }
+
+    /// Plans the current snapshot through a fresh permit-scoped table and
+    /// returns how many file tasks it produced.
+    ///
+    /// # Panics
+    /// Panics when the table cannot be reloaded, built, or planned.
+    async fn planned_file_count(
+        catalog: &BifrostCatalog,
+        identifier: &iceberg::TableIdent,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
+    ) -> usize {
+        use futures_util::TryStreamExt as _;
+        let loaded = catalog
+            .iceberg_catalog()
+            .load_table(identifier)
+            .await
+            .expect("physical table reloads");
+        let tasks: Vec<_> = catalog
+            .permit_scoped_table(
+                identifier,
+                loaded.metadata_ref(),
+                loaded.metadata_location().map(ToOwned::to_owned),
+                permit,
+            )
+            .expect("the scoped table builds")
+            .scan()
+            .build()
+            .expect("the scan builds")
+            .plan_files()
+            .await
+            .expect("planning reads the cached manifests")
+            .try_collect()
+            .await
+            .expect("planning streams the cached manifests");
+        tasks.len()
+    }
+
     /// A pinned provider resolves only against the snapshot it names.
     ///
     /// A follower resolves its own catalog handle, so without pinning its leaf
@@ -2241,10 +2370,15 @@ mod production_pin_tests {
     /// the current one, which is what this asserts: the committed snapshot
     /// resolves, and a neighbouring id does not.
     ///
+    /// It also proves the pin and the scan share one decode: after the pin,
+    /// every Avro manifest object is deleted from the warehouse, and a fresh
+    /// permit-scoped table must still plan the committed file, which it can
+    /// only do from the node-wide manifest cache the pin populated.
+    ///
     /// # Panics
     /// Panics when the fixture, registration, or commit fails, when the
-    /// committed snapshot does not resolve, or when an unpublished snapshot id
-    /// resolves anyway.
+    /// committed snapshot does not resolve, when an unpublished snapshot id
+    /// resolves anyway, or when planning re-reads a manifest the pin decoded.
     #[test]
     fn pinned_provider_refuses_a_snapshot_the_table_does_not_publish() {
         wyrd_runtime::runtime().block_on(async {
@@ -2330,6 +2464,12 @@ mod production_pin_tests {
             let snapshot_id = pinned
                 .snapshot_id
                 .expect("a committed table has a snapshot");
+            delete_manifest_objects(warehouse.path());
+            assert_eq!(
+                planned_file_count(&catalog, &binding.table_ident(), &permit).await,
+                1,
+                "the pin's decoded manifests plan the file"
+            );
             catalog
                 .pinned_provider(&table, tenant, snapshot_id, &permit)
                 .await

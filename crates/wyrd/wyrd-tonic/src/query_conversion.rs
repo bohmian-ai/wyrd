@@ -540,6 +540,7 @@ fn proto_terminal_error(value: domain::QueryTerminalError) -> proto::QueryTermin
             D::CatalogUnreachable => P::CatalogUnreachable as i32,
             D::StorageUnreachable => P::StorageUnreachable as i32,
             D::QueryExecutionFailed => P::QueryExecutionFailed as i32,
+            D::QueryResourcesExhausted => P::QueryResourcesExhausted as i32,
         },
         detail: value.detail.map(|detail| detail.as_str().to_owned()),
     }
@@ -609,6 +610,7 @@ fn terminal_error(
         P::CatalogUnreachable => D::CatalogUnreachable,
         P::StorageUnreachable => D::StorageUnreachable,
         P::QueryExecutionFailed => D::QueryExecutionFailed,
+        P::QueryResourcesExhausted => D::QueryResourcesExhausted,
         P::Unspecified => return Err(QueryConversionError::RequiredEnum("error_code")),
     };
     Ok(domain::QueryTerminalError {

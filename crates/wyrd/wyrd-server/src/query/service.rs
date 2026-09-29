@@ -389,6 +389,7 @@ pub(crate) fn terminal_error_to_bifrost(
             detail: "Oracle typed query storage unavailable".to_owned(),
         },
         QueryTerminalErrorCode::QueryExecutionFailed => BifrostError::QueryExecutionFailed,
+        QueryTerminalErrorCode::QueryResourcesExhausted => BifrostError::QueryResourcesExhausted,
     }
 }
 #[cfg(test)]

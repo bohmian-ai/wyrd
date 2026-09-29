@@ -92,6 +92,19 @@ pub enum BifrostError {
     )]
     QueryQueueFull,
 
+    /// An admitted query could not obtain the execution memory it needed.
+    ///
+    /// Not retryable as-is: the query failed inside its own ceiling and the
+    /// shared Bifrost cap, so an unchanged retry meets the same limit.
+    #[error("query resources exhausted")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED",
+        status = 503,
+        title = "Query resources exhausted",
+        remediation = "Narrow the query or add capacity; retrying unchanged will not succeed."
+    )]
+    QueryResourcesExhausted,
+
     /// One indivisible query memory request exceeds its governing ceiling.
     #[error("query memory request too large")]
     #[wyrd_error(

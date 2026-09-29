@@ -458,6 +458,7 @@ mod error_mapper_tests {
             },
             wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge.into(),
             wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
+            wyrd_spec::vala::error::BifrostError::QueryResourcesExhausted.into(),
             wyrd_spec::vala::error::BifrostError::PayloadTooLarge { bytes: 1, limit: 1 }.into(),
             wyrd_spec::vala::error::BifrostError::WalDiskFull.into(),
         ] {

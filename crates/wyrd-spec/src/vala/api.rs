@@ -792,6 +792,8 @@ pub enum QueryTerminalErrorCode {
     StorageUnreachable,
     /// Query execution failed after framing began.
     QueryExecutionFailed,
+    /// The admitted query could not obtain the execution memory it needed.
+    QueryResourcesExhausted,
 }
 
 /// Scrubbed detail attached to a failed terminal.

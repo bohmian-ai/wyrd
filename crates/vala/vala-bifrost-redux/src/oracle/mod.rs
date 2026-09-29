@@ -4463,6 +4463,7 @@ const fn terminal_error_label(code: QueryTerminalErrorCode) -> &'static str {
         QueryTerminalErrorCode::CatalogUnreachable => "catalog_unreachable",
         QueryTerminalErrorCode::StorageUnreachable => "storage_unreachable",
         QueryTerminalErrorCode::QueryExecutionFailed => "query_execution_failed",
+        QueryTerminalErrorCode::QueryResourcesExhausted => "query_resources_exhausted",
     }
 }
 
@@ -4703,10 +4704,13 @@ fn map_query_planning_error(error: &DataFusionError) -> BifrostError {
 }
 
 /// Maps a pre-stream `DataFusion` failure into the stable public catalog.
+///
+/// The query was already admitted, so a typed resource refusal anywhere in the
+/// chain is execution-memory exhaustion, never admission or queue overload.
 fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostError {
     tracing::error!(error = %error, "Oracle DataFusion operation failed");
     if datafusion_resources_exhausted(error) {
-        return BifrostError::QueryAdmissionRejected;
+        return BifrostError::QueryResourcesExhausted;
     }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("tenant invariant") {
@@ -4722,7 +4726,7 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
 
 /// Reports whether any typed `DataFusion` source in an execution error chain is
 /// a resource-capacity refusal, including contextual wrappers added by plans.
-fn datafusion_resources_exhausted(error: &datafusion::error::DataFusionError) -> bool {
+pub(super) fn datafusion_resources_exhausted(error: &datafusion::error::DataFusionError) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(current) = source {
         if current
@@ -5249,7 +5253,7 @@ mod tests {
         );
         assert_eq!(
             map_query_planning_error(&exhausted),
-            BifrostError::QueryAdmissionRejected
+            BifrostError::QueryResourcesExhausted
         );
     }
 
@@ -5285,9 +5289,10 @@ mod tests {
         }
     }
 
-    /// Generic `DataFusion` resource exhaustion is classified structurally as capacity.
+    /// Typed `DataFusion` resource exhaustion under a wrapper is classified
+    /// structurally as admitted-query resource exhaustion, not admission.
     #[test]
-    fn datafusion_resource_exhaustion_maps_to_query_admission_rejected() {
+    fn datafusion_resource_exhaustion_maps_to_query_resources_exhausted() {
         let exhausted = datafusion::error::DataFusionError::ResourcesExhausted(
             "message intentionally contains no capacity keyword".to_owned(),
         );
@@ -5297,7 +5302,7 @@ mod tests {
         );
         assert_eq!(
             map_datafusion_error(&error),
-            BifrostError::QueryAdmissionRejected
+            BifrostError::QueryResourcesExhausted
         );
     }
 

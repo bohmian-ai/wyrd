@@ -202,6 +202,9 @@ fn terminal_bifrost_error(terminal: &QueryTerminalFrame) -> BifrostError {
         Some(QueryTerminalErrorCode::StorageUnreachable) => {
             BifrostError::StorageUnreachable { detail }
         }
+        Some(QueryTerminalErrorCode::QueryResourcesExhausted) => {
+            BifrostError::QueryResourcesExhausted
+        }
         Some(QueryTerminalErrorCode::QueryExecutionFailed) | None => {
             BifrostError::QueryExecutionFailed
         }
@@ -2155,6 +2158,10 @@ mod tests {
                 QueryTerminalErrorCode::QueryExecutionFailed,
                 BifrostError::QueryExecutionFailed,
             ),
+            (
+                QueryTerminalErrorCode::QueryResourcesExhausted,
+                BifrostError::QueryResourcesExhausted,
+            ),
         ];
         for (code, expected) in cases {
             let mut terminal = failed_terminal(0);
@@ -2644,6 +2651,45 @@ mod tests {
             QueryTerminalOutcome::Failed
         );
         assert_eq!(result.settlement, StreamSettlement::Settled);
+    }
+
+    /// A resource-exhausted terminal after delivered rows rejects the whole
+    /// result as the stable typed error; no partial rows are returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when collection returns rows or the error loses its stable code.
+    #[tokio::test]
+    async fn resource_terminal_rejects_partial_rows() {
+        let schema = test_schema();
+        let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+        let mut terminal = failed_terminal(1);
+        terminal
+            .error
+            .as_mut()
+            .expect("failed terminal has error")
+            .code = QueryTerminalErrorCode::QueryResourcesExhausted;
+        let chunks = vec![
+            encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "fingerprint".to_owned(),
+                arrow_ipc_schema: prefix,
+            })),
+            encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+                arrow_ipc_batch: ipc.batch(&schema, &[1]),
+            })),
+            encoded(QueryStreamFrame::Terminal(terminal)),
+        ];
+        let error = result_stream(chunks)
+            .collect_bounded(CollectedQueryLimits {
+                max_rows: usize::MAX,
+                max_encoded_bytes: usize::MAX,
+            })
+            .await
+            .expect_err("a resource terminal rejects rows already received");
+        assert_eq!(
+            WyrdError::from(&error).code(),
+            "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED"
+        );
     }
 
     /// A failed terminal is a validated failure only when clean EOF follows it.

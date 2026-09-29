@@ -282,6 +282,7 @@ fn bifrost_error_from_code(
         },
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
         "WYRD_VALA_429_QUERY_QUEUE_FULL" => BifrostError::QueryQueueFull,
+        "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED" => BifrostError::QueryResourcesExhausted,
         "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE" => BifrostError::QueryMemoryRequestTooLarge,
         "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => BifrostError::QueryExecutionFailed,
         // Every remaining closed query terminal. Without these a caller cannot

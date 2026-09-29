@@ -1257,7 +1257,13 @@ impl QueryIpcDecoder {
 }
 
 /// Maps a late `DataFusion` failure to the closed terminal-code catalog.
+///
+/// A typed resource refusal anywhere in the chain is selected structurally
+/// before any message classification.
 fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTerminalErrorCode {
+    if super::datafusion_resources_exhausted(error) {
+        return QueryTerminalErrorCode::QueryResourcesExhausted;
+    }
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("tenant invariant") {
         QueryTerminalErrorCode::QueryTenantInvariant
@@ -1600,6 +1606,29 @@ mod tests {
         QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
+
+    /// A late typed resource refusal, even under a wrapper whose text names
+    /// another class, ends the stream as `QueryResourcesExhausted`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the typed chain is not selected before message text.
+    #[test]
+    fn late_resource_exhaustion_is_typed_terminal() {
+        use datafusion::error::DataFusionError;
+        let wrapped = DataFusionError::Context(
+            "tenant invariant".to_owned(),
+            Box::new(DataFusionError::ResourcesExhausted("private".to_owned())),
+        );
+        assert_eq!(
+            super::terminal_error_code(&wrapped),
+            QueryTerminalErrorCode::QueryResourcesExhausted
+        );
+        assert_eq!(
+            super::terminal_error_code(&DataFusionError::Internal("private".to_owned())),
+            QueryTerminalErrorCode::QueryExecutionFailed
+        );
+    }
 
     /// An abandoned pre-transfer owner retires its entry failed from raw `Drop`.
     ///

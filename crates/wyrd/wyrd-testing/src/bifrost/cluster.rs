@@ -479,8 +479,6 @@ pub struct OracleInspection {
     pub queued_queries: u64,
     /// Memory reservations retained by Oracle queries.
     pub reserved_memory_bytes: u64,
-    /// Spill reservations retained by Oracle queries.
-    pub reserved_spill_bytes: u64,
     /// Active Oracle-owned process/query scratch directories.
     pub spill_directories: u64,
     /// Regular files beneath all running Oracle-owned scratch prefixes.
@@ -1950,9 +1948,6 @@ impl WyrdTestCluster {
                 runtime.reserved_memory_bytes = runtime
                     .reserved_memory_bytes
                     .saturating_add(snapshot.reserved_memory_bytes);
-                runtime.reserved_spill_bytes = runtime
-                    .reserved_spill_bytes
-                    .saturating_add(snapshot.reserved_spill_bytes);
                 runtime.peer_pending = runtime.peer_pending.saturating_add(snapshot.peer_pending);
                 runtime.peer_running = runtime.peer_running.saturating_add(snapshot.peer_running);
                 runtime.audit_pending =
@@ -1971,7 +1966,6 @@ impl WyrdTestCluster {
             active_queries: runtime.active_queries,
             queued_queries: runtime.queued_queries,
             reserved_memory_bytes: runtime.reserved_memory_bytes,
-            reserved_spill_bytes: runtime.reserved_spill_bytes,
             spill_directories: runtime.spill_directories,
             spill_files: runtime.spill_files,
             spill_file_bytes: runtime.spill_file_bytes,
@@ -2784,7 +2778,6 @@ mod tests {
         assert_eq!(restarted_resources.plan, original_resources.plan);
         assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
         assert_eq!(restarted_resources.elastic_memory_used_bytes, 0);
-        assert_eq!(restarted_resources.scratch_used_bytes, 0);
         assert!(!restarted_resources.oracle_query_active);
         let mut system_conn = cluster
             .fixture

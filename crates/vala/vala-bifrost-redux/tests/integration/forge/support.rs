@@ -2407,8 +2407,7 @@ fn fixture_roles(
 ) -> vala_bifrost_redux::resources::BifrostRoleResources {
     let scribe_stage = wal_root.join("scribe-stage");
     let scribe_output = scratch_root.join("scribe-output");
-    let oracle_scratch = scratch_root.join("oracle");
-    for root in [&scribe_stage, &scribe_output, &oracle_scratch] {
+    for root in [&scribe_stage, &scribe_output] {
         std::fs::create_dir_all(root).expect("fixture volume root");
     }
     BifrostRuntimeResources::from_snapshot(
@@ -2435,7 +2434,6 @@ fn fixture_roles(
                 wal: wal_root.to_owned(),
                 scribe_stage,
                 scribe_output_scratch: scribe_output,
-                oracle_scratch,
             }),
         },
     )

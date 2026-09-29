@@ -366,8 +366,6 @@ pub struct OracleRuntimeInspection {
     /// Actual `DataFusion` reservation, not an admission quantum: an admitted
     /// query that never grew a consumer contributes nothing here.
     pub reserved_memory_bytes: u64,
-    /// Spill bytes reserved by active queries.
-    pub reserved_spill_bytes: u64,
     /// Peer pending reservations held by this Oracle.
     pub peer_pending: u64,
     /// Peer running reservations held by this Oracle.
@@ -1250,8 +1248,6 @@ pub struct OracleConfig {
     pub queue_capacity: u32,
     /// Longest queue wait for either class; the total deadline may end it sooner.
     pub max_queue_wait: Duration,
-    /// Bytes one Analytical attempt may retain as spill scratch.
-    pub analytical_scratch_bytes: u64,
 }
 
 impl Default for OracleConfig {
@@ -1269,7 +1265,6 @@ impl Default for OracleConfig {
             analytical_slots: 4,
             queue_capacity: admission::DEFAULT_QUEUE_CAPACITY,
             max_queue_wait: admission::DEFAULT_MAX_QUEUE_WAIT,
-            analytical_scratch_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -1724,8 +1719,6 @@ struct AnalyticalCompositionInputs {
     peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
     /// Process-owned spill runtime every query-owned runtime is built from.
     spill: Arc<OracleSpillRuntime>,
-    /// Per-attempt scratch share.
-    scratch_bytes: u64,
     /// Immutable peer identity every east-west channel is dialed through.
     peer_tls: dispatcher::BifrostPeerTls,
     /// Workload credential every east-west request presents.
@@ -1752,7 +1745,6 @@ fn compose_analytical_handle(
         reservations,
         peer_transports,
         spill,
-        scratch_bytes,
         peer_tls,
         peer_credentials,
     } = inputs;
@@ -1794,7 +1786,6 @@ fn compose_analytical_handle(
             node_id,
             oracle_fence: fence,
             ticket_ttl: ANALYTICAL_STAGE_TICKET_TTL,
-            scratch_bytes,
             peer_tls,
             peer_credentials,
         },
@@ -1972,7 +1963,6 @@ impl Oracle {
                     reservations: Arc::clone(&config.reservations),
                     peer_transports: config.peer_transports.as_ref().map(Arc::clone),
                     spill: Arc::clone(&config.spill_runtime),
-                    scratch_bytes: config.config.analytical_scratch_bytes,
                 })
             });
         Ok(Self {
@@ -3307,7 +3297,6 @@ impl Oracle {
                 active_queries = report.active_queries,
                 queued_queries = report.queued_queries,
                 reserved_memory_bytes = report.reserved_memory_bytes,
-                reserved_spill_bytes = report.reserved_spill_bytes,
                 peer_pending = report.peer_pending,
                 peer_running = report.peer_running,
                 "Oracle shutdown reached deadline with residual local admission state"
@@ -5729,7 +5718,6 @@ mod tests {
             "bifrost_oracle_local_bytes{kind=\"memory_limit\"}",
             "bifrost_oracle_local_bytes{kind=\"memory_used\"}",
             "bifrost_oracle_local_bytes{kind=\"memory_headroom\"}",
-            "bifrost_oracle_local_bytes{kind=\"scratch_used\"}",
             "bifrost_oracle_local_slot_units{kind=\"limit\"}",
             "bifrost_oracle_local_slot_units{kind=\"used\"}",
             "bifrost_oracle_local_slot_units{kind=\"analytical_used\"}",

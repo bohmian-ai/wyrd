@@ -1866,15 +1866,13 @@ mod tests {
         let wal_root = directory.path().join("wal");
         let scribe_stage = directory.path().join("scribe-stage");
         let scribe_scratch = directory.path().join("scribe-scratch");
-        let oracle_scratch = directory.path().join("oracle-scratch");
-        for path in [&wal_root, &scribe_stage, &scribe_scratch, &oracle_scratch] {
+        for path in [&wal_root, &scribe_stage, &scribe_scratch] {
             std::fs::create_dir(path).expect("registered volume root");
         }
         let roots = BifrostVolumeRoots {
             wal: wal_root.clone(),
             scribe_stage: scribe_stage.clone(),
             scribe_output_scratch: scribe_scratch.clone(),
-            oracle_scratch: oracle_scratch.clone(),
         };
         let governor =
             BifrostVolumeGovernor::register(roots, 1024 * 1024, BifrostResourceHealth::default())
@@ -1940,7 +1938,6 @@ mod tests {
                 wal: wal_root.clone(),
                 scribe_stage,
                 scribe_output_scratch: scribe_scratch,
-                oracle_scratch,
             },
             &wal_root,
             expected,

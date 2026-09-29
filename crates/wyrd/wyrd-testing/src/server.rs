@@ -362,8 +362,6 @@ pub struct OracleRuntimeInspection {
     pub queued_queries: u64,
     /// Memory bytes reserved by active queries.
     pub reserved_memory_bytes: u64,
-    /// Spill bytes reserved by active queries.
-    pub reserved_spill_bytes: u64,
     /// Peer reservations waiting for worker execution.
     pub peer_pending: u64,
     /// Peer reservations executing worker streams.
@@ -1381,7 +1379,6 @@ impl WyrdTestServer {
             active_queries: admission.active_queries,
             queued_queries: admission.queued_queries,
             reserved_memory_bytes: admission.reserved_memory_bytes,
-            reserved_spill_bytes: admission.reserved_spill_bytes,
             peer_pending: admission.peer_pending,
             peer_running: admission.peer_running,
             audit_pending: audit_pending as u64,

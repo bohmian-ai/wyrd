@@ -494,8 +494,7 @@ mod tests {
         let wal = base.join("wal");
         let scribe_output = base.join("scribe-output-scratch");
         let forge = base.join("forge");
-        let oracle = base.join("oracle");
-        for path in [&wal, &scribe_output, &forge, &oracle] {
+        for path in [&wal, &scribe_output, &forge] {
             std::fs::create_dir_all(path).expect("registered volume root");
         }
         let governor = crate::resources::BifrostVolumeGovernor::register(
@@ -503,7 +502,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root.to_owned(),
                 scribe_output_scratch: scribe_output,
-                oracle_scratch: oracle,
             },
             1024 * 1024 * 1024,
             crate::resources::BifrostResourceHealth::default(),

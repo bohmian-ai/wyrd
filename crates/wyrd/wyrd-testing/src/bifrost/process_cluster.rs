@@ -640,8 +640,6 @@ pub struct OracleOwnershipSnapshot {
     pub queued_queries: u64,
     /// Memory bytes reserved by active queries.
     pub reserved_memory_bytes: u64,
-    /// Spill bytes reserved by active queries.
-    pub reserved_spill_bytes: u64,
     /// Peer pending reservations held by this Oracle.
     pub peer_pending: u64,
     /// Peer running reservations held by this Oracle.
@@ -654,8 +652,6 @@ pub struct OracleOwnershipSnapshot {
     pub root_query_slot_units: u32,
     /// Memory retained specifically by Oracle query owners.
     pub root_query_memory_used_bytes: u64,
-    /// Scratch retained specifically by Oracle query owners.
-    pub root_query_scratch_used_bytes: u64,
     /// Whether at least one Oracle query owner is active.
     pub root_query_active: bool,
     /// Process-owned Oracle scratch occupancy.
@@ -3118,14 +3114,12 @@ mod tests {
             active_queries: 7,
             queued_queries: 8,
             reserved_memory_bytes: 9,
-            reserved_spill_bytes: 10,
             peer_pending: 11,
             peer_running: 12,
             root_active_queries: 13,
             root_analytical_queries: 14,
             root_query_slot_units: 15,
             root_query_memory_used_bytes: 16,
-            root_query_scratch_used_bytes: 17,
             root_query_active: true,
             scratch: ScratchUsage {
                 entries: 18,

@@ -603,8 +603,6 @@ struct OwnershipBaseline {
     queued_queries: u64,
     /// Query-grant memory retained across every node.
     reserved_memory_bytes: u64,
-    /// Query-grant scratch retained across every node.
-    reserved_spill_bytes: u64,
     /// Retained Oracle spill directories.
     spill_directories: u64,
     /// Retained Oracle spill files.
@@ -628,7 +626,6 @@ async fn ownership_baseline(cluster: &WyrdTestCluster) -> Result<OwnershipBaseli
         active_queries: inspection.active_queries,
         queued_queries: inspection.queued_queries,
         reserved_memory_bytes: inspection.reserved_memory_bytes,
-        reserved_spill_bytes: inspection.reserved_spill_bytes,
         spill_directories: inspection.spill_directories,
         spill_files: inspection.spill_files,
         spill_file_bytes: inspection.spill_file_bytes,

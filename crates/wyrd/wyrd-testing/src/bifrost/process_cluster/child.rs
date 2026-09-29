@@ -1742,7 +1742,6 @@ fn ownership_snapshot(
         active_queries: runtime.active_queries,
         queued_queries: runtime.queued_queries,
         reserved_memory_bytes: runtime.reserved_memory_bytes,
-        reserved_spill_bytes: runtime.reserved_spill_bytes,
         peer_pending: runtime.peer_pending,
         peer_running: runtime.peer_running,
         root_active_queries: root.oracle_active_queries,
@@ -1750,7 +1749,6 @@ fn ownership_snapshot(
         root_query_slot_units: root.oracle_query_slot_units,
         root_query_memory_used_bytes: u64::try_from(root.oracle_query_memory_used_bytes)
             .unwrap_or(u64::MAX),
-        root_query_scratch_used_bytes: root.oracle_query_scratch_used_bytes,
         root_query_active: root.oracle_query_active,
         scratch,
         attempts_active: gauge("bifrost_oracle_analytical_attempts_active"),

@@ -869,7 +869,6 @@ fn assert_scheduled_owners_released(
             || root.oracle_query_active
             || root.oracle_query_slot_units != 0
             || root.oracle_query_memory_used_bytes != 0
-            || root.oracle_query_scratch_used_bytes != 0
         {
             return Err(format!("scheduled return retained ownership: {live:?}, {root:?}").into());
         }

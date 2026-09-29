@@ -4822,8 +4822,7 @@ mod tests {
         let scribe = directory.path().join("scribe-output-scratch");
         let stage = directory.path().join("scribe-stage");
         let forge = directory.path().join("forge");
-        let oracle = directory.path().join("oracle");
-        for path in [&scribe, &stage, &forge, &oracle] {
+        for path in [&scribe, &stage, &forge] {
             std::fs::create_dir(path).expect("registered volume root");
         }
         let governor = crate::resources::BifrostVolumeGovernor::register(
@@ -4831,7 +4830,6 @@ mod tests {
                 wal: directory.path().to_owned(),
                 scribe_stage: stage,
                 scribe_output_scratch: scribe,
-                oracle_scratch: oracle,
             },
             64 * 1024 * 1024,
             crate::resources::BifrostResourceHealth::default(),
@@ -4926,18 +4924,16 @@ mod tests {
     #[test]
     fn wal_capacity_refusal_is_not_sticky() {
         let directory = TempDir::new().expect("temporary WAL directory");
-        let [stage, scribe, oracle] =
-            ["scribe-stage", "scribe-output-scratch", "oracle"].map(|name| {
-                let path = directory.path().join(name);
-                std::fs::create_dir(&path).expect("registered volume root");
-                path
-            });
+        let [stage, scribe] = ["scribe-stage", "scribe-output-scratch"].map(|name| {
+            let path = directory.path().join(name);
+            std::fs::create_dir(&path).expect("registered volume root");
+            path
+        });
         let governor = crate::resources::BifrostVolumeGovernor::register(
             crate::resources::BifrostVolumeRoots {
                 wal: directory.path().to_owned(),
                 scribe_stage: stage,
                 scribe_output_scratch: scribe,
-                oracle_scratch: oracle,
             },
             64 * 1024,
             crate::resources::BifrostResourceHealth::default(),
@@ -5001,8 +4997,7 @@ mod tests {
             let scribe = directory.path().join("scribe-output-scratch");
             let stage = directory.path().join("scribe-stage");
             let forge = directory.path().join("forge");
-            let oracle = directory.path().join("oracle");
-            for path in [&scribe, &stage, &forge, &oracle] {
+            for path in [&scribe, &stage, &forge] {
                 std::fs::create_dir(path).expect("registered volume root");
             }
             let health = crate::resources::BifrostResourceHealth::default();
@@ -5011,7 +5006,6 @@ mod tests {
                     wal: directory.path().to_owned(),
                     scribe_stage: stage,
                     scribe_output_scratch: scribe,
-                    oracle_scratch: oracle,
                 },
                 64 * 1024 * 1024,
                 health.clone(),
@@ -5047,7 +5041,13 @@ mod tests {
                 health.reason(),
                 Some(crate::resources::BifrostResourcePoisonReason::Volume)
             );
-            assert!(governor.capabilities().oracle.try_acquire(1).is_err());
+            assert!(
+                governor
+                    .capabilities()
+                    .scribe_output
+                    .try_acquire(1)
+                    .is_err()
+            );
         }
     }
 

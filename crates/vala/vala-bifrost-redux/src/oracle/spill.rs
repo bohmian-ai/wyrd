@@ -1,8 +1,9 @@
 //! Oracle-owned process and query spill runtime lifecycle.
 //!
 //! The process owner limits cleanup to its private child prefix, while each
-//! admitted query receives a fresh `DataFusion` disk manager bounded by the
-//! spill share already retained by admission.
+//! admitted query receives a fresh `DataFusion` disk manager bounded by its
+//! per-query spill limit. Spill is a limit on bytes actually written, never a
+//! reservation: an unspilled query holds no disk.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -175,13 +176,19 @@ mod tests {
         ));
     }
 
-    /// A query runtime rejects spill growth beyond its exact admitted share.
+    /// Exceeding the native per-query spill limit fails only that query.
     ///
     /// `DataFusion` 55 enforces the temp-directory quota inside the spill
-    /// writer's `Write::write`, so growth past the admitted share surfaces as a
-    /// write error naming the limit rather than a post-hoc usage refresh.
+    /// writer's `Write::write`, so growth past the limit surfaces as a write
+    /// error naming the limit. A sibling query keeps spilling, and dropping the
+    /// failed query removes its temporary files.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the limit is not enforced, the sibling is refused, or a
+    /// temporary file outlives its query.
     #[test]
-    fn oracle_query_runtime_enforces_exact_disk_share() {
+    fn native_spill_limit_fails_one_query_and_cleans_up() {
         let root = tempfile::tempdir().expect("test spill root must exist");
         let runtime = OracleSpillRuntime::new(root.path(), 1_024)
             .expect("bounded spill owner must be created");
@@ -213,6 +220,19 @@ mod tests {
             Some(8),
             "a refused write must not grow the accounted file"
         );
+        let sibling = runtime
+            .build_query_runtime(Arc::new(GreedyMemoryPool::new(1_024)), 8)
+            .expect("sibling query runtime must be created");
+        let sibling_file = sibling
+            .disk_manager
+            .create_tmp_file("sibling")
+            .expect("a sibling query still spills");
+        sibling_file
+            .open_writer()
+            .expect("sibling spill file must open a writer")
+            .write_all(&[0; 8])
+            .expect("the sibling's own limit is untouched");
+        drop((sibling_file, sibling));
         drop(writer);
         drop(file);
         drop(query);

@@ -705,7 +705,6 @@ impl Oracle {
             || report.peer_pending != 0
             || report.peer_running != 0
             || report.reserved_memory_bytes != 0
-            || report.reserved_spill_bytes != 0
             || audit != 0
         {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {

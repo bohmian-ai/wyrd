@@ -3302,7 +3302,6 @@ mod tests {
             wal_root: &std::path::Path,
             scribe_stage: std::path::PathBuf,
             scribe_output: std::path::PathBuf,
-            oracle_scratch: std::path::PathBuf,
         ) -> crate::resources::BifrostRuntimeResources {
             crate::resources::BifrostRuntimeResources::from_snapshot(
                 crate::resources::SystemResourceSnapshot {
@@ -3328,7 +3327,6 @@ mod tests {
                         wal: wal_root.to_owned(),
                         scribe_stage,
                         scribe_output_scratch: scribe_output,
-                        oracle_scratch,
                     }),
                 },
             )
@@ -3345,8 +3343,7 @@ mod tests {
             let scratch_root = tempfile::tempdir().expect("scratch directory");
             let scribe_stage = wal_root.path().join("scribe-stage");
             let scribe_output = scratch_root.path().join("scribe-output");
-            let oracle_scratch = scratch_root.path().join("oracle");
-            for root in [&scribe_stage, &scribe_output, &oracle_scratch] {
+            for root in [&scribe_stage, &scribe_output] {
                 std::fs::create_dir(root).expect("test volume root");
             }
             let node_id = crate::scribe::stream_identity::NodeId::generate();
@@ -3381,7 +3378,6 @@ mod tests {
                 wal_root.path(),
                 scribe_stage,
                 scribe_output,
-                oracle_scratch,
             );
             let roles = runtime_resources
                 .compose_roles()

@@ -82,8 +82,6 @@ pub struct OracleShutdownReport {
     /// Actual `DataFusion` reservation, not an admission quantum: an admitted
     /// query that never grew a consumer contributes nothing here.
     pub reserved_memory_bytes: u64,
-    /// Spill bytes still reserved at the deadline.
-    pub reserved_spill_bytes: u64,
     /// Pending peer reservations observed at shutdown.
     pub peer_pending: u64,
     /// Running peer reservations observed at shutdown.
@@ -140,9 +138,7 @@ struct Grant {
     class: AdmissionClass,
     /// Tenant counter charged by the grant.
     tenant: DataTenantId,
-    /// Spill bytes reserved by the grant.
-    spill: u64,
-    /// Complete memory and scratch envelope transferred to the stream guard.
+    /// Complete memory and slot envelope transferred to the stream guard.
     resources: Option<crate::resources::OracleQueryResources>,
 }
 
@@ -265,8 +261,6 @@ struct AdmissionState {
     total_slot_units: u32,
     /// Protected Interactive slot units granted before any class comparison.
     interactive_floor_units: u32,
-    /// Pod-global spill bytes retained by all active query grants.
-    spill_used: u64,
     /// Maximum number of queued waiters.
     queue_capacity: u32,
     /// Current queued waiter count.
@@ -297,7 +291,6 @@ impl AdmissionState {
             analytical: ClassState::new(config.analytical_slots, config.tenant_analytical_slots),
             total_slot_units,
             interactive_floor_units: config.interactive_slots,
-            spill_used: 0,
             queue_capacity: config.queue_capacity.max(1),
             queued: 0,
             generation: 0,
@@ -360,8 +353,6 @@ struct LocalPermit {
     class: AdmissionClass,
     /// Tenant counter charged by this permit.
     tenant: DataTenantId,
-    /// Spill bytes charged by this permit.
-    spill: u64,
     /// Complete resource envelope released before queued work is reconsidered.
     resources: Mutex<Option<crate::resources::OracleQueryResources>>,
     /// Read-only projection of the envelope, retained after it moves away.
@@ -388,6 +379,8 @@ struct RetainedQuerySessionShape {
     granted_memory_bytes: usize,
     /// Adaptive partition count derived from that grant.
     target_partitions: usize,
+    /// Most bytes `DataFusion` may spill for this query; a limit, not a charge.
+    spill_limit_bytes: u64,
 }
 
 impl LocalPermit {
@@ -403,7 +396,6 @@ impl LocalPermit {
         let release = Grant {
             class: self.class,
             tenant: self.tenant,
-            spill: self.spill,
             resources: None,
         };
         if let Err(error) = rollback_counts(&mut state, &release) {
@@ -744,7 +736,6 @@ impl OracleAdmission {
             queued_queries: u64::from(state.queued),
             reserved_memory_bytes: u64::try_from(self.shared.resources.shared_memory_reserved())
                 .unwrap_or(u64::MAX),
-            reserved_spill_bytes: state.spill_used,
             peer_pending: self.slots.pending_in_use(),
             peer_running: self.shared.resources.live_slot_units(),
         }
@@ -763,7 +754,6 @@ impl OracleAdmission {
             queued_queries: u64::from(state.queued),
             reserved_memory_bytes: u64::try_from(self.shared.resources.shared_memory_reserved())
                 .unwrap_or(u64::MAX),
-            reserved_spill_bytes: state.spill_used,
             peer_pending: self.slots.pending_in_use(),
             peer_running: self.shared.resources.live_slot_units(),
         }
@@ -860,7 +850,7 @@ impl OracleAdmission {
             // A class that cannot seat one query is not a queue that is
             // momentarily full; it is a class this pod does not offer. Rejecting
             // here keeps a caller from waiting out its whole deadline, and keeps
-            // scratch, a query view, and every peer contact off the path.
+            // a query view and every peer contact off the path.
             if class_kind == AdmissionClass::Analytical
                 && state.analytical.capacity < AdmissionClass::Analytical.slot_units()
             {
@@ -1022,7 +1012,6 @@ impl OracleAdmission {
             shared: Arc::clone(&self.shared),
             class: grant.class,
             tenant: grant.tenant,
-            spill: grant.spill,
             shape: grant
                 .resources
                 .as_ref()
@@ -1031,6 +1020,7 @@ impl OracleAdmission {
                     memory_peak_bytes: resources.memory_peak_bytes(),
                     granted_memory_bytes: resources.granted_memory_bytes,
                     target_partitions: resources.target_partitions,
+                    spill_limit_bytes: resources.spill_limit_bytes,
                 }),
             resources: Mutex::new(grant.resources.take()),
             released: AtomicBool::new(false),
@@ -1159,8 +1149,8 @@ fn grant_waiters_with_clock(
         // grants decided ahead of them: popping a live head can expose an entry
         // that already expired, and an entry can expire while an earlier grant
         // in this same pass is being decided. Re-reading the clock and pruning
-        // here removes both before they can be selected, acquire slot and
-        // scratch ownership, or be notified.
+        // here removes both before they can be selected, acquire slot
+        // ownership, or be notified.
         let now = now();
         let expired = state.interactive.prune_expired(now) + state.analytical.prune_expired(now);
         state.queued = state.queued.saturating_sub(expired);
@@ -1218,8 +1208,6 @@ fn grant_waiters_with_clock(
             refused[usize::from(kind == AdmissionClass::Analytical)] = true;
             continue;
         };
-        let spill = resources.scratch_bytes;
-        state.spill_used += spill;
         state.queued = state.queued.saturating_sub(1);
         state.active_queries += 1;
         let class = state.class_mut(kind);
@@ -1234,7 +1222,6 @@ fn grant_waiters_with_clock(
             Grant {
                 class: kind,
                 tenant,
-                spill,
                 resources: Some(resources),
             },
         ));
@@ -1244,14 +1231,14 @@ fn grant_waiters_with_clock(
 
 /// Acquires the root ownership one queued admission class must hold to run.
 ///
-/// What is acquired is slot units and a scratch lease; the class memory quantum
+/// What is acquired is slot units; the class memory quantum
 /// is validated for shape but reserves nothing. Governed memory is charged later,
 /// as the query's shared-pool consumers actually grow.
 ///
 /// # Errors
 ///
 /// Returns [`crate::resources::BifrostResourceError`] when the root governor
-/// cannot seat the class's slot units or its scratch lease.
+/// cannot seat the class's slot units.
 fn acquire_waiter_resources(
     shared: &AdmissionShared,
     kind: AdmissionClass,
@@ -1291,15 +1278,8 @@ fn notify_grants(shared: &Arc<AdmissionShared>, mut notifications: Vec<GrantNoti
     }
 }
 
-/// Reverses one grant's class, tenant, spill, and active counters.
+/// Reverses one grant's class, tenant, and active counters.
 fn rollback_counts(state: &mut AdmissionState, grant: &Grant) -> Result<(), BifrostError> {
-    state.spill_used =
-        state
-            .spill_used
-            .checked_sub(grant.spill)
-            .ok_or_else(|| BifrostError::Internal {
-                detail: "Oracle admission spill rollback underflow".to_owned(),
-            })?;
     let class = match grant.class {
         AdmissionClass::Interactive => &mut state.interactive,
         AdmissionClass::Analytical => &mut state.analytical,
@@ -1348,7 +1328,7 @@ pub(super) struct AdmittedQueryGuard {
     ///
     /// Present only on an attempt that the production-unreachable Analytical
     /// path leased a session for. Dropping this guard drops those owners, which
-    /// is what returns the exchange-buffer and scratch children to the query
+    /// is what returns the exchange-buffer and memory children to the query
     /// envelope and the envelope to the root capability.
     pub(super) analytical: Option<super::analytical::AnalyticalAttemptOwnership>,
     /// Cancellation shared with stream and peer dispatch.
@@ -1428,7 +1408,7 @@ impl AdmittedQueryGuard {
     /// envelope to drop before admission is released.
     ///
     /// Dropping a failed plan aborts its spawned `DataFusion` partition tasks,
-    /// but the runtime drops an aborted task — and the memory or scratch
+    /// but the runtime drops an aborted task — and the memory
     /// reservation it holds — only on a later poll. Releasing the envelope in
     /// that window would poison the process governor for a teardown that is
     /// merely in progress. This first returns the reservations the guard itself
@@ -1460,7 +1440,7 @@ impl AdmittedQueryGuard {
             permit.resources.lock().map_or(true, |resources| {
                 resources
                     .as_ref()
-                    .is_none_or(|resources| resources.nested_idle().unwrap_or(true))
+                    .is_none_or(|resources| resources.nested_idle())
             })
         })
     }
@@ -1616,10 +1596,13 @@ impl AdmittedQueryGuard {
         Ok(())
     }
 
-    /// Returns the immutable spill share retained by this admitted query.
+    /// Returns the most bytes `DataFusion` may spill for this admitted query.
     #[must_use]
     pub(super) fn spill_limit_bytes(&self) -> u64 {
-        self.local_permit.as_ref().map_or(0, |permit| permit.spill)
+        self.local_permit
+            .as_ref()
+            .and_then(|permit| permit.shape.as_ref())
+            .map_or(0, |shape| shape.spill_limit_bytes)
     }
 
     /// Builds the tracked greedy pool owned by this query's exact envelope.
@@ -1752,7 +1735,6 @@ pub(super) fn admitted_guard_for_test()
                 shared: Arc::clone(&shared),
                 class: AdmissionClass::Interactive,
                 tenant,
-                spill: 0,
                 resources: Mutex::new(None),
                 shape: None,
                 released: AtomicBool::new(false),
@@ -2187,7 +2169,6 @@ pub(in crate::oracle) mod tests {
         let state = shared.state.lock().expect("state");
         assert_eq!(state.interactive.used, 1);
         assert_eq!(state.active_queries, 1);
-        assert!(state.spill_used > 0);
     }
 
     /// The admission queue never grants beyond its configured waiter bound.
@@ -2554,7 +2535,6 @@ pub(in crate::oracle) mod tests {
             &Grant {
                 class: AdmissionClass::Interactive,
                 tenant,
-                spill: 0,
                 resources: None,
             },
         )
@@ -2584,7 +2564,6 @@ pub(in crate::oracle) mod tests {
         guard.release();
         let state = owner.shared.state.lock().expect("state");
         assert_eq!(state.analytical.used, 0);
-        assert_eq!(state.spill_used, 0);
         assert_eq!(state.active_queries, 0);
     }
 
@@ -2867,8 +2846,8 @@ pub(in crate::oracle) mod tests {
     /// max_queue_wait)`, so deadlines are not monotonic inside one tenant FIFO.
     /// This seeds an older live head in front of a later already-expired entry,
     /// leaves two Interactive units free so one pass can issue two grants, and
-    /// proves the exposed expired entry is dropped rather than given slot and
-    /// scratch ownership. Live work queued afterwards still progresses.
+    /// proves the exposed expired entry is dropped rather than given slot
+    /// ownership. Live work queued afterwards still progresses.
     #[test]
     fn expired_waiter_behind_a_live_head_is_never_granted() {
         let resources = test_resources();
@@ -2924,18 +2903,18 @@ pub(in crate::oracle) mod tests {
             .snapshot()
             .expect("root while the head owns its grant");
         assert_eq!(
-            after.oracle_query_scratch_used_bytes - baseline.oracle_query_scratch_used_bytes,
-            crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
-            "exactly one Interactive scratch lease is outstanding"
+            after.oracle_query_slot_units - baseline.oracle_query_slot_units,
+            1,
+            "exactly one Interactive slot grant is outstanding"
         );
         drop(head_grant);
         assert_eq!(
             resources
                 .snapshot()
                 .expect("root after the head releases")
-                .oracle_query_scratch_used_bytes,
-            baseline.oracle_query_scratch_used_bytes,
-            "no scratch is stranded by the rejected expired waiter"
+                .oracle_query_slot_units,
+            baseline.oracle_query_slot_units,
+            "no slot is stranded by the rejected expired waiter"
         );
 
         let mut next_live = push_waiter(
@@ -2960,7 +2939,7 @@ pub(in crate::oracle) mod tests {
     /// the second. The clock is scripted rather than measured, so the two
     /// decision times are fixed and the test never depends on how long the
     /// intervening grant actually takes. It proves the expired tail acquires no
-    /// slot, scratch, active-query, or tenant ownership and receives no
+    /// slot, active-query, or tenant ownership and receives no
     /// notification, and that live work queued afterwards still progresses.
     #[test]
     fn waiter_expiring_between_grant_decisions_is_never_granted() {
@@ -3030,18 +3009,18 @@ pub(in crate::oracle) mod tests {
             .snapshot()
             .expect("root while the head owns its grant");
         assert_eq!(
-            after.oracle_query_scratch_used_bytes - baseline.oracle_query_scratch_used_bytes,
-            crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
-            "exactly one Interactive scratch lease is outstanding"
+            after.oracle_query_slot_units - baseline.oracle_query_slot_units,
+            1,
+            "exactly one Interactive slot grant is outstanding"
         );
         drop(head_grant);
         assert_eq!(
             resources
                 .snapshot()
                 .expect("root after the head releases")
-                .oracle_query_scratch_used_bytes,
-            baseline.oracle_query_scratch_used_bytes,
-            "no scratch is stranded by the rejected waiter"
+                .oracle_query_slot_units,
+            baseline.oracle_query_slot_units,
+            "no slot is stranded by the rejected waiter"
         );
 
         let mut next_live = push_waiter(
@@ -3067,7 +3046,7 @@ pub(in crate::oracle) mod tests {
     /// returns to the first tenant.
     ///
     /// Rejection is checked against the same process root so a refused request is
-    /// proven to leave class, tenant, memory, scratch, and slot ownership exactly
+    /// proven to leave class, tenant, memory, and slot ownership exactly
     /// where it found it.
     #[test]
     fn analytical_saturation_preserves_interactive_floor_and_rotates_tenants() {
@@ -3129,7 +3108,6 @@ pub(in crate::oracle) mod tests {
             let state = shared.state.lock().expect("state");
             assert_eq!(state.interactive.used, 0);
             assert_eq!(state.analytical.used, 0);
-            assert_eq!(state.spill_used, 0);
             assert_eq!(state.active_queries, 0);
             assert!(
                 state
@@ -3214,7 +3192,7 @@ pub(in crate::oracle) mod tests {
         assert_eq!(
             resources.snapshot().expect("post-rejection root"),
             before_rejection,
-            "a refused request charges no class, tenant, memory, scratch, or slot ownership"
+            "a refused request charges no class, tenant, memory, or slot ownership"
         );
 
         let held_grant = held.receiver.try_recv().expect("held interactive grant");

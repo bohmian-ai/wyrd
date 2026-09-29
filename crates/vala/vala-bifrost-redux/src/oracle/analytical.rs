@@ -25,7 +25,7 @@
 //!    [`HeaderMap`], and the same headers reach the worker before any plan is
 //!    decoded.
 //! 2. **Runtime.** [`AnalyticalSessionBuilder`] resolves the *query-owned*
-//!    [`RuntimeEnv`] — the memory pool and bounded scratch already admitted for
+//!    [`RuntimeEnv`] — the memory pool and spill limit already admitted for
 //!    this query — and installs it on the follower session, replacing the
 //!    worker's process-lifetime runtime.
 //! 3. **Futures.** Upstream returns its task streams to the caller rather than
@@ -65,9 +65,8 @@ pub use super::analytical_supervisor::AnalyticalSupervisor;
 
 use super::AuthorizedQueryContext;
 use super::analytical_supervisor::{
-    AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalAttemptRelease,
-    AnalyticalGraphGuard, AnalyticalGraphLifecycleOwner, AnalyticalSupervisorInspection, StageId,
-    TaskId,
+    AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalAttemptRelease, AnalyticalGraphGuard,
+    AnalyticalGraphLifecycleOwner, AnalyticalSupervisorInspection, StageId, TaskId,
 };
 use super::analytical_transport::AnalyticalDestination;
 use super::analytical_transport::{
@@ -297,7 +296,7 @@ impl AnalyticalGraphKey {
 #[derive(Clone)]
 pub struct AnalyticalGraphRuntime {
     /// The query's own `RuntimeEnv`: its admitted memory pool and the disk
-    /// manager bounded by its admitted scratch share.
+    /// manager bounded by its per-query spill limit.
     ///
     /// Exchanges allocate from this same pool rather than from a child budget.
     /// A separate exchange grant would be a second ceiling inside a query that
@@ -508,7 +507,7 @@ pub(super) const GRAPH_DRAIN_POLLS: usize = 500;
 /// runtime; this builder replaces that runtime with the one the leader admitted
 /// for this exact query, so every descendant operator on the follower — including
 /// spilling operators — charges the query's pool and writes into the query's
-/// bounded scratch.
+/// spill-limited disk manager.
 ///
 /// A graph that is not registered is refused. There is deliberately no fallback
 /// to the process runtime: an unresolvable graph is an invalidated attempt, a
@@ -1156,16 +1155,12 @@ impl GraphLease {
     ///
     /// Returns [`BifrostError::Internal`] on a poisoned lock, and the
     /// supervisor's refusal when the slot is occupied or the graph is unknown.
-    fn admit_attempt(
-        &self,
-        key: AnalyticalAttemptKey,
-        grant: AnalyticalAttemptGrant,
-    ) -> Result<(), BifrostError> {
+    fn admit_attempt(&self, key: AnalyticalAttemptKey) -> Result<(), BifrostError> {
         let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
         if attempts.contains_key(&key) {
             return Ok(());
         }
-        let guard = self.supervisor.spawn_attempt(key, grant)?;
+        let guard = self.supervisor.spawn_attempt(key)?;
         attempts.insert(key, guard);
         Ok(())
     }
@@ -1282,11 +1277,10 @@ impl GraphLease {
             }
             tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
         }
-        let (scratch_bytes, memory_bytes) = self.supervisor.graph_children_debt(self.graph)?;
+        let memory_bytes = self.supervisor.graph_children_debt(self.graph)?;
         tracing::warn!(
             public_query_id = %self.graph.public_query_id,
             datafusion_query_id = %self.graph.datafusion_query_id,
-            scratch_bytes,
             memory_bytes,
             "Oracle analytical graph did not drain before its follower release"
         );
@@ -1796,18 +1790,7 @@ impl AnalyticalStageIngress {
             .record(key.graph(), &authorized, lease.exchanges())?;
         match operation {
             StageOperationV1::SetPlan => {
-                lease.admit_attempt(
-                    key,
-                    AnalyticalAttemptGrant {
-                        // Spill attribution belongs to the graph, not the
-                        // attempt. The graph runtime's disk manager was built
-                        // from the leased envelope's exact scratch share, and
-                        // every attempt of the graph spills through it;
-                        // splitting a second per-attempt share off the same
-                        // envelope would charge the same bytes twice.
-                        scratch_bytes: 0,
-                    },
-                )?;
+                lease.admit_attempt(key)?;
                 record_stage_operation(AnalyticalStageOperation::SetPlan);
             }
             StageOperationV1::ExecuteTask => {
@@ -1953,7 +1936,7 @@ impl AnalyticalStageIngress {
         let envelope = activation.envelope();
         let runtime = match self
             .spill
-            .build_query_runtime(envelope.memory_pool(), envelope.scratch_bytes)
+            .build_query_runtime(envelope.memory_pool(), envelope.spill_limit_bytes)
         {
             Ok(runtime) => AnalyticalGraphRuntime::new(
                 runtime,
@@ -2999,8 +2982,8 @@ impl AnalyticalGraphLifecycle {
         // Folded first, and only for a success terminal: the physical evidence
         // this publishes describes rows a caller actually received, and an
         // abandoned graph has no follower metrics coming. It runs before the
-        // attempt is joined so spill evidence is in hand before scratch is
-        // verified, success is published, and the graph is removed.
+        // attempt is joined so spill evidence is in hand before success is
+        // published and the graph is removed.
         let mut failure = if outcome == AnalyticalAttemptOutcome::Success {
             self.fold_physical_metrics().await.err()
         } else {
@@ -3043,7 +3026,7 @@ impl AnalyticalGraphLifecycle {
             }
         }
         // Retired only here, after every attempt, exchange, participant,
-        // runtime, scratch, and admission owner joined: the public entry
+        // runtime, and admission owner joined: the public entry
         // describes the graph, so it outlives the stream that signalled it.
         if let Some(mut owner) = running_query {
             owner.finish(if outcome == AnalyticalAttemptOutcome::Success {
@@ -3149,11 +3132,10 @@ impl AnalyticalGraphLifecycle {
             }
             tokio::time::sleep_until(self.deadline.min(now + GRAPH_DRAIN_INTERVAL)).await;
         }
-        let (scratch_bytes, memory_bytes) = self.supervisor.graph_children_debt(self.graph)?;
+        let memory_bytes = self.supervisor.graph_children_debt(self.graph)?;
         tracing::warn!(
             public_query_id = %self.graph.public_query_id,
             datafusion_query_id = %self.graph.datafusion_query_id,
-            scratch_bytes,
             memory_bytes,
             "Oracle analytical leader graph was not confirmed drained within its deadline"
         );
@@ -3839,7 +3821,7 @@ mod tests {
     ///    Wyrd-signed ticket can be the authority for follower work;
     /// 2. a **session-construction hook** whose runtime wins over the worker's
     ///    process runtime, so every follower descendant charges the query's own
-    ///    memory pool and scratch; and
+    ///    memory pool and spill limit; and
     /// 3. the task's **streams and task context returned to the caller** rather
     ///    than detached, so Wyrd's supervisor can join every descendant.
     ///
@@ -4462,7 +4444,6 @@ mod tests {
                     node_id: self.node_id,
                     oracle_fence: self.fence,
                     ticket_ttl: chrono::Duration::seconds(30),
-                    scratch_bytes: 0,
                     peer_tls: BifrostPeerTls::unreachable_for_test(),
                     peer_credentials: Arc::new(
                         super::super::dispatcher::StaticOraclePeerCredentials::new(
@@ -4804,10 +4785,7 @@ mod tests {
             .expect("a lost peer settles this attempt exactly once");
         drop(admitted);
         assert!(
-            fixture
-                .supervisor
-                .spawn_attempt(key, AnalyticalAttemptGrant { scratch_bytes: 0 },)
-                .is_err(),
+            fixture.supervisor.spawn_attempt(key).is_err(),
             "the settled graph admits no further attempt"
         );
         assert_eq!(
@@ -5088,10 +5066,7 @@ mod tests {
         let graph = ownership.key().graph();
         let stray = fixture
             .supervisor
-            .spawn_attempt(
-                stray_attempt_key(graph),
-                AnalyticalAttemptGrant { scratch_bytes: 0 },
-            )
+            .spawn_attempt(stray_attempt_key(graph))
             .expect("an active graph admits one more stage");
         let error = ownership
             .settle(AnalyticalAttemptOutcome::Success)
@@ -5167,16 +5142,16 @@ mod tests {
             .expect("every addressed follower accepted its reservation");
         let graph = ownership.key().graph();
         // A nested child the settlement sequence cannot reach: the graph's own
-        // attempt is joined, but the envelope it charged is still owed scratch.
-        let stray = fixture
+        // attempt is joined, but its envelope still holds child memory.
+        let runtime = fixture
             .supervisor
-            .spawn_attempt(
-                stray_attempt_key(graph),
-                AnalyticalAttemptGrant {
-                    scratch_bytes: 4_096,
-                },
-            )
-            .expect("an active graph admits one more stage");
+            .graph_runtime(graph)
+            .expect("the leased graph installed a query-owned runtime");
+        let stray = datafusion::execution::memory_pool::MemoryConsumer::new("stray-child")
+            .register(&runtime.runtime().memory_pool);
+        stray
+            .try_grow(4_096)
+            .expect("the admitted envelope funds one nested child");
         let error = ownership
             .settle(AnalyticalAttemptOutcome::Success)
             .await
@@ -6302,10 +6277,7 @@ mod tests {
         // sequence never joins, so the graph cannot be confirmed released.
         let stray = fixture
             .supervisor
-            .spawn_attempt(
-                stray_attempt_key(graph),
-                AnalyticalAttemptGrant { scratch_bytes: 0 },
-            )
+            .spawn_attempt(stray_attempt_key(graph))
             .expect("an active graph admits one more stage");
 
         let queued_admission = Arc::clone(&admission);
@@ -7003,7 +6975,7 @@ mod tests {
                 .expect("an idle Oracle admits one analytical query");
             let runtime = graph
                 .spill
-                .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)
+                .build_query_runtime(resources.memory_pool(), resources.spill_limit_bytes)
                 .expect("the fixture spill owner builds one query runtime");
             let graph_guard = graph
                 .supervisor
@@ -7902,8 +7874,6 @@ pub struct AnalyticalExecutionConfig {
     pub oracle_fence: u64,
     /// Short acceptance window a minted stage ticket is valid for.
     pub ticket_ttl: chrono::Duration,
-    /// Scratch child every attempt of a graph charges on this node.
-    pub scratch_bytes: u64,
     /// Immutable peer identity every leader-side channel is dialed through.
     pub peer_tls: BifrostPeerTls,
     /// Workload credential every leader-side peer request presents.
@@ -8102,17 +8072,6 @@ impl AnalyticalExecutionHandle {
         &self.supervisor
     }
 
-    /// Returns the exact child grant every attempt of this node is admitted with.
-    ///
-    /// A retry must be admitted with the same grant its predecessor held, so
-    /// this is read from the node's configuration rather than chosen per call.
-    #[must_use]
-    pub const fn attempt_grant(&self) -> AnalyticalAttemptGrant {
-        AnalyticalAttemptGrant {
-            scratch_bytes: self.config.scratch_bytes,
-        }
-    }
-
     /// Reports what this node still owns, leader and follower, without releasing it.
     ///
     /// This is the terminal-cleanup probe: after every query on a node has
@@ -8186,7 +8145,7 @@ impl AnalyticalExecutionHandle {
         let target_partitions = resources.target_partitions;
         let runtime = self
             .spill
-            .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)?;
+            .build_query_runtime(resources.memory_pool(), resources.spill_limit_bytes)?;
         let graph_guard = match self.supervisor.register_graph(
             graph,
             resources,
@@ -8209,18 +8168,13 @@ impl AnalyticalExecutionHandle {
                 return Err(error);
             }
         };
-        let attempt_guard = self.supervisor.spawn_attempt(
-            AnalyticalAttemptKey::new(
-                attempt.public_query_id,
-                attempt.datafusion_query_id,
-                StageId::new(0),
-                None,
-                AnalyticalAttemptNumber::ZERO,
-            ),
-            AnalyticalAttemptGrant {
-                scratch_bytes: self.config.scratch_bytes,
-            },
-        )?;
+        let attempt_guard = self.supervisor.spawn_attempt(AnalyticalAttemptKey::new(
+            attempt.public_query_id,
+            attempt.datafusion_query_id,
+            StageId::new(0),
+            None,
+            AnalyticalAttemptNumber::ZERO,
+        ))?;
         let key = attempt_guard.key();
         let cancel = attempt_guard.cancellation().clone();
         let egressed = attempt_guard.egress_flag();
@@ -8578,7 +8532,7 @@ pub struct AnalyticalAttemptContext {
 /// Graph and attempt ownership retained for one inactive Analytical attempt.
 ///
 /// The two guards are kept together because they release in a fixed order:
-/// the attempt returns its exchange-buffer and scratch children to the query
+/// the attempt returns its exchange-buffer and memory children to the query
 /// envelope, and only then does the graph return the envelope itself. Dropping
 /// this value settles both, which is what makes a cancelled or abandoned
 /// attempt return capacity instead of stranding it.

@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 11
+revision: 12
 status: approved
 ---
 
@@ -70,9 +70,11 @@ DataFusion's residual predicates remain authoritative. Live fragments may run
 concurrently on multiple Scribes while Oracle combines them with published
 work. This change does not promise Scribe-side general aggregation or joins.
 
-The existing authenticated peer protocol, signed assignments, tenant and
-schema checks, Scribe resource admission, and per-query deadline/cancellation
-apply. A live stream validates frames as they arrive and requires a valid final
+The authenticated mTLS peer protocol and receiver-side typed tenant, table,
+query/assignment, target-node, fence, deadline, and resource checks in
+`SPEC-verified-change-contract` REQ-160/REQ-161 apply to remote work. Local
+work retains the same tenant, schema, resource, and query-lifetime rules
+without a network hop. A live stream validates frames as they arrive and requires a valid final
 footer when consumed to its natural end. When the completed DataFusion plan no
 longer needs an opened fragment, Oracle cancels and drops that child as ordinary
 query-owned cleanup; no footer is required from work the plan intentionally
@@ -100,8 +102,8 @@ release ownership. A fragment remains valid beyond 30 seconds while its query
 and stream remain active. Remove the acquire/page/release tail-fence protocol,
 its 30-second expiry, Oracle's full leader drain, and their obsolete bindings
 once the new path is the only public live reader. Keep authenticated active-
-stream discovery. Peer-ticket acceptance expiry remains an authentication
-replay control and does not impose a second lifetime on accepted work.
+stream discovery. A remote fragment's lifetime remains owned by its leader
+query after peer authentication; no ticket expiry imposes another lifetime.
 
 ### REQ-006 — Publication overlap is explicitly best effort
 
@@ -248,11 +250,47 @@ role loss, a class the node cannot execute at all, and genuine resource or
 security faults remain distinct from temporary saturation. The same behavior
 is visible through HTTP, gRPC, and the first-class SDKs.
 
+### REQ-010 — Shared Bifrost memory and server headroom
+
+The process or pod memory limit comes from the operating system or deployment
+runtime. Wyrd leaves at least 1 GiB of that limit for `wyrd-server` work
+outside governed Bifrost memory by default; the operator may increase that
+minimum. It is accounting headroom, not preallocated memory or an upper limit
+on other server work. The shared Bifrost limit defaults to the detected limit
+minus the server minimum and may be configured lower. A configuration that
+cannot leave both the server minimum and a usable Bifrost budget fails
+startup. An 8-GiB pod therefore defaults to a 7-GiB Bifrost limit. Other
+server work may use any memory Bifrost has not consumed. The operator settings
+are WYRD_SERVER_MEMORY_MIN_BYTES for the minimum and
+WYRD_BIFROST_MEMORY_LIMIT_BYTES for an optional lower Bifrost cap. The old
+unmanaged-reserve setting has no compatibility alias.
+
+Scribe, Oracle, Forge, and in-flight Bifrost transport work share one governed
+memory budget and return their charges when ownership ends. An idle role
+reserves no fixed share. The per-request transport size, per-query execution
+ceiling, finite query queue, and Forge execution parallelism remain controls
+for their separate resources; none partitions the shared memory budget.
+Forge uses a bounded DataFusion memory pool with ordinary spill support. A
+resource failure cannot publish a partial compaction and remains retryable
+through its durable work lifecycle.
+
+A queued Oracle query owns no execution memory. A running query charges
+consumers as they grow. A fallible memory refusal or exhausted spill fails
+the requesting query, drains its child work, and returns its slot without
+failing siblings. An admitted query's resource exhaustion uses
+WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED before a stream opens or in its
+Failed terminal after streaming begins; it is never a query-queue refusal.
+First-class SDKs do not automatically retry that error. DataFusion's infallible `grow()` is
+accounted as headroom and released later; it does not trigger a second
+cancellation policy. Untracked allocations and one infallible growth can
+still exhaust an in-process pod. A separately deployed Oracle uses the
+existing server target, not a new execution process or query protocol.
+
 ## Invariants and boundaries
 
 - **INV-001:** Write acknowledgment, WAL durability, publication order, and
   Iceberg promotion are unchanged.
-- **INV-002:** Authenticated tenant authority, signed peer assignments,
+- **INV-002:** Authenticated tenant authority, typed peer assignments,
   authorized projection, tenant tripwire, and sensitive-column denial remain
   effective before source IO and through execution.
 - **INV-003:** One physical plan and the existing Interactive or Analytical
@@ -269,6 +307,9 @@ is visible through HTTP, gRPC, and the first-class SDKs.
   validation. A saturated query waits under its own deadline; a full finite
   queue or a genuine resource fault fails without taking down the node or
   corrupting another query's result.
+- **INV-007:** No idle Bifrost role reserves a fixed share of the shared
+  memory budget. Scribe, Oracle, Forge, and transport allocations compete
+  through one owner; resource failure releases only its owning work.
 
 ## Scope and non-goals
 
@@ -342,10 +383,21 @@ Do not add new persisted state or change write ACK timing.
   timeout free their places. HTTP and gRPC do not shed an otherwise queueable
   authenticated query before Oracle. A 4-CPU/8-GiB process-cluster run with
   the full queue remains under the stated memory ceiling without OOM.
+- **AC-012:** An 8-GiB process limit with default configuration yields at
+  least 1 GiB of non-Bifrost server headroom and a 7-GiB shared Bifrost
+  limit. A lower operator cap and larger server minimum resolve predictably;
+  impossible values fail boot. Idle roles hold no fixed memory share.
+  Concurrent Scribe, Oracle, Forge, and transport work charge and return one
+  bounded total. Resource-exhausted queries fail without becoming queue-full
+  or corrupting siblings; failed compaction publishes nothing partial.
+  Focused tests, real-server journeys, and the standard mixed benchmark prove
+  these behaviors.
 
 ## Open material decisions
 
-None. Revision 3 was explicitly approved by the user on 2026-09-26. The user
+None. Revision 12's memory redesign was explicitly approved by the user on
+2026-09-29. The peer wording follows approved `SPEC-verified-change-contract`
+revision 44. Revision 3 was explicitly approved by the user on 2026-09-26. The user
 explicitly accepted the performance work, supplied its numeric targets, and
 chose a finite 1,000-query queue and one timeout policy for both query classes
 on 2026-09-28.
@@ -394,6 +446,10 @@ on 2026-09-28.
   removes the file-layout and projection cross-products, and separates the
   100-million-row heavy-scan qualification from the quick capacity run.
   Approved by the user on 2026-09-28.
+- Revision 12 (2026-09-29): Records the maintainer-approved shared Bifrost
+  memory and server-headroom redesign, removes idle role partitions, and
+  aligns private-peer wording with the approved mTLS and typed-context
+  contract. Approved by the user on 2026-09-29.
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

@@ -1388,7 +1388,9 @@ fn await_remote_live_held(
 ) -> Result<(), PeerJourneyError> {
     cluster.nodes_mut()[SCRIBE].await_live_production_paused()?;
     let (producers, _) = cluster.nodes_mut()[SCRIBE].live_scribe_holds()?;
-    let admitted = cluster.nodes_mut()[LEADER].ownership_snapshot()?.active_queries;
+    let admitted = cluster.nodes_mut()[LEADER]
+        .ownership_snapshot()?
+        .active_queries;
     if producers != 1 || admitted == 0 {
         return Err(format!(
             "{case}: the paused remote read must hold one producer under the leader's \

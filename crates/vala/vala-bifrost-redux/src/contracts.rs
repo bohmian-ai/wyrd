@@ -208,18 +208,12 @@ impl OtlpDecodeOwner {
         Ok(OtlpDecodeScratch { _memory: memory })
     }
 
-    /// Atomically grows the decode child into Scribe's one complete root.
+    /// Transfers the decode lease into Scribe without a second admission.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] without losing this owner when root capacity
-    /// cannot cover the immutable material plan.
-    pub(crate) fn complete(
-        mut self,
-        root_bytes: usize,
-    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
-        self.memory.resize_ingress(root_bytes)?;
-        Ok(self.memory)
+    /// Scribe resizes the returned lease to the bytes it actually holds once
+    /// the projected Arrow is adopted; the decode charge is never counted twice.
+    pub(crate) fn complete(self) -> crate::resources::ScribeMemoryLease {
+        self.memory
     }
 }
 

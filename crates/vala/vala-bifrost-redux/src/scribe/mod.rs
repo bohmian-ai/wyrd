@@ -5,7 +5,6 @@ pub mod assembly;
 pub mod claim_assembly;
 pub mod claim_merge;
 pub mod claim_publication;
-pub mod contention;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
@@ -66,20 +65,6 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::FetchLiveTailService;
 pub use crate::scribe::tail_rpc::TonicTailReadTransport;
 
-/// Derives the largest replayable Scribe envelope admitted by configured limits.
-///
-/// Server boot compares this intrinsic requirement with the detected root
-/// capability before accepting traffic or starting WAL replay.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::DecodedPayloadTooLarge`] when configured bound
-/// arithmetic cannot be represented on this platform.
-pub fn configured_maximum_envelope_bytes(
-    limits: crate::gate::limits::IngestLimits,
-) -> Result<usize, ScribeError> {
-    material_plan::configured_maximum_envelope_bytes(limits)
-}
 use crate::scribe::telemetry::{
     ScribeBucketMemorySnapshot, ScribeIngressLifecycle, ScribeInspectionSnapshot,
     ScribeRuntimeSnapshot,
@@ -898,7 +883,7 @@ impl ScribeImpl {
             ),
             stream_identity::WriterEpoch::new(writer_epoch),
         );
-        Self::new_with_execution_pools(ScribeBuildConfig {
+        Ok(Self::new_with_execution_pools(ScribeBuildConfig {
             catalog: config.catalog,
             operator,
             wal,
@@ -911,8 +896,7 @@ impl ScribeImpl {
             ingest_limits: crate::gate::limits::IngestLimits::default(),
             geometry,
             staging_file_publisher: None,
-        })
-        .map_err(|error| error.to_string())
+        }))
     }
 
     /// Construct a Scribe using an explicitly owned Tokio coordination runtime.
@@ -1007,11 +991,7 @@ impl ScribeImpl {
     /// # Panics
     ///
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity,
-    /// when the fixed Scribe ownership graph cannot be initialized, or when the
-    /// supplied admission budget cannot hold its own configured guaranteed
-    /// contention width. Server deployments take the fallible
-    /// [`Self::new_with_execution_pools`] instead so that last case becomes a
-    /// typed boot refusal rather than a panic.
+    /// or when the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config_and_admission_and_memory(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
@@ -1050,20 +1030,16 @@ impl ScribeImpl {
             geometry,
             staging_file_publisher: config.staging_file_publisher,
         })
-        .expect("the embedded Scribe budget completes at least one table lifecycle")
     }
 
     /// Construct Scribe from execution lanes provisioned by server boot.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`geometry::ScribeGeometryError`] when the node's Scribe memory
-    /// budget and staging volume cannot hold the configured guaranteed
-    /// contention width, so boot fails with the shortfall named instead of
-    /// reporting ready.
-    pub fn new_with_execution_pools(
-        config: ScribeBuildConfig,
-    ) -> Result<Self, geometry::ScribeGeometryError> {
+    /// Panics only if the fixed zero-sized Scribe ownership graph cannot be
+    /// initialized, which is a construction invariant.
+    #[must_use]
+    pub fn new_with_execution_pools(config: ScribeBuildConfig) -> Self {
         Self::build(config)
     }
 
@@ -1137,23 +1113,16 @@ impl ScribeImpl {
     /// owners so every child receives the same lanes, WAL identity, memory
     /// ledger, and coordination runtime.
     ///
-    /// # Errors
-    ///
-    /// Returns [`geometry::ScribeGeometryError`] when the pod cannot hold every
-    /// guaranteed contention reserve vector. Scribe refuses to exist on a node
-    /// it cannot serve its configured width on, so this check happens here,
-    /// before any owner is built.
-    ///
     /// # Panics
     ///
     /// Panics only if the configured fallback memory governor cannot represent
     /// the fixed one-gibibyte invariant or a shard WAL handle cannot be built.
-    fn build(config: ScribeBuildConfig) -> Result<Self, geometry::ScribeGeometryError> {
+    fn build(config: ScribeBuildConfig) -> Self {
         let memory = config.resources.clone();
         let memory_ownership =
             memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
         let admission =
-            AdmissionController::with_config_and_memory(config.admission, memory.clone())?;
+            AdmissionController::with_config_and_memory(config.admission, memory.clone());
         let ScribeBuildConfig {
             catalog,
             operator,
@@ -1190,14 +1159,13 @@ impl ScribeImpl {
                     staging_file_publisher: staging_file_publisher.clone(),
                     geometry,
                     hot_sources: Arc::clone(&hot_sources),
-                    telemetry: admission.contention().telemetry_handle(),
+                    telemetry: admission.telemetry_handle(),
                 },
                 &coordination_runtime,
             )
         });
         let shards = shards::ScribeShardRuntime::start(
             shards::ScribeShardStartConfig {
-                admission: admission.clone(),
                 geometry,
                 seal_max_age,
                 wal: Arc::clone(&wal),
@@ -1212,7 +1180,7 @@ impl ScribeImpl {
             &coordination_runtime,
         );
         Self::install_boot_metrics();
-        Ok(Self {
+        Self {
             catalog,
             wal,
             node_id: stream.node_id.to_string(),
@@ -1245,7 +1213,7 @@ impl ScribeImpl {
             decoded_request_limit_for_test: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             receipt_offset_micros_for_test: std::sync::atomic::AtomicI64::new(0),
-        })
+        }
     }
 
     /// Publish the zero-initialized Scribe boot telemetry.
@@ -1335,7 +1303,6 @@ impl ScribeImpl {
             geometry,
             staging_file_publisher: None,
         })
-        .expect("the fixed test Scribe geometry fits its embedded governor")
     }
 
     /// Stop accepting new shard work and drain execution lanes until `deadline`.
@@ -2033,33 +2000,6 @@ mod constructor_rotation_tests {
             .await;
     }
 
-    /// Reading memtable statistics leaves admission reservations untouched.
-    ///
-    /// A slice reserves active bytes before its WAL write and enters the
-    /// memtable only after the durable fence, so an inspection taken in between
-    /// sees no writable bytes. If the read reconciled admission from that view
-    /// it would erase the reservation, and the slice's later release (the
-    /// duplicate-batch discard path) would underflow and poison the pod.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the reservation or statistics read fails, or when the read
-    /// changes the reserved active bytes.
-    #[tokio::test]
-    async fn memtable_stats_preserves_pre_insertion_active_reservations() {
-        let scribe = ScribeImpl::new();
-        scribe
-            .admission
-            .try_reserve_active("pre-insertion", 64)
-            .expect("active reservation");
-        scribe.memtable_stats().expect("memtable stats");
-        assert_eq!(scribe.admission_snapshot().active_bytes, 64);
-        scribe
-            .admission
-            .release_active(64)
-            .expect("the reservation is still owned and releases exactly");
-    }
-
     /// Embedded construction applies every explicitly selected test-tier
     /// threshold to the same shard-owner graph used by production boot.
     #[tokio::test]
@@ -2296,40 +2236,17 @@ mod telemetry_tests {
 }
 
 impl ScribeImpl {
-    /// Reports the pod's closed contention registry totals.
-    ///
-    /// The registry is the production observation owner for admission,
-    /// activation, borrowing, and demand transitions, so a fairness case reads
-    /// its totals rather than installing a parallel counter. Read-only: nothing
-    /// here moves capacity or changes a scheduling decision.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn contention_totals_for_test(&self) -> crate::scribe::telemetry::ScribeTelemetrySnapshot {
-        self.admission.contention().telemetry_totals()
-    }
-
     /// Reports the pod's closed staged-member and claim registry totals.
     ///
-    /// The same retained observation owner that records admission also records
-    /// the durability half of the pod, so a reconciliation case reads staged
+    /// The pod's one retained observation owner records the durability half of
+    /// the pod, so a reconciliation case reads staged
     /// minus retired members and claims taken minus claims closed from here
     /// rather than inferring a durable transition from a published object.
     /// Read-only: nothing here stages, claims, publishes, or retires.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn staging_totals_for_test(&self) -> crate::scribe::telemetry::ScribeStagingSnapshot {
-        self.admission.contention().staging_totals()
-    }
-
-    /// Reports how many complete lifecycle vectors this pod's capacity completes.
-    ///
-    /// Derived once at startup from measured capacity, so a case that has to
-    /// place real contention reads the pod's own ceiling instead of recomputing
-    /// it from configuration.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn ownership_ceiling_for_test(&self) -> usize {
-        self.admission.contention().ownership_ceiling()
+        self.admission.telemetry_handle().staging_snapshot()
     }
 
     /// Install a one-shot test barrier at the public write seam.
@@ -2621,9 +2538,7 @@ impl ScribeImpl {
                 restored,
                 retirement_high_water,
             }) => {
-                let stats = self.memtable_stats()?;
-                self.admission
-                    .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
+                self.memtable_stats()?;
                 tracing::info!(
                     restored,
                     retirement_high_water,

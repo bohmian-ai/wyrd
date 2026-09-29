@@ -407,12 +407,10 @@ async fn serve() -> Result<(), ProcessClusterError> {
                 emit(&ControlResponse::PauseReleased)?;
             }
             ControlRequest::LiveScribeHolds => match live_scribe_holds(&server) {
-                Ok((open_producers, follower_bytes)) => {
-                    emit(&ControlResponse::LiveScribeHolds {
-                        open_producers,
-                        follower_bytes,
-                    })?
-                }
+                Ok((open_producers, follower_bytes)) => emit(&ControlResponse::LiveScribeHolds {
+                    open_producers,
+                    follower_bytes,
+                })?,
                 Err(error) => emit(&ControlResponse::Failed {
                     detail: error.to_string(),
                 })?,

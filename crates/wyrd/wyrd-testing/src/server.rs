@@ -2057,25 +2057,6 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
     }
 
-    /// Report the pod's closed contention registry totals.
-    ///
-    /// Fairness is a scheduling decision, not a row: the only truthful evidence
-    /// that a vector was lent, released, or queued is the production registry
-    /// that recorded the decision, so a contention case reads these totals
-    /// instead of inferring capacity from configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this server owns no Scribe.
-    pub fn scribe_contention_totals_for_test(
-        &self,
-    ) -> Result<vala_bifrost_redux::scribe::telemetry::ScribeTelemetrySnapshot, WyrdTestServerError>
-    {
-        self.bifrost_scribe()
-            .map(|scribe| scribe.contention_totals_for_test())
-            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
-    }
-
     /// Report the pod's closed staged-member and claim registry totals.
     ///
     /// Durability is a lifecycle transition, not a file: the only truthful
@@ -2093,17 +2074,6 @@ impl WyrdTestServer {
     {
         self.bifrost_scribe()
             .map(|scribe| scribe.staging_totals_for_test())
-            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
-    }
-
-    /// Report how many complete lifecycle vectors this pod's capacity completes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this server owns no Scribe.
-    pub fn scribe_ownership_ceiling_for_test(&self) -> Result<usize, WyrdTestServerError> {
-        self.bifrost_scribe()
-            .map(|scribe| scribe.ownership_ceiling_for_test())
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
     }
 

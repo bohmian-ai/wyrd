@@ -26,10 +26,13 @@ pub(crate) struct OtlpDecodePlan {
 }
 
 impl OtlpDecodePlan {
-    /// Returns the simultaneous typed-backing and projected-output demand the
-    /// caller reserves before generated decode.
+    /// Returns the generated-request backing the caller reserves before
+    /// generated decode.
+    ///
+    /// Projected Arrow output is not charged here: Scribe charges it when it
+    /// is materialized.
     pub(crate) const fn reservation_bytes(&self) -> usize {
-        self.decode_bytes.saturating_add(self.projected_bytes)
+        self.decode_bytes
     }
 }
 

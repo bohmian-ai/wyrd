@@ -74,47 +74,6 @@ pub(crate) fn file_candidates(batches: &[RecordBatch]) -> Vec<FileCandidate> {
     candidates
 }
 
-/// Returns the largest whole-batch candidate from row and Arrow-byte facts.
-///
-/// This form takes row and byte facts directly. Ingress
-/// and the shard owner use it before WAL mutation so their replayability check
-/// cannot drift from the encoder's grouping rule.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::Internal`] when candidate row or byte arithmetic
-/// overflows.
-pub(crate) fn largest_candidate_bytes_from_facts(
-    facts: impl IntoIterator<Item = (usize, usize)>,
-) -> Result<usize, ScribeError> {
-    let mut candidate_rows = 0_usize;
-    let mut candidate_bytes = 0_usize;
-    let mut largest = 0_usize;
-    for (rows, bytes) in facts {
-        if candidate_rows != 0
-            && candidate_rows
-                .checked_add(rows)
-                .is_none_or(|projected| projected > FILE_CANDIDATE_TARGET_ROWS)
-        {
-            largest = largest.max(candidate_bytes);
-            candidate_rows = 0;
-            candidate_bytes = 0;
-        }
-        candidate_rows = candidate_rows
-            .checked_add(rows)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "Parquet candidate row count overflowed".to_owned(),
-            })?;
-        candidate_bytes =
-            candidate_bytes
-                .checked_add(bytes)
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "Parquet candidate Arrow footprint overflowed".to_owned(),
-                })?;
-    }
-    Ok(largest.max(candidate_bytes))
-}
-
 /// Result of encoding a frozen memtable to Parquet.
 #[derive(Debug)]
 pub struct ParquetEncoded {
@@ -1106,18 +1065,6 @@ mod tests {
         assert_eq!(second_candidates[1].rows, 120 * 1024);
         assert_candidates_cover_batches_within_bounds(&first.1, &first_candidates);
         assert_candidates_cover_batches_within_bounds(&second.1, &second_candidates);
-        assert_eq!(
-            largest_candidate_bytes_from_facts([
-                (60 * 1024, 60),
-                (40 * 1024, 40),
-                (1, 7),
-                (120 * 1024, 120),
-                (2, 9),
-            ])
-            .expect("candidate peak"),
-            120,
-            "admission reserves the complete largest grouped candidate"
-        );
     }
 
     /// Builds the canonical hourly write recipe for a test schema.

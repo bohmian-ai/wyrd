@@ -816,6 +816,9 @@ impl<A: GateAudit + 'static> Gate<A> {
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("trace", &error))?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Traces, "spans"),
@@ -858,6 +861,9 @@ impl<A: GateAudit + 'static> Gate<A> {
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("metric", &error))?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Metrics, "points"),
@@ -900,6 +906,9 @@ impl<A: GateAudit + 'static> Gate<A> {
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("log", &error))?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Logs, "records"),

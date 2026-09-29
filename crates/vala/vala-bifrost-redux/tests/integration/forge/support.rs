@@ -2468,40 +2468,36 @@ async fn start_scribe(
         )
         .expect("fixture WAL writer"),
     );
-    Arc::new(
-        ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-            catalog: Some(catalog),
-            operator: staging,
-            wal,
-            stream: vala_bifrost_redux::scribe::stream_identity::StreamIdentity::new(
-                node_id,
-                vala_bifrost_redux::scribe::stream_identity::WriterEpoch::new(1),
-            ),
-            admission: AdmissionConfig::default(),
-            coordination_runtime: tokio::runtime::Handle::current(),
-            execution_pools: ScribeExecutionPools::new(
-                ScribeIngressCpuPool::new_with_capacity(2, 256),
-                ScribePersistenceCpuPool::new_with_capacity(2, 64),
-                ScribeWalIoPool::new_with_capacity(2, 256),
-            ),
-            persistence: Some(
-                ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 64, 2)
-                    .with_operator_pool(database.operator_pool().clone())
-                    .with_output_scratch(output_scratch),
-            ),
-            resources,
-            ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
-            geometry:
-                vala_bifrost_redux::scribe::geometry::ScribeGeometry::for_uniform_shard_rotation(
-                    WalConfig::default().segment_bytes,
-                    vala_bifrost_redux::scribe::memtable::MEMTABLE_ROTATION_BYTES,
-                    ScribePressureConfig::default().seal_max_age,
-                )
-                .expect("fixture Scribe geometry"),
-            staging_file_publisher: None,
-        })
-        .expect("fixture Scribe"),
-    )
+    Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+        catalog: Some(catalog),
+        operator: staging,
+        wal,
+        stream: vala_bifrost_redux::scribe::stream_identity::StreamIdentity::new(
+            node_id,
+            vala_bifrost_redux::scribe::stream_identity::WriterEpoch::new(1),
+        ),
+        admission: AdmissionConfig::default(),
+        coordination_runtime: tokio::runtime::Handle::current(),
+        execution_pools: ScribeExecutionPools::new(
+            ScribeIngressCpuPool::new_with_capacity(2, 256),
+            ScribePersistenceCpuPool::new_with_capacity(2, 64),
+            ScribeWalIoPool::new_with_capacity(2, 256),
+        ),
+        persistence: Some(
+            ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 64, 2)
+                .with_operator_pool(database.operator_pool().clone())
+                .with_output_scratch(output_scratch),
+        ),
+        resources,
+        ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
+        geometry: vala_bifrost_redux::scribe::geometry::ScribeGeometry::for_uniform_shard_rotation(
+            WalConfig::default().segment_bytes,
+            vala_bifrost_redux::scribe::memtable::MEMTABLE_ROTATION_BYTES,
+            ScribePressureConfig::default().seal_max_age,
+        )
+        .expect("fixture Scribe geometry"),
+        staging_file_publisher: None,
+    }))
 }
 
 /// Registers the cluster-node row Scribe's publication fence requires.

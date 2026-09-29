@@ -3,7 +3,7 @@
 use super::ScribeImpl;
 use crate::contracts::{FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame};
 use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
-use crate::scribe::material_plan::{MaterialPlan, MaximumEnvelopeDecision, ScribeIngressPlanner};
+use crate::scribe::material_plan::{MaterialPlan, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows, PreparedAppend};
 use crate::tables::AuditLogTable;
@@ -255,19 +255,12 @@ impl ScribeImpl {
     fn plan_transport_payload(
         &self,
         frame: &ScribeIngressFrame,
-        physical_binding_peak_bytes: usize,
     ) -> Result<MaterialPlan, ScribeError> {
         let planner = ScribeIngressPlanner::new(self.ingest_limits);
         let plan = match &frame.payload {
-            IngressPayload::ArrowIpc(bytes) => {
-                planner.plan_native(bytes, physical_binding_peak_bytes)?
-            }
+            IngressPayload::ArrowIpc(bytes) => planner.plan_native(bytes)?,
             IngressPayload::Canonical(canonical) => {
-                let plan = planner.plan_canonical(
-                    &canonical.batches,
-                    frame.measured_wire_bytes,
-                    physical_binding_peak_bytes,
-                )?;
+                let plan = planner.plan_canonical(&canonical.batches, frame.measured_wire_bytes)?;
                 validate_decoded_request_size(
                     plan.current_material_bytes,
                     plan.request_bytes,
@@ -372,11 +365,13 @@ impl ScribeImpl {
         }
     }
 
-    /// Validates, plans, and reserves one complete logical root.
+    /// Validates, plans, and charges the bytes one logical frame already holds.
     ///
-    /// A transport-decode owner is adopted when present; otherwise Scribe
-    /// obtains the root directly. Physical binding and shard attachment happen
-    /// only after the complete source-derived plan has been admitted.
+    /// A transport-decode owner is transferred when present; otherwise Scribe
+    /// opens an empty lease on the shared root. The lease is then sized to the
+    /// materialized Arrow the payload holds now. Future decode, WAL, and
+    /// persistence output is charged only when it is materialized. Physical
+    /// binding and shard attachment happen after the charge is admitted.
     ///
     /// # Errors
     ///
@@ -397,33 +392,14 @@ impl ScribeImpl {
         let binding_facts =
             crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
                 .map_err(|_| ScribeError::InvalidFrame)?;
-        let material_plan = self.plan_transport_payload(frame, binding_facts.peak_bytes)?;
-        if let MaximumEnvelopeDecision::IntrinsicRefusal {
-            demand_bytes,
-            limit_bytes,
-        } = material_plan.maximum_envelope_decision(self.memory.ingress_limit_bytes())
-        {
-            return Err(ScribeError::DecodedPayloadTooLarge {
-                bytes: demand_bytes,
-                limit: limit_bytes,
-            });
-        }
+        let material_plan = self.plan_transport_payload(frame)?;
+        let held_bytes = material_plan.held_material_bytes();
         lifecycle.planned(&material_plan);
         let mut memory = match decode_owner {
-            Some(owner) => owner.complete(material_plan.root_bytes)?,
-            None => match self
-                .memory
-                .try_reserve_ingress(MemoryCategory::Raw, material_plan.root_bytes)
-            {
-                Ok(reservation) => reservation,
-                Err(_) => self.reserve_ingress_after_pressure_seal(
-                    MemoryCategory::Raw,
-                    material_plan.root_bytes,
-                    &frame.table.name,
-                )?,
-            },
+            Some(owner) => owner.complete(),
+            None => self.memory.try_reserve_ingress(MemoryCategory::Raw, 0)?,
         };
-        lifecycle.reserved(material_plan.root_bytes);
+        self.resize_after_pressure_seal(&mut memory, held_bytes, &frame.table.name)?;
         let binding = Self::construct_physical_binding(binding_facts, frame.principal.tenant_id)?;
         let table = binding.table_ref.fqn();
         let shard = self.shards.lane_for(
@@ -431,16 +407,7 @@ impl ScribeImpl {
             &binding.table_ref,
             frame.batch_id,
         );
-        // The cell key is the tenant/table pair, not the shard: a table's
-        // protected reserve must survive routing, and blake3 routing puts the
-        // same table on different shards for different batches.
-        let cell = crate::scribe::contention::ContentionKey::new(
-            frame.principal.tenant_id,
-            binding.table_ref.clone(),
-        );
-        let reservation =
-            self.admission
-                .try_reserve_for_cell(&cell, table, material_plan.root_bytes)?;
+        let reservation = self.admission.try_reserve(table)?;
         memory.attach_shard(shard)?;
         #[cfg(any(test, feature = "test-support"))]
         self.pause_admitted_ingest_for_test().await;
@@ -594,8 +561,6 @@ impl ScribeImpl {
             request_id,
             rows,
             measured_wire_bytes: frame.measured_wire_bytes,
-            admitted_bytes: material_plan.root_bytes,
-            maximum_scribe_envelope_bytes: self.memory.ingress_limit_bytes(),
             reservation,
             memory,
             tenant,
@@ -606,7 +571,8 @@ impl ScribeImpl {
             lifecycle,
         };
         let planned_rows_accepted = u64::try_from(material_plan.rows).unwrap_or(u64::MAX);
-        let prepared = self.preprocess(admitted).await?;
+        let mut prepared = self.preprocess(admitted).await?;
+        self.charge_prepared(&mut prepared)?;
         self.shards
             .try_send(prepared)
             .inspect_err(|_| super::record_scribe_rejection("queue"))?;
@@ -620,6 +586,37 @@ impl ScribeImpl {
             receipt_micros,
             first_commit: completion.first_commit,
         })
+    }
+
+    /// Charges the bytes one prepared append actually holds before WAL/ACK.
+    ///
+    /// Preprocessing materialized the memtable slices and their WAL records;
+    /// the admitted lease grows or shrinks to exactly that retained set, which
+    /// is the one root reservation the ingress lifecycle records. A refusal
+    /// drops the append and its owners before any WAL or ACK.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the shared cap cannot cover the
+    /// prepared bytes after one pressure seal, and an internal error when the
+    /// prepared append lost its lease or root accounting is poisoned.
+    fn charge_prepared(&self, prepared: &mut PreparedAppend) -> Result<(), ScribeError> {
+        let bytes = prepared.prepared_bytes;
+        let table = prepared.table.name.clone();
+        let memory = prepared
+            .memory
+            .as_mut()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared append lost its memory lease".to_owned(),
+            })?;
+        let result = self.resize_after_pressure_seal(memory, bytes, &table);
+        if let Some(lifecycle) = prepared.lifecycle.as_mut() {
+            match result {
+                Ok(()) => lifecycle.reserved(bytes),
+                Err(_) => lifecycle.refuse(),
+            }
+        }
+        result
     }
 
     /// Returns the decoded-request ceiling for the current production or test owner.
@@ -689,31 +686,34 @@ impl ScribeImpl {
             .store(bytes, std::sync::atomic::Ordering::Release);
     }
 
-    /// Reserve ingress bytes after one coordinated pressure seal and single retry.
+    /// Resizes one ingress lease, retrying once after a coordinated pressure seal.
     ///
     /// This is the admission-side realization of the D83 flush-first contract:
-    /// on an ingress ceiling rejection, request a shard-count-invariant pressure
-    /// seal toward the low-water mark ([`ScribeImpl::request_pressure_seal_toward_low_water`]),
-    /// then retry the reservation exactly once. The cgroup 90% tripwire is left
-    /// as an immediate `IngestBusy` — a container-level limit that a Scribe
-    /// pressure seal cannot relieve — and is not retried. A retry that still
-    /// fails records the rejection labelled by the ceiling that tripped (D84,
-    /// via [`super::record_scribe_ceiling_rejection`] — `cgroup_breaker`,
-    /// `ingress_sublimit`, or `bifrost_parent`) and returns `IngestBusy`,
-    /// deferring to D71 client backoff for eventual admission. There is no
+    /// when the shared root refuses the resize, request a shard-count-invariant
+    /// pressure seal toward the low-water mark
+    /// ([`ScribeImpl::request_pressure_seal_toward_low_water`]), then retry
+    /// exactly once. An engaged cgroup tripwire is a container-level limit a
+    /// Scribe seal cannot relieve, so it returns `IngestBusy` without a retry.
+    /// A retry that still fails records the rejection labelled by the ceiling
+    /// that tripped (D84, via [`super::record_scribe_ceiling_rejection`]) and
+    /// returns `IngestBusy`, deferring to D71 client backoff. There is no
     /// busy-wait: freezing and persistence proceed asynchronously between the
-    /// seal request and retry.
+    /// seal request and retry. A refused resize leaves the lease unchanged.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::IngestBusy`] when the cgroup tripwire is engaged or
-    /// when the single post-seal retry still cannot fit under the ingress ceiling.
-    fn reserve_ingress_after_pressure_seal(
+    /// when the single post-seal retry still cannot fit under the shared cap,
+    /// and an internal error when root accounting is poisoned.
+    pub(super) fn resize_after_pressure_seal(
         &self,
-        category: MemoryCategory,
+        lease: &mut crate::resources::ScribeMemoryLease,
         bytes: usize,
         table: &str,
-    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
+    ) -> Result<(), ScribeError> {
+        if lease.resize_ingress(bytes).is_ok() {
+            return Ok(());
+        }
         if self.memory.cgroup_tripwire_engaged() {
             super::record_scribe_ceiling_rejection(
                 crate::scribe::memory::ScribeRejectionCeiling::CgroupBreaker,
@@ -723,19 +723,23 @@ impl ScribeImpl {
             });
         }
         self.request_pressure_seal_toward_low_water();
-        match self.memory.try_reserve_ingress(category, bytes) {
-            Ok(reservation) => return Ok(reservation),
-            Err(_) => super::record_scribe_ceiling_rejection(
-                if self.memory.ingress_sublimit_exceeded(bytes) {
-                    crate::scribe::memory::ScribeRejectionCeiling::IngressSublimit
-                } else {
-                    crate::scribe::memory::ScribeRejectionCeiling::BifrostParent
-                },
-            ),
+        match lease.resize_ingress(bytes) {
+            Ok(()) => Ok(()),
+            Err(ScribeError::IngestBusy { .. }) => {
+                let growth = bytes.saturating_sub(lease.bytes());
+                super::record_scribe_ceiling_rejection(
+                    if self.memory.ingress_sublimit_exceeded(growth) {
+                        crate::scribe::memory::ScribeRejectionCeiling::IngressSublimit
+                    } else {
+                        crate::scribe::memory::ScribeRejectionCeiling::BifrostParent
+                    },
+                );
+                Err(ScribeError::IngestBusy {
+                    table: table.to_owned(),
+                })
+            }
+            Err(error) => Err(error),
         }
-        Err(ScribeError::IngestBusy {
-            table: table.to_owned(),
-        })
     }
 
     /// Pause one admitted write at the deterministic test-support barrier.
@@ -853,20 +857,29 @@ mod tests {
             .memory
             .try_reserve_ingress(MemoryCategory::Raw, ceiling)
             .expect("pin ingress at the ceiling");
+        let mut lease = scribe
+            .memory
+            .try_reserve_ingress(MemoryCategory::Raw, 0)
+            .expect("an empty lease never exceeds the cap");
         assert!(
             matches!(
-                scribe.reserve_ingress_after_pressure_seal(MemoryCategory::Raw, 1, "table"),
+                scribe.resize_after_pressure_seal(&mut lease, 1, "table"),
                 Err(ScribeError::IngestBusy { .. })
             ),
             "a backlogged ceiling must reject after the seal request"
         );
+        assert_eq!(
+            lease.bytes(),
+            0,
+            "a refused resize leaves the lease unchanged"
+        );
 
         // Release the pin so capacity is available; the same path now admits.
         drop(pinned);
-        let admitted = scribe
-            .reserve_ingress_after_pressure_seal(MemoryCategory::Raw, ceiling / 2, "table")
+        scribe
+            .resize_after_pressure_seal(&mut lease, ceiling / 2, "table")
             .expect("admits once ingress capacity is available");
-        drop(admitted);
+        drop(lease);
 
         scribe
             .shutdown(Instant::now() + Duration::from_secs(1))
@@ -917,6 +930,77 @@ mod tests {
             measured_wire_bytes: 0,
             payload: IngressPayload::Canonical(CanonicalIngress::unreserved(vec![rows])),
         }
+    }
+
+    /// An OTLP decode lease transfers into Scribe and is resized to the bytes
+    /// Scribe holds, so decode, projection, and memtable are charged once.
+    ///
+    /// A decode owner much larger than the tiny projected batch is carried by
+    /// the frame. After the durable ACK, no transport, decode, or prepared
+    /// category charge remains, and the only Scribe bytes left are the
+    /// memtable's own active ownership — the decode charge was neither added
+    /// to nor left behind the memtable charge.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the owner cannot be reserved, the write is refused, or a
+    /// category other than memtable ownership still holds bytes after ACK.
+    #[tokio::test]
+    async fn decode_to_memtable_transfers_one_charge() {
+        let scribe = ScribeImpl::new();
+        let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("random tenant is valid");
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKind::User,
+            tenant_id: tenant,
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::new(),
+            credential_id: None,
+        };
+        let baseline = scribe.memory_snapshot().scribe_total_bytes;
+        let decode_bytes = 4 * 1024 * 1024;
+        let mut frame = decoded_size_frame(tenant, &principal, "v".repeat(1024));
+        let IngressPayload::Canonical(canonical) = &mut frame.payload else {
+            unreachable!("the fixture frame is canonical");
+        };
+        canonical.owner = Some(crate::contracts::OtlpDecodeOwner {
+            memory: scribe
+                .memory
+                .try_reserve_ingress(MemoryCategory::Decode, decode_bytes)
+                .expect("decode owner fits the embedded root"),
+        });
+        assert_eq!(
+            scribe.memory_snapshot().scribe_total_bytes,
+            baseline + decode_bytes
+        );
+
+        let admission = Scribe::ingest_frame(&scribe, frame)
+            .await
+            .expect("the canonical write is admitted");
+        assert_eq!(admission.rows_accepted, 1);
+
+        let after = scribe.memory_snapshot();
+        for category in [
+            MemoryCategory::Raw,
+            MemoryCategory::Decode,
+            MemoryCategory::Prepared,
+        ] {
+            assert_eq!(
+                after.categories[category as usize], 0,
+                "{category:?} still holds a pre-ACK charge"
+            );
+        }
+        let memtable = after.categories[MemoryCategory::Active as usize]
+            + after.categories[MemoryCategory::Immutable as usize];
+        assert!(memtable > 0, "the ACKed rows are charged to the memtable");
+        assert!(
+            memtable < decode_bytes,
+            "the decode charge was transferred and resized, not retained"
+        );
+        assert_eq!(after.scribe_total_bytes, baseline + memtable);
+        scribe
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
     }
 
     /// The system owner passes transport validation only as the platform audit

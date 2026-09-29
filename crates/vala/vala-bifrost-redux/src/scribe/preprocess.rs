@@ -49,9 +49,6 @@ pub(crate) struct AdmittedAppend {
     pub request_id: Uuid,
     pub rows: AdmittedRows,
     pub measured_wire_bytes: usize,
-    pub admitted_bytes: usize,
-    /// Maximum root envelope that must later replay this accepted unit.
-    pub maximum_scribe_envelope_bytes: usize,
     pub reservation: InflightFrameReservation,
     pub memory: ScribeMemoryLease,
     pub tenant: DataTenantId,
@@ -115,10 +112,6 @@ pub(crate) struct PreparedAppend {
     pub slices: PreparedSliceSet,
     pub reservation: InflightFrameReservation,
     pub memory: Option<ScribeMemoryLease>,
-    /// Exact retained and persistence facts from the sole materialization.
-    pub exact_material: ExactMaterialFacts,
-    /// Maximum root envelope checked again with exact grouped-candidate facts.
-    pub maximum_scribe_envelope_bytes: usize,
     pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
     pub lifecycle: Option<crate::scribe::telemetry::ScribeIngressLifecycleOwner>,
@@ -129,19 +122,6 @@ pub(crate) struct PreparedAppend {
 pub(crate) enum PreparedSliceSet {
     /// The complete once-materialized slice set retained through visibility.
     Materialized(Vec<PreparedSlice>),
-}
-
-/// Exact byte facts measured after the accepted unit is materialized once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExactMaterialFacts {
-    /// Complete retained live-set charged after atomic shrink.
-    pub(crate) retained_live: usize,
-    /// Largest whole stored Arrow batch in this unit.
-    pub(crate) largest_stored_batch: usize,
-    /// Largest candidate persistence must later admit without splitting input.
-    pub(crate) persistence_candidate_peak: usize,
-    /// Immutable candidate plus its serial incremental Parquet workspace.
-    pub(crate) persistence_envelope_peak: usize,
 }
 
 /// Stateful current-only native slice producer.
@@ -679,18 +659,19 @@ fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError
 
 /// Split and serialize an admitted append on the bounded pre-ACK CPU lane.
 ///
+/// The returned `prepared_bytes` is the exact retained memtable-plus-WAL set;
+/// the ingress owner charges it on the shared root before WAL/ACK.
+///
 /// # Errors
 ///
-/// Returns the preparation error after notifying the durable waiter, or a
-/// stable material refusal when the retained prepared source exceeds its root.
+/// Returns the preparation or category-transition error after notifying the
+/// durable waiter.
 pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
     let AdmittedAppend {
         batch_id,
         request_id,
         rows,
         measured_wire_bytes: _measured_wire_bytes,
-        admitted_bytes: _admitted_bytes,
-        maximum_scribe_envelope_bytes,
         reservation,
         mut memory,
         tenant,
@@ -730,39 +711,12 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             .saturating_add(slice.wal_append.data.len());
         lifecycle.materialized(bytes);
     }
-    if prepared_bytes > memory.bytes() {
-        let error = ScribeError::DecodedPayloadTooLarge {
-            bytes: prepared_bytes,
-            limit: memory.bytes(),
-        };
-        lifecycle.refuse();
-        notify_completion(&mut durable_ack, &error);
-        return Err(error);
-    }
-    if let Err(error) = memory.shrink_to(prepared_bytes) {
-        let error = ScribeError::Internal {
-            detail: format!("exact material shrink violated the admitted upper bound: {error}"),
-        };
-        lifecycle.refuse();
-        notify_completion(&mut durable_ack, &error);
-        return Err(error);
-    }
     if let Err(error) = memory.transfer_category(MemoryCategory::Prepared) {
         lifecycle.refuse();
         notify_completion(&mut durable_ack, &error);
         return Err(error);
     }
 
-    let exact_material = exact_material_facts(&slices, prepared_bytes)?;
-    if exact_material.persistence_envelope_peak > maximum_scribe_envelope_bytes {
-        let error = ScribeError::DecodedPayloadTooLarge {
-            bytes: exact_material.persistence_envelope_peak,
-            limit: maximum_scribe_envelope_bytes,
-        };
-        lifecycle.refuse();
-        notify_completion(&mut durable_ack, &error);
-        return Err(error);
-    }
     Ok(PreparedAppend {
         batch_id,
         tenant,
@@ -771,52 +725,8 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         slices,
         reservation,
         memory: Some(memory),
-        exact_material,
-        maximum_scribe_envelope_bytes,
         durable_ack,
         lifecycle: Some(lifecycle),
-    })
-}
-
-/// Measures exact retained and whole-batch persistence facts.
-fn exact_material_facts(
-    slices: &PreparedSliceSet,
-    retained_live_bytes: usize,
-) -> Result<ExactMaterialFacts, ScribeError> {
-    let largest_stored_batch_bytes = match slices {
-        PreparedSliceSet::Materialized(slices) => slices
-            .iter()
-            .map(|slice| slice.memtable_bytes)
-            .max()
-            .unwrap_or(0),
-    };
-    let persistence_candidate_peak = match slices {
-        PreparedSliceSet::Materialized(slices) => {
-            let mut by_key = std::collections::HashMap::<SealKey, Vec<(usize, usize)>>::new();
-            for slice in slices {
-                by_key
-                    .entry(slice.seal_key.clone())
-                    .or_default()
-                    .push((slice.rows.num_rows(), slice.memtable_bytes));
-            }
-            by_key.into_values().try_fold(0_usize, |largest, facts| {
-                crate::scribe::parquet_writer::largest_candidate_bytes_from_facts(facts)
-                    .map(|candidate| largest.max(candidate))
-            })?
-        }
-    };
-    let persistence_envelope_peak = persistence_candidate_peak
-        .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
-            persistence_candidate_peak,
-        )?)
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "persistence replayability envelope overflowed".to_owned(),
-        })?;
-    Ok(ExactMaterialFacts {
-        retained_live: retained_live_bytes,
-        largest_stored_batch: largest_stored_batch_bytes,
-        persistence_candidate_peak,
-        persistence_envelope_peak,
     })
 }
 
@@ -1073,7 +983,7 @@ mod tests {
     /// Builds the retained owner required by the descriptor-driven decoder.
     fn planned_source(bytes: Bytes, fingerprint: SchemaFingerprint) -> NativeAdmittedRows {
         let plan = ScribeIngressPlanner::default()
-            .plan_native(&bytes, 0)
+            .plan_native(&bytes)
             .expect("native plan");
         let tenant = DataTenantId::new_v7();
         NativeAdmittedRows {
@@ -1105,7 +1015,7 @@ mod tests {
     fn native_descriptor_decoder_accepts_aligned_and_unaligned_transport() {
         let (aligned, fingerprint) = native_stream();
         let aligned_plan = ScribeIngressPlanner::default()
-            .plan_native(&aligned, 0)
+            .plan_native(&aligned)
             .expect("aligned plan");
         assert_eq!(aligned_plan.aligned_copy_bytes, 0);
 
@@ -1114,7 +1024,7 @@ mod tests {
         shifted.extend_from_slice(&aligned);
         let unaligned = Bytes::from(shifted).slice(1..);
         let unaligned_plan = ScribeIngressPlanner::default()
-            .plan_native(&unaligned, 0)
+            .plan_native(&unaligned)
             .expect("unaligned plan");
         assert_eq!(
             unaligned_plan.aligned_copy_bytes,

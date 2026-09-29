@@ -333,37 +333,6 @@ impl Memtable {
         Ok(())
     }
 
-    /// Computes the encoder candidate peak after appending whole incoming batches.
-    ///
-    /// The calculation borrows the active bucket and does not concatenate or
-    /// clone Arrow arrays. Its grouping rule is shared with the Parquet writer,
-    /// allowing the shard owner to rotate before WAL mutation when appending to
-    /// an existing candidate would make the generation unreplayable.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the writable lock is poisoned or
-    /// candidate arithmetic overflows.
-    pub(crate) fn projected_candidate_peak(
-        &self,
-        seal_key: &SealKey,
-        incoming: impl IntoIterator<Item = (usize, usize)>,
-    ) -> Result<usize, ScribeError> {
-        let writable = self
-            .writable
-            .lock()
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("memtable writable lock poisoned: {error}"),
-            })?;
-        let retained = writable.get(seal_key).into_iter().flat_map(|bucket| {
-            bucket
-                .batches
-                .iter()
-                .map(|batch| (batch.num_rows(), estimate_batch_bytes(batch)))
-        });
-        crate::scribe::parquet_writer::largest_candidate_bytes_from_facts(retained.chain(incoming))
-    }
-
     /// Return the row count for a batch that is still retained in the active
     /// or immutable grace state for this exact seal key.
     ///

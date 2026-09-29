@@ -3,22 +3,19 @@
 //! The focused owners in this binary each prove one seam. This module proves
 //! they integrate: four tenants driving both a registered dynamic table and the
 //! lazy built-in `vala.traces.spans` through public clients, across adjacent
-//! partitions and disjoint key ranges, on a pod whose capacity forces real
-//! contention — and reading exactly what they acknowledged at every authority
+//! partitions and disjoint key ranges — and reading exactly what they acknowledged at every authority
 //! the rows pass through.
 
 use std::sync::Arc;
 
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT;
-use vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy;
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
 use super::support::{
     append_batch, append_values_at, read_sql, register_table, sorted_values, span_batch,
-    start_scribe_server_with_admission, tenant_client, unique_table, until_admitted,
+    start_scribe_server, tenant_client, unique_table, until_admitted,
 };
 
 /// Tenants that drive the journey concurrently.
@@ -124,14 +121,9 @@ impl Participant {
 /// partitions so the physical layout is not a single cell, and sixty-four
 /// distinct batch identities so ingest is sustained rather than sampled.
 ///
-/// The pod is started with its Scribe child budget at exactly one complete
-/// lifecycle vector. That is what makes the run sustained rather than
-/// sequential: with every tenant in flight at once, capacity is genuinely
-/// contended, the pod refuses with the stable retryable code, and the shared
-/// bounded retry proves those refusals are pressure a real client recovers from
-/// rather than lost work. The journey asserts that at least one refusal
-/// happened — a run in which nothing was ever refused would prove nothing about
-/// pressure — and that every participant was nonetheless admitted.
+/// Every tenant is in flight at once, so the shared bounded retry absorbs any
+/// retryable refusal the one governed pool issues; a refusal is pressure a real
+/// client recovers from, never lost work.
 ///
 /// Reads then follow the rows through all three authorities: active writable
 /// buckets, durable staged members after the freeze, and committed hot objects
@@ -142,57 +134,24 @@ impl Participant {
 /// ranges fails if one tenant's read ever carries another's row.
 ///
 /// Terminal reconciliation closes the run: the pod drains its ownership, the
-/// retained telemetry owner shows every admission transition it opened also
-/// closed, no vector lent, no claim outstanding, and no staged member surviving
+/// retained telemetry owner shows no claim outstanding and no staged member surviving
 /// the objects that replaced it.
 ///
 /// # Panics
 ///
-/// Panics when the pod does not derive a single-vector ceiling, when a public
-/// append is refused for any reason other than capacity, when no participant is
-/// ever refused, when any read returns other than the exact acknowledged rows,
+/// Panics when a public append is refused for any reason other than capacity,
+/// when any read returns other than the exact acknowledged rows,
 /// when publication does not account for every row, or when terminal ownership
 /// and telemetry do not reconcile.
-// Four tenants must actually run at once for the pod's single vector to be
-// contended; a current-thread runtime lets a loaded host serialize them and the
-// run then observes no refusal at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_sustained_ingest_oracle_hot_read_journey() {
-    let admission = AdmissionConfig {
-        scribe_memory_limit_bytes: Some(
-            ScribeArtifactPolicy::default().minimum_scribe_memory_bytes(),
-        ),
-        ..AdmissionConfig::default()
-    };
-    let server = start_scribe_server_with_admission(admission).await;
-    assert_eq!(
-        server
-            .scribe_ownership_ceiling_for_test()
-            .expect("the pod reports its derived ownership ceiling"),
-        1,
-        "a sustained run only observes real contention on a pod whose measured \
-         capacity completes one table's lifecycle at a time"
-    );
+    let server = start_scribe_server().await;
 
     let mut participants = build_participants(&server).await;
 
-    // Every tenant drives both of its tables at once, so the pod's one vector
-    // is contended for the whole phase and each refusal is real pressure a
-    // public client recovers from.
+    // Every tenant drives both of its tables at once.
     drive_sustained_ingest(&mut participants).await;
-    // Counted on the pod, not at the client: the gRPC transport retries a busy
-    // refusal inside its frame budget, so a fast host absorbs every refusal
-    // before `until_admitted` can see one.
-    let refusals = server
-        .scribe_contention_totals_for_test()
-        .expect("the pod's contention totals are inspectable")
-        .activation_refusals();
-    assert!(
-        refusals > 0,
-        "a pod lending a single vector to four concurrent tenants must refuse at \
-         least once; a run with no refusal proves nothing about pressure or retry"
-    );
 
     // Active authority: the rows live in writable buckets on the configured
     // shards and nothing has been staged or published.
@@ -324,8 +283,8 @@ async fn build_participants(server: &WyrdTestServer) -> Vec<Participant> {
 /// Each tenant runs one bounded task that alternates between its dynamic table
 /// and the built-in, placing consecutive batches in two adjacent hour
 /// partitions. The tasks rendezvous on a barrier before their first append, so
-/// contention for the pod's single vector is structural rather than dependent
-/// on scheduling order. Every attempt goes through the shared bounded retry, so
+/// every tenant is in flight at once rather than whenever the runtime happens
+/// to schedule it. Every attempt goes through the shared bounded retry, so
 /// a busy refusal that outlasts the transport's own retries is recovered the
 /// way a public client would recover it.
 ///
@@ -335,11 +294,8 @@ async fn build_participants(server: &WyrdTestServer) -> Vec<Participant> {
 /// for a reason other than capacity pressure.
 async fn drive_sustained_ingest(participants: &mut [Participant]) {
     let base = super::support::hour_start(chrono::Utc::now());
-    // Every participant blocks here until all of them are ready, so the pod's
-    // single vector is contended by the first append of every tenant at once
-    // rather than whenever the runtime happens to schedule them. Without the
-    // barrier a skewed scheduling order can serialize the tenants and the run
-    // observes no refusal at all, which proves nothing about pressure.
+    // Every participant blocks here until all of them are ready, so the first
+    // append of every tenant is in flight at once.
     let start = Arc::new(tokio::sync::Barrier::new(participants.len()));
     let mut tasks = Vec::with_capacity(participants.len());
     for (ordinal, participant) in participants.iter().enumerate() {
@@ -402,8 +358,7 @@ fn batch_values(tenant_ordinal: usize, batch: usize) -> Vec<i64> {
 /// Asserts the drained pod's ownership and retained telemetry reconcile.
 ///
 /// Every published object has replaced the members that produced it, so a
-/// settled pod must lend no vector, hold no admission transition, own no
-/// writable bucket, and have closed every claim it opened. These are the totals
+/// settled pod must own no writable bucket and have closed every claim it opened. These are the totals
 /// of the one retained observation owner checked against the inspected
 /// ownership beside them.
 ///
@@ -411,24 +366,6 @@ fn batch_values(tenant_ordinal: usize, batch: usize) -> Vec<i64> {
 ///
 /// Panics when the totals are not inspectable or any of them does not settle.
 fn assert_terminal_reconciliation(server: &WyrdTestServer) {
-    let contention = server
-        .scribe_contention_totals_for_test()
-        .expect("the pod's contention totals are inspectable");
-    assert_eq!(
-        contention.starts(),
-        contention.terminals(),
-        "every admission transition the sustained run opened was closed exactly once"
-    );
-    assert_eq!(
-        contention.active_transitions(),
-        0,
-        "a drained pod holds no admission transition in flight"
-    );
-    assert_eq!(
-        contention.live_vectors(),
-        0,
-        "a drained pod lends no lifecycle vector"
-    );
     let staging = server
         .scribe_staging_totals_for_test()
         .expect("the pod's staged and claim totals are inspectable");

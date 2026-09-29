@@ -39,23 +39,6 @@ pub(super) async fn start_scribe_server_with_geometry(geometry: ScribeGeometry) 
         .expect("the Scribe production harness starts with the requested geometry")
 }
 
-/// Starts one bound production server with an explicit Scribe admission config.
-///
-/// The admission configuration is the only control that moves the pod's derived
-/// ownership ceiling, which is what a fairness case needs: real contention
-/// cannot be placed on a pod whose measured capacity completes more tables than
-/// the case can ever occupy. Every other control stays exactly what production
-/// uses, so the scheduler under test is the production scheduler.
-pub(super) async fn start_scribe_server_with_admission(
-    admission: vala_bifrost_redux::scribe::admission::AdmissionConfig,
-) -> WyrdTestServer {
-    WyrdTestServer::builder()
-        .with_scribe_admission_for_test(admission)
-        .start_bound()
-        .await
-        .expect("the Scribe production harness starts with the requested admission capacity")
-}
-
 /// Registers one single-column table for a tenant through the real catalog.
 pub(super) async fn register_table(
     server: &WyrdTestServer,
@@ -347,34 +330,6 @@ const ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(6
 /// and records the most refusals. Backing off bounds that, and bounds the load
 /// a waiting participant puts on the pod it is waiting for.
 const ADMISSION_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(16);
-
-/// Sends one append through public ingest until the pod admits it.
-///
-/// Capacity refusal is the one outcome this retries. Every other error is a
-/// fault and fails the case immediately, so a case can never mistake a broken
-/// route for a busy one. The returned count is how many times the pod refused
-/// before admitting, which is the measure of whose turn the scheduler kept
-/// giving away.
-///
-/// Retries back off geometrically to [`ADMISSION_MAX_BACKOFF`] rather than
-/// spinning, and give up at [`ADMISSION_DEADLINE`] with the label and the
-/// refusal count in the message.
-///
-/// # Panics
-///
-/// Panics when the append fails for any reason other than capacity pressure,
-/// or when it is still refused at [`ADMISSION_DEADLINE`].
-pub(super) async fn append_until_admitted(
-    client: &wyrd_client::WyrdClient,
-    table: &str,
-    rows: &[i64],
-    label: &str,
-) -> usize {
-    until_admitted(label, || {
-        append_values(client, table, uuid::Uuid::now_v7(), rows)
-    })
-    .await
-}
 
 /// Retries one caller-supplied public ingest attempt until the pod admits it.
 ///

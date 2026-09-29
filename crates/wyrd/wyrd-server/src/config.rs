@@ -1601,11 +1601,6 @@ impl ScribeRuntimeConfig {
             self.seal_key_early_seal_bytes,
             self.seal_key_max_age_secs.map(Duration::from_secs),
             on_disk_bytes.min(forge_target_file_size_bytes),
-            self.ingest_request_bytes,
-            vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
-            vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
-            vala_bifrost_redux::scribe::geometry::DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
-            vala_bifrost_redux::scribe::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
         )
     }
 

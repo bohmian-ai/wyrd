@@ -1,7 +1,7 @@
 //! Reconciliation of the pod's one production observation owner.
 //!
-//! Scribe publishes every admission, contention, staging and publication
-//! transition through a single `ScribeTelemetry` owner. A counter on its own is
+//! Scribe publishes every staging and publication transition through a single
+//! `ScribeTelemetry` owner. A counter on its own is
 //! not evidence that the transition it names happened, so this module never
 //! asserts a count in isolation: each total is checked against the production
 //! state the same run can observe independently — writable buckets, durable
@@ -59,20 +59,11 @@ async fn await_staging_settled(server: &WyrdTestServer) -> ScribeStagingSnapshot
 ///
 /// The case walks an ordinary hot path — append, freeze, publish, read — and at
 /// every boundary checks the owner's reconcilable totals against a fact the run
-/// can establish without the owner: an idle pod owns no vector and no member; an
-/// settled append has returned the lifecycle vector it borrowed while its rows
-/// stay owned by a writable bucket and nothing is published; the freeze makes at
-/// least one member durable with no claim yet outstanding; and publication
-/// settles every
-/// claim and retires every member it replaced while the same strict read stays
-/// exact.
-///
-/// What makes this a duplicate-projection check rather than a counter tour is
-/// that the append phase is measured as an exact delta. Four appends open four
-/// admission transitions, close four, and serve four bounded demand records on
-/// the one retained owner. A second registry projecting the same transitions
-/// would double every one of those deltas while every other fact in the run —
-/// the rows, the buckets, the objects — stayed identical.
+/// can establish without the owner: an idle pod owns no member; settled appends
+/// stay owned by a writable bucket while nothing is published; the freeze makes
+/// at least one member durable with no claim yet outstanding; and publication
+/// settles every claim and retires every member it replaced while the same
+/// strict read stays exact.
 ///
 /// # Panics
 ///
@@ -90,19 +81,6 @@ async fn scribe_hot_path_telemetry_reconciles() {
     let client = tenant_client(&server, tenant).await;
 
     // Idle: the owner has nothing to report because the pod owns nothing.
-    let idle = server
-        .scribe_contention_totals_for_test()
-        .expect("the pod's contention totals are inspectable");
-    assert_eq!(
-        idle.active_transitions(),
-        0,
-        "an idle pod holds no admission transition in flight"
-    );
-    assert_eq!(
-        idle.live_vectors(),
-        0,
-        "an idle pod lends no lifecycle vector"
-    );
     let idle_staging = server
         .scribe_staging_totals_for_test()
         .expect("the pod's staged and claim totals are inspectable");
@@ -118,52 +96,19 @@ async fn scribe_hot_path_telemetry_reconciles() {
     );
 
     let expected: Vec<i64> = (0..64).collect();
-    let appends = expected.len() / 16;
     for (ordinal, chunk) in expected.chunks(16).enumerate() {
         append_values(&client, &table, uuid::Uuid::now_v7(), chunk)
             .await
             .unwrap_or_else(|error| panic!("append {ordinal} is acknowledged: {error:?}"));
     }
 
-    // Active: every append settled, so the owner reports the exact transition
-    // deltas beside the writable bucket that still holds the acknowledged rows.
-    let active = server
-        .scribe_contention_totals_for_test()
-        .expect("the pod's contention totals are inspectable");
-    assert_eq!(
-        active.starts() - idle.starts(),
-        appends as u64,
-        "each admitted append opens exactly one admission transition on the \
-         retained owner"
-    );
-    assert_eq!(
-        active.terminals() - idle.terminals(),
-        appends as u64,
-        "each admitted append closes exactly the transition it opened"
-    );
-    assert_eq!(
-        active.demand_transitions() - idle.demand_transitions(),
-        appends as u64,
-        "each admitted append serves exactly one bounded demand record"
-    );
-    assert_eq!(
-        active.active_transitions(),
-        0,
-        "every acknowledged append closed the admission transition it opened"
-    );
-    assert_eq!(
-        active.live_vectors(),
-        0,
-        "a settled append returns the lifecycle vector it borrowed, so no \
-         vector stays lent between appends"
-    );
+    // Active: the acknowledged rows are held by a writable bucket.
     let snapshot = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
     assert!(
         snapshot.writable_bucket_count > 0,
-        "the acknowledged rows stay owned by a writable bucket after their \
-         admission transitions settled"
+        "the acknowledged rows stay owned by a writable bucket"
     );
     let staged_before_freeze = server
         .scribe_staging_totals_for_test()
@@ -235,27 +180,6 @@ async fn scribe_hot_path_telemetry_reconciles() {
         sorted_values(&client, &table).await,
         expected,
         "the reconciled run must still read back exactly the acknowledged rows"
-    );
-
-    // Terminal: the admission ledger closes everything it opened, and a pod that
-    // was never refused publishes no demand transition at all.
-    let terminal = server
-        .scribe_contention_totals_for_test()
-        .expect("the pod's contention totals are inspectable");
-    assert_eq!(
-        terminal.starts(),
-        terminal.terminals(),
-        "every admission transition the pod opened was closed exactly once"
-    );
-    assert_eq!(
-        terminal.active_transitions(),
-        0,
-        "a settled pod holds no admission transition in flight"
-    );
-    assert_eq!(
-        terminal.live_vectors(),
-        0,
-        "a settled pod lends no lifecycle vector"
     );
 
     server.shutdown().await.expect("the server drains cleanly");

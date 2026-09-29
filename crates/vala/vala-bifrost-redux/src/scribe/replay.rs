@@ -1720,7 +1720,6 @@ mod tests {
             .expect("append");
         let budget = crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig {
             memory_limit_bytes: 1,
-            scribe_memory_limit_bytes: Some(1),
             ..crate::scribe::AdmissionConfig::default()
         });
         let occupied = budget

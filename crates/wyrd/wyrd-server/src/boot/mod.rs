@@ -457,31 +457,29 @@ fn resolve_forge_config(
     (config, maintenance_interval)
 }
 
-/// Rejects a Scribe configuration whose largest admitted unit cannot replay on this root.
+/// Rejects a Scribe configuration whose largest expanded request exceeds the Bifrost cap.
 ///
-/// The comparison uses only the immutable configured shape and detected maximum
-/// Scribe envelope. Temporary occupancy remains governed by the existing
-/// capacity-epoch wait during replay.
+/// The comparison charges nothing and creates no role share: it only proves
+/// that one maximum legal expanded request can be held by the single shared
+/// cap. Runtime admission charges actual bytes through the same root.
 ///
 /// # Errors
 ///
-/// Returns [`ServerBootError::Scribe`] when envelope arithmetic overflows or
-/// the intrinsic requirement exceeds the detected root capability.
-fn validate_scribe_replay_envelope(
+/// Returns [`ServerBootError::Scribe`] when the configured expanded-data
+/// ceiling exceeds the detected Bifrost cap.
+fn validate_scribe_expanded_request(
     config: crate::config::ScribeRuntimeConfig,
-    maximum_envelope_bytes: usize,
+    cap_bytes: usize,
 ) -> Result<(), ServerBootError> {
     let limits = config.ingest_limits();
-    let required = vala_bifrost_redux::scribe::configured_maximum_envelope_bytes(limits)
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
-    if required > maximum_envelope_bytes {
-        let shortfall = required.saturating_sub(maximum_envelope_bytes);
+    let required = limits.expanded_bytes();
+    if required > cap_bytes {
+        let shortfall = required.saturating_sub(cap_bytes);
         return Err(ServerBootError::Scribe(format!(
-            "scribe configured replay envelope requires {required} bytes but the detected root \
-             provides {maximum_envelope_bytes} bytes ({shortfall} bytes short). The requirement \
-             scales from scribe.ingest_request_bytes = {request_bytes}, which Scribe must be able \
-             to hold, persist, and replay after a crash. Lower scribe.ingest_request_bytes to fit \
-             this node, or raise the node's memory limit \
+            "scribe configured expanded request requires {required} bytes but the detected \
+             Bifrost cap provides {cap_bytes} bytes ({shortfall} bytes short). The requirement \
+             scales from scribe.ingest_request_bytes = {request_bytes}. Lower \
+             scribe.ingest_request_bytes to fit this node, or raise the node's memory limit \
              (WYRD_BIFROST_MEMORY_LIMIT_BYTES / the container memory limit)",
             request_bytes = limits.max_frame_bytes
         )));
@@ -657,7 +655,7 @@ pub async fn compose_bifrost(
                 "Scribe role selected without a composed Scribe capability".to_owned(),
             )
         })?;
-        validate_scribe_replay_envelope(
+        validate_scribe_expanded_request(
             scribe_config,
             scribe_resources.maximum_ingress_envelope_bytes(),
         )?;
@@ -790,11 +788,6 @@ pub async fn compose_bifrost(
         // server. One initializer makes that divergence unrepresentable.
         let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
-            // Scribe may hold up to the one shared cap the governor enforces.
-            scribe_memory_limit_bytes: resource_plan
-                .scribe_enabled
-                .then_some(resource_plan.managed_memory_bytes),
-            policy: vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy::new(geometry),
             event_time_window: EventTimeWindow {
                 past: scribe_config
                     .event_time_past_window_secs
@@ -832,31 +825,24 @@ pub async fn compose_bifrost(
                     controls.scribe_persistence_faults.clone()
                 }),
         );
-        let scribe = Arc::new(
-            ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-                catalog: Some(Arc::clone(&bifrost)),
-                operator: Arc::new(storage.operator().clone()),
-                wal,
-                stream,
-                admission,
-                coordination_runtime: coordination_handle,
-                execution_pools,
-                persistence: Some(persistence),
-                resources: bifrost_resources.scribe().ok_or_else(|| {
-                    ServerBootError::Scribe(
-                        "Scribe role selected without a composed Scribe capability".to_owned(),
-                    )
-                })?,
-                ingest_limits: scribe_config.ingest_limits(),
-                geometry,
-                staging_file_publisher: Some(staging_file_publisher),
-            })
-            .map_err(|error| {
-                ServerBootError::Scribe(format!(
-                    "Scribe cannot complete one table's lifecycle on this node's measured resources: {error}"
-                ))
+        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+            catalog: Some(Arc::clone(&bifrost)),
+            operator: Arc::new(storage.operator().clone()),
+            wal,
+            stream,
+            admission,
+            coordination_runtime: coordination_handle,
+            execution_pools,
+            persistence: Some(persistence),
+            resources: bifrost_resources.scribe().ok_or_else(|| {
+                ServerBootError::Scribe(
+                    "Scribe role selected without a composed Scribe capability".to_owned(),
+                )
             })?,
-        );
+            ingest_limits: scribe_config.ingest_limits(),
+            geometry,
+            staging_file_publisher: Some(staging_file_publisher),
+        }));
         if let Err(error) = scribe.replay_wal_async().await {
             if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
                 tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after recovery failure");
@@ -2461,23 +2447,20 @@ mod tests {
         );
     }
 
-    /// Boot rejects an intrinsic replay envelope while accepting its exact boundary.
+    /// Boot rejects an expanded request above the cap while accepting its exact boundary.
     ///
     /// # Panics
     ///
-    /// Panics if configured maximum-envelope derivation overflows, a root one
-    /// byte too small is accepted, or the exact detected capability is refused.
+    /// Panics if a cap one byte too small is accepted or the exact cap is refused.
     #[test]
-    fn scribe_boot_rejects_intrinsically_unreplayable_config() {
+    fn scribe_boot_rejects_expanded_request_above_cap() {
         let config = crate::config::ScribeRuntimeConfig::default();
-        let required =
-            vala_bifrost_redux::scribe::configured_maximum_envelope_bytes(config.ingest_limits())
-                .expect("configured replay envelope");
-        let error = validate_scribe_replay_envelope(config, required - 1)
-            .expect_err("intrinsically unreplayable root must fail boot");
-        assert!(error.to_string().contains("configured replay envelope"));
-        validate_scribe_replay_envelope(config, required)
-            .expect("exact replay envelope must remain bootable");
+        let required = config.ingest_limits().expanded_bytes();
+        let error = validate_scribe_expanded_request(config, required - 1)
+            .expect_err("an expanded request above the cap must fail boot");
+        assert!(error.to_string().contains("configured expanded request"));
+        validate_scribe_expanded_request(config, required)
+            .expect("an expanded request equal to the cap must remain bootable");
     }
 
     /// An empty `forge` config resolves to the compiled `ForgeConfig` default

@@ -4,10 +4,11 @@
 //! moving one silently moved another. Each is now a separate named field with
 //! one meaning:
 //!
-//! 1. **WAL segment** — encoded bytes in one WAL segment before rotation.
-//! 2. **Active shard generation** — one pod-wide budget divided across the fixed
-//!    sixteen shards, capped by an absolute per-shard ceiling. This is a
-//!    rotation limit, never sixteen reservations and never an object-size
+//! 1. **WAL segment** — encoded bytes in one shard's WAL segment before the
+//!    shard rotates (`WYRD_MAX_FILE_SIZE_ON_DISK`).
+//! 2. **Active shard generation** — Arrow bytes one shard's memtable holds
+//!    before the shard rotates (`WYRD_MAX_FILE_SIZE_IN_MEMORY`). This is a
+//!    per-shard rotation limit, never a reservation and never an object-size
 //!    promise.
 //! 3. **Per-`SealKey` early seal** — an optional size or age that rotates one key
 //!    *earlier* than its shard would. A key may seal earlier on size, age, or
@@ -15,7 +16,11 @@
 //! 4. **Parquet row group** — a soft 128 MiB estimated encoded-size target
 //!    over parquet-rs row-count defaults, owned by
 //!    [`crate::parquet::writer_properties`] and not restated here.
-//! 5. **Scribe hot object** — the approximately 512 MiB staging assembly target.
+//! 5. **Scribe hot object** — the staging assembly target, the smaller of the
+//!    WAL segment size and Forge's rewrite target.
+//!
+//! The shard count (`WYRD_MEM_TABLE_BUCKET_NUM`) is carried here too because
+//! every shard applies the limits above independently.
 //!
 //! Forge's Iceberg rewrite target is a sixth geometry owned by `forge`, kept
 //! deliberately separate from all of the above.
@@ -27,27 +32,20 @@
 
 use std::time::Duration;
 
-use crate::scribe::routing::SCRIBE_SHARD_COUNT;
-
-/// Default encoded bytes in one WAL segment before rotation.
+/// Default number of Scribe shards, each with its own WAL and memtable.
+pub const DEFAULT_SHARD_COUNT: usize = 1;
+/// Largest shard count the WAL segment header's one-byte shard id can name.
+pub const MAX_SHARD_COUNT: usize = 1 << u8::BITS;
+/// Default encoded bytes in one shard's WAL segment before the shard rotates.
 pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = 512 * 1024 * 1024;
-/// Default absolute per-shard active-generation rotation ceiling.
-///
-/// A shard never rotates later than this even when the pod-wide budget would
-/// permit a larger generation, so one oversized budget cannot turn a shard into
-/// an unbounded memory owner.
-pub const DEFAULT_GENERATION_ROTATION_CEILING_BYTES: u64 = 512 * 1024 * 1024;
-/// Default pod-wide active-generation budget shared by all sixteen shards.
-///
-/// Sized so the derived per-shard limit lands exactly on
-/// [`DEFAULT_GENERATION_ROTATION_CEILING_BYTES`]: the default pod behaves as if
-/// each shard owned its own 512 MiB rotation limit, while a smaller deployment
-/// can lower one number and have every shard narrow together.
-pub const DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES: u64 =
-    DEFAULT_GENERATION_ROTATION_CEILING_BYTES * SCRIBE_SHARD_COUNT as u64;
+/// Default Arrow bytes one shard's memtable holds before the shard rotates.
+pub const DEFAULT_GENERATION_ROTATION_BYTES: u64 = 512 * 1024 * 1024;
 /// Default maximum age of an active shard generation before rotation.
 pub const DEFAULT_GENERATION_MAX_AGE: Duration = Duration::from_mins(10);
 /// Default encoded Parquet target for one assembled Scribe hot object.
+///
+/// The server derives the real target as the smaller of the WAL segment size
+/// and Forge's rewrite target; with both defaults that is this value.
 pub const DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// One governed Scribe resource category.
@@ -276,12 +274,12 @@ pub enum ScribeGeometryError {
 /// derived rotation limits or reserve vector with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScribeGeometry {
+    /// Number of shards, each with its own WAL stream and memtable.
+    shard_count: usize,
     /// Encoded bytes in one WAL segment before rotation.
     wal_segment_bytes: u64,
-    /// Pod-wide active-generation budget shared by all sixteen shards.
-    active_generation_budget_bytes: u64,
-    /// Absolute per-shard rotation ceiling applied after the budget divides.
-    generation_rotation_ceiling_bytes: u64,
+    /// Arrow bytes one shard's memtable holds before the shard rotates.
+    generation_rotation_bytes: u64,
     /// Maximum age of an active shard generation before rotation.
     generation_max_age: Duration,
     /// Optional per-`SealKey` size that rotates one key earlier than its shard.
@@ -305,27 +303,27 @@ pub struct ScribeGeometry {
 impl ScribeGeometry {
     /// Validates and constructs one complete geometry.
     ///
-    /// Validation is total: every positive-valued field is checked, the derived
-    /// per-shard rotation limit must be positive, and an early-seal size may not
-    /// exceed the per-shard limit it is supposed to precede. A geometry that
-    /// passes here cannot later produce a zero rotation limit or an early seal
-    /// that fires after the shard would already have rotated.
+    /// Validation is total: every positive-valued field is checked, the shard
+    /// count must fit the WAL header, and an early-seal size may not exceed the
+    /// per-shard limit it is supposed to precede. A geometry that passes here
+    /// cannot later produce a zero rotation limit or an early seal that fires
+    /// after the shard would already have rotated.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeGeometryError::Zero`] for a zero-valued required field,
-    /// and [`ScribeGeometryError::Incoherent`] when the pod-wide budget divides
-    /// to a zero per-shard limit or an early-seal control cannot fire before its
+    /// and [`ScribeGeometryError::Incoherent`] when the shard count exceeds
+    /// [`MAX_SHARD_COUNT`] or an early-seal control cannot fire before its
     /// shard rotates.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one validated value object over fourteen independent geometry knobs; \
+        reason = "one validated value object over twelve independent geometry knobs; \
                   splitting the constructor would let a caller build a half-checked geometry"
     )]
     pub fn new(
+        shard_count: usize,
         wal_segment_bytes: u64,
-        active_generation_budget_bytes: u64,
-        generation_rotation_ceiling_bytes: u64,
+        generation_rotation_bytes: u64,
         generation_max_age: Duration,
         seal_key_early_seal_bytes: Option<usize>,
         seal_key_max_age: Option<Duration>,
@@ -337,9 +335,9 @@ impl ScribeGeometry {
         minimum_merge_lane_scratch_bytes: usize,
     ) -> Result<Self, ScribeGeometryError> {
         let geometry = Self {
+            shard_count,
             wal_segment_bytes,
-            active_generation_budget_bytes,
-            generation_rotation_ceiling_bytes,
+            generation_rotation_bytes,
             generation_max_age,
             seal_key_early_seal_bytes,
             seal_key_max_age,
@@ -368,14 +366,7 @@ impl ScribeGeometry {
     fn check_positive(&self) -> Result<(), ScribeGeometryError> {
         let byte_fields = [
             ("wal_segment_bytes", self.wal_segment_bytes),
-            (
-                "active_generation_budget_bytes",
-                self.active_generation_budget_bytes,
-            ),
-            (
-                "generation_rotation_ceiling_bytes",
-                self.generation_rotation_ceiling_bytes,
-            ),
+            ("generation_rotation_bytes", self.generation_rotation_bytes),
             (
                 "staging_target_file_size_bytes",
                 self.staging_target_file_size_bytes,
@@ -385,6 +376,7 @@ impl ScribeGeometry {
             return Err(ScribeGeometryError::Zero { field });
         }
         let width_fields = [
+            ("shard_count", self.shard_count),
             (
                 "maximum_ingress_envelope_bytes",
                 self.maximum_ingress_envelope_bytes,
@@ -417,29 +409,29 @@ impl ScribeGeometry {
         Ok(())
     }
 
-    /// Refuses a geometry whose derived per-shard limits cannot be served.
+    /// Refuses a geometry whose shard count or per-key controls cannot be served.
     ///
     /// Runs after [`Self::check_positive`] so it can rely on every input being
-    /// positive and only has to judge what the division and the optional
-    /// per-key controls produce.
+    /// positive and only has to judge the shard-count bound and the optional
+    /// per-key controls.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeGeometryError::Incoherent`] when the pod-wide budget
-    /// divides to no per-shard rotation limit at all, or when a per-`SealKey`
-    /// control would fire after its shard has already rotated, and
+    /// Returns [`ScribeGeometryError::Incoherent`] when the shard count exceeds
+    /// what a WAL segment header can name, or when a per-`SealKey` control
+    /// would fire after its shard has already rotated, and
     /// [`ScribeGeometryError::Zero`] for a zero early-seal size.
     fn check_derived(&self) -> Result<(), ScribeGeometryError> {
-        let shard_limit = self.shard_generation_rotation_bytes();
-        if shard_limit == 0 {
+        if self.shard_count > MAX_SHARD_COUNT {
             return Err(ScribeGeometryError::Incoherent {
-                field: "active_generation_budget_bytes",
+                field: "shard_count",
                 detail: format!(
-                    "dividing it across the fixed {SCRIBE_SHARD_COUNT} shards leaves no \
-                     rotation limit at all"
+                    "{} exceeds the {MAX_SHARD_COUNT} shards a WAL segment header can name",
+                    self.shard_count
                 ),
             });
         }
+        let shard_limit = self.generation_rotation_bytes;
         if let Some(early) = self.seal_key_early_seal_bytes {
             if early == 0 {
                 return Err(ScribeGeometryError::Zero {
@@ -468,14 +460,12 @@ impl ScribeGeometry {
         Ok(())
     }
 
-    /// Builds a geometry whose sixteen shards each rotate at `shard_bytes`.
+    /// Builds a default-shard-count geometry whose shards rotate at `shard_bytes`.
     ///
-    /// Embedded and test callers know the per-shard rotation limit they want
-    /// directly rather than a pod-wide budget, so this scales the budget up by
-    /// the shard count and pins the ceiling to the same value; the derived
-    /// per-shard limit is then exactly `shard_bytes`. Every other field takes
-    /// its production default, so an embedded Scribe is not silently running a
-    /// second contention policy.
+    /// Embedded and test callers name the WAL segment, memtable, and age
+    /// limits directly. Every other field takes its production default, so an
+    /// embedded Scribe is not silently running a second contention policy;
+    /// [`Self::with_shard_count`] widens the shard topology.
     ///
     /// # Errors
     ///
@@ -486,11 +476,10 @@ impl ScribeGeometry {
         shard_bytes: usize,
         generation_max_age: Duration,
     ) -> Result<Self, ScribeGeometryError> {
-        let ceiling = u64::try_from(shard_bytes).unwrap_or(u64::MAX);
         Self::new(
+            DEFAULT_SHARD_COUNT,
             wal_segment_bytes,
-            ceiling.saturating_mul(SCRIBE_SHARD_COUNT as u64),
-            ceiling,
+            u64::try_from(shard_bytes).unwrap_or(u64::MAX),
             generation_max_age,
             None,
             None,
@@ -518,20 +507,40 @@ impl ScribeGeometry {
         self,
         staging_target_file_size_bytes: u64,
     ) -> Result<Self, ScribeGeometryError> {
-        Self::new(
-            self.wal_segment_bytes,
-            self.active_generation_budget_bytes,
-            self.generation_rotation_ceiling_bytes,
-            self.generation_max_age,
-            self.seal_key_early_seal_bytes,
-            self.seal_key_max_age,
+        Self {
             staging_target_file_size_bytes,
-            self.maximum_ingress_envelope_bytes,
-            self.maximum_active_request_ownership_bytes,
-            self.maximum_immutable_member_ownership_bytes,
-            self.minimum_stage_member_bytes,
-            self.minimum_merge_lane_scratch_bytes,
-        )
+            ..self
+        }
+        .validated()
+    }
+
+    /// Returns this geometry with a different shard count.
+    ///
+    /// Multi-lane tests need several shards while every limit stays exactly
+    /// what they configured; revalidating keeps the count inside what a WAL
+    /// segment header can name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeGeometryError::Zero`] for zero shards and
+    /// [`ScribeGeometryError::Incoherent`] above [`MAX_SHARD_COUNT`].
+    pub fn with_shard_count(self, shard_count: usize) -> Result<Self, ScribeGeometryError> {
+        Self {
+            shard_count,
+            ..self
+        }
+        .validated()
+    }
+
+    /// Runs the constructor's complete validation over an adjusted copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::new`] would refuse for the same fields.
+    fn validated(self) -> Result<Self, ScribeGeometryError> {
+        self.check_positive()?;
+        self.check_derived()?;
+        Ok(self)
     }
 
     /// Returns the per-shard rotation limit as a `usize` byte count.
@@ -544,20 +553,20 @@ impl ScribeGeometry {
         usize::try_from(self.shard_generation_rotation_bytes()).unwrap_or(usize::MAX)
     }
 
-    /// Returns the rotation limit each of the sixteen shards receives.
+    /// Returns the memtable rotation limit every shard applies independently.
     ///
-    /// This is `min(ceiling, floor(budget / 16))`. It is a *limit*, not a
-    /// reservation: the pod does not set aside sixteen of these, and a shard
-    /// that rotates at this size makes no promise about the size of any object
-    /// later assembled from what it froze.
+    /// It is a *limit*, not a reservation, and a shard that rotates at this
+    /// size makes no promise about the size of any object later assembled from
+    /// what it froze.
     #[must_use]
     pub const fn shard_generation_rotation_bytes(&self) -> u64 {
-        let divided = self.active_generation_budget_bytes / SCRIBE_SHARD_COUNT as u64;
-        if divided < self.generation_rotation_ceiling_bytes {
-            divided
-        } else {
-            self.generation_rotation_ceiling_bytes
-        }
+        self.generation_rotation_bytes
+    }
+
+    /// Returns the number of shards, each with its own WAL stream and memtable.
+    #[must_use]
+    pub const fn shard_count(&self) -> usize {
+        self.shard_count
     }
 
     /// Returns the encoded WAL segment rotation target.
@@ -594,10 +603,8 @@ impl ScribeGeometry {
 impl Default for ScribeGeometry {
     /// Returns the production default geometry.
     ///
-    /// The defaults are chosen so a default pod behaves as if each of the
-    /// sixteen shards owned an independent 512 MiB rotation limit, and so the
-    /// hot-object target equals that limit without either value being derived
-    /// from the other.
+    /// The defaults are one shard, 512 MiB on disk, 512 MiB in
+    /// memory, ten minutes of age, and a 512 MiB hot-object target.
     ///
     /// # Panics
     ///
@@ -606,9 +613,9 @@ impl Default for ScribeGeometry {
     /// rather than an operator input.
     fn default() -> Self {
         Self::new(
+            DEFAULT_SHARD_COUNT,
             DEFAULT_WAL_SEGMENT_BYTES,
-            DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES,
-            DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
+            DEFAULT_GENERATION_ROTATION_BYTES,
             DEFAULT_GENERATION_MAX_AGE,
             None,
             None,
@@ -869,98 +876,25 @@ impl Default for ScribeArtifactPolicy {
 mod tests {
     use super::*;
 
-    /// Builds one geometry from the defaults with named overrides applied.
+    /// The shard count is bounded by what a WAL segment header can name.
     ///
     /// # Panics
     ///
-    /// Panics when the requested override combination is invalid, which is the
-    /// point for the negative cases that assert on the error instead.
-    fn geometry_with(budget: u64, ceiling: u64) -> Result<ScribeGeometry, ScribeGeometryError> {
-        ScribeGeometry::new(
-            DEFAULT_WAL_SEGMENT_BYTES,
-            budget,
-            ceiling,
-            DEFAULT_GENERATION_MAX_AGE,
-            None,
-            None,
-            DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-            DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
-            DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
-            DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
-            DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
-        )
-    }
-
-    /// Every shard's rotation limit comes from one global budget and one ceiling.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a derived limit is not the exact minimum of the ceiling and
-    /// the evenly divided budget, or when an incoherent budget is accepted.
+    /// Panics when the default is not one shard, when the header bound is
+    /// refused, or when one shard past it is accepted.
     #[test]
-    fn shard_generation_limits_derive_from_one_global_budget() {
-        let default = ScribeGeometry::default();
-        assert_eq!(
-            default.shard_generation_rotation_bytes(),
-            DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
-            "the default budget divides exactly onto the default ceiling"
-        );
-
-        // The ceiling wins when the divided budget would exceed it: one large
-        // budget cannot turn a shard into an unbounded memory owner.
-        let ceiling_bound = geometry_with(64 * 1024 * 1024 * 1024, 256 * 1024 * 1024)
-            .expect("a budget above the ceiling is valid");
-        assert_eq!(
-            ceiling_bound.shard_generation_rotation_bytes(),
-            256 * 1024 * 1024
-        );
-
-        // The divided budget wins when it is the smaller of the two, and every
-        // shard narrows together rather than the first sixteen tenants racing.
-        let budget_bound = geometry_with(1024 * 1024 * 1024, 512 * 1024 * 1024)
-            .expect("a budget below sixteen ceilings is valid");
-        assert_eq!(
-            budget_bound.shard_generation_rotation_bytes(),
-            64 * 1024 * 1024,
-            "1 GiB across sixteen shards is 64 MiB each, not sixteen reservations of 512 MiB"
-        );
-
-        // The derivation is exactly `min(ceiling, floor(budget / 16))` for
-        // budgets that do not divide evenly, and the sixteen derived limits
-        // together never exceed the one global budget. A limit that rounded up
-        // would let the fixed topology overcommit the pod.
-        for budget in [
-            u64::from(u32::try_from(SCRIBE_SHARD_COUNT).unwrap()),
-            1024 * 1024 * 1024 + 1,
-            1024 * 1024 * 1024 + u64::from(u32::try_from(SCRIBE_SHARD_COUNT - 1).unwrap()),
-            3 * 1024 * 1024 * 1024 + 7,
-            17 * 1024 * 1024 + 13,
-        ] {
-            for ceiling in [1, 64 * 1024 * 1024, 512 * 1024 * 1024, u64::MAX / 2] {
-                let geometry = geometry_with(budget, ceiling)
-                    .expect("a budget of at least one byte per shard is coherent");
-                let limit = geometry.shard_generation_rotation_bytes();
-                let shards = u64::from(u32::try_from(SCRIBE_SHARD_COUNT).unwrap());
-                assert_eq!(
-                    limit,
-                    ceiling.min(budget / shards),
-                    "budget {budget} and ceiling {ceiling} must derive the exact minimum"
-                );
-                assert!(
-                    limit.saturating_mul(shards) <= budget,
-                    "sixteen limits of {limit} overcommit the {budget} byte global budget"
-                );
-            }
-        }
-
-        // A budget that cannot give every shard even one byte is incoherent.
-        let starved = geometry_with(u64::from(u32::try_from(SCRIBE_SHARD_COUNT - 1).unwrap()), 1)
-            .expect_err("a budget below one byte per shard must refuse");
+    fn shard_count_is_bounded_by_the_wal_header() {
+        assert_eq!(ScribeGeometry::default().shard_count(), DEFAULT_SHARD_COUNT);
+        let widest = ScribeGeometry::default()
+            .with_shard_count(MAX_SHARD_COUNT)
+            .expect("every shard id a WAL header can name is valid");
+        assert_eq!(widest.shard_count(), MAX_SHARD_COUNT);
         assert!(matches!(
-            starved,
+            ScribeGeometry::default()
+                .with_shard_count(MAX_SHARD_COUNT + 1)
+                .expect_err("a shard id the WAL header cannot name must refuse"),
             ScribeGeometryError::Incoherent {
-                field: "active_generation_budget_bytes",
+                field: "shard_count",
                 ..
             }
         ));
@@ -973,12 +907,12 @@ mod tests {
     /// their inputs here rather than restating twelve arguments per case.
     #[derive(Debug, Clone, Copy)]
     struct GeometryOverride {
+        /// Number of shards, each with its own WAL stream and memtable.
+        shard_count: usize,
         /// Encoded bytes in one WAL segment before rotation.
         wal_segment_bytes: u64,
-        /// Pod-wide active-generation budget shared by all sixteen shards.
-        active_generation_budget_bytes: u64,
-        /// Absolute per-shard rotation ceiling applied after the budget divides.
-        generation_rotation_ceiling_bytes: u64,
+        /// Arrow bytes one shard's memtable holds before the shard rotates.
+        generation_rotation_bytes: u64,
         /// Maximum age of an active shard generation before rotation.
         generation_max_age: Duration,
         /// Optional per-`SealKey` early-seal size.
@@ -1003,9 +937,9 @@ mod tests {
         /// Returns every field at its production default.
         fn defaults() -> Self {
             Self {
+                shard_count: DEFAULT_SHARD_COUNT,
                 wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
-                active_generation_budget_bytes: DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES,
-                generation_rotation_ceiling_bytes: DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
+                generation_rotation_bytes: DEFAULT_GENERATION_ROTATION_BYTES,
                 generation_max_age: DEFAULT_GENERATION_MAX_AGE,
                 seal_key_early_seal_bytes: None,
                 seal_key_max_age: None,
@@ -1029,9 +963,9 @@ mod tests {
         /// outcome every negative case asserts on.
         fn build(self) -> Result<ScribeGeometry, ScribeGeometryError> {
             ScribeGeometry::new(
+                self.shard_count,
                 self.wal_segment_bytes,
-                self.active_generation_budget_bytes,
-                self.generation_rotation_ceiling_bytes,
+                self.generation_rotation_bytes,
                 self.generation_max_age,
                 self.seal_key_early_seal_bytes,
                 self.seal_key_max_age,
@@ -1081,10 +1015,13 @@ mod tests {
             base.staging_target_file_size_bytes()
         );
 
-        // Moving the generation budget leaves the object target alone: a shard
+        // Moving the memtable limit leaves the object target alone: a shard
         // rotation limit is not an object-size promise.
-        let generation_moved =
-            geometry_with(1024 * 1024 * 1024, 512 * 1024 * 1024).expect("valid budget");
+        let mut moved = GeometryOverride::defaults();
+        moved.generation_rotation_bytes = 64 * 1024 * 1024;
+        let generation_moved = moved
+            .build()
+            .expect("a smaller memtable limit is valid alone");
         assert_ne!(
             generation_moved.shard_generation_rotation_bytes(),
             base.shard_generation_rotation_bytes()
@@ -1142,12 +1079,10 @@ mod tests {
         // defaults, so a refusal proves that field is checked rather than that
         // some other field happened to fail first.
         let zero_cases: [ZeroCase; 9] = [
+            ("shard_count", |over| over.shard_count = 0),
             ("wal_segment_bytes", |over| over.wal_segment_bytes = 0),
-            ("active_generation_budget_bytes", |over| {
-                over.active_generation_budget_bytes = 0;
-            }),
-            ("generation_rotation_ceiling_bytes", |over| {
-                over.generation_rotation_ceiling_bytes = 0;
+            ("generation_rotation_bytes", |over| {
+                over.generation_rotation_bytes = 0;
             }),
             ("staging_target_file_size_bytes", |over| {
                 over.staging_target_file_size_bytes = 0;
@@ -1207,8 +1142,7 @@ mod tests {
     /// control strictly inside its shard's own limit is refused.
     fn assert_per_key_controls_may_only_fire_earlier() {
         // A key may seal earlier than its shard, never later — on size.
-        let ceiling =
-            usize::try_from(DEFAULT_GENERATION_ROTATION_CEILING_BYTES).expect("ceiling fits");
+        let ceiling = usize::try_from(DEFAULT_GENERATION_ROTATION_BYTES).expect("ceiling fits");
         let mut late_size = GeometryOverride::defaults();
         late_size.seal_key_early_seal_bytes = Some(ceiling + 1);
         assert!(matches!(

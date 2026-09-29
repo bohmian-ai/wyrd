@@ -2,7 +2,7 @@
 //!
 //! These are four separate claims and this file keeps them in four owners. The
 //! topology and accounting owner runs on a production-shaped pod, because that
-//! is the pod whose lane count and memory identities are being asserted. The
+//! is the pod whose shard count and memory identities are being asserted. The
 //! three fairness owners run on a pod whose measured capacity completes exactly
 //! one table at a time, because a scheduling decision is not observable on a
 //! pod that can serve every contender at once. Combining them would mean
@@ -12,11 +12,9 @@
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, GLOBAL_INFLIGHT_ITEMS};
-use vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy;
-use vala_bifrost_redux::scribe::routing::{SCRIBE_SHARD_COUNT, shard_for};
+use vala_bifrost_redux::scribe::geometry::{DEFAULT_SHARD_COUNT, ScribeArtifactPolicy};
 use wyrd_spec::DataTenantId;
 
 use super::support::{
@@ -31,20 +29,13 @@ const TENANTS: usize = 4;
 const TABLES_PER_TENANT: usize = 2;
 /// Rows in one topology batch.
 const ROWS_PER_BATCH: usize = 64;
-/// Lanes each resident table is deliberately routed onto.
-///
-/// Four tenants with two tables each is eight owners, and the pod has sixteen
-/// lanes, so two lanes per table covers every lane exactly once with sixteen
-/// appends. Coverage is chosen rather than sampled: the batch identities are
-/// searched against the production routing function until each one lands on the
-/// lane it was assigned, so an idle lane means the topology is narrower than
-/// sixteen and never means the case was unlucky.
-const LANES_PER_TABLE: usize = SCRIBE_SHARD_COUNT / (TENANTS * TABLES_PER_TENANT);
+/// Batches each resident table appends.
+const BATCHES_PER_TABLE: usize = 2;
 /// Tables one tenant rotates through the pod's single lifecycle vector.
 ///
-/// Seventeen is deliberately one more than the fixed lane count: a scheduler
-/// that quietly bound table turns to lanes would leave exactly one table
-/// without a turn, and this case would see it as a table that never completed.
+/// Many more tables than the pod has shards: a scheduler that quietly bound
+/// table turns to shards would leave tables without a turn, and this case would
+/// see each as a table that never completed.
 const ROTATION_TABLES: usize = 17;
 /// Equal-demand tenants that contend for the same single vector.
 const ROTATION_TENANTS: usize = 10;
@@ -124,38 +115,30 @@ async fn start_single_vector_pod() -> wyrd_testing::WyrdTestServer {
     server
 }
 
-/// Sixteen fixed lanes share one bounded pod budget that is lent, not divided.
+/// The configured shards share one bounded pod budget that is lent, not divided.
 ///
-/// Scribe's topology is a fixed constant, not a function of how many tenants or
+/// Scribe's shard count is configuration, not a function of how many tenants or
 /// tables the pod happens to be serving, and its memory is one pod budget that
-/// every lane and every tenant draws from. The failures this owner guards
-/// against are silent ones: a pod that grows a lane or a WAL stream per tenant,
-/// a lane that is declared but never carries work, accounting that does not add
-/// up across lanes and buckets, or a tenant that keeps a share its neighbours
-/// were owed. Every one of them still returns correct rows.
+/// every shard and every tenant draws from. The failures this owner guards
+/// against are silent ones: a pod that grows a shard or a WAL stream per
+/// tenant, accounting that does not add up across shards and buckets, or a
+/// tenant that keeps a share its neighbours were owed. Every one of them still
+/// returns correct rows.
 ///
-/// The pod runs on production admission. This owner asserts what a real pod's
-/// topology and accounting look like, so starving it would be asserting against
-/// a pod no deployment runs.
-///
-/// Lane coverage is constructed rather than sampled. Routing is a public,
-/// deterministic function of `(tenant, table, batch_id)`, so each table's batch
-/// identities are searched until they land on the two lanes that table was
-/// assigned, and the sixteen appends between them cover all sixteen lanes
-/// exactly once. The identities still go through the ordinary public ingest
-/// route; nothing here places a row on a lane directly.
+/// The pod runs on production admission and the production default shard
+/// count. This owner asserts what a real pod's topology and accounting look
+/// like, so starving it would be asserting against a pod no deployment runs.
 ///
 /// # Panics
 ///
-/// Panics when the topology is not exactly sixteen lanes, when a lane carries
-/// no work, when WAL streams or queued work exceed their per-pod ceilings, when
-/// accounted memory disagrees with the per-shard or per-bucket totals, when
-/// equal demand produces lopsided tenant ownership, when publication leaves a
-/// bucket behind, or when a tenant does not read back exactly what it
-/// acknowledged.
+/// Panics when the topology differs from the configured shard count, when WAL
+/// streams or queued work exceed their per-pod ceilings, when accounted memory
+/// disagrees with the per-shard or per-bucket totals, when equal demand
+/// produces lopsided tenant ownership, when publication leaves a bucket
+/// behind, or when a tenant does not read back exactly what it acknowledged.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
-async fn scribe_sixteen_shards_obey_global_and_tenant_budgets() {
+async fn scribe_shards_obey_global_and_tenant_budgets() {
     let server = start_scribe_server().await;
 
     let mut tenants: Vec<DataTenantId> = vec![server.data_tenant_id()];
@@ -180,54 +163,38 @@ async fn scribe_sixteen_shards_obey_global_and_tenant_budgets() {
         residents.push((*tenant, client, tables));
     }
 
-    // Every lane is assigned to exactly one (tenant, table) owner, so the
-    // appends below cover the whole topology with one batch per lane.
     let mut expected: Vec<Vec<i64>> = vec![Vec::new(); TENANTS];
-    let mut covered: Vec<bool> = vec![false; SCRIBE_SHARD_COUNT];
-    for (index, (tenant, client, tables)) in residents.iter().enumerate() {
-        for (table_ordinal, (name, table)) in tables.iter().enumerate() {
+    for (index, (_, client, tables)) in residents.iter().enumerate() {
+        for (table_ordinal, (_, table)) in tables.iter().enumerate() {
             let owner = index * TABLES_PER_TENANT + table_ordinal;
-            for slot in 0..LANES_PER_TABLE {
-                let lane = owner * LANES_PER_TABLE + slot;
-                let batch_id = batch_id_routing_to(*tenant, name, lane);
-                let first = ((owner * LANES_PER_TABLE + slot) * ROWS_PER_BATCH) as i64;
+            for batch in 0..BATCHES_PER_TABLE {
+                let first = ((owner * BATCHES_PER_TABLE + batch) * ROWS_PER_BATCH) as i64;
                 let rows: Vec<i64> = (first..first + ROWS_PER_BATCH as i64).collect();
-                append_values(client, table, batch_id, &rows)
+                append_values(client, table, uuid::Uuid::now_v7(), &rows)
                     .await
                     .unwrap_or_else(|error| {
-                        panic!("tenant {index} lane {lane} is acknowledged: {error:?}")
+                        panic!("tenant {index} batch {batch} is acknowledged: {error:?}")
                     });
                 expected[index].extend_from_slice(&rows);
-                covered[lane] = true;
             }
         }
     }
-    assert!(
-        covered.iter().all(|hit| *hit),
-        "the case must route a batch onto every lane it asserts about; missed {:?}",
-        covered
-            .iter()
-            .enumerate()
-            .filter(|(_, hit)| !**hit)
-            .map(|(lane, _)| lane)
-            .collect::<Vec<_>>()
-    );
 
     let loaded = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
 
     assert_eq!(
-        loaded.shard_task_count, SCRIBE_SHARD_COUNT,
-        "the pod must own exactly sixteen shard tasks whatever it is serving"
+        loaded.shard_task_count, DEFAULT_SHARD_COUNT,
+        "the pod must own exactly its configured shard tasks whatever it is serving"
     );
     assert_eq!(
-        loaded.shard_channel_count, SCRIBE_SHARD_COUNT,
-        "the pod must own exactly sixteen shard channels whatever it is serving"
+        loaded.shard_channel_count, DEFAULT_SHARD_COUNT,
+        "the pod must own exactly its configured shard channels whatever it is serving"
     );
     assert!(
-        loaded.open_wal_stream_count <= SCRIBE_SHARD_COUNT,
-        "WAL streams are per lane, not per tenant or table: {} open for {TENANTS} tenants",
+        loaded.open_wal_stream_count <= DEFAULT_SHARD_COUNT,
+        "WAL streams are per shard, not per tenant or table: {} open for {TENANTS} tenants",
         loaded.open_wal_stream_count
     );
     assert!(
@@ -244,7 +211,7 @@ async fn scribe_sixteen_shards_obey_global_and_tenant_budgets() {
         .sum();
     assert_eq!(
         by_shard, by_bucket,
-        "per-lane ownership {by_shard} must account for exactly the buckets {by_bucket}"
+        "per-shard ownership {by_shard} must account for exactly the buckets {by_bucket}"
     );
     assert!(
         by_bucket > 0 && by_bucket <= loaded.total_accounted_memory,
@@ -268,15 +235,6 @@ async fn scribe_sixteen_shards_obey_global_and_tenant_budgets() {
         "Bifrost reservation {} exceeded the parent ceiling {}",
         loaded.parent_used_memory,
         loaded.parent_memory_limit
-    );
-
-    let idle: Vec<usize> = (0..SCRIBE_SHARD_COUNT)
-        .filter(|shard| loaded.memory_by_shard[*shard] == 0)
-        .collect();
-    assert!(
-        idle.is_empty(),
-        "every fixed lane must carry admitted work; idle lanes {idle:?} of {:?}",
-        loaded.memory_by_shard
     );
 
     let mut owned = vec![0_usize; TENANTS];
@@ -312,8 +270,8 @@ async fn scribe_sixteen_shards_obey_global_and_tenant_budgets() {
         "publication must leave no bucket owning published rows; surviving: {owned:?}"
     );
     assert_eq!(
-        settled.shard_task_count, SCRIBE_SHARD_COUNT,
-        "the fixed topology must survive publication unchanged"
+        settled.shard_task_count, DEFAULT_SHARD_COUNT,
+        "the configured topology must survive publication unchanged"
     );
 
     for (index, (_, client, tables)) in residents.iter().enumerate() {
@@ -510,9 +468,9 @@ async fn scribe_waiting_contender_precedes_incumbent_reacquisition() {
 
 /// Seventeen tables of one tenant all get a turn on the single vector.
 ///
-/// One more table than the pod has lanes, on purpose: a scheduler that quietly
-/// bound a table's turn to a lane would leave exactly one table without one,
-/// and this case sees that as a table that never completed its demand. The
+/// Many more tables than the pod has shards, on purpose: a scheduler that
+/// quietly bound a table's turn to a shard would leave tables without one, and
+/// this case sees each as a table that never completed its demand. The
 /// tenant is the same throughout, so nothing here can be explained by tenant
 /// fairness; the only question is whether the pod rotates between the tables of
 /// one owner.
@@ -744,35 +702,6 @@ async fn scribe_ten_tenants_rotate_fairly() {
     }
 
     server.shutdown().await.expect("the server drains cleanly");
-}
-
-/// Finds a batch identity that public ingest will route onto `lane`.
-///
-/// Routing is a public, deterministic hash of the authenticated tenant, the
-/// canonical table FQN, and the batch id, so a case that needs a specific lane
-/// covered can search the one input it owns until the function agrees. The
-/// identity returned is an ordinary valid batch id and is sent through the
-/// ordinary public route; nothing here places a row on a lane directly or
-/// depends on the hash staying the same across builds.
-///
-/// # Panics
-///
-/// Panics when no identity in the searched space routes to `lane`, which would
-/// mean the routing function no longer spreads across the declared topology.
-fn batch_id_routing_to(tenant: DataTenantId, table_name: &str, lane: usize) -> Uuid {
-    let table = TableRef::new(BifrostNamespace::Datasets, table_name);
-    for nonce in 0_u64..4_096 {
-        let mut bytes = [0_u8; 16];
-        bytes[..8].copy_from_slice(&(lane as u64).to_be_bytes());
-        bytes[8..].copy_from_slice(&nonce.to_be_bytes());
-        bytes[6] = 0x70 | (bytes[6] & 0x0f);
-        bytes[8] = 0x80 | (bytes[8] & 0x3f);
-        let candidate = Uuid::from_bytes(bytes);
-        if shard_for(tenant, &table, candidate) == lane {
-            return candidate;
-        }
-    }
-    panic!("no batch identity in the searched space routes {table_name} onto lane {lane}");
 }
 
 /// Sends one rotation participant's whole demand and reports what it cost.

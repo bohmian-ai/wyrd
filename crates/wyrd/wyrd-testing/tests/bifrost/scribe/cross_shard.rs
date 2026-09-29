@@ -1,11 +1,19 @@
 //! Generations sealed on several shards publish their objects exactly once.
 
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::geometry::ScribeGeometry;
 
 use super::support::{
-    append_values, published_rows, register_table, sorted_values, start_scribe_server,
-    tenant_client, unique_table,
+    append_values, published_rows, register_table, sorted_values,
+    start_scribe_server_with_geometry, tenant_client, unique_table,
 };
+
+/// Shards the pod runs for this case.
+///
+/// The default pod runs one shard, so this is the journey that proves a
+/// multi-shard pod. Four is enough for twenty-four random batch identities to
+/// spread one table across more than one shard.
+const SHARD_COUNT: usize = 4;
 
 /// Rows appended in one public request.
 ///
@@ -46,9 +54,9 @@ const ROW_GROUP_ROWS: u64 = parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW
 /// groups from per-run groups, and it reads the sealed footer's split offsets
 /// rather than trusting the object count.
 ///
-/// The case drives real appends until the production router has spread the
-/// table across several shards, so the merge it proves is the one production
-/// performs rather than a single-lane special case.
+/// The pod runs [`SHARD_COUNT`] shards and the case drives real appends
+/// through the production router, so the merge it proves is the one a
+/// multi-shard pod performs rather than a single-shard special case.
 ///
 /// # Panics
 ///
@@ -60,7 +68,12 @@ const ROW_GROUP_ROWS: u64 = parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_cross_shard_generations_publish_packed_objects_once() {
-    let server = start_scribe_server().await;
+    let server = start_scribe_server_with_geometry(
+        ScribeGeometry::default()
+            .with_shard_count(SHARD_COUNT)
+            .expect("four shards is a valid geometry"),
+    )
+    .await;
     let tenant = server.data_tenant_id();
     let name = unique_table("cross_shard");
     let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
@@ -137,7 +150,7 @@ async fn scribe_cross_shard_generations_publish_packed_objects_once() {
         "published objects must read back exactly the acknowledged rows"
     );
 
-    // Which lanes produced an object is not a fact the file-list row or its
+    // Which shards produced an object is not a fact the file-list row or its
     // promotion record carries, so the claim observation is what makes "this
     // object is a real cross-shard merge" an assertion rather than an
     // inference from how few objects were published.

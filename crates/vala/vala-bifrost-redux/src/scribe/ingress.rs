@@ -6,7 +6,6 @@ use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCp
 use crate::scribe::material_plan::{MaterialPlan, MaximumEnvelopeDecision, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows};
-use crate::scribe::routing::shard_for;
 use crate::tables::AuditLogTable;
 
 use std::time::Instant;
@@ -427,7 +426,7 @@ impl ScribeImpl {
         lifecycle.reserved(material_plan.root_bytes);
         let binding = Self::construct_physical_binding(binding_facts, frame.principal.tenant_id)?;
         let table = binding.table_ref.fqn();
-        let shard = shard_for(
+        let shard = self.shards.lane_for(
             frame.principal.tenant_id,
             &binding.table_ref,
             frame.batch_id,

@@ -2,9 +2,7 @@
 
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 
-use vala_bifrost_redux::scribe::geometry::{
-    DEFAULT_GENERATION_ROTATION_CEILING_BYTES, ScribeGeometry,
-};
+use vala_bifrost_redux::scribe::geometry::{DEFAULT_GENERATION_ROTATION_BYTES, ScribeGeometry};
 
 use super::support::{
     append_values, register_table, sorted_values, start_scribe_server_with_geometry, tenant_client,
@@ -56,7 +54,7 @@ const WAL_SEGMENT_BYTES: u64 = 64 * 1024;
 async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
     let geometry = ScribeGeometry::for_uniform_shard_rotation(
         WAL_SEGMENT_BYTES,
-        DEFAULT_GENERATION_ROTATION_CEILING_BYTES as usize,
+        DEFAULT_GENERATION_ROTATION_BYTES as usize,
         std::time::Duration::from_secs(60),
     )
     .expect("the scaled WAL segment size is a coherent geometry");

@@ -589,8 +589,8 @@ pub struct ScribeInspectionSnapshot {
     pub immutable_bucket_count: usize,
     /// Category totals in [`MemoryCategory`](crate::scribe::memory::MemoryCategory) order.
     pub memory_by_category: [usize; MEMORY_CATEGORY_COUNT],
-    /// Memory totals distributed across the fixed shard owners.
-    pub memory_by_shard: [usize; crate::scribe::routing::SCRIBE_SHARD_COUNT],
+    /// Memory totals distributed across the shard owners, indexed by shard.
+    pub memory_by_shard: Vec<usize>,
     /// Exact bucket-level memory ownership.
     pub memory_by_bucket: Vec<ScribeBucketMemorySnapshot>,
     /// Sum of all governor category totals.

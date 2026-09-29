@@ -27,7 +27,7 @@ use crate::scribe::persistence::{
     PersistenceSubmitError,
 };
 use crate::scribe::preprocess::{AppendSliceId, PreparedAppend, PreparedSlice, PreparedSliceSet};
-use crate::scribe::routing::{SCRIBE_SHARD_COUNT, shard_for};
+use crate::scribe::routing::shard_for;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, HotBatch};
 use crate::scribe::wal::{WalHandle, WalWriter};
@@ -448,7 +448,7 @@ impl<T> ScribeShard<T> {
     }
 }
 
-/// Exactly sixteen pod-local shard mailboxes.
+/// The pod-local shard mailboxes, one per configured shard.
 #[derive(Debug)]
 pub struct ScribeShardSet<T> {
     shards: Vec<ScribeShard<T>>,
@@ -456,10 +456,10 @@ pub struct ScribeShardSet<T> {
 }
 
 impl<T> ScribeShardSet<T> {
-    /// Construct the fixed shard topology.
+    /// Constructs `shard_count` bounded shard mailboxes.
     #[must_use]
-    pub fn new() -> Self {
-        let channels = (0..SCRIBE_SHARD_COUNT).map(|id| {
+    pub fn new(shard_count: usize) -> Self {
+        let channels = (0..shard_count).map(|id| {
             let (sender, receiver) = mpsc::channel(SHARD_COMMAND_CAPACITY);
             (ScribeShard { id, sender }, receiver)
         });
@@ -481,7 +481,7 @@ impl<T> ScribeShardSet<T> {
         table: &TableRef,
         batch_id: uuid::Uuid,
     ) -> &ScribeShard<T> {
-        &self.shards[shard_for(tenant, table, batch_id)]
+        &self.shards[shard_for(tenant, table, batch_id, self.shards.len())]
     }
 
     /// Return a sender by its fixed shard number.
@@ -494,22 +494,16 @@ impl<T> ScribeShardSet<T> {
         self.receivers.take()
     }
 
-    /// Return the fixed topology cardinality.
+    /// Returns the configured shard count.
     #[must_use]
-    pub const fn len(&self) -> usize {
-        SCRIBE_SHARD_COUNT
+    pub fn len(&self) -> usize {
+        self.shards.len()
     }
 
-    /// Whether the fixed topology is empty. Always false for Scribe.
+    /// Whether the topology has no shards. Geometry validation refuses zero.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        false
-    }
-}
-
-impl<T> Default for ScribeShardSet<T> {
-    fn default() -> Self {
-        Self::new()
+    pub fn is_empty(&self) -> bool {
+        self.shards.is_empty()
     }
 }
 
@@ -957,13 +951,13 @@ impl ScribeShardRuntime {
         self.tasks.lock().await.push(task);
         abort
     }
-    /// Start exactly sixteen shard owners and their bounded command mailboxes.
+    /// Starts one shard owner and bounded command mailbox per configured shard.
     ///
     /// # Panics
     ///
-    /// Panics if a fixed shard cannot obtain its WAL handle; that is a
-    /// construction invariant because the topology always has sixteen WAL
-    /// streams.
+    /// Panics if a shard cannot obtain its WAL handle; that is a construction
+    /// invariant because geometry validation bounds the shard count by what
+    /// the WAL can name.
     pub(crate) fn start(config: ScribeShardStartConfig, runtime: &Handle) -> Arc<Self> {
         let ScribeShardStartConfig {
             admission,
@@ -980,22 +974,23 @@ impl ScribeShardRuntime {
         } = config;
         let wal_segment_bytes = geometry.wal_segment_bytes();
         let generation_rotation_bytes = geometry.shard_generation_rotation_usize();
-        let mut set = ScribeShardSet::<ShardCommand>::new();
+        let shard_count = geometry.shard_count();
+        let mut set = ScribeShardSet::<ShardCommand>::new(shard_count);
         let receivers = set.take_receivers().unwrap_or_default();
         let senders: Vec<ScribeShard<ShardCommand>> =
-            (0..SCRIBE_SHARD_COUNT).map(|id| set.shard(id)).collect();
+            (0..shard_count).map(|id| set.shard(id)).collect();
         let pending = Arc::new(AtomicUsize::new(0));
         let drained = Arc::new(Notify::new());
-        let mut tasks = Vec::with_capacity(SCRIBE_SHARD_COUNT);
-        let abort_handles = Mutex::new(Vec::with_capacity(SCRIBE_SHARD_COUNT));
-        let pressure_channels = (0..SCRIBE_SHARD_COUNT)
+        let mut tasks = Vec::with_capacity(shard_count);
+        let abort_handles = Mutex::new(Vec::with_capacity(shard_count));
+        let pressure_channels = (0..shard_count)
             .map(|_| watch::channel(None))
             .collect::<Vec<_>>();
         let pressure_senders = pressure_channels
             .iter()
             .map(|(sender, _)| sender.clone())
             .collect::<Vec<_>>();
-        let snapshots = (0..SCRIBE_SHARD_COUNT)
+        let snapshots = (0..shard_count)
             .map(|_| Arc::new(Mutex::new(ShardMemtableSnapshot::default())))
             .collect::<Vec<_>>();
         for (id, receiver) in receivers.into_iter().enumerate() {
@@ -1069,9 +1064,29 @@ impl ScribeShardRuntime {
         self.rotation_thresholds
     }
 
+    /// Returns the shard lane that owns one batch in this runtime's topology.
+    ///
+    /// Admission attributes memory to this lane and [`Self::try_send`]
+    /// dispatches to it, so both read the one running shard count.
+    #[must_use]
+    pub(crate) fn lane_for(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+        batch_id: uuid::Uuid,
+    ) -> usize {
+        shard_for(tenant, table, batch_id, self.senders.len())
+    }
+
+    /// Returns the number of running shard owners.
+    #[must_use]
+    pub(crate) fn shard_count(&self) -> usize {
+        self.senders.len()
+    }
+
     /// Enqueue a prepared request onto its deterministic shard.
     ///
-    /// The shard is selected by `shard_for(tenant, table, batch_id)` so that
+    /// The shard is selected by [`Self::lane_for`] so that
     /// distinct batch ids for one (tenant, table) spread across lanes while a
     /// client retry (same `batch_id`) lands on the lane holding its dedup state.
     ///
@@ -1085,7 +1100,7 @@ impl ScribeShardRuntime {
             }
             return Err(ScribeError::IngressClosed);
         }
-        let shard = shard_for(append.tenant, &append.table, append.batch_id);
+        let shard = self.lane_for(append.tenant, &append.table, append.batch_id);
         let table_name = append.table.fqn();
         if let Some(memory) = append.memory.as_mut() {
             memory.transfer_category(MemoryCategory::Queued)?;
@@ -4580,15 +4595,15 @@ mod tests {
         }
     }
 
-    /// Routing retains all sixteen deterministic lanes while distinct keys can
-    /// share one complete shard owner.
+    /// Routing reaches every lane of a sixteen-lane topology while distinct keys
+    /// can share one complete shard owner.
     ///
     /// # Panics
     ///
     /// Panics if deterministic routing cannot reach every fixed lane or two
     /// tenant-qualified keys cannot be colocated under one owner.
     #[test]
-    fn routing_preserves_sixteen_shards_and_multi_key_owner() {
+    fn routing_reaches_every_lane_and_multi_key_owner() {
         let tenant = DataTenantId::new_v7();
         let first = TableRef::new(BifrostNamespace::Bifrost, "routing-first");
         let second = TableRef::new(BifrostNamespace::Bifrost, "routing-second");
@@ -4596,23 +4611,58 @@ mod tests {
         let mut colocated = None;
         for value in 1_u128..100_000 {
             let batch_id = uuid::Uuid::from_u128(value);
-            let first_lane = shard_for(tenant, &first, batch_id);
+            let first_lane = shard_for(
+                tenant,
+                &first,
+                batch_id,
+                crate::scribe::routing::TEST_SHARD_COUNT,
+            );
             reached.insert(first_lane);
-            assert_eq!(first_lane, shard_for(tenant, &first, batch_id));
+            assert_eq!(
+                first_lane,
+                shard_for(
+                    tenant,
+                    &first,
+                    batch_id,
+                    crate::scribe::routing::TEST_SHARD_COUNT
+                )
+            );
             if colocated.is_none() {
                 let second_id = uuid::Uuid::from_u128(value.saturating_add(100_000));
-                if shard_for(tenant, &second, second_id) == first_lane {
+                if shard_for(
+                    tenant,
+                    &second,
+                    second_id,
+                    crate::scribe::routing::TEST_SHARD_COUNT,
+                ) == first_lane
+                {
                     colocated = Some((first_lane, batch_id, second_id));
                 }
             }
-            if reached.len() == SCRIBE_SHARD_COUNT && colocated.is_some() {
+            if reached.len() == crate::scribe::routing::TEST_SHARD_COUNT && colocated.is_some() {
                 break;
             }
         }
-        assert_eq!(reached.len(), SCRIBE_SHARD_COUNT);
+        assert_eq!(reached.len(), crate::scribe::routing::TEST_SHARD_COUNT);
         let (owner, first_id, second_id) = colocated.expect("two keys share one owner");
-        assert_eq!(shard_for(tenant, &first, first_id), owner);
-        assert_eq!(shard_for(tenant, &second, second_id), owner);
+        assert_eq!(
+            shard_for(
+                tenant,
+                &first,
+                first_id,
+                crate::scribe::routing::TEST_SHARD_COUNT
+            ),
+            owner
+        );
+        assert_eq!(
+            shard_for(
+                tenant,
+                &second,
+                second_id,
+                crate::scribe::routing::TEST_SHARD_COUNT
+            ),
+            owner
+        );
     }
 
     /// Root refusal and automatic owner rotation remain independent actions.
@@ -4755,7 +4805,14 @@ mod tests {
     fn batch_id_for_owner(key: &SealKey, owner: usize) -> uuid::Uuid {
         (1_u128..100_000)
             .map(uuid::Uuid::from_u128)
-            .find(|batch_id| shard_for(key.tenant, &key.table, *batch_id) == owner)
+            .find(|batch_id| {
+                shard_for(
+                    key.tenant,
+                    &key.table,
+                    *batch_id,
+                    crate::scribe::routing::TEST_SHARD_COUNT,
+                ) == owner
+            })
             .expect("fixed routing reaches requested owner")
     }
 
@@ -6009,7 +6066,7 @@ mod tests {
                 .shards
                 .shutdown_flush_completions
                 .load(Ordering::Acquire),
-            SCRIBE_SHARD_COUNT
+            scribe.shards.shard_count()
         );
         assert!(scribe.shards.tasks.lock().await.is_empty());
         assert!(scribe.shards.abort_handles.lock().unwrap().is_empty());
@@ -6083,17 +6140,16 @@ mod tests {
             .await;
     }
 
+    /// The shard set owns exactly one bounded mailbox per configured shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the mailbox count differs from the configured count.
     #[test]
-    fn topology_has_exactly_sixteen_mailboxes() {
-        let set = ScribeShardSet::<Item>::new();
-        assert_eq!(set.len(), 16);
+    fn topology_has_one_mailbox_per_configured_shard() {
+        let set = ScribeShardSet::<Item>::new(3);
+        assert_eq!(set.len(), 3);
         assert!(!set.is_empty());
-    }
-
-    #[test]
-    fn fixed_topology_remains_sixteen_tasks_and_channels() {
-        let set = ScribeShardSet::<Item>::new();
-        assert_eq!(set.len(), SCRIBE_SHARD_COUNT);
         assert_eq!(SHARD_COMMAND_CAPACITY, 256);
     }
 
@@ -6640,7 +6696,7 @@ mod tests {
 
     /// Replays `wal`'s directory into `owner` exactly as startup recovery does.
     ///
-    /// The production replay lane streams records to shard 0's command sender
+    /// The production replay lane streams every recorded lane to the one sender
     /// while this test drives the owner's own command loop, so replayed
     /// generations pass through the real fence and memtable path.
     ///
@@ -6654,8 +6710,7 @@ mod tests {
         command_tx: mpsc::Sender<ShardCommand>,
         budget: &crate::resources::ScribeResources,
     ) {
-        let mut shard_senders = vec![command_tx];
-        shard_senders.resize_with(SCRIBE_SHARD_COUNT, || mpsc::channel(1).0);
+        let shard_senders = vec![command_tx];
         let replay_lane = ScribeWalIoPool::new(1);
         let replay = replay_lane.submit(ScribeWalIoOp::ReplayDirectoryStream {
             path: wal.base_dir().to_path_buf(),
@@ -7468,9 +7523,6 @@ mod tests {
 
     /// Verifies that a committed generation retires on the first shard-level sweep
     /// and that retirement does not enqueue additional generation tasks.
-    ///
-    /// The shard count is stable at 16, so FIFO queues indexed by shard ID cannot
-    /// grow beyond `SCRIBE_SHARD_COUNT`.
     #[test]
     fn committed_generation_retires_at_first_shard_sweep() {
         let key = owner_key();
@@ -7487,7 +7539,6 @@ mod tests {
             1,
             "committed generation retires at the first sweep"
         );
-        assert_eq!(SCRIBE_SHARD_COUNT, 16);
     }
 
     #[test]
@@ -7766,7 +7817,7 @@ mod tests {
     /// Verify that shard lookup is bounded within the fixed topology for any batch.
     #[test]
     fn routing_uses_canonical_table_reference() {
-        let set = ScribeShardSet::<Item>::new();
+        let set = ScribeShardSet::<Item>::new(16);
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
         let batch_id = uuid::Uuid::new_v4();
         assert!(set.shard_for(DataTenantId::new_v7(), &table, batch_id).id < 16);

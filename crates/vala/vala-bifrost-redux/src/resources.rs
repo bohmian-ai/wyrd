@@ -1245,22 +1245,28 @@ impl ScribeResources {
         }
     }
 
-    /// Returns fixed closed shard totals from root attribution.
+    /// Returns root-attributed bytes for each of `shard_count` shards.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the root state lock is poisoned.
     #[must_use]
-    pub(crate) fn shard_snapshot(&self) -> [usize; 16] {
+    pub(crate) fn shard_snapshot(&self, shard_count: usize) -> Vec<usize> {
         let state = self
             .governor
             .inner
             .state
             .lock()
             .expect("Scribe root state lock");
-        std::array::from_fn(|shard| {
-            state
-                .scribe_shard_bytes
-                .get(&shard)
-                .copied()
-                .unwrap_or_default()
-        })
+        (0..shard_count)
+            .map(|shard| {
+                state
+                    .scribe_shard_bytes
+                    .get(&shard)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Emits only the root-owned closed resource gauge family.

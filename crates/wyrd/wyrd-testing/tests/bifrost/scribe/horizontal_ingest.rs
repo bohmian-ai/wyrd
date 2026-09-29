@@ -17,7 +17,7 @@ use arrow::array::{FixedSizeBinaryArray, Int32Array, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT;
+use vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT;
 use wyrd_client::WyrdClient;
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
@@ -568,21 +568,21 @@ fn topology_by_pod(cluster: &WyrdTestCluster) -> Vec<(usize, usize, usize)> {
 ///
 /// # Panics
 ///
-/// Panics when any pod reports other than [`SCRIBE_SHARD_COUNT`] shard tasks or
+/// Panics when any pod reports other than [`DEFAULT_SHARD_COUNT`] shard tasks or
 /// channels, or more open WAL streams than it has lanes.
 fn assert_fixed_topology(observed: &[(usize, usize, usize)], phase: &str) {
     for (index, (tasks, channels, wal)) in observed.iter().enumerate() {
         assert_eq!(
-            *tasks, SCRIBE_SHARD_COUNT,
-            "pod {index} must own exactly {SCRIBE_SHARD_COUNT} shard tasks {phase}"
+            *tasks, DEFAULT_SHARD_COUNT,
+            "pod {index} must own exactly {DEFAULT_SHARD_COUNT} shard tasks {phase}"
         );
         assert_eq!(
-            *channels, SCRIBE_SHARD_COUNT,
-            "pod {index} must own exactly {SCRIBE_SHARD_COUNT} shard channels {phase}"
+            *channels, DEFAULT_SHARD_COUNT,
+            "pod {index} must own exactly {DEFAULT_SHARD_COUNT} shard channels {phase}"
         );
         assert!(
-            *wal <= SCRIBE_SHARD_COUNT,
-            "pod {index} must not open more than {SCRIBE_SHARD_COUNT} WAL streams \
+            *wal <= DEFAULT_SHARD_COUNT,
+            "pod {index} must not open more than {DEFAULT_SHARD_COUNT} WAL streams \
              {phase}, but it holds {wal}"
         );
     }

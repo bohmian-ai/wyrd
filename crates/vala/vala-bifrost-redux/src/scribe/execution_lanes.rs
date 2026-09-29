@@ -2147,7 +2147,9 @@ fn execute_replay_directory_stream(
             }
             let state_count = chunk.states.len();
             let (response, receiver) = tokio::sync::oneshot::channel();
-            shard_senders[shard]
+            // A lane recorded under an earlier shard count maps onto the
+            // running one; the owner retains the replayed segments by path.
+            shard_senders[shard % shard_senders.len()]
                 .blocking_send(crate::scribe::shards::ShardCommand::Replay {
                     chunk: Box::new(chunk),
                     response,

@@ -1793,8 +1793,8 @@ impl ScribeImpl {
             persistence,
             wal_io,
             shards: crate::scribe::telemetry::ShardHealthSnapshot {
-                shard_tasks: crate::scribe::routing::SCRIBE_SHARD_COUNT,
-                shard_channels: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+                shard_tasks: self.shards.shard_count(),
+                shard_channels: self.shards.shard_count(),
                 pending_items: self.shards.pending_items(),
                 terminal_errors: 0,
             },
@@ -2394,7 +2394,7 @@ impl ScribeImpl {
         for _ in 0..64 {
             let before = self.memory.memory_snapshot();
             let owner_snapshots = self.shards.memtable_snapshots()?;
-            let transient_by_shard = self.memory.shard_snapshot();
+            let transient_by_shard = self.memory.shard_snapshot(self.shards.shard_count());
             let memory = self.memory.memory_snapshot().with_ingress_watermarks(
                 self.pressure_config.ingress_high_water_percent,
                 self.pressure_config.ingress_low_water_percent,
@@ -2404,8 +2404,8 @@ impl ScribeImpl {
                 .flat_map(|snapshot| &snapshot.bucket_memory)
                 .map(|bucket| bucket.writable_bytes.saturating_add(bucket.immutable_bytes))
                 .sum::<usize>();
-            let transient_total = transient_by_shard.into_iter().sum::<usize>();
-            latest = Some((memory, owner_snapshots.clone(), transient_by_shard));
+            let transient_total = transient_by_shard.iter().sum::<usize>();
+            latest = Some((memory, owner_snapshots.clone(), transient_by_shard.clone()));
             if before.total_bytes() == memory.total_bytes()
                 && bucket_total.saturating_add(transient_total) == memory.total_bytes()
             {
@@ -2418,7 +2418,7 @@ impl ScribeImpl {
             coherent.or(latest).ok_or_else(|| ScribeError::Internal {
                 detail: "inspection could not read bucket and shard ownership".to_owned(),
             })?;
-        let mut memory_by_shard = [0_usize; crate::scribe::routing::SCRIBE_SHARD_COUNT];
+        let mut memory_by_shard = vec![0_usize; self.shards.shard_count()];
         let mut memory_by_bucket = Vec::new();
         for (shard, snapshot) in owner_snapshots.into_iter().enumerate() {
             for bucket in snapshot.bucket_memory {
@@ -2435,8 +2435,8 @@ impl ScribeImpl {
             memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
         }
         Ok(ScribeInspectionSnapshot {
-            shard_task_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,
-            shard_channel_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+            shard_task_count: self.shards.shard_count(),
+            shard_channel_count: self.shards.shard_count(),
             open_wal_stream_count: self.wal.open_stream_count(),
             queued_items: self.shards.pending_items(),
             writable_bucket_count: stats.writable_buckets,

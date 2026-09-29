@@ -636,7 +636,11 @@ pub async fn compose_bifrost(
                 )
             })?;
         let configured_geometry = scribe_config
-            .scribe_geometry()
+            .scribe_geometry(
+                resolve_forge_config(&forge_runtime)
+                    .0
+                    .default_target_file_size_bytes,
+            )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
         #[cfg(feature = "test-support")]
         let geometry = test_controls
@@ -658,12 +662,12 @@ pub async fn compose_bifrost(
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
         // The dedicated coordination runtime hosts every long-lived Scribe
-        // coordination task: the `SCRIBE_SHARD_COUNT` shard-owner lanes plus the
+        // coordination task: the configured shard-owner lanes plus the
         // reconciliation and persistence loops. It is deliberately separate from
         // the request runtime so a saturated ingest path cannot starve shard
         // progress, and its thread count derives from
-        // `default_scribe_coordination_threads` (available parallelism, capped at
-        // the lane count, floored at two). Only the `Handle` is handed to
+        // `default_scribe_coordination_threads` (available parallelism,
+        // floored at two). Only the `Handle` is handed to
         // consumers; the `Runtime` value itself is moved into the single
         // non-`Clone` `ScribeCoordinationRuntime` owner returned below, which must
         // outlive Scribe role drain and releases the executor without blocking.

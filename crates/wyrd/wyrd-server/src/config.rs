@@ -343,47 +343,38 @@ pub struct ScribeRuntimeConfig {
     /// capacity decision rather than only a validation bound.
     #[serde(default = "default_ingest_request_bytes")]
     pub ingest_request_bytes: usize,
-    /// Encoded bytes in one non-empty Scribe WAL segment before rotation.
+    /// Number of Scribe shards, each with its own WAL and memtable.
     ///
-    /// This governs WAL segment size only. It does not size a generation, a
-    /// row group, a hot object, or a Forge rewrite output.
-    #[serde(default = "default_scribe_wal_segment_bytes")]
-    pub wal_segment_bytes: u64,
-    /// Pod-wide Arrow budget shared by every active shard generation.
+    /// `WYRD_MEM_TABLE_BUCKET_NUM` overrides the file value. Default 1.
+    #[serde(default = "default_scribe_mem_table_bucket_num")]
+    pub mem_table_bucket_num: usize,
+    /// Megabytes one shard's WAL segment holds before the shard rotates.
     ///
-    /// Divided evenly across the fixed sixteen shards and then capped by
-    /// [`Self::generation_rotation_ceiling_bytes`] to derive the rotation limit
-    /// each shard applies. It is a limit rather than sixteen reservations, so
-    /// lowering it narrows every shard together instead of letting the first
-    /// shards to fill exclude the rest.
-    #[serde(default = "default_scribe_active_generation_budget_bytes")]
-    pub active_generation_budget_bytes: u64,
-    /// Absolute per-shard active-generation rotation ceiling.
+    /// `WYRD_MAX_FILE_SIZE_ON_DISK` overrides the file value. Default 512. It
+    /// also caps the staging hot-object target, which is the smaller of this
+    /// and Forge's rewrite target.
+    #[serde(default = "default_scribe_max_file_size_on_disk")]
+    pub max_file_size_on_disk: u64,
+    /// Megabytes of Arrow one shard's memtable holds before the shard rotates.
     ///
-    /// Applied after the pod-wide budget divides, so a large budget can never
-    /// turn one shard into an unbounded memory owner.
-    #[serde(default = "default_scribe_generation_rotation_ceiling_bytes")]
-    pub generation_rotation_ceiling_bytes: u64,
-    /// Maximum active shard-generation age before rotation.
-    #[serde(default = "default_scribe_generation_max_age_secs")]
-    pub generation_max_age_secs: u64,
+    /// `WYRD_MAX_FILE_SIZE_IN_MEMORY` overrides the file value. Default 512.
+    #[serde(default = "default_scribe_max_file_size_in_memory")]
+    pub max_file_size_in_memory: u64,
+    /// Seconds a shard generation, or a staged member awaiting assembly, may
+    /// age before it rotates or assembles.
+    ///
+    /// `WYRD_MAX_FILE_RETENTION_TIME` overrides the file value. Default 600.
+    #[serde(default = "default_scribe_max_file_retention_time")]
+    pub max_file_retention_time: u64,
     /// Optional per-`SealKey` size that seals one key earlier than its shard.
     ///
     /// A key may seal earlier than the shard it belongs to; it may never seal
-    /// later, so a value above the derived per-shard rotation limit is refused.
+    /// later, so a value above the per-shard memtable limit is refused.
     #[serde(default)]
     pub seal_key_early_seal_bytes: Option<usize>,
     /// Optional per-`SealKey` age that seals one key earlier than its shard.
     #[serde(default)]
     pub seal_key_max_age_secs: Option<u64>,
-    /// Encoded Parquet target for one assembled Scribe hot object.
-    ///
-    /// Independent of every rotation limit: a generation rotates to bound
-    /// memory, while staging assembles across generations toward this size.
-    /// `WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES` overrides the file
-    /// value; the soft target is validated with the rest of Scribe geometry.
-    #[serde(default = "default_scribe_staging_target_file_size_bytes")]
-    pub staging_target_file_size_bytes: u64,
     /// Maximum distinct event-day partitions in one request.
     #[serde(default = "default_ingest_time_partitions")]
     pub ingest_time_partitions: usize,
@@ -1374,23 +1365,20 @@ pub struct BifrostResourceConfig {
 /// Derives the dedicated Scribe coordination-runtime worker count.
 ///
 /// The coordination runtime hosts one long-lived task per Scribe shard lane
-/// (`SCRIBE_SHARD_COUNT` of them) plus the reconciliation and persistence
-/// loops. Those shard owners are not pure channel-awaiters: each performs
-/// synchronous Arrow memtable insertion inline and awaits a Postgres `COMMIT`,
-/// so a thread count well below the lane count serializes independent lanes.
+/// plus the reconciliation and persistence loops. Those shard owners are not
+/// pure channel-awaiters: each performs synchronous Arrow memtable insertion
+/// inline and awaits a Postgres `COMMIT`, so a thread count well below the
+/// lane count serializes independent lanes.
 ///
 /// The derivation therefore starts from detected parallelism — matching the
 /// sibling ingress and persistence derivations, including their `map_or(4, ..)`
-/// fallback for platforms that cannot report it — then clamps it between two
-/// bounds. The upper bound caps threads at the number of lanes there are to
-/// run, so a large host does not spawn coordination threads that can never own
-/// a lane. The lower bound preserves the historical floor so a single-core box
-/// still gets a second thread to make progress on while one lane blocks in
-/// `COMMIT`. The bounds are constant and ordered, so the clamp cannot panic.
+/// fallback for platforms that cannot report it — floored at two so a
+/// single-core box still gets a second thread to make progress on while one
+/// lane blocks in `COMMIT`.
 fn default_scribe_coordination_threads() -> usize {
     std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
-        .clamp(2, vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
+        .max(2)
 }
 
 fn default_scribe_ingress_cpu_threads() -> usize {
@@ -1415,29 +1403,27 @@ fn default_ingest_request_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::wal_segment_bytes`].
-fn default_scribe_wal_segment_bytes() -> u64 {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_WAL_SEGMENT_BYTES
+/// Bytes in one megabyte of the megabyte-valued Scribe size settings.
+const SCRIBE_MEGABYTE: u64 = 1024 * 1024;
+
+/// Returns the default for [`ScribeRuntimeConfig::mem_table_bucket_num`].
+fn default_scribe_mem_table_bucket_num() -> usize {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::active_generation_budget_bytes`].
-fn default_scribe_active_generation_budget_bytes() -> u64 {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES
+/// Returns the default for [`ScribeRuntimeConfig::max_file_size_on_disk`].
+fn default_scribe_max_file_size_on_disk() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_WAL_SEGMENT_BYTES / SCRIBE_MEGABYTE
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::generation_rotation_ceiling_bytes`].
-fn default_scribe_generation_rotation_ceiling_bytes() -> u64 {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_GENERATION_ROTATION_CEILING_BYTES
+/// Returns the default for [`ScribeRuntimeConfig::max_file_size_in_memory`].
+fn default_scribe_max_file_size_in_memory() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_GENERATION_ROTATION_BYTES / SCRIBE_MEGABYTE
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::generation_max_age_secs`].
-fn default_scribe_generation_max_age_secs() -> u64 {
+/// Returns the default for [`ScribeRuntimeConfig::max_file_retention_time`].
+fn default_scribe_max_file_retention_time() -> u64 {
     vala_bifrost_redux::scribe::geometry::DEFAULT_GENERATION_MAX_AGE.as_secs()
-}
-
-/// Returns the default for [`ScribeRuntimeConfig::staging_target_file_size_bytes`].
-fn default_scribe_staging_target_file_size_bytes() -> u64 {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES
 }
 
 /// Returns the immutable V1 event-day hard maximum.
@@ -1460,13 +1446,12 @@ impl Default for ScribeRuntimeConfig {
             event_time_past_window_secs: None,
             event_time_future_window_secs: None,
             ingest_request_bytes: default_ingest_request_bytes(),
-            wal_segment_bytes: default_scribe_wal_segment_bytes(),
-            active_generation_budget_bytes: default_scribe_active_generation_budget_bytes(),
-            generation_rotation_ceiling_bytes: default_scribe_generation_rotation_ceiling_bytes(),
-            generation_max_age_secs: default_scribe_generation_max_age_secs(),
+            mem_table_bucket_num: default_scribe_mem_table_bucket_num(),
+            max_file_size_on_disk: default_scribe_max_file_size_on_disk(),
+            max_file_size_in_memory: default_scribe_max_file_size_in_memory(),
+            max_file_retention_time: default_scribe_max_file_retention_time(),
             seal_key_early_seal_bytes: None,
             seal_key_max_age_secs: None,
-            staging_target_file_size_bytes: default_scribe_staging_target_file_size_bytes(),
             ingest_time_partitions: default_ingest_time_partitions(),
             ingest_wal_workspace_bytes: default_ingest_wal_workspace_bytes(),
         }
@@ -1480,8 +1465,9 @@ impl ScribeRuntimeConfig {
     ///
     /// Returns a field-specific boot error when a thread or ingest bound is
     /// zero, a frozen cardinality bound exceeds its immutable V1 maximum, the
-    /// configured request cannot be represented by tonic/WAL v4 framing, or a
-    /// configured WAL disk budget is zero.
+    /// configured request cannot be represented by tonic/WAL v4 framing, a
+    /// shard count, file size, or retention time is zero or a size overflows
+    /// bytes, or the derived Scribe geometry is incoherent.
     pub fn validate(&self) -> Result<(), String> {
         let thread_values = [
             ("coordination_threads", self.coordination_threads),
@@ -1492,8 +1478,25 @@ impl ScribeRuntimeConfig {
         if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
             return Err(format!("scribe.{name} must be at least 1"));
         }
-        if self.generation_max_age_secs == 0 {
-            return Err("scribe.generation_max_age_secs must be at least 1".to_owned());
+        let rotation_values = [
+            (
+                "mem_table_bucket_num",
+                u64::try_from(self.mem_table_bucket_num).unwrap_or(u64::MAX),
+            ),
+            ("max_file_size_on_disk", self.max_file_size_on_disk),
+            ("max_file_size_in_memory", self.max_file_size_in_memory),
+            ("max_file_retention_time", self.max_file_retention_time),
+        ];
+        if let Some((name, _value)) = rotation_values.into_iter().find(|(_, value)| *value == 0) {
+            return Err(format!("scribe.{name} must be at least 1"));
+        }
+        for (name, megabytes) in [
+            ("max_file_size_on_disk", self.max_file_size_on_disk),
+            ("max_file_size_in_memory", self.max_file_size_in_memory),
+        ] {
+            if megabytes.checked_mul(SCRIBE_MEGABYTE).is_none() {
+                return Err(format!("scribe.{name} megabytes overflow a byte count"));
+            }
         }
         if self.seal_key_max_age_secs == Some(0) {
             return Err("scribe.seal_key_max_age_secs must be at least 1".to_owned());
@@ -1516,8 +1519,12 @@ impl ScribeRuntimeConfig {
                 "scribe.ingest_request_bytes exceeds WAL v4 payload representability".to_owned(),
             );
         }
-        self.scribe_geometry()
-            .map_err(|error| format!("scribe geometry configuration is invalid: {error}"))?;
+        // The staging target only takes the smaller of two positive sizes, so
+        // Forge's default stands in for its separately validated override.
+        self.scribe_geometry(
+            vala_bifrost_redux::forge::ForgeConfig::default().default_target_file_size_bytes,
+        )
+        .map_err(|error| format!("scribe geometry configuration is invalid: {error}"))?;
         let ingest_values = [
             (
                 "ingest_time_partitions",
@@ -1546,24 +1553,32 @@ impl ScribeRuntimeConfig {
 
     /// Derives the validated independent Scribe geometry from this configuration.
     ///
-    /// This is the single conversion from operator-facing seconds and byte
-    /// fields into the checked [`ScribeGeometry`] the Scribe runtime owns, so
-    /// no caller can assemble an unvalidated geometry of its own.
+    /// This is the single conversion from operator-facing megabyte and
+    /// second fields into the checked [`ScribeGeometry`] the Scribe runtime
+    /// owns, so no caller can assemble an unvalidated geometry of its own.
+    /// The staging hot-object target is the smaller of
+    /// the on-disk file size and `forge_target_file_size_bytes`, Forge's
+    /// resolved rewrite target.
     ///
     /// # Errors
     ///
     /// Returns the [`ScribeGeometryError`] naming the geometry field that is
-    /// zero, that divides to no per-shard rotation limit at all, or that would
-    /// make a per-`SealKey` control fire after its shard has already rotated.
-    pub fn scribe_geometry(&self) -> Result<ScribeGeometry, ScribeGeometryError> {
+    /// zero or out of range, or that would make a per-`SealKey` control fire
+    /// after its shard has already rotated. [`Self::validate`] refuses a
+    /// megabyte size that overflows bytes; this conversion saturates.
+    pub fn scribe_geometry(
+        &self,
+        forge_target_file_size_bytes: u64,
+    ) -> Result<ScribeGeometry, ScribeGeometryError> {
+        let on_disk_bytes = self.max_file_size_on_disk.saturating_mul(SCRIBE_MEGABYTE);
         ScribeGeometry::new(
-            self.wal_segment_bytes,
-            self.active_generation_budget_bytes,
-            self.generation_rotation_ceiling_bytes,
-            Duration::from_secs(self.generation_max_age_secs),
+            self.mem_table_bucket_num,
+            on_disk_bytes,
+            self.max_file_size_in_memory.saturating_mul(SCRIBE_MEGABYTE),
+            Duration::from_secs(self.max_file_retention_time),
             self.seal_key_early_seal_bytes,
             self.seal_key_max_age_secs.map(Duration::from_secs),
-            self.staging_target_file_size_bytes,
+            on_disk_bytes.min(forge_target_file_size_bytes),
             self.ingest_request_bytes,
             vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
             vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
@@ -2560,11 +2575,27 @@ impl WyrdServerConfig {
             Some(self.bifrost.oracle.default_query_deadline_ms),
         )?
         .unwrap_or(self.bifrost.oracle.default_query_deadline_ms);
-        self.bifrost.scribe.staging_target_file_size_bytes = parse_optional_env(
-            "WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES",
-            Some(self.bifrost.scribe.staging_target_file_size_bytes),
+        let scribe = &mut self.bifrost.scribe;
+        scribe.mem_table_bucket_num = parse_optional_env(
+            "WYRD_MEM_TABLE_BUCKET_NUM",
+            Some(scribe.mem_table_bucket_num),
         )?
-        .unwrap_or(self.bifrost.scribe.staging_target_file_size_bytes);
+        .unwrap_or(scribe.mem_table_bucket_num);
+        scribe.max_file_size_on_disk = parse_optional_env(
+            "WYRD_MAX_FILE_SIZE_ON_DISK",
+            Some(scribe.max_file_size_on_disk),
+        )?
+        .unwrap_or(scribe.max_file_size_on_disk);
+        scribe.max_file_size_in_memory = parse_optional_env(
+            "WYRD_MAX_FILE_SIZE_IN_MEMORY",
+            Some(scribe.max_file_size_in_memory),
+        )?
+        .unwrap_or(scribe.max_file_size_in_memory);
+        scribe.max_file_retention_time = parse_optional_env(
+            "WYRD_MAX_FILE_RETENTION_TIME",
+            Some(scribe.max_file_retention_time),
+        )?
+        .unwrap_or(scribe.max_file_retention_time);
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -3637,24 +3668,31 @@ maintenance_interval_secs = 45
         assert_eq!(capped.resolved_per_tenant_active_cap(), 2);
     }
 
-    /// Both whole-file targets take a positive environment override over the
-    /// file value, and a zero or malformed value is refused at boot.
+    /// The Forge target and the Scribe shard and file settings take a
+    /// positive environment override over the file value, and a zero or
+    /// malformed value is refused at boot.
     ///
     /// # Panics
     ///
-    /// Panics when an override does not win, or a zero or malformed target is
+    /// Panics when an override does not win, or a zero or malformed value is
     /// accepted.
     #[test]
     fn file_target_environment_overrides_win_and_refuse_nonpositive_values() {
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         let file = from_toml_str_with_dev_oracle_opt_in(
-            "[forge]\ntarget_file_size_bytes = 268435456\n\n[bifrost.scribe]\nstaging_target_file_size_bytes = 134217728\n",
+            "[forge]\ntarget_file_size_bytes = 268435456\n\n[bifrost.scribe]\nmem_table_bucket_num = 2\nmax_file_size_on_disk = 128\nmax_file_size_in_memory = 64\nmax_file_retention_time = 30\n",
         )
         .expect("file targets parse");
         assert_eq!(file.forge.target_file_size_bytes, Some(268_435_456));
+        let scribe = &file.bifrost.scribe;
         assert_eq!(
-            file.bifrost.scribe.staging_target_file_size_bytes,
-            134_217_728
+            (
+                scribe.mem_table_bucket_num,
+                scribe.max_file_size_on_disk,
+                scribe.max_file_size_in_memory,
+                scribe.max_file_retention_time,
+            ),
+            (2, 128, 64, 30)
         );
         temp_env::with_vars(
             [
@@ -3662,25 +3700,34 @@ maintenance_interval_secs = 45
                     "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
                     Some("2147483648"),
                 ),
-                (
-                    "WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES",
-                    Some("268435456"),
-                ),
+                ("WYRD_MEM_TABLE_BUCKET_NUM", Some("8")),
+                ("WYRD_MAX_FILE_SIZE_ON_DISK", Some("256")),
+                ("WYRD_MAX_FILE_SIZE_IN_MEMORY", Some("32")),
+                ("WYRD_MAX_FILE_RETENTION_TIME", Some("60")),
             ],
             || {
                 let mut config = file.clone();
                 config.apply_env_overrides().expect("overrides apply");
                 assert_eq!(config.forge.target_file_size_bytes, Some(2_147_483_648));
+                let scribe = &config.bifrost.scribe;
                 assert_eq!(
-                    config.bifrost.scribe.staging_target_file_size_bytes,
-                    268_435_456
+                    (
+                        scribe.mem_table_bucket_num,
+                        scribe.max_file_size_on_disk,
+                        scribe.max_file_size_in_memory,
+                        scribe.max_file_retention_time,
+                    ),
+                    (8, 256, 32, 60)
                 );
                 config.validate().expect("positive targets validate");
             },
         );
         for key in [
             "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
-            "WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES",
+            "WYRD_MEM_TABLE_BUCKET_NUM",
+            "WYRD_MAX_FILE_SIZE_ON_DISK",
+            "WYRD_MAX_FILE_SIZE_IN_MEMORY",
+            "WYRD_MAX_FILE_RETENTION_TIME",
         ] {
             temp_env::with_vars([(key, Some("0"))], || {
                 let mut config = file.clone();
@@ -4069,28 +4116,21 @@ minimum_slots = 2
     #[test]
     fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();
-        // Asserted as bounds rather than by restating the derivation: an
-        // assertion that recomputes the implementation expression can never
-        // fail, while these bounds are exactly the properties a wrong formula
-        // violates — never below the two-thread floor, never above the number
-        // of shard lanes the runtime has to host.
         assert!(
-            (2..=vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
-                .contains(&cfg.coordination_threads),
-            "coordination threads {} must stay within the shard-lane bounds",
+            cfg.coordination_threads >= 2,
+            "coordination threads {} must keep the two-thread floor",
             cfg.coordination_threads
         );
         assert_eq!(
             cfg.ingest_request_bytes,
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
-        assert_eq!(cfg.wal_segment_bytes, 512 * 1024 * 1024);
-        assert_eq!(cfg.active_generation_budget_bytes, 8 * 1024 * 1024 * 1024);
-        assert_eq!(cfg.generation_rotation_ceiling_bytes, 512 * 1024 * 1024);
-        assert_eq!(cfg.generation_max_age_secs, 600);
+        assert_eq!(cfg.mem_table_bucket_num, 1);
+        assert_eq!(cfg.max_file_size_on_disk, 512);
+        assert_eq!(cfg.max_file_size_in_memory, 512);
+        assert_eq!(cfg.max_file_retention_time, 600);
         assert_eq!(cfg.seal_key_early_seal_bytes, None);
         assert_eq!(cfg.seal_key_max_age_secs, None);
-        assert_eq!(cfg.staging_target_file_size_bytes, 512 * 1024 * 1024);
         assert_eq!(
             cfg.ingest_limits(),
             vala_bifrost_redux::gate::limits::IngestLimits::default()
@@ -4098,42 +4138,53 @@ minimum_slots = 2
         cfg.validate().expect("resolved defaults must validate");
     }
 
-    /// One pod-wide budget derives every shard's rotation limit at boot.
+    /// The Scribe shard and file settings derive the geometry at boot.
     ///
     /// # Panics
     ///
-    /// Panics when the derived per-shard limit is not the minimum of the
-    /// ceiling and the evenly divided budget, when a geometry that cannot serve
-    /// is accepted, or when a per-`SealKey` control is allowed to fire after
-    /// its shard would already have rotated.
+    /// Panics when a setting does not reach its geometry field, when the
+    /// staging target is not the smaller of the on-disk size and Forge's
+    /// target, or when a per-`SealKey` control is allowed to fire after its
+    /// shard would already have rotated.
     #[test]
     fn scribe_geometry_is_derived_from_independent_configured_fields() {
+        const MIB: u64 = 1024 * 1024;
         let mut config = ScribeRuntimeConfig::default();
         let geometry = config
-            .scribe_geometry()
+            .scribe_geometry(1024 * MIB)
             .expect("the defaults form a coherent geometry");
-        assert_eq!(
-            geometry.shard_generation_rotation_bytes(),
-            512 * 1024 * 1024
-        );
-        assert_eq!(geometry.wal_segment_bytes(), 512 * 1024 * 1024);
-        assert_eq!(geometry.staging_target_file_size_bytes(), 512 * 1024 * 1024);
+        assert_eq!(geometry.shard_count(), 1);
+        assert_eq!(geometry.shard_generation_rotation_bytes(), 512 * MIB);
+        assert_eq!(geometry.wal_segment_bytes(), 512 * MIB);
+        assert_eq!(geometry.generation_max_age(), Duration::from_secs(600));
+        assert_eq!(geometry.staging_target_file_size_bytes(), 512 * MIB);
 
-        // Lowering only the pod-wide budget narrows every shard together and
-        // leaves the WAL segment and hot-object targets exactly where they were.
-        config.active_generation_budget_bytes = 1024 * 1024 * 1024;
+        // Staging assembles to the smaller of the on-disk size and Forge's
+        // target, whichever side is smaller.
+        assert_eq!(
+            config
+                .scribe_geometry(256 * MIB)
+                .expect("a smaller Forge target is coherent")
+                .staging_target_file_size_bytes(),
+            256 * MIB
+        );
+
+        // Each setting moves only its own geometry field.
+        config.mem_table_bucket_num = 4;
+        config.max_file_size_in_memory = 64;
         let narrowed = config
-            .scribe_geometry()
-            .expect("a smaller budget is still coherent");
-        assert_eq!(narrowed.shard_generation_rotation_bytes(), 64 * 1024 * 1024);
-        assert_eq!(narrowed.wal_segment_bytes(), 512 * 1024 * 1024);
-        assert_eq!(narrowed.staging_target_file_size_bytes(), 512 * 1024 * 1024);
+            .scribe_geometry(1024 * MIB)
+            .expect("a smaller memtable limit is still coherent");
+        assert_eq!(narrowed.shard_count(), 4);
+        assert_eq!(narrowed.shard_generation_rotation_bytes(), 64 * MIB);
+        assert_eq!(narrowed.wal_segment_bytes(), 512 * MIB);
+        assert_eq!(narrowed.staging_target_file_size_bytes(), 512 * MIB);
 
         // A per-key control may only seal earlier than the shard it belongs to.
         config.seal_key_early_seal_bytes = Some(65 * 1024 * 1024);
         let error = config
             .validate()
-            .expect_err("an early seal above the derived shard limit must be refused");
+            .expect_err("an early seal above the shard memtable limit must be refused");
         assert!(error.contains("seal_key_early_seal_bytes"), "{error}");
     }
 
@@ -4159,11 +4210,12 @@ minimum_slots = 2
         assert_rejected!(ingress_cpu_threads, 0);
         assert_rejected!(persistence_cpu_threads, 0);
         assert_rejected!(wal_io_threads, 0);
-        assert_rejected!(wal_segment_bytes, 0);
-        assert_rejected!(active_generation_budget_bytes, 0);
-        assert_rejected!(generation_rotation_ceiling_bytes, 0);
-        assert_rejected!(generation_max_age_secs, 0);
-        assert_rejected!(staging_target_file_size_bytes, 0);
+        assert_rejected!(mem_table_bucket_num, 0);
+        assert_rejected!(max_file_size_on_disk, 0);
+        assert_rejected!(max_file_size_in_memory, 0);
+        assert_rejected!(max_file_retention_time, 0);
+        assert_rejected!(max_file_size_on_disk, u64::MAX);
+        assert_rejected!(max_file_size_in_memory, u64::MAX);
         assert_rejected!(ingest_request_bytes, 0);
         assert_rejected!(ingest_time_partitions, 0);
         assert_rejected!(ingest_wal_workspace_bytes, 0);

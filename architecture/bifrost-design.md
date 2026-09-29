@@ -144,18 +144,29 @@ and failure; clients accept rows only after a valid terminal.
 
 ## Ingest: Scribe
 
-### Fixed lanes and hierarchical ownership
+### Shards and hierarchical ownership
 
-Each Scribe pod owns exactly sixteen shard lanes. The routing key is:
+Each Scribe pod runs a configured number of shards (`WYRD_MEM_TABLE_BUCKET_NUM`,
+default 1, at most 256). The routing key is:
 
 ```text
 hash(data_tenant_id, canonical_table, wyrd_batch_id)
 ```
 
-Distinct batches for one table use all lanes; retries use the recorded lane.
-Each lane owns a bounded mailbox, WAL generation, memtable buckets, and cohort
-state. Shards are a pod-local concurrency topology, not tenant partitions or
-table reservations.
+reduced modulo the shard count. Distinct batches for one table use all shards;
+retries use the recorded shard. Each shard owns a bounded mailbox, its own WAL
+stream, memtable buckets, and cohort state. Shards are a pod-local concurrency
+topology, not tenant partitions or table reservations. Replay maps a recorded
+shard onto the running count, so the count may change across restarts.
+
+Each shard rotates its WAL and memtable together when the WAL reaches
+`WYRD_MAX_FILE_SIZE_ON_DISK` (MiB), the memtable reaches
+`WYRD_MAX_FILE_SIZE_IN_MEMORY` (MiB), or the generation reaches
+`WYRD_MAX_FILE_RETENTION_TIME` (seconds). Each trigger reads its own counter;
+no byte is charged to two triggers. WAL disk is provisioned rather than
+tracked: there is no global disk ledger, and an out-of-space write surfaces as
+retryable `507` pressure. Memory stays under the global admission governor
+because it competes with queries.
 
 Shard owners, reconciliation, staging, assembly, and persistence run on one
 dedicated Scribe Tokio runtime separated from request serving. One non-cloneable
@@ -186,12 +197,12 @@ The principal size boundaries are independent:
 
 | Boundary | Rule |
 |---|---|
-| WAL segment | 512 MiB encoded default per shard WAL file |
-| Active shard generation | `min(512 MiB, floor(active_generation_budget / 16))`, plus age and pressure |
+| WAL segment | `WYRD_MAX_FILE_SIZE_ON_DISK`, 512 MiB default per shard WAL file |
+| Active shard generation | `WYRD_MAX_FILE_SIZE_IN_MEMORY`, 512 MiB default per shard, plus age and pressure |
 | Ingest request | one `scribe.ingest_request_bytes` wire ceiling, 16 MiB default |
 | Ingest expanded data | derived 4x the wire ceiling (64 MiB default), enforced before WAL; no row cap |
 | Parquet row group | soft 128 MiB encoded target; a single large accepted row fits a group of its own |
-| Scribe hot object | approximately 512 MiB encoded whole-file target, `WYRD_BIFROST_SCRIBE_STAGING_TARGET_FILE_SIZE_BYTES` override, with bounded residue |
+| Scribe hot object | `min(WYRD_MAX_FILE_SIZE_ON_DISK, Forge target)` encoded whole-file target, drained by size or dwell, with bounded residue |
 | Forge rewrite output | the table's optional registered compaction target, else the deployment default of approximately 1 GiB (`WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`) |
 
 Ingest has exactly one size setting. The wire ceiling bounds encoded request
@@ -213,7 +224,7 @@ The Scribe write path is:
 ```text
 validate and split by canonical physical partition
   -> global, tenant, and table admission
-  -> route to one of sixteen shard mailboxes
+  -> route to one shard mailbox
   -> tenant/table/FIFO scheduling
   -> WAL append, fsync, and durable batch fence
   -> tenant/table/partition memtable insertion

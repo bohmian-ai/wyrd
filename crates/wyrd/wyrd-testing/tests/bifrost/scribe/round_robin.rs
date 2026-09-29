@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy;
-use vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT;
 
 use super::support::{
     INGEST_BUSY, append_batch, append_values, read_sql, register_table, sorted_values, span_batch,
@@ -12,10 +11,7 @@ use super::support::{
 
 /// Batches each of the two tables sends in the interleaving phase.
 ///
-/// At least one batch per lane, so each table is placed on every one of the
-/// sixteen lanes and "the same lanes serve both" holds by construction rather
-/// than by the hash, and enough turns that a scheduler which favours one class
-/// has room to show it.
+/// Enough turns that a scheduler which favours one class has room to show it.
 const BATCHES_PER_TABLE: usize = 24;
 /// Rows in one batch, identical for both tables.
 const ROWS_PER_BATCH: usize = 64;
@@ -32,7 +28,7 @@ const MAX_CONSECUTIVE_TURNS: usize = 2;
 /// A built-in table is a scheduling peer, not a privileged writer.
 ///
 /// Scribe serves engine-owned built-ins and tenant-registered dynamic tables
-/// through one hierarchical scheduler on one fixed lane set. The failure this
+/// through one hierarchical scheduler on the same shards. The failure this
 /// guards against is a scheduler that quietly ranks them: system telemetry that
 /// pre-empts customer ingest, or customer ingest that starves the telemetry the
 /// operator needs to see it happening. Either way both tables still return
@@ -46,8 +42,8 @@ const MAX_CONSECUTIVE_TURNS: usize = 2;
 /// its reserve and has not yet touched the WAL or a shard mailbox.
 ///
 /// Equal demand is the rest of the design: both tables receive the same batch
-/// count with the same row count, so any asymmetry in turns taken, lanes
-/// reached, or bytes held is the scheduler's decision.
+/// count with the same row count, so any asymmetry in turns taken or bytes
+/// held is the scheduler's decision.
 ///
 /// # Panics
 ///
@@ -56,7 +52,7 @@ const MAX_CONSECUTIVE_TURNS: usize = 2;
 /// when the released vector goes back to the incumbent ahead of the waiting
 /// built-in, when either table takes more consecutive turns than rotation
 /// allows, when either table's own batches are acknowledged out of order, when
-/// the two do not share the one fixed lane set, when one table's ownership
+/// one table's ownership
 /// crowds out the other's, or when either table loses a row across publication.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
@@ -155,28 +151,15 @@ async fn scribe_system_and_dynamic_tables_are_round_robin_equal() {
     let acknowledgements = Arc::new(Mutex::new(Vec::<Turn>::new()));
     let mut expected_dynamic: Vec<i64> = held.clone();
     let mut expected_system: Vec<i64> = held.clone();
-    let mut dynamic_routes: Vec<usize> = Vec::with_capacity(BATCHES_PER_TABLE);
-    let mut system_routes: Vec<usize> = Vec::with_capacity(BATCHES_PER_TABLE);
-    let system_ref = vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Traces, "spans");
-    let dynamic_ref =
-        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &dynamic_name);
     let mut dynamic_batches = Vec::with_capacity(BATCHES_PER_TABLE);
     let mut system_batches = Vec::with_capacity(BATCHES_PER_TABLE);
     for batch in 0..BATCHES_PER_TABLE {
         let first = ((batch + 1) * ROWS_PER_BATCH) as i64;
         let rows: Vec<i64> = (first..first + ROWS_PER_BATCH as i64).collect();
-        // Random ids let the hash decide how many lanes the two classes
-        // shared, which fell below half on unlucky draws. Placing batch `n` on
-        // lane `n % SCRIBE_SHARD_COUNT` for both classes makes every lane shared.
-        let lane = batch % SCRIBE_SHARD_COUNT;
-        let dynamic_batch_id = batch_id_on_lane(tenant, &dynamic_ref, lane);
-        let system_batch_id = batch_id_on_lane(tenant, &system_ref, lane);
-        dynamic_routes.push(lane);
-        system_routes.push(lane);
         expected_dynamic.extend_from_slice(&rows);
         expected_system.extend_from_slice(&rows);
-        dynamic_batches.push((dynamic_batch_id, rows.clone()));
-        system_batches.push((system_batch_id, rows));
+        dynamic_batches.push((uuid::Uuid::now_v7(), rows.clone()));
+        system_batches.push((uuid::Uuid::now_v7(), rows));
     }
 
     let dynamic_turns = tokio::spawn({
@@ -218,7 +201,7 @@ async fn scribe_system_and_dynamic_tables_are_round_robin_equal() {
     assert_fifo_within_each_table(&turns);
     assert_rotation_between_tables(&turns);
 
-    // 5. Ownership, lane sharing and exact public read-back for both classes.
+    // 5. Ownership and exact public read-back for both classes.
     let loaded = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
@@ -241,33 +224,6 @@ async fn scribe_system_and_dynamic_tables_are_round_robin_equal() {
     assert!(
         larger <= smaller.saturating_mul(8),
         "equal demand must not produce a lopsided split between a built-in and a dynamic table: system {system_bytes}, dynamic {dynamic_bytes}"
-    );
-
-    let lane_set = |routes: &[usize]| {
-        let mut lanes = [false; SCRIBE_SHARD_COUNT];
-        for lane in routes {
-            lanes[*lane] = true;
-        }
-        lanes
-    };
-    let system_lanes = lane_set(&system_routes);
-    let dynamic_lanes = lane_set(&dynamic_routes);
-    let shared: usize = (0..SCRIBE_SHARD_COUNT)
-        .filter(|lane| system_lanes[*lane] && dynamic_lanes[*lane])
-        .count();
-    assert_eq!(
-        shared, SCRIBE_SHARD_COUNT,
-        "the two table classes must share the one fixed lane set, not split it: {shared} shared lanes of {SCRIBE_SHARD_COUNT}"
-    );
-    let unowned: Vec<usize> = (0..SCRIBE_SHARD_COUNT)
-        .filter(|lane| {
-            (system_lanes[*lane] || dynamic_lanes[*lane]) && loaded.memory_by_shard[*lane] == 0
-        })
-        .collect();
-    assert!(
-        unowned.is_empty(),
-        "every lane the two tables routed to must own their rows; empty lanes {unowned:?} of {:?}",
-        loaded.memory_by_shard
     );
 
     server
@@ -293,24 +249,6 @@ async fn scribe_system_and_dynamic_tables_are_round_robin_equal() {
     );
 
     server.shutdown().await.expect("the server drains cleanly");
-}
-
-/// Draws time-ordered batch ids until one routes to `lane`.
-///
-/// Routing is a uniform hash over tenant, table, and batch id, so a match takes
-/// sixteen draws on average. Ids stay `now_v7`, so a table's batches remain
-/// ascending in submission order exactly as random draws were.
-fn batch_id_on_lane(
-    tenant: wyrd_spec::ids::DataTenantId,
-    table: &vala_bifrost_redux::catalog::TableRef,
-    lane: usize,
-) -> uuid::Uuid {
-    loop {
-        let id = uuid::Uuid::now_v7();
-        if vala_bifrost_redux::scribe::routing::shard_for(tenant, table, id) == lane {
-            return id;
-        }
-    }
 }
 
 /// Which of the two scheduling peers took one acknowledged turn.

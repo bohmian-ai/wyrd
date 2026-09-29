@@ -7,6 +7,7 @@ use crate::contracts::{
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::ScribeImpl;
 use crate::scribe::admission::EventTimeWindow;
+use crate::scribe::geometry::DEFAULT_SHARD_COUNT;
 use crate::scribe::staged_tail::tests::unbounded_pool;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
@@ -503,8 +504,8 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let inspection = scribe
         .inspection_snapshot()
         .expect("exact ownership inspection");
-    assert_eq!(inspection.shard_task_count, 16);
-    assert_eq!(inspection.shard_channel_count, 16);
+    assert_eq!(inspection.shard_task_count, DEFAULT_SHARD_COUNT);
+    assert_eq!(inspection.shard_channel_count, DEFAULT_SHARD_COUNT);
     assert_eq!(
         inspection.memory_by_shard.iter().sum::<usize>(),
         inspection.total_accounted_memory

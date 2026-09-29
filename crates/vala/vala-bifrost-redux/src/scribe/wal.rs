@@ -292,7 +292,7 @@ impl SegmentHeader {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the magic, version, reserved
-    /// fields, shard identifier, or header checksum violates WAL v6 framing.
+    /// fields, or header checksum violates WAL v6 framing.
     pub fn decode(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self, ScribeError> {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != WAL_MAGIC {
@@ -309,11 +309,6 @@ impl SegmentHeader {
             buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
         ]);
         let shard_id = buf[32];
-        if shard_id >= 16 {
-            return Err(ScribeError::Internal {
-                detail: format!("invalid WAL shard id: {shard_id}"),
-            });
-        }
         if buf[33..40].iter().any(|byte| *byte != 0) || buf[48..60].iter().any(|byte| *byte != 0) {
             return Err(ScribeError::Internal {
                 detail: "segment header reserved bytes non-zero".to_owned(),
@@ -2005,11 +2000,6 @@ impl WalWriter {
         health: Option<crate::resources::BifrostResourceHealth>,
     ) -> Result<Self, ScribeError> {
         let config = WalConfig::new(config.segment_bytes)?;
-        if shard_id >= 16 {
-            return Err(ScribeError::Internal {
-                detail: format!("WAL shard id must be below 16, got {shard_id}"),
-            });
-        }
         let base_dir = base_dir.as_ref().to_path_buf();
         let writer = Self {
             base_dir,
@@ -2018,7 +2008,11 @@ impl WalWriter {
             shard_id,
             next_lsn: Arc::new(AtomicU64::new(0)),
             segment_bytes: config.segment_bytes,
-            states: Arc::new((0..16).map(|_| Mutex::new(WalState::default())).collect()),
+            states: Arc::new(
+                (0..=u8::MAX)
+                    .map(|_| Mutex::new(WalState::default()))
+                    .collect(),
+            ),
             #[cfg(any(test, feature = "test-support"))]
             faults: Arc::default(),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
@@ -2095,17 +2089,12 @@ impl WalWriter {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when `shard_id` cannot be represented
-    /// by the fixed WAL topology or lies outside the configured shard set.
+    /// Returns [`ScribeError::Internal`] when `shard_id` does not fit the WAL
+    /// segment header's one-byte shard id.
     pub(crate) fn handle_for_shard(&self, shard_id: usize) -> Result<WalHandle, ScribeError> {
         let shard_id = u8::try_from(shard_id).map_err(|_| ScribeError::Internal {
             detail: format!("invalid WAL shard index: {shard_id}"),
         })?;
-        if usize::from(shard_id) >= self.states.len() {
-            return Err(ScribeError::Internal {
-                detail: format!("WAL shard index is outside the fixed topology: {shard_id}"),
-            });
-        }
         Ok(WalHandle::for_shard(
             Arc::new(self.clone_for_handle()),
             shard_id,
@@ -2178,6 +2167,7 @@ impl WalWriter {
                 seal_key.tenant,
                 &seal_key.table,
                 uuid::Uuid::from_bytes(batch_id),
+                crate::scribe::routing::TEST_SHARD_COUNT,
             ))
             .expect("fixed shard count fits in u8"),
         );
@@ -2391,6 +2381,7 @@ impl WalWriter {
                 seal_key.tenant,
                 &seal_key.table,
                 uuid::Uuid::from_bytes(decoded.batch_id),
+                crate::scribe::routing::TEST_SHARD_COUNT,
             ))
             .expect("fixed shard count fits in u8"),
         );
@@ -2412,6 +2403,7 @@ impl WalWriter {
             seal_key.tenant,
             &seal_key.table,
             uuid::Uuid::nil(),
+            crate::scribe::routing::TEST_SHARD_COUNT,
         ))
         .expect("fixed shard count fits in u8");
         self.sync_data_for_shard(shard_id)
@@ -2437,6 +2429,7 @@ impl WalWriter {
                 seal_key.tenant,
                 &seal_key.table,
                 uuid::Uuid::from_bytes(batch_id),
+                crate::scribe::routing::TEST_SHARD_COUNT,
             ))
             .expect("fixed shard count fits in u8"),
         );
@@ -4201,6 +4194,7 @@ mod tests {
             seal_key.tenant,
             &seal_key.table,
             uuid::Uuid::from_bytes(first_batch),
+            crate::scribe::routing::TEST_SHARD_COUNT,
         );
         let second_batch = (first.saturating_add(1)..=u8::MAX)
             .map(|value| [value; 16])
@@ -4209,6 +4203,7 @@ mod tests {
                     seal_key.tenant,
                     &seal_key.table,
                     uuid::Uuid::from_bytes(*batch_id),
+                    crate::scribe::routing::TEST_SHARD_COUNT,
                 ) == shard
             })
             .expect("a second batch routes to the same fixed shard");

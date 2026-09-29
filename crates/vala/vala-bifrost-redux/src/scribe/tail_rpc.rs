@@ -17,7 +17,6 @@ use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::scribe::memtable::{Memtable, ReadableBatchLimits};
-use crate::scribe::routing::shard_for;
 use crate::scribe::shards::ScribeShardRuntime;
 use crate::scribe::staged_tail::StagedTailReader;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -328,28 +327,6 @@ pub struct FetchLiveTailRequest {
     pub max_retained_bytes: usize,
 }
 
-impl FetchLiveTailRequest {
-    /// Return any consistent shard index for attribution purposes.
-    ///
-    /// Under batch-spread routing the live-tail data for one (tenant, table)
-    /// may be spread across multiple shard lanes, so this value is used only
-    /// for approximate attribution and diagnostics — not for dispatch. Use
-    /// `ScribeShardRuntime::snapshot` for the
-    /// fan-out that merges results across all shards.
-    #[must_use]
-    pub fn shard_id(&self) -> usize {
-        // Use a stable zero-UUID as the batch_id placeholder so the
-        // attribution-only shard is deterministic across calls on the same
-        // request. The fan-out dispatch in ScribeShardRuntime::snapshot is the
-        // authoritative multi-shard read path.
-        shard_for(
-            self.binding.tenant,
-            &self.binding.table_ref,
-            uuid::Uuid::nil(),
-        )
-    }
-}
-
 /// One shallow, structural hot snapshot returned by a shard owner.
 #[derive(Debug, Clone)]
 pub struct HotBatch {
@@ -646,12 +623,6 @@ impl FetchLiveTailService {
         partitions.sort();
         partitions.dedup();
         Ok(partitions)
-    }
-
-    /// Return the canonical pod-local shard for a live-tail scope.
-    #[must_use]
-    pub fn shard_id(&self, request: &FetchLiveTailRequest) -> usize {
-        request.shard_id()
     }
 
     /// Opens one lazily produced live read over this Scribe's stream.

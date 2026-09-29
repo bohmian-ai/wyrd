@@ -1350,9 +1350,9 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     .await
     .err()
     .ok_or("a query against a fully occupied root was not refused")?;
-    if !refusal.contains(QUERY_ADMISSION_REJECTED_CODE) {
+    if !refusal.contains(QUERY_RESOURCES_EXHAUSTED_CODE) {
         return Err(
-            format!("refusal carried {refusal} rather than the typed capacity code").into(),
+            format!("refusal carried {refusal} rather than the typed resource code").into(),
         );
     }
 

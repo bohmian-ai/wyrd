@@ -5065,7 +5065,9 @@ mod tests {
         assert_eq!(pool.reserved(), 0);
     }
 
-    /// An indivisible range above its ceiling is rejected before storage IO.
+    /// An indivisible range above its ceiling is refused before storage IO
+    /// as the admitted query's typed resource exhaustion, not an admission
+    /// refusal.
     #[tokio::test]
     async fn hot_parquet_oversized_single_range_fails_before_io() {
         let fixture = build_hot_causal_fixture();
@@ -5086,7 +5088,7 @@ mod tests {
         let error = DataFusionError::External(Box::new(parquet_error));
         assert_eq!(
             crate::oracle::map_first_batch_failure(Some(&Err(error))),
-            Some(BifrostError::QueryAdmissionRejected)
+            Some(BifrostError::QueryResourcesExhausted)
         );
         assert!(ranges.lock().expect("recorded ranges").is_empty());
         drop(occupied);

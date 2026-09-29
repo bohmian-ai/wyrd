@@ -517,8 +517,8 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
 
 /// An undialable ready Scribe peer degrades a public read to known live loss.
 ///
-/// This drives the public SDK against an active, unflushed generation so Oracle
-/// must use the private Scribe RPC. The test then replaces only the durable
+/// This drives the public SDK against an active, unflushed generation on a
+/// peer-enabled node, so Oracle must use the private Scribe RPC. The test then replaces only the durable
 /// membership address with a concrete closed loopback endpoint and refreshes
 /// the production registry snapshot. The known Scribe is unreachable before
 /// any row, so the query ends `Degraded` with `LiveTailUnavailable` and returns
@@ -532,7 +532,21 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_undialable_private_peer_degrades_live_coverage() {
-    let server = start_scribe_server().await;
+    // Peer mode, because only a peer-enabled node advertises a dialable
+    // private address and reaches even its own Scribe through that transport;
+    // a process-local node calls its Scribe in process and has nothing to break.
+    let peer_root = tempfile::tempdir().expect("peer TLS root");
+    let peer_tls = wyrd_testing::bifrost::peer_ca::BifrostPeerCa::generate(
+        wyrd_server::config::PEER_SERVER_NAME,
+    )
+    .expect("peer CA")
+    .materialize(peer_root.path(), "undialable")
+    .expect("peer TLS material");
+    let server = wyrd_testing::WyrdTestServer::builder()
+        .with_peer_tls(peer_tls)
+        .start_bound()
+        .await
+        .expect("the peer-enabled Scribe harness starts");
     let tenant = server.data_tenant_id();
     let table = register_table(
         &server,

@@ -742,7 +742,6 @@ impl Oracle {
         await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await?;
         if report.active_queries != 0
             || report.queued_queries != 0
-            || report.peer_pending != 0
             || report.peer_running != 0
             || report.reserved_memory_bytes != 0
             || audit != 0

@@ -342,7 +342,6 @@ async fn prove_selective_predicate_pruning(
         if inspection.active_queries == 0
             && inspection.queued_queries == 0
             && inspection.reserved_memory_bytes == 0
-            && inspection.peer_pending == 0
             && inspection.peer_running == 0
         {
             cluster.shutdown().await?;

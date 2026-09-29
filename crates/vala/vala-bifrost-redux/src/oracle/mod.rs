@@ -23,7 +23,6 @@ use datafusion::sql::resolve::resolve_table_references;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -366,23 +365,19 @@ pub struct OracleRuntimeInspection {
     /// Actual `DataFusion` reservation, not an admission quantum: an admitted
     /// query that never grew a consumer contributes nothing here.
     pub reserved_memory_bytes: u64,
-    /// Peer pending reservations held by this Oracle.
-    pub peer_pending: u64,
     /// Peer running reservations held by this Oracle.
     pub peer_running: u64,
 }
 
-/// Bounded local peer-waiter slots for one Oracle process.
+/// Immutable local slot-unit capacity figure for one Oracle process.
 ///
 /// Running capacity is not owned here. `BifrostResourceGovernor` is the one
 /// class-aware slot-unit ledger charged by both leader admission and follower
-/// acquisition, so a second local semaphore could only disagree with it.
+/// acquisition, so a local semaphore could only disagree with it. A receiving
+/// node never waits for a slot on a peer's behalf: a full node refuses before
+/// accepting work and the leader owns any retry.
 #[derive(Debug)]
 pub struct OracleSlotManager {
-    /// Semaphore bounding requests waiting to enter pod-local admission.
-    pending: Arc<Semaphore>,
-    /// Immutable configured pending capacity used for readiness diagnostics.
-    pending_limit: usize,
     /// Immutable local slot-unit total used only for placement calculations.
     ///
     /// This is a capacity figure, never a gate: the governor decides whether
@@ -882,51 +877,16 @@ impl Drop for AdmissionWaitTelemetryGuard {
 }
 
 impl OracleSlotManager {
-    /// Creates the bounded peer-waiter guard for one Oracle process.
+    /// Records the local slot-unit total this Oracle process can ever run.
     #[must_use]
-    pub fn new(pending: usize, total_slot_units: usize) -> Self {
-        Self {
-            pending: Arc::new(Semaphore::new(pending)),
-            pending_limit: pending,
-            total_slot_units,
-        }
+    pub fn new(total_slot_units: usize) -> Self {
+        Self { total_slot_units }
     }
 
     /// Returns the immutable local slot-unit total for placement calculations.
     #[must_use]
     pub fn total_slot_units(&self) -> usize {
         self.total_slot_units
-    }
-
-    /// Returns the currently configured pending capacity.
-    #[must_use]
-    pub fn pending_capacity(&self) -> usize {
-        self.pending_limit
-    }
-
-    /// Returns the number of pending worker units currently reserved locally.
-    #[must_use]
-    pub(crate) fn pending_in_use(&self) -> u64 {
-        self.pending_limit
-            .saturating_sub(self.pending.available_permits()) as u64
-    }
-
-    /// Tries to reserve one bounded reservation-waiter slot.
-    ///
-    /// Peer reservation is allowed to wait out momentary running-slot
-    /// saturation, and this bound caps how many such waits may be in flight at
-    /// once. It is deliberately not a dispatch gate: holding it grants no right
-    /// to execute, only the right to wait for the running gate that does. That
-    /// separation is what keeps a leader's completed fan-out reservation a real
-    /// guarantee rather than an optimistic one.
-    ///
-    /// # Errors
-    ///
-    /// Returns admission rejection when the local waiter bound is full.
-    pub(crate) fn try_pending(&self) -> Result<OwnedSemaphorePermit, BifrostError> {
-        Arc::clone(&self.pending)
-            .try_acquire_owned()
-            .map_err(|_| BifrostError::QueryAdmissionRejected)
     }
 }
 
@@ -3256,16 +3216,11 @@ impl Oracle {
             );
         }
         let report = self.admission.shutdown(deadline).await;
-        if report.active_queries != 0
-            || report.queued_queries != 0
-            || report.peer_pending != 0
-            || report.peer_running != 0
-        {
+        if report.active_queries != 0 || report.queued_queries != 0 || report.peer_running != 0 {
             tracing::warn!(
                 active_queries = report.active_queries,
                 queued_queries = report.queued_queries,
                 reserved_memory_bytes = report.reserved_memory_bytes,
-                peer_pending = report.peer_pending,
                 peer_running = report.peer_running,
                 "Oracle shutdown reached deadline with residual local admission state"
             );

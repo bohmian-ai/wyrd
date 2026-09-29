@@ -67,6 +67,35 @@ pub(super) const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
 const RESERVATION_RETRY_MS: u32 = 1_000;
 
+/// Waits out one explicit pre-accept peer capacity refusal before a leader
+/// retries placement.
+///
+/// The wait is the refusing peer's own `retry_after_ms` hint, bounded by the
+/// leader's absolute `deadline` and cut short by `cancel`. A hint that would
+/// carry the retry past the deadline is not waited at all: the query could
+/// not use the slot, so the leader stops now instead of sleeping into its own
+/// timeout. Stateless by design — the leader owns the deadline, cancellation,
+/// and every provisional reservation it must release before calling this.
+///
+/// Returns `true` when the leader should retry placement, and `false` when
+/// cancellation or the deadline ends the retry.
+pub(super) async fn wait_for_peer_capacity(
+    rejected: ReservationRejected,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> bool {
+    let wake =
+        Instant::now() + std::time::Duration::from_millis(u64::from(rejected.retry_after_ms));
+    if wake >= deadline {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => false,
+        () = tokio::time::sleep_until(wake) => true,
+    }
+}
+
 /// Closed transport failure classification used by terminal dispatch policy.
 #[derive(Debug, Error)]
 pub enum DispatchError {
@@ -142,18 +171,6 @@ impl DispatchError {
         }
     }
 }
-
-/// Longest a peer waits out a saturated running-slot pool before refusing.
-///
-/// Sized far below the query deadline so peer backpressure never becomes a
-/// caller-visible timeout — the failure mode where an uncoordinated worker-side
-/// queue outlives the dispatch RPC and surfaces as a transport error instead of
-/// a clean refusal. Long enough to absorb the brief contention that a fan-out
-/// across several peers otherwise turns into a failed query.
-const PEER_SLOT_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Interval between running-slot retries inside [`PEER_SLOT_WAIT`].
-const PEER_SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Closed reasons accompanying a partial peer attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,11 +544,6 @@ impl ReservationRegistry {
     pub fn admitted_running_total(&self) -> u64 {
         self.admitted_running_total
             .load(core::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Returns this registry's slot manager for waiter-bound admission.
-    pub(crate) fn slots(&self) -> &Arc<OracleSlotManager> {
-        &self.slots
     }
 
     /// Atomically reserves one pending worker slot and returns its generated identity.
@@ -1084,59 +1096,42 @@ impl OraclePeerWorker {
         }
     }
 
-    /// Reserves bounded running capacity for one fenced leader.
+    /// Reserves running capacity for one fenced leader, or refuses at once.
     ///
-    /// Reservation is the single admission gate: accepting here grants the
-    /// slot units the fragment will later execute under, so a leader that
-    /// completes its fan-out reservation knows every participant can run.
-    /// A saturated pool is waited out for at most [`PEER_SLOT_WAIT`] before
-    /// refusing, which converts a momentary instant of contention into a
-    /// slightly delayed fragment instead of a failed query, while still
-    /// refusing sustained overload promptly enough that the leader can retry
-    /// well inside the query deadline.
-    pub async fn reserve(&self, request: &ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
-        let query_class = request.query_class;
-        let rejected = || {
-            record_slot(query_class, SlotOutcome::Rejected);
+    /// Reservation is the single admission gate: accepting here charges the
+    /// slot units the fragment or graph will later execute under, so a leader
+    /// that completes its fan-out reservation knows every participant can run,
+    /// and the pending-to-running transfer at execute cannot fail on capacity.
+    /// A node whose slots are full answers `Rejected` with its retry hint
+    /// before accepting any work. It never waits on the leader's behalf:
+    /// several leaders may target this node, and only a leader knows its own
+    /// deadline, so the leader owns the bounded retry.
+    pub fn reserve(&self, request: &ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
+        // Charge the governor's slot ledger here, and derive the fragment's
+        // memory ceiling from that charge rather than debiting it, so a node
+        // already saturated by its own leader-side queries refuses before the
+        // leader commits to this participant rather than after.
+        let attempt = match self.acquire_reserved_capacity(request) {
+            Ok(capacity) => self
+                .reservations
+                .reserve(request, Utc::now(), Some(capacity)),
+            Err(error) => {
+                tracing::warn!(
+                    stage = "slot_reservation",
+                    query_class = ?request.query_class,
+                    "oracle peer capacity rejection"
+                );
+                Err(error)
+            }
+        };
+        if let Ok(pending) = attempt {
+            record_slot(request.query_class, SlotOutcome::Pending);
+            ReserveNodeSlotsResponse::Pending(pending)
+        } else {
+            record_slot(request.query_class, SlotOutcome::Rejected);
             ReserveNodeSlotsResponse::Rejected(ReservationRejected {
                 retry_after_ms: RESERVATION_RETRY_MS,
             })
-        };
-        // The waiter bound is taken before the first attempt and held for the
-        // whole wait, so a saturated node sheds new arrivals immediately instead
-        // of accumulating an unbounded set of sleepers behind one running gate.
-        let Ok(_waiter) = self.reservations.slots().try_pending() else {
-            return rejected();
-        };
-        let deadline = std::time::Instant::now() + PEER_SLOT_WAIT;
-        loop {
-            // Charge the governor's slot ledger here, and derive the fragment's
-            // memory ceiling from that charge rather than debiting it, so a node
-            // already saturated by its own leader-side queries refuses before the
-            // leader commits to this participant rather than after.
-            let attempt = match self.acquire_reserved_capacity(request) {
-                Ok(capacity) => self
-                    .reservations
-                    .reserve(request, Utc::now(), Some(capacity)),
-                Err(error) => {
-                    tracing::warn!(
-                        stage = "slot_reservation",
-                        query_class = ?request.query_class,
-                        "oracle peer capacity rejection"
-                    );
-                    Err(error)
-                }
-            };
-            match attempt {
-                Ok(pending) => {
-                    record_slot(query_class, SlotOutcome::Pending);
-                    return ReserveNodeSlotsResponse::Pending(pending);
-                }
-                Err(DispatchError::Capacity) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(PEER_SLOT_POLL).await;
-                }
-                Err(_) => return rejected(),
-            }
         }
     }
 
@@ -2904,21 +2899,28 @@ impl OraclePeerTransportDirectory {
     ///
     /// # Errors
     ///
-    /// Returns [`DispatchError::Terminal`] when `request` names no graph,
-    /// [`DispatchError::Capacity`] when the participant declined, and the
-    /// selected adapter's failure otherwise.
+    /// The outer result carries transport or contract failure; the inner one
+    /// separates acceptance from an explicit pre-accept refusal, which keeps
+    /// the participant's `retry_after_ms` so the leader can own a bounded
+    /// retry. Only that inner refusal is proof the participant accepted no
+    /// work.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when `request` names no graph, and
+    /// the selected adapter's retryable or terminal failure otherwise.
     pub async fn reserve_graph(
         &self,
         candidate: &DispatchCandidate,
         request: ReserveNodeSlotsRequest,
-    ) -> Result<PendingNodeReservation, DispatchError> {
+    ) -> Result<Result<PendingNodeReservation, ReservationRejected>, DispatchError> {
         if request.graph.is_none() {
             return Err(DispatchError::Terminal);
         }
-        match self.reserve(candidate, request).await? {
+        Ok(match self.reserve(candidate, request).await? {
             ReserveNodeSlotsResponse::Pending(pending) => Ok(pending),
-            ReserveNodeSlotsResponse::Rejected(_) => Err(DispatchError::Capacity),
-        }
+            ReserveNodeSlotsResponse::Rejected(rejected) => Err(rejected),
+        })
     }
 
     /// Releases one graph reservation this node took on a participant.
@@ -3205,6 +3207,17 @@ fn fragment_request(
     }
 }
 
+/// Why one fragment placement round ended without a validated attempt.
+#[derive(Debug)]
+enum RoundFailure {
+    /// Every candidate explicitly refused before accepting work; carries the
+    /// shortest retry hint any of them returned.
+    Rejected(ReservationRejected),
+    /// A terminal, ambiguous, or retryable-elsewhere failure the leader must
+    /// not retry as capacity.
+    Failed(DispatchError),
+}
+
 /// Owns claims construction and one ambiguity-terminal reserve/execute/release cut.
 pub struct FragmentDispatcher {
     /// Node-aware directory enforcing in-process leader and tonic remote routing.
@@ -3234,16 +3247,17 @@ impl FragmentDispatcher {
     ///
     /// Returns [`DispatchError::Unavailable`] when the deadline has already
     /// passed, the query was cancelled, or the reserve call timed out, and
-    /// propagates a terminal reservation failure unchanged. `Ok(None)` means the
-    /// candidate rejected the reservation and the caller should try the next one.
+    /// propagates a terminal reservation failure unchanged. `Ok(Err(_))` means
+    /// the candidate explicitly rejected the reservation before accepting any
+    /// work, carrying its retry hint, and the caller should try the next one.
     async fn reserve_candidate(
         &self,
         candidate: &DispatchCandidate,
         reserve: ReserveNodeSlotsRequest,
         context: &DispatchContext,
-    ) -> Result<Option<PendingNodeReservation>, DispatchError> {
+    ) -> Result<Result<PendingNodeReservation, ReservationRejected>, DispatchError> {
         if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
-            return Ok(Some(PendingNodeReservation {
+            return Ok(Ok(PendingNodeReservation {
                 reservation_id: ReservationId::new(uuid::Uuid::nil()),
                 expires_at: reserve.expires_at,
             }));
@@ -3257,8 +3271,8 @@ impl FragmentDispatcher {
             result = tokio::time::timeout(remaining, self.transports.reserve(candidate, reserve)) =>
                 result.map_err(|_| DispatchError::Unavailable).and_then(std::convert::identity),
         } {
-            Ok(ReserveNodeSlotsResponse::Rejected(_)) => Ok(None),
-            Ok(ReserveNodeSlotsResponse::Pending(pending)) => Ok(Some(pending)),
+            Ok(ReserveNodeSlotsResponse::Rejected(rejected)) => Ok(Err(rejected)),
+            Ok(ReserveNodeSlotsResponse::Pending(pending)) => Ok(Ok(pending)),
             Err(error) => {
                 tracing::error!(?error, "Oracle peer reservation failed terminally");
                 Err(error)
@@ -3273,9 +3287,17 @@ impl FragmentDispatcher {
     /// proven pre-delivery `Rejected` response may advance to the next ordered
     /// candidate. Attempt bytes become visible only after footer validation.
     ///
+    /// When every candidate of a round explicitly rejected before accepting
+    /// work, the round holds no reservation, so the leader waits for the
+    /// shortest peer retry hint within its own deadline and cancellation (see
+    /// [`wait_for_peer_capacity`]) and retries placement. A round that ended in
+    /// any ambiguous failure is never retried as capacity.
+    ///
     /// # Errors
-    /// Returns the first ambiguity-terminal failure or capacity when every
-    /// candidate explicitly rejects before delivery.
+    /// Returns the first ambiguity-terminal failure, the last retryable
+    /// attempt failure, [`DispatchError::Unavailable`] when the query is
+    /// cancelled while waiting to retry, or capacity when every candidate
+    /// keeps rejecting until a retry could no longer fit the deadline.
     pub async fn execute(
         &self,
         context: &DispatchContext,
@@ -3285,12 +3307,43 @@ impl FragmentDispatcher {
         if !self.transports.is_local(context.leader_node_id) {
             return Err(DispatchError::Terminal);
         }
+        loop {
+            let rejected = match self.execute_round(context, &fragment, candidates).await {
+                Ok(attempt) => return Ok(attempt),
+                Err(RoundFailure::Failed(error)) => return Err(error),
+                Err(RoundFailure::Rejected(rejected)) => rejected,
+            };
+            if !wait_for_peer_capacity(rejected, context.deadline, &context.cancellation).await {
+                return Err(if context.cancellation.is_cancelled() {
+                    DispatchError::Unavailable
+                } else {
+                    DispatchError::Capacity
+                });
+            }
+        }
+    }
+
+    /// Runs one placement round over the ordered candidates.
+    ///
+    /// # Errors
+    /// Returns [`RoundFailure::Rejected`] with the shortest retry hint when
+    /// every candidate explicitly rejected before accepting work, and
+    /// [`RoundFailure::Failed`] with the terminal or last retryable failure
+    /// otherwise.
+    async fn execute_round(
+        &self,
+        context: &DispatchContext,
+        fragment: &PhysicalDispatchFragment,
+        candidates: &[DispatchCandidate],
+    ) -> Result<ValidatedAttempt, RoundFailure> {
         // Last retryable attempt failure, kept so an exhausted candidate list
         // reports the real cause instead of a bare admission failure.
-        let mut last_retryable: Option<Result<ValidatedAttempt, DispatchError>> = None;
+        let mut last_retryable: Option<DispatchError> = None;
+        // Shortest explicit pre-accept refusal hint seen this round.
+        let mut rejected: Option<ReservationRejected> = None;
         for candidate in candidates {
             if candidate.role != fragment.target_role {
-                return Err(DispatchError::Terminal);
+                return Err(RoundFailure::Failed(DispatchError::Terminal));
             }
             let expires_at = Utc::now() + PENDING_TTL;
             let reserve = ReserveNodeSlotsRequest {
@@ -3304,8 +3357,19 @@ impl FragmentDispatcher {
                 // quantum, not the whole query envelope a graph lease owns.
                 graph: None,
             };
-            let Some(pending) = self.reserve_candidate(candidate, reserve, context).await? else {
-                continue;
+            let pending = match self
+                .reserve_candidate(candidate, reserve, context)
+                .await
+                .map_err(RoundFailure::Failed)?
+            {
+                Ok(pending) => pending,
+                Err(refusal) => {
+                    rejected = Some(match rejected {
+                        Some(held) if held.retry_after_ms <= refusal.retry_after_ms => held,
+                        _ => refusal,
+                    });
+                    continue;
+                }
             };
             let release = ReleaseNodeSlotsRequest {
                 reservation_id: pending.reservation_id,
@@ -3313,24 +3377,26 @@ impl FragmentDispatcher {
                 leader_node_id: context.leader_node_id,
                 leader_fencing_token: context.leader_fence,
             };
-            let claims = peer_ticket_claims(candidate, context, &fragment, &pending)?;
+            let claims = peer_ticket_claims(candidate, context, fragment, &pending)
+                .map_err(RoundFailure::Failed)?;
             let Ok(peer_context) = claims.to_context() else {
                 tracing::error!("Oracle peer context encoding failed");
                 if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
                     self.release_pending(candidate, release, context).await;
                 }
-                return Err(DispatchError::Partial {
+                return Err(RoundFailure::Failed(DispatchError::Partial {
                     attempt: None,
                     reason: DispatchPartialReason::Setup,
-                });
+                }));
             };
-            let request = fragment_request(peer_context, candidate, context, &fragment, &pending);
-            let result = self
-                .execute_attempt(candidate, request, claims, context, &fragment)
-                .await;
-            if result.is_ok() {
-                return result;
-            }
+            let request = fragment_request(peer_context, candidate, context, fragment, &pending);
+            let error = match self
+                .execute_attempt(candidate, request, claims, context, fragment)
+                .await
+            {
+                Ok(attempt) => return Ok(attempt),
+                Err(error) => error,
+            };
             if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
                 self.release_pending(candidate, release, context).await;
             }
@@ -3341,17 +3407,22 @@ impl FragmentDispatcher {
             // dispatch here: a contract or security refusal, a foreign-tenant
             // row, a pinned object that no longer exists, and admission
             // pressure that the next candidate would also hit.
-            match result {
-                Err(DispatchError::Unavailable | DispatchError::EligibleSourceLoss { .. }) => {
-                    last_retryable = Some(result);
+            match error {
+                DispatchError::Unavailable | DispatchError::EligibleSourceLoss { .. } => {
+                    last_retryable = Some(error);
                 }
-                _ => return result,
+                _ => return Err(RoundFailure::Failed(error)),
             }
         }
         // Reaching here means every candidate either rejected its reservation
         // or failed retryably. Report the last real failure when there was one
-        // so the caller sees why, and admission pressure otherwise.
-        last_retryable.unwrap_or(Err(DispatchError::Capacity))
+        // so the caller sees why: that work may have been delivered, so it is
+        // never retried as capacity. Only an all-refusal round is retryable.
+        match (last_retryable, rejected) {
+            (Some(error), _) => Err(RoundFailure::Failed(error)),
+            (None, Some(rejected)) => Err(RoundFailure::Rejected(rejected)),
+            (None, None) => Err(RoundFailure::Failed(DispatchError::Capacity)),
+        }
     }
 
     /// Attempts immediate tuple-bound cleanup after any accepted-attempt failure.
@@ -4491,7 +4562,7 @@ mod tests {
     /// A mismatched execute cannot remove another leader's pending reservation.
     #[test]
     fn oracle_peer_reservation_transition_is_tuple_bound() {
-        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(2, 2)), 2);
+        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(2)), 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
@@ -4519,18 +4590,16 @@ mod tests {
         drop(running);
     }
 
-    /// Leader-local execution reuses admitted waiter and slot capacity.
+    /// Leader-local execution reuses admitted slot capacity.
     ///
     /// The leader's own query envelope already holds its slot units in the
-    /// shared governor ledger, so the leader-local transition must charge
-    /// neither a second follower quantum nor a peer-waiter slot.
+    /// shared governor ledger, so the leader-local transition must not charge
+    /// a second follower quantum.
     #[test]
     fn oracle_peer_local_transition_does_not_double_charge_leader_slot() {
         let oracle = slot_limited_oracle(1);
-        let slots = Arc::new(OracleSlotManager::new(1, 1));
-        let pending_slot = slots.try_pending().expect("admitted leader pending slot");
         let leader_slot = worker_capacity(&oracle);
-        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
+        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1)), 1);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
@@ -4550,11 +4619,8 @@ mod tests {
             running.worker_resources.is_none(),
             "the leader-local transition charges no follower quantum"
         );
-        assert!(slots.try_pending().is_err());
         assert_eq!(oracle.live_slot_units(), 1);
-        drop(pending_slot);
         drop(leader_slot);
-        assert!(slots.try_pending().is_ok());
         assert_eq!(oracle.live_slot_units(), 0);
     }
 
@@ -4580,7 +4646,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let fence = 41;
         let reservations = Arc::new(ReservationRegistry::new(
-            Arc::new(OracleSlotManager::new(1, 1)),
+            Arc::new(OracleSlotManager::new(1)),
             1,
         ));
         let fragment = dispatcher_fixture();
@@ -4673,7 +4739,7 @@ mod tests {
         let node = NodeId::new(uuid::Uuid::now_v7());
         let query_id = QueryId::new(uuid::Uuid::now_v7());
         let reservations = Arc::new(ReservationRegistry::new(
-            Arc::new(OracleSlotManager::new(1, 1)),
+            Arc::new(OracleSlotManager::new(1)),
             1,
         ));
         let resolver = Arc::new(CountingFollowerResolver {
@@ -4885,7 +4951,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let fence = 31;
         let reservations = Arc::new(ReservationRegistry::new(
-            Arc::new(OracleSlotManager::new(1, 1)),
+            Arc::new(OracleSlotManager::new(1)),
             1,
         ));
         let fragment = dispatcher_fixture();
@@ -5026,7 +5092,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let fence = 37;
         let reservations = Arc::new(ReservationRegistry::new(
-            Arc::new(OracleSlotManager::new(1, 1)),
+            Arc::new(OracleSlotManager::new(1)),
             1,
         ));
         let fragment = dispatcher_fixture();
@@ -5045,15 +5111,12 @@ mod tests {
         // charged at reservation, so a test that inserted a registry entry
         // directly would exercise an admission state the server can never
         // produce.
-        let ReserveNodeSlotsResponse::Pending(pending) = worker
-            .reserve(&reserve_request(
-                query_id,
-                node,
-                fence,
-                now + ChronoDuration::seconds(2),
-            ))
-            .await
-        else {
+        let ReserveNodeSlotsResponse::Pending(pending) = worker.reserve(&reserve_request(
+            query_id,
+            node,
+            fence,
+            now + ChronoDuration::seconds(2),
+        )) else {
             panic!("remote pending reservation");
         };
         let reserved = oracle
@@ -5100,7 +5163,7 @@ mod tests {
     /// Expiry cleanup releases pending capacity and release is fenced and idempotent.
     #[test]
     fn peer_pending_reservation_expires() {
-        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1, 1)), 1);
+        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1)), 1);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
@@ -5196,7 +5259,7 @@ mod tests {
     #[test]
     fn accepted_reservation_guarantees_execution_and_saturation_refuses_up_front() {
         let oracle = slot_limited_oracle(1);
-        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1, 1)), 2);
+        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1)), 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
@@ -5242,7 +5305,7 @@ mod tests {
     #[test]
     fn expired_reservation_returns_its_running_permit() {
         let oracle = slot_limited_oracle(1);
-        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1, 1)), 2);
+        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1)), 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
@@ -5393,6 +5456,259 @@ mod tests {
             .expect_err("ambiguous first reserve is terminal");
         assert!(matches!(error, DispatchError::Unavailable));
         assert_eq!(transport.reserve_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Transport scripting each reserve reply and counting every peer call.
+    ///
+    /// Once the script is exhausted every reserve is an explicit pre-accept
+    /// refusal carrying `retry_after_ms`, which is what a full receiving node
+    /// answers.
+    struct ScriptedReserveTransport {
+        /// Reserve replies returned in order before the default refusal.
+        replies: Mutex<std::collections::VecDeque<Result<ReserveNodeSlotsResponse, DispatchError>>>,
+        /// Retry hint carried by the default refusal.
+        retry_after_ms: u32,
+        /// Token cancelled inside the first reserve, when present.
+        cancel_on_reserve: Option<CancellationToken>,
+        /// Number of reserve calls observed.
+        reserve_calls: AtomicUsize,
+        /// Number of release calls observed.
+        release_calls: AtomicUsize,
+        /// Number of execute calls observed.
+        execute_calls: AtomicUsize,
+    }
+
+    impl ScriptedReserveTransport {
+        /// Builds one transport over `replies` with a default refusal hint.
+        fn new(
+            replies: Vec<Result<ReserveNodeSlotsResponse, DispatchError>>,
+            retry_after_ms: u32,
+            cancel_on_reserve: Option<CancellationToken>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies.into()),
+                retry_after_ms,
+                cancel_on_reserve,
+                reserve_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+                execute_calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OraclePeerTransport for ScriptedReserveTransport {
+        /// Returns the next scripted reply, or an explicit capacity refusal.
+        ///
+        /// # Errors
+        ///
+        /// Returns a scripted transport failure unchanged.
+        async fn reserve(
+            &self,
+            _worker: NodeId,
+            _request: ReserveNodeSlotsRequest,
+        ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
+            self.reserve_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cancel) = &self.cancel_on_reserve {
+                cancel.cancel();
+            }
+            self.replies
+                .lock()
+                .expect("script lock")
+                .pop_front()
+                .unwrap_or(Ok(ReserveNodeSlotsResponse::Rejected(
+                    ReservationRejected {
+                        retry_after_ms: self.retry_after_ms,
+                    },
+                )))
+        }
+
+        /// Counts one release of an accepted reservation.
+        ///
+        /// # Errors
+        ///
+        /// This deterministic release path never fails.
+        async fn release(
+            &self,
+            _worker: NodeId,
+            _request: ReleaseNodeSlotsRequest,
+        ) -> Result<(), DispatchError> {
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        /// Fails every accepted execution ambiguously, as a lost stream would.
+        ///
+        /// # Errors
+        ///
+        /// Always returns [`DispatchError::Unavailable`].
+        async fn execute(
+            &self,
+            _worker: NodeId,
+            _request: ExecuteFragmentRequest,
+            _admitted_grant: Option<LeaderAdmittedGrant>,
+        ) -> Result<WorkerAttemptStream, DispatchError> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            Err(DispatchError::Unavailable)
+        }
+    }
+
+    /// Runs one fragment dispatch through `transport` to one remote candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns the dispatcher's terminal classification.
+    async fn dispatch_through(
+        transport: &Arc<ScriptedReserveTransport>,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<ValidatedAttempt, DispatchError> {
+        let leader = NodeId::new(uuid::Uuid::from_u128(31));
+        let dispatcher =
+            FragmentDispatcher::new(Arc::new(OraclePeerTransportDirectory::new_for_test(
+                leader,
+                transport.clone(),
+                transport.clone(),
+            )));
+        let context = DispatchContext {
+            query_id: QueryId::new(uuid::Uuid::now_v7()),
+            leader_node_id: leader,
+            leader_fence: 1,
+            tenant_id: uuid::Uuid::now_v7(),
+            query_class: QueryClass::Interactive,
+            slot_units: 1,
+            permission_digest: "permission".to_owned(),
+            attempt_bytes: 1_024,
+            attempt_memory_bytes: 1_024,
+            query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
+            granted_memory_bytes: 1_024,
+            admitted_target_partitions: 1,
+            cancellation,
+            deadline,
+        };
+        dispatcher
+            .execute(
+                &context,
+                physical_dispatch_fragment("retry"),
+                &[DispatchCandidate {
+                    node_id: NodeId::new(uuid::Uuid::from_u128(32)),
+                    role: ClusterRole::Oracle,
+                    worker_fence: 2,
+                    endpoint: None,
+                }],
+            )
+            .await
+    }
+
+    /// Only the leader retries peer slot pressure, and only an explicit
+    /// pre-accept refusal is retried.
+    ///
+    /// Four cases on paused time, so every wait is the production wait:
+    /// a refusal is retried after exactly its hint and the next acceptance is
+    /// dispatched; a hint that cannot fit the deadline stops at once as
+    /// capacity; cancellation during the wait stops the retry; and work that
+    /// may have been delivered — an accepted reservation whose execution then
+    /// failed, or a reserve transport failure — is never retried as capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a case retries the wrong failure, waits the wrong time, or
+    /// returns the wrong classification.
+    #[tokio::test(start_paused = true)]
+    async fn leader_retries_only_preaccept_peer_capacity() {
+        let accepted = || {
+            Ok(ReserveNodeSlotsResponse::Pending(PendingNodeReservation {
+                reservation_id: ReservationId::new(uuid::Uuid::now_v7()),
+                expires_at: Utc::now() + ChronoDuration::seconds(2),
+            }))
+        };
+        let refused = |retry_after_ms| {
+            Ok(ReserveNodeSlotsResponse::Rejected(ReservationRejected {
+                retry_after_ms,
+            }))
+        };
+
+        // A refusal is waited out for its hint, then placement is retried.
+        let retried = ScriptedReserveTransport::new(vec![refused(250), accepted()], 250, None);
+        let started = Instant::now();
+        let error = dispatch_through(
+            &retried,
+            started + std::time::Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("the accepted execution fails ambiguously");
+        assert!(
+            !matches!(error, DispatchError::Capacity),
+            "an accepted, possibly delivered attempt is not reported as capacity"
+        );
+        assert_eq!(retried.reserve_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(retried.execute_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            retried.release_calls.load(Ordering::SeqCst),
+            1,
+            "the accepted reservation is released after its failed attempt"
+        );
+        assert_eq!(
+            started.elapsed(),
+            std::time::Duration::from_millis(250),
+            "the leader waits exactly the refusing peer's hint"
+        );
+
+        // A hint that cannot fit the remaining deadline stops without waiting.
+        let saturated = ScriptedReserveTransport::new(Vec::new(), 1_000, None);
+        let started = Instant::now();
+        let error = dispatch_through(
+            &saturated,
+            started + std::time::Duration::from_millis(500),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a saturated peer past the deadline refuses");
+        assert!(matches!(error, DispatchError::Capacity));
+        assert_eq!(saturated.reserve_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+
+        // Repeated refusals are retried until the deadline leaves no room.
+        let repeated = ScriptedReserveTransport::new(Vec::new(), 200, None);
+        let started = Instant::now();
+        let error = dispatch_through(
+            &repeated,
+            started + std::time::Duration::from_millis(700),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a peer that stays full exhausts the deadline");
+        assert!(matches!(error, DispatchError::Capacity));
+        assert_eq!(repeated.reserve_calls.load(Ordering::SeqCst), 4);
+        assert!(started.elapsed() < std::time::Duration::from_millis(700));
+
+        // Cancellation during the wait stops the retry.
+        let cancel = CancellationToken::new();
+        let cancelled = ScriptedReserveTransport::new(Vec::new(), 1_000, Some(cancel.clone()));
+        let error = dispatch_through(
+            &cancelled,
+            Instant::now() + std::time::Duration::from_secs(30),
+            cancel,
+        )
+        .await
+        .expect_err("a cancelled leader stops retrying");
+        assert!(matches!(error, DispatchError::Unavailable));
+        assert_eq!(cancelled.reserve_calls.load(Ordering::SeqCst), 1);
+
+        // A reserve transport failure is ambiguous and never retried.
+        let ambiguous =
+            ScriptedReserveTransport::new(vec![Err(DispatchError::Unavailable)], 1, None);
+        let error = dispatch_through(
+            &ambiguous,
+            Instant::now() + std::time::Duration::from_secs(30),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("an ambiguous reserve failure is terminal");
+        assert!(matches!(error, DispatchError::Unavailable));
+        assert_eq!(ambiguous.reserve_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ambiguous.execute_calls.load(Ordering::SeqCst), 0);
     }
 
     /// A post-reserve context-encoding failure releases pending capacity before

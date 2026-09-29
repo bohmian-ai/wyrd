@@ -1704,7 +1704,6 @@ fn ownership_snapshot(
         active_queries: runtime.active_queries,
         queued_queries: runtime.queued_queries,
         reserved_memory_bytes: runtime.reserved_memory_bytes,
-        peer_pending: runtime.peer_pending,
         peer_running: runtime.peer_running,
         root_active_queries: root.oracle_active_queries,
         root_analytical_queries: root.oracle_analytical_queries,

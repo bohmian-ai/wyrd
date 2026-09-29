@@ -477,8 +477,6 @@ pub struct OracleInspection {
     pub spill_files: u64,
     /// Exact regular-file bytes beneath all running Oracle-owned scratch prefixes.
     pub spill_file_bytes: u64,
-    /// Peer pending reservations across Oracle pods.
-    pub peer_pending: u64,
     /// Peer running reservations across Oracle pods.
     pub peer_running: u64,
     /// Oracle audit outbox commits still in flight across pods.
@@ -1872,7 +1870,6 @@ impl WyrdTestCluster {
                 runtime.reserved_memory_bytes = runtime
                     .reserved_memory_bytes
                     .saturating_add(snapshot.reserved_memory_bytes);
-                runtime.peer_pending = runtime.peer_pending.saturating_add(snapshot.peer_pending);
                 runtime.peer_running = runtime.peer_running.saturating_add(snapshot.peer_running);
                 runtime.audit_pending =
                     runtime.audit_pending.saturating_add(snapshot.audit_pending);
@@ -1893,7 +1890,6 @@ impl WyrdTestCluster {
             spill_directories: runtime.spill_directories,
             spill_files: runtime.spill_files,
             spill_file_bytes: runtime.spill_file_bytes,
-            peer_pending: runtime.peer_pending,
             peer_running: runtime.peer_running,
             audit_pending: runtime.audit_pending,
             forge_active_claims: u64::try_from(forge_active_claims)

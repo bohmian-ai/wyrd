@@ -3114,20 +3114,17 @@ async fn oracle_authority_request(
     let node = server.node_id();
     let query = QueryId::new(uuid::Uuid::now_v7());
     let expires = chrono::Utc::now() + chrono::Duration::seconds(15);
-    let ReserveNodeSlotsResponse::Pending(pending) = worker
-        .reserve(&ReserveNodeSlotsRequest {
-            query_id: query,
-            leader_node_id: node,
-            leader_fencing_token: fence,
-            query_class: QueryClass::Interactive,
-            slot_units: 1,
-            expires_at: expires,
-            // A fragment reservation, which charges a worker quantum rather
-            // than a whole graph envelope.
-            graph: None,
-        })
-        .await
-    else {
+    let ReserveNodeSlotsResponse::Pending(pending) = worker.reserve(&ReserveNodeSlotsRequest {
+        query_id: query,
+        leader_node_id: node,
+        leader_fencing_token: fence,
+        query_class: QueryClass::Interactive,
+        slot_units: 1,
+        expires_at: expires,
+        // A fragment reservation, which charges a worker quantum rather
+        // than a whole graph envelope.
+        graph: None,
+    }) else {
         panic!("Oracle reservation refused")
     };
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![

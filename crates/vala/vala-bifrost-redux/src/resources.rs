@@ -77,8 +77,6 @@ pub const ORACLE_PARTITION_WORKING_MEMORY_BYTES: usize = 32 * MIB;
 /// A single partition removes intra-query parallelism entirely, so even the
 /// smallest query keeps two.
 pub const ORACLE_MIN_TARGET_PARTITIONS: usize = 2;
-/// Fixed Oracle footer-planning slot acquired before metadata I/O.
-pub const ORACLE_METADATA_MEMORY_BYTES: usize = 40 * MIB;
 /// Retry delays for exact-prefix scratch cleanup before fail-stop poisoning.
 const SCRATCH_CLEANUP_BACKOFFS: [Duration; 3] = [
     Duration::from_millis(10),
@@ -3551,7 +3549,11 @@ impl OracleWorkerResources {
     }
 }
 
-/// Focused issuer for the fixed Oracle footer-planning child.
+/// Focused issuer for retained decoded-metadata bytes.
+///
+/// Footer decodes charge nothing up front: the decode itself is bounded by the
+/// node's one storage-request semaphore, and only the metadata the cache keeps
+/// afterwards is charged, at its actual size.
 #[derive(Debug, Clone)]
 pub struct OracleMetadataResources {
     /// Shared Oracle role authority; callers cannot request arbitrary bytes.
@@ -3559,30 +3561,12 @@ pub struct OracleMetadataResources {
 }
 
 impl OracleMetadataResources {
-    /// Acquires the exact 40 MiB footer slot alongside other Oracle owners.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostResourceError::Occupied`] when the remaining room in
-    /// the shared cap cannot cover the fixed slot, or a poison/invalid-plan
-    /// error when root accounting or role configuration is not trustworthy.
-    pub fn try_acquire_footer_slot(
-        &self,
-    ) -> Result<OracleFooterSlotResources, BifrostResourceError> {
-        let lease = self
-            .governor
-            .try_acquire_oracle_memory(ORACLE_METADATA_MEMORY_BYTES)?;
-        Ok(OracleFooterSlotResources { lease })
-    }
-
     /// Reserves exact retained-metadata bytes against the same shared pool.
     ///
-    /// Distinct from [`Self::try_acquire_footer_slot`] in lifetime, not in
-    /// authority: the footer slot is the transient workspace one decode needs,
-    /// while this is the ownership of bytes the node intends to keep and share
-    /// after that decode returns. Both spend the one Oracle managed-memory
-    /// root, which is what stops a decoded-metadata cache from becoming a
-    /// second, ungoverned memory pool beside the queries it serves.
+    /// This is the ownership of bytes the node intends to keep and share after
+    /// a decode returns. It spends the one Oracle managed-memory root, which is
+    /// what stops a decoded-metadata cache from becoming a second, ungoverned
+    /// memory pool beside the queries it serves.
     ///
     /// # Errors
     ///
@@ -3615,21 +3599,6 @@ impl MetadataReservation {
     /// Returns the exact bytes this reservation owns.
     #[must_use]
     pub const fn bytes(&self) -> usize {
-        self.lease.bytes
-    }
-}
-
-/// Non-cloneable owner of the fixed Oracle metadata-planning slot.
-#[derive(Debug)]
-pub struct OracleFooterSlotResources {
-    /// Exact floor-first root-memory ownership for footer planning.
-    lease: OracleMemoryLease,
-}
-
-impl OracleFooterSlotResources {
-    /// Returns the fixed metadata slot size retained by this owner.
-    #[must_use]
-    pub fn memory_bytes(&self) -> usize {
         self.lease.bytes
     }
 }
@@ -5551,20 +5520,19 @@ mod tests {
                 [BifrostRole::Oracle, BifrostRole::Forge],
             );
             let oracle = roles.oracle().expect("Oracle capability");
-            // Followers hold slot units rather than root memory now, so the
-            // fixed metadata slot is the owner whose refusal the memory metrics
+            // Followers hold slot units rather than root memory, so retained
+            // metadata is the owner whose grant and refusal the memory metrics
             // report.
-            let mut filled = Vec::new();
-            while let Ok(slot) = oracle.metadata().try_acquire_footer_slot() {
-                filled.push(slot);
-            }
+            let filled = oracle
+                .metadata()
+                .try_reserve_metadata(MIB)
+                .expect("the Oracle budget admits one retained MiB");
             assert!(
-                !filled.is_empty(),
-                "the Oracle budget admits at least one fixed slot"
-            );
-            assert!(
-                oracle.metadata().try_acquire_footer_slot().is_err(),
-                "a saturated budget refuses and records the refusal"
+                oracle
+                    .metadata()
+                    .try_reserve_metadata(usize::MAX / 2)
+                    .is_err(),
+                "a reservation beyond the shared cap refuses and records the refusal"
             );
             drop(filled);
         });

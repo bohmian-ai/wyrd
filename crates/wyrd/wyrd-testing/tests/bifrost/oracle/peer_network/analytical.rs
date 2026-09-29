@@ -1452,3 +1452,249 @@ async fn await_oracles_released(
     }
     Ok(())
 }
+
+/// Indices of the two pods that each lead one Analytical graph.
+const RETRY_LEADERS: [usize; 2] = [0, 1];
+
+/// Index of the pod that publishes the data both leaders read.
+const RETRY_SCRIBE: usize = 2;
+
+/// Index of the one Oracle both leaders' graphs must be placed on.
+const RETRY_RECEIVER: usize = 3;
+
+/// Oracle slot units each leader admits with.
+///
+/// Room for its own graph envelope, the other leader's follower envelope, and
+/// the protected Interactive quantum, so neither leader is the node that runs
+/// out of capacity.
+const RETRY_LEADER_SLOTS: usize = 8;
+
+/// Oracle slot units the receiving node admits with.
+///
+/// One Analytical envelope charges two units and the root keeps one
+/// Interactive quantum, so exactly one graph fits and the second leader's
+/// reservation must be refused before it is accepted.
+const RETRY_RECEIVER_SLOTS: usize = 3;
+
+/// Observations of a saturated receiver while the second leader retries.
+///
+/// At [`CLEAN_LEASE_INTERVAL`] this spans three seconds, longer than two of
+/// the receiver's one-second retry hints, so the second leader has been
+/// refused and has retried at least once inside the window.
+const RETRY_OBSERVATION_POLLS: usize = 30;
+
+/// Two leaders target one Oracle whose running slots never exceed its limit,
+/// and the refused leader retries within its original deadline.
+///
+/// # Panics
+///
+/// Panics when the retry journey cannot be driven to its claims.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn two_leaders_retry_preaccept_capacity() {
+    prove_two_leaders_retry_preaccept_capacity()
+        .await
+        .expect("two-leader pre-accept retry journey");
+}
+
+/// Drives two leaders' graphs onto one receiving Oracle that fits only one.
+///
+/// The first leader's graph is held at the receiver's follower `ExecuteTask`
+/// boundary, so the receiver's only Analytical envelope is running. The second
+/// leader's graph is then admitted locally and must place on the receiver. The
+/// receiver refuses it before accepting any work and never waits itself; the
+/// second leader releases its round, waits the refusal's hint, and retries.
+/// While the hold lasts the receiver must never run more than its limit, and
+/// once it returns the slot the second graph must complete inside the
+/// statement's original deadline. Every rejected round is released before
+/// activation, so each follower activates exactly one lease per query.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyError> {
+    let mut cluster = BifrostProcessCluster::start_with_oracle_query_slot_limit(
+        NODE_BINARY,
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+        ],
+        Some(RETRY_LEADER_SLOTS),
+    )
+    .await?;
+    let receiver = cluster
+        .join_with_oracle_query_slot_limit(ProcessNodeTarget::Oracle, RETRY_RECEIVER_SLOTS)?
+        .node_id;
+    await_receiver_membership(&mut cluster, receiver).await?;
+
+    let table = format!("preaccept_retry_{}", uuid::Uuid::now_v7().simple());
+    cluster.nodes_mut()[RETRY_SCRIBE].register_table(&table)?;
+    cluster.nodes_mut()[RETRY_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.nodes_mut()[RETRY_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    for index in [
+        RETRY_LEADERS[0],
+        RETRY_LEADERS[1],
+        RETRY_SCRIBE,
+        RETRY_RECEIVER,
+    ] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+    let baseline = cluster.nodes_mut()[RETRY_RECEIVER].ownership_snapshot()?;
+    if baseline.root_query_slot_units != 0 {
+        return Err(format!("the receiver must start idle, held {baseline:?}").into());
+    }
+
+    let sql = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    );
+    // The first graph occupies the receiver's only Analytical envelope and is
+    // held there with its lease active.
+    cluster.nodes_mut()[RETRY_RECEIVER].arm_execute_pause()?;
+    cluster.nodes_mut()[RETRY_LEADERS[0]].start_inactive_sql(&sql)?;
+    cluster.nodes_mut()[RETRY_RECEIVER].await_execute_paused()?;
+    let held = cluster.nodes_mut()[RETRY_RECEIVER].ownership_snapshot()?;
+    if held.root_analytical_queries != 1 || held.follower_graphs != 1 {
+        return Err(format!("the receiver must run exactly the first graph, held {held:?}").into());
+    }
+
+    // The second graph is admitted by its own leader, so the only thing it can
+    // be waiting on is placement on the saturated receiver.
+    cluster.nodes_mut()[RETRY_LEADERS[1]].start_inactive_sql(&sql)?;
+    await_leader_placing(&mut cluster, RETRY_LEADERS[1]).await?;
+    let receiver_slots = u32::try_from(RETRY_RECEIVER_SLOTS)?;
+    for _ in 0..RETRY_OBSERVATION_POLLS {
+        let receiving = cluster.nodes_mut()[RETRY_RECEIVER].ownership_snapshot()?;
+        if receiving.root_query_slot_units > receiver_slots
+            || receiving.root_analytical_queries > 1
+            || receiving.follower_graphs > 1
+        {
+            return Err(format!(
+                "the receiver ran beyond its {RETRY_RECEIVER_SLOTS} slots: {receiving:?}"
+            )
+            .into());
+        }
+        let placing = cluster.nodes_mut()[RETRY_LEADERS[1]].ownership_snapshot()?;
+        if placing.leader_graphs != 1 || placing.active_queries != 1 {
+            return Err(format!(
+                "the refused leader must keep retrying its admitted graph, held {placing:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+    }
+
+    // Returning the slot is what lets the refused leader's next retry land,
+    // well inside the statement's original deadline.
+    cluster.nodes_mut()[RETRY_RECEIVER].release_execute_pause()?;
+    for leader in RETRY_LEADERS {
+        match cluster.nodes_mut()[leader].await_inactive_sql()? {
+            Ok(3) => {}
+            Ok(rows) => {
+                return Err(format!("leader {leader} returned {rows} groups, not 3").into());
+            }
+            Err(detail) => {
+                return Err(format!("leader {leader} did not complete: {detail}").into());
+            }
+        }
+    }
+
+    // A refused round is released before activation, so each follower
+    // activated exactly one lease per query that it actually ran.
+    for (index, expected) in [
+        (RETRY_LEADERS[0], 1),
+        (RETRY_LEADERS[1], 1),
+        (RETRY_RECEIVER, 2),
+    ] {
+        let (activated, live) = await_released_lease(&mut cluster, index).await?;
+        if (activated, live) != (expected, 0) {
+            return Err(format!(
+                "node {index} must activate and release {expected} leases, reported \
+                 ({activated}, {live})"
+            )
+            .into());
+        }
+    }
+    for index in [RETRY_LEADERS[0], RETRY_LEADERS[1], RETRY_RECEIVER] {
+        await_root_released(&mut cluster, index).await?;
+    }
+
+    cluster.shutdown()?;
+    Ok(())
+}
+
+/// Waits until both leaders observe the receiver as a ready Oracle.
+///
+/// Membership is heartbeat-driven, so the joined receiver appears in each
+/// leader's cut within a heartbeat rather than at once.
+///
+/// # Errors
+///
+/// Returns the leader that never observed the receiver.
+async fn await_receiver_membership(
+    cluster: &mut BifrostProcessCluster,
+    receiver: uuid::Uuid,
+) -> Result<(), PeerJourneyError> {
+    for leader in RETRY_LEADERS {
+        let mut observed = false;
+        for _ in 0..CLEAN_LEASE_POLLS {
+            observed = cluster.nodes_mut()[leader]
+                .inspect()?
+                .membership
+                .iter()
+                .any(|entry| entry.node_id == receiver && entry.role == "oracle" && entry.ready);
+            if observed {
+                break;
+            }
+            tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        }
+        if !observed {
+            return Err(format!("leader {leader} never observed the receiving Oracle").into());
+        }
+    }
+    Ok(())
+}
+
+/// Waits until `leader` has admitted its query and registered its graph.
+///
+/// Registration precedes participant placement, so from here the graph is
+/// either placing or retrying placement.
+///
+/// # Errors
+///
+/// Returns the leader's last ownership when it never registered the graph.
+async fn await_leader_placing(
+    cluster: &mut BifrostProcessCluster,
+    leader: usize,
+) -> Result<(), PeerJourneyError> {
+    let mut last = cluster.nodes_mut()[leader].ownership_snapshot()?;
+    for _ in 0..CLEAN_LEASE_POLLS {
+        if last.leader_graphs == 1 && last.active_queries == 1 {
+            return Ok(());
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        last = cluster.nodes_mut()[leader].ownership_snapshot()?;
+    }
+    Err(format!("leader {leader} never registered its graph, held {last:?}").into())
+}
+
+/// Waits until `index` retains no Oracle query slot units at its root.
+///
+/// # Errors
+///
+/// Returns the node's last ownership when its slots never return.
+async fn await_root_released(
+    cluster: &mut BifrostProcessCluster,
+    index: usize,
+) -> Result<(), PeerJourneyError> {
+    let mut last = cluster.nodes_mut()[index].ownership_snapshot()?;
+    for _ in 0..CLEAN_LEASE_POLLS {
+        if last.root_query_slot_units == 0 && last.peer_running == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        last = cluster.nodes_mut()[index].ownership_snapshot()?;
+    }
+    Err(format!("node {index} never returned its slots, held {last:?}").into())
+}

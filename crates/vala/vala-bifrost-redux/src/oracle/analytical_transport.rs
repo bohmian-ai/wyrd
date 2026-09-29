@@ -2453,7 +2453,7 @@ mod tests {
             let authority_calls = Arc::new(AtomicUsize::new(0));
             let node_id = NodeId::new(Uuid::from_u128(2));
             let reservations = Arc::new(super::super::dispatcher::ReservationRegistry::new(
-                Arc::new(crate::oracle::OracleSlotManager::new(4, 4)),
+                Arc::new(crate::oracle::OracleSlotManager::new(4)),
                 16,
             ));
             let graph = AnalyticalGraphKey::new(

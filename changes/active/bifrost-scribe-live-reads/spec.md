@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 12
+revision: 13
 status: approved
 ---
 
@@ -286,6 +286,47 @@ cancellation policy. Untracked allocations and one infallible growth can
 still exhaust an in-process pod. A separately deployed Oracle uses the
 existing server target, not a new execution process or query protocol.
 
+### REQ-011 — One capacity owner without speculative memory refusals
+
+The shared Bifrost governor is the only authority for the process's governed
+memory cap. It counts a buffer once while that buffer is held; transferring the
+buffer between transport, Scribe, Oracle, or Forge transfers its charge rather
+than charging it again. A request's predicted Arrow output, a future Parquet
+write, a table's future lifecycle, a queued query, and a fixed footer allowance
+hold no memory credit. Scribe has no separate 90-percent memory breaker or
+second global byte ledger. Tenant/table ingest scheduling and bounded work
+remain, without reserving future byte capacity for an active table.
+
+Before write ACK, the existing configurable wire-request ceiling and its
+derived expanded-data ceiling validate the request. Every buffer Wyrd creates
+is charged while held, and a failed fallible charge refuses the write before
+ACK. OTLP's opaque decoder is the sole narrow exception: its allocation-free
+preflight may temporarily charge the generated-request backing and decode
+scratch it is about to allocate internally. That same charge follows the
+decoded request into Scribe; scratch returns when decoding ends. It does not
+include projected future Arrow output. The exception does not create a second
+capacity owner or a new configurable limit. A size-valid request must not be
+ACKed if its materialization has failed. After ACK, a failed staging attempt
+retains queryable WAL authority and retries; an estimated future writer
+workspace cannot refuse or invalidate the acknowledged write.
+
+Scribe live followers use the receiving pod's shared governed DataFusion pool
+and the leader-owned stream lifetime without a separate follower permit or
+estimated memory pool. Oracle metadata reads hold no fixed 40-MiB memory slot;
+retained decoded metadata is charged by actual held bytes. Oracle peers keep
+the receiving pod's real running-slot reservation because several leaders can
+send work to one pod. They do not maintain another peer-waiter limit or poll
+for slots: a genuine pre-accept capacity refusal carries retry timing, and
+only the leader may retry it within the same query deadline. Ambiguous or
+accepted work is never retried as a capacity refusal.
+
+The existing node-wide storage-I/O concurrency bound remains a work bound,
+not a query admission or memory charge. A request waits for I/O capacity under
+its existing operation deadline and cancellation rather than failing
+immediately when every permit is occupied. No independent storage wait
+timeout, query queue, or memory reservation is added. A genuine deadline,
+cancellation, or backend failure retains its existing terminal semantics.
+
 ## Invariants and boundaries
 
 - **INV-001:** Write acknowledgment, WAL durability, publication order, and
@@ -310,6 +351,12 @@ existing server target, not a new execution process or query protocol.
 - **INV-007:** No idle Bifrost role reserves a fixed share of the shared
   memory budget. Scribe, Oracle, Forge, and transport allocations compete
   through one owner; resource failure releases only its owning work.
+- **INV-008:** Only held bytes count toward the shared memory cap, apart from
+  the one transferred, temporary OTLP decoder charge for allocations Wyrd
+  cannot observe before decoding. Work bounds never masquerade as memory
+  charges. Accepted peer reservations retain actual receiving-node slots;
+  storage-I/O waits and leader retries remain within the original operation
+  or query deadline. Write ACK and query terminal rules are unchanged.
 
 ## Scope and non-goals
 
@@ -392,10 +439,22 @@ Do not add new persisted state or change write ACK timing.
   or corrupting siblings; failed compaction publishes nothing partial.
   Focused tests, real-server journeys, and the standard mixed benchmark prove
   these behaviors.
+- **AC-013:** A wire-valid, expanded-data-valid write is not refused by a
+  second Scribe percentage or future-lifecycle byte charge; every owned
+  request buffer is counted once and a failed materialization returns no ACK.
+  An acknowledged write remains readable and stageable across retry and
+  restart. Concurrent footer and storage reads do not fail solely because a
+  fixed footer slot or momentarily occupied I/O permit refused immediately.
+  Multiple leaders cannot exceed a receiving Oracle's running slots; a
+  pre-accept peer refusal is retried only by its leader within the unchanged
+  deadline, while ambiguous work is never replayed. Focused ownership tests,
+  real-server write/read and peer journeys, and the standard mixed benchmark
+  prove the rule.
 
 ## Open material decisions
 
-None. Revision 12's memory redesign was explicitly approved by the user on
+None. Revision 13's capacity-owner clarification was explicitly approved by
+the user on 2026-09-29. Revision 12's memory redesign was explicitly approved by the user on
 2026-09-29. The peer wording follows approved `SPEC-verified-change-contract`
 revision 44. Revision 3 was explicitly approved by the user on 2026-09-26. The user
 explicitly accepted the performance work, supplied its numeric targets, and
@@ -450,6 +509,11 @@ on 2026-09-28.
   memory and server-headroom redesign, removes idle role partitions, and
   aligns private-peer wording with the approved mTLS and typed-context
   contract. Approved by the user on 2026-09-29.
+- Revision 13 (2026-09-29): Makes the single held-byte owner explicit,
+  removes speculative Scribe and footer memory refusals, retains only the
+  narrow opaque-decoder charge, and distinguishes receiving-node running
+  slots and storage-I/O backpressure from duplicate query admission.
+  Approved by the user on 2026-09-29.
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

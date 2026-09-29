@@ -3,8 +3,8 @@ id: TASK-004
 kind: remediation
 status: proposed
 spec: SPEC-bifrost-scribe-live-reads
-spec_revision: 12
-requirements: [REQ-003, REQ-005, REQ-008, REQ-010, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, AC-003, AC-004, AC-008, AC-009, AC-010, AC-012]
+spec_revision: 13
+requirements: [REQ-003, REQ-005, REQ-008, REQ-010, REQ-011, INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008, AC-003, AC-004, AC-008, AC-009, AC-010, AC-012, AC-013]
 depends_on: []
 parent_task: TASK-003
 remediates: [INT-001, MEM-001, MEM-002, MEM-003, MEM-004]
@@ -47,6 +47,179 @@ verified-change-contract spec is revision 38 and must not be misrepresented
 as revision 44. Replay and verify the approved implementation; do not
 redefine its behavior here.
 
+## Revision 13 — One capacity owner, no future-byte hold-back
+
+This maintainer-approved revision applies to unfinished resource work. Keep
+completed Eval, boot, peer-authentication, and Scribe-follower changes in this
+worktree. It supersedes TASK-003's instruction to keep the per-table
+contention *capacity vector*: retain tenant/table scheduling, not a reservation
+for every future phase of a table. Do not restart TASK-004 or port old Bifrost
+resource code from vcc/task-006.
+
+### Exact read and write flow
+
+**Before ACK:** Keep the existing configurable 16-MiB-default wire ceiling and
+its derived four-times expanded-data ceiling. Charge the encoded body while
+held. An OTLP decoder may temporarily charge its preflighted generated-request
+backing and JSON decode scratch because those allocations occur inside
+Prost/JSON before Wyrd sees them. Its existing lease transfers into Scribe;
+scratch returns when decoding ends. Projected future Arrow output is not
+charged. New Arrow/copied buffers receive ownership when materialized;
+zero-copy Arrow views transfer the retained wire-body lease without charging
+the same allocation again. Validate and complete all fallible charges before
+WAL/ACK. On refusal, drop the owners and leave no WAL or ACK.
+
+**After ACK:** The shard retains query-visible WAL and memtable data until the
+existing durable stage/publication transitions retire them. Size/age rotation
+and existing bounded producer/claim work drive staging. Writer output is
+chunked; Wyrd-owned buffers are charged for the bytes they actually hold. A
+failed stage attempt retains WAL and retries. It cannot retract an ACK or
+publish a partial result. The existing volume owner still reserves real disk
+use. No predicted writer, footer, transfer, or table-lifecycle memory is
+admitted in advance.
+
+**During queries:** Leader admission remains the only query queue. Scribe
+followers already use the receiving pod's shared DataFusion memory view and
+leader-owned response stream. A receiving Oracle must reserve actual running
+slot units before accepting work from any leader. Footer reads charge decoded
+metadata retained in the cache, not a fixed 40-MiB slot. The existing one
+storage-I/O semaphore is a work bound: occupied permits wait within the
+current operation deadline/cancellation. Only the leader retries an explicit
+pre-accept peer capacity refusal, within the original query deadline.
+
+### Required deletions and owner changes
+
+| Existing owner/files | Implement this decision |
+| --- | --- |
+| `scribe/admission.rs`, `scribe/contention.rs`, `scribe/geometry.rs`, `scribe/ingress.rs`, `scribe/shards.rs`, `scribe/telemetry.rs` | Delete `memory_breaker_bytes`, `AdmissionState::bytes`, its duplicate resize/release/refusal/metrics, and the future-capacity hold-back: `ScribeContentionLedger`, `ContentionReserveVector`, `ScribeGlobalCapacity`, category shares, activation/demand records, and `max_active_tables` derived from those shares. Delete duplicate active/immutable admission counters after replacing their diagnostics with the existing root snapshot. Keep `GLOBAL_INFLIGHT_ITEMS`, bounded shard mailboxes, and the existing hierarchical tenant-then-table round-robin/FIFO scheduler in `shards.rs`. Keep stage/claim work concurrency and real volume admission; do not create another fairness or memory ledger. Replace vector-specific tests with single-root and scheduler tests. |
+| `scribe/material_plan.rs`, `scribe/ingress.rs`, `scribe/preprocess.rs`, `scribe/memory.rs`, `contracts.rs`, `gate/limits.rs`, server `otlp_decode.rs`, `otlp_json.rs`, `grpc/otlp.rs`, `http/otlp.rs` | Delete `root_bytes` as an advance charge, its eight-term summation, and the per-request `maximum_envelope_decision` based on future persistence work. Keep wire, expanded-data, and structural checks; no new size knob. At boot, reject a configured maximum expanded request larger than the resolved Bifrost cap; that comparison charges zero and creates no role share. `OtlpDecodePlan::reservation_bytes` and `JsonDecodePlan::reservation_bytes` include generated-request backing and actual decode scratch only, never projected output. `OtlpDecodeOwner::complete` transfers its lease rather than resizing to a whole future Scribe plan. Charge materialized Arrow/copy ownership before WAL/ACK; transfer a zero-copy view's source lease. |
+| `scribe/persistence.rs`, `scribe/parquet_writer.rs`, `scribe/memory.rs`, `parquet/object_uploader.rs` | Delete `parquet_candidate_incremental_bytes`, the `candidate × 2 + 24 MiB` projected workspace admission, fixed 8-MiB `EncodedFooterReservation` child/split, and producer byte-based waiting on that estimate. Keep existing producer/claim worker-count limits and FIFO scheduling, plus chunked Parquet/object-store writes; delete their future-byte admission. Charge owned transfer buffers at actual allocated capacity. Recovery currently allocates one 8-MiB chunk but reserves 16 MiB: charge the actual chunk once and delete the second fixed 8-MiB allowance. Any later concurrent buffer follows the same actual-byte owner rule. Keep WAL and staged authority until durable retirement. |
+| `resources.rs`, server `oracle/peer_service.rs`, `oracle/live.rs`, `scribe/staged_tail.rs` | Preserve the in-progress follower change: `ScribeResources::follower_memory_pool` is a shared governed DataFusion view with no Scribe follower CPU semaphore or estimated-byte charge. Remove only stale production paths/tests. `GreedyMemoryPool` in isolated tests is not a production second pool. |
+| `storage/mod.rs`, `storage/policy.rs`, `resources.rs` | Delete `ORACLE_METADATA_MEMORY_BYTES`, `OracleFooterSlotResources`, `try_acquire_footer_slot`, their 40-MiB refusal and obsolete tests. Keep the actual-byte metadata-cache lease. Keep the existing configurable `max_concurrent_requests` (128 default) and its **one** semaphore. At both `governed_decode` and `attempt_once`, replace immediate `try_acquire_owned` refusal with asynchronous acquisition selected against owner/caller cancellation and the already existing absolute operation bound. Permit wait, retries, backoff, and I/O consume that one bound; if no caller bound exists, use the existing `max_retry_elapsed`. Start per-attempt `request_timeout` after permit acquisition. Drop the permit on success, failure, cancellation, and retry. Add no storage queue, second semaphore, or timeout setting. |
+| `oracle/mod.rs`, `oracle/dispatcher.rs`, fragment and analytical leader callers | Delete `OracleSlotManager`'s pending semaphore/count/capacity API, `try_pending`, `PEER_SLOT_WAIT`, `PEER_SLOT_POLL`, and its sleep loop. Keep receiving-node `try_acquire_worker` / `try_acquire_query` and pending-to-running slot transfer: several leaders can target the same pod. A genuinely full receiving node returns existing `Rejected { retry_after_ms }` before work acceptance. Both fragment and graph leaders preserve that value. If placement cannot complete because required peers explicitly reject before work acceptance, release every provisional reservation from that round, wait for at most the indicated delay and remaining leader deadline, then retry placement. Cancellation/deadline stops retry. Transport error, missing reply, or possibly delivered work is ambiguous and never retried as capacity. Add no peer-side waiter or second query queue. |
+
+Remove all consumers of the deleted types, including
+`scribe/{claim_assembly,execution_lanes,member_stager,replay,staging_runtime}.rs`,
+`storage/cache.rs`, and the tests in `resources.rs`. In particular, no
+test-only `EncodedFooterReservation::for_test()` remains after the type is
+deleted. Keep the existing owner and IO fixtures those modules still need.
+
+Do not claim a hard resident-memory guarantee for allocations inside Prost,
+parquet-rs, DataFusion's infallible `grow`, or OpenDAL. Existing request size,
+one transferred opaque-decode charge, bounded work, the shared DataFusion
+pool, and server headroom are the agreed in-process protection. Add no
+execution subprocess, watchdog, precharge, or configurable limit. A maximum
+legal request must ACK, stage, survive restart, and read back; if it cannot,
+fix the writer flow before closing this scenario instead of restoring a
+lifecycle vector.
+
+### Revision 13 TDD scenarios
+
+#### R13-A — One write owns each held byte once
+
+**Behavior.** A request that fits the real shared cap succeeds even when the
+old 90-percent breaker or eight-term plan would refuse it. A full root
+refuses before WAL/ACK, then admits a write after release. OTLP wire, decoder
+backing/scratch, and new Arrow buffers are counted once while live; a
+zero-copy view adds no second charge. Busy tenants still alternate through
+the existing shard scheduler.
+
+**RED.** Add the two focused lib tests below for the root total, refusal,
+release, and ownership transfer. Extend the existing shard scheduler fairness
+test instead of creating another scheduler harness. The current breaker,
+plan, and vector fail these cases.
+
+**GREEN.** Apply the Scribe/OTLP deletions and transfers above; preserve public
+size errors and first-commit ACK order.
+
+**REFACTOR.** Remove vector/ledger types, category arithmetic, metrics, and
+tests. Retain only actual-byte root attribution and real work counters.
+
+#### R13-B — ACKed rows remain readable through stage failure and restart
+
+**Behavior.** A maximum legal expanded request ACKs only after WAL sync and
+memtable insertion. Under memory pressure it stays readable from live
+authority; a failed stage attempt retries, later stages/publishes, and
+survives restart with the same rows and no duplicate ACK. No future Parquet
+workspace estimate refuses this already ACKed request.
+
+**RED.** Add `write_read::acknowledged_rows_survive_stage_pressure_and_restart`
+to the real-client Scribe journey with a test-only
+post-ACK stage failure and restart/readback; assert ACK identity, live read,
+retry, published read, and WAL retirement. The current producer byte wait and
+fixed footer/recovery charges fail the pressure case.
+
+**GREEN.** Keep bounded writer chunks and producer concurrency, charge actual
+Wyrd-owned buffers, and retain durable retry/WAL lifetime.
+
+**REFACTOR.** Delete the projected workspace and footer-child plumbing, not
+WAL or volume admission.
+
+#### R13-C — Storage contention waits within one bound
+
+**Behavior.** Hold the single storage permit. A second footer/object read
+waits rather than returning `RateLimited`, then completes if released before
+its original deadline. Cancellation/deadline clears the waiter and active
+permits. Metadata retention charges actual bytes, not 40 MiB.
+
+**RED.** Add the two focused storage lib tests below. Immediate
+`try_acquire_owned` and the footer slot fail them.
+
+**GREEN.** Change both permit sites and remove the fixed footer lease without
+changing backend retry/error classification.
+
+**REFACTOR.** Delete obsolete footer-slot and immediate-refusal tests/metrics;
+retain one semaphore and one operation bound.
+
+#### R13-D — Only the leader retries peer slot pressure
+
+**Behavior.** Two leaders target one Oracle; its actual running slots never
+exceed its local limit. A pre-accept refusal carries retry timing; a leader
+retries within its original deadline after a slot returns. Cancellation and
+deadline release partial fan-out reservations. Ambiguous work is never
+retried. Scribe followers retain no separate semaphore.
+
+**RED.** Add the focused dispatcher lib test below and
+`peer_network::analytical::two_leaders_retry_preaccept_capacity` to the
+existing real-server journey, using two leaders and one receiving node.
+The current peer waiter/poll loop and discarded
+`retry_after_ms` fail these assertions.
+
+**GREEN.** Preserve receiving-node slots, remove peer-side waiting, and make
+both fragment and graph leaders own bounded retry and release.
+
+**REFACTOR.** Delete pending semaphore API/counts/tests and duplicate peer
+wait constants; keep leader deadline and actual slot metrics.
+
+Add the named tests to the indicated existing lib modules, confirm their
+selectors with `mise exec -- cargo nextest list`, then run exactly:
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::admission::tests::one_root_charge_has_no_secondary_memory_ceiling)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::ingress::tests::decode_to_memtable_transfers_one_charge)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=storage::governed_request_tests::occupied_storage_permit_waits_within_operation_deadline)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=storage::governed_request_tests::footer_decode_has_no_fixed_memory_slot)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::dispatcher::tests::leader_retries_only_preaccept_peer_capacity)'
+```
+
+Run the two new real-server cases through the existing PostgreSQL wrapper,
+then run their owning lanes:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(=write_read::acknowledged_rows_survive_stage_pressure_and_restart)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=peer_network::analytical::two_leaders_retry_preaccept_capacity)'"
+mise run test:bifrost:journey:scribe
+mise run test:bifrost:journey:oracle
+```
+
+Confirm their selectors with `mise exec -- cargo nextest list` after adding
+them. After these scenarios, run the existing
+standard benchmark **first** and report accepted QPS, client p50/p95/p99,
+ingest rows/s, CPU, peak cgroup memory, refusal reasons, and complete
+readback. The required heavy qualification and the existing final gate order
+below remain unchanged. Unit tests or a green gate cannot substitute for an
+invalid benchmark row.
+
 ## Owners, Scope, Consumers, and Prohibited Changes
 
 - This task's implementation base is `origin/main` at
@@ -54,7 +227,7 @@ redefine its behavior here.
   second parent is vcc/task-005 commit
   5ae8125156add44e549ac090a82a4fcb20e9cce7. The dedicated
   `wyrd-verfication-t006-merge` worktree on branch `vcc/task-004` contains
-  Bifrost spec revision 12 and this task,
+  Bifrost spec revision 13 and this task,
   ported from packet commit 310765353361c0da7d3b906fedea04ddd3f53126.
   PR #94's CI override does not certify TASK-003 or this task. Replay Eval
   and peer behavior from pinned vcc/task-006 commit
@@ -104,6 +277,9 @@ attribution for diagnostics only. Every fallible charge checks
 `held_total + newly_held_bytes <= cap` under that owner's existing
 synchronization and either records the full charge or records none. A role
 estimate, query ceiling, queued query, or planned compaction charges zero.
+The only opaque-decode exception is the narrow temporary charge for generated
+OTLP request backing and JSON scratch allocated inside Prost/JSON; transfer
+that charge to its actual owner and never also charge projected Arrow output.
 
 | Holder | Charge and return rule |
 | --- | --- |
@@ -273,7 +449,8 @@ failure, or cancellation. Per-message size and Forge parallelism remain
 separate bounds. Forge uses a bounded DataFusion memory pool and ordinary
 disk spill in the existing Bifrost data root; an exhausted attempt publishes
 nothing partial and follows durable retry. An estimate
-does not reserve future heap use in advance.
+does not reserve future heap use in advance. The narrow opaque OTLP decoder
+charge follows Revision 13 and transfers with its held buffer.
 
 **RED.** Add focused concurrent-charge/release cases and a Forge
 failure/retry integration case. Show that Forge's current estimated budget
@@ -342,6 +519,11 @@ an actually full waiting queue.
    meeting Bifrost REQ-008/AC-010. Invalid or wrong-result rows cannot pass.
 5. Focused checks, generated contracts, and the broad gate pass after
    benchmark acceptance. PR #94's CI override is not completion evidence.
+6. Revision 13's AC-013 holds: Scribe uses one actual-byte memory owner,
+   acknowledged writes stage and read back across retry/restart, occupied
+   storage permits wait within the caller's bound, and only leaders retry
+   explicit pre-accept peer capacity. The R13-A–D focused and real-server
+   scenarios pass before the benchmark.
 
 ## Expected Write Set and Consumer Closure
 
@@ -364,7 +546,10 @@ existing root in `resources.rs`, encoded-body owner in `gate/limits.rs`, and
 Forge context in `forge/managed/executor.rs`, and the existing
 `boot/data_root.rs` for its spill child; do not create a second root. Complete
 the Scribe WAL boundary through `scribe/wal.rs`, the Scribe role lifecycle,
-and the existing server readiness snapshot.
+and the existing server readiness snapshot. Revision 13 additionally owns
+`scribe/{admission,contention,geometry,material_plan,ingress,persistence,parquet_writer}.rs`,
+`storage/mod.rs`, `oracle/{mod,dispatcher}.rs`, and the server OTLP decode
+boundary. The revision's owner table gives the symbol-level deletions.
 
 ## Verification and Evidence
 
@@ -387,6 +572,8 @@ journey must use a real client and server; a unit case cannot replace it.
 | New `boot::data_root::tests::prepare_clears_stale_forge_spill` unit | Start from a stale file in `forge-spill`; prepare the shared root and prove its lock is held, the file is removed, and WAL, staging, and Oracle files remain untouched. | 3 |
 | New `oracle::capacity::memory_failure_is_query_local_and_typed` journey | Two running queries plus one queued: force one admitted query's fallible DataFusion allocation failure after rows; sibling finishes, failed stream has one typed Failed terminal, queued query runs only after children and memory release; server stays healthy. | 2, 3 |
 | New `grpc::query::tests::resource_failure_has_no_retry_hint` unit and `bifrost::query::tests::resource_terminal_rejects_partial_rows` unit | Map pre-stream 503 and post-stream Failed terminal; assert stable code, no `retry-after-ms` for resource failure, no partial client success, and queue-full remains 429/retryable. | 3 |
+| Revision 13 R13-A and R13-B focused units plus `write_read::acknowledged_rows_survive_stage_pressure_and_restart` journey | Prove one Scribe held-byte owner and no second breaker or future-byte hold-back; ACK, live read, stage retry, restart, published read, and WAL retirement. | 6 |
+| Revision 13 R13-C focused units plus `peer_network::analytical::two_leaders_retry_preaccept_capacity` journey and R13-D dispatcher unit | Prove storage permit waits within the original bound, actual footer charge, receiver running slots, leader-only explicit pre-accept retry, and no ambiguous replay. | 6 |
 
 Exact focused commands (run sequentially; each new test is added to the
 named existing module/target before invoking its selector):
@@ -472,12 +659,15 @@ not complete this task.
 - Stop if memory work moves ACK earlier, loses retained WAL/read authority,
   returns query capacity before child work ends, or substitutes Forge
   estimates for governed execution.
+- Stop if Revision 13 adds a second memory ledger or capacity refusal,
+  charges one held buffer twice, makes acknowledged staging permanently
+  unstageable, or retries peer work that may already have been accepted.
 - A benchmark miss is a failed outcome to diagnose, not permission to lower
   the target, remove the workload, or substitute the gate.
 
 ## Authority Links
 
-- Approved Bifrost spec revision 12: ../spec.md
+- Approved Bifrost spec revision 13: ../spec.md
 - Approved verification contract revision 44 at pinned vcc/task-006 commit
   `0e9c6e98c74361b1f2d18dd857a2aff7690cfdb0` (the local
   [verified-change-contract spec](../../verified-change-contract/spec.md)

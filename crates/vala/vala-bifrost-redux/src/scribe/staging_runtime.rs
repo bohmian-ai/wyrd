@@ -454,6 +454,10 @@ impl ScribeStagingRuntime {
     /// restored as that claim, and published members restore nothing because a
     /// hot object already serves their rows.
     ///
+    /// The volume governor's registration scan is the one charge for staged
+    /// files that survived; restore never charges them again and only releases
+    /// the members it retires.
+    ///
     /// Each key's encoding context is reconstructed from the same two
     /// authorities the members were staged under: the physical schema is read
     /// from the members' own Parquet runs, and the write recipe is re-resolved
@@ -470,8 +474,8 @@ impl ScribeStagingRuntime {
     /// Returns [`ScribeError::Internal`] when the staged namespace cannot be
     /// recovered or validated, a member's binding, schema, or recipe cannot be
     /// reconstructed, the recovered layout contradicts the key, the ready index
-    /// refuses a duplicate member, or the governed volume cannot re-admit the
-    /// bytes already on it.
+    /// refuses a duplicate member, or the governed volume cannot release a
+    /// retired member's bytes.
     pub async fn restore(&self, pool: &sqlx::PgPool) -> Result<usize, ScribeError> {
         let recovered = self
             .stage
@@ -486,7 +490,6 @@ impl ScribeStagingRuntime {
                 total.saturating_add(member.record().encoded_bytes())
             });
             self.restore_authorities(&key, &members)?;
-            self.stager.readmit_staged_bytes(staged_bytes)?;
             let terminal = self
                 .publisher
                 .recover_terminal_members(&key, &members)
@@ -1024,6 +1027,20 @@ mod tests {
 
     /// Registers a governed staging volume rooted at the stage's own root.
     fn staging_volume(base: &Path, stage_root: &Path) -> crate::resources::StageVolume {
+        staging_governor(base, stage_root)
+            .capabilities()
+            .scribe_stage
+    }
+
+    /// Registers the volume governor whose startup scan charges the stage root.
+    ///
+    /// Tests that compare restart accounting keep the governor so they can
+    /// read the per-class totals the scan and recovery leave behind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture root cannot be created or registration fails.
+    fn staging_governor(base: &Path, stage_root: &Path) -> crate::resources::BifrostVolumeGovernor {
         let wal = base.join("wal");
         let scribe_output = base.join("scribe-output-scratch");
         let forge = base.join("forge");
@@ -1042,8 +1059,6 @@ mod tests {
             crate::resources::BifrostResourceHealth::default(),
         )
         .expect("staging volume registration")
-        .capabilities()
-        .scribe_stage
     }
 
     /// Builds the publisher the runtime owns, over lazy and in-memory owners.
@@ -1681,5 +1696,90 @@ mod tests {
         assert!(stage.recover().await.expect("stage rescans").is_empty());
         assert_no_restored_authority_survives(&hot_sources, &key, &member_ids);
         assert_eq!(recovered.restore(&pool).await.expect("cleanup replays"), 0);
+    }
+
+    /// Restart charges surviving staged files once, through the startup scan.
+    ///
+    /// The governor's registration scan already owns every byte on the stage
+    /// root, so recovery must only reattach members and release the ones it
+    /// retires. Were recovery to charge the recovered members again, the
+    /// retired bytes would come back out of a total that still held them and
+    /// the stage class would end above what the surviving files justify.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage or crash-split the claim, recovery
+    /// fails, or the stage total after restore is not the scanned total minus
+    /// the exact bytes recovery retired.
+    #[tokio::test]
+    async fn recovered_staged_bytes_are_charged_once() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xc02));
+        let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            staging_volume(root.path(), &stage_root),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls"),
+        );
+        let tenant = DataTenantId::new_v7();
+        let schema = runtime_schema();
+        let layout = runtime_layout(schema.as_ref());
+        let (key, member_ids) =
+            stage_four_durable_members(&runtime, tenant, node_id, &schema, &layout).await;
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("residue claim")
+            .expect("four members form one claim");
+        drive_mixed_member_states(&stage, &key, &member_ids, &claim.id().to_string()).await;
+        drop(runtime);
+
+        let retired: u64 = stage
+            .recover()
+            .await
+            .expect("the staged namespace validates")
+            .values()
+            .flatten()
+            .map(|member| member.record().encoded_bytes())
+            .sum();
+        let governor = staging_governor(root.path(), &stage_root);
+        let (scanned, _, _) = governor
+            .usage_for_test(crate::resources::BifrostVolumeClass::ScribeStage)
+            .expect("stage usage");
+        assert!(
+            scanned >= retired,
+            "the startup scan owns every staged byte"
+        );
+        let recovered = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            governor.capabilities().scribe_stage,
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls"),
+        );
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused").expect("lazy pool");
+        recovered
+            .restore(&pool)
+            .await
+            .expect("terminal claim recovers");
+
+        let (restored, provisional, _) = governor
+            .usage_for_test(crate::resources::BifrostVolumeClass::ScribeStage)
+            .expect("stage usage");
+        assert_eq!(
+            provisional, 0,
+            "recovery leaves no provisional stage charge"
+        );
+        assert_eq!(
+            restored,
+            scanned - retired,
+            "recovery releases what it retires and charges nothing again"
+        );
     }
 }

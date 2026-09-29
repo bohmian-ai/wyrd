@@ -1576,9 +1576,23 @@ impl ScribeImpl {
     }
 
     /// Return whether Scribe has completed recovery and still accepts writes.
+    ///
+    /// A faulted WAL makes Scribe unready immediately, so Gate and ingress
+    /// refuse new writes before any acknowledgment.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        !self.closed.load(Ordering::Acquire) && self.recovery_ready.load(Ordering::Acquire)
+        !self.closed.load(Ordering::Acquire)
+            && self.recovery_ready.load(Ordering::Acquire)
+            && !self.wal.is_faulted()
+    }
+
+    /// Returns the signal cancelled when this Scribe's WAL faults.
+    ///
+    /// The owning role awaits it to withdraw readiness and its cluster fence;
+    /// the fault never reaches process health.
+    #[must_use]
+    pub fn wal_fault(&self) -> tokio_util::sync::CancellationToken {
+        self.wal.fault_signal()
     }
 
     /// Drain shard work after the pod lifecycle scanner's tick.
@@ -2478,6 +2492,15 @@ impl ScribeImpl {
     #[cfg(any(test, feature = "test-support"))]
     pub fn clear_wal_disk_full_injection_for_test(&self) {
         self.wal.set_device_full_for_test(false);
+    }
+
+    /// Fails the next WAL sync after its record bytes are written.
+    ///
+    /// Durability of those bytes is then unknown, so the WAL faults: the
+    /// write gets no ACK and Scribe stays unready until restart replay.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn trip_wal_sync_fault_for_test(&self) {
+        self.wal.trip_sync_failure_for_test();
     }
 
     /// Returns the bounded CPU pool used by Scribe's ingest materialization.

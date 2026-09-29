@@ -27,7 +27,7 @@ pub use lifecycle_transport::{
 };
 pub use peer_audit::PostgresPeerSecurityAudit;
 pub use peer_authority::OraclePeerAuthority;
-pub use peer_service::OraclePeerGrpc;
+pub use peer_service::{OraclePeerGrpc, ScribeFragmentExecutor};
 #[cfg(feature = "test-support")]
 pub use peer_service::{ScribeFragmentFault, arm_scribe_fragment_fault_for_test};
 pub use query_audit::OracleQueryAudit;

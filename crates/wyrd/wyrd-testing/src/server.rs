@@ -2100,6 +2100,17 @@ impl WyrdTestServer {
             .map_err(WyrdTestServerError::Start)
     }
 
+    /// Fail the next WAL sync after its record is written, faulting only Scribe.
+    ///
+    /// # Errors
+    /// Returns a start error when this server hosts no Scribe.
+    pub fn trip_bifrost_wal_sync_fault_for_test(&self) -> Result<(), WyrdTestServerError> {
+        self.inner
+            .state
+            .trip_scribe_wal_sync_fault_for_test()
+            .map_err(WyrdTestServerError::Start)
+    }
+
     /// Release the held WAL refusal so a real retirement clears the breaker.
     ///
     /// # Errors

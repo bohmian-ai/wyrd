@@ -72,3 +72,179 @@ async fn each_composed_node_owns_exactly_one_storage_owner() {
         "two simulated nodes must not share one storage owner"
     );
 }
+
+/// Published Int64 `value` column of one table, ascending, read through Oracle.
+///
+/// # Errors
+///
+/// Returns the scheduled-query or column-shape error.
+async fn published_values(
+    server: &wyrd_testing::WyrdTestServer,
+    table: &str,
+) -> Result<Vec<i64>, super::query::ServerJourneyError> {
+    let mut batches = Vec::new();
+    wyrd_server::query::scheduled::ScheduledQueryCaller::new(
+        server.state().clone(),
+        super::query::scheduled_context(server.data_tenant_id())?,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .run_with(
+        wyrd_spec::vala::api::BifrostQueryRequest {
+            sql: format!("SELECT value FROM vala.bifrost.{table} ORDER BY value"),
+            deadline_ms: Some(30_000),
+        },
+        |batch| {
+            batches.push(batch);
+            Ok(())
+        },
+    )
+    .await?;
+    let mut values = Vec::new();
+    for batch in &batches {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or("the value column is not Int64")?;
+        values.extend(column.values().iter().copied());
+    }
+    Ok(values)
+}
+
+/// Current `/readyz` status code and JSON body.
+///
+/// # Errors
+///
+/// Returns the HTTP or JSON decoding error.
+async fn readyz(
+    server: &wyrd_testing::WyrdTestServer,
+) -> Result<(u16, serde_json::Value), super::query::ServerJourneyError> {
+    let base = server.base_url().ok_or("missing HTTP URL")?;
+    let response = reqwest::get(format!("{base}/readyz")).await?;
+    Ok((response.status().as_u16(), response.json().await?))
+}
+
+/// Builder for the combined Scribe+Oracle+Forge target with the Eval worker,
+/// over one durable data root so a restart replays the same WAL.
+fn combined_target(data_root: &std::path::Path) -> wyrd_testing::WyrdTestServerBuilder {
+    wyrd_testing::WyrdTestServer::builder()
+        .with_verification_runtime_for_test()
+        .with_durable_bifrost_data_root(data_root.to_path_buf())
+}
+
+/// A Scribe WAL fault withdraws only Scribe; the combined target keeps serving.
+///
+/// A WAL sync failure after the record bytes land leaves their durability
+/// unknown. That write must get no ACK, and Scribe must refuse every later
+/// write, report unready, and drop its cluster fence, while WAL files stay on
+/// disk. The same process keeps `/readyz` at 200 because Oracle, Forge, and
+/// the verification worker are healthy; the body still names Scribe's fault.
+/// Oracle keeps answering published reads. A restart over the same data root
+/// replays the WAL before Scribe reports ready and accepts writes again. A
+/// shared-governor poison, by contrast, still ends the process.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJourneyError> {
+    let data_root = tempfile::tempdir()?;
+    let server = combined_target(data_root.path()).start_bound().await?;
+    super::query::await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+    let table = format!("wal_fault_{}", uuid::Uuid::now_v7().simple());
+    server
+        .create_bifrost_table_for_test(vala_bifrost_redux::catalog::CreateTableRequest {
+            table: vala_bifrost_redux::catalog::TableRef::new(
+                vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+                &table,
+            ),
+            user_fields: vec![arrow::datatypes::Field::new(
+                "value",
+                arrow::datatypes::DataType::Int64,
+                false,
+            )],
+            tenant: server.data_tenant_id(),
+            physical_layout: None,
+            audit: None,
+        })
+        .await?;
+    let fqn = format!("vala.bifrost.{table}");
+    server.seed_bifrost_rows(&fqn, &[1, 2, 3]).await?;
+
+    server.trip_bifrost_wal_sync_fault_for_test()?;
+    assert!(
+        server.seed_bifrost_rows(&fqn, &[4]).await.is_err(),
+        "a write whose WAL sync failed must not be acknowledged"
+    );
+    let scribe = server
+        .state()
+        .bifrost
+        .scribe()
+        .ok_or("the combined target selects Scribe")?;
+    assert!(scribe.wal_faulted() && !scribe.is_ready());
+    assert!(
+        server.seed_bifrost_rows(&fqn, &[5]).await.is_err(),
+        "a faulted Scribe admits no later write"
+    );
+
+    // The monitor withdraws the fence and the readiness loop republishes; both
+    // are asynchronous, so poll the observable outcome within a bound.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (status, body) = loop {
+        let cluster = scribe.cluster();
+        cluster.refresh_snapshot().await?;
+        let fenced_out = cluster.snapshot().live_scribes().is_empty();
+        let (status, body) = readyz(&server).await?;
+        if fenced_out && body["checks"]["scribe"]["reason"] == "scribe_wal_faulted" {
+            break (status, body);
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(format!("Scribe was not withdrawn: fenced_out={fenced_out} {body}").into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    assert_eq!(status, 200, "a combined target stays ready: {body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["checks"]["oracle"]["reason"], "ok");
+    assert_eq!(body["checks"]["verification"]["reason"], "ok");
+    assert_eq!(published_values(&server, &table).await?, vec![1, 2, 3]);
+    let wal_root = server
+        .scribe_wal_root_for_test()
+        .ok_or("the combined target composes a WAL")?;
+    assert!(
+        std::fs::read_dir(wal_root)?.next().is_some(),
+        "a faulted Scribe keeps its WAL files"
+    );
+
+    let server = server
+        .restart_bound(combined_target(data_root.path()))
+        .await?;
+    super::query::await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+    let (_, body) = readyz(&server).await?;
+    assert_eq!(
+        body["checks"]["scribe"]["reason"], "ok",
+        "replay precedes ready: {body}"
+    );
+    server.seed_bifrost_rows(&fqn, &[6]).await?;
+    let recovered = published_values(&server, &table).await?;
+    assert!(
+        recovered.starts_with(&[1, 2, 3]) && recovered.ends_with(&[6]) && !recovered.contains(&5),
+        "restart keeps acknowledged rows and serves writes: {recovered:?}"
+    );
+
+    server
+        .state()
+        .bifrost
+        .resource_health()
+        .ok_or("a data role reports resource health")?
+        .poison(vala_bifrost_redux::resources::BifrostResourcePoisonReason::Accounting);
+    let terminal = server
+        .await_terminal_failure_for_test(std::time::Duration::from_secs(60))
+        .await?;
+    assert!(
+        terminal.contains("bifrost_resource_health"),
+        "shared-governor poison stays process-terminal: {terminal}"
+    );
+    Ok(())
+}

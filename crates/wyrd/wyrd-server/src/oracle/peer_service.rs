@@ -10,7 +10,8 @@ use std::sync::Arc;
 use datafusion::error::DataFusionError;
 use futures_util::{Stream, StreamExt};
 use vala_bifrost_redux::oracle::dispatcher::{
-    AttemptEncoder, DispatchError, EligibleSourceLossCause, PEER_PROTOCOL_VERSION, WorkerExecution,
+    AttemptEncoder, DispatchError, EligibleSourceLossCause, LeaderAdmittedGrant,
+    OraclePeerTransport, PEER_PROTOCOL_VERSION, WorkerAttemptStream, WorkerExecution,
 };
 use vala_bifrost_redux::oracle::follower::{
     AuthenticatedFollowerContext, FollowerResolutionError, PhysicalPlanFollowerError,
@@ -32,7 +33,7 @@ use wyrd_tonic::wyrd::v1::{
     self as proto, ForwardQueryRequest, ReleaseNodeSlotsRequest, ReserveNodeSlotsRequest,
 };
 
-use crate::state::Bifrost;
+use crate::state::{Bifrost, Scribe};
 
 /// Private tonic service retaining one fenced worker runtime.
 pub struct OraclePeerGrpc {
@@ -197,16 +198,40 @@ impl OraclePeerGrpc {
                 _ => Status::permission_denied("Bifrost peer reservation is not authorized"),
             })
     }
+}
+
+/// In-process executor for fragments that target this process's own Scribe.
+///
+/// The private gRPC service and a process-local Oracle, which has no peer
+/// channel, both run Scribe fragments through it, so the fence, context, and
+/// claims checks exist once.
+pub struct ScribeFragmentExecutor {
+    /// Local Scribe owner whose fence, verifier, and resources serve fragments.
+    scribe: Arc<Scribe>,
+}
+
+impl ScribeFragmentExecutor {
+    /// Creates the executor over this process's Scribe owner.
+    #[must_use]
+    pub fn new(scribe: Arc<Scribe>) -> Self {
+        Self { scribe }
+    }
 
     /// Executes one Scribe-targeted physical fragment under Scribe's own fence and resources.
-    async fn execute_scribe_fragment(
+    ///
+    /// Checks the target fence, verifies the typed peer context, validates
+    /// its claims and assignment-authority digest against the request, then
+    /// charges a follower lease and streams a footer-terminated attempt.
+    ///
+    /// # Errors
+    /// Returns [`DispatchError::Terminal`] for a fence, context, claims, or
+    /// preflight mismatch, [`DispatchError::Capacity`] when the follower
+    /// lease is refused, and the follower's start classification otherwise.
+    pub async fn execute(
         &self,
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerExecution, DispatchError> {
-        let scribe = self.bifrost.scribe().ok_or_else(|| {
-            tracing::error!("Scribe fragment reached a process without the Scribe owner");
-            DispatchError::Terminal
-        })?;
+        let scribe = &self.scribe;
         let local_role = scribe.scribe_registered_role();
         if request.target_fence.role != ClusterRole::Scribe
             || request.target_fence.node_id != local_role.key.node_id
@@ -393,6 +418,48 @@ impl OraclePeerGrpc {
     }
 }
 
+#[async_trait::async_trait]
+impl OraclePeerTransport for ScribeFragmentExecutor {
+    /// Scribe fragments are never reserved; the leader skips reservation.
+    ///
+    /// # Errors
+    /// Always returns [`DispatchError::Terminal`].
+    async fn reserve(
+        &self,
+        _worker: wyrd_spec::vala::api::NodeId,
+        _request: wyrd_spec::vala::api::ReserveNodeSlotsRequest,
+    ) -> Result<wyrd_spec::vala::api::ReserveNodeSlotsResponse, DispatchError> {
+        Err(DispatchError::Terminal)
+    }
+
+    /// Nothing is reserved, so release is a no-op.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn release(
+        &self,
+        _worker: wyrd_spec::vala::api::NodeId,
+        _request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
+    ) -> Result<(), DispatchError> {
+        Ok(())
+    }
+
+    /// Executes the fragment in-process through [`Self::execute`].
+    ///
+    /// # Errors
+    /// Returns the same failures as [`Self::execute`].
+    async fn execute(
+        &self,
+        _worker: wyrd_spec::vala::api::NodeId,
+        request: ExecuteFragmentRequest,
+        _admitted_grant: Option<LeaderAdmittedGrant>,
+    ) -> Result<WorkerAttemptStream, DispatchError> {
+        ScribeFragmentExecutor::execute(self, request)
+            .await
+            .map(|execution| execution.stream)
+    }
+}
+
 #[wyrd_tonic::tonic::async_trait]
 impl OraclePeerService for OraclePeerGrpc {
     /// Worker attempt stream retaining the running slot until EOF or cancellation.
@@ -493,7 +560,17 @@ impl OraclePeerService for OraclePeerGrpc {
                 Some(peer) => peer.worker().execute(request).await,
                 None => Err(DispatchError::Terminal),
             },
-            ClusterRole::Scribe => self.execute_scribe_fragment(request).await,
+            ClusterRole::Scribe => match self.bifrost.scribe() {
+                Some(scribe) => {
+                    ScribeFragmentExecutor::new(Arc::clone(scribe))
+                        .execute(request)
+                        .await
+                }
+                None => {
+                    tracing::error!("Scribe fragment reached a process without the Scribe owner");
+                    Err(DispatchError::Terminal)
+                }
+            },
         }
         .map_err(dispatch_status)?;
         let output = async_stream::stream! {

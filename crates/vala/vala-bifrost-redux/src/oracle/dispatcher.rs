@@ -2796,6 +2796,9 @@ pub struct OraclePeerTransportDirectory {
     local: Arc<dyn OraclePeerTransport>,
     /// Closed remote route separating live production resolution from injection.
     remote: RemoteOraclePeerTransport,
+    /// In-process Scribe fragment executor for a process-local node, whose
+    /// own Scribe is otherwise unreachable without a peer channel.
+    local_scribe: Option<Arc<dyn OraclePeerTransport>>,
 }
 
 /// Private remote dispatch variants preserving the public transport contract.
@@ -2813,12 +2816,14 @@ impl OraclePeerTransportDirectory {
     /// Creates an unambiguous production directory from concrete local and tonic adapters.
     ///
     /// `remote` is absent for a process-local node, which serves no peer plane;
-    /// any non-local candidate then fails terminally rather than being dialed.
+    /// its own Scribe fragments then run through `local_scribe`, and any
+    /// non-local candidate fails terminally rather than being dialed.
     #[must_use]
     pub fn new(
         local_node_id: NodeId,
         local: Arc<LocalOraclePeerTransport>,
         remote: Option<Arc<TonicOraclePeerTransport>>,
+        local_scribe: Option<Arc<dyn OraclePeerTransport>>,
     ) -> Self {
         Self {
             local_node_id,
@@ -2827,6 +2832,7 @@ impl OraclePeerTransportDirectory {
                 RemoteOraclePeerTransport::Unavailable,
                 RemoteOraclePeerTransport::Production,
             ),
+            local_scribe,
         }
     }
 
@@ -2842,6 +2848,7 @@ impl OraclePeerTransportDirectory {
             local_node_id,
             local,
             remote: RemoteOraclePeerTransport::Injected(remote),
+            local_scribe: None,
         }
     }
 
@@ -2980,7 +2987,15 @@ impl OraclePeerTransportDirectory {
                 RemoteOraclePeerTransport::Production(remote) => {
                     remote.execute_candidate(candidate, request).await
                 }
-                RemoteOraclePeerTransport::Unavailable => Err(DispatchError::Terminal),
+                RemoteOraclePeerTransport::Unavailable => match &self.local_scribe {
+                    Some(scribe)
+                        if self.is_local(candidate.node_id)
+                            && candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe =>
+                    {
+                        scribe.execute(candidate.node_id, request, None).await
+                    }
+                    _ => Err(DispatchError::Terminal),
+                },
                 #[cfg(test)]
                 RemoteOraclePeerTransport::Injected(remote) => {
                     remote.execute(candidate.node_id, request, None).await

@@ -717,13 +717,12 @@ pub async fn compose_bifrost(
         let geometry = configured_geometry;
         let wal_segment_bytes = geometry.wal_segment_bytes();
         let wal = Arc::new(
-            WalWriter::new_with_health(
+            WalWriter::new(
                 data_root.wal(),
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
                 WalConfig::new(wal_segment_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-                bifrost_resources.health(),
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
@@ -1074,6 +1073,7 @@ pub async fn compose_bifrost(
         advertise_addr: &advertise_addr,
         spill_root: data_root.oracle_spill().to_path_buf(),
         peer_tls: peer_tls.clone(),
+        local_scribe: scribe.clone(),
         audit: query_audit.clone(),
         shutdown: shutdown.clone(),
     }
@@ -1533,6 +1533,8 @@ struct OracleRoleBuilder<'a> {
     /// Cluster mTLS identity; present only in peer mode, where it is the sole
     /// trust boundary for every private call this Oracle sends or receives.
     peer_tls: Option<BifrostPeerTls>,
+    /// Co-located Scribe a process-local Oracle lists and reads in-process.
+    local_scribe: Option<Arc<crate::state::Scribe>>,
     /// Shared query audit used by the leader and role-local tenant tripwires.
     audit: Option<Arc<OracleQueryAudit>>,
     /// One process-wide shutdown token injected into every Oracle owner.
@@ -1580,6 +1582,7 @@ impl<'a> OracleRoleBuilder<'a> {
             advertise_addr,
             spill_root,
             peer_tls,
+            local_scribe,
             audit,
             shutdown,
         } = self;
@@ -1734,7 +1737,10 @@ impl<'a> OracleRoleBuilder<'a> {
             .ok_or_else(|| {
                 ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
             })?;
-        let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(tail_tls));
+        let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
+            tail_tls,
+            local_scribe.as_ref().map(|scribe| scribe.tail_service()),
+        ));
         let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
             authority.clone();
         let stage_authority: Arc<dyn vala_bifrost_redux::oracle::peer::OracleStageAuthority> =
@@ -1774,6 +1780,10 @@ impl<'a> OracleRoleBuilder<'a> {
             node_id,
             local_transport,
             remote_transport,
+            local_scribe.map(|scribe| {
+                Arc::new(crate::oracle::ScribeFragmentExecutor::new(scribe))
+                    as Arc<dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerTransport>
+            }),
         ));
         let spill_runtime =
             match OracleSpillRuntime::new(&spill_root, resource_plan.scratch_limit_bytes) {

@@ -437,6 +437,10 @@ pub struct Scribe {
     snapshot_poller_abort: AbortHandle,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
+    /// Withdraws this role when its WAL faults; ends with `role_shutdown`.
+    wal_fault_monitor: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Synchronously aborts the WAL fault monitor.
+    wal_fault_monitor_abort: AbortHandle,
 }
 
 /// Owns one retained Oracle and its independent fenced server lifecycle.
@@ -838,6 +842,36 @@ where
     settlement.await
 }
 
+/// Withdraws this Scribe role once its WAL faults.
+///
+/// A WAL integrity or ambiguous-mutation fault is role-local: the writer has
+/// already refused new appends, so this closes local readiness, stops the
+/// heartbeat advertising it, and marks the exact durable fence unready so no
+/// peer routes ingest or live-tail reads here. Accepted work keeps draining
+/// through the running shard and persistence owners, WAL and staged files are
+/// kept, and the process supervisor is never asked to exit. Only a restart,
+/// whose replay finishes before Scribe reports ready, restores the role.
+async fn run_scribe_wal_fault_monitor(
+    fault: CancellationToken,
+    cluster: Arc<ClusterRegistry>,
+    registered_role: RegisteredRole,
+    lifecycle: RoleLifecycle,
+    advertise_ready: Arc<AtomicBool>,
+    shutdown: CancellationToken,
+) {
+    tokio::select! {
+        () = shutdown.cancelled() => return,
+        () = fault.cancelled() => {}
+    }
+    advertise_ready.store(false, Ordering::Release);
+    lifecycle.begin_draining();
+    metrics::gauge!("bifrost_role_ready", "role" => "scribe").set(0.0);
+    tracing::error!("Scribe WAL faulted; withdrawing Scribe readiness and its cluster fence");
+    if let Err(error) = cluster.deactivate(&registered_role).await {
+        tracing::error!(%error, "failed to withdraw the Scribe fence after a WAL fault");
+    }
+}
+
 impl Scribe {
     /// Borrows the durable Scribe implementation handed to the one Gate.
     ///
@@ -866,6 +900,7 @@ impl Scribe {
         self.role_shutdown.cancel();
         self.heartbeat_abort.abort();
         self.snapshot_poller_abort.abort();
+        self.wal_fault_monitor_abort.abort();
         self.ingest.abort_shutdown();
     }
     /// Builds the Scribe runtime retained by the process composition owner.
@@ -908,6 +943,16 @@ impl Scribe {
         let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
         let heartbeat_abort = heartbeat.abort_handle();
         let snapshot_poller_abort = snapshot_poller.abort_handle();
+        let lifecycle = RoleLifecycle::serving();
+        let wal_fault_monitor = tokio::spawn(run_scribe_wal_fault_monitor(
+            ingest.wal_fault(),
+            Arc::clone(&cluster),
+            registered_role.clone(),
+            lifecycle.clone(),
+            Arc::clone(&advertise_ready),
+            role_shutdown.clone(),
+        ));
+        let wal_fault_monitor_abort = wal_fault_monitor.abort_handle();
         Self {
             ingest,
             tail_service,
@@ -917,7 +962,7 @@ impl Scribe {
             resources,
             cluster,
             registered_role,
-            lifecycle: RoleLifecycle::serving(),
+            lifecycle,
             catalog,
             fragment_verifier,
             fragment_security_audit,
@@ -929,6 +974,8 @@ impl Scribe {
             snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
             snapshot_poller_abort,
             advertise_ready,
+            wal_fault_monitor: Arc::new(Mutex::new(Some(wal_fault_monitor))),
+            wal_fault_monitor_abort,
         }
     }
 
@@ -1004,6 +1051,12 @@ impl Scribe {
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.lifecycle.is_serving() && self.ingest.is_ready()
+    }
+
+    /// Reports whether this role's WAL faulted and withdrew it until restart.
+    #[must_use]
+    pub fn wal_faulted(&self) -> bool {
+        self.ingest.wal_fault().is_cancelled()
     }
 
     /// Synchronously closes local Scribe readiness before transport cancellation.
@@ -1092,6 +1145,12 @@ impl Scribe {
         }
         await_role_task(&self.heartbeat, deadline, "scribe heartbeat").await?;
         await_role_task(&self.snapshot_poller, deadline, "scribe snapshot poller").await?;
+        await_role_task(
+            &self.wal_fault_monitor,
+            deadline,
+            "scribe WAL fault monitor",
+        )
+        .await?;
         Ok(())
     }
 
@@ -2445,6 +2504,22 @@ impl AppState {
             return Err("Scribe is not configured".to_owned());
         };
         runtime.scribe().trip_wal_disk_full_for_test();
+        Ok(())
+    }
+
+    /// Fail the next Scribe WAL sync after its record bytes are written.
+    ///
+    /// The ambiguous durability faults only the Scribe role; see
+    /// [`ScribeImpl::trip_wal_sync_fault_for_test`].
+    ///
+    /// # Errors
+    /// Returns an error when this server hosts no Scribe.
+    #[cfg(feature = "test-support")]
+    pub fn trip_scribe_wal_sync_fault_for_test(&self) -> Result<(), String> {
+        let Some(runtime) = self.bifrost.scribe() else {
+            return Err("Scribe is not configured".to_owned());
+        };
+        runtime.scribe().trip_wal_sync_fault_for_test();
         Ok(())
     }
 

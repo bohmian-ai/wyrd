@@ -2,19 +2,22 @@
 //!
 //! Listing returns partition metadata, never rows. It trusts the mutually
 //! authenticated `wyrd-peer` channel alone; row-serving fragments additionally
-//! carry the receiver-validated typed peer context.
+//! carry the receiver-validated typed peer context. A process-local node has
+//! no peer channel: its roster names only its own Scribe, listed in-process.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::{
     DiscoveredTailRoute, OracleQueryParticipant, TailStreamDiscovery,
 };
-use vala_bifrost_redux::scribe::tail_rpc::{TailReadError, TonicTailReadTransport};
+use vala_bifrost_redux::scribe::tail_rpc::{
+    FetchLiveTailService, TailReadError, TonicTailReadTransport,
+};
 use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
 use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
@@ -57,6 +60,8 @@ pub fn arm_tail_listing_stall_for_test() {
 pub struct RegistryTailStreamDiscovery {
     /// Shared Oracle/Scribe private-service trust material.
     tls: Option<BifrostPeerTls>,
+    /// Co-located Scribe live source, listed in-process when `tls` is absent.
+    local: Option<Arc<FetchLiveTailService>>,
     /// Reusable channel per Scribe node, keyed with the endpoint it dials.
     ///
     /// An entry is replaced when the frozen roster names another endpoint for
@@ -69,10 +74,15 @@ pub struct RegistryTailStreamDiscovery {
 
 impl RegistryTailStreamDiscovery {
     /// Creates a resolver over the private mTLS peer trust.
+    ///
+    /// `local` is this process's own Scribe live source. Without `tls` the
+    /// node serves no peer listener, so its own Scribe is listed in-process
+    /// and any other frozen Scribe is unreachable.
     #[must_use]
-    pub fn new(tls: Option<BifrostPeerTls>) -> Self {
+    pub fn new(tls: Option<BifrostPeerTls>, local: Option<Arc<FetchLiveTailService>>) -> Self {
         Self {
             tls,
+            local,
             channels: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-support")]
             unavailable: AtomicBool::new(false),
@@ -143,18 +153,52 @@ impl RegistryTailStreamDiscovery {
             })?;
         streams
             .into_iter()
-            .map(|stream| {
-                if stream.stream.node_id != scribe.node_id
-                    || stream.stream.writer_epoch != scribe.fencing_token
-                {
-                    return Err(TailReadError::StaleIdentity);
-                }
-                Ok(DiscoveredTailRoute {
-                    time_partition: stream.time_partition,
-                    stream: stream.stream,
-                })
-            })
+            .map(|stream| Self::route(scribe, stream.time_partition, stream.stream))
             .collect()
+    }
+
+    /// Lists the frozen roster in-process on a node with no peer channel.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::State`] when the roster names a Scribe other
+    /// than this process's own, and the local listing or
+    /// [`TailReadError::StaleIdentity`] class otherwise.
+    fn list_local(
+        local: &FetchLiveTailService,
+        scribes: &[OracleQueryParticipant],
+        binding: &TenantTableBinding,
+    ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
+        let mut routes = Vec::new();
+        for scribe in scribes {
+            if scribe.node_id.as_uuid() != local.stream().node_id.as_uuid() {
+                return Err(TailReadError::State {
+                    detail: "tail transport requires the Bifrost peer identity".to_owned(),
+                });
+            }
+            for (time_partition, stream) in local.list_active_streams(binding)? {
+                routes.push(Self::route(scribe, time_partition, stream)?);
+            }
+        }
+        Ok(routes)
+    }
+
+    /// Admits one listed stream only when it names the frozen incarnation.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError::StaleIdentity`] when the stream names another
+    /// node or writer epoch than the frozen participant.
+    fn route(
+        scribe: &OracleQueryParticipant,
+        time_partition: wyrd_spec::vala::api::TimePartitionWire,
+        stream: wyrd_spec::vala::api::TailStreamIdentity,
+    ) -> Result<DiscoveredTailRoute, TailReadError> {
+        if stream.node_id != scribe.node_id || stream.writer_epoch != scribe.fencing_token {
+            return Err(TailReadError::StaleIdentity);
+        }
+        Ok(DiscoveredTailRoute {
+            time_partition,
+            stream,
+        })
     }
 }
 
@@ -196,6 +240,11 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
         }
         if scribes.is_empty() {
             return Ok(Vec::new());
+        }
+        if self.tls.is_none()
+            && let Some(local) = &self.local
+        {
+            return Self::list_local(local, scribes, binding);
         }
         let channels = self.channels_for(scribes)?;
         let remaining = deadline

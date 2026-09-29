@@ -1207,6 +1207,158 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     Ok(())
 }
 
+/// Poll until the refusing trigger has counted `count` enqueue attempts.
+///
+/// The trigger advances `wyrd.eval_journey_attempts` before it raises, and a
+/// sequence advance survives the aborted transaction, so the sequence counts
+/// every enqueue transaction that reached `wyrd.verifier_runs`.
+///
+/// # Errors
+/// Returns a query error or a timeout naming the observed count.
+async fn enqueue_attempts(superuser: &sqlx::PgPool, count: i64) -> Result<i64, ServerJourneyError> {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT CASE WHEN is_called THEN last_value ELSE 0 END \
+               FROM wyrd.eval_journey_attempts",
+        )
+        .fetch_one(superuser)
+        .await?;
+        if attempts >= count {
+            return Ok(attempts);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("only {attempts} of {count} enqueue attempts ran").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A post-ACK enqueue failure through the integrated Gate, Scribe, and Eval
+/// path keeps the acknowledged observation readable and invents no run or
+/// result, and a same-batch-ID retry is acknowledged as a replay without a
+/// second enqueue attempt.
+///
+/// A trigger refuses every observation run insert after counting the attempt
+/// in a sequence, so the one failed enqueue is observed deterministically
+/// before the replay, and the replay's absence of an attempt is checked after a
+/// distinct sentinel frame acknowledged behind it has had its attempt counted.
+///
+/// # Errors
+/// Returns server, registration, query, or fixture errors, or a description of
+/// the first mismatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn integrated_enqueue_failure_preserves_ack() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let service = write_graph(root.path());
+    let bundle = root.path().join("bundle");
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let admin = api_key(
+        server
+            .bootstrap_service("eval_enqueue_admin", &["admin"])
+            .await?,
+    );
+    let receipt = register(&connect(&server, &admin), &service, &bundle).await;
+    let writer = api_key(
+        server
+            .credential_registered_service(&receipt.root, &["admin"])
+            .await?,
+    );
+    let client = connect(&server, &writer);
+    let state = start_state(&bundle, &client).await;
+    let subject = state.run().for_card("agent")?.card_ref().clone();
+    state.shutdown().await?;
+    let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&client).await?;
+
+    let superuser = server.pg_fixture().superuser_pool().await?;
+    sqlx::query("CREATE SEQUENCE wyrd.eval_journey_attempts")
+        .execute(&superuser)
+        .await?;
+    sqlx::query(
+        "CREATE FUNCTION wyrd.eval_journey_refuse() RETURNS trigger LANGUAGE plpgsql AS \
+         $$BEGIN PERFORM nextval('wyrd.eval_journey_attempts'); \
+         RAISE EXCEPTION 'eval journey refuses this enqueue'; END$$",
+    )
+    .execute(&superuser)
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER eval_journey_refuse BEFORE INSERT ON wyrd.verifier_runs \
+         FOR EACH ROW WHEN (NEW.origin = 'observation') \
+         EXECUTE FUNCTION wyrd.eval_journey_refuse()",
+    )
+    .execute(&superuser)
+    .await?;
+
+    let record = uuid::Uuid::now_v7().to_string();
+    let batch = uuid::Uuid::now_v7();
+    let frame = unstamped_observation(&subject, &record);
+    ingest.insert(OBSERVATIONS, batch, frame.clone()).await?;
+    enqueue_attempts(&superuser, 1).await?;
+    ingest.insert(OBSERVATIONS, batch, frame).await?;
+    let sentinel = uuid::Uuid::now_v7().to_string();
+    ingest
+        .insert(
+            OBSERVATIONS,
+            uuid::Uuid::now_v7(),
+            unstamped_observation(&subject, &sentinel),
+        )
+        .await?;
+    // A replay enqueue would be spawned before the sentinel's; once the
+    // sentinel's attempt is counted, an extra attempt shows as a third.
+    let attempts = enqueue_attempts(&superuser, 2).await?;
+    if attempts != 2 {
+        return Err(
+            format!("{attempts} enqueue attempts for one original and one sentinel").into(),
+        );
+    }
+
+    server.flush_bifrost().await?;
+    let stored = texts(
+        &query(
+            &server,
+            tenant,
+            format!("SELECT record_id FROM vala.eval.observations WHERE record_id = '{record}'"),
+        )
+        .await?,
+    )?;
+    if stored != [Some(record.clone())] {
+        return Err(format!("the acknowledged batch is not stored once: {stored:?}").into());
+    }
+    sqlx::query("DROP TRIGGER eval_journey_refuse ON wyrd.verifier_runs")
+        .execute(&superuser)
+        .await?;
+    let runs = seed.observation_runs().await?;
+    if !runs.is_empty() {
+        return Err(format!("a refused enqueue invented runs: {runs:?}").into());
+    }
+    // No result ever published leaves the results table unregistered.
+    let results = ScheduledQueryCaller::new(
+        server.state().clone(),
+        scheduled_context(tenant)?,
+        CancellationToken::new(),
+    )
+    .run(BifrostQueryRequest {
+        sql: "SELECT result_id FROM vala.verification.results".to_owned(),
+        deadline_ms: Some(30_000),
+    })
+    .await;
+    let results = match results {
+        Ok(outcome) => outcome.rows,
+        Err(wyrd_spec::error::WyrdError::Vala {
+            error: wyrd_spec::vala::error::BifrostError::TableNotFound { .. },
+        }) => 0,
+        Err(error) => return Err(error.into()),
+    };
+    if results != 0 {
+        return Err(format!("a refused enqueue invented {results} results").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
 /// One UTC day, the receipt-clock step the matrix and trace-window journeys
 /// move by.
 const DAY: Duration = Duration::from_secs(86_400);

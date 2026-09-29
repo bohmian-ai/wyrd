@@ -528,8 +528,11 @@ impl BifrostStorage {
 
     /// Decodes one object's Parquet metadata through the caller's reader.
     ///
-    /// Kept as an associated function so it can be boxed into the cache's
-    /// retained loader task without borrowing the owner.
+    /// The page index is decoded with the footer when the object carries one,
+    /// so a hot scan can select pages rather than whole row groups; its bytes
+    /// are part of the retained metadata's weight. Kept as an associated
+    /// function so it can be boxed into the cache's retained loader task
+    /// without borrowing the owner.
     ///
     /// # Errors
     /// Returns [`BifrostStorageError::InvalidData`] when the object's footer
@@ -543,6 +546,7 @@ impl BifrostStorage {
         R: AsyncFileReader + Send + 'static,
     {
         parquet::file::metadata::ParquetMetaDataReader::new()
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional)
             .load_and_finish(&mut reader, size)
             .await
             .map(Arc::new)

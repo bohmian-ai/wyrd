@@ -2626,10 +2626,10 @@ impl ExecutionPlan for HotParquetExec {
 /// Builds the hot-file stream after partition validation has completed.
 ///
 /// Files are read sequentially. Each one publishes a file observation before
-/// its footer is touched, prunes row groups against the closed predicates,
-/// decodes at the admitted `batch_size`, projects to the authenticated physical
-/// schema, and holds one governed reservation for exactly the lifetime of the
-/// yielded batch. Dropping the stream releases every retained reservation,
+/// its footer is touched, prunes row groups and then pages against the closed
+/// predicates, decodes at the admitted `batch_size`, projects to the
+/// authenticated physical schema, and holds one governed reservation for
+/// exactly the lifetime of the yielded batch. Dropping the stream releases every retained reservation,
 /// which is what makes cancellation return the query's memory.
 fn hot_stream(
     exec: &HotParquetExec,
@@ -2717,6 +2717,12 @@ fn hot_stream(
             // post-decode `project_batch` below then normalizes exact order and
             // types; it is a normalizer, not the thing that avoids the IO.
             let mask = hot_projection_mask(builder.parquet_schema(), schema.as_ref());
+            let pages =
+                select_pages_for_predicates(builder.metadata(), &selection.retained, &predicates);
+            let builder = match pages {
+                Some(pages) => builder.with_row_selection(pages),
+                None => builder,
+            };
             let mut batches = builder
                 .with_row_groups(selection.retained)
                 .with_batch_size(batch_size)
@@ -3447,8 +3453,6 @@ fn leaf_excludes_row_group(
     row_group_index: usize,
     predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
 ) -> bool {
-    use wyrd_spec::vala::assignment_authority::ScanPredicate;
-
     let Some(column_index) = parquet_column_index(metadata, predicate.column()) else {
         return false;
     };
@@ -3456,73 +3460,171 @@ fn leaf_excludes_row_group(
     let Some(stats) = row_group.column(column_index).statistics() else {
         return false;
     };
+    leaf_excludes_span(
+        predicate,
+        |target| statistics_bound(stats, target),
+        stats.null_count_opt(),
+        u64::try_from(row_group.num_rows()).unwrap_or(0),
+    )
+}
+
+/// Returns true only when one span's evidence proves no row in it can satisfy
+/// `predicate`.
+///
+/// A span is a row group or one data page; both prune through this one
+/// decision so page selection can never disagree with row-group pruning.
+/// `bounds` yields the span's min/max matched to the literal's type, and
+/// `null_count` with `rows` decides the null checks. Absent evidence always
+/// keeps the span, so this never produces a false exclusion.
+fn leaf_excludes_span(
+    predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
+    bounds: impl Fn(&StatBound) -> Option<(StatBound, StatBound)>,
+    null_count: Option<u64>,
+    rows: u64,
+) -> bool {
+    use std::cmp::Ordering;
+    use wyrd_spec::vala::assignment_authority::ScanPredicate;
+
     match predicate {
-        ScanPredicate::IsNull(_) => stats.null_count_opt() == Some(0),
-        ScanPredicate::IsNotNull(_) => {
-            let rows = u64::try_from(row_group.num_rows()).unwrap_or(0);
-            stats.null_count_opt() == Some(rows)
+        ScanPredicate::IsNull(_) => return null_count == Some(0),
+        ScanPredicate::IsNotNull(_) => return null_count == Some(rows),
+        _ => {}
+    }
+    let Some(target) = predicate.literal().and_then(literal_bound) else {
+        return false;
+    };
+    let Some((min, max)) = bounds(&target) else {
+        return false;
+    };
+    match predicate {
+        ScanPredicate::Eq(..) => target < min || max < target,
+        ScanPredicate::NotEq(..) => min == max && min == target,
+        ScanPredicate::Lt(..) => matches!(
+            min.partial_cmp(&target),
+            Some(Ordering::Equal | Ordering::Greater)
+        ),
+        ScanPredicate::LtEq(..) => target < min,
+        ScanPredicate::Gt(..) => matches!(
+            target.partial_cmp(&max),
+            Some(Ordering::Equal | Ordering::Greater)
+        ),
+        ScanPredicate::GtEq(..) => max < target,
+        ScanPredicate::IsNull(_) | ScanPredicate::IsNotNull(_) => false,
+    }
+}
+
+/// Reads one page's typed min/max from a column index as comparable bounds.
+///
+/// The page-index counterpart of [`statistics_bound`]: returns `None` for an
+/// all-null page, a missing index, or a physical type that does not match
+/// `target`'s variant, so the caller keeps the page.
+fn page_bound(
+    index: &parquet::file::page_index::column_index::ColumnIndexMetaData,
+    page: usize,
+    target: &StatBound,
+) -> Option<(StatBound, StatBound)> {
+    use parquet::file::page_index::column_index::ColumnIndexMetaData;
+    match (index, target) {
+        (ColumnIndexMetaData::BOOLEAN(pages), StatBound::Bool(_)) => Some((
+            StatBound::Bool(*pages.min_value(page)?),
+            StatBound::Bool(*pages.max_value(page)?),
+        )),
+        (ColumnIndexMetaData::INT64(pages), StatBound::I64(_)) => Some((
+            StatBound::I64(*pages.min_value(page)?),
+            StatBound::I64(*pages.max_value(page)?),
+        )),
+        (ColumnIndexMetaData::BYTE_ARRAY(pages), StatBound::Utf8(_)) => Some((
+            StatBound::Utf8(String::from_utf8_lossy(pages.min_value(page)?).into_owned()),
+            StatBound::Utf8(String::from_utf8_lossy(pages.max_value(page)?).into_owned()),
+        )),
+        _ => None,
+    }
+}
+
+/// Selects the pages of `row_groups` whose page index can still satisfy every
+/// predicate leaf, as one row selection over those groups in order.
+///
+/// Row-group pruning alone makes a point lookup decode its whole row group;
+/// this narrows the retained groups to the pages that may match, and the
+/// reader then fetches and decodes only those pages of every projected column.
+/// A page is skipped only when [`leaf_excludes_span`] proves it empty for some
+/// leaf, so the selection is always a superset of the matching rows and the
+/// plan's own filter still decides exact membership. Returns `None` when the
+/// file carries no page index or no page was excluded, leaving the reader
+/// unchanged.
+fn select_pages_for_predicates(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    row_groups: &[usize],
+    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+) -> Option<parquet::arrow::arrow_reader::RowSelection> {
+    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+    let (Some(column_indexes), Some(offset_indexes)) =
+        (metadata.column_index(), metadata.offset_index())
+    else {
+        return None;
+    };
+    let mut selectors = Vec::new();
+    let mut excluded_any = false;
+    for &row_group in row_groups {
+        let rows = usize::try_from(metadata.row_group(row_group).num_rows()).unwrap_or(0);
+        let mut excluded: Vec<Range<usize>> = Vec::new();
+        for predicate in predicates {
+            let Some(column) = parquet_column_index(metadata, predicate.column()) else {
+                continue;
+            };
+            let (Some(index), Some(offsets)) = (
+                column_indexes
+                    .get(row_group)
+                    .and_then(|group| group.get(column)),
+                offset_indexes
+                    .get(row_group)
+                    .and_then(|group| group.get(column)),
+            ) else {
+                continue;
+            };
+            let pages = offsets.page_locations();
+            if usize::try_from(index.num_pages()).ok() != Some(pages.len()) {
+                continue;
+            }
+            let first_row = |page: usize| {
+                pages.get(page).map_or(rows, |location| {
+                    usize::try_from(location.first_row_index).map_or(rows, |row| row.min(rows))
+                })
+            };
+            for page in 0..pages.len() {
+                let start = first_row(page);
+                let end = first_row(page + 1).max(start);
+                let null_count = index
+                    .null_count(page)
+                    .and_then(|count| u64::try_from(count).ok());
+                if leaf_excludes_span(
+                    predicate,
+                    |target| page_bound(index, page, target),
+                    null_count,
+                    u64::try_from(end - start).unwrap_or(u64::MAX),
+                ) {
+                    excluded.push(start..end);
+                }
+            }
         }
-        ScanPredicate::Eq(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((min, max)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            target < min || max < target
+        excluded_any |= !excluded.is_empty();
+        excluded.sort_by_key(|range| range.start);
+        let mut cursor = 0;
+        for range in excluded {
+            if range.start > cursor {
+                selectors.push(RowSelector::select(range.start - cursor));
+            }
+            if range.end > cursor {
+                selectors.push(RowSelector::skip(range.end - range.start.max(cursor)));
+                cursor = range.end;
+            }
         }
-        ScanPredicate::NotEq(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((min, max)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            min == max && min == target
-        }
-        ScanPredicate::Lt(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((min, _)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            matches!(
-                min.partial_cmp(&target),
-                Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
-            )
-        }
-        ScanPredicate::LtEq(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((min, _)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            target < min
-        }
-        ScanPredicate::Gt(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((_, max)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            matches!(
-                target.partial_cmp(&max),
-                Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
-            )
-        }
-        ScanPredicate::GtEq(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((_, max)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            max < target
+        if rows > cursor {
+            selectors.push(RowSelector::select(rows - cursor));
         }
     }
+    excluded_any.then(|| RowSelection::from(selectors))
 }
 
 /// Row groups retained after closed-predicate statistics pruning for one
@@ -4340,6 +4442,68 @@ mod tests {
         assert_eq!(
             wide_services, unique,
             "dictionary overflow must fall back to PLAIN without losing a row"
+        );
+    }
+
+    /// Page selection measured on one production-recipe row group: an
+    /// equality leaf on a sorted column skips every page whose index proves it
+    /// cannot match, keeps strictly fewer rows than the group, and still
+    /// yields the one matching row when the reader applies the selection.
+    #[test]
+    fn page_index_selects_only_the_matching_pages() {
+        use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+
+        const ROWS: i64 = 100_000;
+        const TARGET: i64 = 54_321;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let published =
+            write_grouped_fixture(&schema, &[service_block(&schema, "checkout", 0, ROWS)]);
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional)
+            .parse_and_finish(&published)
+            .expect("valid Parquet footer and page index");
+        let predicates = vec![ScanPredicate::Eq(
+            "value".to_owned(),
+            ScanLiteral::I64(TARGET),
+        )];
+
+        let selection = select_pages_for_predicates(&metadata, &[0], &predicates)
+            .expect("the sorted column's page index excludes pages");
+        let kept = selection.row_count();
+        assert!(
+            kept > 0 && kept < usize::try_from(ROWS).expect("fixture rows fit usize"),
+            "kept {kept} of {ROWS} rows"
+        );
+
+        let matching: usize = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            published,
+            ArrowReaderOptions::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional),
+        )
+        .expect("reader builder")
+        .with_row_selection(selection)
+        .build()
+        .expect("selected reader")
+        .map(|batch| {
+            let batch = batch.expect("selected batch");
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column")
+                .iter()
+                .filter(|value| *value == Some(TARGET))
+                .count()
+        })
+        .sum();
+        assert_eq!(matching, 1, "the selection must keep the matching row");
+        assert!(
+            select_pages_for_predicates(&metadata, &[0], &[]).is_none(),
+            "an empty conjunction leaves the reader unchanged"
         );
     }
 

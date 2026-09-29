@@ -761,3 +761,53 @@ not complete this task.
 | R13-D: only the leader retries pre-accept peer capacity; receiver never exceeds its running slots | 65da92a03, D6 | `oracle::dispatcher::tests::leader_retries_only_preaccept_peer_capacity`; `peer_network::analytical::two_leaders_retry_preaccept_capacity` | PASS |
 | Lint lanes | D8 | `mise run lints:default`, `mise run lints` | PASS |
 | Crate lib suite | — | `vala-bifrost-redux --lib --features test-support`: 848/848 | PASS |
+
+### D9 — selective first-row cost at one client (benchmark miss)
+
+- **Symptom:** standard benchmark selective@1 p50/p95/p99 24.3/28.2/41.1 ms,
+  server `first_row` mean 17.6 ms, while selective@8 `first_row` was 3.7 ms.
+  Reproduced on a second run (24.4/27.9/41.0 ms), so not host variance.
+- **Evidence:** selective@1 window metrics: 3.07 MB scanned per point lookup,
+  one row group scanned and nine pruned per query, all via
+  `HotParquetExec` (`bifrost_storage_metadata_cache_effects_total{hit}` one
+  per query). From selective@4 onward Forge `scribe_promotion` had published
+  the fixture, and hot files were pruned by `snapshot_overlap`; those windows
+  read through `OracleIcebergScanExec`, which already uses page-index row
+  selection. That path switch is why the cost fell as concurrency rose.
+- **Cause:** `hot_stream` restricted the reader to retained row groups only.
+  A point lookup decoded the whole 1,048,576-row group, about 122 batches, for
+  every projected column. Cached hot metadata was decoded without the page
+  index, so page-level selection was not possible.
+- **Fix site:** `storage::BifrostStorage::decode_metadata` (the sole hot
+  metadata decode) now loads the page index when present. `oracle::exec`
+  adds `select_pages_for_predicates`, which reuses row-group pruning's
+  exclusion decision (`leaf_excludes_span`) on page-index bounds. `hot_stream`
+  applies the resulting `RowSelection`. The row-group caller
+  (`select_row_groups_for_predicates`) and the follower resolver share the
+  same decision function. No test assertion, timeout, retry, or concurrency
+  was touched, so no diagnostician was required.
+- **Result:** two post-fix standard runs: selective@1 8.8–9.0/10.6–11.0/
+  12.4–12.7 ms, server `first_row` 2.8–2.9 ms, 0.31 MB scanned per query;
+  remote-live 137→333 QPS; every row exact (0 wrong).
+
+### Residual misses after D9 (measured, not yet fixed)
+
+- **Selective capacity ~760–780 QPS vs 1000 floor; latency targets 2/5/10 ms.**
+  At saturation the Iceberg path costs ~5.1 ms CPU per lookup on 4 CPUs.
+  A perf profile of the selective@8–16 window gives zstd 25%, libc
+  copy/alloc 18–22%, DataFusion 8.5%, parquet metadata/thrift 6%, and kernel
+  6.5%. Offline on the real fixture, one lookup costs 0.18 ms of footer plus
+  page-index decode and 1.0–1.2 ms of page decode, including the 1 MB
+  `event_id` dictionary page. The scan is therefore ~1.4 ms of the ~5.1 ms.
+  Server phases at c1 are `snapshot_pin` 4.8 ms, split into `table_lookup`
+  1.7, `hot_cut` 1.6, `metadata_pointer` 0.7 and `revalidation` 0.7
+  (sequential Postgres round-trips), then `first_row` 2.8 ms. The 2 ms p50
+  target is below the catalog pin alone.
+- **small-aggregate c32/c64 p95 107–110 / 210–219 ms vs 100 ms.** The cgroup is
+  CPU-saturated at ~340 QPS. Admission wait is 55/149 ms mean, and closed-loop
+  c64 at a 100 ms p95 would need about 640 QPS. Same as baseline.
+- **table-aggregate p95 301–338 ms vs 300 ms** (run-to-run spread). A single
+  published file's ten row groups decode sequentially in one Iceberg task
+  (1.3 cores), with ~267 ms server `first_row`.
+- **Seed ingest:** 557k rows/s on the first R13 run versus 676k and 681k on
+  reruns of the same code, so it is host variance.

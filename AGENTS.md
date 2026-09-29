@@ -431,10 +431,11 @@ behavior has no cross-boundary state (record the reason).
 
 ### Host Load
 
+- Independent verification lanes may run in parallel.
 - Never generate synthetic host load to reproduce a failure: no `stress-ng`,
-  busy loops, duplicated or parallel lane runs, or raised test-thread counts.
-  The workstation is shared. Diagnose a load-only failure from its logs, code,
-  and timing assumptions, and prove the fix with the normal lane.
+  busy loops, or raised test-thread counts. Diagnose a load-only failure from
+  its logs, code, and timing assumptions, and prove the fix with the normal
+  lane.
 
 ### Verification Scope
 

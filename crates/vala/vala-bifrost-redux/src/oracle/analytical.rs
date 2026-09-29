@@ -4051,9 +4051,8 @@ mod tests {
             roles: [crate::resources::BifrostRole::Oracle]
                 .into_iter()
                 .collect(),
-            memory_limit_bytes: None,
-            forge_compaction_memory_limit_bytes: None,
-            unmanaged_reserve_bytes: None,
+            server_memory_min_bytes: None,
+            bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,

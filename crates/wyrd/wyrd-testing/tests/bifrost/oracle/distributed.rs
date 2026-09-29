@@ -13,8 +13,8 @@ use vala_bifrost_redux::oracle::{
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
 use wyrd_server::oracle::{
-    ScribeFragmentFault, arm_scribe_fragment_fault_for_test,
-    arm_tail_listing_stale_for_test, arm_tail_listing_stall_for_test,
+    ScribeFragmentFault, arm_scribe_fragment_fault_for_test, arm_tail_listing_stale_for_test,
+    arm_tail_listing_stall_for_test,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{

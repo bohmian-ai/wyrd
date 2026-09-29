@@ -38,9 +38,9 @@ use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 /// instead would make every physical assertion a property of whichever machine
 /// ran the test.
 ///
-/// An Oracle pod is deliberately the tightest of the two: 512 MiB less the
-/// 256 MiB unmanaged reserve is the budget the query grant is derived from. A
-/// Scribe or Forge pod is sized to complete one table lifecycle instead, which
+/// An Oracle pod is deliberately the tightest of the two: 1.25 GiB less the
+/// 1 GiB server minimum leaves a 256 MiB shared cap the query grant is derived
+/// from. A Scribe or Forge pod is sized to complete one table lifecycle instead, which
 /// its own boot-time capacity check refuses to do inside the Oracle envelope.
 ///
 /// `memory_limit_bytes` replaces that per-target envelope only for the
@@ -52,8 +52,8 @@ pub(super) const fn pod_system_resources(
 ) -> vala_bifrost_redux::resources::SystemResourceSnapshot {
     let memory_limit_bytes = match (memory_limit_bytes, target) {
         (Some(bytes), _) => bytes,
-        (None, ProcessNodeTarget::Oracle) => 512 * 1024 * 1024,
-        (None, _) => 2 * 1024 * 1024 * 1024,
+        (None, ProcessNodeTarget::Oracle) => 1280 * 1024 * 1024,
+        (None, _) => 3 * 1024 * 1024 * 1024,
     };
     vala_bifrost_redux::resources::SystemResourceSnapshot {
         memory_limit_bytes,

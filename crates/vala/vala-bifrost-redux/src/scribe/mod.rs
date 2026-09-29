@@ -637,36 +637,36 @@ impl ScribeEmbeddedConfig {
 ///
 /// # Panics
 ///
-/// Panics when the embedded admission configuration cannot cover the protected
-/// unmanaged reserve and Scribe floor, which is a construction invariant.
+/// Panics when the embedded admission configuration cannot form a shared cap
+/// above the default server headroom, which is a construction invariant.
 fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::ScribeResources {
-    let memory_limit_bytes = config.memory_limit_bytes.max(
-        crate::resources::MIN_UNMANAGED_RESERVE_BYTES + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
-    );
-    let runtime = crate::resources::BifrostRuntimeResources::from_snapshot(
-        crate::resources::SystemResourceSnapshot {
-            memory_limit_bytes,
-            effective_cpu: 1,
-            scratch_capacity_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
-            scratch_available_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
-            memory_source: crate::resources::ResourceSource::Injected,
-            cpu_source: crate::resources::ResourceSource::Injected,
-        },
-        crate::resources::BifrostResourcePolicy {
-            roles: [crate::resources::BifrostRole::Scribe]
-                .into_iter()
-                .collect(),
-            memory_limit_bytes: None,
-            unmanaged_reserve_bytes: None,
-            scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
-            forge_compaction_memory_limit_bytes: None,
-            effective_cpu: None,
-            oracle_query_slot_limit: None,
-            scratch_root: std::path::PathBuf::new(),
-            volume_roots: None,
-        },
-    )
-    .expect("embedded Scribe resource policy must satisfy its configured floor");
+    let cap = config.memory_limit_bytes.max(1);
+    let memory_limit_bytes = cap.saturating_add(crate::resources::DEFAULT_SERVER_MEMORY_MIN_BYTES);
+    let runtime =
+        crate::resources::BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
+            crate::resources::SystemResourceSnapshot {
+                memory_limit_bytes,
+                effective_cpu: 1,
+                scratch_capacity_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
+                scratch_available_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
+                memory_source: crate::resources::ResourceSource::Injected,
+                cpu_source: crate::resources::ResourceSource::Injected,
+            },
+            crate::resources::BifrostResourcePolicy {
+                roles: [crate::resources::BifrostRole::Scribe]
+                    .into_iter()
+                    .collect(),
+                server_memory_min_bytes: None,
+                bifrost_memory_limit_bytes: None,
+                scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
+                effective_cpu: None,
+                oracle_query_slot_limit: None,
+                scratch_root: std::path::PathBuf::new(),
+                volume_roots: None,
+            },
+            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES.min(cap),
+        )
+        .expect("embedded Scribe resource policy must form a shared cap");
     runtime
         .compose_roles()
         .expect("embedded Scribe root must remain healthy")

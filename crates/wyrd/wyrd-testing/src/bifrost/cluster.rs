@@ -114,9 +114,6 @@ pub struct BifrostNodeSpec {
     pub roles: BTreeSet<BifrostRuntimeRole>,
     /// Optional Oracle-local resource placement.
     pub oracle: Option<TestOracleResources>,
-    /// Forge compaction budget this pod admits plans against, when it is not
-    /// the harness default.
-    pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional accelerated role cadence applied only by test-support builders.
     pub role_timing: Option<RoleTiming>,
 }
@@ -353,7 +350,6 @@ impl BifrostClusterSpec {
             node_id: NodeId::new(uuid::Uuid::from_u128(id)),
             roles: roles.into_iter().collect(),
             oracle: None,
-            forge_compaction_memory_limit_bytes: None,
             role_timing: None,
         }
     }
@@ -1715,9 +1711,6 @@ impl WyrdTestCluster {
         {
             builder = builder.with_system_resources_for_test(snapshot);
         }
-        if let Some(bytes) = resources.spec.forge_compaction_memory_limit_bytes {
-            builder = builder.with_forge_compaction_memory_limit_for_test(bytes);
-        }
         if let Some(oracle) = self.oracle_runtime.clone() {
             builder = builder.with_oracle_runtime_for_test(oracle);
         }
@@ -2666,7 +2659,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_restart_rederives_same_plan_from_retained_snapshot() {
         let observation = SystemResourceSnapshot {
-            memory_limit_bytes: 1024 * 1024 * 1024,
+            memory_limit_bytes: 2 * 1024 * 1024 * 1024,
             effective_cpu: 3,
             scratch_capacity_bytes: 1280 * 1024 * 1024,
             scratch_available_bytes: 1280 * 1024 * 1024,
@@ -2708,7 +2701,7 @@ mod tests {
             .expect("restarted resource snapshot");
         assert_eq!(restarted_resources.plan, original_resources.plan);
         assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
-        assert_eq!(restarted_resources.elastic_memory_used_bytes, 0);
+        assert_eq!(restarted_resources.governed_memory_used_bytes, 0);
         assert!(!restarted_resources.oracle_query_active);
         cluster.shutdown().await.expect("cluster shuts down");
     }

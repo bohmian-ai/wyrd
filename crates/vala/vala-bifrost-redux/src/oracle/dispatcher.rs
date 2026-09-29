@@ -890,7 +890,7 @@ pub struct WorkerExecution {
 /// Exact role-root quantum retained by one remote follower stream.
 #[derive(Debug)]
 pub(crate) enum FollowerWorkerResources {
-    /// Oracle floor/elastic ownership for persisted execution.
+    /// Oracle shared-cap ownership for persisted execution.
     Oracle(crate::resources::OracleWorkerResources),
 }
 
@@ -1956,7 +1956,7 @@ mod resource_tests {
     fn remote_worker_stream_retains_slot_units_until_terminal_drop() {
         let roles = BifrostRuntimeResources::from_snapshot(
             SystemResourceSnapshot {
-                memory_limit_bytes: 576 * 1024 * 1024,
+                memory_limit_bytes: (1024 + 576) * 1024 * 1024,
                 effective_cpu: 1,
                 scratch_capacity_bytes: 1024 * 1024 * 1024,
                 scratch_available_bytes: 1024 * 1024 * 1024,
@@ -1965,17 +1965,11 @@ mod resource_tests {
             },
             BifrostResourcePolicy {
                 roles: BTreeSet::from([BifrostRole::Oracle, BifrostRole::Forge]),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: None,
+                server_memory_min_bytes: None,
+                bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                // The unclamped production default cannot sit beside the
-                // Oracle floor; this topology names one rewrite working set,
-                // exactly as its co-located deployment configures one.
-                forge_compaction_memory_limit_bytes: Some(
-                    crate::resources::FORGE_TEST_BUDGET_BYTES,
-                ),
                 scratch_root: PathBuf::new(),
                 volume_roots: None,
             },
@@ -5137,7 +5131,7 @@ mod tests {
     fn slot_limited_oracle(units: usize) -> crate::resources::OracleResources {
         crate::resources::BifrostRuntimeResources::from_snapshot(
             crate::resources::SystemResourceSnapshot {
-                memory_limit_bytes: 1024 * 1024 * 1024,
+                memory_limit_bytes: 2 * 1024 * 1024 * 1024,
                 effective_cpu: 8,
                 scratch_capacity_bytes: 1024 * 1024 * 1024,
                 scratch_available_bytes: 1024 * 1024 * 1024,
@@ -5146,12 +5140,11 @@ mod tests {
             },
             crate::resources::BifrostResourcePolicy {
                 roles: std::collections::BTreeSet::from([crate::resources::BifrostRole::Oracle]),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: None,
+                server_memory_min_bytes: None,
+                bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: Some(units),
-                forge_compaction_memory_limit_bytes: None,
                 scratch_root: std::path::PathBuf::new(),
                 volume_roots: None,
             },

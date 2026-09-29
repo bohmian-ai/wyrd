@@ -29,8 +29,7 @@ use vala_bifrost_redux::oracle::{
     OracleSlotManager, OracleSpillRuntime,
 };
 use vala_bifrost_redux::resources::{
-    BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,
-    OracleClassSplit,
+    BifrostRole, BifrostRoleResources, BifrostRuntimeResources, OracleClassSplit,
 };
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
@@ -558,19 +557,11 @@ async fn build_bifrost_external_dependencies(
         })
         .collect();
     let runtime_resources = BifrostRuntimeResources::detect_with_transport_message_limit(
-        BifrostResourcePolicy {
-            roles: resource_roles,
-            memory_limit_bytes: config.resources.memory_limit_bytes,
-            unmanaged_reserve_bytes: config.resources.unmanaged_reserve_bytes,
-            scratch_limit_bytes: config.resources.scratch_limit_bytes,
-            effective_cpu: config.resources.effective_cpu,
-            oracle_query_slot_limit: config.resources.oracle_query_slot_limit,
-            forge_compaction_memory_limit_bytes: config
-                .resources
-                .forge_compaction_memory_limit_bytes,
-            scratch_root: data_root.oracle_spill().to_path_buf(),
-            volume_roots: Some(data_root.volume_roots()),
-        },
+        config.resources.policy(
+            resource_roles,
+            data_root.oracle_spill().to_path_buf(),
+            Some(data_root.volume_roots()),
+        ),
         config.scribe.ingest_request_bytes,
     )
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
@@ -800,15 +791,10 @@ pub async fn compose_bifrost(
         // server. One initializer makes that divergence unrepresentable.
         let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
-            // Scribe's real ceiling is its guaranteed floor plus the shared
-            // elastic allowance it may borrow, which is what the role governor
-            // enforces. Validating against the floor alone would understate the
-            // memory Scribe actually owns and refuse pods that can serve.
-            scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0).then(|| {
-                resource_plan
-                    .scribe_floor_bytes
-                    .saturating_add(resource_plan.elastic_memory_bytes)
-            }),
+            // Scribe may hold up to the one shared cap the governor enforces.
+            scribe_memory_limit_bytes: resource_plan
+                .scribe_enabled
+                .then_some(resource_plan.managed_memory_bytes),
             policy: vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy::new(geometry),
             event_time_window: EventTimeWindow {
                 past: scribe_config
@@ -937,7 +923,12 @@ pub async fn compose_bifrost(
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
         let coordinator = Arc::new(ForgeCoordinator::new(ForgeBuildConfig {
-            resource_plan,
+            resources: bifrost_resources.forge().ok_or_else(|| {
+                ServerBootError::ForgeSchedulerRequired {
+                    detail: "Forge role selected without a composed Forge capability".to_owned(),
+                }
+            })?,
+            spill_root: data_root.forge_spill().to_path_buf(),
             vala: postgres.vala().clone(),
             operator_pool: operator_pool.clone(),
             catalog: {
@@ -1165,8 +1156,8 @@ pub async fn compose_bifrost(
 ///
 /// Every bound comes from values the immutable [`ResourcePlan`] already
 /// resolved, so a node cannot admit compaction work its own resource plan did
-/// not reserve. The memory budget is the plan's selected Forge budget verbatim.
-/// Running parallelism is three units per effective CPU, matching upstream's
+/// not reserve. Memory is not bounded here: each rewrite charges the shared
+/// governor through its own pool. Running parallelism is three units per effective CPU, matching upstream's
 /// task multiplier over its detected worker threads, and waiting parallelism is
 /// four times that, so a burst of planned work queues rather than being refused
 /// while earlier plans still run. Tenant fairness is unrelated to either and
@@ -1182,7 +1173,6 @@ fn forge_compaction_worker_config(
         .max(1);
     ForgeWorkerConfig {
         per_tenant_active_cap: forge_runtime.resolved_per_tenant_active_cap(),
-        compaction_memory_budget_bytes: plan.forge_compaction_memory_limit_bytes,
         max_task_parallelism,
         pending_task_parallelism: max_task_parallelism.saturating_mul(4),
     }
@@ -1617,13 +1607,7 @@ impl<'a> OracleRoleBuilder<'a> {
         )
         .map_err(|_| ServerBootError::OraclePeer("worker quantum exceeds u64".to_owned()))?;
         // Derive Oracle capability sizing from the portable resource plan.
-        let memory_budget = resource_plan
-            .oracle_floor_bytes
-            .checked_add(resource_plan.elastic_memory_bytes)
-            .ok_or_else(|| {
-                ServerBootError::OraclePeer("Oracle memory grant overflow".to_owned())
-            })?;
-        let memory_budget_bytes = u64::try_from(memory_budget)
+        let memory_budget_bytes = u64::try_from(resource_plan.managed_memory_bytes)
             .map_err(|_| ServerBootError::OraclePeer("memory budget exceeds u64".to_owned()))?;
         let raw_slots = u32::try_from(
             vala_bifrost_redux::resources::oracle_worker_slots(resource_plan)
@@ -1717,8 +1701,7 @@ impl<'a> OracleRoleBuilder<'a> {
             configured = resource_plan.oracle_query_slot_limit.is_some(),
             admission_waiters = config.oracle.admission_waiters,
             effective_cpu = resource_plan.effective_cpu,
-            oracle_floor_bytes = resource_plan.oracle_floor_bytes,
-            elastic_memory_bytes = resource_plan.elastic_memory_bytes,
+            managed_memory_bytes = resource_plan.managed_memory_bytes,
             "Oracle admission capacity resolved"
         );
         let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1_024));
@@ -1744,15 +1727,14 @@ impl<'a> OracleRoleBuilder<'a> {
             node_id,
             tail_tls.clone(),
         ));
-        let reconciliation_limit_bytes = memory_budget
+        let reconciliation_limit_bytes = resource_plan
+            .managed_memory_bytes
             .checked_div(4)
             .filter(|limit| *limit > 0)
             .ok_or_else(|| {
                 ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
             })?;
-        let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
-            tail_tls,
-        ));
+        let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(tail_tls));
         let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
             authority.clone();
         let stage_authority: Arc<dyn vala_bifrost_redux::oracle::peer::OracleStageAuthority> =
@@ -2285,67 +2267,32 @@ mod tests {
         );
     }
 
-    /// The compaction runtime is role-scoped and its budget refuses invalid boot.
+    /// The compaction runtime is role-scoped and sized from effective CPU.
     ///
-    /// Two facts sit on the same owner because composition decides both at the
-    /// same moment. Only a process that actually runs admitted plans builds a
-    /// dedicated executor, and it sizes that executor from the resolved
-    /// effective CPU the memory budget came from rather than from a second CPU
-    /// knob that could disagree. A budget the protected floors cannot cover is
-    /// refused outright, because a clamped budget would silently admit plans
-    /// against memory another role is guaranteed.
+    /// Only a process that actually runs admitted plans builds a dedicated
+    /// executor, and its admission bounds follow the resolved effective CPU
+    /// rather than a second knob that could disagree. Memory is not bounded
+    /// here: every rewrite charges the one shared governor.
     ///
     /// # Panics
     ///
-    /// Panics when a non-worker role builds an executor, when the derived
-    /// admission bounds do not follow effective CPU, or when an invalid budget
-    /// is accepted.
+    /// Panics when a non-worker role builds an executor or the derived
+    /// admission bounds do not follow effective CPU.
     #[test]
-    fn forge_runtime_is_role_scoped_and_budget_refuses_invalid_boot() {
-        use vala_bifrost_redux::resources::{
-            BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
-            SystemResourceSnapshot,
+    fn forge_runtime_is_role_scoped_and_cpu_sized() {
+        let mut plan = vala_bifrost_redux::resources::ResourcePlan {
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+            effective_cpu: 6,
+            oracle_query_slot_limit: None,
+            server_memory_min_bytes: 1024 * 1024 * 1024,
+            managed_memory_bytes: 3 * 1024 * 1024 * 1024,
+            scribe_enabled: false,
+            oracle_enabled: false,
+            forge_enabled: true,
+            scratch_limit_bytes: 1024 * 1024 * 1024,
         };
-
-        /// Plans one node exactly as `compose_bifrost` does for these roles.
-        fn plan_for(
-            roles: &[BifrostRole],
-            override_bytes: Option<usize>,
-        ) -> Result<vala_bifrost_redux::resources::ResourcePlan, String> {
-            let scratch = 1024 * 1024 * 1024_u64;
-            BifrostRuntimeResources::from_snapshot(
-                SystemResourceSnapshot {
-                    memory_limit_bytes: 4 * 1024 * 1024 * 1024,
-                    effective_cpu: 6,
-                    scratch_capacity_bytes: scratch * 2,
-                    scratch_available_bytes: scratch * 2,
-                    memory_source: ResourceSource::Injected,
-                    cpu_source: ResourceSource::Injected,
-                },
-                BifrostResourcePolicy {
-                    roles: roles.iter().copied().collect(),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: Some(scratch),
-                    effective_cpu: None,
-                    oracle_query_slot_limit: None,
-                    forge_compaction_memory_limit_bytes: override_bytes,
-                    scratch_root: std::path::PathBuf::new(),
-                    volume_roots: None,
-                },
-            )
-            .map(|resources| resources.plan())
-            .map_err(|error| error.to_string())
-        }
-
-        // Admission bounds follow the plan's effective CPU, not a new knob.
-        let plan = plan_for(&[BifrostRole::Forge], None).expect("dedicated Forge plans");
         let forge_runtime = crate::config::ForgeRuntimeConfig::default();
         let worker = super::forge_compaction_worker_config(&plan, &forge_runtime);
-        assert_eq!(
-            worker.compaction_memory_budget_bytes, plan.forge_compaction_memory_limit_bytes,
-            "the worker charges plans against exactly the reserved budget"
-        );
         assert_eq!(worker.max_task_parallelism, 18, "three per effective CPU");
         assert_eq!(
             worker.pending_task_parallelism, 72,
@@ -2355,45 +2302,10 @@ mod tests {
         worker
             .validate()
             .expect("composition-derived bounds are usable");
-
-        // The same derivation holds for co-located `All`, which additionally
-        // preserves both protected floors.
-        let all = plan_for(
-            &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
-            None,
-        )
-        .expect("co-located All plans");
-        assert!(all.scribe_floor_bytes > 0 && all.oracle_floor_bytes > 0);
-        super::forge_compaction_worker_config(&all, &forge_runtime)
+        plan.effective_cpu = 0;
+        super::forge_compaction_worker_config(&plan, &forge_runtime)
             .validate()
-            .expect("co-located bounds are usable");
-
-        // Forge absent: nothing is reserved, so nothing may be admitted, which
-        // is what makes the executor role-scoped rather than always-composed.
-        let absent =
-            plan_for(&[BifrostRole::Scribe, BifrostRole::Oracle], None).expect("Forge-absent plan");
-        assert_eq!(absent.forge_compaction_memory_limit_bytes, 0);
-        assert!(
-            super::forge_compaction_worker_config(&absent, &forge_runtime)
-                .validate()
-                .is_err(),
-            "a node that reserved nothing must not compose an admitting worker"
-        );
-
-        // Invalid budgets refuse at planning, before any executor is built.
-        assert!(
-            plan_for(&[BifrostRole::Forge], Some(0)).is_err(),
-            "a zero budget refuses boot"
-        );
-        let safe = all.managed_memory_bytes - all.scribe_floor_bytes - all.oracle_floor_bytes;
-        assert!(
-            plan_for(
-                &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
-                Some(safe + 1),
-            )
-            .is_err(),
-            "a budget past the protected floors refuses boot, never clamps"
-        );
+            .expect("running parallelism never falls below one");
 
         // Only the Forge worker role reaches the executor construction at all.
         let production = include_str!("mod.rs")

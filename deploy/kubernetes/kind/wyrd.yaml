@@ -64,9 +64,8 @@ spec:
             httpGet: {path: /readyz, port: http}
             periodSeconds: 2
             failureThreshold: 3
-          # `all` adds the default four-fifths Forge compaction budget to the
-          # 768 MiB of Scribe, Oracle, and unmanaged floors, so it needs at
-          # least 3.75 GiB; 3 GiB refuses to boot.
+          # Every role shares one Bifrost cap: the limit less the 1 GiB server
+          # minimum (WYRD_SERVER_MEMORY_MIN_BYTES), so 4 GiB leaves 3 GiB.
           resources:
             requests: {cpu: 500m, memory: 1Gi}
             limits: {cpu: "2", memory: 4Gi}

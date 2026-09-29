@@ -3,7 +3,7 @@
 //! One production-shaped run proves that the retained admission owner stays
 //! safe *and* useful when a real memory-heavy Analytical query already holds a
 //! query envelope, a distributed graph, and live spill ownership on the exact
-//! 512 MiB Oracle-only memory floor: bounded Interactive queries from two
+//! 1.25 GiB Oracle-only rung (a 256 MiB shared cap): bounded Interactive queries from two
 //! separate tenants still complete through the real public client, every query
 //! pool stays inside the grant it was issued, root admission accounting stays
 //! inside the managed budget, and every owner returns to baseline.
@@ -38,12 +38,13 @@ use wyrd_testing::bifrost::{
 
 use crate::support::*;
 
-/// Exact Oracle-only process memory floor this qualification runs at.
+/// Exact Oracle-only process memory this qualification runs at.
 ///
-/// The lowest observation `BifrostRuntimeResources` accepts for an Oracle-only
-/// pod. It is an injected observation, not an OS limit, so this journey bounds
+/// The 1 GiB server minimum plus a 256 MiB shared cap: the smallest rung at
+/// which one Analytical query is granted the whole cap. It is an injected
+/// observation, not an OS limit, so this journey bounds
 /// what admission *accounts for* and makes no aggregate physical-memory claim.
-const ORACLE_MEMORY_FLOOR_BYTES: usize = 512 * 1024 * 1024;
+const ORACLE_MEMORY_FLOOR_BYTES: usize = 1280 * 1024 * 1024;
 
 /// Effective CPU injected on every Oracle-only node.
 const ORACLE_EFFECTIVE_CPU: usize = 2;
@@ -489,16 +490,11 @@ fn prove_pool_within_grant(
 ///
 /// # Errors
 ///
-/// Returns an error when any node's Scribe, Oracle, and Forge ownership
-/// together exceed the memory the plan governs.
+/// Returns an error when any node's governed ownership exceeds the one shared
+/// cap the plan governs.
 fn prove_roots_within_budget(cluster: &WyrdTestCluster, label: &str) -> Result<(), JourneyError> {
     for snapshot in cluster.oracle_resource_snapshots()? {
-        // Forge holds no live root lease: its compaction budget is reserved
-        // once during plan calculation, so the plan's figure is its whole
-        // standing claim on the managed budget.
-        let held = snapshot.scribe_memory_used_bytes
-            + snapshot.oracle_memory_used_bytes
-            + snapshot.plan.forge_compaction_memory_limit_bytes;
+        let held = snapshot.governed_memory_used_bytes;
         if held > snapshot.plan.managed_memory_bytes {
             return Err(format!(
                 "during {label} one Oracle root held {held} bytes against a managed budget of {}",
@@ -917,8 +913,7 @@ fn fixture_rows_ipc(start_id: i64, rows: i64, groups: i64) -> Result<bytes::Byte
 
 /// Memory observation injected on the smaller of the two heterogeneous Oracles.
 ///
-/// Above the combined Scribe and Oracle role floors a mixed pod must satisfy,
-/// and far enough below its sibling that the two derived plans cannot coincide.
+/// Above the 1 GiB server minimum a pod must leave, and far enough below its sibling that the two derived plans cannot coincide.
 const SMALL_ORACLE_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// Memory observation injected on the larger of the two heterogeneous Oracles.
@@ -988,7 +983,6 @@ async fn prove_heterogeneous_local_capacity() -> Result<(), JourneyError> {
                 system_resources: Some(snapshot),
                 ..TestOracleResources::default()
             }),
-            forge_compaction_memory_limit_bytes: node.forge_compaction_memory_limit_bytes,
             role_timing: node.role_timing,
         })
         .collect();
@@ -1084,7 +1078,7 @@ fn heterogeneous_observation(
 fn derived_capacities(
     cluster: &WyrdTestCluster,
     node_ids: &[NodeId],
-) -> Result<Vec<(usize, usize, usize, usize)>, JourneyError> {
+) -> Result<Vec<(usize, usize, usize)>, JourneyError> {
     node_ids
         .iter()
         .map(|node_id| {
@@ -1096,8 +1090,7 @@ fn derived_capacities(
                 .ok_or_else(|| format!("node {} composed no Bifrost resources", node_id.as_uuid()))?
                 .plan();
             Ok((
-                plan.oracle_floor_bytes,
-                plan.elastic_memory_bytes,
+                plan.managed_memory_bytes,
                 plan.effective_cpu,
                 vala_bifrost_redux::resources::oracle_worker_slots(plan)
                     .map_err(|error| error.to_string())?,
@@ -1273,8 +1266,8 @@ async fn memory_refusal_preserves_oracle_health_and_next_query() {
 /// Returns the first claim that broke.
 async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     // The lowest supported Oracle rung is the only one where a single query can
-    // occupy the whole governed root: at 512 MiB an Oracle-only pod has no
-    // elastic memory, so its root equals the ceiling one query is granted.
+    // occupy the whole governed root: at 1.25 GiB an Oracle-only pod has a
+    // 256 MiB shared cap, which equals the ceiling one query is granted.
     // Above that rung no single query can fill the root, by design.
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::three_oracles_one_scribe()
@@ -1311,9 +1304,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         .bifrost_resources()
         .ok_or("node composed no Bifrost resources")?;
     let plan = resources.plan();
-    let root_limit = plan
-        .oracle_floor_bytes
-        .saturating_add(plan.elastic_memory_bytes);
+    let root_limit = plan.managed_memory_bytes;
     let health = resources.oracle().ok_or("node hosts no Oracle")?.health();
 
     // Both controls arm the same next query: it takes the whole governed root

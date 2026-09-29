@@ -3,10 +3,12 @@
 //! Includes adapted Apache-2.0-licensed queue code identified by the
 //! copyright notice below.
 //!
-//! The accounting rules prevent worker over-commitment: waiting plans charge
-//! parallelism only, running plans charge parallelism *and* estimated memory.
-//! Only the queue head is considered, and a plan that cannot fit the
-//! worker at all is refused rather than parked forever.
+//! The accounting rules prevent worker over-commitment of parallelism: waiting
+//! and running plans each charge their own parallelism budget. Memory is not a
+//! queue figure — a running plan charges the one shared Bifrost governor as
+//! its `DataFusion` pool actually grows. Only the queue head is considered, and
+//! a plan that cannot fit the worker at all is refused rather than parked
+//! forever.
 //!
 //! The key is `(TaskId, plan_index)`, and the runner payload belongs to
 //! [`ForgeWorker`](crate::forge::worker::ForgeWorker), not to the accounting.
@@ -43,8 +45,8 @@ pub(crate) type ForgePlanKey = (Uuid, usize);
 
 /// Admission terms for one planned rewrite.
 ///
-/// Both figures are validated by [`ForgeCompactionQueue::push`] rather than by
-/// the producer, so an implausible estimate is refused at one place.
+/// Parallelism is validated by [`ForgeCompactionQueue::push`] rather than by
+/// the producer, so an implausible figure is refused at one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ForgePlanAdmission {
     /// Durable task this plan belongs to.
@@ -53,9 +55,6 @@ pub(crate) struct ForgePlanAdmission {
     pub plan_index: usize,
     /// Execution parallelism the plan recommends; must be `1..=max_parallelism`.
     pub required_parallelism: u32,
-    /// Estimated heap peak charged while the plan runs; must be
-    /// `1..=total_memory_budget_bytes`.
-    pub memory_reservation_bytes: usize,
 }
 
 impl ForgePlanAdmission {
@@ -78,15 +77,6 @@ pub(crate) struct PoppedForgePlan {
     pub runner: Option<ForgeCompactionPlanRunner>,
 }
 
-/// Resources one admitted plan holds while it waits and while it runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ForgePlanResources {
-    /// Parallelism units charged to waiting, then to running.
-    required_parallelism: u32,
-    /// Estimated heap peak charged only once the plan is running.
-    memory_reservation_bytes: usize,
-}
-
 /// Why [`ForgeCompactionQueue::push`] refused, or that it accepted.
 ///
 /// The distinction between the three refusals matters to settlement: capacity
@@ -98,7 +88,7 @@ pub(crate) enum ForgePushResult {
     Added,
     /// Admitting it would exceed the waiting-parallelism budget.
     RejectedCapacity,
-    /// Its parallelism or estimated memory exceeds the whole worker.
+    /// Its parallelism exceeds the whole worker.
     RejectedTooLarge,
     /// Its `required_parallelism` is zero.
     RejectedInvalidParallelism,
@@ -106,15 +96,14 @@ pub(crate) enum ForgePushResult {
     RejectedDuplicate,
 }
 
-/// Strict-FIFO admission queue bounded by parallelism and running memory.
+/// Strict-FIFO admission queue bounded by waiting and running parallelism.
 ///
 /// Invariants the type maintains, and which its callers rely on:
 ///
 /// * every waiting plan's parallelism is in `waiting_parallelism_sum`, and
 ///   nothing else is;
-/// * every running plan's parallelism and memory are in the running sums, and
-///   nothing else is — a waiting plan's memory is deliberately uncharged, so a
-///   large queued plan cannot starve smaller running ones;
+/// * every running plan's parallelism is in `running_parallelism_sum`, and
+///   nothing else is;
 /// * `resource_map` holds exactly the keys that are waiting or running, which
 ///   is what makes a duplicate push and a double finish both detectable;
 /// * only the head is ever examined by [`Self::pop`], so admission order is
@@ -122,22 +111,18 @@ pub(crate) enum ForgePushResult {
 pub(crate) struct ForgeCompactionQueue {
     /// FIFO of waiting admissions.
     deque: VecDeque<ForgePlanAdmission>,
-    /// Resources of every waiting or running plan, keyed by plan key.
-    resource_map: HashMap<ForgePlanKey, ForgePlanResources>,
+    /// Parallelism of every waiting or running plan, keyed by plan key.
+    resource_map: HashMap<ForgePlanKey, u32>,
     /// Runners of waiting plans, removed on pop or cancel.
     runners: HashMap<ForgePlanKey, ForgeCompactionPlanRunner>,
     /// Sum of `required_parallelism` over waiting plans.
     waiting_parallelism_sum: u32,
     /// Sum of `required_parallelism` over running plans.
     running_parallelism_sum: u32,
-    /// Sum of `memory_reservation_bytes` over running plans.
-    running_memory_reservation_bytes: usize,
     /// Maximum concurrent parallelism across running plans.
     max_parallelism: u32,
     /// Maximum total parallelism across waiting plans.
     pending_parallelism_budget: u32,
-    /// Immutable worker memory budget running plans are charged against.
-    total_memory_budget_bytes: usize,
 }
 
 impl std::fmt::Debug for ForgeCompactionQueue {
@@ -146,16 +131,11 @@ impl std::fmt::Debug for ForgeCompactionQueue {
             .field("waiting", &self.deque.len())
             .field("waiting_parallelism_sum", &self.waiting_parallelism_sum)
             .field("running_parallelism_sum", &self.running_parallelism_sum)
-            .field(
-                "running_memory_reservation_bytes",
-                &self.running_memory_reservation_bytes,
-            )
             .field("max_parallelism", &self.max_parallelism)
             .field(
                 "pending_parallelism_budget",
                 &self.pending_parallelism_budget,
             )
-            .field("total_memory_budget_bytes", &self.total_memory_budget_bytes)
             .field("resource_map", &self.resource_map.len())
             .field("runners", &self.runners.len())
             .finish_non_exhaustive()
@@ -167,24 +147,16 @@ impl ForgeCompactionQueue {
     ///
     /// # Panics
     ///
-    /// Panics when `max_parallelism` is zero, when
-    /// `pending_parallelism_budget` cannot hold one maximally parallel plan, or
-    /// when `total_memory_budget_bytes` is zero. Each is a composition
-    /// invariant resolved once at boot, so a violation is a programming error
-    /// in resource planning rather than a runtime condition.
-    pub(crate) fn new(
-        max_parallelism: u32,
-        pending_parallelism_budget: u32,
-        total_memory_budget_bytes: usize,
-    ) -> Self {
+    /// Panics when `max_parallelism` is zero or when
+    /// `pending_parallelism_budget` cannot hold one maximally parallel plan.
+    /// Each is a composition invariant resolved once at boot, so a violation
+    /// is a programming error in resource planning rather than a runtime
+    /// condition.
+    pub(crate) fn new(max_parallelism: u32, pending_parallelism_budget: u32) -> Self {
         assert!(max_parallelism > 0, "max_parallelism must be > 0");
         assert!(
             pending_parallelism_budget >= max_parallelism,
             "pending budget should allow at least one task"
-        );
-        assert!(
-            total_memory_budget_bytes > 0,
-            "total memory budget must be > 0"
         );
         Self {
             deque: VecDeque::new(),
@@ -192,10 +164,8 @@ impl ForgeCompactionQueue {
             runners: HashMap::new(),
             waiting_parallelism_sum: 0,
             running_parallelism_sum: 0,
-            running_memory_reservation_bytes: 0,
             max_parallelism,
             pending_parallelism_budget,
-            total_memory_budget_bytes,
         }
     }
 
@@ -214,21 +184,10 @@ impl ForgeCompactionQueue {
         self.waiting_parallelism_sum
     }
 
-    /// Returns the estimated memory currently charged to running plans.
-    pub(crate) fn running_memory_reservation_bytes(&self) -> usize {
-        self.running_memory_reservation_bytes
-    }
-
     /// Returns parallelism available to a plan that would start now.
     fn available_parallelism(&self) -> u32 {
         self.max_parallelism
             .saturating_sub(self.running_parallelism_sum)
-    }
-
-    /// Returns estimated memory available to a plan that would start now.
-    fn available_memory_reservation_bytes(&self) -> usize {
-        self.total_memory_budget_bytes
-            .saturating_sub(self.running_memory_reservation_bytes)
     }
 
     /// Appends one plan to the FIFO, or refuses it with a typed reason.
@@ -245,9 +204,7 @@ impl ForgeCompactionQueue {
         if admission.required_parallelism == 0 {
             return ForgePushResult::RejectedInvalidParallelism;
         }
-        if admission.required_parallelism > self.max_parallelism
-            || admission.memory_reservation_bytes > self.total_memory_budget_bytes
-        {
+        if admission.required_parallelism > self.max_parallelism {
             return ForgePushResult::RejectedTooLarge;
         }
         let key = admission.key();
@@ -263,13 +220,8 @@ impl ForgeCompactionQueue {
         if new_parallelism_total > self.pending_parallelism_budget {
             return ForgePushResult::RejectedCapacity;
         }
-        self.resource_map.insert(
-            key,
-            ForgePlanResources {
-                required_parallelism: admission.required_parallelism,
-                memory_reservation_bytes: admission.memory_reservation_bytes,
-            },
-        );
+        self.resource_map
+            .insert(key, admission.required_parallelism);
         self.waiting_parallelism_sum = new_parallelism_total;
         if let Some(runner) = runner {
             self.runners.insert(key, runner);
@@ -278,22 +230,14 @@ impl ForgeCompactionQueue {
         ForgePushResult::Added
     }
 
-    /// Moves the head to running when both running budgets admit it.
+    /// Moves the head to running when running parallelism admits it.
     ///
     /// Returns `None` when the queue is empty or the head does not fit. Only
     /// the head is ever considered, which is what makes head-of-line blocking
     /// the queue's advertised behavior rather than an accident.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the running memory sum would overflow `usize`, which cannot
-    /// happen while every admission is bounded by the worker budget.
     pub(crate) fn pop(&mut self) -> Option<PoppedForgePlan> {
         let front = self.deque.front()?;
         if front.required_parallelism > self.available_parallelism() {
-            return None;
-        }
-        if front.memory_reservation_bytes > self.available_memory_reservation_bytes() {
             return None;
         }
         let admission = self.deque.pop_front()?;
@@ -303,10 +247,6 @@ impl ForgeCompactionQueue {
         self.running_parallelism_sum = self
             .running_parallelism_sum
             .saturating_add(admission.required_parallelism);
-        self.running_memory_reservation_bytes = self
-            .running_memory_reservation_bytes
-            .checked_add(admission.memory_reservation_bytes)
-            .expect("running memory reservation sum overflowed");
         let runner = self.runners.remove(&admission.key());
         Some(PoppedForgePlan { admission, runner })
     }
@@ -315,13 +255,8 @@ impl ForgeCompactionQueue {
     ///
     /// Returns `false` for an unknown key, which is how a double finish is
     /// detected rather than silently double-crediting the budgets.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the running memory sum would underflow, which would mean a
-    /// plan was finished with resources it never held.
     pub(crate) fn finish_running(&mut self, key: ForgePlanKey) -> bool {
-        let Some(resources) = self.resource_map.remove(&key) else {
+        let Some(required_parallelism) = self.resource_map.remove(&key) else {
             tracing::warn!(
                 task_id = %key.0,
                 plan_index = key.1,
@@ -331,11 +266,7 @@ impl ForgeCompactionQueue {
         };
         self.running_parallelism_sum = self
             .running_parallelism_sum
-            .saturating_sub(resources.required_parallelism);
-        self.running_memory_reservation_bytes = self
-            .running_memory_reservation_bytes
-            .checked_sub(resources.memory_reservation_bytes)
-            .expect("running memory reservation bookkeeping underflowed");
+            .saturating_sub(required_parallelism);
         self.runners.remove(&key);
         true
     }
@@ -380,24 +311,12 @@ mod tests {
         Uuid::from_bytes(bytes)
     }
 
-    /// Builds an admission with a nominal one-byte memory reservation, so
-    /// parallelism assertions are not perturbed by the memory budget.
+    /// Builds an admission for one plan of one numbered task.
     fn admission(ordinal: u8, plan_index: usize, parallelism: u32) -> ForgePlanAdmission {
         ForgePlanAdmission {
             task_id: task(ordinal),
             plan_index,
             required_parallelism: parallelism,
-            memory_reservation_bytes: 1,
-        }
-    }
-
-    /// Builds an admission that charges an exact memory reservation.
-    fn sized(ordinal: u8, memory_reservation_bytes: usize) -> ForgePlanAdmission {
-        ForgePlanAdmission {
-            task_id: task(ordinal),
-            plan_index: 0,
-            required_parallelism: 1,
-            memory_reservation_bytes,
         }
     }
 
@@ -414,7 +333,7 @@ mod tests {
     #[test]
     fn queue_admission_state_machine() {
         // Basic push, pop, finish.
-        let mut queue = ForgeCompactionQueue::new(8, 32, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(8, 32);
         assert_eq!(queue.push(admission(1, 0, 4), None), ForgePushResult::Added);
         assert_eq!(queue.waiting_parallelism_sum(), 4);
         let popped = queue.pop().expect("the head fits both running budgets");
@@ -430,7 +349,7 @@ mod tests {
         assert!(!queue.finish_running((task(99), 0)));
 
         // Strict FIFO across tasks.
-        let mut queue = ForgeCompactionQueue::new(8, 32, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(8, 32);
         for ordinal in 1..=3 {
             assert_eq!(
                 queue.push(admission(ordinal, 0, 2), None),
@@ -445,7 +364,7 @@ mod tests {
         }
 
         // Pending-parallelism capacity refuses without disturbing accounting.
-        let mut queue = ForgeCompactionQueue::new(4, 6, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(4, 6);
         assert_eq!(queue.push(admission(1, 0, 3), None), ForgePushResult::Added);
         assert_eq!(queue.push(admission(2, 0, 3), None), ForgePushResult::Added);
         assert_eq!(
@@ -454,8 +373,8 @@ mod tests {
         );
         assert_eq!(queue.waiting_parallelism_sum(), 6);
 
-        // Zero parallelism, over-large parallelism, and over-large memory.
-        let mut queue = ForgeCompactionQueue::new(4, 10, 100);
+        // Zero parallelism and over-large parallelism.
+        let mut queue = ForgeCompactionQueue::new(4, 10);
         assert_eq!(
             queue.push(admission(1, 0, 0), None),
             ForgePushResult::RejectedInvalidParallelism
@@ -464,14 +383,10 @@ mod tests {
             queue.push(admission(2, 0, 5), None),
             ForgePushResult::RejectedTooLarge
         );
-        assert_eq!(
-            queue.push(sized(3, 101), None),
-            ForgePushResult::RejectedTooLarge
-        );
         assert_eq!(queue.waiting_parallelism_sum(), 0);
 
         // Duplicate keys refuse; a different plan index of the same task does not.
-        let mut queue = ForgeCompactionQueue::new(8, 32, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(8, 32);
         assert_eq!(queue.push(admission(1, 0, 3), None), ForgePushResult::Added);
         assert_eq!(
             queue.push(admission(1, 0, 5), None),
@@ -492,8 +407,7 @@ mod tests {
     /// Budget pressure blocks the head rather than letting a smaller plan pass.
     ///
     /// Running parallelism, a whole-worker plan, out-of-order finishes across
-    /// one task's plans, cancellation of only the waiting siblings, and the
-    /// deliberate exemption of waiting memory from the running bound are all
+    /// one task's plans, and cancellation of only the waiting siblings are all
     /// admission-order properties: none of them may reorder the queue.
     ///
     /// # Panics
@@ -503,7 +417,7 @@ mod tests {
     #[test]
     fn queue_capacity_pressure_never_reorders_admission() {
         // Head-of-line blocking on running parallelism.
-        let mut queue = ForgeCompactionQueue::new(8, 32, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(8, 32);
         assert_eq!(queue.push(admission(1, 0, 6), None), ForgePushResult::Added);
         assert_eq!(queue.push(admission(2, 0, 4), None), ForgePushResult::Added);
         assert_eq!(queue.pop().expect("head fits").admission.task_id, task(1));
@@ -515,7 +429,7 @@ mod tests {
         );
 
         // A plan sized to the whole worker is admitted, and blocks the rest.
-        let mut queue = ForgeCompactionQueue::new(4, 4, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(4, 4);
         assert_eq!(queue.push(admission(1, 0, 4), None), ForgePushResult::Added);
         assert_eq!(
             queue.push(admission(2, 0, 1), None),
@@ -533,7 +447,7 @@ mod tests {
         assert!(queue.pop().is_none(), "no running parallelism remains");
 
         // Several plans of one task are independent and finish out of order.
-        let mut queue = ForgeCompactionQueue::new(10, 30, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(10, 30);
         assert_eq!(queue.push(admission(1, 0, 3), None), ForgePushResult::Added);
         assert_eq!(queue.push(admission(1, 1, 4), None), ForgePushResult::Added);
         assert_eq!(queue.push(admission(1, 2, 2), None), ForgePushResult::Added);
@@ -551,7 +465,7 @@ mod tests {
         assert_eq!(queue.running_parallelism_sum(), 0);
 
         // Cancellation removes only waiting siblings.
-        let mut queue = ForgeCompactionQueue::new(10, 30, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(10, 30);
         assert_eq!(queue.push(admission(1, 0, 3), None), ForgePushResult::Added);
         assert_eq!(queue.push(admission(1, 1, 4), None), ForgePushResult::Added);
         assert_eq!(queue.push(admission(2, 0, 2), None), ForgePushResult::Added);
@@ -566,39 +480,8 @@ mod tests {
         assert!(queue.finish_running((task(1), 0)));
         assert_eq!(queue.pop().expect("head fits").admission.task_id, task(2));
 
-        // Waiting memory is uncharged; only running memory bounds the head.
-        let mut queue = ForgeCompactionQueue::new(8, 32, 100);
-        assert_eq!(queue.push(sized(1, 80), None), ForgePushResult::Added);
-        queue.pop().expect("the first plan fits the empty budget");
-        assert_eq!(queue.running_memory_reservation_bytes(), 80);
-        assert_eq!(
-            queue.push(sized(2, 60), None),
-            ForgePushResult::Added,
-            "a waiting plan is not charged memory, so it is admitted"
-        );
-        assert!(queue.pop().is_none(), "but it cannot run beside the first");
-        assert!(queue.finish_running((task(1), 0)));
-        assert_eq!(
-            queue.pop().expect("memory freed").admission.task_id,
-            task(2)
-        );
-
-        // Memory head-of-line blocking preserves FIFO rather than skipping ahead.
-        let mut queue = ForgeCompactionQueue::new(8, 32, 100);
-        assert_eq!(queue.push(sized(1, 60), None), ForgePushResult::Added);
-        queue.pop().expect("the first plan fits");
-        assert_eq!(queue.push(sized(2, 50), None), ForgePushResult::Added);
-        assert_eq!(queue.push(sized(3, 40), None), ForgePushResult::Added);
-        assert!(
-            queue.pop().is_none(),
-            "the smaller third plan must not bypass the blocked head"
-        );
-        assert!(queue.finish_running((task(1), 0)));
-        assert_eq!(queue.pop().expect("head fits").admission.task_id, task(2));
-        assert_eq!(queue.pop().expect("tail fits").admission.task_id, task(3));
-
         // An empty queue is inert.
-        let mut queue = ForgeCompactionQueue::new(8, 32, usize::MAX);
+        let mut queue = ForgeCompactionQueue::new(8, 32);
         assert!(queue.pop().is_none());
         assert!(!queue.finish_running((task(1), 0)));
         assert_eq!(queue.waiting_parallelism_sum(), 0);

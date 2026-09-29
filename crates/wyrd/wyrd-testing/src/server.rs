@@ -36,8 +36,8 @@ use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
-    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, MIN_UNMANAGED_RESERVE_BYTES,
-    ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
+    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+    SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -88,10 +88,9 @@ use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    grant_role_to_service_account, grant_role_to_user, insert_api_key,
-    insert_service_account, insert_user, provision_system_principal,
-    revoke_role_from_service_account, revoke_role_from_user, role_by_name, trusted_issuer_by_url,
-    workload_binding_by_subject,
+    grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_service_account,
+    insert_user, provision_system_principal, revoke_role_from_service_account,
+    revoke_role_from_user, role_by_name, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_storage::{BackendConfig, StorageSettings};
 
@@ -116,22 +115,12 @@ const AUDIT_INSPECTION_PRINCIPAL: Uuid = Uuid::from_u128(0x0AD1_7000_0000_0000_0
 /// The retained read-decision operation every Bifrost read commits.
 const READ_DECISION: &str = "bifrost.query.read_decision";
 
-/// Default Forge compaction budget a harness node carrying a Forge role names.
-///
-/// The production default is four fifths of the memory limit and deliberately
-/// does not clamp, so a co-located harness whose Scribe and Oracle floors are
-/// also protected must name a budget that fits the remainder — exactly as a
-/// co-located deployment configures one. The constant is public because a test
-/// that pins two Oracle replicas to one durable admission ceiling has to
-/// subtract the same reservation the Forge-carrying replica takes.
-pub const HARNESS_FORGE_COMPACTION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-
 /// Memory limit a harness node observes when a test injects no snapshot.
 ///
 /// Every node in a test cluster is carved from the same fixed observation, so
 /// role placement is the only thing that moves a node's derived plan. The
 /// constant is public because a test that pins two Oracle replicas to one
-/// durable admission ceiling has to name the limit it sheds role floors from.
+/// durable admission ceiling has to name the limit its shared cap derives from.
 pub const HARNESS_NODE_MEMORY_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Separates a serve-task join failure from the server's own terminal outcome.
@@ -443,8 +432,6 @@ pub struct WyrdTestServerBuilder {
     /// A journey that proves queue or total-deadline expiry states short
     /// limits rather than waiting out the hour-scale production defaults.
     oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
-    /// Forge compaction budget replacing the harness default on this node.
-    forge_compaction_memory_limit_bytes: Option<usize>,
     /// Process-installed production telemetry guard shared by every node.
     telemetry: Option<Arc<TelemetryGuard>>,
     /// Optional fixed HTTP/gRPC addresses used for truthful peer advertisement.
@@ -586,7 +573,6 @@ impl Default for WyrdTestServerBuilder {
             system_resources: None,
             oracle_query_slot_limit: None,
             oracle_runtime: None,
-            forge_compaction_memory_limit_bytes: None,
             telemetry: None,
             bind_addrs: None,
             peer_tls: None,
@@ -4013,8 +3999,8 @@ impl WyrdTestServerBuilder {
 
     /// Injects complete process-visible resources into the production bootstrap.
     ///
-    /// Tests vary raw observations through this seam; all reserve, floor,
-    /// elastic, lease, and partition calculations remain production-owned.
+    /// Tests vary raw observations through this seam; all server-minimum,
+    /// shared-cap, lease, and partition calculations remain production-owned.
     #[must_use]
     pub(crate) fn with_system_resources_for_test(
         mut self,
@@ -4048,17 +4034,6 @@ impl WyrdTestServerBuilder {
         config: wyrd_server::config::OracleRuntimeConfig,
     ) -> Self {
         self.oracle_runtime = Some(config);
-        self
-    }
-
-    /// Names the Forge compaction budget this node admits plans against.
-    ///
-    /// The harness default is sized for the small tables most fixtures compact.
-    /// A journey that compacts production-sized inputs states the budget its
-    /// pod was sized for here, exactly as a deployment configures one.
-    #[must_use]
-    pub(crate) fn with_forge_compaction_memory_limit_for_test(mut self, bytes: usize) -> Self {
-        self.forge_compaction_memory_limit_bytes = Some(bytes);
         self
     }
 
@@ -4287,59 +4262,16 @@ impl WyrdTestServerBuilder {
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         });
-        // The formula's default (four fifths of the memory limit) deliberately
-        // does not clamp, so a co-located harness whose Scribe and Oracle floors
-        // are also protected must name a budget that fits the remainder —
-        // exactly as a co-located deployment configures one.
-        let forge_budget_bytes = self
-            .bifrost_roles
-            .iter()
-            .any(|role| {
-                matches!(
-                    role,
-                    BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker
-                )
-            })
-            .then(|| {
-                self.forge_compaction_memory_limit_bytes.unwrap_or_else(|| {
-                    // The default is sized for the tables most fixtures
-                    // compact, but a small pod still has to leave elastic
-                    // memory for the Scribe and Oracle work beside it, so the
-                    // remainder left by the protected floors halves it.
-                    let protected = self
-                        .bifrost_roles
-                        .iter()
-                        .filter(|role| {
-                            matches!(
-                                role,
-                                BifrostRuntimeRole::Scribe | BifrostRuntimeRole::Oracle
-                            )
-                        })
-                        .count()
-                        * ROLE_MEMORY_FLOOR_BYTES;
-                    let safe = snapshot
-                        .memory_limit_bytes
-                        .saturating_sub(MIN_UNMANAGED_RESERVE_BYTES)
-                        .saturating_sub(protected);
-                    HARNESS_FORGE_COMPACTION_BUDGET_BYTES.min(safe / 2)
-                })
-            });
         let runtime_resources =
             BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
                 snapshot,
                 BifrostResourcePolicy {
                     roles: resource_roles,
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
+                    server_memory_min_bytes: None,
+                    bifrost_memory_limit_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: self.oracle_query_slot_limit,
-                    // The formula's default (four fifths of the memory limit)
-                    // deliberately does not clamp, so a co-located harness whose
-                    // Scribe and Oracle floors are also protected must name a
-                    // budget that fits the remainder — exactly as a co-located
-                    // deployment configures one.
-                    forge_compaction_memory_limit_bytes: forge_budget_bytes,
                     scratch_root,
                     volume_roots,
                 },
@@ -5368,7 +5300,7 @@ mod production_composition_tests {
     /// Injected raw observations reach production composition unmodified.
     ///
     /// The harness supplies only raw process-visible observations and the
-    /// enabled roles. Every reserve, floor, elastic, scratch, and partition
+    /// enabled roles. Every server-minimum, shared-cap, scratch, and partition
     /// number the booted server holds must therefore equal the plan
     /// [`BifrostRuntimeResources`] derives from the same observation, proving
     /// the harness derives no allocator output of its own.
@@ -5389,12 +5321,11 @@ mod production_composition_tests {
                 roles: [vala_bifrost_redux::resources::BifrostRole::Oracle]
                     .into_iter()
                     .collect(),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: None,
+                server_memory_min_bytes: None,
+                bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                forge_compaction_memory_limit_bytes: None,
                 scratch_root: scratch.path().to_owned(),
                 volume_roots: None,
             },

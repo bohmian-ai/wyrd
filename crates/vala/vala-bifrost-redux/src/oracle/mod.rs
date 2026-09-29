@@ -1915,23 +1915,24 @@ impl Oracle {
         });
         // Both owners are required together: the authority proves a stage
         // operation, and the peer identity is the only way to deliver one.
-        let analytical = config
-            .stage_authority
-            .zip(config.peer_tls)
-            .map(|(authority, peer_tls)| {
-                compose_analytical_handle(AnalyticalCompositionInputs {
-                    authority,
-                    peer_tls,
-                    node_id: admission.local_role.key.node_id,
-                    fence: admission.local_role.fencing_token,
-                    catalog: Arc::clone(&config.catalog),
-                    audit: Arc::clone(&config.audit),
-                    reader_authority: Arc::clone(&reader_authority),
-                    reservations: Arc::clone(&config.reservations),
-                    peer_transports: config.peer_transports.as_ref().map(Arc::clone),
-                    spill: Arc::clone(&config.spill_runtime),
-                })
-            });
+        let analytical =
+            config
+                .stage_authority
+                .zip(config.peer_tls)
+                .map(|(authority, peer_tls)| {
+                    compose_analytical_handle(AnalyticalCompositionInputs {
+                        authority,
+                        peer_tls,
+                        node_id: admission.local_role.key.node_id,
+                        fence: admission.local_role.fencing_token,
+                        catalog: Arc::clone(&config.catalog),
+                        audit: Arc::clone(&config.audit),
+                        reader_authority: Arc::clone(&reader_authority),
+                        reservations: Arc::clone(&config.reservations),
+                        peer_transports: config.peer_transports.as_ref().map(Arc::clone),
+                        spill: Arc::clone(&config.spill_runtime),
+                    })
+                });
         Ok(Self {
             planner,
             admission,
@@ -5574,7 +5575,7 @@ mod tests {
                 .unwrap_or_default()
         };
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * 1024 * 1024,
+            512 * 1024 * 1024,
             8 * 1024 * 1024 * 1024,
             [crate::resources::BifrostRole::Oracle],
         );

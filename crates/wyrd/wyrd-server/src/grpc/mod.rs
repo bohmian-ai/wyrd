@@ -111,10 +111,9 @@ impl GrpcFirstFrame {
     /// Returns the first message's declared payload size, when it is knowable.
     ///
     /// `None` means the body ended before a complete header, which is a legal
-    /// empty body, or the message is compressed. A compressed frame declares
-    /// its *compressed* length, which would under-bound the decompressed body,
-    /// so it is treated as unknown rather than admitted against a lease that is
-    /// too small.
+    /// empty body. A compressed frame declares its encoded length, which is
+    /// exactly the transport bytes this edge retains; decompression is bounded
+    /// separately by tonic's decode limit.
     ///
     /// # Errors
     ///
@@ -125,8 +124,7 @@ impl GrpcFirstFrame {
             return Ok(None);
         }
         match self.header[0] {
-            0 => {}
-            1 => return Ok(None),
+            0 | 1 => {}
             _ => return Err(FirstFrameError::MalformedFlag),
         }
         let length: [u8; 4] = self.header[1..GRPC_FRAME_HEADER_BYTES]
@@ -309,11 +307,7 @@ where
                 .into_status()
                 .into_http());
             }
-            let lease = declared.map_or_else(
-                || admission.try_acquire_unknown(),
-                |bytes| admission.try_acquire(bytes),
-            );
-            let _lease = match lease {
+            let _lease = match admission.try_acquire(declared.unwrap_or(0)) {
                 Ok(lease) => lease,
                 Err(_) => {
                     return Ok(Status::resource_exhausted(

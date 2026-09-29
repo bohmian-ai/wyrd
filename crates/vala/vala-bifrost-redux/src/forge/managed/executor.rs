@@ -4,24 +4,24 @@
 //! owns the single [`ManagedExecutionContext`] every plan of that attempt
 //! shares — the attempt identity, the shared cancellation token, one observer,
 //! and therefore the one [`AttemptLedger`] that numbers every object the
-//! attempt opens. Planning enumerates the complete real plan set and estimates
-//! each plan before anything is admitted, so admission decides against real
-//! figures rather than a synthetic envelope.
+//! attempt opens. Planning enumerates the complete real plan set before
+//! anything is admitted.
 //!
-//! Execution is deliberately unbounded: the context is built with no memory
-//! pool and no spill lease, which selects `DataFusion`'s unbounded pool and no
-//! disk manager. This makes the queue's estimated-memory admission the boundary between
-//! a worker and over-commitment. A hard pool here would turn an admitted plan
-//! into a mid-write failure instead of a plan that was never admitted.
+//! Execution runs against a `DataFusion` pool backed by the one shared Bifrost
+//! governor and a spill lease over the data root's `forge-spill` directory.
+//! Memory is charged as the rewrite's reservations actually grow, not from an
+//! estimate; a refused growth spills or fails the attempt with a typed
+//! resource error, and the attempt's durable task stays unsettled so a retry
+//! replans without publishing anything partial.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use iceberg::spec::Schema;
 use iceberg::table::Table;
 use iceberg_compaction_core::compaction::CompactionPlan;
 use iceberg_compaction_core::managed::{
-    AttemptId, ManagedExecutionContext, NonCommittingCompaction,
+    AttemptId, ManagedExecutionContext, NonCommittingCompaction, SpillLease,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -36,16 +36,10 @@ use super::fingerprint::{
 };
 use super::handoff::RewriteHandoff;
 use super::identity::ForgeOutputIdentity;
-use super::memory::estimate_plan_memory;
 use super::observer::ForgeRewriteObserver;
 use super::policy::ForgeTablePolicy;
 
-/// One planned rewrite and the exact admission terms it was estimated at.
-///
-/// The estimate is computed once, here, from the plan the core produced and the
-/// table's own schema and format version. Recomputing it at admission time
-/// would let a plan be admitted against different figures from the ones it was
-/// planned with.
+/// One planned rewrite and the parallelism it is admitted at.
 #[derive(Debug)]
 pub struct ForgePlannedRewrite {
     /// Planner ordinal, which is also this plan's queue key component.
@@ -54,8 +48,6 @@ pub struct ForgePlannedRewrite {
     pub plan: CompactionPlan,
     /// Execution parallelism the plan recommends.
     pub required_parallelism: u32,
-    /// Estimated peak heap bytes for this plan.
-    pub memory_reservation_bytes: usize,
 }
 
 /// The complete result of planning one attempt, before any admission.
@@ -146,7 +138,13 @@ impl ForgeManagedRewrite {
         cancel: &CancellationToken,
     ) -> Result<Self, ForgeError> {
         let observer = Arc::new(ForgeRewriteObserver::new());
-        let context = unbounded_context_for(attempt_id, cancel, &observer)?;
+        let context = governed_context_for(
+            attempt_id,
+            cancel,
+            &observer,
+            &core.resources,
+            &core.spill_root,
+        )?;
         Ok(Self {
             core,
             binding: binding.clone(),
@@ -167,7 +165,7 @@ impl ForgeManagedRewrite {
         self.attempt_id
     }
 
-    /// Loads the table, enumerates every real plan, and estimates each one.
+    /// Loads the table and enumerates every real plan.
     ///
     /// The core's selection limit is set to `usize::MAX` so its default cap
     /// cannot silently truncate the plan set: deferral is the queue's job, and
@@ -224,21 +222,10 @@ impl ForgeManagedRewrite {
             ),
             policy_fingerprint: policy_fingerprint(&report),
         };
-        let schema: &Schema = table.metadata().current_schema();
-        let format_version = table.metadata().format_version();
-        let requires_sort = policy.sort_order_id != 0;
         let planned = plans
             .into_iter()
             .enumerate()
             .map(|(plan_index, plan)| {
-                let memory_reservation_bytes = estimate_plan_memory(
-                    &plan,
-                    schema,
-                    format_version,
-                    config.execution.max_record_batch_rows,
-                    config.execution.enable_prefetch,
-                    requires_sort,
-                );
                 let required_parallelism = u32::try_from(plan.recommended_executor_parallelism())
                     .map_err(|_| ForgeError::Invariant {
                     detail: format!(
@@ -250,7 +237,6 @@ impl ForgeManagedRewrite {
                     plan_index,
                     plan,
                     required_parallelism,
-                    memory_reservation_bytes,
                 })
             })
             .collect::<Result<Vec<_>, ForgeError>>()?;
@@ -414,24 +400,36 @@ impl ForgeManagedRewrite {
     }
 }
 
-/// Builds the attempt's single unbounded managed execution context.
+/// Builds the attempt's single governed managed execution context.
 ///
-/// No memory pool and no spill lease are supplied, which is the whole point:
-/// the core's builder then selects `DataFusion`'s unbounded pool and leaves the
-/// runtime without a disk manager. Admission keeps a worker inside its budget.
+/// The pool is a fresh view of the one shared Bifrost governor, so every
+/// reservation the rewrite grows is charged to the same cap Scribe, Oracle,
+/// and transport charge, and every byte returns when the attempt's context and
+/// reservations drop. No pool capacity or scratch capacity is named: the
+/// shared cap is the only memory bound, and `forge-spill` keeps `DataFusion`'s
+/// own temp-directory limit. A fresh view per attempt means a failed attempt
+/// releases everything before its retry builds the next one.
 ///
 /// # Errors
 ///
-/// Returns [`ForgeError::Invariant`] when the core cannot build the runtime.
-fn unbounded_context_for(
+/// Returns [`ForgeError::Invariant`] when the spill root is not an existing
+/// directory or the core cannot build the runtime.
+fn governed_context_for(
     attempt_id: Uuid,
     cancel: &CancellationToken,
     observer: &Arc<ForgeRewriteObserver>,
+    resources: &crate::resources::ForgeResources,
+    spill_root: &Path,
 ) -> Result<Arc<ManagedExecutionContext>, ForgeError> {
+    let spill = SpillLease::new(spill_root).map_err(|error| ForgeError::Invariant {
+        detail: format!("Forge spill root is unusable: {error}"),
+    })?;
     ManagedExecutionContext::builder()
         .with_attempt_id(AttemptId::from_uuid(attempt_id))
         .with_cancellation(cancel.clone())
         .with_observer(Arc::clone(observer) as Arc<_>)
+        .with_memory_pool(resources.rewrite_memory_pool(), None)
+        .with_spill_lease(spill)
         .build()
         .map_err(|error| ForgeError::Invariant {
             detail: format!("Forge managed execution context is unusable: {error}"),
@@ -491,7 +489,9 @@ fn total_equality_deletes(plans: &[CompactionPlan]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::super::policy::ForgeTablePolicy;
-    use super::unbounded_context_for;
+    use super::governed_context_for;
+    use crate::resources::{BifrostRole, BifrostRuntimeResources};
+    use datafusion::execution::memory_pool::MemoryConsumer;
     use iceberg_compaction_core::config::{CompactionPlanningConfig, DEFAULT_MAX_SELECTION_PLANS};
     use iceberg_compaction_core::managed::{CandidateIdentity, IdentityAwareSelector};
     use std::sync::Arc;
@@ -604,46 +604,61 @@ mod tests {
         );
     }
 
-    /// The attempt's context executes unbounded and spills nowhere.
+    /// The attempt's pool charges the shared root and releases on cancel.
     ///
-    /// Forge admits plans by estimate, so the executing runtime must not also
-    /// impose a hard ceiling: a bounded pool would convert an admitted plan
-    /// into a mid-write resource failure, and a disk manager would reintroduce
-    /// the scratch dependency this design removed. Both facts are read from the
-    /// runtime the core actually built.
+    /// The rewrite runtime's pool is a view of the one Bifrost governor: its
+    /// growth appears as Forge-attributed governed memory, it is refused at
+    /// the shared cap, and cancelling the attempt and dropping its context
+    /// returns every byte. The disk manager spills into the leased root.
     ///
     /// # Panics
     ///
-    /// Panics when the context cannot be built, when its pool reports a bound,
-    /// or when its runtime has a temp-directory limit.
+    /// Panics when the context cannot be built, when growth is not charged to
+    /// the shared root, when the cap does not refuse, or when cancellation and
+    /// drop leave bytes behind.
     #[test]
-    fn unbounded_context_has_no_disk_manager() {
-        let context = unbounded_context_for(
+    fn rewrite_pool_charges_root_and_releases_on_cancel() {
+        const MIB: usize = 1024 * 1024;
+        let roles = BifrostRuntimeResources::composed_for_test(
+            64 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Forge],
+        );
+        let forge = roles.forge().expect("Forge capability");
+        let spill = tempfile::tempdir().expect("spill root");
+        let cancel = CancellationToken::new();
+        let context = governed_context_for(
             Uuid::new_v4(),
-            &CancellationToken::new(),
+            &cancel,
             &Arc::new(super::ForgeRewriteObserver::new()),
+            &forge,
+            spill.path(),
         )
-        .expect("the unbounded managed context builds");
+        .expect("the governed managed context builds");
         let runtime = context.runtime_env();
+        let spill_dirs = runtime.disk_manager.temp_dir_paths();
         assert!(
-            matches!(
-                runtime.memory_pool.memory_limit(),
-                datafusion::execution::memory_pool::MemoryLimit::Infinite
-            ),
-            "an admitted plan executes against DataFusion's unbounded pool"
+            !spill_dirs.is_empty() && spill_dirs.iter().all(|dir| dir.starts_with(spill.path())),
+            "spills land beneath the leased forge-spill root, saw {spill_dirs:?}"
         );
+        let reservation = MemoryConsumer::new("forge-rewrite").register(&runtime.memory_pool);
+        reservation
+            .try_grow(48 * MIB)
+            .expect("growth under the cap");
+        let charged = roles.snapshot().expect("charged snapshot");
+        assert_eq!(charged.forge_memory_used_bytes, 48 * MIB);
+        assert_eq!(charged.governed_memory_used_bytes, 48 * MIB);
         assert!(
-            runtime.disk_manager.temp_dir_paths().is_empty(),
-            "no spill directory is registered, so no Forge scratch is required"
+            reservation.try_grow(32 * MIB).is_err(),
+            "the shared cap, not a Forge budget, refuses growth"
         );
-        assert_eq!(
-            context.pool_capacity_bytes(),
-            None,
-            "the context leases no bounded pool capacity"
-        );
-        assert!(
-            context.spill().is_none(),
-            "the context leases no scratch root"
-        );
+        cancel.cancel();
+        assert!(context.is_cancelled());
+        drop(reservation);
+        drop(context);
+        let released = roles.snapshot().expect("released snapshot");
+        assert_eq!(released.forge_memory_used_bytes, 0);
+        assert_eq!(released.governed_memory_used_bytes, 0);
+        assert!(roles.health().reason().is_none());
     }
 }

@@ -5130,7 +5130,7 @@ mod tests {
     async fn shutdown_drains_cohorts_and_incremental_producers() {
         const MIB: usize = 1024 * 1024;
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * MIB,
+            512 * MIB,
             512 * MIB as u64,
             [crate::resources::BifrostRole::Scribe],
         );
@@ -6688,7 +6688,11 @@ mod tests {
         batch_ids: &[uuid::Uuid],
     ) -> (
         Vec<PreparedAppend>,
-        Vec<tokio::sync::oneshot::Receiver<Result<crate::scribe::preprocess::DurableCompletion, ScribeError>>>,
+        Vec<
+            tokio::sync::oneshot::Receiver<
+                Result<crate::scribe::preprocess::DurableCompletion, ScribeError>,
+            >,
+        >,
     ) {
         batch_ids
             .iter()

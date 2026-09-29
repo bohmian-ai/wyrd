@@ -3505,50 +3505,31 @@ async fn coordinator_preseeded_demand_requires_roster_discovery() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// A real boot reserves a usable compaction budget only for a Forge process.
+/// A real boot composes Forge only for a Forge process.
 ///
-/// The budget is decided during composition, against the same Postgres-backed
-/// graph the worker later admits plans on, so the only place it can be observed
-/// as the worker sees it is a booted server. Two facts are asserted there: a
-/// Forge process reserves a positive budget that leaves both protected floors
-/// intact, and a process without the Forge role composes no Forge at all — so
-/// there is no admitting worker charging memory it never reserved.
+/// Composition runs against the same Postgres-backed graph the worker later
+/// admits plans on, so a booted server is where it is observed: the default
+/// target composes a Forge coordinator, and a process without the Forge role
+/// composes no Forge at all.
 ///
 /// # Panics
 ///
-/// Panics when either server fails to boot, when the composed budget is zero or
-/// exceeds what the floors leave, or when a Forge-absent target still composes
-/// a Forge.
+/// Panics when either server fails to boot, when the default target composes
+/// no Forge, or when a Forge-absent target still composes one.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn forge_budget_and_runtime_compose_with_postgres() {
+async fn forge_runtime_composes_only_for_forge_targets() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let plan = server
-        .state()
-        .forge()
-        .and_then(|forge| forge.coordinator())
-        .expect("the default target selects Forge")
-        .resource_plan_for_test();
-
     assert!(
-        plan.forge_compaction_memory_limit_bytes > 0,
-        "a booted Forge process must reserve memory it can admit plans against"
+        server
+            .state()
+            .forge()
+            .and_then(|forge| forge.coordinator())
+            .is_some(),
+        "the default target selects Forge"
     );
-    let safe = plan.managed_memory_bytes - plan.scribe_floor_bytes - plan.oracle_floor_bytes;
-    assert!(
-        plan.forge_compaction_memory_limit_bytes <= safe,
-        "the reserved budget must leave both co-located floors intact"
-    );
-    vala_bifrost_redux::forge::ForgeWorkerConfig {
-        per_tenant_active_cap: 1,
-        compaction_memory_budget_bytes: plan.forge_compaction_memory_limit_bytes,
-        max_task_parallelism: 3,
-        pending_task_parallelism: 12,
-    }
-    .validate()
-    .expect("the composed budget yields usable admission bounds");
 
     server.shutdown().await.expect("server shuts down");
 

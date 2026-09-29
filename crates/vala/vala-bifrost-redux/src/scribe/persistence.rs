@@ -3014,7 +3014,7 @@ mod tests {
     async fn producer_admission_is_fifo_cancellation_safe_and_starvation_free() {
         const MIB: usize = 1024 * 1024;
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * MIB,
+            512 * MIB,
             512 * MIB as u64,
             [crate::resources::BifrostRole::Scribe],
         );
@@ -3079,7 +3079,7 @@ mod tests {
     async fn two_candidate_encodes_overlap_and_large_candidate_waits() {
         const MIB: usize = 1024 * 1024;
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * MIB,
+            512 * MIB,
             512 * MIB as u64,
             [crate::resources::BifrostRole::Scribe],
         );
@@ -3295,7 +3295,7 @@ mod tests {
         ) -> crate::resources::BifrostRuntimeResources {
             crate::resources::BifrostRuntimeResources::from_snapshot(
                 crate::resources::SystemResourceSnapshot {
-                    memory_limit_bytes: 1024 * 1024 * 1024,
+                    memory_limit_bytes: 2 * 1024 * 1024 * 1024,
                     effective_cpu: 2,
                     scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
                     scratch_available_bytes: 2 * 1024 * 1024 * 1024,
@@ -3306,12 +3306,11 @@ mod tests {
                     roles: std::collections::BTreeSet::from([
                         crate::resources::BifrostRole::Scribe,
                     ]),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
+                    server_memory_min_bytes: None,
+                    bifrost_memory_limit_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: None,
-                    forge_compaction_memory_limit_bytes: None,
                     scratch_root: scratch_root.to_owned(),
                     volume_roots: Some(crate::resources::BifrostVolumeRoots {
                         wal: wal_root.to_owned(),

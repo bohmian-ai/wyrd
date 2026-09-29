@@ -2993,12 +2993,12 @@ mod tests {
         let journey = child::pod_system_resources(ProcessNodeTarget::All, None);
         assert_eq!(
             (journey.effective_cpu, journey.memory_limit_bytes),
-            (4, 2 << 30),
-            "the journey constructor keeps its 4-CPU/2-GiB snapshot"
+            (4, 3 << 30),
+            "the journey constructor keeps its 4-CPU/3-GiB snapshot"
         );
         assert_eq!(
             child::pod_system_resources(ProcessNodeTarget::Oracle, None).memory_limit_bytes,
-            512 << 20
+            1280 << 20
         );
         let benchmark = child::pod_system_resources(ProcessNodeTarget::All, Some(bytes));
         assert_eq!(

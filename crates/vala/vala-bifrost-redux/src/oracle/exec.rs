@@ -3989,12 +3989,11 @@ mod tests {
                 roles: [crate::resources::BifrostRole::Oracle]
                     .into_iter()
                     .collect(),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: Some(256 * 1024 * 1024),
+                server_memory_min_bytes: None,
+                bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: Some(1024 * 1024 * 1024),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                forge_compaction_memory_limit_bytes: None,
                 scratch_root: std::env::temp_dir(),
                 volume_roots: None,
             },
@@ -4104,7 +4103,7 @@ mod tests {
     ) {
         let snapshot = roles.snapshot().expect("root snapshot");
         assert_eq!(snapshot.oracle_memory_used_bytes, 0);
-        assert_eq!(snapshot.elastic_memory_used_bytes, 0);
+        assert_eq!(snapshot.governed_memory_used_bytes, 0);
         assert_eq!(query_pool.reserved(), 0);
     }
 
@@ -5169,7 +5168,7 @@ mod tests {
             governor
                 .snapshot()
                 .expect("root snapshot")
-                .elastic_memory_used_bytes,
+                .governed_memory_used_bytes,
             0
         );
         assert_eq!(query_pool.reserved(), 0);
@@ -6917,7 +6916,10 @@ mod tests {
                 crate::resources::bounded_memory_pool(64 * 1024 * 1024),
                 crate::oracle::bindings::OracleExecutionGrant::for_test(
                     QueryClass::Interactive,
-                    oracle_memory_resources(&oracle_test_roles(1024 * 1024 * 1024), 1024 * 1024),
+                    oracle_memory_resources(
+                        &oracle_test_roles(2 * 1024 * 1024 * 1024),
+                        1024 * 1024,
+                    ),
                     Arc::new(OracleTelemetry::new()),
                 ),
             ),

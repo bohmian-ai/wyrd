@@ -799,8 +799,10 @@ pub(crate) struct PromotionIntegrationFixture {
     pub(crate) binding: TenantTableBinding,
     /// Validated Forge limits every supervised pair is built with.
     pub(crate) config: ForgeConfig,
-    /// Boot resource plan every supervised Forge owner is built with.
-    resource_plan: vala_bifrost_redux::resources::ResourcePlan,
+    /// Forge capability every supervised Forge owner is built with.
+    forge_resources: vala_bifrost_redux::resources::ForgeResources,
+    /// Existing spill directory every supervised Forge owner leases.
+    forge_spill: std::path::PathBuf,
     /// Real Scribe retained so its owned WAL and workers outlive the seals,
     /// and reused by [`PromotionIntegrationFixture::seal_more`] to publish
     /// further hot objects through the same writer.
@@ -923,7 +925,9 @@ impl PromotionIntegrationFixture {
 
         let roles = fixture_roles(scratch_root.path(), wal_root.path());
         let scribe_resources = roles.scribe().expect("fixture Scribe capability");
-        let resource_plan = roles.plan();
+        let forge_resources = roles.forge().expect("fixture Forge capability");
+        let forge_spill = scratch_root.path().join("forge-spill");
+        std::fs::create_dir_all(&forge_spill).expect("fixture Forge spill root");
 
         let scribe = start_scribe(
             &database,
@@ -961,7 +965,8 @@ impl PromotionIntegrationFixture {
             tenant,
             binding,
             config: ForgeConfig::default(),
-            resource_plan,
+            forge_resources,
+            forge_spill,
             scribe,
             database,
             _warehouse: warehouse,
@@ -1049,7 +1054,8 @@ impl PromotionIntegrationFixture {
             staging_file_channel(self.config.max_hints_per_wake).expect("fixture hint capacity");
         Arc::new(
             Forge::new(ForgeBuildConfig {
-                resource_plan: self.resource_plan,
+                resources: self.forge_resources.clone(),
+                spill_root: self.forge_spill.clone(),
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
@@ -2410,12 +2416,11 @@ fn fixture_roles(
             roles: [BifrostRole::Scribe, BifrostRole::Forge]
                 .into_iter()
                 .collect(),
-            memory_limit_bytes: None,
-            unmanaged_reserve_bytes: None,
+            server_memory_min_bytes: None,
+            bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
-            forge_compaction_memory_limit_bytes: None,
             scratch_root: scratch_root.to_owned(),
             volume_roots: Some(BifrostVolumeRoots {
                 wal: wal_root.to_owned(),

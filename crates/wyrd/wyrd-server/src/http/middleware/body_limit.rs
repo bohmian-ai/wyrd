@@ -131,23 +131,14 @@ where
                 return Ok(WyrdErrorResponse::from(error).into_response());
             }
 
-            let _transport_lease = if let Some(admission) = admission {
-                let acquired = declared_bytes.map_or_else(
-                    || admission.try_acquire_unknown(),
-                    |bytes| admission.try_acquire(bytes),
-                );
-                match acquired {
+            // A declared length is charged before a byte is buffered; an
+            // undeclared body is charged its exact collected length below.
+            let mut transport_lease = match (&admission, declared_bytes) {
+                (Some(admission), Some(bytes)) => match admission.try_acquire(bytes) {
                     Ok(lease) => Some(lease),
-                    Err(error) => {
-                        let error = WyrdError::ServiceUnavailable {
-                            message: "request body capacity is occupied".to_owned(),
-                            details: serde_json::json!({ "reason": error.to_string() }),
-                        };
-                        return Ok(WyrdErrorResponse::from(error).into_response());
-                    }
-                }
-            } else {
-                None
+                    Err(error) => return Ok(transport_occupied(&error)),
+                },
+                _ => None,
             };
 
             // Collect body into memory, capping at max_bytes + 1 via Limited.
@@ -167,8 +158,18 @@ where
                         };
                         return Ok(WyrdErrorResponse::from(error).into_response());
                     }
+                    if let Some(admission) =
+                        admission.as_ref().filter(|_| transport_lease.is_none())
+                    {
+                        match admission.try_acquire(bytes.len()) {
+                            Ok(lease) => transport_lease = Some(lease),
+                            Err(error) => return Ok(transport_occupied(&error)),
+                        }
+                    }
                     let request = Request::from_parts(parts, Body::from(bytes));
-                    inner.call(request).await.map_err(Into::into)
+                    let response = inner.call(request).await.map_err(Into::into);
+                    drop(transport_lease);
+                    response
                 }
                 Err(error) if error.is::<LengthLimitError>() => {
                     let error = WyrdError::PayloadTooLarge {
@@ -193,6 +194,15 @@ where
             }
         })
     }
+}
+
+/// Maps a refused transport charge to the typed occupied-capacity response.
+fn transport_occupied(error: &vala_bifrost_redux::resources::BifrostResourceError) -> Response {
+    let error = WyrdError::ServiceUnavailable {
+        message: "request body capacity is occupied".to_owned(),
+        details: serde_json::json!({ "reason": error.to_string() }),
+    };
+    WyrdErrorResponse::from(error).into_response()
 }
 
 /// Convenience constructor for use in `Router::layer` composition.
@@ -233,20 +243,21 @@ mod tests {
             .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("first maximum message");
         let second = admission
-            .try_acquire_unknown()
-            .expect("unknown HTTP body reaches exact aggregate boundary");
+            .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
+            .expect("second maximum message reaches the shared cap");
         assert!(admission.try_acquire(1).is_err());
         drop((first, second));
         assert_eq!(admission.used_bytes(), 0);
     }
 
-    /// An HTTP/2-style body without a length reserves pessimistically before collection.
+    /// An HTTP/2-style body without a length is charged its exact collected
+    /// bytes, and a full shared cap refuses it before the handler runs.
     ///
     /// # Panics
     ///
     /// Panics when the in-memory request service unexpectedly errors.
     #[tokio::test]
-    async fn bifrost_transport_admission_pessimistically_rejects_unknown_http2_body() {
+    async fn bifrost_transport_admission_charges_collected_unknown_http2_body() {
         let admission = BifrostTransportAdmission::for_tests();
         let first = admission
             .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)

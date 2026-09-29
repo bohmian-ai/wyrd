@@ -23,12 +23,6 @@ pub(crate) fn arm_replay_identity_return_failure_for_test() {
     FAIL_REPLAY_IDENTITY_RETURN.with(|failure| failure.set(true));
 }
 
-/// Minimum managed memory accepted by the checked Scribe/Oracle ledger.
-///
-/// The root resource plan removes the unmanaged process reserve before
-/// constructing this ledger. A combined process therefore needs exactly two
-/// 256 MiB role floors beneath this 512 MiB managed minimum.
-pub const MIN_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 /// Exact encoded-footer child held from before writer creation through inspection.
 pub(crate) const PARQUET_FOOTER_CHILD_BYTES: usize = 8 * 1024 * 1024;
 /// Bounded transfer buffer held while `OpenDAL` owns one payload copy.

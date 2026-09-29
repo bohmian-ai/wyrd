@@ -1328,28 +1328,26 @@ impl BifrostStorageIoConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostResourceConfig {
-    /// Optional process memory cap; detection may select a tighter bound.
+    /// Optional lower cap on the one shared Bifrost memory budget.
+    ///
+    /// Unset, the cap is the detected process memory limit less
+    /// [`Self::server_memory_min_bytes`]. A value may only lower that figure;
+    /// boot refuses zero or anything above it rather than clamping.
     #[serde(default)]
     pub memory_limit_bytes: Option<usize>,
-    /// Optional unmanaged process reserve, never below 256 MiB.
+    /// Minimum process memory left to non-Bifrost server work, in bytes.
+    ///
+    /// Defaults to 1 GiB and may only rise. It is accounting headroom, not a
+    /// reservation or a server cap; boot refuses a value below the default or
+    /// one that leaves Bifrost no memory.
     #[serde(default)]
-    pub unmanaged_reserve_bytes: Option<usize>,
+    pub server_memory_min_bytes: Option<usize>,
     /// Optional disposable scratch cap; filesystem availability may be tighter.
     #[serde(default)]
     pub scratch_limit_bytes: Option<u64>,
     /// Optional effective CPU cap; process/cgroup affinity may be tighter.
     #[serde(default)]
     pub effective_cpu: Option<usize>,
-    /// Optional explicit Forge compaction memory budget for this node, in bytes.
-    ///
-    /// When unset the plan derives four fifths of the resolved process memory
-    /// limit. An explicit value replaces that default outright: it is a capacity
-    /// decision, not a detected bound, so it may raise as well as lower the
-    /// derived figure. Boot refuses a Forge-enabled process whose selected
-    /// budget is zero or exceeds the memory left by the protected Scribe and
-    /// Oracle floors; there is no clamp.
-    #[serde(default)]
-    pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional Oracle query slot-unit concurrency limit for this node.
     ///
     /// Unlike the caps above this is a capacity decision rather than a detected
@@ -1357,6 +1355,33 @@ pub struct BifrostResourceConfig {
     /// derives twice effective CPU, never below the portable slot-unit floor.
     #[serde(default)]
     pub oracle_query_slot_limit: Option<usize>,
+}
+
+impl BifrostResourceConfig {
+    /// Projects these operator settings onto the checked resource policy.
+    ///
+    /// This is the only translation from server configuration to Bifrost
+    /// resource planning, so boot and tests resolve the same shared cap from
+    /// the same fields. Validation happens where the policy meets an
+    /// observation, never here.
+    #[must_use]
+    pub fn policy(
+        &self,
+        roles: std::collections::BTreeSet<vala_bifrost_redux::resources::BifrostRole>,
+        scratch_root: PathBuf,
+        volume_roots: Option<vala_bifrost_redux::resources::BifrostVolumeRoots>,
+    ) -> vala_bifrost_redux::resources::BifrostResourcePolicy {
+        vala_bifrost_redux::resources::BifrostResourcePolicy {
+            roles,
+            server_memory_min_bytes: self.server_memory_min_bytes,
+            bifrost_memory_limit_bytes: self.memory_limit_bytes,
+            scratch_limit_bytes: self.scratch_limit_bytes,
+            effective_cpu: self.effective_cpu,
+            oracle_query_slot_limit: self.oracle_query_slot_limit,
+            scratch_root,
+            volume_roots,
+        }
+    }
 }
 
 /// Derives the dedicated Scribe coordination-runtime worker count.
@@ -2530,9 +2555,9 @@ impl WyrdServerConfig {
             "WYRD_BIFROST_MEMORY_LIMIT_BYTES",
             self.bifrost.resources.memory_limit_bytes,
         )?;
-        self.bifrost.resources.unmanaged_reserve_bytes = parse_optional_env(
-            "WYRD_BIFROST_UNMANAGED_RESERVE_BYTES",
-            self.bifrost.resources.unmanaged_reserve_bytes,
+        self.bifrost.resources.server_memory_min_bytes = parse_optional_env(
+            "WYRD_SERVER_MEMORY_MIN_BYTES",
+            self.bifrost.resources.server_memory_min_bytes,
         )?;
         self.bifrost.resources.scratch_limit_bytes = parse_optional_env(
             "WYRD_BIFROST_SCRATCH_LIMIT_BYTES",
@@ -2545,10 +2570,6 @@ impl WyrdServerConfig {
         self.bifrost.resources.oracle_query_slot_limit = parse_optional_env(
             "WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT",
             self.bifrost.resources.oracle_query_slot_limit,
-        )?;
-        self.bifrost.resources.forge_compaction_memory_limit_bytes = parse_optional_env(
-            "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
-            self.bifrost.resources.forge_compaction_memory_limit_bytes,
         )?;
         self.forge.target_file_size_bytes = parse_optional_env(
             "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
@@ -3520,66 +3541,126 @@ maintenance_interval_secs = 45
         assert!(from_toml_str_with_dev_oracle_opt_in(toml).is_err());
     }
 
-    /// The optional Forge compaction memory budget replaces the deleted
-    /// per-worker executor concurrency knob completely.
+    /// The server memory minimum and the shared Bifrost cap resolve to one
+    /// boot plan or one boot error, and the removed settings have no alias.
     ///
-    /// Three facts travel together because they are one operator-visible
-    /// change. Local compaction parallelism is now the worker's own queue,
-    /// bounded by the node's compaction memory budget, so the budget is what an
-    /// operator sets and that knob no longer exists in any surface:
-    /// not the struct, not TOML, not the environment. `per_tenant_active_cap`
-    /// therefore has nothing to alias and defaults directly to one.
+    /// An 8-GiB observation yields 1-GiB server headroom and a 7-GiB cap by
+    /// default; the file and `WYRD_SERVER_MEMORY_MIN_BYTES` raise the minimum,
+    /// `WYRD_BIFROST_MEMORY_LIMIT_BYTES` lowers the cap, and an impossible
+    /// combination refuses. The deleted unmanaged-reserve and Forge-budget
+    /// settings are rejected by `deny_unknown_fields`, and their environment
+    /// variables change nothing.
     ///
     /// # Panics
     ///
-    /// Panics when the budget does not parse from file or environment, when the
-    /// removed executor knob is still accepted, or when the per-tenant cap does
-    /// not default to one.
+    /// Panics when a combination resolves differently, an impossible one is
+    /// accepted, or a removed setting is still honoured.
     #[test]
-    fn forge_compaction_budget_config_replaces_worker_concurrency() {
+    fn server_memory_minimum_rejects_impossible_plan() {
+        use vala_bifrost_redux::resources::{
+            BifrostResourceError, BifrostRole, BifrostRuntimeResources, ResourceSource,
+            SystemResourceSnapshot,
+        };
+        const GIB: usize = 1024 * 1024 * 1024;
         let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let resolve = |config: &WyrdServerConfig| {
+            BifrostRuntimeResources::from_snapshot(
+                SystemResourceSnapshot {
+                    memory_limit_bytes: 8 * GIB,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: 64 * GIB as u64,
+                    scratch_available_bytes: 64 * GIB as u64,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                },
+                config.bifrost.resources.policy(
+                    [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
+                        .into_iter()
+                        .collect(),
+                    PathBuf::new(),
+                    None,
+                ),
+            )
+            .map(|runtime| {
+                let plan = runtime.plan();
+                (plan.server_memory_min_bytes, plan.managed_memory_bytes)
+            })
+        };
 
-        // Unset: the plan derives the budget, and fairness defaults to one.
         let bare = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
+        assert_eq!(resolve(&bare).expect("default plan"), (GIB, 7 * GIB));
+        let raised = from_toml_str_with_dev_oracle_opt_in(
+            "[bifrost.resources]\nserver_memory_min_bytes = 2147483648\n",
+        )
+        .expect("the minimum parses from the resource section");
         assert_eq!(
-            bare.bifrost.resources.forge_compaction_memory_limit_bytes, None,
-            "an unset budget leaves the derived default to resource planning"
+            resolve(&raised).expect("raised minimum"),
+            (2 * GIB, 6 * GIB)
         );
+
+        temp_env::with_vars(
+            [
+                ("WYRD_SERVER_MEMORY_MIN_BYTES", Some("3221225472")),
+                ("WYRD_BIFROST_MEMORY_LIMIT_BYTES", Some("4294967296")),
+                ("WYRD_BIFROST_UNMANAGED_RESERVE_BYTES", Some("1")),
+                (
+                    "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
+                    Some("1"),
+                ),
+            ],
+            || {
+                let mut config = raised.clone();
+                config
+                    .apply_env_overrides()
+                    .expect("the documented overrides apply and removed ones are inert");
+                assert_eq!(resolve(&config).expect("env plan"), (3 * GIB, 4 * GIB));
+            },
+        );
+
+        for impossible in [
+            "server_memory_min_bytes = 1073741823",
+            "server_memory_min_bytes = 8589934592",
+            "memory_limit_bytes = 0",
+            "memory_limit_bytes = 7516192769",
+        ] {
+            let config = from_toml_str_with_dev_oracle_opt_in(&format!(
+                "[bifrost.resources]\n{impossible}\n"
+            ))
+            .expect("an impossible value still parses");
+            assert!(
+                matches!(
+                    resolve(&config),
+                    Err(BifrostResourceError::InvalidPlan { .. })
+                ),
+                "{impossible} must refuse boot"
+            );
+        }
+        for removed in [
+            "unmanaged_reserve_bytes = 268435456",
+            "forge_compaction_memory_limit_bytes = 268435456",
+        ] {
+            assert!(
+                from_toml_str_with_dev_oracle_opt_in(&format!("[bifrost.resources]\n{removed}\n"))
+                    .is_err(),
+                "{removed} has no alias"
+            );
+        }
+    }
+
+    /// The deleted per-worker executor concurrency knob stays deleted and the
+    /// per-tenant fairness cap defaults directly to one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the removed executor knob is still accepted or the
+    /// per-tenant cap does not default to one.
+    #[test]
+    fn forge_worker_concurrency_knob_stays_removed() {
+        let bare = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
         assert_eq!(
             bare.forge.resolved_per_tenant_active_cap(),
             1,
             "the fairness cap no longer tracks a deleted executor count"
-        );
-
-        // File: the budget is an ordinary optional resource field.
-        let configured = from_toml_str_with_dev_oracle_opt_in(
-            "[bifrost.resources]\nforge_compaction_memory_limit_bytes = 268435456\n",
-        )
-        .expect("the budget parses from the resource section");
-        assert_eq!(
-            configured
-                .bifrost
-                .resources
-                .forge_compaction_memory_limit_bytes,
-            Some(268_435_456)
-        );
-
-        // Environment: the documented override wins over the file value.
-        temp_env::with_vars(
-            [(
-                "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
-                Some("134217728"),
-            )],
-            || {
-                let mut config = configured.clone();
-                config
-                    .apply_env_overrides()
-                    .expect("the budget environment override applies");
-                assert_eq!(
-                    config.bifrost.resources.forge_compaction_memory_limit_bytes,
-                    Some(134_217_728)
-                );
-            },
         );
 
         // The deleted executor knob is not silently tolerated anywhere.
@@ -4906,12 +4987,11 @@ minimum_slots = 2
             memory_limit_bytes: oracle_bytes * 2,
             effective_cpu,
             oracle_query_slot_limit: limit,
-            unmanaged_reserve_bytes: 0,
+            server_memory_min_bytes: oracle_bytes,
             managed_memory_bytes: oracle_bytes,
-            scribe_floor_bytes: 0,
-            oracle_floor_bytes: oracle_bytes,
-            forge_compaction_memory_limit_bytes: 0,
-            elastic_memory_bytes: 0,
+            scribe_enabled: false,
+            oracle_enabled: true,
+            forge_enabled: false,
             scratch_limit_bytes: 0,
         };
         // Memory is generous, so CPU is what bounds concurrency; the ratio is

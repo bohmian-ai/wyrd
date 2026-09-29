@@ -254,11 +254,10 @@ impl CloseoutJourney {
         spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
         spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
         // Only the qualification profile needs an oversized worker pod: its
-        // 512 MiB inputs decode into a working set the admission estimate puts
-        // well past an ordinary pod. The scaled default admits its plans on the
-        // harness default budget.
+        // 512 MiB inputs decode into a working set that would spill heavily
+        // under an ordinary pod's shared cap. The scaled default runs on the
+        // harness default snapshot.
         if profile.production_resources {
-            spec.nodes[1].forge_compaction_memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
             spec.nodes[1].oracle = Some(TestOracleResources {
                 data_root_parent: None,
                 system_resources: Some(SystemResourceSnapshot {
@@ -273,15 +272,10 @@ impl CloseoutJourney {
         }
         if !profile.production_resources {
             // The scaled default runs the same journey on the resource plan
-            // every node reports for itself: no Forge compaction budget and no
-            // injected snapshot anywhere. Each Oracle now derives its own local
+            // every node reports for itself: no injected snapshot anywhere. Each Oracle now derives its own local
             // capacity, so two replicas no longer have to agree on one durable
             // ceiling.
             for node in &spec.nodes {
-                assert_eq!(
-                    node.forge_compaction_memory_limit_bytes, None,
-                    "the fast profile overrides no Forge compaction budget"
-                );
                 assert!(
                     node.oracle
                         .as_ref()

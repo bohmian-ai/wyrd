@@ -11,8 +11,8 @@
 
 pub mod drift;
 pub mod engines;
-pub mod fitter;
 pub mod eval;
+pub mod fitter;
 pub mod health;
 pub mod observations;
 pub mod permits;

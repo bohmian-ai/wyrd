@@ -136,12 +136,15 @@ impl ForgeRoleReadiness {
 
 /// Construction-time dependency graph for one Forge maintenance handle.
 pub struct ForgeBuildConfig {
-    /// Immutable root resource plan this process booted with.
+    /// Forge capability issued by the one process resource composition.
     ///
-    /// Forge reads the plan rather than holding a live root lease: its only
-    /// dynamic memory accounting is the worker-local compaction queue, charged
-    /// against `forge_compaction_memory_limit_bytes`.
-    pub resource_plan: crate::resources::ResourcePlan,
+    /// Every rewrite attempt draws a fresh `DataFusion` pool view from it, so
+    /// rewrite memory is charged to the same shared Bifrost cap as every other
+    /// role rather than to a Forge-local budget.
+    pub resources: crate::resources::ForgeResources,
+    /// Existing directory rewrite operators spill into, the data root's
+    /// `forge-spill` child in production.
+    pub spill_root: std::path::PathBuf,
     /// SQL handle used by tenant-scoped durable Forge transitions.
     pub vala: vala_sql::ValaPostgres,
     /// Cross-tenant operator pool used by discovery and table leases.
@@ -190,8 +193,10 @@ pub struct Forge {
 
 /// Immutable dependency graph shared by one Forge owner.
 pub(crate) struct ForgeCore {
-    /// Immutable root resource plan this process booted with.
-    resource_plan: crate::resources::ResourcePlan,
+    /// Forge capability each rewrite attempt draws its governed pool from.
+    resources: crate::resources::ForgeResources,
+    /// Existing directory rewrite operators spill into.
+    spill_root: std::path::PathBuf,
     /// Vala SQL handle used by tenant-scoped transitions.
     vala: vala_sql::ValaPostgres,
     /// Operator pool used by discovery and lease operations.
@@ -241,7 +246,8 @@ impl Forge {
         }
         build.config.validate()?;
         let core = ForgeCore {
-            resource_plan: build.resource_plan,
+            resources: build.resources,
+            spill_root: build.spill_root,
             vala: build.vala,
             operator_pool: build.operator_pool,
             catalog: build.catalog,
@@ -273,17 +279,6 @@ impl Forge {
     #[must_use]
     pub fn clock_for_test(&self) -> ForgeClock {
         self.core.clock.clone()
-    }
-
-    /// Returns this Forge's narrow resource capability for lifecycle assertions.
-    ///
-    /// The plan is the same immutable calculation the worker admits against,
-    /// so a test can assert the composed Forge budget without gaining the
-    /// ability to construct a sibling governor or a raw pool.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn resource_plan_for_test(&self) -> crate::resources::ResourcePlan {
-        self.core.resource_plan
     }
 
     /// Returns deterministic controls for the expiry commit boundaries.

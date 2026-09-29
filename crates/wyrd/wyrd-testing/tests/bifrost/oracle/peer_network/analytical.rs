@@ -330,8 +330,8 @@ const SORT_INPUT_LOWER_BOUND: u64 = 307_200_000 + 1_200_004 + 2_400_000;
 
 /// Memory ceiling the fixed pod envelope grants one Analytical query.
 ///
-/// 512 MiB process memory less the 256 MiB unmanaged reserve leaves a 256 MiB
-/// Oracle budget, and one Analytical query holding both its slot units is
+/// 1.25 GiB process memory less the 1 GiB server minimum leaves a 256 MiB
+/// shared cap, and one Analytical query holding both its slot units is
 /// granted all of it, clamped to the partition ceiling.
 const QUERY_GRANT_BYTES: u64 = 256 * 1024 * 1024;
 

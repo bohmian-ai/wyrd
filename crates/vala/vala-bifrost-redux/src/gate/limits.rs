@@ -1,13 +1,8 @@
 //! Unary batch bounds.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use crate::resources::BifrostResourceError;
 use num_traits::ToPrimitive;
 
-/// Smallest accounting unit used for transport body ownership.
-pub const BIFROST_TRANSPORT_QUANTUM_BYTES: usize = 64 * 1024;
 /// Default largest single ingest request Scribe plans and reserves for.
 ///
 /// Scribe reserves a crash-replayable envelope for one request of this size and
@@ -73,80 +68,83 @@ impl OtlpWireLimits {
     }
 }
 
-/// Byte-weighted process admission for encoded HTTP and tonic bodies.
+/// Byte-weighted admission for encoded HTTP and tonic bodies.
+///
+/// Transport bodies are Bifrost memory: each lease charges its exact encoded
+/// bytes to the one shared cap Scribe, Oracle, and Forge also charge, and
+/// returns them when the body is consumed, dropped, cancelled, or refused by
+/// decode. The per-message ceiling is a separate, boot-frozen bound checked
+/// before anything is retained.
 #[derive(Debug, Clone)]
 pub struct BifrostTransportAdmission {
-    /// Exact rounded live ownership shared by every transport surface.
-    used: Arc<AtomicUsize>,
-    /// Checked aggregate capacity derived from the process unmanaged-memory plan.
-    capacity: usize,
+    /// The one process governor every transport charge lands in.
+    governor: crate::resources::BifrostResourceGovernor,
     /// Boot-frozen maximum for one declared or decoded message.
     message_limit: usize,
 }
 
 impl BifrostTransportAdmission {
-    /// Constructs transport admission under independently selected message and aggregate bounds.
+    /// Constructs transport admission over the shared process governor.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError::InvalidPlan`] when the selected maximum
-    /// is zero or cannot fit once inside the aggregate encoded-body capacity.
-    pub fn new(
-        limit_bytes: usize,
+    /// is zero or cannot fit once inside the shared Bifrost cap.
+    pub(crate) fn new(
+        governor: crate::resources::BifrostResourceGovernor,
         message_limit_bytes: usize,
     ) -> Result<Self, BifrostResourceError> {
-        let rounded_message_limit = message_limit_bytes
-            .checked_add(BIFROST_TRANSPORT_QUANTUM_BYTES - 1)
-            .map(|bytes| bytes / BIFROST_TRANSPORT_QUANTUM_BYTES * BIFROST_TRANSPORT_QUANTUM_BYTES);
-        if message_limit_bytes == 0
-            || rounded_message_limit.is_none_or(|rounded| rounded > limit_bytes)
-        {
+        let cap = governor.plan().managed_memory_bytes;
+        if message_limit_bytes == 0 || message_limit_bytes > cap {
             return Err(BifrostResourceError::InvalidPlan {
                 detail: format!(
-                    "transport message limit {message_limit_bytes} must fit aggregate capacity {limit_bytes}"
+                    "transport message limit {message_limit_bytes} must be positive and fit \
+                     the {cap}-byte shared Bifrost cap"
                 ),
             });
         }
         Ok(Self {
-            used: Arc::new(AtomicUsize::new(0)),
-            capacity: limit_bytes,
+            governor,
             message_limit: message_limit_bytes,
         })
     }
 
     /// Builds a live admission object for tests that need one without a plan.
     ///
-    /// Every serving path derives both bounds from the resource plan, so this
-    /// exists only so unit tests and test shells can exercise byte-weighted
-    /// admission without a resource observation. The aggregate is sized to hold
+    /// Every serving path derives admission from the resource composition, so
+    /// this exists only so unit tests and test shells can exercise byte-weighted
+    /// admission without a resource observation. The private shared cap holds
     /// exactly two default maximum ingest messages, which is what the boundary
-    /// tests assert against; it is not a production budget and must not be read
-    /// as one.
+    /// tests assert against; it is not a production budget.
     ///
     /// # Panics
     ///
-    /// Panics when the fixed test bounds stop satisfying [`Self::new`], which
-    /// can only happen if the constants below are edited inconsistently.
+    /// Panics when the fixed test observation stops composing, which can only
+    /// happen if the constants below are edited inconsistently.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn for_tests() -> Self {
-        Self::new(
+        crate::resources::BifrostRuntimeResources::composed_for_test(
             2 * BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-            BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+            u64::MAX / 4,
+            [],
         )
-        .expect("fixed test transport bounds are internally consistent")
+        .transport_admission()
     }
-    /// Acquires the rounded declared or frame length before body allocation.
+
+    /// Validates one message against the ceiling, then charges its exact bytes.
+    ///
+    /// Callers pass the encoded length they are about to retain: a declared
+    /// `Content-Length`, a gRPC frame length, or the collected length of a
+    /// body whose size was not declared. Nothing is precharged.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostResourceError::Occupied`] when the message exceeds the
-    /// boot-selected individual cap or the next aggregate ownership exceeds
-    /// the independently derived process capacity.
-    pub fn try_acquire(
-        &self,
-        declared_bytes: usize,
-    ) -> Result<BifrostTransportLease, BifrostResourceError> {
-        if declared_bytes > self.message_limit {
+    /// boot-selected individual cap or the shared Bifrost cap cannot cover it,
+    /// and a poison error for an untrustworthy ledger.
+    pub fn try_acquire(&self, bytes: usize) -> Result<BifrostTransportLease, BifrostResourceError> {
+        if bytes > self.message_limit {
             record_transport("refused_message_limit", self.used_bytes());
             return Err(BifrostResourceError::Occupied {
                 detail: format!(
@@ -155,52 +153,27 @@ impl BifrostTransportAdmission {
                 ),
             });
         }
-        let rounded = declared_bytes
-            .checked_add(BIFROST_TRANSPORT_QUANTUM_BYTES - 1)
-            .ok_or_else(|| BifrostResourceError::InvalidPlan {
-                detail: "transport admission arithmetic overflow".to_owned(),
-            })?
-            / BIFROST_TRANSPORT_QUANTUM_BYTES
-            * BIFROST_TRANSPORT_QUANTUM_BYTES;
-        if self
-            .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(rounded)
-                    .filter(|next| *next <= self.capacity)
-            })
-            .is_err()
-        {
+        if let Err(error) = self.governor.try_charge_transport(bytes) {
             record_transport("refused_occupied", self.used_bytes());
-            return Err(BifrostResourceError::Occupied {
-                detail: "transport encoded-body budget is occupied".to_owned(),
-            });
+            return Err(error);
         }
         record_transport("acquired", self.used_bytes());
         Ok(BifrostTransportLease {
-            bytes: rounded,
+            bytes,
             admission: self.clone(),
         })
     }
 
-    /// Acquires a pessimistic maximum-body charge for unknown HTTP lengths.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed capacity refusal when the selected maximum body cannot fit.
-    pub fn try_acquire_unknown(&self) -> Result<BifrostTransportLease, BifrostResourceError> {
-        self.try_acquire(self.message_limit)
-    }
-
-    /// Returns exact rounded live ownership for telemetry and tests.
+    /// Returns exact live transport ownership for telemetry and tests.
     #[must_use]
     pub fn used_bytes(&self) -> usize {
-        self.used.load(Ordering::Acquire)
+        self.governor.transport_used_bytes()
     }
 
-    /// Returns the checked aggregate encoded-body capacity.
+    /// Returns the shared Bifrost cap transport competes for.
     #[must_use]
-    pub const fn limit_bytes(&self) -> usize {
-        self.capacity
+    pub fn limit_bytes(&self) -> usize {
+        self.governor.plan().managed_memory_bytes
     }
 
     /// Returns the boot-frozen maximum for one encoded message.
@@ -213,14 +186,14 @@ impl BifrostTransportAdmission {
 /// Exact RAII ownership for one encoded transport body.
 #[derive(Debug)]
 pub struct BifrostTransportLease {
-    /// Rounded bytes charged before allocation.
+    /// Exact encoded bytes charged to the shared cap.
     bytes: usize,
     /// Shared process admission that receives cancellation and terminal drops.
     admission: BifrostTransportAdmission,
 }
 
 impl BifrostTransportLease {
-    /// Returns the rounded byte charge retained by this lease.
+    /// Returns the exact byte charge retained by this lease.
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.bytes
@@ -230,11 +203,9 @@ impl BifrostTransportLease {
 impl Drop for BifrostTransportLease {
     /// Releases exact ownership on success, error, or cancellation.
     fn drop(&mut self) {
-        let prior = self.admission.used.fetch_sub(self.bytes, Ordering::AcqRel);
-        debug_assert!(
-            prior >= self.bytes,
-            "transport lease release must not underflow"
-        );
+        if let Err(error) = self.admission.governor.release_transport(self.bytes) {
+            tracing::error!(%error, "transport lease release could not be reconciled");
+        }
         record_transport("released", self.admission.used_bytes());
     }
 }
@@ -296,71 +267,38 @@ impl Default for IngestLimits {
 mod tests {
     use super::*;
 
-    /// Weighted transport admission honors exact boundaries and cancellation release.
+    /// Transport charges exact encoded bytes against the shared cap and
+    /// releases them on drop; the per-message ceiling is checked first.
     ///
     /// # Panics
     ///
     /// Panics when an exact-boundary acquisition unexpectedly fails.
     #[test]
-    fn bifrost_transport_admission_is_byte_weighted_and_exact_at_boundaries() {
+    fn bifrost_transport_admission_charges_exact_bytes_to_the_shared_cap() {
         let admission = BifrostTransportAdmission::for_tests();
         let first = admission
             .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
             .expect("first maximum body");
         let second = admission
             .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
-            .expect("equal aggregate boundary succeeds");
-        assert!(admission.try_acquire(1).is_err());
+            .expect("equal cap boundary succeeds");
+        assert!(admission.try_acquire(1).is_err(), "the shared cap is full");
         drop(first);
-        let small = (0..8)
-            .map(|_| admission.try_acquire(64 * 1024).expect("small body"))
-            .collect::<Vec<_>>();
-        assert_eq!(small.len(), 8);
+        let small = admission.try_acquire(1).expect("one exact byte");
+        assert_eq!(small.bytes(), 1, "no quantum or maximum-message precharge");
+        assert_eq!(
+            admission.used_bytes(),
+            BIFROST_INGEST_REQUEST_LIMIT_BYTES + 1
+        );
         drop(small);
         drop(second);
-        let unknown = admission.try_acquire_unknown().expect("unknown body");
-        assert_eq!(unknown.bytes(), BIFROST_INGEST_REQUEST_LIMIT_BYTES);
-        drop(unknown);
         assert_eq!(admission.used_bytes(), 0);
         assert!(
             admission
                 .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES + 1)
-                .is_err()
+                .is_err(),
+            "the per-message ceiling is independent of free capacity"
         );
-    }
-
-    /// A selected request maximum remains distinct from aggregate capacity.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a supported selected bound is rejected or exact accounting drifts.
-    #[test]
-    fn bifrost_transport_admission_uses_selected_message_limit_and_independent_aggregate() {
-        let selected = 48 * 1024 * 1024;
-        let aggregate = selected * 2;
-        let admission = BifrostTransportAdmission::new(aggregate, selected)
-            .expect("selected maximum fits aggregate capacity");
-
-        let known = admission
-            .try_acquire(selected)
-            .expect("selected maximum succeeds");
-        assert_eq!(known.bytes(), selected);
-        assert!(admission.try_acquire(selected + 1).is_err());
-
-        let unknown = admission
-            .try_acquire_unknown()
-            .expect("unknown length charges selected maximum");
-        assert_eq!(unknown.bytes(), selected);
-        assert_eq!(admission.used_bytes(), aggregate);
-        assert!(
-            admission.try_acquire(1).is_err(),
-            "aggregate occupancy remains independent from the per-message bound"
-        );
-        assert_eq!(admission.limit_bytes(), aggregate);
-        assert_eq!(admission.message_limit_bytes(), selected);
-        drop(known);
-        drop(unknown);
-        assert_eq!(admission.used_bytes(), 0);
-        assert!(BifrostTransportAdmission::new(selected - 1, selected).is_err());
+        assert_eq!(admission.used_bytes(), 0, "refusal charges nothing");
     }
 }

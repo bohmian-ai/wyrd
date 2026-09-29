@@ -3,13 +3,14 @@
 //! `WYRD_BIFROST_DATA_DIR` names a single directory. The root itself is the
 //! Scribe WAL base, and therefore also holds the stable node identity written
 //! beside the WAL. Every other managed local path is a fixed child of it:
-//! Scribe staged members, Scribe output scratch, and Oracle spill. Forge owns
-//! no local path.
+//! Scribe staged members, Scribe output scratch, Oracle spill, and Forge
+//! spill.
 //!
 //! Preparation creates every managed path, takes an exclusive advisory lock on
-//! the root, and write-probes each managed directory before any role is
-//! constructed, so a second process mounting the same root, or an unwritable
-//! child, fails boot instead of surfacing after work was acknowledged.
+//! the root, clears Forge spill left by a previous owner, and write-probes each
+//! managed directory before any role is constructed, so a second process
+//! mounting the same root, or an unwritable child, fails boot instead of
+//! surfacing after work was acknowledged.
 
 use std::fs::{File, TryLockError};
 use std::io::Error as IoError;
@@ -61,6 +62,8 @@ pub struct BifrostDataRoot {
     roots: BifrostVolumeRoots,
     /// Oracle spill directory; bounded per query by `DataFusion`, not governed.
     oracle_spill: PathBuf,
+    /// Forge rewrite spill directory; emptied at every boot under the lock.
+    forge_spill: PathBuf,
     /// Open lock file; the advisory lock lives exactly as long as this handle.
     _lock: File,
 }
@@ -71,15 +74,18 @@ impl BifrostDataRoot {
     ///
     /// Directories are created before locking so a fresh root needs no manual
     /// provisioning. Creation is idempotent; existing WAL, staged, and identity
-    /// contents are never removed here. After locking, one probe file is
-    /// created, written, synced, and removed in every managed directory, so a
-    /// read-only child fails boot before any role can acknowledge work.
+    /// contents are never removed here. Forge spill is disposable attempt
+    /// scratch that no restart can resume, so once the lock proves no other
+    /// owner is spilling into it, every entry left by a previous owner is
+    /// removed. Then one probe file is created, written, synced, and removed in
+    /// every managed directory, so a read-only child fails boot before any
+    /// role can acknowledge work.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostDataRootError::Unusable`] when a managed directory or
-    /// the lock file cannot be created or locked, or a directory rejects the
-    /// write probe, and
+    /// the lock file cannot be created or locked, stale Forge spill cannot be
+    /// removed, or a directory rejects the write probe, and
     /// [`BifrostDataRootError::InUse`] when another process holds the root.
     pub fn prepare(root: &Path) -> Result<Self, BifrostDataRootError> {
         let roots = BifrostVolumeRoots {
@@ -88,11 +94,13 @@ impl BifrostDataRoot {
             scribe_output_scratch: root.join("scribe-output-scratch"),
         };
         let oracle_spill = root.join("oracle-spill");
+        let forge_spill = root.join("forge-spill");
         for path in [
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
             &oracle_spill,
+            &forge_spill,
         ] {
             std::fs::create_dir_all(path).map_err(|source| BifrostDataRootError::Unusable {
                 path: path.clone(),
@@ -123,11 +131,16 @@ impl BifrostDataRoot {
                 });
             }
         }
+        clear_directory(&forge_spill).map_err(|source| BifrostDataRootError::Unusable {
+            path: forge_spill.clone(),
+            source,
+        })?;
         for dir in [
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
             &oracle_spill,
+            &forge_spill,
         ] {
             let probe = dir.join(PROBE_FILE_NAME);
             probe_write(&probe).map_err(|source| BifrostDataRootError::Unusable {
@@ -138,6 +151,7 @@ impl BifrostDataRoot {
         Ok(Self {
             roots,
             oracle_spill,
+            forge_spill,
             _lock: lock,
         })
     }
@@ -154,11 +168,34 @@ impl BifrostDataRoot {
         &self.oracle_spill
     }
 
+    /// Forge rewrite spill directory, empty when preparation returned.
+    #[must_use]
+    pub fn forge_spill(&self) -> &Path {
+        &self.forge_spill
+    }
+
     /// Managed paths in the shape the Bifrost resource detector registers.
     #[must_use]
     pub fn volume_roots(&self) -> BifrostVolumeRoots {
         self.roots.clone()
     }
+}
+
+/// Removes every entry beneath `dir`, keeping `dir` itself.
+///
+/// # Errors
+///
+/// Returns the first filesystem error listing or removing an entry.
+fn clear_directory(dir: &Path) -> Result<(), IoError> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Creates, writes, syncs, and removes `probe`, removing it on failure too.
@@ -184,7 +221,7 @@ mod tests {
 
     use super::*;
 
-    /// Every managed path is created beneath the one root, and Forge gets none.
+    /// Every managed path is created beneath the one root.
     ///
     /// # Panics
     ///
@@ -197,11 +234,13 @@ mod tests {
         let roots = prepared.volume_roots();
         assert_eq!(prepared.wal(), root);
         assert_eq!(prepared.oracle_spill(), root.join("oracle-spill"));
+        assert_eq!(prepared.forge_spill(), root.join("forge-spill"));
         for path in [
             &roots.wal,
             &roots.scribe_stage,
             &roots.scribe_output_scratch,
             prepared.oracle_spill(),
+            prepared.forge_spill(),
         ] {
             assert!(
                 path.starts_with(&root) && path.is_dir(),
@@ -209,7 +248,39 @@ mod tests {
                 path.display()
             );
         }
-        assert!(!root.join("forge-spill").exists());
+    }
+
+    /// Stale Forge spill is cleared under the root lock while every other
+    /// managed child keeps its contents.
+    ///
+    /// # Panics
+    ///
+    /// Panics when preparation fails, stale spill survives, or a WAL,
+    /// staged, or Oracle spill entry is removed.
+    #[test]
+    fn prepare_clears_stale_forge_spill() {
+        let base = tempfile::tempdir().expect("root fixture");
+        let root = base.path();
+        let stale_dir = root.join("forge-spill").join("datafusion-stale");
+        std::fs::create_dir_all(&stale_dir).expect("stale spill directory");
+        std::fs::write(stale_dir.join("run.arrow"), b"spill").expect("stale spill file");
+        std::fs::write(root.join("forge-spill").join("loose"), b"spill").expect("loose spill");
+        let wal = root.join("retained.wal");
+        std::fs::write(&wal, b"wal").expect("retained WAL");
+        std::fs::create_dir_all(root.join("oracle-spill")).expect("oracle spill");
+        let oracle = root.join("oracle-spill").join("retained");
+        std::fs::write(&oracle, b"oracle").expect("oracle spill file");
+
+        let prepared = BifrostDataRoot::prepare(root).expect("root prepares");
+        assert_eq!(
+            std::fs::read_dir(prepared.forge_spill())
+                .expect("forge spill readable")
+                .count(),
+            0,
+            "stale Forge spill is cleared"
+        );
+        assert!(wal.exists(), "WAL contents are never cleared");
+        assert!(oracle.exists(), "only Forge spill is cleared");
     }
 
     /// A root that cannot be a directory fails with a typed error.

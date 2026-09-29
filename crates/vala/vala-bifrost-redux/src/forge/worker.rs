@@ -399,7 +399,6 @@ impl ForgeAttemptPool {
             queue: super::managed::queue::ForgeCompactionQueue::new(
                 config.max_task_parallelism,
                 config.pending_task_parallelism,
-                config.compaction_memory_budget_bytes,
             ),
             attempts: HashMap::new(),
             completion_tx,
@@ -444,7 +443,6 @@ impl ForgeAttemptPool {
                         task_id,
                         plan_index: plan.plan_index,
                         required_parallelism: plan.required_parallelism,
-                        memory_reservation_bytes: plan.memory_reservation_bytes,
                     },
                     Some(ForgeCompactionPlanRunner::new(worker, &state, plan)),
                 )
@@ -666,19 +664,13 @@ struct ForgeWorkerLoopHandles {
     stop: CancellationToken,
 }
 
-/// Compaction memory budget used by embedded fixtures and defaults.
-///
-/// Production always overrides this from the node's immutable resource plan.
-/// The value only has to be large enough that a small fixture table's single
-/// plan is admitted rather than refused as too large for the whole worker.
-const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES: usize = 1 << 30;
-
 /// Fixed process-local bounds for one Forge worker.
 ///
 /// One worker runs exactly one event loop and one compaction-admission queue.
 /// Local execution concurrency is therefore not an executor count: it is the
-/// parallelism and estimated-memory budget the queue admits plans against,
-/// resolved once from the immutable node resource plan.
+/// parallelism budget the queue admits plans against, resolved once from the
+/// immutable node resource plan. Memory is charged by each running plan's
+/// governed `DataFusion` pool, never by the queue.
 #[derive(Debug, Clone, Copy)]
 pub struct ForgeWorkerConfig {
     /// Maximum active tasks one tenant may hold concurrently (the D78 fairness
@@ -688,11 +680,6 @@ pub struct ForgeWorkerConfig {
     /// execution parallelism, because one claimed compaction task fans out into
     /// as many concurrent plan runners as the queue admits.
     pub per_tenant_active_cap: usize,
-    /// Estimated heap this worker charges against concurrently running plans.
-    ///
-    /// Waiting plans are uncharged, so a large queued plan cannot starve
-    /// smaller running ones. Must be positive.
-    pub compaction_memory_budget_bytes: usize,
     /// Maximum parallelism summed across concurrently running plans.
     pub max_task_parallelism: u32,
     /// Maximum parallelism summed across waiting plans.
@@ -1845,7 +1832,6 @@ impl Default for ForgeWorkerConfig {
     fn default() -> Self {
         Self {
             per_tenant_active_cap: 1,
-            compaction_memory_budget_bytes: DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES,
             max_task_parallelism: 3,
             pending_task_parallelism: 12,
         }
@@ -1858,18 +1844,12 @@ impl ForgeWorkerConfig {
     /// # Errors
     ///
     /// Returns invalid configuration when the per-tenant active cap is zero (no
-    /// task would ever be claimable), when the compaction memory budget is zero
-    /// (no plan could ever run), when running parallelism is zero, or when the
+    /// task would ever be claimable), when running parallelism is zero, or when the
     /// waiting budget cannot hold one maximally parallel plan.
     pub fn validate(self) -> Result<Self, ForgeError> {
         if self.per_tenant_active_cap == 0 {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge per-tenant active cap must be positive".to_owned(),
-            });
-        }
-        if self.compaction_memory_budget_bytes == 0 {
-            return Err(ForgeError::InvalidConfig {
-                detail: "Forge compaction memory budget must be positive".to_owned(),
             });
         }
         if self.max_task_parallelism == 0 {
@@ -5304,7 +5284,6 @@ impl ForgeWorker {
                     task_id = %task_id,
                     dropped,
                     running_parallelism = pool.queue.running_parallelism_sum(),
-                    running_memory_reservation_bytes = pool.queue.running_memory_reservation_bytes(),
                     "Forge dropped the plans a drained attempt had not started"
                 );
             }
@@ -5494,7 +5473,7 @@ impl ForgeWorker {
     /// unoffered remainder is ordinary planning debt the next attempt replans.
     ///
     /// Every other refusal is recorded and the pass continues, because those
-    /// describe the individual plan (an invalid estimate, a duplicate key)
+    /// describe the individual plan (an invalid parallelism, a duplicate key)
     /// rather than the worker's remaining room.
     ///
     /// Returns each refused plan's index and reason, in offer order.
@@ -8402,9 +8381,8 @@ mod tests {
             task_id,
             plan_index,
             required_parallelism,
-            memory_reservation_bytes: 1,
         };
-        let mut queue = ForgeCompactionQueue::new(8, 12, 1 << 20);
+        let mut queue = ForgeCompactionQueue::new(8, 12);
         let refusals = ForgeWorker::offer_planned_rewrites(
             &mut queue,
             [
@@ -8470,10 +8448,6 @@ mod tests {
         for invalid in [
             ForgeWorkerConfig {
                 per_tenant_active_cap: 0,
-                ..base
-            },
-            ForgeWorkerConfig {
-                compaction_memory_budget_bytes: 0,
                 ..base
             },
             ForgeWorkerConfig {
@@ -8649,12 +8623,10 @@ mod tests {
     /// Panics when either combination is refused or read back changed.
     #[test]
     fn per_tenant_active_cap_is_independent_of_compaction_parallelism() {
-        let base = ForgeWorkerConfig::default();
         let wider = ForgeWorkerConfig {
             per_tenant_active_cap: 8,
             max_task_parallelism: 2,
             pending_task_parallelism: 8,
-            ..base
         }
         .validate()
         .expect("a per-tenant cap above running parallelism is legal");
@@ -8665,7 +8637,6 @@ mod tests {
             per_tenant_active_cap: 1,
             max_task_parallelism: 8,
             pending_task_parallelism: 32,
-            ..base
         }
         .validate()
         .expect("a per-tenant cap below running parallelism is legal");

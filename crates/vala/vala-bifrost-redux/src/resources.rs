@@ -1967,6 +1967,27 @@ impl ForgeResources {
     pub fn snapshot(&self) -> Result<ResourceSnapshot, BifrostResourceError> {
         self.memory_root.governor.snapshot()
     }
+
+    /// Fills every free byte of the shared root through one Forge view.
+    ///
+    /// Test-tier pressure for journeys proving a refused Forge growth fails
+    /// only its attempt: the reservation is grown fallibly in halving chunks
+    /// until one byte more is refused, so the root is exactly full and every
+    /// later fallible growth on any role sharing it is refused. Dropping the
+    /// returned reservation returns the bytes.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn occupy_root_for_test(&self) -> MemoryReservation {
+        let reservation =
+            MemoryConsumer::new("forge-test-root-occupant").register(&self.rewrite_memory_pool());
+        let mut chunk = self.memory_root.limit_bytes();
+        while chunk > 0 {
+            if reservation.try_grow(chunk).is_err() {
+                chunk /= 2;
+            }
+        }
+        reservation
+    }
 }
 
 #[derive(Debug)]

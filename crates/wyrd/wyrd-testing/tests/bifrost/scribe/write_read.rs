@@ -80,6 +80,23 @@ async fn scribe_write_flush_read_user_journey() {
         cluster.server(0).expect("the mixed pod is running"),
     )
     .await;
+    // The span read above opens a freshly flushed hot object on a pod whose
+    // Forge has not yet promoted it, so it is the one read that must decide
+    // hot metadata. The terminal owner is the restarted pod's, and whether its
+    // reads still find hot objects races Forge promotion after boot.
+    let booted = ScribeStorageDrainObservationV1::from_snapshot(
+        &cluster
+            .server(0)
+            .expect("the mixed pod is running")
+            .state()
+            .bifrost_storage()
+            .expect("a composed pod owns Bifrost storage")
+            .telemetry_snapshot(),
+    );
+    assert!(
+        booted.cache_bypasses > 0 && booted.cache_bypasses_disabled > 0,
+        "a disabled composition must positively record a bypass with reason disabled, observed {booted:?}"
+    );
 
     let uncached_run = cluster
         .run_scribe_production_workload(&workload, ScribeCacheMode::Disabled)
@@ -110,9 +127,9 @@ async fn scribe_write_flush_read_user_journey() {
     let cached_storage = terminal_storage(&cached_run.evidence);
     assert_settled(&uncached_storage, "cache disabled");
     assert_settled(&cached_storage, "cache enabled");
-    assert!(
-        uncached_storage.cache_bypasses > 0 && uncached_storage.cache_bypasses_disabled > 0,
-        "a disabled composition must positively record a bypass with reason disabled, observed {uncached_storage:?}"
+    assert_eq!(
+        uncached_storage.cache_bypasses, uncached_storage.cache_bypasses_disabled,
+        "every bypass a disabled composition records has reason disabled, observed {uncached_storage:?}"
     );
     assert_eq!(
         (

@@ -291,12 +291,6 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: "this target composes no Scribe".to_owned(),
                 })?,
             },
-            ControlRequest::ExecuteSql { sql } => match config.execute_sql(&server, &sql).await {
-                Ok(rows) => emit(&ControlResponse::Executed { rows })?,
-                Err(error) => emit(&ControlResponse::Failed {
-                    detail: error.to_string(),
-                })?,
-            },
             ControlRequest::ArmAnalyticalPlanFailure => match oracle(&server) {
                 Ok(engine) => {
                     engine.fail_next_analytical_plan_for_test();
@@ -949,33 +943,6 @@ impl ChildConfig {
                 .map_err(|error| child(error.to_string()))?;
         }
         Ok(())
-    }
-
-    /// Runs one statement through this node's Analytical path.
-    ///
-    /// The stream is drained to its terminal frame rather than dropped early,
-    /// so the graph and attempt guards it carries settle before the parent
-    /// inspects the node. The child
-    /// authenticates the same way the public query service does and hands
-    /// Oracle the identical context its own gRPC surface would have built.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProcessClusterError::Child`] when this target composes no
-    /// Oracle, the context cannot be authorized, or the attempt fails at
-    /// admission, planning, execution, or decode.
-    async fn execute_sql(
-        &self,
-        server: &WyrdTestServer,
-        sql: &str,
-    ) -> Result<usize, ProcessClusterError> {
-        drive_sql(
-            oracle(server)?,
-            self.tenant_id,
-            sql.to_owned(),
-            &mut ResultFold::default(),
-        )
-        .await
     }
 
     /// Runs one statement and collects everything its own pod can observe.

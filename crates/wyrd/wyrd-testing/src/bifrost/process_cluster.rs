@@ -166,11 +166,6 @@ impl ProcessNodeTarget {
 pub enum ControlRequest {
     /// Report this child's current identity, addresses, and membership.
     Inspect,
-    /// Execute one statement through the Analytical path.
-    ExecuteSql {
-        /// Statement to execute.
-        sql: String,
-    },
     /// Execute one statement and report its complete physical evidence.
     ///
     /// Distinct from [`ControlRequest::ExecuteSql`] because the
@@ -450,11 +445,6 @@ pub enum ControlResponse {
     Ready(NodeReport),
     /// Answer to [`ControlRequest::Inspect`].
     Inspection(NodeReport),
-    /// Answer to [`ControlRequest::ExecuteSql`].
-    Executed {
-        /// Rows the statement produced.
-        rows: usize,
-    },
     /// Answer to [`ControlRequest::ExecuteAnalyticalBaseline`].
     AnalyticalBaseline(Box<AnalyticalBaselineEvidence>),
     /// Answer to [`ControlRequest::ScratchUsage`].
@@ -1537,28 +1527,20 @@ impl ProcessNode {
         }
     }
 
-    /// Asks this child to run one statement through Oracle.
+    /// Runs one statement through Oracle in this child's query slot.
     ///
-    /// Returns the row count the attempt produced. Nothing in production
-    /// routing reaches this seam; the child builds the same authorized
-    /// context its public query surface would have built and drives the
-    /// stream to its terminal frame, so the caller observes a settled
+    /// Returns the row count the attempt produced. It is [`Self::start_sql`]
+    /// followed by [`Self::await_sql`], so the caller observes a settled
     /// attempt rather than an abandoned one.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::request`], and
-    /// [`ProcessClusterError::Child`] when the attempt itself failed.
+    /// [`ProcessClusterError::Child`] when the slot is occupied or the attempt
+    /// itself failed.
     pub fn execute_sql(&mut self, sql: &str) -> Result<usize, ProcessClusterError> {
-        match self.request(&ControlRequest::ExecuteSql {
-            sql: sql.to_owned(),
-        })? {
-            ControlResponse::Executed { rows } => Ok(rows),
-            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
-            other => Err(ProcessClusterError::Protocol(format!(
-                "expected an execution, received {other:?}"
-            ))),
-        }
+        self.start_sql(sql)?;
+        self.await_sql()?.map_err(ProcessClusterError::Child)
     }
 
     /// Asks this child to dial another pod as its own peer identity.

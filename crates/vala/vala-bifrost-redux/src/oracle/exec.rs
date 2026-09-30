@@ -6814,7 +6814,7 @@ mod tests {
         let tenant = wyrd_spec::DataTenantId::new_v7();
         let (provider, _live) = projection_closure_provider(tenant, None, None).await;
 
-        let shape = crate::resources::OracleSessionShape::planning(
+        let shape = crate::resources::OracleSessionShape::new(
             crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
         );
         let lock = Arc::new(crate::oracle::bindings::OracleExecutionLock::new());

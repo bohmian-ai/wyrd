@@ -4057,46 +4057,22 @@ pub fn oracle_query_memory_limit(managed_memory_bytes: usize) -> usize {
 
 /// `DataFusion` session shape for one Oracle query, leader or follower.
 ///
-/// Partitions come from [`oracle_target_partitions`]; batch size and join
-/// preference stay at the `DataFusion` defaults. The only memory-derived knob
-/// is the sort-merge reservation, which is read at execution rather than
-/// planning, so an admitted grant can set it without reshaping the plan.
+/// Partitions come from [`oracle_target_partitions`]; every other execution
+/// option, including batch size, join preference, and the sort-merge
+/// reservation, stays at the `DataFusion` default. No
+/// knob is derived from the memory grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OracleSessionShape {
     /// `DataFusion` target partition count for this query.
     pub target_partitions: usize,
-    /// Per-partition memory a spilling sort holds back for its merge phase.
-    pub sort_spill_reservation_bytes: usize,
 }
 
 impl OracleSessionShape {
-    /// Shapes a session that plans `target_partitions` before any grant exists.
-    ///
-    /// The sort-merge reservation keeps the `DataFusion` default until
-    /// [`Self::for_grant`] narrows it for execution.
+    /// Shapes a session that runs `target_partitions`, at least one.
     #[must_use]
-    pub fn planning(target_partitions: usize) -> Self {
+    pub fn new(target_partitions: usize) -> Self {
         Self {
             target_partitions: target_partitions.max(1),
-            sort_spill_reservation_bytes: datafusion::config::ExecutionOptions::default()
-                .sort_spill_reservation_bytes,
-        }
-    }
-
-    /// Shapes the execution session for an admitted grant.
-    ///
-    /// A spilling `SortExec` reserves this many bytes per partition for its
-    /// merge and fails the query outright if the pool cannot supply them, so
-    /// the reservation is half of one partition's share of the grant, capped at
-    /// the `DataFusion` default. Every sorting partition can then merge what it
-    /// spilled instead of turning a spill into a resource failure.
-    #[must_use]
-    pub fn for_grant(granted_memory_bytes: usize, target_partitions: usize) -> Self {
-        let planning = Self::planning(target_partitions);
-        let share = granted_memory_bytes / planning.target_partitions / 2;
-        Self {
-            sort_spill_reservation_bytes: planning.sort_spill_reservation_bytes.min(share),
-            ..planning
         }
     }
 
@@ -4121,9 +4097,7 @@ impl OracleSessionShape {
         config: datafusion::execution::context::SessionConfig,
     ) -> datafusion::execution::context::SessionConfig {
         let mut config = config.with_target_partitions(self.target_partitions);
-        let options = config.options_mut();
-        options.execution.sort_spill_reservation_bytes = self.sort_spill_reservation_bytes;
-        let parquet_options = &mut options.execution.parquet;
+        let parquet_options = &mut config.options_mut().execution.parquet;
         parquet_options.pushdown_filters = true;
         parquet_options.reorder_filters = true;
         parquet_options.bloom_filter_on_read = true;
@@ -4195,7 +4169,7 @@ impl OracleExecution {
         Self {
             runtime,
             granted_memory_bytes,
-            shape: OracleSessionShape::for_grant(granted_memory_bytes, target_partitions),
+            shape: OracleSessionShape::new(target_partitions),
         }
     }
 
@@ -4481,8 +4455,8 @@ mod tests {
     /// use it.
     #[test]
     fn oracle_reader_session_options_contract() {
-        let config = OracleSessionShape::for_grant(ORACLE_PARTITION_MEMORY_BYTES, 4)
-            .apply(datafusion::execution::context::SessionConfig::new());
+        let config =
+            OracleSessionShape::new(4).apply(datafusion::execution::context::SessionConfig::new());
         let parquet_options = &config.options().execution.parquet;
         assert!(parquet_options.pushdown_filters);
         assert!(parquet_options.reorder_filters);
@@ -5816,10 +5790,7 @@ mod tests {
             .follower_execution(ORACLE_PARTITION_MEMORY_BYTES, 1)
             .expect("Scribe follower execution");
 
-        assert_eq!(
-            execution.shape(),
-            OracleSessionShape::for_grant(ORACLE_PARTITION_MEMORY_BYTES, 1)
-        );
+        assert_eq!(execution.shape(), OracleSessionShape::new(1));
         assert_eq!(execution.target_partitions(), 1);
         let state = execution.session_state(datafusion::prelude::SessionConfig::new());
         assert_eq!(
@@ -6080,46 +6051,21 @@ mod tests {
         );
     }
 
-    /// A grant sizes only the sort-merge reservation, never parallelism.
-    ///
-    /// Partitions, batch size, and join preference are identical across grants;
-    /// the reservation is half of one partition's share, capped at the
-    /// `DataFusion` default, so every sorting partition can merge its spill.
+    /// A session shape sets only partitions; batch size and join preference
+    /// stay at the `DataFusion` defaults.
     #[test]
-    fn oracle_session_shape_sizes_only_the_sort_merge_reservation() {
-        let default_reservation =
-            datafusion::config::ExecutionOptions::default().sort_spill_reservation_bytes;
-        let full = OracleSessionShape::for_grant(ORACLE_PARTITION_MEMORY_BYTES, 16);
-        let floor = OracleSessionShape::for_grant(ORACLE_PARTITION_WORKING_MEMORY_BYTES, 16);
-
-        assert_eq!(full.target_partitions, floor.target_partitions);
-        assert_eq!(
-            full.sort_spill_reservation_bytes,
-            default_reservation.min(8 * MIB)
-        );
-        assert_eq!(floor.sort_spill_reservation_bytes, MIB);
-        assert_eq!(
-            OracleSessionShape::planning(16).sort_spill_reservation_bytes,
-            default_reservation
-        );
-
-        let full_config = full.session_config();
-        let floor_config = floor.session_config();
+    fn oracle_session_shape_sets_only_partitions() {
+        let config = OracleSessionShape::new(16).session_config();
         let defaults = SessionConfig::new();
-        for config in [&full_config, &floor_config] {
-            assert_eq!(config.target_partitions(), 16);
-            assert_eq!(config.batch_size(), defaults.batch_size());
-            assert_eq!(
-                config.options().optimizer.prefer_hash_join,
-                defaults.options().optimizer.prefer_hash_join
-            );
-        }
+        assert_eq!(config.target_partitions(), 16);
+        assert_eq!(config.batch_size(), defaults.batch_size());
         assert_eq!(
-            floor_config
-                .options()
-                .execution
-                .sort_spill_reservation_bytes,
-            floor.sort_spill_reservation_bytes
+            config.options().optimizer.prefer_hash_join,
+            defaults.options().optimizer.prefer_hash_join
+        );
+        assert_eq!(
+            config.options().execution.sort_spill_reservation_bytes,
+            defaults.options().execution.sort_spill_reservation_bytes
         );
     }
 

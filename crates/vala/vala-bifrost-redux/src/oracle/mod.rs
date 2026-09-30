@@ -3078,7 +3078,7 @@ impl Oracle {
         let oracles = roster.oracles();
         #[cfg(feature = "test-support")]
         record_physical_build(&roster.fingerprint());
-        let shape = crate::resources::OracleSessionShape::planning(target_partitions);
+        let shape = crate::resources::OracleSessionShape::new(target_partitions);
         // Installed empty before any planning happens. The lock owns no runtime
         // and no memory; it is the one place a planned leaf's concrete source,
         // grant, and drained batches arrive once, after admission.

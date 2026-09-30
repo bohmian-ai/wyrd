@@ -4374,10 +4374,8 @@ mod tests {
     /// lease test hands `lease_session` the same shape rather than letting the
     /// handle invent one.
     fn min_grant_lease_config() -> datafusion::prelude::SessionConfig {
-        crate::resources::OracleSessionShape::planning(
-            crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
-        )
-        .session_config()
+        crate::resources::OracleSessionShape::new(crate::resources::ORACLE_MIN_TARGET_PARTITIONS)
+            .session_config()
     }
 
     /// Builds one authenticated Analytical context for a leasing fixture.

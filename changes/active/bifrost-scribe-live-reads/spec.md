@@ -362,9 +362,9 @@ and the pinned file count do not change the partition count. Batch size is the
 engine's fixed default rather than a memory-derived value, and the optimizer's
 join preference is the engine default.
 
-The admitted grant supplies only the query's memory limit and the
-per-partition sort-merge reservation derived from it, which never exceeds the
-engine default. Every query's memory
+The admitted grant supplies only the query's memory limit; every other
+execution option, including the sort-merge reservation, is the engine
+default. Every query's memory
 limit is half the pod's managed Bifrost budget, never below 256 MiB and never
 above the budget. It is not divided by concurrent load: queries compete for
 the one shared pod pool, which refuses growth once concurrent queries fill it.
@@ -535,7 +535,7 @@ Do not add new persisted state or change write ACK timing.
   for its pinned input regardless of grant or file count. A single-file and a
   many-file published scan, a hot scan, and a distributed query over split
   leaves return exactly the same rows as the unsplit scan. Admission changes
-  only the memory ceiling and sort-merge reservation. The heavy full scan uses
+  only the memory ceiling. The heavy full scan uses
   more than one core, and the standard and heavy benchmarks are re-run with a
   full table. A query's memory limit is half the managed budget whatever the
   concurrent load; a pod below 4 GiB is refused at boot; a spilling query
@@ -651,7 +651,9 @@ on 2026-09-28.
   Spill runtimes use `DataFusion` defaults, bounded only by the
   per-query memory limit. A query exceeding that limit fails with a typed
   resource error. Approved by the user on 2026-09-30 ("agree on 1 and 2. and
-  for 3 the decision is "fail with a typed resource error"").
+  for 3 the decision is "fail with a typed resource error"). The
+  grant-sized sort-merge reservation (`OracleSessionShape::for_grant`) is
+  deleted with it; the reservation is the `DataFusion` default ("delete").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

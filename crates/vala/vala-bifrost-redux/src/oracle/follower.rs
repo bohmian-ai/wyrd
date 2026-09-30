@@ -2430,15 +2430,12 @@ pub(crate) mod tests {
 
         let granted = crate::resources::ORACLE_PARTITION_MEMORY_BYTES;
         let execution = bounded_execution(granted, 8);
-        let expected = crate::resources::OracleSessionShape::for_grant(granted, 8);
-        assert_eq!(execution.shape(), expected);
-        let (state, _context) = request_session(&execution);
-        let options = state.config().options();
-        assert_eq!(options.execution.target_partitions, 8);
         assert_eq!(
-            options.execution.sort_spill_reservation_bytes,
-            expected.sort_spill_reservation_bytes
+            execution.shape(),
+            crate::resources::OracleSessionShape::new(8)
         );
+        let (state, _context) = request_session(&execution);
+        assert_eq!(state.config().options().execution.target_partitions, 8);
     }
 
     /// Every follower session enables Parquet-level predicate and index

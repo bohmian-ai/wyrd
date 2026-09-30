@@ -9,8 +9,8 @@ DataFusion planning receives an authenticated, tenant-qualified immutable cut
 before path-specific admission. Its session takes CPU- and locality-derived
 target partitions with default batch size and performs no row IO or
 query-memory retention. After the returned root selects its class, execution
-receives the admitted query-owned runtime, memory pool, and grant-derived
-sort-merge reservation through `TaskContext` while retaining the planned
+receives the admitted query-owned runtime and memory pool through
+`TaskContext` while retaining the planned
 partitioning; memory never reshapes the plan. Wyrd owns authorization, query-class routing, resource
 grants, deadlines, failure policy, audit, and terminal semantics. A
 `SessionContext`, SQL parser, optimizer, or `TableProvider` is never an

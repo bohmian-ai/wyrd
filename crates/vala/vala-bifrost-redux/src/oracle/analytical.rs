@@ -4119,10 +4119,7 @@ mod tests {
             let node_id = NodeId::new(Uuid::from_u128(2));
             let fence = 7;
             let supervisor = Arc::new(AnalyticalSupervisor::new());
-            let reservations = Arc::new(ReservationRegistry::new(
-                Arc::new(crate::oracle::OracleSlotManager::new(4)),
-                16,
-            ));
+            let reservations = Arc::new(ReservationRegistry::new(4, 16));
             let ingress = AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
                 node_id,
                 oracle_fence: fence,

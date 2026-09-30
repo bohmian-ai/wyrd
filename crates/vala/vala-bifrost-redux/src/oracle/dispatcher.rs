@@ -25,7 +25,6 @@ use wyrd_tonic::tonic::Status;
 use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
-use super::OracleSlotManager;
 use super::peer::{
     PeerSecurityError, PeerTicketClaims, ReservationBinding, ReservationOperationV1,
     ReservationTicketClaims, reservation_body_digest,
@@ -341,8 +340,12 @@ pub struct ReservationRegistry {
     entries: Mutex<HashMap<ReservationId, PendingReservation>>,
     /// Hard bound on retained pending entries for this worker role.
     capacity: usize,
-    /// Role-scoped pending and running slot owner.
-    slots: Arc<OracleSlotManager>,
+    /// Immutable local slot-unit total, used only for placement and bounds.
+    ///
+    /// A capacity figure, never a gate: the shared governor ledger decides
+    /// whether a unit is free. A full node refuses before accepting work and
+    /// the leader owns any retry.
+    total_slot_units: usize,
     /// Cumulative count of graph leases this node activated from a reservation.
     ///
     /// Incremented only on the first activation for a graph, never on reuse, so
@@ -357,11 +360,11 @@ pub struct ReservationRegistry {
 impl ReservationRegistry {
     /// Creates a bounded registry for one fenced Oracle role.
     #[must_use]
-    pub fn new(slots: Arc<OracleSlotManager>, capacity: usize) -> Self {
+    pub fn new(total_slot_units: usize, capacity: usize) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             capacity,
-            slots,
+            total_slot_units,
             #[cfg(any(test, feature = "test-support"))]
             graph_leases_activated_total: core::sync::atomic::AtomicU64::new(0),
         }
@@ -509,14 +512,14 @@ impl ReservationRegistry {
         entries.insert(reservation_id, entry);
     }
 
-    /// Returns the running slot units of the slot manager this registry charges.
+    /// Returns this node's immutable local slot-unit total.
     ///
     /// Test-tier readiness inspection reads capacity here because the registry
-    /// is the one owner of the node's slot manager.
+    /// owns the figure.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub(crate) fn total_slot_units(&self) -> usize {
-        self.slots.total_slot_units()
+        self.total_slot_units
     }
 
     /// Returns the greatest number of graphs this node may own at one time.
@@ -527,7 +530,7 @@ impl ReservationRegistry {
     /// admit one graph must be able to settle it.
     #[must_use]
     pub(crate) fn max_concurrent_graphs(&self) -> usize {
-        self.slots.total_slot_units().max(1)
+        self.total_slot_units.max(1)
     }
 
     /// Returns the cumulative count of graph leases activated on this node.
@@ -2263,7 +2266,7 @@ mod tests {
     #[test]
     fn peer_pending_reservation_expires() {
         let oracle = slot_limited_oracle(2);
-        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(2)), 2);
+        let registry = ReservationRegistry::new(2, 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
@@ -2310,7 +2313,7 @@ mod tests {
     #[test]
     fn graph_reservation_saturation_refuses_up_front() {
         let oracle = slot_limited_oracle(1);
-        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1)), 2);
+        let registry = ReservationRegistry::new(1, 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
@@ -2354,7 +2357,7 @@ mod tests {
     #[test]
     fn expired_reservation_returns_its_envelope() {
         let oracle = slot_limited_oracle(1);
-        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1)), 2);
+        let registry = ReservationRegistry::new(1, 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());

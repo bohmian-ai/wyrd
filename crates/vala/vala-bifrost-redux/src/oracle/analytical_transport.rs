@@ -2441,10 +2441,7 @@ mod tests {
         fn new() -> Self {
             let authority_calls = Arc::new(AtomicUsize::new(0));
             let node_id = NodeId::new(Uuid::from_u128(2));
-            let reservations = Arc::new(super::super::dispatcher::ReservationRegistry::new(
-                Arc::new(crate::oracle::OracleSlotManager::new(4)),
-                16,
-            ));
+            let reservations = Arc::new(super::super::dispatcher::ReservationRegistry::new(4, 16));
             let graph = AnalyticalGraphKey::new(
                 PublicQueryId::from_uuid(Uuid::from_u128(11)),
                 DataFusionQueryId::from_uuid(Uuid::from_u128(12)),

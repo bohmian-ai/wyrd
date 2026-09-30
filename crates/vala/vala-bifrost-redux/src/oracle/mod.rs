@@ -38,8 +38,6 @@ use wyrd_spec::vala::api::{
     QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
     SourceCompletion, SourceCompletionOutcome,
 };
-#[cfg(feature = "test-support")]
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
@@ -365,23 +363,6 @@ pub struct OracleRuntimeInspection {
     pub reserved_memory_bytes: u64,
     /// Peer running reservations held by this Oracle.
     pub peer_running: u64,
-}
-
-/// Immutable local slot-unit capacity figure for one Oracle process.
-///
-/// Running capacity is not owned here. `BifrostResourceGovernor` is the one
-/// class-aware slot-unit ledger charged by both leader admission and follower
-/// acquisition, so a local semaphore could only disagree with it. A receiving
-/// node never waits for a slot on a peer's behalf: a full node refuses before
-/// accepting work and the leader owns any retry.
-#[derive(Debug)]
-pub struct OracleSlotManager {
-    /// Immutable local slot-unit total used only for placement calculations.
-    ///
-    /// This is a capacity figure, never a gate: the governor decides whether
-    /// units are available, while placement needs to know how many this pod
-    /// could ever have.
-    total_slot_units: usize,
 }
 
 /// Per-phase stopwatch for one SQL attempt after planning completes.
@@ -874,20 +855,6 @@ impl Drop for AdmissionWaitTelemetryGuard {
     }
 }
 
-impl OracleSlotManager {
-    /// Records the local slot-unit total this Oracle process can ever run.
-    #[must_use]
-    pub fn new(total_slot_units: usize) -> Self {
-        Self { total_slot_units }
-    }
-
-    /// Returns the immutable local slot-unit total for placement calculations.
-    #[must_use]
-    pub fn total_slot_units(&self) -> usize {
-        self.total_slot_units
-    }
-}
-
 /// Narrow audit collaborator owned by the serving composition root.
 #[async_trait]
 pub trait OracleAudit: Send + Sync {
@@ -1000,118 +967,6 @@ impl OracleAudit for AcceptingOracleAudit {
         _violation: BifrostSecurityViolation,
     ) -> Result<(), BifrostError> {
         Ok(())
-    }
-}
-
-/// SQL-backed audit writer used by the T3 Postgres integration harness.
-///
-/// Production composition may provide a broader audit owner, while this
-/// implementation deliberately exercises the canonical `append_audit`
-/// transaction and tenant RLS boundary without inventing a parallel sink.
-#[cfg(feature = "test-support")]
-#[derive(Clone)]
-pub struct TestPostgresOracleAudit {
-    /// Tenant-scoped Vala SQL root used for each independent audit transaction.
-    vala: ValaPostgres,
-}
-
-#[cfg(feature = "test-support")]
-impl TestPostgresOracleAudit {
-    /// Creates the integration audit writer around the managed Postgres owner.
-    #[must_use]
-    pub fn new(vala: ValaPostgres) -> Self {
-        Self { vala }
-    }
-
-    /// Appends and commits one exact audit event under tenant RLS.
-    ///
-    /// The caller selects the outcome the authorization boundary reached:
-    /// an admitted read records `Allowed` and a refused source security
-    /// violation records `Denied`.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit unavailable when tenant acquisition, append, or commit
-    /// fails. No caller-visible read may begin after this operation fails.
-    async fn commit(
-        &self,
-        context: &AuthorizedQueryContext,
-        operation: &str,
-        outcome: AuditOutcome,
-        detail: AuditDetail,
-    ) -> Result<(), BifrostError> {
-        let event = AuditEvent::new(
-            context.request_id.clone(),
-            context.trace_id.clone(),
-            operation.to_owned(),
-            "bifrost.query".to_owned(),
-            context.principal.card_ref().cloned(),
-            context.principal.id,
-            context.principal.kind.tag(),
-            context.permission.to_string(),
-            outcome,
-        )
-        .with_detail(detail);
-        let mut conn = self
-            .vala
-            .tenant_conn(context.data_tenant_id)
-            .await
-            .map_err(|_| BifrostError::QueryAuditUnavailable)?;
-        vala_sql::queries::audit_staging::append_audit(&mut conn, &event)
-            .await
-            .map_err(|_| BifrostError::QueryAuditUnavailable)?;
-        conn.commit()
-            .await
-            .map_err(|_| BifrostError::QueryAuditUnavailable)
-    }
-}
-
-#[cfg(feature = "test-support")]
-#[async_trait]
-impl OracleAudit for TestPostgresOracleAudit {
-    /// Commits one locked read decision to the tenant audit chain.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit unavailable when the transaction cannot commit.
-    async fn append_read_decision(
-        &self,
-        context: &AuthorizedQueryContext,
-        decision: BifrostQueryReadDecision,
-    ) -> Result<(), BifrostError> {
-        self.commit(
-            context,
-            "bifrost.query.read_decision",
-            AuditOutcome::Allowed,
-            decision.into_detail(),
-        )
-        .await
-    }
-
-    /// Commits one locked security violation to the tenant audit chain.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit unavailable when the transaction cannot commit.
-    async fn append_security_violation(
-        &self,
-        context: VerifiedSecurityContext,
-        violation: BifrostSecurityViolation,
-    ) -> Result<(), BifrostError> {
-        self.commit(
-            &context.query,
-            "bifrost.query.security_violation",
-            AuditOutcome::Denied,
-            AuditDetail::BifrostSecurityViolation {
-                violation: violation.violation,
-                phase: violation.phase,
-                query_digest: context.query_digest,
-                delegation_chain: wyrd_runtime::audit_delegation_chain(
-                    &context.query.delegation_chain,
-                ),
-            },
-        )
-        .await
     }
 }
 
@@ -1456,9 +1311,6 @@ pub struct Oracle {
     startup_result: Mutex<Option<StartupResultReceiver>>,
     /// Cancellation-bound local admission lifecycle task.
     maintenance: Mutex<Option<JoinHandle<()>>>,
-    /// Test-tier one-shot pause after immutable worker selection.
-    #[cfg(feature = "test-support")]
-    topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
     /// Request-keyed test pause between catalog pinning and roster publication.
     #[cfg(feature = "test-support")]
     preparation_pause: Mutex<Option<Arc<OraclePreparationPause>>>,
@@ -1512,44 +1364,6 @@ impl OraclePreparationPause {
         {
             self.release.cancelled().await;
         }
-    }
-}
-
-/// Notification-backed test seam for a topology change after worker selection.
-#[cfg(feature = "test-support")]
-#[derive(Debug, Default)]
-pub struct OracleTopologyProbe {
-    /// Ensures exactly one query attempt pauses at the selected-candidate seam.
-    claimed: AtomicBool,
-    /// Wakes the journey once the first attempt has selected its immutable cut.
-    selected: tokio::sync::Notify,
-    /// Records permission for the paused attempt to continue dispatch.
-    resumed: AtomicBool,
-    /// Wakes the paused attempt after the fixture changes membership.
-    resume: tokio::sync::Notify,
-    /// Remote worker selected by the paused immutable assignment.
-    target: Mutex<Option<NodeId>>,
-}
-
-#[cfg(feature = "test-support")]
-impl OracleTopologyProbe {
-    /// Waits until the first query attempt has selected its worker candidates.
-    pub async fn wait_selected(&self) {
-        while !self.claimed.load(Ordering::Acquire) {
-            self.selected.notified().await;
-        }
-    }
-
-    /// Returns the remote worker selected by the paused first attempt.
-    #[must_use]
-    pub fn selected_worker(&self) -> Option<NodeId> {
-        self.target.lock().ok().and_then(|target| *target)
-    }
-
-    /// Releases the selected attempt after the fixture changes membership.
-    pub fn resume(&self) {
-        self.resumed.store(true, Ordering::Release);
-        self.resume.notify_waiters();
     }
 }
 
@@ -1772,14 +1586,6 @@ impl Oracle {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Reports whether an armed distributed-planning refusal is still unconsumed.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn analytical_plan_failure_armed_for_test(&self) -> bool {
-        self.fail_next_analytical_plan
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// Consumes an armed one-shot distributed-planning refusal, if any.
     fn take_analytical_plan_failure(&self) -> bool {
         #[cfg(feature = "test-support")]
@@ -1894,8 +1700,6 @@ impl Oracle {
             startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
             #[cfg(feature = "test-support")]
-            topology_probe: Mutex::new(None),
-            #[cfg(feature = "test-support")]
             preparation_pause: Mutex::new(None),
         })
     }
@@ -1927,14 +1731,6 @@ impl Oracle {
     #[must_use]
     pub fn fragment_dispatcher(&self) -> Option<Arc<dispatcher::FragmentDispatcher>> {
         self.fragment_dispatcher.as_ref().map(Arc::clone)
-    }
-
-    /// Binds a one-shot topology selection probe for a test-tier query.
-    #[cfg(feature = "test-support")]
-    pub fn bind_topology_probe_for_test(&self, probe: Arc<OracleTopologyProbe>) {
-        if let Ok(mut current) = self.topology_probe.lock() {
-            *current = Some(probe);
-        }
     }
 
     /// Validates the query floor before any asynchronous metadata operation.
@@ -3615,21 +3411,6 @@ fn projected_request_deadline(requested_ms: Option<i64>, default: Duration) -> D
         .map_or(default, Duration::from_millis)
 }
 
-/// Returns exact deadline projection observations from the production helper.
-#[cfg(feature = "test-support")]
-#[must_use]
-pub fn deadline_projection_for_test() -> (Duration, Duration, Duration, bool) {
-    let default = Duration::from_secs(30);
-    let omitted = projected_request_deadline(None, default);
-    let zero = projected_request_deadline(Some(0), default);
-    let explicit = projected_request_deadline(Some(125), default);
-    let deadline = Instant::now() + explicit;
-    let first = deadline.saturating_duration_since(Instant::now());
-    std::thread::sleep(Duration::from_millis(1));
-    let second = deadline.saturating_duration_since(Instant::now());
-    (omitted, zero, explicit, second < first)
-}
-
 /// Projects one pinned Iceberg manifest entry into the descriptor a follower is
 /// signed to read.
 ///
@@ -4677,6 +4458,20 @@ mod tests {
     use super::participant_cut::tests::lease;
     use super::*;
     use wyrd_runtime::{BifrostPermissionScope, BifrostTableScope};
+
+    /// Omitted, zero, and negative budgets fall back to the default; a positive
+    /// budget is honored exactly.
+    #[test]
+    fn request_deadline_projects_unusable_budgets_to_the_default() {
+        let default = Duration::from_secs(30);
+        assert_eq!(projected_request_deadline(None, default), default);
+        assert_eq!(projected_request_deadline(Some(0), default), default);
+        assert_eq!(projected_request_deadline(Some(-5), default), default);
+        assert_eq!(
+            projected_request_deadline(Some(125), default),
+            Duration::from_millis(125)
+        );
+    }
 
     /// Builds a same-tenant query context holding exactly `permissions`.
     ///

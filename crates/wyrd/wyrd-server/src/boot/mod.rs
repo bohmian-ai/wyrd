@@ -26,7 +26,6 @@ use vala_bifrost_redux::oracle::dispatcher::{
 };
 use vala_bifrost_redux::oracle::{
     Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
-    OracleSlotManager,
 };
 use vala_bifrost_redux::resources::{
     BifrostRole, BifrostRoleResources, BifrostRuntimeResources, OracleClassSplit,
@@ -1671,7 +1670,6 @@ impl<'a> OracleRoleBuilder<'a> {
         let running_slots = usize::try_from(split.total_units()).map_err(|_| {
             ServerBootError::OraclePeer("Oracle slot count exceeds usize".to_owned())
         })?;
-        let slots = Arc::new(OracleSlotManager::new(running_slots));
         // Query concurrency is the single number that decides whether this node
         // serves or queues, and it is derived rather than configured. An
         // operator diagnosing query latency needs it at startup, not inferred
@@ -1686,7 +1684,7 @@ impl<'a> OracleRoleBuilder<'a> {
             managed_memory_bytes = resource_plan.managed_memory_bytes,
             "Oracle admission capacity resolved"
         );
-        let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1_024));
+        let reservations = Arc::new(ReservationRegistry::new(running_slots, 1_024));
         let snapshot = cluster.snapshot();
         validate_remote_oracle_addresses(
             deployment_profile,

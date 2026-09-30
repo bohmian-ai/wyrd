@@ -875,3 +875,32 @@ and therefore `QueryClass::Analytical`, implies the distributed path runs.
   `AwaitSql`, `lease_analytical_attempt`, `analytical_lifecycle.rs`).
 - **Fixed:** the checked-in `wyrd.v1.bin` descriptor snapshot was stale since
   the D10 wire change; regenerated (`check:proto-drift`).
+
+### D12 — duplicate-path sweep
+
+An independent read-only sweep found the remaining second ways to do one thing;
+each was deleted or routed through its production owner.
+
+- `Oracle::lease_analytical_attempt` now runs production preparation,
+  classification, and `admit_built_attempt` instead of hand-finalizing an
+  Analytical cut; it no longer takes a caller-built attempt identity
+  (`support::attempt_context` deleted). The attempt deadline conversion is one
+  `instant_deadline` helper.
+- `OracleSlotManager` deleted: `ReservationRegistry` holds the local slot
+  total directly.
+- `ResourceState.oracle_active_queries` is derived from the two class counters
+  rather than stored beside them; the public snapshot field is unchanged.
+- `OracleQueryClassLabel` replaced by one `query_class_label` function;
+  `exec.rs` `NoopAudit` replaced by `AcceptingOracleAudit`.
+- Dead test-support deleted: `TestPostgresOracleAudit`, `OracleTopologyProbe`,
+  `analytical_plan_failure_armed_for_test`, `deadline_projection_for_test`
+  (replaced by a unit test of `projected_request_deadline`).
+- Harness: `ControlRequest::ExecuteSql` deleted; `execute_sql` is
+  `start_sql` + `await_sql`. The Analytical baseline reads its grant from
+  `oracle_query_memory_limit` instead of acquiring and dropping an envelope.
+- Kept deliberately: the per-call frame-decode loops (transport, fold, and
+  partial-drain shapes differ, so a shared helper would add generics without
+  removing a path), and the two-field slot sums in admission and validation.
+- Open, needs a decision: the read-decision audit records
+  `QueryExecutionMode::Local`, one node, zero workers for Analytical queries
+  that ran distributed.

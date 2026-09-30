@@ -653,6 +653,9 @@ impl AnalyticalSupervisor {
     /// The guard must already be cycle-free: its Analytical ownership names
     /// this supervisor, so storing a guard that still holds it would make the
     /// graph own a handle to itself.
+    /// Its physical projections are released here, at the one transfer seam,
+    /// because they are children of the envelope this graph must see idle
+    /// before it can release.
     ///
     /// # Errors
     ///
@@ -678,6 +681,8 @@ impl AnalyticalSupervisor {
         if state.retained_admission.is_some() {
             return Err(Box::new(admitted));
         }
+        let mut admitted = admitted;
+        admitted.release_physical_projections();
         state.retained_admission = Some(admitted);
         Ok(())
     }

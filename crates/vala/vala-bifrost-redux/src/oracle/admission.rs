@@ -1357,16 +1357,21 @@ impl AdmittedQueryGuard {
     /// Taking rather than borrowing is deliberate: settlement consumes the two
     /// guards, and removing them here means a later drop of this admission
     /// cannot settle or release the same attempt a second time.
-    ///
-    /// This query's physical projections are released first because they are
-    /// children of the very envelope the graph is about to return. Settling
-    /// with them still live makes the graph refuse to release, which strands
-    /// the graph on this node instead of returning its capacity.
     pub(super) fn take_analytical(
         &mut self,
     ) -> Option<super::analytical::AnalyticalAttemptOwnership> {
-        self.physical_projections.clear();
         self.analytical.take()
+    }
+
+    /// Releases this query's physical projections before its Analytical graph
+    /// retains the guard.
+    ///
+    /// The projections are children of the very envelope the graph returns on
+    /// release, and the graph releases only once that envelope has no live
+    /// children. A retained guard still holding them would make the graph wait
+    /// on itself until its deadline and strand its capacity on this node.
+    pub(super) fn release_physical_projections(&mut self) {
+        self.physical_projections.clear();
     }
 
     /// Installs one already-admitted envelope for an ownership-transfer test.

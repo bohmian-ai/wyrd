@@ -936,3 +936,19 @@ Oracle journey failures after D12 (diagnosed by a fresh read-only diagnostician)
   sub-proof parks `SCHEDULING_HOLDS - 1` Analytical queries, proves the next
   one queues to its deadline, and proves both tenants' Interactive floor
   queries still run.
+
+After the lease SQL fix, both lifecycle tests failed at settle (second
+diagnostician):
+
+- **Symptom:** `ownership.settle` returned `Internal` "Oracle analytical graph
+  cleanup did not complete". **Evidence:** "leader graph was not confirmed
+  drained within its deadline … memory_bytes=161"; the governor showed
+  `oracle_total=161` until the deadline. **Cause:** a production bug. Only the
+  stream path (`take_analytical`) cleared the guard's physical projections, which
+  are children of the graph's own pool, before handing the guard to the graph.
+  `lease_analytical_attempt` handed over a guard that still held them, so the
+  graph waited on itself. **Fix site:** `AnalyticalSupervisor::retain_admission`,
+  the single transfer seam, now calls
+  `AdmittedQueryGuard::release_physical_projections`; `take_analytical` lost the
+  side effect. Callers checked: `settle_analytical` (unchanged behavior), the
+  lease seam (fixed), and the `analytical.rs` unit test (no projections).

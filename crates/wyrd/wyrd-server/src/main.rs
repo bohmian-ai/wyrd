@@ -17,6 +17,13 @@ use wyrd_sql::dsn::{ResolvedDsns, owner_dsn_from_env};
 use wyrd_sql::pool::build_pool;
 use wyrd_sql::{MIGRATION_LEASE_WAIT, PoolConfig, SqlError, WyrdPostgres};
 
+/// Process-wide allocator for the server binary.
+///
+/// mimalloc replaces the system allocator for every allocation the server
+/// makes. Library crates never install an allocator, so embedders keep theirs.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const EX_CONFIG: i32 = 78;
 const EX_SOFTWARE: i32 = 70;
 

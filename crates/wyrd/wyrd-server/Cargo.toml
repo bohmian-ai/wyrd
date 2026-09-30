@@ -22,6 +22,7 @@ name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }
 arc-swap = { workspace = true }

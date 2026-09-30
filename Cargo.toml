@@ -133,6 +133,8 @@ rustix = { version = "1.1.4", features = ["fs"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 metrics = { version = "0.24", default-features = false }
+# Global allocator for server binaries only; libraries never set one.
+mimalloc = "0.1.50"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
 mini-moka = { version = "0.10", features = ["sync"] }
 proptest = "1"
@@ -257,6 +259,11 @@ module_name_repetitions = "allow"
 # Workspace crates keep full debug info.
 [profile.dev.package."*"]
 debug = "line-tables-only"
+
+# Local image builds, test lanes, and benchmarks. Four codegen units recover
+# most cross-unit inlining without the single-unit build time `dist` pays.
+[profile.release]
+codegen-units = 4
 
 # Published release artifacts (`--profile dist`: the server binary, Python
 # wheels, and the TypeScript native addon): whole-program LTO and one codegen

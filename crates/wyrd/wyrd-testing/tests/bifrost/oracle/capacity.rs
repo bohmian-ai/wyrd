@@ -19,9 +19,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
-use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
-use vala_bifrost_redux::oracle::Oracle;
 use vala_bifrost_redux::oracle::{QueryIpcDecoder, QueryResourceProbe, QueryResourceSnapshot};
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
 use wyrd_client::Bifrost;
@@ -75,6 +73,18 @@ const INTERACTIVE_GROUPS: i64 = 1_000;
 /// batch in the Scribe's address space, which no real writer does.
 const INGEST_CHUNK: i64 = 100_000;
 
+/// Left-table rows under the contending Analytical join.
+///
+/// Wider than the right table so the join is not an identity.
+const CONTENTION_LEFT_ROWS: i64 = 400_000;
+
+/// Right-table rows under the contending Analytical join, and its result rows.
+///
+/// Large enough that the undrained result cannot fit the Oracle stream's
+/// buffers, so the unpulled stream keeps the query holding its grant across
+/// both Interactive windows.
+const CONTENTION_RIGHT_ROWS: i64 = 300_000;
+
 /// Distinct `filter_key` groups the Analytical fixture rows fall into.
 ///
 /// Irrelevant to the statement under test, which derives its own key from `id`;
@@ -100,19 +110,19 @@ const ANALYTICAL_WARMUP_FRAMES: usize = 4096;
 /// Bound on how long one awaited observation may take before it is a failure.
 const OBSERVATION_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Bound on polls waiting for the settled graph to publish its spill evidence.
+/// Bound on polls waiting for a released query's gauge to settle.
 const PHYSICAL_EVIDENCE_POLLS: usize = 300;
 
-/// Interval between polls for settled physical evidence.
+/// Interval between polls for a settled gauge.
 const PHYSICAL_EVIDENCE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// A live memory-heavy Analytical query does not stop two tenants' bounded
-/// Interactive queries from being admitted and completing at the 4 GiB pod
-/// floor.
+/// A live Analytical query holding its grant does not stop two tenants'
+/// bounded Interactive queries from being admitted and completing at the
+/// 4 GiB pod floor.
 ///
 /// # Panics
 ///
-/// Panics when any admission, memory, spill, telemetry, or cleanup claim fails.
+/// Panics when any admission, memory, telemetry, or cleanup claim fails.
 // Four pods, a distributed join, and two client streams share this runtime. On
 // the single-threaded default the executing query starves the pods' own
 // heartbeats, their Oracle role leases expire, and the graph fails for a reason
@@ -153,7 +163,7 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         ingest,
         tenant_a,
         &left,
-        ANALYTICAL_LEFT_ROWS,
+        CONTENTION_LEFT_ROWS,
         ANALYTICAL_INGEST_GROUPS,
     )
     .await?;
@@ -161,7 +171,7 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         ingest,
         tenant_a,
         &right,
-        ANALYTICAL_RIGHT_ROWS,
+        CONTENTION_RIGHT_ROWS,
         ANALYTICAL_INGEST_GROUPS,
     )
     .await?;
@@ -203,7 +213,14 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         .query_sql(
             query_context(tenant_a)?,
             BifrostQueryRequest {
-                sql: analytical_baseline_sql(&left, &right),
+                // A distributed join and grouped aggregate that fits its grant:
+                // this journey needs a live Analytical query holding its
+                // envelope, not one that must spill. Exceeding the grant and
+                // spilling is the peer-network baseline's claim.
+                sql: format!(
+                    "SELECT l.id, COUNT(*) AS matched FROM vala.bifrost.{left} AS l \
+                     JOIN vala.bifrost.{right} AS r ON l.id = r.id GROUP BY l.id"
+                ),
                 deadline_ms: Some(ANALYTICAL_DEADLINE_MS),
             },
         )
@@ -213,7 +230,7 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
     // Driven, not slept on: pulling a frame is what advances execution, so the
     // stream reaches live ownership through its own progress and is then simply
     // left alone with that ownership held.
-    let mut fold = BaselineFold::default();
+    let mut fold = AnalyticalFold::default();
     let mut decoder = QueryIpcDecoder::new();
     let mut live_analytical = None;
     for _ in 0..ANALYTICAL_WARMUP_FRAMES {
@@ -262,15 +279,12 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
     while let Some(frame) = analytical.frames.next().await {
         accept_frame(&mut decoder, &mut fold, frame?)?;
     }
-    if fold.rows != u64::try_from(ANALYTICAL_RIGHT_ROWS)? {
+    if fold.rows != u64::try_from(CONTENTION_RIGHT_ROWS)? {
         return Err(format!(
-            "the Analytical query returned {} rows, not {ANALYTICAL_RIGHT_ROWS}",
+            "the Analytical query returned {} rows, not {CONTENTION_RIGHT_ROWS}",
             fold.rows
         )
         .into());
-    }
-    if fold.digest() != expected_analytical_digest() {
-        return Err("the Analytical query returned a result the fixture never produced".into());
     }
     let terminal = fold
         .terminal
@@ -278,7 +292,6 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
     if terminal != QueryTerminalOutcome::Success {
         return Err(format!("the Analytical query settled as {terminal:?}, not a success").into());
     }
-    prove_spill_evidence(&engine).await?;
 
     let analytical_final = analytical_probe.snapshot();
     for (label, live, final_snapshot) in [
@@ -526,41 +539,6 @@ async fn prove_nodes_ready(cluster: &WyrdTestCluster, label: &str) -> Result<(),
     Ok(())
 }
 
-/// Asserts the executed graph published real operator spill evidence.
-///
-/// The terminal reaches the caller before the graph's own lifecycle settles,
-/// and the physical fold happens inside that settlement, so this waits for the
-/// evidence rather than asserting on whatever the race left behind.
-///
-/// # Errors
-///
-/// Returns an error when no Analytical handle exists, no evidence settles
-/// within the bound, or the settled evidence reports no spill.
-async fn prove_spill_evidence(engine: &Arc<Oracle>) -> Result<(), JourneyError> {
-    let supervisor = engine
-        .analytical_execution()
-        .ok_or("Oracle composed no Analytical handle")?
-        .supervisor()
-        .clone();
-    for _ in 0..PHYSICAL_EVIDENCE_POLLS {
-        if let Some(evidence) = supervisor.settled_physical_evidence() {
-            if evidence.spill_count == 0
-                || evidence.spilled_bytes == 0
-                || evidence.spilled_rows == 0
-            {
-                return Err(format!(
-                    "the Analytical query reported no spill: {} spills, {} bytes, {} rows",
-                    evidence.spill_count, evidence.spilled_bytes, evidence.spilled_rows
-                )
-                .into());
-            }
-            return Ok(());
-        }
-        tokio::time::sleep(PHYSICAL_EVIDENCE_INTERVAL).await;
-    }
-    Err("the settled Analytical graph published no physical evidence".into())
-}
-
 /// Asserts no production metric label carries a tenant identity.
 ///
 /// # Errors
@@ -730,63 +708,24 @@ fn labelled_sum(delta: &BifrostTelemetryDelta, family: &str, labels: &[(&str, &s
         .sum()
 }
 
-/// Folds the Analytical result into a digest without retaining it.
-///
-/// The baseline result is a third of a gigabyte of keys; holding it to re-walk
-/// later would change the very memory behavior this journey observes.
-struct BaselineFold {
-    /// Running digest over every ordered `(key, count)` pair.
-    digest: Sha256,
+/// Counts the Analytical result without retaining it.
+#[derive(Default)]
+struct AnalyticalFold {
     /// Rows accepted across every batch.
     rows: u64,
     /// Terminal outcome the stream published, if it published one.
     terminal: Option<QueryTerminalOutcome>,
 }
 
-impl Default for BaselineFold {
-    /// Starts empty, before any frame has been accepted.
-    fn default() -> Self {
-        Self {
-            digest: Sha256::new(),
-            rows: 0,
-            terminal: None,
-        }
-    }
-}
-
-impl BaselineFold {
-    /// Accepts one decoded `(Utf8, Int64)` batch into the running digest.
-    fn accept(&mut self, batch: &RecordBatch) {
-        let (Some(keys), Some(counts)) = (
-            batch.column(0).as_any().downcast_ref::<StringArray>(),
-            batch.column(1).as_any().downcast_ref::<Int64Array>(),
-        ) else {
-            return;
-        };
-        for row in 0..batch.num_rows() {
-            let key = keys.value(row);
-            self.digest
-                .update(u32::try_from(key.len()).unwrap_or(u32::MAX).to_le_bytes());
-            self.digest.update(key.as_bytes());
-            self.digest.update(counts.value(row).to_le_bytes());
-            self.rows = self.rows.saturating_add(1);
-        }
-    }
-
-    /// Returns the hex digest of everything accepted so far.
-    fn digest(&self) -> String {
-        format!("{:x}", self.digest.clone().finalize())
-    }
-}
-
 /// Routes one stream frame into the decoder and the running fold.
 ///
 /// # Errors
 ///
-/// Returns the Arrow IPC decode error unchanged.
+/// Returns the Arrow IPC decode error unchanged, or a row-count conversion
+/// error.
 fn accept_frame(
     decoder: &mut QueryIpcDecoder,
-    fold: &mut BaselineFold,
+    fold: &mut AnalyticalFold,
     frame: QueryStreamFrame,
 ) -> Result<(), JourneyError> {
     match frame {
@@ -794,7 +733,8 @@ fn accept_frame(
             decoder.accept_schema(&schema.arrow_ipc_schema)?;
         }
         QueryStreamFrame::Batch(batch) => {
-            fold.accept(&decoder.accept_batch(&batch.arrow_ipc_batch)?);
+            let batch = decoder.accept_batch(&batch.arrow_ipc_batch)?;
+            fold.rows = fold.rows.saturating_add(u64::try_from(batch.num_rows())?);
         }
         QueryStreamFrame::Terminal(terminal) => fold.terminal = Some(terminal.outcome),
     }

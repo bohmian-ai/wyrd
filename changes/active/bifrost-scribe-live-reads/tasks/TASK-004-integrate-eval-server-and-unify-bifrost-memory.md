@@ -975,3 +975,12 @@ diagnostician):
   non-spilled partition's in-memory merge, so an over-limit sort can fail
   nondeterministically. Under the decision, that failure is the typed error,
   not a defect.
+- **Capacity journey follow-up:** `lowest_rung_analytical_contention_preserves_two_interactive_tenants`
+  proves the Interactive floor under a live Analytical query. It no longer runs
+  the over-grant wide-key sort: the contending query is a distributed join and
+  grouped aggregate that fits its grant, and the unpulled 300k-row result keeps
+  it holding its envelope across both Interactive windows. The result-digest
+  and spill checks were duplicates of the peer-network baseline, their one
+  owner, and were removed. Passed 3/3 alone. The typed over-limit contract is
+  already covered by `memory_failure_is_query_local_and_typed` and
+  `memory_refusal_preserves_oracle_health_and_next_query`.

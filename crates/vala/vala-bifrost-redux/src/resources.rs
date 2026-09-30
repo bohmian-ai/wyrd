@@ -324,7 +324,7 @@ fn record_oracle_capacity(state: &ResourceState, plan: &ResourcePlan, split: Ora
     metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => "limit")
         .set(f64::from(split.total_units()));
     metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => "used")
-        .set(f64::from(state.oracle_active_queries));
+        .set(f64::from(state.oracle_active_queries()));
 }
 
 /// Emits `memory_used`, the one capacity series a query's growth changes.
@@ -819,8 +819,9 @@ struct ResourceState {
     held_bytes: [usize; MEMORY_HOLDER_COUNT],
     /// Infallible `DataFusion` overshoot above the cap, released on shrink.
     infallible_headroom_bytes: usize,
-    oracle_active_queries: u32,
+    /// Live Interactive queries; each holds one local slot unit.
     oracle_interactive_queries: u32,
+    /// Live Analytical queries and follower graphs; each holds one slot unit.
     oracle_analytical_queries: u32,
     oracle_query_memory_used_bytes: usize,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
@@ -836,6 +837,12 @@ struct ResourceState {
 }
 
 impl ResourceState {
+    /// Returns the live Oracle slot units: one per query of either class.
+    const fn oracle_active_queries(&self) -> u32 {
+        self.oracle_interactive_queries
+            .saturating_add(self.oracle_analytical_queries)
+    }
+
     /// Returns bytes held by one holder.
     const fn held(&self, holder: MemoryHolder) -> usize {
         self.held_bytes[holder as usize]
@@ -1788,7 +1795,7 @@ impl OracleResources {
     pub fn live_slot_units(&self) -> u64 {
         self.governor
             .lock_state()
-            .map_or(0, |state| u64::from(state.oracle_active_queries))
+            .map_or(0, |state| u64::from(state.oracle_active_queries()))
     }
 
     /// Returns the immutable pod-local class split this capability admits under.
@@ -2195,12 +2202,12 @@ impl BifrostResourceGovernor {
             oracle_memory_used_bytes: state.held(MemoryHolder::Oracle),
             forge_memory_used_bytes: state.held(MemoryHolder::Forge),
             transport_memory_used_bytes: state.held(MemoryHolder::Transport),
-            oracle_active_queries: state.oracle_active_queries,
+            oracle_active_queries: state.oracle_active_queries(),
             oracle_interactive_queries: state.oracle_interactive_queries,
             oracle_analytical_queries: state.oracle_analytical_queries,
             oracle_query_memory_used_bytes: state.oracle_query_memory_used_bytes,
             infallible_headroom_bytes: state.infallible_headroom_bytes,
-            oracle_query_active: state.oracle_active_queries > 0,
+            oracle_query_active: state.oracle_active_queries() > 0,
         })
     }
 
@@ -2521,10 +2528,6 @@ impl BifrostResourceGovernor {
         // query counters are that ledger, shared by leaders and graph
         // followers, so Analytical work on either side cannot together spend the
         // units the Interactive floor is guaranteed.
-        let next_active = state
-            .oracle_active_queries
-            .checked_add(1)
-            .ok_or_else(accounting_overflow)?;
         let next_interactive = state
             .oracle_interactive_queries
             .checked_add(u32::from(request.query_class == QueryClass::Interactive))
@@ -2533,6 +2536,9 @@ impl BifrostResourceGovernor {
             .oracle_analytical_queries
             .checked_add(u32::from(request.query_class == QueryClass::Analytical))
             .ok_or_else(accounting_overflow)?;
+        let next_active = next_interactive
+            .checked_add(next_analytical)
+            .ok_or_else(accounting_overflow)?;
         let split = self.oracle_class_split();
         if next_active > split.total_units() || next_analytical > split.analytical_max_units {
             record_memory_transition("oracle", "refused", state.held(MemoryHolder::Oracle));
@@ -2540,7 +2546,6 @@ impl BifrostResourceGovernor {
                 detail: "Oracle slot units exceed local class capacity".to_owned(),
             });
         }
-        state.oracle_active_queries = next_active;
         state.oracle_interactive_queries = next_interactive;
         state.oracle_analytical_queries = next_analytical;
         record_memory_transition("oracle", "acquired", state.held(MemoryHolder::Oracle));
@@ -3890,12 +3895,11 @@ impl OracleQueryResources {
         // Query memory is released by the shared root as each consumer shrinks,
         // so this owner returns only what it actually charged: its one slot,
         // which is its place in the live query counters.
-        if state.oracle_active_queries == 0 || class_count == 0 {
+        if class_count == 0 {
             return Err(self
                 .governor
                 .poison_locked(&mut state, "Oracle query release underflow"));
         }
-        state.oracle_active_queries -= 1;
         match self.query_class {
             QueryClass::Interactive => state.oracle_interactive_queries -= 1,
             QueryClass::Analytical => state.oracle_analytical_queries -= 1,
@@ -6247,7 +6251,7 @@ mod tests {
             .state
             .lock()
             .expect("underflow state lock")
-            .oracle_active_queries = 0;
+            .oracle_interactive_queries = 0;
         assert!(matches!(
             underflow_owner.release(),
             Err(BifrostResourceError::Poisoned { .. })

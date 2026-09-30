@@ -988,7 +988,7 @@ pub struct OracleBuildConfig {
     pub memory: OracleMemoryResources,
     /// Read/security audit collaborator.
     pub audit: Arc<dyn OracleAudit>,
-    /// Reservation owner this node's fragment and graph paths both charge against.
+    /// Reservation owner this node's Analytical graphs charge against.
     ///
     /// One registry per node, shared with the peer worker that accepts
     /// reservations, so a graph lease can only ever be activated from a
@@ -1259,8 +1259,8 @@ pub struct Oracle {
     admission: Arc<OracleAdmission>,
     /// Immutable membership registry retained for planning and worker selection.
     cluster: Arc<ClusterRegistry>,
-    /// Reservation owner this node's fragment and graph paths both charge
-    /// against; the engine reads it only for test-tier inspection.
+    /// Reservation owner this node's Analytical graphs charge against; the
+    /// engine reads it only for test-tier inspection.
     #[cfg(feature = "test-support")]
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// One process-local lifecycle registry shared with private controls.
@@ -1460,7 +1460,7 @@ struct AnalyticalCompositionInputs {
     audit: Arc<dyn OracleAudit>,
     /// This node's reader epoch, which every decoded Analytical leaf protects under.
     reader_authority: Arc<reader_pins::OracleReaderAuthority>,
-    /// Reservation owner both the fragment and graph paths charge against.
+    /// Reservation owner this node's Analytical graphs charge against.
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// Directory this leader reserves each graph participant's envelope through.
     peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,

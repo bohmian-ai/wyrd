@@ -980,9 +980,9 @@ impl ChildConfig {
 
     /// Runs one statement and collects everything its own pod can observe.
     ///
-    /// The grant is read before the statement runs, from an envelope acquired
-    /// out of the live resource plan and immediately dropped, so it is the
-    /// arithmetic admission will apply rather than a restatement of a constant.
+    /// The grant is read before the statement runs from the live resource
+    /// plan through the same function admission applies, so it is not a
+    /// restatement of a constant and charges no slot.
     /// Scratch is measured on both sides of the same statement, and the
     /// physical evidence is folded by the graph lifecycle before the terminal
     /// this call awaits, so it is already retained by the time it is read.
@@ -990,8 +990,8 @@ impl ChildConfig {
     /// # Errors
     ///
     /// Returns [`ProcessClusterError::Child`] when this target composes no
-    /// Oracle or no Analytical handle, the resource plan admits no Analytical
-    /// query, scratch cannot be measured, the statement fails, or the
+    /// Oracle or no Analytical handle, the resource ledger is poisoned, scratch
+    /// cannot be measured, the statement fails, or the
     /// statement's graph does not settle inside the bounded wait.
     async fn execute_analytical_baseline(
         &self,
@@ -1000,20 +1000,16 @@ impl ChildConfig {
     ) -> Result<super::AnalyticalBaselineEvidence, ProcessClusterError> {
         let child = ProcessClusterError::Child;
         let engine = oracle(server)?;
-        let granted_memory_bytes = {
-            let envelope = engine
-                .role_resources()
-                .try_acquire_query(
-                    vala_bifrost_redux::resources::OracleResourceRequest::for_class(
-                        wyrd_spec::vala::api::QueryClass::Analytical,
-                        0.0,
-                    ),
-                )
-                .map_err(|error| child(error.to_string()))?;
-            let granted = envelope.execution().granted_memory_bytes();
-            drop(envelope);
-            u64::try_from(granted).unwrap_or(u64::MAX)
-        };
+        let managed_memory_bytes = engine
+            .role_resources()
+            .snapshot()
+            .map_err(|error| child(error.to_string()))?
+            .plan
+            .managed_memory_bytes;
+        let granted_memory_bytes = u64::try_from(
+            vala_bifrost_redux::resources::oracle_query_memory_limit(managed_memory_bytes),
+        )
+        .unwrap_or(u64::MAX);
         let scratch_root = spill_root(&engine)?.to_path_buf();
         let scratch_before = scratch_usage(&scratch_root)?;
 

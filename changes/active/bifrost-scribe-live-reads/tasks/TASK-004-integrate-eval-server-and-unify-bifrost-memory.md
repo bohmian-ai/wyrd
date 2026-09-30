@@ -952,3 +952,26 @@ diagnostician):
   `AdmittedQueryGuard::release_physical_projections`; `take_analytical` lost the
   side effect. Callers checked: `settle_analytical` (unchanged behavior), the
   lease seam (fixed), and the `analytical.rs` unit test (no projections).
+
+### D14 — spill-merge fan-in cap deleted (spec revision 18)
+
+- **Symptom:** `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`
+  intermittently failed with `QueryResourcesExhausted`: a 1.5 GiB query held
+  an in-memory `ExternalSorterMerge[0]` of 673 MB and a spill
+  `ExternalSorterMerge[1]` of 625 MB.
+- **Cause:** 16224df5b added `spill_merge_fan_in`, turning a file count into
+  bytes with a fixed 64 MiB-per-file guess. DataFusion seats two buffers per
+  file, so the cap over-reserved; any fixed guess is wrong for data shapes
+  Bifrost cannot know. The cap also contradicted the user's recorded "do not
+  add the cap for now"; DataFusion's defaults are bounded only by the
+  per-query pool.
+- **Decision (user, 2026-09-30):** delete the cap and keep DataFusion's defaults; a query
+  exceeding its memory limit fails with a typed resource error.
+- **Change:** `spill_merge_fan_in`, `SPILL_MERGE_FILE_BUDGET_BYTES`, their two
+  tests, and `build_query_runtime`'s memory-limit and partition parameters are
+  deleted. `bifrost-design.md`, `datafusion.md`, and the spec now state the
+  per-query limit as the only bound.
+- **Residual:** DataFusion frees `sort_spill_reservation_bytes` before a
+  non-spilled partition's in-memory merge, so an over-limit sort can fail
+  nondeterministically. Under the decision, that failure is the typed error,
+  not a defect.

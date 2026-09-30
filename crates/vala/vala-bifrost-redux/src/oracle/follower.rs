@@ -1748,8 +1748,6 @@ pub(crate) mod tests {
                 Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
                     granted_memory_bytes,
                 )),
-                granted_memory_bytes,
-                target_partitions,
                 0,
             )
             .expect("governed follower runtime"),

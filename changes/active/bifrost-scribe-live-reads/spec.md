@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 17
+revision: 18
 status: approved
 ---
 
@@ -382,11 +382,11 @@ live fragments share one query spill budget. A Scribe follower owns no Oracle
 spill directory and never spills. A memory refusal names the consumer that
 asked and reports the pod's largest current holders.
 
-Every spilling query runtime caps each sort merge phase's spill-file fan-in,
-derived per query like its memory limit: all of a query's merges may hold at
-most half its memory limit in non-spillable read buffers, budgeted at 64 MiB
-per spill file and never fewer than two files. The cap widens as pods grow
-and is never a fixed file count.
+Spill merges keep `DataFusion`'s default fan-in; the per-query memory limit
+is the only memory bound. A query whose sort or merge needs
+more non-spillable memory than that limit fails with the typed
+`QueryResourcesExhausted` error naming its largest consumers; Oracle does not
+estimate data shape to avoid it.
 
 Pinned published and hot scan leaves honor the session's partition count. The
 pinned files are laid end to end and divided into contiguous, equal byte
@@ -644,6 +644,14 @@ on 2026-09-28.
   user on 2026-09-30 ("roll this deletion in with all other consoldiation
   work"; "yes. drop it. our aim is to simplify without degrading
   performance").
+- Revision 18 (2026-09-30): Deletes the spill-merge fan-in cap that
+  revision 16 recorded and 16224df5b implemented against the user's recorded
+  "do not add the cap for now". The cap turned a file count into bytes with a
+  fixed batch-size guess, which is wrong for data shapes Bifrost cannot know.
+  Spill runtimes use `DataFusion` defaults, bounded only by the
+  per-query memory limit. A query exceeding that limit fails with a typed
+  resource error. Approved by the user on 2026-09-30 ("agree on 1 and 2. and
+  for 3 the decision is "fail with a typed resource error"").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

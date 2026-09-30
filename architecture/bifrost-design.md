@@ -507,12 +507,11 @@ Every session that can spill, whether the leader, a leader-local live
 fragment, or a remote Oracle follower, spills only into its node's governed
 Oracle spill directory under its query's spill share; the leader and its live
 fragments share one runtime and therefore one share. A Scribe follower owns no
-Oracle spill directory and runs with spill disabled. Every spilling runtime
-caps each sort merge phase's fan-in at
-`max(2, grant / 2 / partitions / 64 MiB)` spill files: `DataFusion`'s unbounded
-default lets merging partitions reserve non-spillable read buffers until they
-hold the whole query limit, and deriving the cap from the grant widens it as
-pods grow.
+Oracle spill directory and runs with spill disabled. Spill merges keep
+`DataFusion`'s default fan-in: the per-query memory limit is the only memory
+bound, and a sort or merge that needs more non-spillable memory than that
+limit fails the query with the typed `QueryResourcesExhausted` error. Oracle
+never guesses data shape to avoid it.
 
 Tenant fairness is owned separately by per-tenant FIFO and weighted
 round-robin admission, scheduled pod-locally: tenant slot caps are local

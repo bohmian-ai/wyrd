@@ -99,9 +99,8 @@ uncertain-outcome reconciliation.
   spilling session (leader, live fragment, or remote follower) uses a
   runtime whose disk manager points at the governed Oracle spill directory
   with the query's spill share; no session spills to the OS temp directory.
-  That disk manager caps spill-merge fan-in per query from its grant and
-  partition count, since the unbounded default lets merges starve sibling
-  sorters. The process
+  Merge fan-in is `DataFusion`'s default; the query's memory limit is the
+  only bound, and exceeding it is a typed resource error. The process
   pool is the aggregate capacity root every Oracle consumer shares, not an
   operation-local grant, and a query view allocates no capacity of its own.
 - Only fallible reservation is hard-limited. Infallible growth is measured as

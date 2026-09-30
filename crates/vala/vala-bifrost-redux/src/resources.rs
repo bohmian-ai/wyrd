@@ -4165,7 +4165,7 @@ impl OracleExecution {
     /// Issues one grant's execution over `memory_pool`.
     ///
     /// Only the grant issuers in this module call this, through
-    /// [`build_query_runtime`]; see it for the spill and fan-in rules.
+    /// [`build_query_runtime`]; see it for the spill rules.
     ///
     /// # Errors
     ///
@@ -4178,13 +4178,7 @@ impl OracleExecution {
         target_partitions: usize,
         spill_limit_bytes: u64,
     ) -> Result<Self, BifrostResourceError> {
-        let runtime = build_query_runtime(
-            spill,
-            memory_pool,
-            granted_memory_bytes,
-            target_partitions,
-            spill_limit_bytes,
-        )?;
+        let runtime = build_query_runtime(spill, memory_pool, spill_limit_bytes)?;
         Ok(Self::new(runtime, granted_memory_bytes, target_partitions))
     }
 

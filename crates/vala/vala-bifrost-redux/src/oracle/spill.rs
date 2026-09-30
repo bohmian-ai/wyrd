@@ -16,26 +16,6 @@ use crate::resources::BifrostResourceError;
 
 const ORACLE_RUNTIME_PREFIX: &str = "oracle-runtime-";
 
-/// Read-buffer budget one spill file is assumed to need while it is merged.
-///
-/// A merge holds one non-spillable read buffer per spill file it reads. The
-/// widest measured case, 8192-row batches of 6 KiB keys, needed about 50 MB.
-const SPILL_MERGE_FILE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
-
-/// Most spill files one sort merge phase may read, derived from its query.
-///
-/// `DataFusion`'s default is unbounded: a merge greedily reserves a read
-/// buffer per spill file until the pool refuses, so a few merging partitions
-/// can hold the whole query limit and starve their sibling sorters (measured
-/// at the 4 GiB pod floor: four merges at about 288 MB each). Here every
-/// partition's merges together may use at most half the query's memory limit,
-/// at [`SPILL_MERGE_FILE_BUDGET_BYTES`] per file, never below the two files a
-/// merge needs. The cap therefore widens with the pod: larger limits merge in
-/// fewer passes, and the floor stays safe.
-fn spill_merge_fan_in(memory_limit_bytes: usize, target_partitions: usize) -> usize {
-    (memory_limit_bytes / 2 / target_partitions.max(1) / SPILL_MERGE_FILE_BUDGET_BYTES).max(2)
-}
-
 /// Process-lifetime owner of Oracle's pod-local disposable spill directory.
 ///
 /// The owner creates exactly one prefixed child beneath the supplied pod root.
@@ -94,9 +74,9 @@ impl OracleSpillRuntime {
 /// result. With no spill owner, or a zero `spill_limit_bytes`, the runtime has
 /// a disabled disk manager, so an operator that would spill fails with a typed
 /// resource error instead of writing ungoverned files. Otherwise it spills
-/// under the owner's active child up to exactly `spill_limit_bytes`, and each
-/// sort merge phase's fan-in is capped from the query's memory limit and
-/// partition count; see [`spill_merge_fan_in`].
+/// under the owner's active child up to exactly `spill_limit_bytes`. Merge
+/// fan-in keeps `DataFusion`'s default: the query's memory pool is the only
+/// bound, and a merge the pool refuses fails with a typed resource error.
 ///
 /// # Errors
 ///
@@ -105,8 +85,6 @@ impl OracleSpillRuntime {
 pub(crate) fn build_query_runtime(
     spill: Option<&OracleSpillRuntime>,
     memory_pool: Arc<dyn MemoryPool>,
-    memory_limit_bytes: usize,
-    target_partitions: usize,
     spill_limit_bytes: u64,
 ) -> Result<Arc<RuntimeEnv>, BifrostResourceError> {
     let disk_manager = match spill {
@@ -114,8 +92,7 @@ pub(crate) fn build_query_runtime(
             .with_mode(DiskManagerMode::Directories(vec![
                 spill.spill_dir.path().to_path_buf(),
             ]))
-            .with_max_temp_directory_size(spill_limit_bytes)
-            .with_max_spill_merge_fan_in(spill_merge_fan_in(memory_limit_bytes, target_partitions)),
+            .with_max_temp_directory_size(spill_limit_bytes),
         _ => DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
     };
     RuntimeEnvBuilder::new()
@@ -163,61 +140,14 @@ mod tests {
         assert!(unrelated.exists());
     }
 
-    /// Merge fan-in widens with the query limit and narrows with partitions.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a derived cap differs from the half-limit budget rule.
-    #[test]
-    fn spill_merge_fan_in_scales_with_the_query() {
-        const GIB: usize = 1024 * 1024 * 1024;
-        // 4 GiB pod floor: 1.5 GiB limit.
-        assert_eq!(spill_merge_fan_in(3 * GIB / 2, 4), 3);
-        assert_eq!(spill_merge_fan_in(3 * GIB / 2, 16), 2);
-        // 32 GiB pod: 15.5 GiB limit.
-        assert_eq!(spill_merge_fan_in(31 * GIB / 2, 8), 15);
-        assert_eq!(spill_merge_fan_in(0, 0), 2);
-    }
-
-    /// A spilling query runtime carries the derived fan-in.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the runtime cannot be built or carries another fan-in.
-    #[test]
-    fn spilling_query_runtime_caps_merge_fan_in() {
-        let root = tempfile::tempdir().expect("test spill root must exist");
-        let runtime =
-            OracleSpillRuntime::new(root.path()).expect("bounded spill owner must be created");
-        let limit = 8 * 1024 * 1024 * 1024;
-        let query = build_query_runtime(
-            Some(&runtime),
-            Arc::new(GreedyMemoryPool::new(1_024)),
-            limit,
-            4,
-            8,
-        )
-        .expect("bounded query runtime must be created");
-        assert_eq!(
-            query.disk_manager.max_spill_merge_fan_in(),
-            spill_merge_fan_in(limit, 4)
-        );
-    }
-
     /// A zero query share installs a disk manager that refuses temp files.
     #[test]
     fn oracle_zero_spill_share_disables_temp_files() {
         let root = tempfile::tempdir().expect("test spill root must exist");
         let runtime =
             OracleSpillRuntime::new(root.path()).expect("bounded spill owner must be created");
-        let query = build_query_runtime(
-            Some(&runtime),
-            Arc::new(GreedyMemoryPool::new(1_024)),
-            1_024,
-            1,
-            0,
-        )
-        .expect("memory-only runtime must be created");
+        let query = build_query_runtime(Some(&runtime), Arc::new(GreedyMemoryPool::new(1_024)), 0)
+            .expect("memory-only runtime must be created");
         assert!(matches!(
             query.disk_manager.create_tmp_file("disabled"),
             Err(datafusion::error::DataFusionError::ResourcesExhausted(_))
@@ -240,14 +170,8 @@ mod tests {
         let root = tempfile::tempdir().expect("test spill root must exist");
         let runtime =
             OracleSpillRuntime::new(root.path()).expect("bounded spill owner must be created");
-        let query = build_query_runtime(
-            Some(&runtime),
-            Arc::new(GreedyMemoryPool::new(1_024)),
-            1_024,
-            1,
-            8,
-        )
-        .expect("bounded query runtime must be created");
+        let query = build_query_runtime(Some(&runtime), Arc::new(GreedyMemoryPool::new(1_024)), 8)
+            .expect("bounded query runtime must be created");
         let file = query
             .disk_manager
             .create_tmp_file("quota")
@@ -273,14 +197,9 @@ mod tests {
             Some(8),
             "a refused write must not grow the accounted file"
         );
-        let sibling = build_query_runtime(
-            Some(&runtime),
-            Arc::new(GreedyMemoryPool::new(1_024)),
-            1_024,
-            1,
-            8,
-        )
-        .expect("sibling query runtime must be created");
+        let sibling =
+            build_query_runtime(Some(&runtime), Arc::new(GreedyMemoryPool::new(1_024)), 8)
+                .expect("sibling query runtime must be created");
         let sibling_file = sibling
             .disk_manager
             .create_tmp_file("sibling")

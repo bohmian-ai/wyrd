@@ -1,0 +1,435 @@
+<!doctype html>
+<!-- Reference mock, not approved authority. Change Impact Map for Change Requests (subject map, behavior paths, Overview summary). Works from repository source alone; Cards enrich it when present but are never required. Adopting it requires a $wyrd-spec revision of REQ-062/REQ-065. Published: https://claude.ai/artifact/RfXt9o8v94R5Tw6pc22hwx -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Change Impact Map</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@400;500;600;700&family=Fragment+Mono&display=swap">
+<style>
+:root{
+  --bg:#f5f6f8;--surface:#ffffff;--surface-2:#eef0f4;--border:#d9dde5;--border-soft:#e8ebf0;
+  --text:#101014;--muted:#62626d;--declare:#4d5ef0;--declare-soft:#eceefe;--declare-ink:#ffffff;
+  --observe:#c5f23b;--observe-line:#7fa800;--observe-soft:#f3fce0;--ok:#3dbe5a;--ok-ink:#1f7a35;--warn:#f0a13c;--warn-ink:#9a5b06;--danger:#e2484d;--danger-soft:#fbe9ea;
+  --strong:700;--r:2px;
+  --sans:"Familjen Grotesk",system-ui,sans-serif;--mono:"Fragment Mono",ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  color-scheme:dark;--bg:#0b0c12;--surface:#12141c;--surface-2:#1a1d28;--border:#252838;--border-soft:#1c1f2c;
+  --text:#e6e4da;--muted:#8f92a5;--declare:#7a8cff;--declare-soft:#1a2040;--declare-ink:#0b0c12;
+  --observe-line:#c5f23b;--observe-soft:#394523;--ok-ink:#3dbe5a;--warn-ink:#f0a13c;--danger-soft:#2b1a22;--strong:600;}}
+:root[data-theme="dark"]{
+  color-scheme:dark;--bg:#0b0c12;--surface:#12141c;--surface-2:#1a1d28;--border:#252838;--border-soft:#1c1f2c;
+  --text:#e6e4da;--muted:#8f92a5;--declare:#7a8cff;--declare-soft:#1a2040;--declare-ink:#0b0c12;
+  --observe-line:#c5f23b;--observe-soft:#394523;--ok-ink:#3dbe5a;--warn-ink:#f0a13c;--danger-soft:#2b1a22;--strong:600;}
+
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45;padding-inline:16px;padding-block:28px 64px}
+.wrap{max-width:1320px;margin:0 auto;display:grid;gap:40px}
+h1,h2,h3{margin:0;text-wrap:balance}
+h1{font-size:26px;font-weight:var(--strong);letter-spacing:-.01em}
+h2{font-size:18px;font-weight:var(--strong)}
+h3{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+p{margin:0}
+.lede{color:var(--muted);max-width:72ch}
+.mono,code{font-family:var(--mono);font-size:12px}
+a{color:var(--declare);text-decoration:none}
+a:hover{text-decoration:underline}
+a:focus-visible,button:focus-visible{outline:2px solid var(--declare);outline-offset:2px}
+
+.mock{display:grid;gap:10px}
+.mock-cap{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+.mock-cap .route{color:var(--muted)}
+.frame{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.note{color:var(--muted);font-size:13px;max-width:90ch}
+
+/* shared Change header */
+.crh{padding:14px 18px 0;border-bottom:1px solid var(--border);display:grid;gap:8px}
+.crh-top{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start}
+.crh-title{font-size:18px;font-weight:var(--strong)}
+.crh-meta{color:var(--muted);font-size:13px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-family:var(--mono);font-size:11px;padding:2px 7px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface-2);white-space:nowrap}
+.chip.bad{border-color:var(--danger);background:var(--danger-soft)}
+.chip.ok{border-color:var(--ok)}
+.chip.warn{border-color:var(--warn)}
+.btn{font:inherit;font-size:13px;padding:5px 10px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface-2);color:var(--text);cursor:pointer;white-space:nowrap}
+.btn.primary{background:var(--declare);border-color:var(--declare);color:var(--declare-ink)}
+.nav{display:flex;gap:2px;overflow-x:auto}
+.nav a{padding:8px 12px;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap}
+.nav a.on{color:var(--text);border-bottom-color:var(--declare);font-weight:600}
+.nav a:hover{text-decoration:none;color:var(--text)}
+
+/* overview impact panel */
+.panel{margin:18px;border:1px solid var(--border);border-radius:var(--r)}
+.panel-h{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;padding:10px 14px;background:var(--surface-2);border-bottom:1px solid var(--border)}
+.panel-h strong{font-weight:600}
+.sum{padding:12px 14px;border-bottom:1px solid var(--border-soft);font-size:15px}
+.sum b{font-weight:600}
+.subj{display:grid;grid-template-columns:minmax(200px,1.1fr) minmax(260px,2fr) minmax(220px,1.3fr);gap:14px;padding:12px 14px;border-bottom:1px solid var(--border-soft);align-items:start}
+.subj:last-child{border-bottom:0}
+.subj-id{display:grid;gap:2px}
+.subj-id .mono{color:var(--muted)}
+.mods{display:flex;gap:4px;flex-wrap:wrap}
+.mod{font-family:var(--mono);font-size:11px;padding:3px 6px;border-radius:var(--r);border:1px solid var(--border);background:var(--surface-2);color:var(--muted)}
+.mod.chg{background:var(--declare-soft);border-color:var(--declare);color:var(--text)}
+.mod.reach{background:var(--surface);border-color:var(--text);color:var(--text)}
+.eps{display:grid;gap:4px}
+.ep{display:flex;justify-content:space-between;gap:8px;font-family:var(--mono);font-size:12px}
+.cov-ok{color:var(--ok-ink)}
+.cov-no{color:var(--warn-ink);font-weight:600}
+.cardonly{color:var(--muted);font-size:13px}
+
+/* subject map */
+.subhead{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;padding:12px 18px;border-bottom:1px solid var(--border)}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.seg button{font:inherit;font-size:13px;padding:5px 12px;border:0;background:var(--surface);color:var(--muted);cursor:pointer}
+.seg button.on{background:var(--declare-soft);color:var(--text);font-weight:600}
+.seg button+button{border-left:1px solid var(--border)}
+.mapgrid{display:grid;grid-template-columns:230px minmax(0,1fr) 320px}
+.rail{padding:14px;display:grid;gap:18px;align-content:start;border-right:1px solid var(--border)}
+.rail.right{border-right:0;border-left:1px solid var(--border)}
+.list{display:grid;gap:6px}
+.ep-row{display:grid;gap:1px;padding:7px 8px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface)}
+.ep-row.sel{border-color:var(--declare);background:var(--declare-soft)}
+.ep-row .mono{font-size:11.5px}
+.ep-row small{color:var(--muted);font-size:12px}
+.ctl{display:grid;gap:6px;font-size:13px}
+.ctl label{display:flex;gap:6px;align-items:center}
+.legend{display:grid;gap:6px;font-size:12px}
+.legend div{display:flex;gap:8px;align-items:center}
+.sw{width:22px;height:12px;border-radius:var(--r);flex:none}
+.canvas{overflow-x:auto;padding:12px;background:var(--bg)}
+.canvas svg{display:block;min-width:760px;width:100%;height:auto}
+.prov{padding:8px 14px;border-top:1px solid var(--border);font-family:var(--mono);font-size:11px;color:var(--muted);display:flex;gap:14px;flex-wrap:wrap}
+
+.insp{display:grid;gap:16px}
+.insp-h{display:grid;gap:4px}
+.insp-h .name{font-family:var(--mono);font-size:14px;font-weight:600}
+.kv{display:grid;gap:6px}
+.sig{font-family:var(--mono);font-size:11.5px;padding:8px;border-radius:var(--r);background:var(--surface-2);border:1px solid var(--border);display:grid;gap:3px;overflow-x:auto}
+.sig .del{color:var(--danger);text-decoration:line-through}
+.sig .add{color:var(--declare)}
+.reach-row{display:grid;grid-template-columns:1fr auto;gap:2px 8px;font-size:12.5px;padding:6px 0;border-bottom:1px solid var(--border-soft)}
+.reach-row:last-child{border-bottom:0}
+.reach-row .mono{font-size:11.5px}
+.reach-row small{grid-column:1/-1;color:var(--muted);font-size:12px}
+.tag{font-family:var(--mono);font-size:10.5px;padding:1px 5px;border-radius:var(--r);border:1px solid var(--border);white-space:nowrap;align-self:start}
+.tag.obs{background:var(--observe-soft);border-color:var(--observe-line)}
+.tag.warn{border-color:var(--warn);color:var(--warn-ink)}
+.tag.ok{border-color:var(--ok);color:var(--ok-ink)}
+.acts{display:flex;gap:6px;flex-wrap:wrap}
+
+/* SVG */
+.m-box{fill:var(--surface);stroke:var(--border);stroke-width:1}
+.m-box.dim{fill:none;stroke-dasharray:4 3}
+.m-hd{fill:var(--surface-2)}
+.m-lbl{font-family:var(--mono);font-size:11px;fill:var(--text);font-weight:600}
+.m-cnt{font-family:var(--mono);font-size:10px;fill:var(--muted)}
+.n rect{rx:2}
+.n text{font-family:var(--mono);font-size:11px;fill:var(--text)}
+.n .g{font-weight:600}
+.n.mod rect,.n.add rect{fill:var(--declare-soft);stroke:var(--declare);stroke-width:1.5}
+.n.add rect{stroke-dasharray:5 2}
+.n.del rect{fill:var(--surface);stroke:var(--danger);stroke-width:1.5;stroke-dasharray:4 3}
+.n.del text{text-decoration:line-through;fill:var(--muted)}
+.n.del .g{fill:var(--danger);text-decoration:none}
+.n.reach rect{fill:var(--surface);stroke:var(--text);stroke-width:1}
+.n.idle rect{fill:var(--surface-2);stroke:var(--border)}
+.n.idle text{fill:var(--muted)}
+.n.entry rect{fill:var(--surface);stroke:var(--text);stroke-width:1}
+.sel-ring{fill:none;stroke:var(--declare);stroke-width:2}
+.badge-ok{fill:var(--ok-ink);font-family:var(--mono);font-size:10px}
+.badge-warn{fill:var(--warn-ink);font-family:var(--mono);font-size:10px;font-weight:600}
+.e{fill:none;stroke-width:1.6}
+.e.obs{stroke:var(--observe-line);stroke-width:2.2}
+.e.stat{stroke:var(--muted);stroke-dasharray:4 3}
+.e.new{stroke:var(--declare);stroke-width:2}
+.e.gone{stroke:var(--danger);stroke-dasharray:5 3}
+.ah-obs{fill:var(--observe-line)}.ah-stat{fill:var(--muted)}.ah-new{fill:var(--declare)}.ah-gone{fill:var(--danger)}
+.elbl{font-family:var(--mono);font-size:10px}
+.elbl.new{fill:var(--declare)}.elbl.gone{fill:var(--danger)}
+.more text{font-family:var(--mono);font-size:10.5px;fill:var(--muted)}
+
+/* path view */
+.pathwrap{overflow-x:auto}
+table.path{border-collapse:collapse;width:100%;min-width:760px;font-family:var(--mono);font-size:12px}
+table.path th{text-align:left;font-family:var(--sans);font-size:12px;font-weight:600;color:var(--muted);padding:10px 14px;border-bottom:1px solid var(--border);background:var(--surface-2)}
+table.path td{padding:5px 14px;border-bottom:1px solid var(--border-soft);vertical-align:top;white-space:nowrap}
+table.path td.mk{width:28px;text-align:center;font-weight:600}
+table.path tr.add td.cand{background:var(--declare-soft)}
+table.path tr.add td.mk{color:var(--declare)}
+table.path tr.gone td.base{background:var(--danger-soft)}
+table.path tr.gone td.base span{text-decoration:line-through}
+table.path tr.gone td.mk{color:var(--danger)}
+table.path tr.chg td.mk{color:var(--declare)}
+table.path td.ev{font-family:var(--sans);font-size:12px;color:var(--muted);white-space:normal}
+.i1{padding-left:18px}.i2{padding-left:36px}.i3{padding-left:54px}
+.blank{color:var(--muted)}
+
+.how{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+.step{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:12px;display:grid;gap:6px;align-content:start}
+.step .who{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.step p{font-size:13px}
+.gap{border-color:var(--warn)}
+
+@media (max-width:1100px){
+  .mapgrid{grid-template-columns:1fr}
+  .rail{border-right:0;border-bottom:1px solid var(--border)}
+  .rail.right{border-left:0;border-top:1px solid var(--border);border-bottom:0}
+  .subj{grid-template-columns:1fr}
+}
+</style>
+
+<div class="wrap">
+
+<header style="display:grid;gap:8px">
+  <h3>Wyrd · Change Requests · design mocks</h3>
+  <h1>Change Impact Map</h1>
+  <p class="lede">Shows what a proposed change does inside a repository's code, whether it is a deployed service or a published library: which modules and functions it edits, which call paths now behave differently, which entry points reach them, and whether a Claim covers each path. Every map is computed on the server from the exact base and candidate commits, so the same revision always produces the same map.</p>
+</header>
+
+<!-- ============ MOCK 1 ============ -->
+<section class="mock">
+  <div class="mock-cap"><h2>Overview: impact summary</h2><span class="mono route">/t/acme/changes/change_01</span></div>
+  <p class="note">A compact panel on the existing Overview, placed below intent and above Claims. The unit is modules and entry points inside each repository. It needs no registered Cards; a library's entry points are its public API.</p>
+  <div class="frame">
+    <div class="crh">
+      <div class="crh-top">
+        <div style="display:grid;gap:4px">
+          <div class="crh-title">Rank fresh inventory first in checkout search</div>
+          <div class="crh-meta"><span class="mono">change_01</span> · revision 7 · r.okafor opened 3 days ago · 3 subjects in 2 repositories</div>
+        </div>
+        <div class="acts"><button class="btn primary" type="button">Review changes ▾</button><button class="btn" type="button" aria-label="More actions">⋯</button></div>
+      </div>
+      <div class="chips"><span class="chip">● OPEN</span><span class="chip bad">✕ NOT VERIFIED · 1/3</span><span class="chip">◐ 1 approval · 1 changes requested</span><span class="chip">no override</span></div>
+      <nav class="nav" aria-label="Change Request"><a class="on" href="#m1">Overview</a><a href="#m1">Verification</a><a href="#m1">Review</a><a href="#m1">Timeline</a><a href="#m1">Subjects</a></nav>
+    </div>
+
+    <div class="panel">
+      <div class="panel-h"><strong>Impact on revision 7</strong><a href="#m2">Open impact map →</a></div>
+      <div class="sum">Edits <b>9 symbols in 4 modules</b> · reaches <b>4 entry points</b> across 2 repositories · <b class="cov-no">△ 1 entry point has no covering Claim</b></div>
+
+      <div class="subj">
+        <div class="subj-id"><strong>acme/ranking-api</strong><span class="mono">PR #4412 · 3f9a2c1 → a81d0e7</span></div>
+        <div style="display:grid;gap:6px">
+          <div class="mods">
+            <span class="mod chg">~ ranking/ · 4</span><span class="mod chg">+ features/ · 1</span><span class="mod reach">◇ api/</span><span class="mod reach">◇ store/</span><span class="mod reach">◇ jobs/</span><span class="mod">9 unaffected</span>
+          </div>
+          <span class="note">~ edited · + added · ◇ calls into edited code</span>
+        </div>
+        <div class="eps">
+          <div class="ep"><span>POST /v1/rank</span><span class="cov-ok">✓ CLAIM-1</span></div>
+          <div class="ep"><span>GET /v1/rank/explain</span><span class="cov-no">△ no Claim</span></div>
+          <div class="ep"><span>cron reindex_job</span><span class="cov-ok">✓ CLAIM-2</span></div>
+        </div>
+      </div>
+
+      <div class="subj">
+        <div class="subj-id"><strong>acme/ranking-api</strong><span class="mono">PR #4415 · a81d0e7 → c02b77e</span></div>
+        <div class="cardonly">No code symbols changed. One Card changed: Verifier <span class="mono">drift-inventory-age</span> v3 → v4 (threshold 0.15 → 0.10).</div>
+        <div class="eps"><div class="ep"><span>Card: drift-inventory-age</span><span class="cov-ok">✓ CLAIM-3</span></div></div>
+      </div>
+
+      <div class="subj">
+        <div class="subj-id"><strong>acme/web-storefront</strong><span class="mono">PR #981 · 7d10e4a → 5be9f31</span></div>
+        <div style="display:grid;gap:6px"><div class="mods"><span class="mod chg">~ ui/results/ · 2</span><span class="mod reach">◇ routes/search/</span><span class="mod">21 unaffected</span></div></div>
+        <div class="eps"><div class="ep"><span>route /search</span><span class="cov-ok">✓ CLAIM-1</span></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ MOCK 2 ============ -->
+<section class="mock" id="m2">
+  <div class="mock-cap"><h2>Subject: impact map</h2><span class="mono route">/t/acme/changes/change_01/subjects/subject_api?view=map&amp;node=ranking::apply_boosts</span></div>
+  <p class="note">The default view for a subject. Modules are boxes and functions are nodes. The map shows only edited code, what calls it, and what it calls, up to two hops away. Everything else is folded into one count. Selecting a node opens its diff hunk, callers, observed traffic, and Claim coverage.</p>
+  <div class="frame">
+    <div class="subhead">
+      <div style="display:grid;gap:2px"><strong>acme/ranking-api · PR #4412</strong><span class="mono" style="color:var(--muted)">base 3f9a2c1 → candidate a81d0e7 · 6 files · 9 symbols edited</span></div>
+      <div class="acts">
+        <div class="seg" role="group" aria-label="Subject view"><button class="on" type="button" aria-pressed="true">Map</button><button type="button" aria-pressed="false">Paths</button><button type="button" aria-pressed="false">Diff</button></div>
+        <button class="btn" type="button">View on GitHub ↗</button>
+        <button class="btn primary" type="button">Review changes ▾</button>
+      </div>
+    </div>
+
+    <div class="mapgrid">
+      <aside class="rail">
+        <div style="display:grid;gap:8px">
+          <h3>Entry points reached · 3 of 11</h3>
+          <div class="list">
+            <div class="ep-row"><span class="mono">▸ POST /v1/rank</span><small>4.1k req/s observed · <span class="cov-ok">✓ CLAIM-1</span></small></div>
+            <div class="ep-row sel"><span class="mono">▸ GET /v1/rank/explain</span><small>12 req/s observed · <span class="cov-no">△ no Claim</span></small></div>
+            <div class="ep-row"><span class="mono">▸ cron reindex_job</span><small>static call only · <span class="cov-ok">✓ CLAIM-2</span></small></div>
+          </div>
+        </div>
+        <div class="ctl">
+          <h3>Show</h3>
+          <label><input id="f-hops" type="radio" name="scope" checked> Edited + 2 hops</label>
+          <label><input id="f-edit" type="radio" name="scope"> Edited only</label>
+          <label><input id="f-all" type="radio" name="scope"> Whole repository</label>
+          <label style="margin-top:4px"><input id="f-obs" type="checkbox" checked> Observed traffic (24h)</label>
+          <label><input id="f-static" type="checkbox" checked> Static calls</label>
+        </div>
+        <div class="legend">
+          <h3>Legend</h3>
+          <div><span class="sw" style="background:var(--declare-soft);border:1.5px solid var(--declare)"></span>~ edited</div>
+          <div><span class="sw" style="background:var(--declare-soft);border:1.5px dashed var(--declare)"></span>+ added</div>
+          <div><span class="sw" style="border:1.5px dashed var(--danger)"></span>− removed</div>
+          <div><span class="sw" style="border:1px solid var(--text)"></span>unchanged, in reach</div>
+          <div><span class="sw" style="height:3px;background:var(--observe-line)"></span>call seen in traces</div>
+          <div><span class="sw" style="height:0;border-top:2px dashed var(--muted)"></span>call found in source</div>
+          <div><span class="sw" style="height:3px;background:var(--declare)"></span>+ new call</div>
+          <div><span class="sw" style="height:0;border-top:2px dashed var(--danger)"></span>− removed call</div>
+        </div>
+      </aside>
+
+      <div style="display:grid;grid-template-rows:1fr auto;min-width:0">
+        <div class="canvas">
+<svg viewBox="0 0 760 430" role="img" aria-label="Impact map for acme/ranking-api: edited functions in ranking and features modules, reached from three entry points">
+  <defs>
+    <marker id="a-obs" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="ah-obs"/></marker>
+    <marker id="a-stat" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="ah-stat"/></marker>
+    <marker id="a-new" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="ah-new"/></marker>
+    <marker id="a-gone" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="ah-gone"/></marker>
+  </defs>
+
+  <!-- modules -->
+  <g><rect class="m-box" x="16" y="16" width="200" height="190" rx="2"/><rect class="m-hd" x="16.5" y="16.5" width="199" height="22"/><text class="m-lbl" x="26" y="31">api/</text><text class="m-cnt" x="206" y="31" text-anchor="end">◇ reached</text></g>
+  <g><rect class="m-box" x="256" y="16" width="236" height="300" rx="2"/><rect class="m-hd" x="256.5" y="16.5" width="235" height="22"/><text class="m-lbl" x="266" y="31">ranking/</text><text class="m-cnt" x="482" y="31" text-anchor="end">~ 4 edited</text></g>
+  <g><rect class="m-box" x="532" y="16" width="212" height="126" rx="2"/><rect class="m-hd" x="532.5" y="16.5" width="211" height="22"/><text class="m-lbl" x="542" y="31">features/</text><text class="m-cnt" x="734" y="31" text-anchor="end">+ 1 added</text></g>
+  <g><rect class="m-box" x="532" y="166" width="212" height="110" rx="2"/><rect class="m-hd" x="532.5" y="166.5" width="211" height="22"/><text class="m-lbl" x="542" y="181">store/</text><text class="m-cnt" x="734" y="181" text-anchor="end">◇ reached</text></g>
+  <g><rect class="m-box" x="16" y="226" width="200" height="90" rx="2"/><rect class="m-hd" x="16.5" y="226.5" width="199" height="22"/><text class="m-lbl" x="26" y="241">jobs/</text><text class="m-cnt" x="206" y="241" text-anchor="end">◇ reached</text></g>
+  <g><rect class="m-box" x="256" y="340" width="236" height="74" rx="2"/><rect class="m-hd" x="256.5" y="340.5" width="235" height="22"/><text class="m-lbl" x="266" y="355">clients/</text><text class="m-cnt" x="482" y="355" text-anchor="end">unchanged</text></g>
+  <g class="more"><rect class="m-box dim" x="532" y="300" width="212" height="114" rx="2"/><text x="546" y="324">9 unaffected modules</text><text x="546" y="344">auth/ · config/ · db/</text><text x="546" y="360">telemetry/ · metrics/</text><text x="546" y="376">admin/ · models/ · util/</text><text x="546" y="392">health/</text></g>
+
+  <!-- edges -->
+  <path class="e obs" d="M116,78 V88" marker-end="url(#a-obs)"/>
+  <path class="e obs" d="M202,103 C236,103 238,65 270,65" marker-end="url(#a-obs)"/>
+  <path class="e obs" d="M352,78 V108" marker-end="url(#a-obs)"/>
+  <path class="e gone" d="M320,136 V166" marker-end="url(#a-gone)"/>
+  <text class="elbl gone" x="326" y="156">− call</text>
+  <path class="e new" d="M410,136 V212" marker-end="url(#a-new)"/>
+  <text class="elbl new" x="416" y="160">+ call</text>
+  <path class="e obs" d="M432,62 H546" marker-end="url(#a-obs)"/>
+  <path class="e new" d="M432,227 C492,227 490,109 546,109" marker-end="url(#a-new)"/>
+  <path class="e new" d="M432,72 C504,72 492,215 546,215" marker-end="url(#a-new)"/>
+  <text class="elbl new" x="498" y="150">+ call</text>
+  <path class="e stat" d="M202,275 C242,275 238,74 270,74" marker-end="url(#a-stat)"/>
+  <path class="e obs" d="M116,154 V164" marker-end="url(#a-obs)"/>
+  <path class="e obs" d="M202,179 C236,179 238,283 270,283" marker-end="url(#a-obs)"/>
+  <path class="e obs" d="M432,283 H478 V123 H436" marker-end="url(#a-obs)"/>
+  <path class="e stat" d="M352,386 V398" style="display:none"/>
+
+  <!-- api nodes -->
+  <g class="n entry"><rect x="30" y="52" width="172" height="26"/><text x="40" y="69"><tspan class="g">▸</tspan> POST /v1/rank</text><text class="badge-ok" x="194" y="69" text-anchor="end">✓ C1</text></g>
+  <g class="n reach"><rect x="30" y="90" width="172" height="26"/><text x="40" y="107">rank_handler</text></g>
+  <rect class="sel-ring" x="26" y="124" width="180" height="34" rx="3" style="stroke:var(--warn);stroke-dasharray:3 2"/>
+  <g class="n entry"><rect x="30" y="128" width="172" height="26"/><text x="40" y="145"><tspan class="g">▸</tspan> GET /v1/rank/explain</text></g>
+  <text class="badge-warn" x="212" y="145">△</text>
+  <g class="n reach"><rect x="30" y="166" width="172" height="26"/><text x="40" y="183">explain_handler</text></g>
+
+  <!-- jobs -->
+  <g class="n entry"><rect x="30" y="262" width="172" height="26"/><text x="40" y="279"><tspan class="g">▸</tspan> cron reindex_job</text><text class="badge-ok" x="194" y="279" text-anchor="end">✓ C2</text></g>
+
+  <!-- ranking nodes -->
+  <g class="n mod"><rect x="272" y="52" width="160" height="26"/><text x="282" y="69"><tspan class="g">~</tspan> score_candidates</text></g>
+  <rect class="sel-ring" x="267" y="105" width="170" height="36" rx="3"/>
+  <g class="n mod"><rect x="272" y="110" width="160" height="26"/><text x="282" y="127"><tspan class="g">~</tspan> apply_boosts</text></g>
+  <g class="n del"><rect x="272" y="168" width="110" height="26"/><text x="282" y="185"><tspan class="g">−</tspan> legacy_boost</text></g>
+  <g class="n add"><rect x="272" y="214" width="160" height="26"/><text x="282" y="231"><tspan class="g">+</tspan> freshness_weight</text></g>
+  <g class="n mod"><rect x="272" y="270" width="160" height="26"/><text x="282" y="287"><tspan class="g">~</tspan> explain</text></g>
+
+  <!-- features -->
+  <g class="n reach"><rect x="548" y="50" width="180" height="26"/><text x="558" y="67">load_features</text></g>
+  <g class="n add"><rect x="548" y="96" width="180" height="26"/><text x="558" y="113"><tspan class="g">+</tspan> inventory_age</text></g>
+
+  <!-- store -->
+  <g class="n reach"><rect x="548" y="202" width="180" height="26"/><text x="558" y="219">cache::put</text></g>
+  <g class="n idle"><rect x="548" y="238" width="180" height="26"/><text x="558" y="255">cache::get</text></g>
+
+  <!-- clients -->
+  <g class="n idle"><rect x="272" y="376" width="160" height="26"/><text x="282" y="393">catalog_client</text></g>
+</svg>
+        </div>
+        <div class="prov"><span>computed for revision 7</span><span>extractor v0.4.1</span><span>214 files indexed</span><span>calls: 14 resolved · 3 ambiguous · 9 seen in traces</span><span>same input → same map</span></div>
+      </div>
+
+      <aside class="rail right insp">
+        <div class="insp-h">
+          <h3>Selected function</h3>
+          <span class="name">ranking::apply_boosts</span>
+          <span class="mono" style="color:var(--muted)">fn · ranking/boost.rs:88–131</span>
+        </div>
+        <div class="kv">
+          <h3>What changed</h3>
+          <div class="sig">
+            <span class="del">fn apply_boosts(c: &amp;mut [Candidate])</span>
+            <span class="add">fn apply_boosts(c: &amp;mut [Candidate], now: Timestamp)</span>
+          </div>
+          <span style="font-size:13px">Signature and body changed. Stops calling <span class="mono">legacy_boost</span>. Now calls <span class="mono">freshness_weight</span>.</span>
+        </div>
+        <div class="kv">
+          <h3>Who reaches it</h3>
+          <div class="reach-row"><span class="mono">POST /v1/rank</span><span class="tag obs">seen 4.1k/s</span><small>covered by CLAIM-1 · Eval ranking-quality v12 · 3 tests</small></div>
+          <div class="reach-row"><span class="mono">GET /v1/rank/explain</span><span class="tag obs">seen 12/s</span><small><span class="cov-no">△ No Claim or test reaches this path.</span> Explanations will now include freshness.</small></div>
+          <div class="reach-row"><span class="mono">cron reindex_job</span><span class="tag">source only</span><small>covered by CLAIM-2 · 1 test</small></div>
+        </div>
+        <div class="acts">
+          <button class="btn primary" type="button">Open diff hunk</button>
+          <button class="btn" type="button">Start discussion</button>
+          <button class="btn" type="button">Add Claim for /explain</button>
+        </div>
+      </aside>
+    </div>
+  </div>
+</section>
+
+<!-- ============ MOCK 3 ============ -->
+<section class="mock" id="m3">
+  <div class="mock-cap"><h2>Subject: behavior path</h2><span class="mono route">/t/acme/changes/change_01/subjects/subject_api?view=paths&amp;entry=POST+/v1/rank</span></div>
+  <p class="note">Pick an entry point and see its call path before and after the change, side by side. This answers "how does this request work now?" without reading a diff. The right column shows which runtime evidence confirms each step.</p>
+  <div class="frame">
+    <div class="subhead">
+      <div style="display:grid;gap:2px"><strong>▸ POST /v1/rank</strong><span class="mono" style="color:var(--muted)">entry point · 3 new calls · 1 removed · depth 4</span></div>
+      <div class="acts">
+        <div class="seg" role="group" aria-label="Subject view"><button type="button" aria-pressed="false">Map</button><button class="on" type="button" aria-pressed="true">Paths</button><button type="button" aria-pressed="false">Diff</button></div>
+        <button class="btn primary" type="button">Review changes ▾</button>
+      </div>
+    </div>
+    <div class="pathwrap">
+      <table class="path">
+        <thead><tr><th>Base · 3f9a2c1</th><th></th><th>Candidate · a81d0e7</th><th>Confirmed by</th></tr></thead>
+        <tbody>
+          <tr><td class="base">rank_handler</td><td class="mk"></td><td class="cand">rank_handler</td><td class="ev"><span class="tag obs">prod trace</span> t_91ab… 38 ms</td></tr>
+          <tr><td class="base i1">validate_request</td><td class="mk"></td><td class="cand i1">validate_request</td><td class="ev"></td></tr>
+          <tr class="chg"><td class="base i1">score_candidates</td><td class="mk">~</td><td class="cand i1">score_candidates</td><td class="ev">body edited · <span class="tag obs">test trace</span> rank_orders_fresh_first</td></tr>
+          <tr><td class="base i2">load_features</td><td class="mk"></td><td class="cand i2">load_features</td><td class="ev"></td></tr>
+          <tr><td class="base i3">catalog_client::get</td><td class="mk"></td><td class="cand i3">catalog_client::get</td><td class="ev">external call · unchanged</td></tr>
+          <tr class="chg"><td class="base i2">apply_boosts</td><td class="mk">~</td><td class="cand i2">apply_boosts(now)</td><td class="ev">signature edited</td></tr>
+          <tr class="gone"><td class="base i3"><span>legacy_boost</span></td><td class="mk">−</td><td class="cand i3 blank">—</td><td class="ev">removed from path</td></tr>
+          <tr class="add"><td class="base i3 blank">—</td><td class="mk">+</td><td class="cand i3">freshness_weight</td><td class="ev"><span class="tag obs">test trace</span> rank_orders_fresh_first</td></tr>
+          <tr class="add"><td class="base i3 blank">—</td><td class="mk">+</td><td class="cand i3" style="padding-left:72px">inventory_age</td><td class="ev"><span class="tag warn">source only</span> no test executes this</td></tr>
+          <tr class="add"><td class="base i2 blank">—</td><td class="mk">+</td><td class="cand i2">cache::put</td><td class="ev"><span class="tag obs">test trace</span> rank_caches_scores · new write per request</td></tr>
+          <tr><td class="base i1">serialize_ranking</td><td class="mk"></td><td class="cand i1">serialize_ranking</td><td class="ev"></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="prov"><span>paths come from source analysis</span><span>green tags: step seen in a trace (prod traffic on base, CI test runs on candidate)</span><span>source only: found in code, never seen running</span></div>
+  </div>
+</section>
+
+<!-- ============ HOW ============ -->
+<section class="mock">
+  <div class="mock-cap"><h2>How the map is computed</h2></div>
+  <div class="how">
+    <div class="step"><span class="who">bohmian-code-review · extract + pipeline</span><strong>Index each commit</strong><p>Fetch the base and candidate trees from the provider without cloning. Parse them with tree-sitter into declarations and references. Store the result without source text, keyed by commit and extractor version.</p></div>
+    <div class="step gap"><span class="who">new · on top of index + resolve</span><strong>Build the call graph and diff it</strong><p>Resolve references into call edges and group them by module. Compare base and candidate: symbols added, removed, or edited, and calls added or removed.</p></div>
+    <div class="step gap"><span class="who">new · server</span><strong>Walk back to entry points</strong><p>From each edited symbol, follow callers back to routes, jobs, and tools, bounded by hop count. Label each call as resolved or ambiguous.</p></div>
+    <div class="step"><span class="who">existing · Bifrost + Evidence</span><strong>Add what actually ran</strong><p>Join functions to <span class="mono">code.function</span> spans from production and CI test traces. Attach the Claims and Verifiers bound to each entry point.</p></div>
+    <div class="step"><span class="who">existing · wyrd-ui</span><strong>Render only</strong><p>The browser lays out the server's projection with <span class="mono">@xyflow/svelte</span> and a fixed layout. It never computes reach or coverage.</p></div>
+  </div>
+</section>
+
+</div>

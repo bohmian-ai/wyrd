@@ -3,36 +3,11 @@
 use std::time::Instant;
 use wyrd_spec::vala::api::QueryClass;
 
-/// Closed query class projection used by every Oracle metric family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OracleQueryClassLabel {
-    /// Latency-sensitive query.
-    Interactive,
-    /// Scan-heavy query.
-    Analytical,
-}
-
-impl OracleQueryClassLabel {
-    /// Every query class used by benchmark telemetry fixtures.
-    #[cfg(feature = "bench-support")]
-    pub(crate) const ALL: [Self; 2] = [Self::Interactive, Self::Analytical];
-
-    /// Return the wire-safe label value.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Interactive => "interactive",
-            Self::Analytical => "analytical",
-        }
-    }
-}
-
-impl From<QueryClass> for OracleQueryClassLabel {
-    /// Project the planner's closed class into the telemetry label domain.
-    fn from(value: QueryClass) -> Self {
-        match value {
-            QueryClass::Interactive => Self::Interactive,
-            QueryClass::Analytical => Self::Analytical,
-        }
+/// Returns the closed metric label every Oracle metric family uses for a class.
+pub(crate) const fn query_class_label(class: QueryClass) -> &'static str {
+    match class {
+        QueryClass::Interactive => "interactive",
+        QueryClass::Analytical => "analytical",
     }
 }
 

@@ -4154,7 +4154,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::oracle::BifrostQueryReadDecision;
     use crate::oracle::bindings::{
         FollowerSourceKey, OracleExecutionBindingInputs, OracleExecutionBindings,
     };
@@ -4176,30 +4175,6 @@ mod tests {
     use wyrd_spec::vala::api::QueryStreamFrame;
 
     use crate::oracle::live::LiveTableRoutes;
-
-    /// In-memory audit sink used only to inspect physical plan structure.
-    struct NoopAudit;
-
-    #[async_trait]
-    impl OracleAudit for NoopAudit {
-        /// Accepts a read-decision event without persisting it in this plan test.
-        async fn append_read_decision(
-            &self,
-            _context: &AuthorizedQueryContext,
-            _decision: BifrostQueryReadDecision,
-        ) -> Result<(), BifrostError> {
-            Ok(())
-        }
-
-        /// Accepts a security-violation event without persisting it in this plan test.
-        async fn append_security_violation(
-            &self,
-            _context: VerifiedSecurityContext,
-            _violation: BifrostSecurityViolation,
-        ) -> Result<(), BifrostError> {
-            Ok(())
-        }
-    }
 
     /// Tenant validation finds foreign rows at every batch position.
     #[test]
@@ -4297,7 +4272,7 @@ mod tests {
                 source,
                 context,
                 "vala.traces.spans".to_owned(),
-                Arc::new(NoopAudit),
+                Arc::new(crate::oracle::AcceptingOracleAudit),
             )
             .expect("tripwire plan");
             assert_eq!(
@@ -4370,7 +4345,7 @@ mod tests {
                 source_union,
                 context,
                 "vala.traces.spans".to_owned(),
-                Arc::new(NoopAudit),
+                Arc::new(crate::oracle::AcceptingOracleAudit),
             )
             .expect("tripwire plan"),
         );
@@ -7268,7 +7243,7 @@ mod tests {
             iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
-            audit: Arc::new(NoopAudit),
+            audit: Arc::new(crate::oracle::AcceptingOracleAudit),
             remote: None,
             live: None,
         })
@@ -7570,7 +7545,7 @@ mod tests {
             iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
-            audit: Arc::new(NoopAudit),
+            audit: Arc::new(crate::oracle::AcceptingOracleAudit),
             remote,
             live: live_routes,
         })

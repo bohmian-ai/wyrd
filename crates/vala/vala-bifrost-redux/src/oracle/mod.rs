@@ -103,7 +103,7 @@ mod tail_discovery;
 pub mod telemetry;
 
 use telemetry::{
-    OracleAdmissionOutcome, OracleAdmissionReason, OracleCancellationReason, OracleQueryClassLabel,
+    OracleAdmissionOutcome, OracleAdmissionReason, OracleCancellationReason, query_class_label,
 };
 
 use admission::AdmittedQueryGuard;
@@ -4058,11 +4058,6 @@ pub(super) fn resolved_table_scopes(cuts: &[PinnedSealedTable]) -> Vec<Permissio
     cuts.iter()
         .map(|cut| resolved_table_scope(&cut.binding, &cut.table_uid))
         .collect()
-}
-
-/// Returns the closed production metric label for one admission class.
-fn query_class_label(class: QueryClass) -> &'static str {
-    OracleQueryClassLabel::from(class).as_str()
 }
 
 /// Returns the closed metric label for one stable late terminal code.

@@ -31,7 +31,10 @@ freshness, or query-class choice. Oracle includes the pinned published cut and
 selected online Scribe live sources in that one plan. A
 normal DataFusion physical root selects Interactive; a
 `datafusion_distributed::DistributedExec` root selects Analytical. Retain and
-execute that exact returned root after path-specific admission. Do not add a
+execute that exact returned root after path-specific admission. The class is
+the execution path and the terminal reports it as `query_class`. A node outside
+peer mode composes no distributed planner, so every root it builds is
+Interactive. Do not add a
 candidate classifier, operator allowlist, second physical build, or fallback
 planner. Representative end-to-end stage-graph queries prove the integrated
 planner, codec, worker, and result path without promising exhaustive operator

@@ -852,8 +852,8 @@ in-progress recovery is a readiness signal, not a metric.
 
 Every active gauge decrements on success, refusal, retry, uncertainty,
 cancellation, and failure. Metric labels use only closed, bounded dimensions
-such as stage, decision, outcome, close reason, query class, execution path,
-route reason, fallback reason, and stage role. Tenant, table, SQL, object path,
+such as stage, decision, outcome, close reason, query class, route reason,
+fallback reason, and stage role. Tenant, table, SQL, object path,
 query ID, task ID, snapshot digest, and other high-cardinality values are
 scrubbed trace fields, never metric labels. Physical size, latency, throughput,
 and SLA claims require measured evidence from the production path.

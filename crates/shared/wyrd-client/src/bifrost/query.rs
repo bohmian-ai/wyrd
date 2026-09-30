@@ -2265,7 +2265,7 @@ mod tests {
     fn success_terminal(rows: u64, arrow_ipc_eos: Vec<u8>) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
             row_count: rows,
             warnings: Vec::new(),
             source_completion: sources(),
@@ -2278,7 +2278,7 @@ mod tests {
     fn degraded_terminal(rows: u64, arrow_ipc_eos: Vec<u8>) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Degraded,
-            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
             row_count: rows,
             warnings: vec![QueryWarning::LiveTailUnavailable],
             source_completion: vec![
@@ -2304,7 +2304,7 @@ mod tests {
     fn failed_terminal(rows: u64) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
             row_count: rows,
             warnings: Vec::new(),
             source_completion: sources(),

@@ -1241,7 +1241,7 @@ pub(super) struct AdmittedQueryGuard {
     resources: Option<crate::resources::OracleQueryResources>,
     /// Parent reservations retaining drained live batches through stream cleanup.
     pub(super) live_reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
-    /// Inactive Analytical graph and attempt ownership retained until cleanup.
+    /// Analytical graph and attempt ownership retained until cleanup.
     ///
     /// Present only on an attempt that the distributed Analytical path leased
     /// a session for. Dropping this guard drops those owners, which
@@ -1352,7 +1352,7 @@ impl AdmittedQueryGuard {
             .is_none_or(crate::resources::OracleQueryResources::nested_idle)
     }
 
-    /// Takes the inactive Analytical ownership so the stream can settle it.
+    /// Takes the Analytical ownership so the stream can settle it.
     ///
     /// Taking rather than borrowing is deliberate: settlement consumes the two
     /// guards, and removing them here means a later drop of this admission

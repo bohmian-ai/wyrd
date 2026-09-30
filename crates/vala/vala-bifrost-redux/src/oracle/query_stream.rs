@@ -187,7 +187,7 @@ impl OracleQueryStream {
 /// Complete owned inputs for one terminal-aware query stream.
 pub(super) struct QueryStreamInput {
     /// Execution path Oracle irreversibly selected before this stream opened.
-    pub(super) execution_path: QueryExecutionPath,
+    pub(super) query_class: QueryClass,
     /// Public output schema drained from the query's own IPC encoder.
     pub(super) schema_frame: QuerySchemaFrame,
     /// The one IPC encoder every batch frame and the terminal EOS come from.
@@ -315,7 +315,7 @@ enum QueryStreamEvent {
 /// Inputs retained by the lazy frame stream until terminal cleanup.
 struct FrameBuildInput {
     /// Execution path every terminal this stream emits must name.
-    execution_path: QueryExecutionPath,
+    query_class: QueryClass,
     /// Encoded public schema frame.
     schema_frame: QuerySchemaFrame,
     /// The one IPC encoder retained for this stream's batches and terminal.
@@ -413,7 +413,7 @@ fn encode_frame(
 
 fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameStream>> {
     let FrameBuildInput {
-        execution_path,
+        query_class,
         schema_frame,
         mut ipc,
         batches,
@@ -463,7 +463,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                         Err(()) => break failed_terminal_on_path(
                             QueryTerminalErrorCode::QueryExecutionFailed,
                             row_count,
-                            execution_path,
+                            query_class,
                         ),
                         Ok(None) => {}
                         Ok(Some(frame)) => {
@@ -482,15 +482,15 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                 QueryStreamEvent::Batch(Some(Err(error))) => {
                     let code = terminal_error_code(&error);
                     tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                    break failed_terminal_on_path(code, row_count, execution_path);
+                    break failed_terminal_on_path(code, row_count, query_class);
                 }
                 QueryStreamEvent::Batch(None) => break exhausted_terminal(
                     &degraded_sources,
                                 row_count,
-                    execution_path,
+                    query_class,
                 ),
                 QueryStreamEvent::Failed(code) => {
-                    break failed_terminal_on_path(code, row_count, execution_path);
+                    break failed_terminal_on_path(code, row_count, query_class);
                 }
             }
         };
@@ -507,7 +507,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
             query_telemetry: &mut query_telemetry,
             gate_lifecycle: gate_lifecycle.as_ref(),
             running_query: &mut running_query,
-            execution_path,
+            query_class,
             row_count,
             reader_protection,
         })
@@ -589,7 +589,7 @@ struct StreamSettlementInputs<'a> {
     /// Running-query registry entry retired with the terminal outcome.
     running_query: &'a mut Option<RunningQueryTerminalOwner>,
     /// Execution path this stream's terminal must name, however it ends.
-    execution_path: QueryExecutionPath,
+    query_class: QueryClass,
     /// Rows emitted before the terminal, reported on every outcome.
     row_count: u64,
     /// Reader-epoch protection released only once nothing can read again.
@@ -617,7 +617,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         query_telemetry,
         gate_lifecycle,
         running_query,
-        execution_path,
+        query_class,
         row_count,
         reader_protection,
     } = inputs;
@@ -646,10 +646,10 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         failed_terminal_on_path(
             QueryTerminalErrorCode::QueryExecutionFailed,
             row_count,
-            execution_path,
+            query_class,
         )
     };
-    let candidate = close_ipc_stream(ipc, candidate, row_count, execution_path);
+    let candidate = close_ipc_stream(ipc, candidate, row_count, query_class);
     let terminal = release_and_finish_terminal(
         admitted,
         query_telemetry,
@@ -758,7 +758,7 @@ async fn settle_distributed(
     }
 }
 
-/// Settles an inactive Analytical attempt before its admission is released.
+/// Settles an Analytical attempt before its admission is released.
 ///
 /// Dropping the admission guard would release the attempt too, but only an
 /// explicit settlement cancels the attempt's cancellation child and joins the
@@ -858,7 +858,7 @@ pub(super) async fn settle_analytical(
 fn exhausted_terminal(
     degraded_sources: &super::DegradedSourceAccumulator,
     row_count: u64,
-    execution_path: QueryExecutionPath,
+    query_class: QueryClass,
 ) -> QueryTerminalFrame {
     let degraded = collect_degraded_sources(degraded_sources);
     if !degraded.reasons.is_empty() {
@@ -868,7 +868,7 @@ fn exhausted_terminal(
             "Oracle query completed with degraded partitions"
         );
     }
-    successful_terminal(&degraded.sources, row_count, execution_path)
+    successful_terminal(&degraded.sources, row_count, query_class)
 }
 
 /// Constructs the validated success/degraded terminal for one completed stream.
@@ -888,7 +888,7 @@ fn exhausted_terminal(
 fn successful_terminal(
     degraded_sources: &[QuerySource],
     row_count: u64,
-    execution_path: QueryExecutionPath,
+    query_class: QueryClass,
 ) -> QueryTerminalFrame {
     let live_tail_lost = degraded_sources.contains(&QuerySource::LiveTail);
     let published_lost = degraded_sources
@@ -898,7 +898,7 @@ fn successful_terminal(
         return failed_terminal_on_path(
             QueryTerminalErrorCode::QueryVisibilityUnavailable,
             row_count,
-            execution_path,
+            query_class,
         );
     }
     let (outcome, live_outcome, warnings) = if live_tail_lost {
@@ -930,7 +930,7 @@ fn successful_terminal(
     ];
     QueryTerminalFrame {
         outcome,
-        execution_path,
+        query_class,
         row_count,
         warnings,
         source_completion,
@@ -1344,7 +1344,7 @@ fn close_ipc_stream(
     ipc: &mut QueryIpcEncoder,
     candidate: QueryTerminalFrame,
     row_count: u64,
-    execution_path: QueryExecutionPath,
+    query_class: QueryClass,
 ) -> QueryTerminalFrame {
     if candidate.outcome == QueryTerminalOutcome::Failed {
         return candidate;
@@ -1359,7 +1359,7 @@ fn close_ipc_stream(
             failed_terminal_on_path(
                 QueryTerminalErrorCode::QueryExecutionFailed,
                 row_count,
-                execution_path,
+                query_class,
             )
         }
     }
@@ -1467,7 +1467,7 @@ impl OracleQueryStream {
             super::admission::admitted_guard_for_test();
         let (ipc, schema_frame) = QueryIpcEncoder::new(schema).expect("test schema frame");
         Self::new(QueryStreamInput {
-            execution_path: QueryExecutionPath::Interactive,
+            query_class: QueryClass::Interactive,
             schema_frame,
             ipc,
             batches,
@@ -1493,7 +1493,7 @@ impl OracleQueryStream {
     pub(super) fn new(input: QueryStreamInput) -> Self {
         let _stream_span = tracing::info_span!("bifrost.oracle.stream").entered();
         let QueryStreamInput {
-            execution_path,
+            query_class,
             schema_frame,
             ipc,
             batches,
@@ -1521,7 +1521,7 @@ impl OracleQueryStream {
         query_telemetry.record_scan_stats(scan_stats);
         query_telemetry.start_stream();
         let frames = build_frames(FrameBuildInput {
-            execution_path,
+            query_class,
             schema_frame,
             ipc,
             batches,
@@ -1626,7 +1626,7 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
-    use wyrd_spec::vala::api::{QueryExecutionPath, QueryWarning};
+    use wyrd_spec::vala::api::QueryWarning;
 
     use super::{OracleQueryStream, QueryStreamInput, QueryStreamLifecycle, successful_terminal};
     use crate::oracle::admission::{active_queries_for_test, admitted_guard_for_test};
@@ -1734,12 +1734,7 @@ mod tests {
         let (mut ipc, _schema_frame) =
             super::QueryIpcEncoder::new(&schema).expect("empty schema opens an IPC stream");
         let row_count = candidate.row_count;
-        super::close_ipc_stream(
-            &mut ipc,
-            candidate,
-            row_count,
-            QueryExecutionPath::Interactive,
-        )
+        super::close_ipc_stream(&mut ipc, candidate, row_count, QueryClass::Interactive)
     }
 
     /// Terminal construction maps each source loss to the one representation
@@ -1750,14 +1745,13 @@ mod tests {
     /// requires both published tiers to be complete.
     #[test]
     fn successful_terminal_maps_source_loss_to_closed_outcomes() {
-        let complete = successful_terminal(&[], 3, QueryExecutionPath::Interactive);
+        let complete = successful_terminal(&[], 3, QueryClass::Interactive);
         assert_eq!(complete.outcome, QueryTerminalOutcome::Success);
         closed(complete)
             .validate()
             .expect("complete terminal validates");
 
-        let live =
-            successful_terminal(&[QuerySource::LiveTail], 2, QueryExecutionPath::Interactive);
+        let live = successful_terminal(&[QuerySource::LiveTail], 2, QueryClass::Interactive);
         assert_eq!(live.outcome, QueryTerminalOutcome::Degraded);
         assert_eq!(live.warnings, vec![QueryWarning::LiveTailUnavailable]);
         closed(live)
@@ -1765,7 +1759,7 @@ mod tests {
             .expect("known live-source degradation validates");
 
         for source in [QuerySource::Iceberg, QuerySource::HotSealed] {
-            let failed = successful_terminal(&[source], 0, QueryExecutionPath::Interactive);
+            let failed = successful_terminal(&[source], 0, QueryClass::Interactive);
             assert_eq!(
                 failed.outcome,
                 QueryTerminalOutcome::Failed,
@@ -1862,9 +1856,9 @@ mod tests {
             super::QueryIpcEncoder::new(schema).expect("empty terminal stream opens");
         let empty_terminal = super::close_ipc_stream(
             &mut empty_terminal_encoder,
-            successful_terminal(&[], 0, QueryExecutionPath::Interactive),
+            successful_terminal(&[], 0, QueryClass::Interactive),
             0,
-            QueryExecutionPath::Interactive,
+            QueryClass::Interactive,
         );
         assert_eq!(empty_terminal.row_count, 0);
         empty_terminal
@@ -1875,9 +1869,9 @@ mod tests {
             super::QueryIpcEncoder::new(schema).expect("mixed terminal stream opens");
         let mixed_terminal = super::close_ipc_stream(
             &mut mixed_terminal_encoder,
-            successful_terminal(&[], 5, QueryExecutionPath::Interactive),
+            successful_terminal(&[], 5, QueryClass::Interactive),
             5,
-            QueryExecutionPath::Interactive,
+            QueryClass::Interactive,
         );
         assert_eq!(mixed_terminal.row_count, 5);
         mixed_terminal
@@ -1930,7 +1924,7 @@ mod tests {
         let failed = failed_terminal_on_path(
             QueryTerminalErrorCode::QueryExecutionFailed,
             0,
-            QueryExecutionPath::Interactive,
+            QueryClass::Interactive,
         );
         assert!(failed.arrow_ipc_eos.is_empty());
         failed
@@ -2089,7 +2083,7 @@ mod tests {
         let telemetry = OracleTelemetry::start_query(QueryClass::Interactive);
         let (ipc, schema_frame) = empty_schema_ipc("production");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
-            execution_path: QueryExecutionPath::Interactive,
+            query_class: QueryClass::Interactive,
             schema_frame,
             ipc,
             batches: Box::pin(RecordBatchStreamAdapter::new(
@@ -2127,7 +2121,7 @@ mod tests {
         ));
         let (ipc, schema_frame) = empty_schema_ipc("post-output-stale");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
-            execution_path: QueryExecutionPath::Interactive,
+            query_class: QueryClass::Interactive,
             schema_frame,
             ipc,
             batches: Box::pin(RecordBatchStreamAdapter::new(
@@ -2164,7 +2158,7 @@ mod tests {
         let (admitted, shared, request_cancellation) = admitted_guard_for_test();
         let (ipc, schema_frame) = empty_schema_ipc("request-cancel");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
-            execution_path: QueryExecutionPath::Interactive,
+            query_class: QueryClass::Interactive,
             schema_frame,
             ipc,
             batches: Box::pin(RecordBatchStreamAdapter::new(

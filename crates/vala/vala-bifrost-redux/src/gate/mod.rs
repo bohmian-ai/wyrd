@@ -2306,7 +2306,7 @@ mod tests {
             let frames = futures_util::stream::iter([Ok(QueryStreamFrame::Terminal(
                 wyrd_spec::vala::api::QueryTerminalFrame {
                     outcome: wyrd_spec::vala::api::QueryTerminalOutcome::Success,
-                    execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                    query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                     row_count: 0,
                     warnings: Vec::new(),
                     source_completion: Vec::new(),

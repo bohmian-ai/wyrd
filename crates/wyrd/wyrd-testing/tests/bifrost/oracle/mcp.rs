@@ -284,7 +284,7 @@ mod pg_tests {
                 .call_tool(query(serde_json::json!({"sql": join_sql, "max_rows": 100})))
                 .await?,
         )?;
-        if joined["terminal"]["execution_path"] != serde_json::json!("analytical") {
+        if joined["terminal"]["query_class"] != serde_json::json!("analytical") {
             return Err(format!("Oracle did not select Analytical: {joined}").into());
         }
         if joined["terminal"]["outcome"] != serde_json::json!("success") {

@@ -640,7 +640,7 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),
                 source_completion: Vec::new(),
@@ -742,7 +742,7 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
@@ -810,7 +810,7 @@ mod tests {
     async fn http_query_stream_preserves_late_failed_terminal() {
         let terminal = QueryStreamFrame::Terminal(QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
             row_count: 1,
             warnings: Vec::new(),
             source_completion: Vec::new(),

@@ -346,8 +346,7 @@ pub(crate) async fn query_rows(client: &WyrdClient, table: &str) -> Result<u64, 
 }
 /// Builds one authenticated in-process query context for the fixture tenant.
 ///
-/// The public SDK cannot reach the inactive path, so the journey authenticates
-/// the same way the public query service does — a tenant-bound principal
+/// The journey drives Oracle in process, so it authenticates the same way the public query service does — a tenant-bound principal
 /// holding exactly `bifrost:query:read` — and hands Oracle the identical
 /// context its own gRPC surface would have built.
 pub(crate) fn query_context(
@@ -371,7 +370,7 @@ pub(crate) fn query_context(
     )?)
 }
 
-/// Allocates the per-query identities one inactive attempt is leased under.
+/// Allocates the per-query identities one Analytical attempt is leased under.
 ///
 /// The two query identities are allocated independently on purpose: a leaked
 /// public identity into the distributed graph, or the reverse, is exactly what

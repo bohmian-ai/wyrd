@@ -140,7 +140,7 @@ async fn serve() -> Result<(), ProcessClusterError> {
     // two is describing a different topology, not a deeper control protocol.
     let mut pause: Option<Arc<vala_bifrost_redux::oracle::analytical::AnalyticalExecutePause>> =
         None;
-    let mut active: Option<InactiveQuerySlot> = None;
+    let mut active: Option<QuerySlot> = None;
     let mut preparation_pause: Option<Arc<OraclePreparationPause>> = None;
     let mut cleanup_pause = None;
     let stdin = std::io::stdin();
@@ -291,14 +291,12 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: "this target composes no Scribe".to_owned(),
                 })?,
             },
-            ControlRequest::ExecuteInactiveSql { sql } => {
-                match config.execute_inactive_sql(&server, &sql).await {
-                    Ok(rows) => emit(&ControlResponse::Executed { rows })?,
-                    Err(error) => emit(&ControlResponse::Failed {
-                        detail: error.to_string(),
-                    })?,
-                }
-            }
+            ControlRequest::ExecuteSql { sql } => match config.execute_sql(&server, &sql).await {
+                Ok(rows) => emit(&ControlResponse::Executed { rows })?,
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
             ControlRequest::ArmAnalyticalPlanFailure => match oracle(&server) {
                 Ok(engine) => {
                     engine.fail_next_analytical_plan_for_test();
@@ -416,15 +414,15 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: error.to_string(),
                 })?,
             },
-            ControlRequest::StartInactiveSql { sql } => {
+            ControlRequest::StartSql { sql } => {
                 if active.is_some() {
                     emit(&ControlResponse::Failed {
-                        detail: "the inactive-query slot is already occupied".to_owned(),
+                        detail: "the query slot is already occupied".to_owned(),
                     })?;
                 } else {
                     match oracle(&server) {
                         Ok(engine) => {
-                            active = Some(InactiveQuerySlot::start(engine, config.tenant_id, sql));
+                            active = Some(QuerySlot::start(engine, config.tenant_id, sql));
                             emit(&ControlResponse::Started)?;
                         }
                         Err(error) => emit(&ControlResponse::Failed {
@@ -433,22 +431,22 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     }
                 }
             }
-            ControlRequest::CancelInactiveSql => match active.as_ref() {
+            ControlRequest::CancelSql => match active.as_ref() {
                 Some(slot) => {
                     slot.cancel();
                     emit(&ControlResponse::CancelRequested)?;
                 }
                 None => emit(&ControlResponse::Failed {
-                    detail: "the inactive-query slot is empty".to_owned(),
+                    detail: "the query slot is empty".to_owned(),
                 })?,
             },
-            ControlRequest::AwaitInactiveSql => match active.take() {
+            ControlRequest::AwaitSql => match active.take() {
                 Some(slot) => {
                     let (rows, detail) = slot.join().await;
-                    emit(&ControlResponse::InactiveOutcome { rows, detail })?;
+                    emit(&ControlResponse::SqlOutcome { rows, detail })?;
                 }
                 None => emit(&ControlResponse::Failed {
-                    detail: "the inactive-query slot is empty".to_owned(),
+                    detail: "the query slot is empty".to_owned(),
                 })?,
             },
             ControlRequest::CaptureResourceEvidence { directory } => {
@@ -483,14 +481,14 @@ async fn serve() -> Result<(), ProcessClusterError> {
 /// to act on a query while it is running — pause a follower, kill it, cancel
 /// from the leader — cannot use the synchronous execute request. This owns that
 /// statement's task and its cancellation, and nothing else about it.
-struct InactiveQuerySlot {
+struct QuerySlot {
     /// The running statement.
     task: tokio::task::JoinHandle<Result<usize, ProcessClusterError>>,
     /// Cancellation the leader selects on, mirroring a caller drop.
     cancel: tokio_util::sync::CancellationToken,
 }
 
-impl InactiveQuerySlot {
+impl QuerySlot {
     /// Starts one statement and returns immediately.
     fn start(
         engine: Arc<vala_bifrost_redux::oracle::Oracle>,
@@ -503,9 +501,9 @@ impl InactiveQuerySlot {
             let mut fold = ResultFold::default();
             tokio::select! {
                 () = token.cancelled() => Err(ProcessClusterError::Child(
-                    "the inactive attempt was cancelled by its caller".to_owned(),
+                    "the attempt was cancelled by its caller".to_owned(),
                 )),
-                outcome = drive_inactive_sql(engine, tenant_id, sql, &mut fold) => outcome,
+                outcome = drive_sql(engine, tenant_id, sql, &mut fold) => outcome,
             }
         });
         Self { task, cancel }
@@ -679,7 +677,7 @@ fn accept_query_terminal(
         .map_err(|error| child(error.to_string()))?;
     if terminal.outcome != wyrd_spec::vala::api::QueryTerminalOutcome::Success {
         return Err(child(format!(
-            "the inactive attempt ended on a {:?} terminal: {:?}",
+            "the attempt ended on a {:?} terminal: {:?}",
             terminal.outcome, terminal.error
         )));
     }
@@ -688,7 +686,7 @@ fn accept_query_terminal(
         .map_err(|error| child(error.to_string()))?;
     if !decoder.eos_accepted() {
         return Err(child(
-            "the inactive attempt never closed its Arrow IPC stream".to_owned(),
+            "the attempt never closed its Arrow IPC stream".to_owned(),
         ));
     }
     Ok(emitted_rows)
@@ -953,7 +951,7 @@ impl ChildConfig {
         Ok(())
     }
 
-    /// Runs one statement through this node's inactive Analytical path.
+    /// Runs one statement through this node's Analytical path.
     ///
     /// The stream is drained to its terminal frame rather than dropped early,
     /// so the graph and attempt guards it carries settle before the parent
@@ -966,12 +964,12 @@ impl ChildConfig {
     /// Returns [`ProcessClusterError::Child`] when this target composes no
     /// Oracle, the context cannot be authorized, or the attempt fails at
     /// admission, planning, execution, or decode.
-    async fn execute_inactive_sql(
+    async fn execute_sql(
         &self,
         server: &WyrdTestServer,
         sql: &str,
     ) -> Result<usize, ProcessClusterError> {
-        drive_inactive_sql(
+        drive_sql(
             oracle(server)?,
             self.tenant_id,
             sql.to_owned(),
@@ -1027,7 +1025,7 @@ impl ChildConfig {
         let settled_before = supervisor.settled_graph_count();
 
         let mut fold = ResultFold::default();
-        let rows = drive_inactive_sql(
+        let rows = drive_sql(
             Arc::clone(&engine),
             self.tenant_id,
             sql.to_owned(),
@@ -1326,7 +1324,7 @@ fn spill_root(
         .ok_or_else(|| ProcessClusterError::Child("this node composes no spill root".to_owned()))
 }
 
-/// Drives one statement through the production inactive Analytical path.
+/// Drives one statement through the production path.
 ///
 /// Owns everything it needs, so the same body serves both the synchronous
 /// control request and the single active slot a peer-loss journey starts.
@@ -1335,7 +1333,7 @@ fn spill_root(
 ///
 /// Returns [`ProcessClusterError::Child`] when admission, planning, execution,
 /// or decoding fails, which is the attempt's own terminal failure.
-async fn drive_inactive_sql(
+async fn drive_sql(
     engine: Arc<vala_bifrost_redux::oracle::Oracle>,
     tenant_id: wyrd_spec::DataTenantId,
     sql: String,
@@ -1361,28 +1359,13 @@ async fn drive_inactive_sql(
             permission,
         )
         .map_err(|error| child(error.to_string()))?;
-        // Both query identities are allocated independently on purpose: a
-        // leaked public identity into the distributed graph, or the reverse,
-        // is exactly what the stage authority's isolation exists to refuse.
-        let attempt = vala_bifrost_redux::oracle::analytical::AnalyticalAttemptContext {
-            public_query_id: vala_bifrost_redux::oracle::analytical::PublicQueryId::from_uuid(
-                uuid::Uuid::now_v7(),
-            ),
-            datafusion_query_id:
-                vala_bifrost_redux::oracle::analytical::DataFusionQueryId::from_uuid(
-                    uuid::Uuid::now_v7(),
-                ),
-            snapshot_digest: format!("snapshot-{}", uuid::Uuid::now_v7().simple()),
-            permission_digest: format!("permission-{}", uuid::Uuid::now_v7().simple()),
-        };
         let mut stream = engine
-            .query_sql_inactive_analytical(
+            .query_sql(
                 context,
                 wyrd_spec::vala::api::BifrostQueryRequest {
                     sql: sql.to_owned(),
                     deadline_ms: Some(STATEMENT_DEADLINE_MS.cast_signed()),
                 },
-                attempt,
             )
             .await
             .map_err(|error| child(error.to_string()))?;
@@ -1406,8 +1389,8 @@ async fn drive_inactive_sql(
                 wyrd_spec::vala::api::QueryStreamFrame::Terminal(frame) => terminal = Some(frame),
             }
         }
-        let terminal = terminal
-            .ok_or_else(|| child("the inactive attempt emitted no terminal frame".to_owned()))?;
+        let terminal =
+            terminal.ok_or_else(|| child("the attempt emitted no terminal frame".to_owned()))?;
         accept_query_terminal(&terminal, rows, &mut decoder)
     }
 }
@@ -1830,7 +1813,7 @@ mod tests {
     ///
     /// Panics when the fixture stream cannot be encoded or decoded.
     #[test]
-    fn inactive_sql_terminal_rejects_failed_output_after_rows() {
+    fn sql_terminal_rejects_failed_output_after_rows() {
         let schema = Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
         ]));
@@ -1859,7 +1842,7 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
             row_count: u64::try_from(emitted).expect("a fixture row count fits a u64"),
             warnings: Vec::new(),
             source_completion: vec![

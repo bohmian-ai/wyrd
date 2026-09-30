@@ -166,14 +166,14 @@ impl ProcessNodeTarget {
 pub enum ControlRequest {
     /// Report this child's current identity, addresses, and membership.
     Inspect,
-    /// Execute one statement through the inactive Analytical path.
-    ExecuteInactiveSql {
+    /// Execute one statement through the Analytical path.
+    ExecuteSql {
         /// Statement to execute.
         sql: String,
     },
     /// Execute one statement and report its complete physical evidence.
     ///
-    /// Distinct from [`ControlRequest::ExecuteInactiveSql`] because the
+    /// Distinct from [`ControlRequest::ExecuteSql`] because the
     /// evidence a physical baseline needs — the admitted grant, the scratch
     /// occupancy on either side, the result digest, and the executed plan's own
     /// spill counters — only exists inside the process that ran the query.
@@ -272,15 +272,15 @@ pub enum ControlRequest {
     AwaitCleanupPaused,
     /// Release and clear the graph-release hold.
     ReleaseCleanupPause,
-    /// Start one statement in this child's single active inactive-query slot.
-    StartInactiveSql {
+    /// Start one statement in this child's single query slot.
+    StartSql {
         /// Statement to execute.
         sql: String,
     },
     /// Cancel the statement occupying that slot.
-    CancelInactiveSql,
+    CancelSql,
     /// Block until that statement reaches its terminal and report it.
-    AwaitInactiveSql,
+    AwaitSql,
     /// Write this child's raw metrics exposition and cgroup files, and report
     /// its effective limits and resource plan.
     ///
@@ -450,7 +450,7 @@ pub enum ControlResponse {
     Ready(NodeReport),
     /// Answer to [`ControlRequest::Inspect`].
     Inspection(NodeReport),
-    /// Answer to [`ControlRequest::ExecuteInactiveSql`].
+    /// Answer to [`ControlRequest::ExecuteSql`].
     Executed {
         /// Rows the statement produced.
         rows: usize,
@@ -499,12 +499,12 @@ pub enum ControlResponse {
         /// None while this candidate has not pinned the matching request.
         deadline_ms: Option<i64>,
     },
-    /// Answer to [`ControlRequest::StartInactiveSql`].
+    /// Answer to [`ControlRequest::StartSql`].
     Started,
-    /// Answer to [`ControlRequest::CancelInactiveSql`].
+    /// Answer to [`ControlRequest::CancelSql`].
     CancelRequested,
-    /// Answer to [`ControlRequest::AwaitInactiveSql`].
-    InactiveOutcome {
+    /// Answer to [`ControlRequest::AwaitSql`].
+    SqlOutcome {
         /// Rows the statement produced, when it succeeded.
         rows: Option<usize>,
         /// The terminal failure, when it did not.
@@ -1537,7 +1537,7 @@ impl ProcessNode {
         }
     }
 
-    /// Asks this child to run one statement through inactive Analytical.
+    /// Asks this child to run one statement through Oracle.
     ///
     /// Returns the row count the attempt produced. Nothing in production
     /// routing reaches this seam; the child builds the same authorized
@@ -1549,8 +1549,8 @@ impl ProcessNode {
     ///
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when the attempt itself failed.
-    pub fn execute_inactive_sql(&mut self, sql: &str) -> Result<usize, ProcessClusterError> {
-        match self.request(&ControlRequest::ExecuteInactiveSql {
+    pub fn execute_sql(&mut self, sql: &str) -> Result<usize, ProcessClusterError> {
+        match self.request(&ControlRequest::ExecuteSql {
             sql: sql.to_owned(),
         })? {
             ControlResponse::Executed { rows } => Ok(rows),
@@ -1883,15 +1883,15 @@ impl ProcessNode {
         }
     }
 
-    /// Starts one statement in this child's single active inactive-query slot.
+    /// Starts one statement in this child's single query slot.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when the slot is already occupied.
-    pub fn start_inactive_sql(&mut self, sql: &str) -> Result<(), ProcessClusterError> {
+    pub fn start_sql(&mut self, sql: &str) -> Result<(), ProcessClusterError> {
         self.require(
-            &ControlRequest::StartInactiveSql {
+            &ControlRequest::StartSql {
                 sql: sql.to_owned(),
             },
             |response| matches!(response, ControlResponse::Started),
@@ -1904,8 +1904,8 @@ impl ProcessNode {
     ///
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when the slot is empty.
-    pub fn cancel_inactive_sql(&mut self) -> Result<(), ProcessClusterError> {
-        self.require(&ControlRequest::CancelInactiveSql, |response| {
+    pub fn cancel_sql(&mut self) -> Result<(), ProcessClusterError> {
+        self.require(&ControlRequest::CancelSql, |response| {
             matches!(response, ControlResponse::CancelRequested)
         })
     }
@@ -1919,18 +1919,18 @@ impl ProcessNode {
     ///
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when the slot is empty.
-    pub fn await_inactive_sql(&mut self) -> Result<Result<usize, String>, ProcessClusterError> {
-        match self.request(&ControlRequest::AwaitInactiveSql)? {
-            ControlResponse::InactiveOutcome {
+    pub fn await_sql(&mut self) -> Result<Result<usize, String>, ProcessClusterError> {
+        match self.request(&ControlRequest::AwaitSql)? {
+            ControlResponse::SqlOutcome {
                 rows: Some(rows), ..
             } => Ok(Ok(rows)),
-            ControlResponse::InactiveOutcome {
+            ControlResponse::SqlOutcome {
                 detail: Some(detail),
                 ..
             } => Ok(Err(detail)),
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
-                "expected an inactive-query outcome, received {other:?}"
+                "expected a query-slot outcome, received {other:?}"
             ))),
         }
     }

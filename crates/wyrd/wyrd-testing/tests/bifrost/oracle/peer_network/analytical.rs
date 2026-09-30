@@ -77,7 +77,7 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
-    let rows = cluster.nodes_mut()[LEADER].execute_inactive_sql(&sql)?;
+    let rows = cluster.nodes_mut()[LEADER].execute_sql(&sql)?;
     if rows != 3 {
         return Err(PeerJourneyError::from(format!(
             "the distributed attempt must return one row per group, returned {rows}"
@@ -105,7 +105,7 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
     // A second attempt takes a second reservation and returns it too, which is
     // what distinguishes a lease that is released from one that was merely
     // never charged again.
-    let repeated = cluster.nodes_mut()[LEADER].execute_inactive_sql(&sql)?;
+    let repeated = cluster.nodes_mut()[LEADER].execute_sql(&sql)?;
     if repeated != 3 {
         return Err(PeerJourneyError::from(format!(
             "the repeated attempt must return one row per group, returned {repeated}"
@@ -195,7 +195,7 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
-    cluster.nodes_mut()[LEADER].start_inactive_sql(&sql)?;
+    cluster.nodes_mut()[LEADER].start_sql(&sql)?;
     cluster.nodes_mut()[paused].await_execute_paused()?;
 
     let (activated, live) = cluster.nodes_mut()[paused].graph_leases()?;
@@ -207,10 +207,10 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
 
     match cause {
         TerminalCause::PeerLoss => cluster.nodes_mut()[paused].kill()?,
-        TerminalCause::Cancellation => cluster.nodes_mut()[LEADER].cancel_inactive_sql()?,
+        TerminalCause::Cancellation => cluster.nodes_mut()[LEADER].cancel_sql()?,
     }
 
-    let outcome = cluster.nodes_mut()[LEADER].await_inactive_sql()?;
+    let outcome = cluster.nodes_mut()[LEADER].await_sql()?;
     if let Ok(rows) = outcome {
         return Err(PeerJourneyError::from(format!(
             "a lost peer must not produce a successful result, returned {rows} rows"
@@ -348,7 +348,7 @@ const EXCHANGE_COUNTERS: [&str; 2] = [
 /// Panics when the baseline cannot be driven across the process topology.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn inactive_baseline_executes_join_group_spill_and_interchangeable_topology() {
+async fn baseline_executes_join_group_spill_and_interchangeable_topology() {
     prove_physical_analytical_baseline()
         .await
         .expect("physical analytical baseline journey");
@@ -1547,7 +1547,7 @@ async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyE
     // The first graph occupies the receiver's only Analytical envelope and is
     // held there with its lease active.
     cluster.nodes_mut()[RETRY_RECEIVER].arm_execute_pause()?;
-    cluster.nodes_mut()[RETRY_LEADERS[0]].start_inactive_sql(&sql)?;
+    cluster.nodes_mut()[RETRY_LEADERS[0]].start_sql(&sql)?;
     cluster.nodes_mut()[RETRY_RECEIVER].await_execute_paused()?;
     let held = cluster.nodes_mut()[RETRY_RECEIVER].ownership_snapshot()?;
     if held.root_analytical_queries != 1 || held.follower_graphs != 1 {
@@ -1556,7 +1556,7 @@ async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyE
 
     // The second graph is admitted by its own leader, so the only thing it can
     // be waiting on is placement on the saturated receiver.
-    cluster.nodes_mut()[RETRY_LEADERS[1]].start_inactive_sql(&sql)?;
+    cluster.nodes_mut()[RETRY_LEADERS[1]].start_sql(&sql)?;
     await_leader_placing(&mut cluster, RETRY_LEADERS[1]).await?;
     let receiver_slots = u32::try_from(RETRY_RECEIVER_SLOTS)?;
     for _ in 0..RETRY_OBSERVATION_POLLS {
@@ -1584,7 +1584,7 @@ async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyE
     // well inside the statement's original deadline.
     cluster.nodes_mut()[RETRY_RECEIVER].release_execute_pause()?;
     for leader in RETRY_LEADERS {
-        match cluster.nodes_mut()[leader].await_inactive_sql()? {
+        match cluster.nodes_mut()[leader].await_sql()? {
             Ok(3) => {}
             Ok(rows) => {
                 return Err(format!("leader {leader} returned {rows} groups, not 3").into());

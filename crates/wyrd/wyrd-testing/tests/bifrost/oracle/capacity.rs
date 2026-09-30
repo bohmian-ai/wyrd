@@ -200,13 +200,12 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
             .engine(),
     );
     let mut analytical = engine
-        .query_sql_inactive_analytical(
+        .query_sql(
             query_context(tenant_a)?,
             BifrostQueryRequest {
                 sql: analytical_baseline_sql(&left, &right),
                 deadline_ms: Some(ANALYTICAL_DEADLINE_MS),
             },
-            attempt_context(),
         )
         .await?;
     let analytical_probe = analytical.resource_probe_for_test();

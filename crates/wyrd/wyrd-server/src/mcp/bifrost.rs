@@ -746,7 +746,7 @@ fn project_columns(schema: &arrow::datatypes::Schema) -> Vec<JsonValue> {
 fn project_terminal(frame: &QueryTerminalFrame) -> JsonValue {
     serde_json::json!({
         "outcome": frame.outcome,
-        "execution_path": frame.execution_path,
+        "query_class": frame.query_class,
         "row_count": frame.row_count,
         "warnings": frame.warnings,
         "source_completion": frame.source_completion,
@@ -771,7 +771,7 @@ mod tests {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryExecutionPath, QuerySchemaFrame, QuerySource, QueryStreamFrame,
+        QueryBatchFrame, QueryClass, QuerySchemaFrame, QuerySource, QueryStreamFrame,
         QueryTerminalError, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
         SourceCompletion, SourceCompletionOutcome,
     };
@@ -839,7 +839,7 @@ mod tests {
             })),
             Ok(QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                execution_path: QueryExecutionPath::Interactive,
+                query_class: QueryClass::Interactive,
                 row_count: 2,
                 warnings: Vec::new(),
                 source_completion: [
@@ -1119,7 +1119,7 @@ mod tests {
             "principal_id",
             "delegation_chain",
             "roles",
-            "execution_path",
+            "query_class",
             "path",
             "query_class",
             "visibility",

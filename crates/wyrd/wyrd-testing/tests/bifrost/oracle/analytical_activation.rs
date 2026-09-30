@@ -24,7 +24,7 @@ use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryExecutionPath};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::process_cluster::BifrostProcessCluster;
 use wyrd_testing::bifrost::process_cluster::{OracleOwnershipSnapshot, ProcessNodeTarget};
@@ -467,7 +467,7 @@ struct PublicSettlement {
     /// Row count the server's own terminal frame reported.
     terminal_rows: u64,
     /// Server-selected execution path.
-    path: QueryExecutionPath,
+    path: QueryClass,
     /// Absolute deadline the response header pinned.
     deadline_ms: i64,
 }
@@ -507,7 +507,7 @@ async fn run_public_request(
     Ok(PublicSettlement {
         rows,
         terminal_rows: terminal.row_count,
-        path: terminal.execution_path,
+        path: terminal.query_class,
         deadline_ms,
     })
 }
@@ -547,7 +547,7 @@ async fn run_self_join(
         PublicSettlement {
             rows,
             terminal_rows: terminal.row_count,
-            path: terminal.execution_path,
+            path: terminal.query_class,
             deadline_ms,
         },
         decoded,
@@ -707,7 +707,7 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let scan = run_public(&client, &scan_sql).await?;
     expect_public(
         &scan,
-        QueryExecutionPath::Interactive,
+        QueryClass::Interactive,
         usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)?,
         "normal root",
     )?;
@@ -716,7 +716,7 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let grouped = run_public(&client, &grouped_sql).await?;
     expect_public(
         &grouped,
-        QueryExecutionPath::Analytical,
+        QueryClass::Analytical,
         usize::try_from(FIXTURE_GROUPS)?,
         "distributed root",
     )?;
@@ -757,7 +757,7 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let (self_join, self_join_result) = run_self_join(&client, &self_join_sql).await?;
     expect_public(
         &self_join,
-        QueryExecutionPath::Analytical,
+        QueryClass::Analytical,
         SELF_JOIN_RESULT.len(),
         "same-table self-join",
     )?;
@@ -944,7 +944,7 @@ async fn prove_preparation_deadline(
         terminal.outcome,
         wyrd_spec::vala::api::QueryTerminalOutcome::Success
     );
-    assert_eq!(terminal.execution_path, QueryExecutionPath::Analytical);
+    assert_eq!(terminal.query_class, QueryClass::Analytical);
     assert_eq!(terminal.row_count, u64::try_from(FIXTURE_GROUPS)?);
     let mut builds = 0;
     for (index, ownership, before) in baseline {
@@ -1003,7 +1003,7 @@ fn pinned_parquet(cluster: &BifrostProcessCluster, table: &str) -> Result<String
 /// Returns a description naming the case, the expectation, and what was seen.
 fn expect_public(
     settled: &PublicSettlement,
-    path: QueryExecutionPath,
+    path: QueryClass,
     rows: usize,
     case: &str,
 ) -> Result<(), JourneyError> {
@@ -1145,7 +1145,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     // admitted envelope and both followers hold their leases: the Interactive
     // floor is what makes that concurrency possible rather than a queue.
     let ui = run_public(&client, &ui_sql).await?;
-    if ui.path != QueryExecutionPath::Interactive {
+    if ui.path != QueryClass::Interactive {
         return Err(format!(
             "a UI query alongside a held Analytical graph must stay Interactive, settled {:?}",
             ui.path
@@ -1183,7 +1183,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
 
     cluster.nodes_mut()[paused].release_execute_pause()?;
     let analytical = held.await??;
-    if analytical.path != QueryExecutionPath::Analytical {
+    if analytical.path != QueryClass::Analytical {
         return Err(format!(
             "the supported data-scientist query must select Analytical, settled {:?}",
             analytical.path
@@ -1685,7 +1685,7 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     // the units Interactive work is owed.
     let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
     let ui = run_public(&client, &ui_sql).await?;
-    if ui.path != QueryExecutionPath::Interactive {
+    if ui.path != QueryClass::Interactive {
         return Err(format!(
             "a UI query alongside a held Analytical graph must stay Interactive, settled {:?}",
             ui.path
@@ -1700,7 +1700,7 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
         cluster.nodes_mut()[index].release_execute_pause()?;
     }
     let settled = attempt.await??;
-    if settled.path != QueryExecutionPath::Analytical {
+    if settled.path != QueryClass::Analytical {
         return Err(format!(
             "the bounded attempt settled {:?}, not Analytical",
             settled.path
@@ -1784,9 +1784,9 @@ async fn prove_cancelled_query_returns_owners(
     sql: &str,
     baseline: &[(usize, OracleOwnershipSnapshot)],
 ) -> Result<(), JourneyError> {
-    cluster.nodes_mut()[COORDINATOR].start_inactive_sql(sql)?;
-    cluster.nodes_mut()[COORDINATOR].cancel_inactive_sql()?;
-    if let Ok(rows) = cluster.nodes_mut()[COORDINATOR].await_inactive_sql()? {
+    cluster.nodes_mut()[COORDINATOR].start_sql(sql)?;
+    cluster.nodes_mut()[COORDINATOR].cancel_sql()?;
+    if let Ok(rows) = cluster.nodes_mut()[COORDINATOR].await_sql()? {
         return Err(format!("a cancelled logical query still returned {rows} rows").into());
     }
     for (index, before) in baseline {

@@ -10,7 +10,7 @@ use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryExecutionPath};
+use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryClass};
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
@@ -452,10 +452,10 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
     if scheduled.rows != FIXTURE_VALUES.len() as u64 {
         return Err(format!("the scheduled query returned {} rows", scheduled.rows).into());
     }
-    if scheduled.terminal.execution_path != path {
+    if scheduled.terminal.query_class != path {
         return Err(format!(
             "the scheduled query settled {:?} where the public query settled {path:?}",
-            scheduled.terminal.execution_path
+            scheduled.terminal.query_class
         )
         .into());
     }
@@ -530,7 +530,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
 /// Returns a status, decode, or missing-terminal error.
 async fn drain_grpc(
     mut frames: wyrd_tonic::tonic::Streaming<proto::QueryStreamFrame>,
-) -> Result<(usize, QueryExecutionPath), ServerJourneyError> {
+) -> Result<(usize, QueryClass), ServerJourneyError> {
     let mut decoder = QueryIpcDecoder::new();
     let mut rows = 0_usize;
     let mut path = None;
@@ -543,15 +543,13 @@ async fn drain_grpc(
                 rows += decoder.accept_batch(&batch.arrow_ipc_batch)?.num_rows();
             }
             Some(proto::query_stream_frame::Frame::Terminal(terminal)) => {
-                path = Some(
-                    match proto::QueryExecutionPath::try_from(terminal.execution_path)? {
-                        proto::QueryExecutionPath::Analytical => QueryExecutionPath::Analytical,
-                        proto::QueryExecutionPath::Interactive => QueryExecutionPath::Interactive,
-                        proto::QueryExecutionPath::Unspecified => {
-                            return Err("the terminal named no execution path".into());
-                        }
-                    },
-                );
+                path = Some(match proto::QueryClass::try_from(terminal.query_class)? {
+                    proto::QueryClass::Analytical => QueryClass::Analytical,
+                    proto::QueryClass::Interactive => QueryClass::Interactive,
+                    proto::QueryClass::Unspecified => {
+                        return Err("the terminal named no execution path".into());
+                    }
+                });
             }
             None => return Err("the gRPC stream carried an empty frame".into()),
         }
@@ -771,10 +769,7 @@ async fn prove_scheduled_analytical_completion(
         outcome.terminal.outcome,
         wyrd_spec::vala::api::QueryTerminalOutcome::Success
     );
-    assert_eq!(
-        outcome.terminal.execution_path,
-        QueryExecutionPath::Analytical
-    );
+    assert_eq!(outcome.terminal.query_class, QueryClass::Analytical);
     assert_eq!(outcome.rows, u64::try_from(FIXTURE_VALUES.len())?);
     assert_eq!(outcome.terminal.row_count, outcome.rows);
     assert_scheduled_owners_released(cluster)?;

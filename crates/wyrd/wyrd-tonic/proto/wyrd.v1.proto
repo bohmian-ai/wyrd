@@ -17,7 +17,6 @@ service BifrostQueryService {
 
 enum QueryTerminalOutcome { QUERY_TERMINAL_OUTCOME_UNSPECIFIED = 0; QUERY_TERMINAL_OUTCOME_SUCCESS = 1; QUERY_TERMINAL_OUTCOME_DEGRADED = 2; QUERY_TERMINAL_OUTCOME_FAILED = 3; }
 enum RunningQueryLifecycleState { RUNNING_QUERY_LIFECYCLE_STATE_UNSPECIFIED = 0; RUNNING_QUERY_LIFECYCLE_STATE_ADMITTED = 1; RUNNING_QUERY_LIFECYCLE_STATE_RUNNING = 2; RUNNING_QUERY_LIFECYCLE_STATE_CANCELLING = 3; }
-enum QueryExecutionPath { QUERY_EXECUTION_PATH_UNSPECIFIED = 0; QUERY_EXECUTION_PATH_INTERACTIVE = 1; QUERY_EXECUTION_PATH_ANALYTICAL = 2; }
 enum QuerySource { QUERY_SOURCE_UNSPECIFIED = 0; QUERY_SOURCE_ICEBERG = 1; QUERY_SOURCE_HOT_SEALED = 2; QUERY_SOURCE_LIVE_TAIL = 3; }
 enum SourceCompletionOutcome { SOURCE_COMPLETION_OUTCOME_UNSPECIFIED = 0; SOURCE_COMPLETION_OUTCOME_COMPLETE = 1; SOURCE_COMPLETION_OUTCOME_UNAVAILABLE = 2; }
 enum QueryWarning { QUERY_WARNING_UNSPECIFIED = 0; QUERY_WARNING_LIVE_TAIL_UNAVAILABLE = 1; QUERY_WARNING_STALE_CUT_REPLANNED = 2; }
@@ -52,8 +51,9 @@ message QueryTerminalFrame {
   // Arrow IPC end-of-stream delta closing the query's single IPC stream.
   // Required on success/degraded, and empty on failure.
   bytes arrow_ipc_eos = 7;
-  // Server-selected execution path. Never a request field.
-  QueryExecutionPath execution_path = 8;
+  // Server-derived query class, which is also the path that ran. Never a
+  // request field.
+  QueryClass query_class = 8;
 }
 message QueryStreamFrame {
   oneof frame { QuerySchemaFrame schema = 1; QueryBatchFrame batch = 2; QueryTerminalFrame terminal = 3; }

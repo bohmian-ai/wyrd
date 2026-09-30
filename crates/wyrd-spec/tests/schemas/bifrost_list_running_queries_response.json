@@ -17,17 +17,17 @@
   },
   "definitions": {
     "QueryClass": {
-      "description": "Server-derived admission class.",
+      "description": "Server-derived class of one query: how Oracle admits and executes it.\n\nNever a request field. Oracle reads it from the one physical root it built: a distributed root is Analytical, anything else Interactive. The class selects the admission rules and the execution path together, so the terminal's class is also the path that ran.",
       "oneOf": [
         {
-          "description": "Latency-sensitive bounded work.",
+          "description": "Executed locally on the leader.",
           "type": "string",
           "enum": [
             "interactive"
           ]
         },
         {
-          "description": "Larger analytical work.",
+          "description": "Executed as a distributed graph across Oracle peers.",
           "type": "string",
           "enum": [
             "analytical"

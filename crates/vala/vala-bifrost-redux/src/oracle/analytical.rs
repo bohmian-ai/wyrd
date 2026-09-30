@@ -7694,7 +7694,7 @@ impl WorkerResolver for AnalyticalWorkerResolver {
     }
 }
 
-/// Node-scoped configuration for the inactive Analytical execution handle.
+/// Node-scoped configuration for the Analytical execution handle.
 pub struct AnalyticalExecutionConfig {
     /// This node's own identity, minted as every ticket's source.
     pub node_id: NodeId,
@@ -7706,7 +7706,7 @@ pub struct AnalyticalExecutionConfig {
     pub peer_tls: BifrostPeerTls,
 }
 
-/// What one inactive Analytical execution left behind once it drained.
+/// What one Analytical execution left behind once it drained.
 ///
 /// Every field is observed *after* the attempt settled, so a nonzero retained
 /// count is a leak rather than work still in flight.
@@ -7907,7 +7907,7 @@ impl AnalyticalExecutionHandle {
         })
     }
 
-    /// Installs one inactive Analytical attempt and returns its leader session.
+    /// Installs one Analytical attempt and returns its leader session.
     ///
     /// This is the seam Oracle's raw-SQL harness leases through. Everything
     /// before it — validation, classification, the participant cut, providers,
@@ -8308,7 +8308,7 @@ struct AnalyticalSessionInputs<'a> {
     work_units: usize,
 }
 
-/// The per-query identities one inactive Analytical attempt is leased under.
+/// The per-query identities one Analytical attempt is leased under.
 ///
 /// These are the parts of the coordinator identity that a caller allocates
 /// rather than the handle: the two query identities and the three digests the
@@ -8325,7 +8325,7 @@ pub struct AnalyticalAttemptContext {
     pub permission_digest: String,
 }
 
-/// Graph and attempt ownership retained for one inactive Analytical attempt.
+/// Graph and attempt ownership retained for one Analytical attempt.
 ///
 /// The two guards are kept together because they release in a fixed order:
 /// the attempt returns its exchange-buffer and memory children to the query
@@ -8378,7 +8378,7 @@ impl AnalyticalAttemptOwnership {
 
     /// Moves the admission owner into the graph that holds this query's envelope.
     ///
-    /// Both seams use this: the inactive attempt, which holds no query stream,
+    /// Both seams use this: the attempt, which holds no query stream,
     /// and the production stream at its terminal. Storing the permit on the
     /// graph is what makes admission follow ownership — a graph retained as
     /// `Draining` keeps the envelope *and* the counters charged, so a queued

@@ -1,4 +1,4 @@
-//! Attempt-scoped supervision for Oracle's inactive Analytical execution path.
+//! Attempt-scoped supervision for Oracle's Analytical execution path.
 //!
 //! A distributed graph fans work out across followers, so nothing about its
 //! cleanup is implied by a leader stream ending. This module owns the one place
@@ -20,9 +20,8 @@
 //!   of the same key finds nothing and refuses, so no child reservation is
 //!   returned twice and no gauge is decremented twice.
 //!
-//! The supervisor is inactive in T1: production Oracle routing still selects the
-//! Interactive path, and only [`super::analytical`]'s inactive handle and the
-//! crate's tests construct one.
+//! [`super::analytical`]'s execution handle constructs the one per-node
+//! supervisor when Oracle runs in peer mode.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -349,7 +348,7 @@ pub struct AnalyticalSupervisorInspection {
 
 /// Node-local owner of every live Analytical attempt.
 ///
-/// One supervisor exists per Oracle node and is shared by the leader's inactive
+/// One supervisor exists per Oracle node and is shared by the leader's
 /// execution handle and by the follower ingress that installs stage plans. It
 /// owns the node's [`AnalyticalRuntimeRegistry`], so registering an attempt and
 /// making its graph resolvable to upstream session construction are the same

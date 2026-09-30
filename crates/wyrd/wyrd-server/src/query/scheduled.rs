@@ -386,7 +386,7 @@ mod tests {
     fn success_terminal(row_count: u64, arrow_ipc_eos: Vec<u8>) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
             row_count,
             warnings: Vec::new(),
             source_completion: vec![

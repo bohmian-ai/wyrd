@@ -1,4 +1,4 @@
-//! Oracle journeys — the inactive distributed Analytical engine.
+//! Oracle journeys — the distributed Analytical engine.
 //!
 //! Every journey here begins at raw SQL and runs the complete production
 //! attempt path — validation, classification, the participant cut, providers,
@@ -28,7 +28,7 @@ use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use crate::support::*;
 
-/// One drained inactive Analytical result.
+/// One drained Analytical result.
 struct AnalyticalOutcome {
     /// Every decoded Arrow batch the distributed plan produced, in order.
     batches: Vec<RecordBatch>,
@@ -41,7 +41,7 @@ impl AnalyticalOutcome {
     }
 }
 
-/// Runs one raw SQL statement through the inactive Analytical path and drains it.
+/// Runs one raw SQL statement through the Analytical path and drains it.
 ///
 /// The stream is drained to its terminal frame rather than dropped early, so
 /// the graph and attempt guards it carries settle before the caller inspects
@@ -52,7 +52,7 @@ impl AnalyticalOutcome {
 ///
 /// Returns a role-unavailable, admission, planning, execution, decode, or
 /// terminal-contract error surfaced by the attempt.
-async fn execute_inactive_analytical(
+async fn execute_analytical(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     sql: &str,
@@ -65,13 +65,12 @@ async fn execute_inactive_analytical(
             .engine(),
     );
     let mut stream = engine
-        .query_sql_inactive_analytical(
+        .query_sql(
             query_context(tenant)?,
             BifrostQueryRequest {
                 sql: sql.to_owned(),
                 deadline_ms: Some(30_000),
             },
-            attempt_context(),
         )
         .await?;
     let mut decoder = QueryIpcDecoder::new();
@@ -92,7 +91,7 @@ async fn execute_inactive_analytical(
     }
     // Drained rather than dropped: a stream that ended without a terminal did
     // not settle its graph, whatever its rows say.
-    terminal.ok_or("inactive analytical stream emitted no terminal frame")?;
+    terminal.ok_or("analytical stream emitted no terminal frame")?;
     Ok(AnalyticalOutcome { batches })
 }
 
@@ -138,10 +137,10 @@ fn request(sql: &str) -> BifrostQueryRequest {
 /// all six nodes owning no Analytical graph, attempt, or reservation.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_inactive_analytical_cancel_deadline_and_slow_consumer_leave_six_clean_nodes() {
+async fn pg_analytical_cancel_deadline_and_slow_consumer_leave_six_clean_nodes() {
     prove_terminal_cleanup()
         .await
-        .expect("inactive analytical terminal cleanup journey");
+        .expect("analytical terminal cleanup journey");
 }
 
 /// Drives the three abnormal terminals and asserts a clean cluster after each.
@@ -169,20 +168,19 @@ async fn prove_terminal_cleanup() -> Result<(), JourneyError> {
 
     // Explicit cancellation: the owner signals and drains under its own bound.
     let stream = engine
-        .query_sql_inactive_analytical(query_context(tenant)?, request(&sql), attempt_context())
+        .query_sql(query_context(tenant)?, request(&sql))
         .await?;
     stream.cancel().await;
     await_clean_nodes(&cluster).await?;
 
     // An expired deadline: the attempt never gets to produce a full result.
     let expired = engine
-        .query_sql_inactive_analytical(
+        .query_sql(
             query_context(tenant)?,
             BifrostQueryRequest {
                 deadline_ms: Some(1),
                 ..request(&sql)
             },
-            attempt_context(),
         )
         .await;
     if let Ok(mut stream) = expired {
@@ -193,7 +191,7 @@ async fn prove_terminal_cleanup() -> Result<(), JourneyError> {
     // A consumer that walks away mid-stream: the frames owner is dropped
     // without a terminal, which is the case a Drop-only cleanup would miss.
     let mut stream = engine
-        .query_sql_inactive_analytical(query_context(tenant)?, request(&sql), attempt_context())
+        .query_sql(query_context(tenant)?, request(&sql))
         .await?;
     let _first = stream.frames.next().await;
     drop(stream);
@@ -207,10 +205,10 @@ async fn prove_terminal_cleanup() -> Result<(), JourneyError> {
 /// neither settle, cancel, nor attach work to a live attempt.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_inactive_analytical_stale_attempt_and_sibling_graph_cannot_emit_or_cancel() {
+async fn pg_analytical_stale_attempt_and_sibling_graph_cannot_emit_or_cancel() {
     prove_stale_and_sibling_fencing()
         .await
-        .expect("inactive analytical fencing journey");
+        .expect("analytical fencing journey");
 }
 
 /// Drives the stale-attempt and sibling-graph refusals against a live attempt.
@@ -244,7 +242,7 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
 
     let attempt = attempt_context();
     let (_session, ownership) = engine
-        .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
+        .lease_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
         .await?;
     let live = ownership.key();
 
@@ -318,10 +316,10 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
 /// is confined to this node's own bounded scratch.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_inactive_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill() {
+async fn pg_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill() {
     prove_pushdown_exchange_and_spill()
         .await
-        .expect("inactive analytical pushdown, exchange, and spill journey");
+        .expect("analytical pushdown, exchange, and spill journey");
 }
 
 /// Drives the pushdown, exchange, and qualified-spill proofs.
@@ -354,7 +352,7 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
         .telemetry()
         .checkpoint()
         .map_err(|e| e.to_string())?;
-    let broad = execute_inactive_analytical(
+    let broad = execute_analytical(
         query_server,
         tenant,
         &format!("SELECT id, filter_key, unused_payload FROM vala.bifrost.{table}"),
@@ -370,7 +368,7 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
         .telemetry()
         .checkpoint()
         .map_err(|e| e.to_string())?;
-    let narrow = execute_inactive_analytical(
+    let narrow = execute_analytical(
         query_server,
         tenant,
         &format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'"),
@@ -414,7 +412,7 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
         .telemetry()
         .checkpoint()
         .map_err(|e| e.to_string())?;
-    execute_inactive_analytical(
+    execute_analytical(
         query_server,
         tenant,
         &format!(
@@ -447,7 +445,7 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
     let attempt = attempt_context();
     let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
     let (session, ownership) = engine
-        .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
+        .lease_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
         .await?;
     let spill_root = engine
         .analytical_spill_root()
@@ -482,10 +480,10 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
 /// terminal.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_inactive_analytical_production_telemetry_covers_every_hot_path() {
+async fn pg_analytical_production_telemetry_covers_every_hot_path() {
     prove_production_telemetry()
         .await
-        .expect("inactive analytical production telemetry journey");
+        .expect("analytical production telemetry journey");
 }
 
 /// Drives one drained and one cancelled attempt and reads the production
@@ -520,7 +518,7 @@ async fn prove_production_telemetry() -> Result<(), JourneyError> {
         .telemetry()
         .checkpoint()
         .map_err(|e| e.to_string())?;
-    let drained = execute_inactive_analytical(query_server, tenant, &sql).await?;
+    let drained = execute_analytical(query_server, tenant, &sql).await?;
     if i64::try_from(drained.rows())? != FIXTURE_GROUPS {
         return Err(format!(
             "grouped aggregate expected {FIXTURE_GROUPS} rows, saw {}",
@@ -529,7 +527,7 @@ async fn prove_production_telemetry() -> Result<(), JourneyError> {
         .into());
     }
     let mut cancelled = engine
-        .query_sql_inactive_analytical(query_context(tenant)?, request(&sql), attempt_context())
+        .query_sql(query_context(tenant)?, request(&sql))
         .await?;
     let _first = cancelled.frames.next().await;
     cancelled.cancel().await;

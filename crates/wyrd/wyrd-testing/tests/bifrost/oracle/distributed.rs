@@ -18,8 +18,7 @@ use wyrd_server::oracle::{
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, QueryExecutionPath, QueryTerminalErrorCode, QueryTerminalOutcome,
-    QueryWarning,
+    BifrostQueryRequest, QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::bifrost::process_cluster::{BifrostProcessCluster, ProcessNodeTarget};
@@ -1053,7 +1052,7 @@ const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
 async fn grouped_counts(
     client: &WyrdClient,
     sql: String,
-) -> Result<(Vec<(String, i64)>, QueryExecutionPath), JourneyError> {
+) -> Result<(Vec<(String, i64)>, QueryClass), JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             sql,
@@ -1082,7 +1081,7 @@ async fn grouped_counts(
         )
         .into());
     }
-    Ok((rows, terminal.execution_path))
+    Ok((rows, terminal.query_class))
 }
 
 /// A filtered aggregate over published files and live rows on two Scribes is
@@ -1162,7 +1161,7 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
             format!("published plus live counts expected {expected:?}, saw {rows:?}").into(),
         );
     }
-    if path != QueryExecutionPath::Analytical {
+    if path != QueryClass::Analytical {
         return Err(
             format!("the distributed published scan must stay Analytical, saw {path:?}").into(),
         );

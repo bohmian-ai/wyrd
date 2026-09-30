@@ -27,7 +27,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, QueryExecutionPath, QueryTerminalErrorCode, QueryTerminalOutcome,
+    BifrostQueryRequest, QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome,
 };
 
 use super::schedule::{
@@ -2128,7 +2128,7 @@ async fn hold_one(
     }
     ids.sort_unstable();
     match stream.terminal() {
-        Some(terminal) if terminal.execution_path != QueryExecutionPath::Interactive => {
+        Some(terminal) if terminal.query_class != QueryClass::Interactive => {
             tally.not_interactive += 1;
         }
         Some(terminal)

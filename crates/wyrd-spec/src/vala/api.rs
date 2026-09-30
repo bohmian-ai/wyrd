@@ -489,14 +489,19 @@ impl BifrostQueryRequest {
     }
 }
 
-/// Server-derived admission class.
+/// Server-derived class of one query: how Oracle admits and executes it.
+///
+/// Never a request field. Oracle reads it from the one physical root it built:
+/// a distributed root is Analytical, anything else Interactive. The class
+/// selects the admission rules and the execution path together, so the
+/// terminal's class is also the path that ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum QueryClass {
-    /// Latency-sensitive bounded work.
+    /// Executed locally on the leader.
     Interactive,
-    /// Larger analytical work.
+    /// Executed as a distributed graph across Oracle peers.
     Analytical,
 }
 
@@ -696,32 +701,6 @@ pub enum QueryTerminalOutcome {
     Failed,
 }
 
-/// The execution path Oracle selected for one logical query.
-///
-/// This is a server-derived terminal fact, never a request field: REQ-001 keeps
-/// path selection entirely on the server, and REQ-008 requires the terminal to
-/// name the path that actually ran. It is deliberately distinct from
-/// [`QueryClass`], which is the admission class of a *candidate*; a query
-/// admitted as an Analytical candidate still terminates as
-/// [`QueryExecutionPath::Interactive`] when its distributed plan is unsupported
-/// or carries no real exchange.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum QueryExecutionPath {
-    /// Oracle executed the query locally on the coordinator.
-    Interactive,
-    /// Oracle executed the query as a distributed graph across Oracle peers.
-    Analytical,
-}
-
-impl Default for QueryExecutionPath {
-    /// Uses Interactive so an unset path can never claim distributed execution.
-    fn default() -> Self {
-        Self::Interactive
-    }
-}
-
 /// Closed source tiers represented in terminal metadata.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
@@ -863,13 +842,13 @@ pub struct QueryTerminalError {
 pub struct QueryTerminalFrame {
     /// Stream outcome.
     pub outcome: QueryTerminalOutcome,
-    /// Execution path Oracle selected for this query.
+    /// Class Oracle derived for this query, which is also the path that ran.
     ///
     /// Present on every terminal, successful or failed, so a caller always
-    /// learns which path ran. A failed terminal on
-    /// [`QueryExecutionPath::Analytical`] is the proof that selection was
-    /// irreversible: REQ-002 forbids rerunning that query through Interactive.
-    pub execution_path: QueryExecutionPath,
+    /// learns which path ran. A failed terminal on [`QueryClass::Analytical`]
+    /// is the proof that selection was irreversible: REQ-002 forbids rerunning
+    /// that query through Interactive.
+    pub query_class: QueryClass,
     /// Rows already emitted in batch frames.
     pub row_count: u64,
     /// Closed bounded warnings.
@@ -1026,7 +1005,7 @@ mod query_terminal_tests {
         let failed = outcome == QueryTerminalOutcome::Failed;
         QueryTerminalFrame {
             outcome,
-            execution_path: QueryExecutionPath::Interactive,
+            query_class: QueryClass::Interactive,
             row_count: 1,
             warnings,
             source_completion: sources(live),
@@ -2222,7 +2201,7 @@ mod tests {
         ];
         let base = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            execution_path: QueryExecutionPath::Interactive,
+            query_class: QueryClass::Interactive,
             row_count: 0,
             warnings: vec![],
             source_completion: sources,
@@ -2317,7 +2296,7 @@ mod tests {
             "the request must not accept a source, freshness, path, class, worker, or plan selector"
         );
 
-        let path = serde_json::to_value(schemars::schema_for!(QueryExecutionPath).schema)
+        let path = serde_json::to_value(schemars::schema_for!(QueryClass).schema)
             .expect("path schema serializes");
         let path_variants = path["oneOf"]
             .as_array()
@@ -2338,7 +2317,7 @@ mod tests {
 
         let terminal = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            execution_path: QueryExecutionPath::Analytical,
+            query_class: QueryClass::Analytical,
             row_count: 0,
             warnings: vec![],
             source_completion: vec![
@@ -2363,7 +2342,7 @@ mod tests {
             .expect("an Analytical terminal is valid");
         let encoded = serde_json::to_value(&terminal).expect("terminal serializes");
         assert_eq!(
-            encoded["execution_path"],
+            encoded["query_class"],
             serde_json::Value::from("analytical"),
             "the terminal names the server-selected path on the wire"
         );

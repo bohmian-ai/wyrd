@@ -541,7 +541,7 @@ mod tests {
             schema_frame(),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
@@ -580,7 +580,7 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 1,
                 warnings: vec![QueryWarning::LiveTailUnavailable],
                 source_completion: degraded_sources,
@@ -595,7 +595,7 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Failed,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),

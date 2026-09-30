@@ -27,7 +27,7 @@
 //! module first.
 
 mod analytical_activation;
-mod analytical_inactive;
+mod analytical_lifecycle;
 mod capacity;
 mod distributed;
 mod mcp;

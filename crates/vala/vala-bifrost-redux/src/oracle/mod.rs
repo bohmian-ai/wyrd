@@ -34,9 +34,9 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, NodeId, PersistedFileDescriptor, QueryAuditDigest,
-    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryExecutionPath, QueryId, QuerySchemaFrame,
-    QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
-    QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+    QueryBatchFrame, QueryClass, QueryExecutionMode, QueryId, QuerySchemaFrame, QuerySource,
+    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+    SourceCompletion, SourceCompletionOutcome,
 };
 #[cfg(feature = "test-support")]
 use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
@@ -1139,10 +1139,10 @@ pub struct OracleBuildConfig {
     /// reservations, so a graph lease can only ever be activated from a
     /// reservation this same node actually granted.
     pub reservations: Arc<dispatcher::ReservationRegistry>,
-    /// Server-owned east-west stage authority for the inactive Analytical path.
+    /// Server-owned east-west stage authority for the Analytical path.
     ///
     /// Absent on a deployment whose Oracle role cannot serve stage operations.
-    /// The inactive Analytical owners are only composed when it is present, so
+    /// The Analytical owners are only composed when it is present, so
     /// a node without it has no follower ingress to mount and no leader handle
     /// to execute through.
     pub stage_authority: Option<Arc<dyn peer::OracleStageAuthority>>,
@@ -1269,11 +1269,7 @@ struct RetainedExecutionInput<'a> {
     running_query: &'a mut Option<RunningQueryTerminalOwner>,
 }
 
-/// One executed cut's output together with the path it was executed on.
-///
-/// The path is produced by execution rather than chosen by the caller: only
-/// the code that saw a real `DistributedExec` survive can say the query became
-/// Analytical, so it travels out with the stream it describes.
+/// One executed cut's output together with the class it executed under.
 struct CutExecution {
     /// Output schema of the executed root.
     schema: SchemaRef,
@@ -1283,8 +1279,8 @@ struct CutExecution {
     scan_stats: OracleQueryScanStats,
     /// Shared accumulator recording ordered degradation reasons.
     degraded_sources: DegradedSourceAccumulator,
-    /// Path this cut irreversibly selected before its stream opened.
-    execution_path: QueryExecutionPath,
+    /// Class, and therefore path, this cut irreversibly ran on.
+    query_class: QueryClass,
 }
 
 /// Pinned tables and class selected during one retry's planning phase.
@@ -1359,8 +1355,6 @@ struct SqlAttemptInput<'a> {
     roster: participant_cut::OracleQueryAttemptRoster,
     /// Catalog snapshot already pinned in this process for this attempt.
     prepared: PlannedSqlCut,
-    /// Inactive Analytical attempt identity, present only on the harness entry.
-    analytical: Option<&'a analytical::AnalyticalAttemptContext>,
 }
 
 /// Inputs for the pre-admission half of one attempt.
@@ -1375,8 +1369,6 @@ struct ClassifyInput<'a> {
     roster: participant_cut::OracleQueryAttemptRoster,
     /// Catalog snapshot already pinned in this process for this attempt.
     prepared: PlannedSqlCut,
-    /// Inactive Analytical attempt identity, present only on the harness entry.
-    analytical: Option<&'a analytical::AnalyticalAttemptContext>,
     /// Telemetry slot opened once the class is known.
     query_telemetry: &'a mut Option<QueryTelemetryGuard>,
 }
@@ -1960,7 +1952,7 @@ impl Oracle {
         self.planner.validate_query(request)
     }
 
-    /// Returns this node's inactive Analytical follower ingress, when composed.
+    /// Returns this node's Analytical follower ingress, when composed.
     ///
     /// The server mounts the upstream worker service behind
     /// [`AnalyticalStageAuthLayer`] over this owner. It is `None` on a
@@ -1975,7 +1967,7 @@ impl Oracle {
             .map(|handle| Arc::clone(handle.worker()))
     }
 
-    /// Returns this node's inactive Analytical execution handle, when composed.
+    /// Returns this node's Analytical execution handle, when composed.
     ///
     /// Nothing in the query path calls this. It exists so test-support can
     /// drive the distributed path that production routing never selects.
@@ -2015,8 +2007,7 @@ impl Oracle {
         let (roster, planned) = self
             .prepare_query_attempt(&context, &request, absolute_deadline_ms)
             .await?;
-        self.run_sql_query(context, request, roster, planned, None)
-            .await
+        self.run_sql_query(context, request, roster, planned).await
     }
 
     /// Capture a direct-entry query budget once before any preparation IO.
@@ -2032,37 +2023,6 @@ impl Oracle {
             .checked_add_signed(duration)
             .map(|deadline| deadline.timestamp_millis())
             .ok_or(BifrostError::QueryTimeout)
-    }
-
-    /// Starts one raw-SQL query with a caller-fixed Analytical attempt identity.
-    ///
-    /// Runs the production path unchanged: the same validation,
-    /// classification, participant cut, providers, audit, admission, lease,
-    /// and terminal stream owner.
-    ///
-    /// Production derives the attempt identity itself in [`Self::query_sql`];
-    /// this test seam lets a journey pin it so it can inspect the graph and
-    /// attempt owners it names.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same stable query, catalog, admission, visibility, audit,
-    /// timeout, or execution errors as [`Self::query_sql`], plus
-    /// [`BifrostError::OracleRoleUnavailable`] when this node composed no
-    /// Analytical handle.
-    #[cfg(feature = "test-support")]
-    pub async fn query_sql_inactive_analytical(
-        &self,
-        context: AuthorizedQueryContext,
-        request: BifrostQueryRequest,
-        attempt: analytical::AnalyticalAttemptContext,
-    ) -> Result<OracleQueryStream, BifrostError> {
-        let deadline_ms = self.capture_query_deadline(&request)?;
-        let (roster, planned) = self
-            .prepare_query_attempt(&context, &request, deadline_ms)
-            .await?;
-        self.run_sql_query(context, request, roster, planned, Some(attempt))
-            .await
     }
 
     /// Borrows this node's own root-derived Oracle resource capability.
@@ -2090,7 +2050,7 @@ impl Oracle {
         self.memory.resources.spill_path()
     }
 
-    /// Leases one inactive Analytical attempt without executing anything.
+    /// Leases one Analytical attempt without executing anything.
     ///
     /// The cut, classification, and providers are prepared exactly as a real
     /// query would prepare them, and the returned session is the one a
@@ -2105,7 +2065,7 @@ impl Oracle {
     /// as [`Self::query_sql`], plus [`BifrostError::OracleRoleUnavailable`]
     /// when this node composed no Analytical handle.
     #[cfg(feature = "test-support")]
-    pub async fn lease_inactive_analytical_attempt(
+    pub async fn lease_analytical_attempt(
         &self,
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
@@ -2337,7 +2297,6 @@ impl Oracle {
         request: BifrostQueryRequest,
         roster: participant_cut::OracleQueryAttemptRoster,
         prepared: PlannedSqlCut,
-        analytical: Option<analytical::AnalyticalAttemptContext>,
     ) -> Result<OracleQueryStream, BifrostError> {
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
@@ -2370,7 +2329,6 @@ impl Oracle {
                     deadline,
                     roster,
                     prepared,
-                    analytical: analytical.as_ref(),
                 },
                 &mut query_telemetry,
             )
@@ -2491,7 +2449,6 @@ impl Oracle {
             deadline,
             mut roster,
             prepared: planned,
-            analytical,
             query_telemetry,
         } = input;
         let work_units = Self::scannable_work_units(&planned.cuts);
@@ -2505,13 +2462,11 @@ impl Oracle {
             .map_err(|_| BifrostError::OracleRoleUnavailable)?;
         // Started once across a possible stale retry.
         query_telemetry.get_or_insert_with(|| OracleTelemetry::start_query(query_class));
-        let attempt = match analytical {
-            Some(attempt) => Some(attempt.clone()),
-            None if query_class == QueryClass::Analytical && self.analytical.is_some() => Some(
-                Self::candidate_attempt_context(context, participant_cut.attempt_id(), &planned)?,
-            ),
-            None => None,
-        };
+        let attempt = (query_class == QueryClass::Analytical)
+            .then(|| {
+                Self::candidate_attempt_context(context, participant_cut.attempt_id(), &planned)
+            })
+            .transpose()?;
         Ok(ClassifiedAttempt {
             planned,
             retained,
@@ -2578,7 +2533,6 @@ impl Oracle {
             deadline,
             roster,
             prepared,
-            analytical,
         } = input;
         let ClassifiedAttempt {
             planned,
@@ -2594,7 +2548,6 @@ impl Oracle {
                 deadline,
                 roster,
                 prepared,
-                analytical,
                 query_telemetry,
             })
             .await?;
@@ -2678,8 +2631,10 @@ impl Oracle {
     ///
     /// # Errors
     ///
-    /// Returns the stable admission, supervisor, reservation, runtime, or
-    /// `DataFusion` execution error; every one of them is terminal.
+    /// Returns [`BifrostError::OracleRoleUnavailable`] when an Analytical root
+    /// has no handle or attempt identity, and otherwise the stable admission,
+    /// supervisor, reservation, runtime, or `DataFusion` execution error; every
+    /// one of them is terminal.
     async fn execute_retained_root(
         &self,
         input: RetainedExecutionInput<'_>,
@@ -2697,11 +2652,16 @@ impl Oracle {
             running_query,
         } = input;
         let RetainedPhysicalPlan { config, root, .. } = retained;
-        let (handle, attempt) = match (self.analytical.as_ref(), analytical) {
-            (Some(handle), Some(attempt)) if query_class == QueryClass::Analytical => {
-                (handle, attempt)
-            }
-            _ => {
+        let (handle, attempt) = match query_class {
+            // Only a node that composed the handle plans a distributed root, so
+            // an Analytical class without one is a broken invariant, never a
+            // reason to run the root locally under the wrong class.
+            QueryClass::Analytical => self
+                .analytical
+                .as_ref()
+                .zip(analytical)
+                .ok_or(BifrostError::OracleRoleUnavailable)?,
+            QueryClass::Interactive => {
                 let session = admitted.execution_session(config)?;
                 let scan_stats =
                     OracleQueryScanStats::from_plan(root.as_ref(), logical_bytes_selected);
@@ -2713,7 +2673,7 @@ impl Oracle {
                     batches,
                     scan_stats,
                     degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-                    execution_path: QueryExecutionPath::Interactive,
+                    query_class: QueryClass::Interactive,
                 });
             }
         };
@@ -2756,7 +2716,7 @@ impl Oracle {
             batches,
             scan_stats,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            execution_path: QueryExecutionPath::Analytical,
+            query_class: QueryClass::Analytical,
         })
     }
 
@@ -3615,7 +3575,7 @@ impl Oracle {
 /// Test-support observation of the one shared physical-build convergence point.
 ///
 /// Process-local because every entry point that can build a root — production
-/// classification and the inactive attempt lease alike — runs inside the pod
+/// classification and the attempt lease alike — runs inside the pod
 /// under observation. A journey differences the total across one serialized
 /// request, so it needs no per-query key and retains no event list.
 #[cfg(feature = "test-support")]
@@ -3979,23 +3939,23 @@ pub type OracleFrameStream = dyn Stream<Item = Result<QueryStreamFrame, BifrostE
 /// Returns a terminal failed frame for a late execution error.
 ///
 /// This entry is for failures that never reached Analytical selection, so the
-/// terminal names [`QueryExecutionPath::Interactive`]: REQ-002 makes selection
+/// terminal names [`QueryClass::Interactive`]: REQ-002 makes selection
 /// irreversible, and a caller must never read a path the server did not run.
 #[must_use]
 pub fn failed_terminal(code: QueryTerminalErrorCode, row_count: u64) -> QueryTerminalFrame {
-    failed_terminal_on_path(code, row_count, QueryExecutionPath::Interactive)
+    failed_terminal_on_path(code, row_count, QueryClass::Interactive)
 }
 
 /// Returns a contract-valid failed terminal naming every source tier.
 ///
-/// `execution_path` is the path the stream had already selected, so a failure
+/// `query_class` is the path the stream had already selected, so a failure
 /// after Analytical selection reports `Analytical` rather than silently
 /// presenting itself as an Interactive failure. A failed terminal carries no
 /// live-loss warning: the failure, not a degraded source, is the result.
 fn failed_terminal_on_path(
     code: QueryTerminalErrorCode,
     row_count: u64,
-    execution_path: QueryExecutionPath,
+    query_class: QueryClass,
 ) -> QueryTerminalFrame {
     let source_completion = [
         QuerySource::Iceberg,
@@ -4009,7 +3969,7 @@ fn failed_terminal_on_path(
     .to_vec();
     QueryTerminalFrame {
         outcome: QueryTerminalOutcome::Failed,
-        execution_path,
+        query_class,
         row_count,
         warnings: Vec::new(),
         source_completion,
@@ -4375,7 +4335,7 @@ struct AttemptOutput {
     /// Running-query terminal owner transferred into the returned stream.
     running_query: Option<RunningQueryTerminalOwner>,
     /// Execution path this attempt irreversibly selected before it opened.
-    execution_path: QueryExecutionPath,
+    query_class: QueryClass,
     /// Reader-epoch protection transferred into the returned stream.
     reader_protection: ReaderProtectedQueryTerminalOwner,
 }
@@ -4398,7 +4358,7 @@ impl AttemptOutput {
             batches,
             scan_stats,
             degraded_sources,
-            execution_path,
+            query_class,
         } = execution;
         Self {
             schema,
@@ -4407,7 +4367,7 @@ impl AttemptOutput {
             degraded_sources,
             admitted,
             running_query,
-            execution_path,
+            query_class,
             reader_protection,
         }
     }
@@ -4464,7 +4424,7 @@ async fn settle_attempt_output(
         degraded_sources,
         mut admitted,
         running_query,
-        execution_path,
+        query_class,
         reader_protection,
     } = output;
     let AttemptSettlement {
@@ -4527,7 +4487,7 @@ async fn settle_attempt_output(
         }
     };
     Ok(OracleQueryStream::new(QueryStreamInput {
-        execution_path,
+        query_class,
         schema_frame,
         ipc,
         batches,

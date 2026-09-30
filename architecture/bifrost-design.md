@@ -561,7 +561,9 @@ hash-chain staging table, and the `AuditPublisher` retains it like every other
 event. Rows are not held for that commit; a failed commit is logged and counted
 through `oracle_audit_commit_failures_total`, and shutdown waits for pending
 commits. One logical query produces one read-audit event; distributed stages
-produce none.
+produce none. An Interactive event records `Local` execution on one node; an
+Analytical event records `Distributed` execution over every Oracle in the
+frozen participant cut, leader included, with the followers as its workers.
 
 Query streams are length-delimited, terminal-safe frames. A full queue before
 framing is `QueryQueueFull`; any other admission refusal before framing is

@@ -901,6 +901,38 @@ each was deleted or routed through its production owner.
 - Kept deliberately: the per-call frame-decode loops (transport, fold, and
   partial-drain shapes differ, so a shared helper would add generics without
   removing a path), and the two-field slot sums in admission and validation.
-- Open, needs a decision: the read-decision audit records
-  `QueryExecutionMode::Local`, one node, zero workers for Analytical queries
-  that ran distributed.
+- The Analytical audit topology was decided in D13.
+
+### D13 — non-blocking read audit and Analytical topology
+
+Decided by the user: the read-decision audit is fire-and-forget, and an
+Analytical decision records its real topology.
+
+- `OracleAudit` methods are synchronous and return `()`. The writer
+  (`OracleQueryAudit`) already stages through its tracked task and counts
+  commit failures in `oracle_audit_commit_failures_total`; the Oracle-side
+  timeout and error mapping were deleted, and `audit_and_bind` is synchronous.
+  Building the locked detail stays fail-closed. The tenant tripwire stages its
+  security event and still refuses with `QueryTenantInvariant`.
+- Analytical records `Distributed`, `selected_node_count` = the frozen
+  participant cut's Oracles (leader included), and `worker_count` = that − 1.
+  Interactive stays `Local`/1/0. The persisted schema is unchanged. Unit test:
+  `oracle::tests::analytical_audit_topology_counts_the_frozen_cut`.
+
+Oracle journey failures after D12 (diagnosed by a fresh read-only diagnostician):
+
+- **Symptom:** `pg_analytical_stale_attempt_and_sibling_graph_cannot_emit_or_cancel`
+  and `pg_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill`
+  returned `OracleRoleUnavailable` from `lease_analytical_attempt`.
+  **Evidence:** the lease SQL was `SELECT id ... ORDER BY id` over one hot file;
+  `AnalyticalCutTaskCount::new` yields one task and no shuffle, so the root is
+  not `DistributedExec`. **Cause:** D12 made the lease use production
+  classification, and that SQL classifies Interactive. **Fix site:** the tests
+  now lease the grouped statement that distributes.
+- **Symptom:** `two_tenants_make_bounded_progress_across_query_classes` saw a
+  second Analytical query admitted. **Evidence:** boot split
+  `interactive_floor_units=1 analytical_max_units=3`; one unit per query.
+  **Cause:** the sub-proof kept the deleted two-unit premise. **Fix site:** the
+  sub-proof parks `SCHEDULING_HOLDS - 1` Analytical queries, proves the next
+  one queues to its deadline, and proves both tenants' Interactive floor
+  queries still run.

@@ -1993,25 +1993,37 @@ async fn prove_rotation_serves_both_tenants(
     Ok(())
 }
 
-/// Proves a live Analytical query cannot take the units Interactive is owed.
+/// Proves live Analytical work cannot take the unit Interactive is owed.
 ///
-/// One Analytical query costs two of this rung's four units and the Analytical
-/// maximum cannot seat a second, so the second waits in the queue until its
-/// deadline while two units always remain for Interactive work no matter how
-/// much Analytical work is offered.
+/// Every query charges one unit, so this rung seats at most
+/// `SCHEDULING_HOLDS - 1` Analytical queries. With that many parked, one more
+/// waits in the queue until its deadline, while the one protected unit still
+/// serves each tenant's Interactive query in turn.
 ///
 /// # Errors
 ///
-/// Returns an error when a second Analytical query is admitted, when either
-/// tenant's Interactive query is refused, or when the parked Analytical query
-/// does not release its envelope.
+/// Returns an error when an Analytical query beyond the maximum is admitted,
+/// when either tenant's Interactive query is refused, or when the parked
+/// Analytical queries do not release their envelopes.
 async fn prove_analytical_cannot_cross_the_interactive_floor(
     cluster: &WyrdTestCluster,
     server: &WyrdTestServer,
     clients: &[WyrdClient],
     tables: &[String],
 ) -> Result<(), JourneyError> {
-    let parked = hold_envelope(server, &clients[0], &scheduling_analytical_sql(&tables[0])).await?;
+    let mut parked = Vec::new();
+    for index in 0..SCHEDULING_HOLDS - 1 {
+        let slot = index % clients.len();
+        parked.push(
+            hold_envelope(
+                server,
+                &clients[slot],
+                &scheduling_analytical_sql(&tables[slot]),
+            )
+            .await
+            .map_err(|error| format!("analytical hold {index}: {error}"))?,
+        );
+    }
     let refusal = drain_query_within(
         &wyrd_client::Bifrost::query_only(&clients[1]),
         &scheduling_analytical_sql(&tables[1]),
@@ -2019,10 +2031,10 @@ async fn prove_analytical_cannot_cross_the_interactive_floor(
     )
     .await
     .err()
-    .ok_or("the rung seated a second Analytical query")?;
+    .ok_or("the rung seated an Analytical query past its maximum")?;
     if !refusal.contains(QUERY_TIMEOUT_CODE) {
         return Err(format!(
-            "the second Analytical query failed with {refusal}, not a queued timeout"
+            "the excess Analytical query failed with {refusal}, not a queued timeout"
         )
         .into());
     }
@@ -2039,7 +2051,12 @@ async fn prove_analytical_cannot_cross_the_interactive_floor(
             return Err(format!("tenant {index}'s floor query returned {rows} rows").into());
         }
     }
-    release_envelope(cluster, parked, "analytical", 0.0).await
+    let last = parked.pop().ok_or("no parked Analytical envelope")?;
+    for envelope in parked {
+        envelope.abort();
+        let _ = envelope.await;
+    }
+    release_envelope(cluster, last, "analytical", 0.0).await
 }
 
 /// Proves both tenants complete both classes once the pod has drained.

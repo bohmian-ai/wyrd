@@ -63,7 +63,6 @@ use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
-use tracing::Instrument;
 use wyrd_spec::vala::BifrostError;
 
 use crate::storage::error_chain_contains_not_found;
@@ -2294,26 +2293,16 @@ impl ExecutionPlan for TenantTripwireExec {
                         "event_class" => "tenant_row"
                     )
                     .increment(1);
-                    let audit_span = tracing::info_span!(
-                        "bifrost.oracle.audit",
-                        audit_kind = "security_violation",
-                        event_class = "tenant_row"
+                    audit.append_security_violation(
+                        VerifiedSecurityContext {
+                            query: context.clone(),
+                            query_digest: None,
+                        },
+                        BifrostSecurityViolation {
+                            violation: BifrostSecurityViolationKind::TenantRow,
+                            phase: BifrostSecurityPhase::Source,
+                        },
                     );
-                    let audit_result = audit
-                        .append_security_violation(
-                            VerifiedSecurityContext {
-                                query: context.clone(),
-                                query_digest: None,
-                            },
-                            BifrostSecurityViolation {
-                                violation: BifrostSecurityViolationKind::TenantRow,
-                                phase: BifrostSecurityPhase::Source,
-                            },
-                        )
-                        .instrument(audit_span)
-                        .await;
-                    audit_result
-                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
                     Err::<(), _>(DataFusionError::External(Box::new(
                         BifrostError::QueryTenantInvariant,
                     )))?;

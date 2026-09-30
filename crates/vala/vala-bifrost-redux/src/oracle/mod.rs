@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
@@ -25,7 +24,6 @@ use futures_util::{Stream, StreamExt};
 use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument;
 use vala_sql::ValaPostgres;
 use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
@@ -855,30 +853,25 @@ impl Drop for AdmissionWaitTelemetryGuard {
     }
 }
 
-/// Narrow audit collaborator owned by the serving composition root.
-#[async_trait]
+/// Narrow, non-blocking audit collaborator owned by the serving composition root.
+///
+/// Both methods only stage the event and return: the writer commits it to the
+/// tenant audit outbox from a tracked task, and owns counting and logging a
+/// commit that fails. Rows are never held for that commit.
 pub trait OracleAudit: Send + Sync {
-    /// Records the immutable read-decision detail before row access.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit unavailable when the writer refuses the event.
-    async fn append_read_decision(
+    /// Stages the immutable read-decision detail after admission.
+    fn append_read_decision(
         &self,
         context: &AuthorizedQueryContext,
         decision: BifrostQueryReadDecision,
-    ) -> Result<(), BifrostError>;
+    );
 
-    /// Records a tenant-tripwire security event.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit unavailable when the writer refuses the event.
-    async fn append_security_violation(
+    /// Stages a tenant-tripwire security event.
+    fn append_security_violation(
         &self,
         context: VerifiedSecurityContext,
         violation: BifrostSecurityViolation,
-    ) -> Result<(), BifrostError>;
+    );
 }
 
 /// Locked T1 projection of one immutable local Oracle read decision.
@@ -942,31 +935,21 @@ pub struct BifrostSecurityViolation {
 pub struct AcceptingOracleAudit;
 
 #[cfg(any(test, feature = "test-support"))]
-#[async_trait]
 impl OracleAudit for AcceptingOracleAudit {
-    /// Accepts the read decision so the worker proceeds to serve rows.
-    ///
-    /// # Errors
-    /// Never returns an error.
-    async fn append_read_decision(
+    /// Discards the read decision.
+    fn append_read_decision(
         &self,
         _context: &AuthorizedQueryContext,
         _decision: BifrostQueryReadDecision,
-    ) -> Result<(), BifrostError> {
-        Ok(())
+    ) {
     }
 
-    /// Accepts the security violation so refusal reporting is not masked by an
-    /// audit failure.
-    ///
-    /// # Errors
-    /// Never returns an error.
-    async fn append_security_violation(
+    /// Discards the security violation.
+    fn append_security_violation(
         &self,
         _context: VerifiedSecurityContext,
         _violation: BifrostSecurityViolation,
-    ) -> Result<(), BifrostError> {
-        Ok(())
+    ) {
     }
 }
 
@@ -1178,7 +1161,8 @@ pub(crate) struct ProtectedPlannedSqlCut {
     pub(crate) cuts: Vec<PinnedSealedTable>,
 }
 
-/// Inputs for live-fence acquisition, mandatory audit, and bounded drain.
+/// Borrowed inputs for staging the read decision and binding its sources.
+#[derive(Clone, Copy)]
 struct CutAuditInput<'a> {
     /// Authenticated request context.
     context: &'a AuthorizedQueryContext,
@@ -1188,6 +1172,8 @@ struct CutAuditInput<'a> {
     cuts: &'a [PinnedSealedTable],
     /// Server-derived query class.
     query_class: QueryClass,
+    /// Oracle participants frozen for the attempt, leader included.
+    oracle_count: usize,
     /// Absolute query deadline.
     deadline: Instant,
     /// Admitted query owner supplying cancellation and durable query identity.
@@ -2257,16 +2243,16 @@ impl Oracle {
         })
     }
 
-    /// Commits the read decision, then binds the pinned sources to the retained plan.
+    /// Stages the read decision, then binds the pinned sources to the retained plan.
     ///
-    /// No leaf can execute before its sources are bound, and none may be bound
-    /// before the decision that authorizes reading them is durable.
+    /// No leaf can execute before its sources are bound, and none is bound
+    /// before the decision that authorizes reading them is staged.
     ///
     /// # Errors
     ///
     /// Returns the stable audit or binding-validation error. Every one of them
     /// settles the sole attempt.
-    async fn audit_and_bind(
+    fn audit_and_bind(
         &self,
         audit: CutAuditInput<'_>,
         retained: &RetainedPhysicalPlan,
@@ -2282,7 +2268,7 @@ impl Oracle {
             root: retained.root.as_ref(),
             live_listing_lost: retained.live_listing_lost,
         };
-        self.audit_read_decision(audit).await?;
+        self.audit_read_decision(audit)?;
         phases.drained();
         self.bind_execution_sources(&retained.config, admitted, cut_deadline, deadline, &sources)
     }
@@ -2342,22 +2328,20 @@ impl Oracle {
                 &mut phases,
             )
             .await?;
-        let bound = match self
-            .audit_and_bind(
-                CutAuditInput {
-                    context,
-                    request,
-                    cuts: &planned.cuts,
-                    query_class,
-                    deadline,
-                    admitted: &admitted,
-                },
-                &retained,
-                participant_cut.deadline(),
-                &mut phases,
-            )
-            .await
-        {
+        let bound = match self.audit_and_bind(
+            CutAuditInput {
+                context,
+                request,
+                cuts: &planned.cuts,
+                query_class,
+                oracle_count: participant_cut.oracles().len(),
+                deadline,
+                admitted: &admitted,
+            },
+            &retained,
+            participant_cut.deadline(),
+            &mut phases,
+        ) {
             Ok(bound) => bound,
             Err(error) => return release_error(deadline, admitted, error, "source rejection"),
         };
@@ -2723,50 +2707,29 @@ impl Oracle {
         &self.reader_authority
     }
 
-    /// Commits the read decision authorizing every pinned source.
+    /// Stages the read decision authorizing every pinned source.
+    ///
+    /// Building the locked detail is the only fallible step; staging never
+    /// blocks and never fails the query, because the writer commits from a
+    /// tracked task and counts a commit that fails.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::QueryTimeout`] when the deadline elapses and
-    /// [`BifrostError::QueryAuditUnavailable`] for any other audit failure.
-    async fn audit_read_decision(&self, input: CutAuditInput<'_>) -> Result<(), BifrostError> {
-        let audit_span = tracing::info_span!(
-            "bifrost.oracle.audit",
-            audit_kind = "read_decision",
-            query_class = query_class_label(input.query_class)
-        );
-        let audit_started = Instant::now();
-        let result = async {
-            let remaining = input
-                .deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(BifrostError::QueryTimeout)?;
-            let decision = read_decision(
-                input.context,
-                &input.request.sql,
-                input.cuts,
-                input.query_class,
-                input.deadline,
-            )?;
-            tokio::time::timeout(
-                remaining,
-                self.audit.append_read_decision(input.context, decision),
-            )
-            .await
-            .map_err(|_| BifrostError::QueryTimeout)
-            .and_then(|result| result)
-        }
-        .instrument(audit_span)
-        .await;
-        let _ = audit_started;
-        result.map_err(|error| {
-            tracing::error!(error = %error, "Oracle read-decision audit failed");
-            if error == BifrostError::QueryTimeout {
-                error
-            } else {
-                BifrostError::QueryAuditUnavailable
-            }
-        })
+    /// Returns [`BifrostError::QueryTimeout`] when no deadline remains and
+    /// [`BifrostError::QueryAuditUnavailable`] when the detail violates the
+    /// bounded audit contract.
+    fn audit_read_decision(&self, input: CutAuditInput<'_>) -> Result<(), BifrostError> {
+        let decision = read_decision(
+            input.context,
+            &input.request.sql,
+            input.cuts,
+            input.query_class,
+            input.oracle_count,
+            input.deadline,
+        )
+        .inspect_err(|error| tracing::error!(error = %error, "Oracle read decision is invalid"))?;
+        self.audit.append_read_decision(input.context, decision);
+        Ok(())
     }
 
     /// Returns whether startup readiness completed and queries may enter admission.
@@ -3862,8 +3825,11 @@ fn read_decision(
     sql: &str,
     cuts: &[PinnedSealedTable],
     query_class: QueryClass,
+    oracle_count: usize,
     deadline: Instant,
 ) -> Result<BifrostQueryReadDecision, BifrostError> {
+    let (execution, selected_node_count, worker_count) =
+        execution_topology(query_class, oracle_count)?;
     let mut binding_digests = cuts
         .iter()
         .map(|cut| audit_digest(&cut.binding.table_ref.fqn()))
@@ -3893,9 +3859,9 @@ fn read_decision(
             &context.permission,
             &resolved_table_scopes(cuts),
         )?,
-        execution: QueryExecutionMode::Local,
-        selected_node_count: 1,
-        worker_count: 0,
+        execution,
+        selected_node_count,
+        worker_count,
         // Every query holds one local slot unit.
         slot_units: 1,
         // One attempt per logical query: the audit contract still carries the
@@ -3904,6 +3870,32 @@ fn read_decision(
         deadline_ms,
         delegation_chain: wyrd_runtime::audit_delegation_chain(&context.delegation_chain),
     })
+}
+
+/// Projects a query class onto the audited execution topology.
+///
+/// Interactive runs on the leader alone. Analytical runs as one graph across
+/// every Oracle frozen in the attempt's participant cut, so the selected nodes
+/// are that cut, leader included, and the workers are the followers.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryAuditUnavailable`] when an Analytical cut is
+/// empty or larger than the audit contract's node field can carry.
+fn execution_topology(
+    query_class: QueryClass,
+    oracle_count: usize,
+) -> Result<(QueryExecutionMode, u8, u8), BifrostError> {
+    match query_class {
+        QueryClass::Interactive => Ok((QueryExecutionMode::Local, 1, 0)),
+        QueryClass::Analytical => {
+            let nodes = u8::try_from(oracle_count)
+                .ok()
+                .filter(|nodes| *nodes > 0)
+                .ok_or(BifrostError::QueryAuditUnavailable)?;
+            Ok((QueryExecutionMode::Distributed, nodes, nodes - 1))
+        }
+    }
 }
 
 /// Projects one catalog-resolved table binding into its RBAC object scope.
@@ -4453,6 +4445,22 @@ mod tests {
     use super::participant_cut::tests::lease;
     use super::*;
     use wyrd_runtime::{BifrostPermissionScope, BifrostTableScope};
+
+    /// Interactive audits one local node; Analytical audits its whole frozen
+    /// cut as distributed, and an unrepresentable cut fails closed.
+    #[test]
+    fn analytical_audit_topology_counts_the_frozen_cut() {
+        assert_eq!(
+            execution_topology(QueryClass::Interactive, 5).expect("interactive topology"),
+            (QueryExecutionMode::Local, 1, 0)
+        );
+        assert_eq!(
+            execution_topology(QueryClass::Analytical, 3).expect("analytical topology"),
+            (QueryExecutionMode::Distributed, 3, 2)
+        );
+        assert!(execution_topology(QueryClass::Analytical, 0).is_err());
+        assert!(execution_topology(QueryClass::Analytical, 256).is_err());
+    }
 
     /// Omitted, zero, and negative budgets fall back to the default; a positive
     /// budget is honored exactly.

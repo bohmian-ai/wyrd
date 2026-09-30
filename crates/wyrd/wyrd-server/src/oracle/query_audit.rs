@@ -23,7 +23,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use async_trait::async_trait;
 use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 use vala_bifrost_redux::oracle::{
@@ -33,7 +32,6 @@ use vala_bifrost_redux::oracle::{
 use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
-use wyrd_spec::vala::error::BifrostError;
 
 use crate::audit;
 
@@ -126,17 +124,15 @@ impl OracleQueryAudit {
     }
 }
 
-#[async_trait]
 impl OracleAudit for OracleQueryAudit {
     /// Stages the immutable read decision in the tenant audit outbox.
     ///
-    /// # Errors
-    /// Never returns an error; commit failures are logged and counted.
-    async fn append_read_decision(
+    /// Commit failures are logged and counted, never returned.
+    fn append_read_decision(
         &self,
         context: &AuthorizedQueryContext,
         decision: BifrostQueryReadDecision,
-    ) -> Result<(), BifrostError> {
+    ) {
         let event = build_event(
             context,
             "bifrost.query.read_decision",
@@ -144,18 +140,16 @@ impl OracleAudit for OracleQueryAudit {
             decision.into_detail(),
         );
         self.stage(context.data_tenant_id, event);
-        Ok(())
     }
 
     /// Stages a verified security violation in the tenant audit outbox.
     ///
-    /// # Errors
-    /// Never returns an error; commit failures are logged and counted.
-    async fn append_security_violation(
+    /// Commit failures are logged and counted, never returned.
+    fn append_security_violation(
         &self,
         context: VerifiedSecurityContext,
         violation: BifrostSecurityViolation,
-    ) -> Result<(), BifrostError> {
+    ) {
         let event = build_event(
             &context.query,
             "bifrost.query.security_violation",
@@ -170,7 +164,6 @@ impl OracleAudit for OracleQueryAudit {
             },
         );
         self.stage(context.query.data_tenant_id, event);
-        Ok(())
     }
 }
 

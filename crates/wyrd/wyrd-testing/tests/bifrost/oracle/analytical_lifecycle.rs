@@ -238,7 +238,9 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
             .ok_or("Oracle composed no Analytical handle")?,
     );
     let supervisor = Arc::clone(handle.supervisor());
-    let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
+    // Only a statement carrying a shuffle classifies Analytical; a projection
+    // scan of one cut settles Interactive and has no attempt to lease.
+    let sql = format!("SELECT filter_key, count(*) FROM vala.bifrost.{table} GROUP BY filter_key");
 
     let (_session, ownership) = engine
         .lease_analytical_attempt(query_context(tenant)?, request(&sql))
@@ -441,7 +443,9 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
     }
 
     // Qualified spill: the attempt's own runtime, not a process default.
-    let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
+    // Only a statement carrying a shuffle classifies Analytical; a projection
+    // scan of one cut settles Interactive and has no attempt to lease.
+    let sql = format!("SELECT filter_key, count(*) FROM vala.bifrost.{table} GROUP BY filter_key");
     let (session, ownership) = engine
         .lease_analytical_attempt(query_context(tenant)?, request(&sql))
         .await?;

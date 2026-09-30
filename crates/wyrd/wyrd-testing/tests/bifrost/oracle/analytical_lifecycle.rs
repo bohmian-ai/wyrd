@@ -240,9 +240,8 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
     let supervisor = Arc::clone(handle.supervisor());
     let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
 
-    let attempt = attempt_context();
     let (_session, ownership) = engine
-        .lease_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
+        .lease_analytical_attempt(query_context(tenant)?, request(&sql))
         .await?;
     let live = ownership.key();
 
@@ -442,10 +441,9 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
     }
 
     // Qualified spill: the attempt's own runtime, not a process default.
-    let attempt = attempt_context();
     let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
     let (session, ownership) = engine
-        .lease_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
+        .lease_analytical_attempt(query_context(tenant)?, request(&sql))
         .await?;
     let spill_root = engine
         .analytical_spill_root()

@@ -2052,24 +2052,22 @@ impl Oracle {
 
     /// Leases one Analytical attempt without executing anything.
     ///
-    /// The cut, classification, and providers are prepared exactly as a real
-    /// query would prepare them, and the returned session is the one a
-    /// distributed plan would execute through. Nothing is planned or run, so a
-    /// caller receives an attempt at rest — which is what makes the retry,
-    /// fencing, and settlement orderings observable without racing an
+    /// Runs production's own preparation, single build, classification, and
+    /// admission, then leases the session the distributed plan would execute
+    /// through. Nothing runs, so a caller receives an attempt at rest — which is
+    /// what makes the fencing and spill orderings observable without racing an
     /// executing graph.
     ///
     /// # Errors
     ///
     /// Returns the same stable query, catalog, visibility, and admission errors
     /// as [`Self::query_sql`], plus [`BifrostError::OracleRoleUnavailable`]
-    /// when this node composed no Analytical handle.
+    /// when the statement does not classify as Analytical on this node.
     #[cfg(feature = "test-support")]
     pub async fn lease_analytical_attempt(
         &self,
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
-        attempt: &analytical::AnalyticalAttemptContext,
     ) -> Result<
         (
             datafusion::prelude::SessionContext,
@@ -2078,64 +2076,57 @@ impl Oracle {
         BifrostError,
     > {
         let deadline_ms = self.capture_query_deadline(&request)?;
-        let (mut roster, planned) = self
+        let (roster, prepared) = self
             .prepare_query_attempt(&context, &request, deadline_ms)
             .await?;
-        let handle = self
-            .analytical
-            .as_ref()
-            .ok_or(BifrostError::OracleRoleUnavailable)?;
-        let work_units = Self::scannable_work_units(&planned.cuts);
-        // The same single build production performs, so this attempt leases the
-        // exact config its retained root was planned with.
-        let retained = self
-            .build_physical_root(
-                &context,
-                &request.sql,
-                &planned,
-                &mut roster,
-                Instant::now()
-                    + Duration::from_millis(
-                        u64::try_from(deadline_ms - chrono::Utc::now().timestamp_millis())
-                            .unwrap_or_default(),
-                    ),
-            )
-            .await?;
-        let cut = roster
-            .finalize(QueryClass::Analytical)
-            .map_err(|_| BifrostError::OracleRoleUnavailable)?;
-        // Admitted exactly as production admits: the leader envelope this graph
-        // owns is the one this guard holds, and there is no second acquisition.
-        let remaining = cut
-            .deadline()
-            .signed_duration_since(chrono::Utc::now())
-            .to_std()
-            .map_err(|_| BifrostError::QueryTimeout)?;
-        let deadline = Instant::now()
-            .checked_add(remaining)
-            .ok_or(BifrostError::QueryTimeout)?;
-        let mut admitted = self
-            .admit_sql_query(
-                &context,
-                QueryClass::Analytical,
-                planned.local_ratio,
+        let deadline = instant_deadline(roster.deadline())?;
+        let ClassifiedAttempt {
+            planned,
+            retained,
+            query_class,
+            participant_cut,
+            attempt,
+            work_units,
+        } = self
+            .classify_one_build(ClassifyInput {
+                context: &context,
+                request: &request,
                 deadline,
-                cut.attempt_id(),
+                roster,
+                prepared,
+                query_telemetry: &mut None,
+            })
+            .await?;
+        let (Some(handle), Some(attempt)) = (self.analytical.as_ref(), attempt) else {
+            return Err(BifrostError::OracleRoleUnavailable);
+        };
+        let (mut admitted, running_query) = self
+            .admit_built_attempt(
+                &context,
+                &planned,
+                &participant_cut,
+                query_class,
+                deadline,
+                &mut AttemptPhaseTimer::started(),
             )
             .await?;
         let (session, ownership) = handle.lease_session(analytical::AnalyticalLeaseInputs {
-            attempt,
-            cut: &cut,
+            attempt: &attempt,
+            cut: &participant_cut,
             context: &context,
             admitted: &mut admitted,
             work_units,
             config: retained.config,
             deadline: tokio::time::Instant::from_std(deadline),
         })?;
-        if ownership.retain_admission(admitted).is_err() {
+        if handle
+            .retain_running_query(ownership.key().graph(), running_query)
+            .is_err()
+            || ownership.retain_admission(admitted).is_err()
+        {
             tracing::error!(
                 public_query_id = %attempt.public_query_id,
-                "Oracle analytical graph refused this query's admission owner"
+                "Oracle analytical graph refused this query's owners"
             );
         }
         Ok((session, ownership))
@@ -2307,14 +2298,7 @@ impl Oracle {
         {
             return Err(BifrostError::QueryPeerSecurity);
         }
-        let remaining = roster
-            .deadline()
-            .signed_duration_since(chrono::Utc::now())
-            .to_std()
-            .map_err(|_| BifrostError::QueryTimeout)?;
-        let deadline = Instant::now()
-            .checked_add(remaining)
-            .ok_or(BifrostError::QueryTimeout)?;
+        let deadline = instant_deadline(roster.deadline())?;
         // Phase timing at DEBUG: `oracle_query_duration_seconds` reports only a
         // total, which cannot separate a slow catalog pin from a slow fan-out.
         // This is the leader entry every public query passes through, so it is
@@ -4672,6 +4656,22 @@ where
     }
 }
 
+/// Converts one attempt's wall-clock deadline into the monotonic instant every
+/// later step of that attempt is bounded by.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryTimeout`] when the deadline has already passed
+/// or the remaining budget cannot form an instant.
+fn instant_deadline(deadline: chrono::DateTime<chrono::Utc>) -> Result<Instant, BifrostError> {
+    let remaining = deadline
+        .signed_duration_since(chrono::Utc::now())
+        .to_std()
+        .map_err(|_| BifrostError::QueryTimeout)?;
+    Instant::now()
+        .checked_add(remaining)
+        .ok_or(BifrostError::QueryTimeout)
+}
 #[cfg(test)]
 mod tests {
     use super::participant_cut::tests::lease;

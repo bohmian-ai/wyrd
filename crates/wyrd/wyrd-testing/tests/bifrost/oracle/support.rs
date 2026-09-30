@@ -18,9 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::oracle::analytical::{
-    AnalyticalAttemptContext, AnalyticalLiveInspection, DataFusionQueryId, PublicQueryId,
-};
+use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties;
 use vala_bifrost_redux::schema::with_managed_columns;
 use wyrd_client::WyrdClient;
@@ -368,20 +366,6 @@ pub(crate) fn query_context(
         AuthMethod::Internal,
         permission,
     )?)
-}
-
-/// Allocates the per-query identities one Analytical attempt is leased under.
-///
-/// The two query identities are allocated independently on purpose: a leaked
-/// public identity into the distributed graph, or the reverse, is exactly what
-/// the stage authority's identity isolation exists to refuse.
-pub(crate) fn attempt_context() -> AnalyticalAttemptContext {
-    AnalyticalAttemptContext {
-        public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
-        datafusion_query_id: DataFusionQueryId::from_uuid(uuid::Uuid::now_v7()),
-        snapshot_digest: format!("snapshot-{}", uuid::Uuid::now_v7().simple()),
-        permission_digest: format!("permission-{}", uuid::Uuid::now_v7().simple()),
-    }
 }
 
 /// Returns every Oracle node's live Analytical ownership, leader and follower

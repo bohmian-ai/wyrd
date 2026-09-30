@@ -65,6 +65,8 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use tracing::Instrument;
 use wyrd_spec::vala::BifrostError;
+
+use crate::storage::error_chain_contains_not_found;
 use wyrd_spec::vala::api::{BifrostSecurityPhase, BifrostSecurityViolationKind, QueryClass};
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
@@ -93,13 +95,14 @@ pub fn remote_partition_attempts_for_test() -> u64 {
 /// Shared physical scan state retained by one executing source plan.
 #[derive(Debug, Default)]
 pub(super) struct OracleScanMetricsHandle {
-    /// Iceberg's dependency-reported requested-range counter.
-    iceberg: Mutex<Option<ScanMetrics>>,
+    /// Iceberg's dependency-reported requested-range counters, one per
+    /// partition reader that started.
+    iceberg: Mutex<Vec<ScanMetrics>>,
     /// Requested bytes from governed hot Parquet range reads.
     hot_bytes: AtomicU64,
     /// Whether at least one hot object read was requested.
     hot_available: AtomicBool,
-    /// Number of Iceberg file tasks delivered to the reader.
+    /// Number of Iceberg files delivered to the readers, counted once per file.
     iceberg_files: AtomicU64,
     /// Whether the Iceberg reader received at least one task.
     iceberg_partitions: AtomicU64,
@@ -114,16 +117,22 @@ pub(super) struct OracleScanMetricsHandle {
 }
 
 impl OracleScanMetricsHandle {
-    /// Stores the dependency counter before its stream is consumed.
-    fn set_iceberg_metrics(&self, metrics: ScanMetrics) {
+    /// Retains one partition reader's dependency counter before its stream
+    /// is consumed; terminal bytes sum every retained counter.
+    fn add_iceberg_metrics(&self, metrics: ScanMetrics) {
         if let Ok(mut current) = self.iceberg.lock() {
-            *current = Some(metrics);
+            current.push(metrics);
         }
     }
 
-    /// Records one task delivered to the Iceberg reader.
-    fn record_iceberg_task(&self) {
-        self.iceberg_files.fetch_add(1, Ordering::Relaxed);
+    /// Records one task delivered to an Iceberg reader.
+    ///
+    /// A file split across partitions is counted only by the piece that
+    /// begins at the file's first byte, so each file counts once.
+    fn record_iceberg_task(&self, task: &FileScanTask) {
+        if task.start == 0 {
+            self.iceberg_files.fetch_add(1, Ordering::Relaxed);
+        }
         self.iceberg_partitions.store(1, Ordering::Relaxed);
     }
 
@@ -157,9 +166,11 @@ impl OracleScanMetricsHandle {
         let mut total = 0_u64;
         let mut available = false;
         if let Ok(metrics) = self.iceberg.lock()
-            && let Some(metrics) = metrics.as_ref()
+            && !metrics.is_empty()
         {
-            total = total.saturating_add(metrics.bytes_read());
+            total = metrics.iter().fold(total, |total, metrics| {
+                total.saturating_add(metrics.bytes_read())
+            });
             available = true;
         }
         if self.hot_available.load(Ordering::Acquire) {
@@ -189,8 +200,62 @@ impl OracleScanMetricsHandle {
 /// Records one pinned Iceberg task and returns it without altering its delete
 /// metadata, schema, predicate, or byte range.
 fn retain_iceberg_task(task: FileScanTask, metrics: &Arc<OracleScanMetricsHandle>) -> FileScanTask {
-    metrics.record_iceberg_task();
+    metrics.record_iceberg_task(&task);
     task
+}
+
+/// Returns the byte ranges one partition reads when `sizes` are laid end to end.
+///
+/// The concatenated bytes are cut into `partitions` equal contiguous ranges and
+/// each returned `(file index, range)` is the non-empty intersection of this
+/// partition's range with one file. The ranges of all partitions tile every
+/// file exactly, so a row group assigned by its midpoint (see
+/// [`row_groups_in_byte_range`]) is read by exactly one partition. This is the
+/// split Iceberg's own reader honors through `FileScanTask::start`/`length`.
+fn partition_byte_ranges(
+    sizes: &[u64],
+    partition: usize,
+    partitions: usize,
+) -> Vec<(usize, Range<u64>)> {
+    let total: u128 = sizes.iter().map(|size| u128::from(*size)).sum();
+    let partitions = u128::try_from(partitions.max(1)).unwrap_or(u128::MAX);
+    let partition = u128::try_from(partition).unwrap_or(u128::MAX);
+    let bound = |index: u128| total.saturating_mul(index) / partitions;
+    let (low, high) = (bound(partition), bound(partition.saturating_add(1)));
+    let mut ranges = Vec::new();
+    let mut offset = 0_u128;
+    for (index, size) in sizes.iter().enumerate() {
+        let end = offset + u128::from(*size);
+        let (start, stop) = (low.max(offset), high.min(end));
+        if start < stop {
+            // Both bounds lie within this file, so they fit its u64 size.
+            let local = |at: u128| u64::try_from(at - offset).unwrap_or(u64::MAX);
+            ranges.push((index, local(start)..local(stop)));
+        }
+        offset = end;
+    }
+    ranges
+}
+
+/// Returns the row groups of `metadata` whose byte midpoint lies in `range`.
+///
+/// Row groups are laid out after the four-byte magic header in index order,
+/// exactly as Iceberg's reader locates them for a split `FileScanTask`, so a
+/// hot file and a published file split identically.
+fn row_groups_in_byte_range(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    range: &Range<u64>,
+) -> Vec<usize> {
+    let mut offset = 4_u64;
+    let mut owned = Vec::new();
+    for (index, row_group) in metadata.row_groups().iter().enumerate() {
+        let size = u64::try_from(row_group.compressed_size()).unwrap_or_default();
+        if range.contains(&(offset + size / 2)) {
+            owned.push(index);
+        }
+        offset += size;
+    }
+    owned
 }
 
 /// Physical scan volume reported by every participant of one distributed query.
@@ -804,10 +869,195 @@ pub(crate) struct OracleIcebergScanExec {
     /// two are the same object, so drift detection has to compare them in one
     /// spelling or it refuses every promoted file.
     assigned_aliases: std::collections::BTreeMap<String, String>,
-    /// Cached properties copied from the pinned source plan.
+    /// Properties copied from the pinned source plan, at this scan's
+    /// partition count.
     properties: Arc<PlanProperties>,
     /// Shared terminal metric owner retained by query telemetry.
     metrics: Arc<OracleScanMetricsHandle>,
+    /// Governed footer cache the reader loads data-file metadata through;
+    /// `None` leaves footer decoding to the Iceberg reader.
+    footers: Option<PublishedFooters>,
+    /// Pinned file tasks, planned once and shared by every partition.
+    planned: Arc<tokio::sync::OnceCell<Vec<FileScanTask>>>,
+}
+
+/// What a pinned Iceberg scan needs to load data-file footers through the
+/// node's one governed metadata cache.
+///
+/// Built at planning time, before admission, so it retains only the
+/// planning-time [`HotParquetPlan`]; the admitted pool, class, and deadline
+/// are resolved from the executing task, exactly as a hot leaf resolves them.
+#[derive(Clone)]
+pub(super) struct PublishedFooters {
+    /// The node's one storage owner and its decoded-metadata cache.
+    storage: Arc<crate::storage::BifrostStorage>,
+    /// Authenticated tenant owning every scanned object.
+    tenant_id: wyrd_spec::DataTenantId,
+    /// Canonical logical table name scoping every key.
+    table: String,
+    /// Planning-time governance for the footer ranges a cache miss reads.
+    governance: HotParquetPlan,
+}
+
+impl PublishedFooters {
+    /// Captures the storage owner, tenant, table, and governance mode one
+    /// pinned Iceberg scan loads its footers under.
+    pub(super) fn new(
+        storage: Arc<crate::storage::BifrostStorage>,
+        tenant_id: wyrd_spec::DataTenantId,
+        table: String,
+        governance: HotParquetPlan,
+    ) -> Self {
+        Self {
+            storage,
+            tenant_id,
+            table,
+            governance,
+        }
+    }
+
+    /// Resolves one executing scan's footer loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` execution error when the admitted governance
+    /// cannot be resolved from `task`: absent bindings, a cancelled query, or
+    /// an elapsed deadline.
+    fn loader(
+        &self,
+        file_io: FileIO,
+        task: &TaskContext,
+    ) -> DataFusionResult<Arc<PublishedFooterLoader>> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        Ok(Arc::new(PublishedFooterLoader {
+            storage: Arc::clone(&self.storage),
+            file_io,
+            tenant_id: self.tenant_id,
+            table: self.table.clone(),
+            governance: self.governance.resolve(task)?,
+            retained: Arc::new(Mutex::new(Vec::new())),
+            _cancel_on_drop: cancel.clone().drop_guard(),
+            cancel,
+        }))
+    }
+}
+
+/// Serves one pinned Iceberg scan's data-file footers from the node's one
+/// governed metadata cache.
+///
+/// Without it the Iceberg reader decodes every data file's footer and page
+/// index again on every query. Through it, one decode per immutable object is
+/// shared across queries, concurrent misses single-flight, and retained
+/// footers are charged to the one Oracle memory root. Every load's
+/// [`crate::storage::RetainedMetadata`] is held for the loader's life, which is
+/// the scan stream's life, so evicting an entry never releases the charge for
+/// bytes this scan still reads. Dropping the loader cancels any decode it still
+/// has outstanding.
+struct PublishedFooterLoader {
+    /// The node's one storage owner and its decoded-metadata cache.
+    storage: Arc<crate::storage::BifrostStorage>,
+    /// Pinned table reader, used only when a footer is not cached.
+    file_io: FileIO,
+    /// Authenticated tenant owning every scanned object.
+    tenant_id: wyrd_spec::DataTenantId,
+    /// Canonical logical table name scoping every key.
+    table: String,
+    /// Admitted governance charged for the footer ranges a miss reads.
+    governance: HotParquetGovernance,
+    /// Every footer this scan loaded, retained until the scan ends.
+    retained: Arc<Mutex<Vec<crate::storage::RetainedMetadata>>>,
+    /// Cancels outstanding decodes when the loader is dropped.
+    _cancel_on_drop: tokio_util::sync::DropGuard,
+    /// Token every decode this loader starts is bound to.
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl iceberg::arrow::ParquetMetadataLoader for PublishedFooterLoader {
+    /// Loads one data file's footer through the governed cache.
+    ///
+    /// A miss reads the footer and page index through the same governed,
+    /// range-reserving reader the hot tier uses; its range observations go to
+    /// a scratch handle because they are not hot-tier reads.
+    ///
+    /// # Errors
+    ///
+    /// The returned future fails with the storage owner's closed error as the
+    /// Iceberg error's source, so a vanished object keeps its not-found cause
+    /// for stale-object classification.
+    fn load(
+        &self,
+        path: &str,
+        size: u64,
+    ) -> BoxFuture<'static, iceberg::Result<Arc<ParquetMetaData>>> {
+        let key = crate::storage::ObjectMetadataKey::published(
+            self.tenant_id,
+            self.table.clone(),
+            path.to_owned(),
+            size,
+        );
+        let build_reader = {
+            let file_io = self.file_io.clone();
+            let location = path.to_owned();
+            let governance = self.governance.clone();
+            move || {
+                IcebergParquetReader::new(
+                    HotObjectSource::Pending {
+                        file_io: file_io.clone(),
+                        location: location.clone(),
+                    },
+                    size,
+                    governance.clone(),
+                    Arc::new(OracleScanMetricsHandle::default()),
+                )
+            }
+        };
+        let storage = Arc::clone(&self.storage);
+        let cancel = self.cancel.clone();
+        let retained = Arc::clone(&self.retained);
+        async move {
+            let loaded = storage
+                .object_metadata(key, build_reader, storage.metadata_deadline(), cancel)
+                .await
+                .map_err(|error| {
+                    iceberg::Error::new(
+                        iceberg::ErrorKind::Unexpected,
+                        "governed data-file footer load failed",
+                    )
+                    .with_source((*error).clone())
+                })?;
+            let metadata = Arc::clone(loaded.metadata());
+            retained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(loaded);
+            Ok(metadata)
+        }
+        .boxed()
+    }
+}
+
+/// Routes every pinned Iceberg scan in `plan` through `footers`.
+///
+/// Used where a plan's Iceberg leaves were built by code that cannot see the
+/// storage owner, such as a follower's catalog scan.
+///
+/// # Errors
+///
+/// Returns the `DataFusion` error of a failed plan rewrite.
+pub(super) fn route_published_footers(
+    plan: Arc<dyn ExecutionPlan>,
+    footers: &PublishedFooters,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    use datafusion::common::tree_node::{Transformed, TreeNode as _};
+    plan.transform_up(|node| {
+        let Some(exec) = node.downcast_ref::<OracleIcebergScanExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        Ok(Transformed::yes(Arc::new(
+            exec.clone().with_footers(footers.clone()),
+        )))
+    })
+    .map(|transformed| transformed.data)
 }
 
 /// Domain marker for one authenticated Iceberg object lost after cut selection.
@@ -817,30 +1067,6 @@ struct OracleIcebergStaleObject {
     /// Exact typed storage cause retained for diagnostics and downcast proof.
     #[source]
     source: Box<dyn std::error::Error + Send + Sync>,
-}
-
-/// Returns whether an error chain contains an exact filesystem or `OpenDAL` not-found cause.
-///
-/// Object-store backends report a vanished object through their own typed
-/// error, wrapped an arbitrary number of times by Iceberg, Parquet, and
-/// `DataFusion`. Walking the whole chain and downcasting is the only way to
-/// separate a pinned object that disappeared after cut selection from a
-/// genuine storage outage, which the caller must classify differently.
-pub(super) fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(error);
-    while let Some(source) = current {
-        if source
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            || source
-                .downcast_ref::<opendal::Error>()
-                .is_some_and(|error| error.kind() == opendal::ErrorKind::NotFound)
-        {
-            return true;
-        }
-        current = source.source();
-    }
-    false
 }
 
 /// Preserves a typed Iceberg-only stale marker without classifying adjacent IO.
@@ -927,7 +1153,29 @@ impl OracleIcebergScanExec {
             assigned_aliases: std::collections::BTreeMap::new(),
             properties: Arc::clone(plan.properties()),
             metrics: Arc::new(OracleScanMetricsHandle::default()),
+            footers: None,
+            planned: Arc::default(),
         })
+    }
+
+    /// Reads this scan across `partitions` byte-range partitions.
+    ///
+    /// Callers pass their session's target partitions, the way a `DataFusion`
+    /// listing scan splits its file groups. See [`partition_byte_ranges`].
+    pub(crate) fn with_partitions(mut self, partitions: usize) -> Self {
+        self.properties = Arc::new(
+            self.properties
+                .as_ref()
+                .clone()
+                .with_partitioning(Partitioning::UnknownPartitioning(partitions.max(1))),
+        );
+        self
+    }
+
+    /// Loads this scan's data-file footers through the governed cache.
+    pub(super) fn with_footers(mut self, footers: PublishedFooters) -> Self {
+        self.footers = Some(footers);
+        self
     }
 
     /// Restricts this pinned scan to one exact authenticated follower assignment.
@@ -943,6 +1191,9 @@ impl OracleIcebergScanExec {
     ) -> Self {
         self.assigned_files = Some(assigned_files);
         self.assigned_aliases = assigned_aliases;
+        // A restricted scan plans a different task set, never the one an
+        // unrestricted clone may already have planned.
+        self.planned = Arc::default();
         self
     }
 
@@ -1000,7 +1251,7 @@ impl OracleIcebergScanExec {
             .map_err(iceberg_datafusion_error)
     }
 
-    /// Rebuilds the exact pinned Iceberg scan and starts its reader stream.
+    /// Rebuilds the exact pinned Iceberg scan and plans its file tasks.
     ///
     /// Where the predicate is applied depends on who selected the files.
     ///
@@ -1023,10 +1274,10 @@ impl OracleIcebergScanExec {
     ///
     /// # Errors
     ///
-    /// Returns a typed `DataFusion` error when scan planning, task planning,
-    /// predicate binding, reader construction, or object-store reads fail, and
-    /// a plan error when an assigned file is absent from the pinned snapshot.
-    async fn start_stream(&self) -> DataFusionResult<SendableRecordBatchStream> {
+    /// Returns a typed `DataFusion` error when scan planning, task planning, or
+    /// predicate binding fails, and a plan error when an assigned file is
+    /// absent from the pinned snapshot.
+    async fn plan_tasks(&self) -> DataFusionResult<Vec<FileScanTask>> {
         let mut builder = self.table.scan();
         if let Some(snapshot_id) = self.snapshot_id {
             builder = builder.snapshot_id(snapshot_id);
@@ -1046,7 +1297,7 @@ impl OracleIcebergScanExec {
             .try_collect::<Vec<_>>()
             .await
             .map_err(iceberg_datafusion_error)?;
-        let tasks = if let Some(assigned) = &self.assigned_files {
+        if let Some(assigned) = &self.assigned_files {
             let planned = tasks
                 .iter()
                 .map(|task| self.assignment_location(&task.data_file_path))
@@ -1076,32 +1327,63 @@ impl OracleIcebergScanExec {
                 ));
             }
             let row_filter = self.assignment_row_filter()?;
-            tasks
+            return Ok(tasks
                 .into_iter()
                 .filter(|task| assigned.contains(&self.assignment_location(&task.data_file_path)))
                 .map(|mut task| {
                     task.predicate.clone_from(&row_filter);
                     task
                 })
-                .collect::<Vec<_>>()
-        } else {
-            tasks
-        };
-        let tasks = futures_util::stream::iter(tasks.into_iter().map(Ok));
+                .collect());
+        }
+        Ok(tasks)
+    }
+
+    /// Starts one partition's Iceberg reader over its byte ranges.
+    ///
+    /// Every partition awaits the same planned task list, then reads only the
+    /// byte ranges [`partition_byte_ranges`] assigns it; the reader keeps each
+    /// row group whose midpoint lies in a task's range. `footers`, when
+    /// present, is the resolved governed footer loader the reader loads every
+    /// unencrypted data file's metadata through.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed `DataFusion` error when task planning, reader
+    /// construction, or object-store reads fail.
+    async fn start_stream(
+        &self,
+        partition: usize,
+        footers: Option<Arc<PublishedFooterLoader>>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let planned = self.planned.get_or_try_init(|| self.plan_tasks()).await?;
+        let sizes = planned.iter().map(|task| task.length).collect::<Vec<_>>();
+        let partitions = self.properties.partitioning.partition_count();
+        let tasks = partition_byte_ranges(&sizes, partition, partitions)
+            .into_iter()
+            .map(|(index, range)| {
+                let mut task = planned[index].clone();
+                task.start += range.start;
+                task.length = range.end - range.start;
+                Ok(task)
+            })
+            .collect::<Vec<_>>();
+        let tasks = futures_util::stream::iter(tasks);
         // Row selection turns each task predicate into a page-index selection,
         // so a point lookup decodes the matching pages instead of every page
         // of each surviving row group. The reader defaults it off.
-        let metrics = self
-            .table
-            .reader_builder()
-            .with_row_selection_enabled(true)
+        let mut reader = self.table.reader_builder().with_row_selection_enabled(true);
+        if let Some(footers) = footers {
+            reader = reader.with_parquet_metadata_loader(footers);
+        }
+        let metrics = reader
             .build()
             .read(Box::pin(tasks.map_ok({
                 let metrics = Arc::clone(&self.metrics);
                 move |task| retain_iceberg_task(task, &metrics)
             })))
             .map_err(iceberg_datafusion_error)?;
-        self.metrics.set_iceberg_metrics(metrics.metrics().clone());
+        self.metrics.add_iceberg_metrics(metrics.metrics().clone());
         let stream = metrics
             .stream()
             .map(|result| result.map_err(iceberg_datafusion_error));
@@ -1187,24 +1469,32 @@ impl ExecutionPlan for OracleIcebergScanExec {
         &self.properties
     }
 
-    /// Starts one single-partition Iceberg reader stream.
+    /// Starts one partition's Iceberg reader stream.
     ///
     /// # Errors
     ///
     /// Returns a typed `DataFusion` error when scan planning or storage setup
-    /// fails, or when a non-zero partition is requested.
+    /// fails, when the partition is out of range, or when footer governance
+    /// cannot be resolved from the admitted task.
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
+        if partition >= self.properties.partitioning.partition_count() {
             return Err(DataFusionError::Execution(format!(
                 "OracleIcebergScanExec has no partition {partition}"
             )));
         }
+        // Resolved here, never at planning time: the admitted pool, class,
+        // cancellation, and deadline all arrive with this task.
+        let footers = self
+            .footers
+            .as_ref()
+            .map(|footers| footers.loader(self.table.file_io().clone(), context.as_ref()))
+            .transpose()?;
         let source = self.clone();
-        let future = async move { source.start_stream().await };
+        let future = async move { source.start_stream(partition, footers).await };
         let stream = futures_util::stream::once(future).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -1227,7 +1517,7 @@ impl ExecutionPlan for OracleIcebergScanExec {
 pub(super) fn hot_metadata_key(
     file: &vala_sql::row_types::file_list::HotFileRow,
     size_bytes: usize,
-) -> Result<crate::storage::HotMetadataKey, BifrostError> {
+) -> Result<crate::storage::ObjectMetadataKey, BifrostError> {
     let size_bytes_u64 = u64::try_from(size_bytes).map_err(|_| BifrostError::MetadataMismatch {
         detail: "hot file size exceeds process bounds".to_owned(),
     })?;
@@ -1240,7 +1530,7 @@ pub(super) fn hot_metadata_key(
         .ok_or_else(|| BifrostError::MetadataMismatch {
             detail: "hot file row carries no usable object checksum".to_owned(),
         })?;
-    Ok(crate::storage::HotMetadataKey::new(
+    Ok(crate::storage::ObjectMetadataKey::new(
         wyrd_spec::DataTenantId::new(file.data_tenant_id).map_err(|_| {
             BifrostError::MetadataMismatch {
                 detail: "hot file row carries a non-v7 tenant identity".to_owned(),
@@ -1272,7 +1562,7 @@ pub(crate) struct HotFileSource {
     /// Built from the signed `vala.file_list` facts rather than from the
     /// location, so two queries for the same durable object share one decode
     /// and two distinct objects never collide even under the same path prefix.
-    pub(crate) metadata_key: crate::storage::HotMetadataKey,
+    pub(crate) metadata_key: crate::storage::ObjectMetadataKey,
 }
 
 /// One table cut's persisted sources delegated to a frozen remote participant.
@@ -1529,6 +1819,9 @@ impl OracleTableProvider {
         occurrence: u64,
     ) -> DataFusionResult<Vec<Arc<dyn ExecutionPlan>>> {
         let required_schema = Arc::clone(&scan_projection.required_schema);
+        // Like a `DataFusion` listing scan, each persisted leaf reads across
+        // the session's target partitions.
+        let partitions = state.config_options().execution.target_partitions;
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         let published_index = inputs.len();
         {
@@ -1546,8 +1839,16 @@ impl OracleTableProvider {
                     limit,
                 )
                 .await?;
-            let published: Arc<dyn ExecutionPlan> =
-                Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
+            let published: Arc<dyn ExecutionPlan> = Arc::new(
+                OracleIcebergScanExec::from_plan(published.as_ref())?
+                    .with_partitions(partitions)
+                    .with_footers(PublishedFooters::new(
+                        Arc::clone(&self.storage),
+                        self.context.data_tenant_id,
+                        self.table.clone(),
+                        HotParquetPlan::Leader,
+                    )),
+            );
             // The dependency may return the projected columns in its own
             // physical order. The signed closure is authoritative, so the plan
             // is normalized to it here rather than the closure being reordered
@@ -1558,15 +1859,18 @@ impl OracleTableProvider {
             )?);
         }
         if !self.hot_files.is_empty() {
-            inputs.push(Arc::new(HotParquetExec::new(
-                self.retained_hot_files(supported_predicates),
-                self.file_io.clone(),
-                Arc::clone(&self.storage),
-                Arc::clone(&required_schema),
-                HotParquetPlan::Leader,
-                Arc::new(OracleScanMetricsHandle::default()),
-                supported_predicates.to_vec(),
-            )));
+            inputs.push(Arc::new(
+                HotParquetExec::new(
+                    self.retained_hot_files(supported_predicates),
+                    self.file_io.clone(),
+                    Arc::clone(&self.storage),
+                    Arc::clone(&required_schema),
+                    HotParquetPlan::Leader,
+                    Arc::new(OracleScanMetricsHandle::default()),
+                    supported_predicates.to_vec(),
+                )
+                .with_partitions(partitions),
+            ));
         }
         let Some(remote) = self.remote.as_ref() else {
             return Ok(inputs);
@@ -2411,14 +2715,16 @@ impl AsyncFileReader for IcebergParquetReader {
                 self.reader
                     .read(range)
                     .await
-                    .map_err(|error| ParquetError::General(error.to_string()))?
+                    .map_err(|error| ParquetError::External(Box::new(error)))?
             };
             #[cfg(not(test))]
+            // Kept typed so the storage owner can tell a vanished object from
+            // an outage when this read backs a governed footer decode.
             let bytes = self
                 .reader
                 .read(range)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))?;
+                .map_err(|error| ParquetError::External(Box::new(error)))?;
             if bytes.len() != requested {
                 return Err(ParquetError::General(format!(
                     "hot Parquet short range: requested {requested} bytes, received {}",
@@ -2493,7 +2799,8 @@ impl fmt::Debug for HotParquetExec {
 }
 
 impl HotParquetExec {
-    /// Creates a single-partition hot-file leaf from validated manifests.
+    /// Creates a hot-file leaf from validated manifests, single-partition
+    /// until [`Self::with_partitions`] splits it.
     ///
     /// Callers must have already authenticated the assignment, validated every
     /// object identity and size, and chosen the governance mode that matches
@@ -2519,6 +2826,37 @@ impl HotParquetExec {
             properties: plan_properties(Arc::clone(&schema)),
             schema,
         }
+    }
+
+    /// Reads this leaf across `partitions` byte-range partitions.
+    ///
+    /// Callers pass their session's target partitions; see
+    /// [`partition_byte_ranges`].
+    pub(super) fn with_partitions(mut self, partitions: usize) -> Self {
+        self.properties =
+            plan_properties_with_partitions(Arc::clone(&self.schema), partitions.max(1));
+        self
+    }
+
+    /// Returns the files and byte ranges `partition` owns, in file order.
+    ///
+    /// Every file's bytes are tiled across this leaf's partition count by
+    /// [`partition_byte_ranges`], so the union over partitions covers each byte
+    /// exactly once. A size that does not fit `u64` counts as empty.
+    fn partition_pieces(&self, partition: usize) -> Vec<(HotFileSource, Range<u64>)> {
+        let sizes = self
+            .files
+            .iter()
+            .map(|file| u64::try_from(file.size_bytes).unwrap_or_default())
+            .collect::<Vec<_>>();
+        partition_byte_ranges(
+            &sizes,
+            partition,
+            self.properties.partitioning.partition_count(),
+        )
+        .into_iter()
+        .map(|(index, range)| (self.files[index].clone(), range))
+        .collect()
     }
 
     /// Returns the shared terminal metric owner for this hot leaf.
@@ -2595,7 +2933,7 @@ impl ExecutionPlan for HotParquetExec {
         }
     }
 
-    /// Reads validated hot files sequentially through governed Parquet ranges.
+    /// Reads this partition's byte ranges through governed Parquet ranges.
     ///
     /// # Errors
     ///
@@ -2606,7 +2944,7 @@ impl ExecutionPlan for HotParquetExec {
         partition: usize,
         task: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
+        if partition >= self.properties.partitioning.partition_count() {
             return Err(DataFusionError::Execution(format!(
                 "HotParquetExec has no partition {partition}"
             )));
@@ -2618,25 +2956,33 @@ impl ExecutionPlan for HotParquetExec {
         // The hot leaf decodes at the admitted session's batch size, so this
         // path is shaped by the same grant as every other operator in the plan
         // rather than by a fixed constant of its own.
-        let stream = hot_stream(self, task.session_config().batch_size(), governance);
+        let stream = hot_stream(
+            self,
+            partition,
+            task.session_config().batch_size(),
+            governance,
+        );
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
-/// Builds the hot-file stream after partition validation has completed.
+/// Builds one partition's hot-file stream after partition validation.
 ///
-/// Files are read sequentially. Each one publishes a file observation before
-/// its footer is touched, prunes row groups and then pages against the closed
-/// predicates, decodes at the admitted `batch_size`, projects to the
+/// The partition's byte ranges are read sequentially. The piece holding a
+/// file's first byte publishes its file observation before the footer is
+/// touched; each piece keeps only the row groups whose midpoint lies in its
+/// range, prunes those and then pages against the closed predicates, decodes
+/// at the session `batch_size`, projects to the
 /// authenticated physical schema, and holds one governed reservation for
 /// exactly the lifetime of the yielded batch. Dropping the stream releases every retained reservation,
 /// which is what makes cancellation return the query's memory.
 fn hot_stream(
     exec: &HotParquetExec,
+    partition: usize,
     batch_size: usize,
     governance: HotParquetGovernance,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static {
-    let files = exec.files.clone();
+    let pieces = exec.partition_pieces(partition);
     let file_io = exec.file_io.clone();
     let storage = Arc::clone(&exec.storage);
     let schema = Arc::clone(&exec.schema);
@@ -2651,7 +2997,7 @@ fn hot_stream(
     let cancel_on_drop = cancel.clone().drop_guard();
     async_stream::try_stream! {
         let _cancel_on_drop = cancel_on_drop;
-        for file in files {
+        for (file, range) in pieces {
             let size = u64::try_from(file.size_bytes).map_err(|_| {
                 DataFusionError::Execution("hot object size exceeds u64".to_owned())
             })?;
@@ -2685,13 +3031,17 @@ fn hot_stream(
             // for every attempt on this file, including one whose reader fails
             // or is abandoned mid-open. Row-group pruning is reported
             // separately, so a file whose groups are all pruned still counts as
-            // opened rather than vanishing from the scan accounting.
-            metrics.record_hot_file();
+            // opened rather than vanishing from the scan accounting. Only the
+            // piece holding the file's first byte records it, so a file split
+            // across partitions counts once.
+            if range.start == 0 {
+                metrics.record_hot_file();
+            }
             // The owner, not this leaf, decides whether this object's footer is
             // decoded again: it owns the node-wide cache, single-flight, request
             // admission, and retry bound for every hot identity.
             let retained = storage
-                .hot_metadata(
+                .object_metadata(
                     file.metadata_key.clone(),
                     build_reader.clone(),
                     storage.metadata_deadline(),
@@ -2708,7 +3058,12 @@ fn hot_stream(
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
             let builder =
                 ParquetRecordBatchStreamBuilder::new_with_metadata(build_reader(), metadata);
-            let selection = select_row_groups_for_predicates(builder.metadata(), &predicates);
+            let owned = row_groups_in_byte_range(builder.metadata(), &range);
+            if owned.is_empty() {
+                continue;
+            }
+            let selection =
+                select_row_groups_for_predicates(builder.metadata(), owned, &predicates);
             metrics.record_row_groups(&selection);
             if selection.excludes_file() {
                 continue;
@@ -3649,25 +4004,21 @@ impl RowGroupSelection {
     }
 }
 
-/// Selects the row groups of `metadata` whose statistics can still satisfy the
-/// closed predicate conjunction, pruning the rest.
+/// Selects the `candidates` row groups of `metadata` whose statistics can
+/// still satisfy the closed predicate conjunction, pruning the rest.
 ///
 /// A row group is pruned only when at least one leaf proves it cannot contain a
 /// matching row; absent, type-mismatched, or unusable statistics always retain
 /// it, so pruning is a pure IO optimization and never changes results. An empty
-/// predicate conjunction retains every row group and prunes none.
+/// predicate conjunction retains every candidate and prunes none.
 pub(super) fn select_row_groups_for_predicates(
     metadata: &parquet::file::metadata::ParquetMetaData,
+    candidates: Vec<usize>,
     predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
 ) -> RowGroupSelection {
-    let total = metadata.num_row_groups();
-    if predicates.is_empty() || total == 0 {
-        return RowGroupSelection {
-            retained: (0..total).collect(),
-            pruned: 0,
-        };
-    }
-    let retained: Vec<usize> = (0..total)
+    let total = candidates.len();
+    let retained: Vec<usize> = candidates
+        .into_iter()
         .filter(|row_group_index| {
             !predicates
                 .iter()
@@ -4055,13 +4406,13 @@ mod tests {
     /// The checksum is derived from the name so two differently named fixture
     /// objects never share a cache entry, which is the same property the
     /// durable writer checksum gives production.
-    fn fixture_metadata_key(name: &str, size_bytes: usize) -> crate::storage::HotMetadataKey {
+    fn fixture_metadata_key(name: &str, size_bytes: usize) -> crate::storage::ObjectMetadataKey {
         let mut checksum = [0_u8; 32];
         for (slot, byte) in checksum.iter_mut().zip(name.as_bytes()) {
             *slot = *byte;
         }
         checksum[31] = 1;
-        crate::storage::HotMetadataKey::new(
+        crate::storage::ObjectMetadataKey::new(
             wyrd_spec::DataTenantId::new_v7(),
             "vala.traces.spans".to_owned(),
             name.to_owned(),
@@ -4096,7 +4447,7 @@ mod tests {
                 scratch_limit_bytes: Some(1024 * 1024 * 1024),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                scratch_root: std::env::temp_dir(),
+                scratch_root: None,
                 volume_roots: None,
             },
         )
@@ -4542,7 +4893,11 @@ mod tests {
             "service_name".to_owned(),
             ScanLiteral::Utf8("checkout".to_owned()),
         )];
-        let selection = select_row_groups_for_predicates(&metadata, &predicates);
+        let selection = select_row_groups_for_predicates(
+            &metadata,
+            (0..metadata.num_row_groups()).collect(),
+            &predicates,
+        );
         assert_eq!(selection.retained, vec![0]);
         assert_eq!(selection.pruned, 1);
         assert!(!selection.excludes_file());
@@ -4734,6 +5089,223 @@ mod tests {
         )
         .build();
         assert_position_delete_rows(&reader, forwarded, fixture.data_schema).await;
+    }
+
+    /// Every partition count tiles each non-empty file exactly once.
+    ///
+    /// The union of all partitions' ranges for a file must be `[0, size)`
+    /// with no overlap, and an empty file must never be assigned, so each
+    /// row group's midpoint lands in exactly one partition.
+    #[test]
+    fn partition_byte_ranges_tile_every_file_once() {
+        let sizes = [10_u64, 3, 0, 20, 1];
+        for partitions in 1..=8 {
+            let mut covered = vec![Vec::<Range<u64>>::new(); sizes.len()];
+            for partition in 0..partitions {
+                for (index, range) in partition_byte_ranges(&sizes, partition, partitions) {
+                    assert!(range.start < range.end, "ranges are never empty");
+                    covered[index].push(range);
+                }
+            }
+            for (index, ranges) in covered.iter_mut().enumerate() {
+                ranges.sort_by_key(|range| range.start);
+                let mut next = 0;
+                for range in ranges.iter() {
+                    assert_eq!(range.start, next, "file {index} has a gap or overlap");
+                    next = range.end;
+                }
+                assert_eq!(next, sizes[index], "file {index} is not fully covered");
+            }
+        }
+        assert!(partition_byte_ranges(&[], 0, 4).is_empty());
+    }
+
+    /// Writes `values` as a Parquet file with two-row row groups.
+    fn write_split_fixture(path: &std::path::Path, schema: &SchemaRef, values: &[i64]) -> usize {
+        let batch = RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(Int64Array::from(values.to_vec())) as ArrayRef],
+        )
+        .expect("split fixture batch");
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(path).expect("split fixture file"),
+            Arc::clone(schema),
+            Some(properties),
+        )
+        .expect("split fixture writer");
+        writer.write(&batch).expect("split fixture write");
+        writer.close().expect("split fixture close");
+        usize::try_from(std::fs::metadata(path).expect("split fixture size").len())
+            .expect("split fixture size fits usize")
+    }
+
+    /// Collects every `Int64` value one stream yields.
+    async fn collect_int64(
+        mut stream: datafusion::execution::SendableRecordBatchStream,
+    ) -> Vec<i64> {
+        let mut values = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("split partition batch");
+            values.extend(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("split values remain Int64")
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        values
+    }
+
+    /// A hot leaf split across partitions reads every row exactly once.
+    ///
+    /// One multi-row-group file and one small file are read at several
+    /// partition counts, including more partitions than row groups. The union
+    /// of all partitions must equal the source rows, and each file must count
+    /// once in scan telemetry however many partitions read it.
+    #[tokio::test]
+    async fn hot_parquet_split_partitions_read_every_row_once() {
+        let directory = tempfile::tempdir().expect("split fixture directory");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let large: Vec<i64> = (0..11).collect();
+        let small: Vec<i64> = vec![100, 101];
+        let files = [("large.parquet", &large), ("small.parquet", &small)]
+            .into_iter()
+            .map(|(name, values)| {
+                let path = directory.path().join(name);
+                let size_bytes = write_split_fixture(&path, &schema, values);
+                HotFileSource {
+                    metadata_key: fixture_metadata_key(&path.to_string_lossy(), size_bytes),
+                    location: path.to_string_lossy().into_owned(),
+                    size_bytes,
+                    event_time: unusable_event_time(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut expected = large.iter().chain(&small).copied().collect::<Vec<_>>();
+        expected.sort_unstable();
+        let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
+        let telemetry = Arc::new(OracleTelemetry::new());
+        for partitions in [1, 2, 3, 4, 16] {
+            let metrics = Arc::new(OracleScanMetricsHandle::default());
+            let exec = HotParquetExec::new(
+                files.clone(),
+                FileIO::new_with_fs(),
+                fixture_storage(),
+                Arc::clone(&schema),
+                HotParquetPlan::Leader,
+                Arc::clone(&metrics),
+                Vec::new(),
+            )
+            .with_partitions(partitions);
+            assert_eq!(exec.properties().partitioning.partition_count(), partitions);
+            let context = bound_leader_task(
+                oracle_memory_resources(&governor, 1024 * 1024),
+                &telemetry,
+                crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+            );
+            let mut actual = Vec::new();
+            for partition in 0..partitions {
+                let stream = exec
+                    .execute(partition, Arc::clone(&context))
+                    .expect("split partition stream");
+                actual.extend(collect_int64(stream).await);
+            }
+            assert!(exec.execute(partitions, context).is_err());
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{partitions} partitions");
+            let (_, scanned_files, _) = metrics.terminal_values();
+            assert_eq!(
+                scanned_files, 2,
+                "{partitions} partitions count each file once"
+            );
+        }
+    }
+
+    /// Byte-range pieces handed to Iceberg's reader return every row once.
+    ///
+    /// This pins the contract between [`partition_byte_ranges`] and the
+    /// reader's midpoint rule for a split `FileScanTask`: the published leaf
+    /// relies on it to split one data file across partitions.
+    #[tokio::test]
+    async fn iceberg_reader_honors_partition_byte_ranges() {
+        let directory = tempfile::tempdir().expect("split fixture directory");
+        let path = directory.path().join("data.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_owned(),
+                "1".to_owned(),
+            )])),
+        ]));
+        let values: Vec<i64> = (0..9).collect();
+        let size = u64::try_from(write_split_fixture(&path, &schema, &values))
+            .expect("fixture size fits u64");
+        let iceberg_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "value",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("Iceberg task schema"),
+        );
+        let reader = iceberg::arrow::ArrowReaderBuilder::new(
+            FileIO::new_with_fs(),
+            iceberg::Runtime::current(),
+        )
+        .build();
+        for partitions in [1, 2, 3, 5, 12] {
+            let mut actual = Vec::new();
+            for partition in 0..partitions {
+                for (_, range) in partition_byte_ranges(&[size], partition, partitions) {
+                    let task = FileScanTask::builder()
+                        .with_file_size_in_bytes(size)
+                        .with_start(range.start)
+                        .with_length(range.end - range.start)
+                        .with_record_count(None)
+                        .with_data_file_path(path.to_string_lossy().to_string())
+                        .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
+                        .with_schema(Arc::clone(&iceberg_schema))
+                        .with_project_field_ids(vec![1])
+                        .with_deletes(Vec::new())
+                        .with_case_sensitive(false)
+                        .build();
+                    let batches = reader
+                        .clone()
+                        .read(Box::pin(futures_util::stream::iter(vec![Ok(task)])))
+                        .expect("split reader")
+                        .stream()
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                        .expect("split rows");
+                    for batch in batches {
+                        actual.extend(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .expect("Iceberg split keeps Int64")
+                                .values()
+                                .iter()
+                                .copied(),
+                        );
+                    }
+                }
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, values, "{partitions} partitions");
+        }
     }
 
     /// Production hot execution records requested bytes once on success,
@@ -5775,6 +6347,69 @@ mod tests {
         )
     }
 
+    /// Published data-file footers load once through the governed cache, stay
+    /// retained for the scan, and a vanished object keeps its stale cause.
+    ///
+    /// The second load of the same object must return the identical decoded
+    /// metadata, proving the cache served it; both loads are held by the
+    /// loader so eviction cannot release bytes the scan still reads. A missing
+    /// path must classify as a stale Iceberg object so the query retries
+    /// against a fresh snapshot instead of failing as an outage.
+    #[tokio::test]
+    async fn published_footer_loader_serves_retains_and_classifies_stale() {
+        use iceberg::arrow::ParquetMetadataLoader as _;
+
+        // Reads go through the production Iceberg storage adapter, which keeps
+        // the owner's typed not-found cause a vanished object reports.
+        let fixture = build_hot_batch_fixture();
+        let size = u64::try_from(fixture.bytes.len()).expect("fixture size fits u64");
+        let root = tempfile::tempdir().expect("published footer root");
+        std::fs::write(root.path().join("data.parquet"), &fixture.bytes)
+            .expect("published footer object");
+        let storage = crate::storage::BifrostStorage::for_test(root.path(), true);
+        let warehouse = format!("file://{}", root.path().display());
+        let file_io = iceberg::io::FileIOBuilder::new(Arc::new(
+            crate::catalog::iceberg_storage::BifrostIcebergStorageFactory::new(
+                Arc::clone(&storage),
+                &warehouse,
+            ),
+        ))
+        .build();
+        let footers = PublishedFooters::new(
+            storage,
+            wyrd_spec::DataTenantId::new_v7(),
+            "vala.traces.spans".to_owned(),
+            HotParquetPlan::Follower {
+                memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+            },
+        );
+        let loader = footers
+            .loader(file_io, &task_context_with_batch_size(8))
+            .expect("footer loader");
+        let path = format!("{warehouse}/data.parquet");
+
+        let first = loader.load(&path, size).await.expect("first footer load");
+        let second = loader.load(&path, size).await.expect("cached footer load");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.num_row_groups(), 1);
+        assert_eq!(
+            loader
+                .retained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
+
+        let error = loader
+            .load(&format!("{warehouse}/vanished.parquet"), size)
+            .await
+            .expect_err("a vanished object must not load");
+        assert!(is_stale_iceberg_object_error(&iceberg_datafusion_error(
+            error
+        )));
+    }
+
     /// Builds one bound task context for a leader leaf under test.
     ///
     /// Every leader leaf resolves its governance from the task it executes
@@ -6173,15 +6808,15 @@ mod tests {
         );
     }
 
-    /// Asserts admission changed no optimizer or memory knob of the retained shape.
+    /// Asserts admission changed no planning knob of the retained shape.
     ///
-    /// Admission supplies a runtime and a memory pool only, so a grant larger
-    /// than the minimum-grant planning shape must leave target partitions,
-    /// batch size, hash-join preference, and sort-spill reservation untouched.
+    /// Admission supplies a runtime, a memory pool, and the execution-time
+    /// sort-merge reservation only, so target partitions, batch size, and
+    /// hash-join preference stay exactly as planned.
     ///
     /// # Panics
     ///
-    /// Panics when any of those four knobs differs between the two configs.
+    /// Panics when any of those three knobs differs between the two configs.
     fn assert_same_session_shape(
         planned: &datafusion::prelude::SessionConfig,
         executed: &datafusion::prelude::SessionConfig,
@@ -6191,10 +6826,6 @@ mod tests {
         assert_eq!(
             executed.options().optimizer.prefer_hash_join,
             planned.options().optimizer.prefer_hash_join
-        );
-        assert_eq!(
-            executed.options().execution.sort_spill_reservation_bytes,
-            planned.options().execution.sort_spill_reservation_bytes
         );
     }
 
@@ -6219,10 +6850,8 @@ mod tests {
         let tenant = wyrd_spec::DataTenantId::new_v7();
         let (provider, _live) = projection_closure_provider(tenant, None, None).await;
 
-        let shape = crate::resources::OracleSessionShape::for_grant(
-            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+        let shape = crate::resources::OracleSessionShape::planning(
             crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
-            1,
         );
         let lock = Arc::new(crate::oracle::bindings::OracleExecutionLock::new());
         let retained_config = shape.session_config().with_extension(Arc::clone(&lock));

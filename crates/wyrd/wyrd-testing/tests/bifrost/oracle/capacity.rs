@@ -1,9 +1,9 @@
-//! Oracle journeys — admission contention at the lowest supported Oracle rung.
+//! Oracle journeys — admission contention at the 4 GiB pod floor.
 //!
 //! One production-shaped run proves that the retained admission owner stays
 //! safe *and* useful when a real memory-heavy Analytical query already holds a
 //! query envelope, a distributed graph, and live spill ownership on the exact
-//! 1.25 GiB Oracle-only rung (a 256 MiB shared cap): bounded Interactive queries from two
+//! 4 GiB pod floor (a 3 GiB shared cap): bounded Interactive queries from two
 //! separate tenants still complete through the real public client, every query
 //! pool stays inside the grant it was issued, root admission accounting stays
 //! inside the managed budget, and every owner returns to baseline.
@@ -40,11 +40,11 @@ use crate::support::*;
 
 /// Exact Oracle-only process memory this qualification runs at.
 ///
-/// The 1 GiB server minimum plus a 256 MiB shared cap: the smallest rung at
-/// which one Analytical query is granted the whole cap. It is an injected
-/// observation, not an OS limit, so this journey bounds
-/// what admission *accounts for* and makes no aggregate physical-memory claim.
-const ORACLE_MEMORY_FLOOR_BYTES: usize = 1280 * 1024 * 1024;
+/// The hard 4 GiB pod floor: the 1 GiB server minimum plus a 3 GiB shared cap,
+/// half of which is one query's memory limit. It is an injected observation,
+/// not an OS limit, so this journey bounds what admission *accounts for* and
+/// makes no aggregate physical-memory claim.
+const ORACLE_MEMORY_FLOOR_BYTES: usize = vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES;
 
 /// Effective CPU injected on every Oracle-only node.
 const ORACLE_EFFECTIVE_CPU: usize = 2;
@@ -53,7 +53,7 @@ const ORACLE_EFFECTIVE_CPU: usize = 2;
 ///
 /// Large enough that the Analytical query's spill is bounded by its admitted
 /// scratch envelope rather than by a fixture-sized filesystem.
-const ORACLE_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
+const ORACLE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Rows in each tenant's bounded Interactive table.
 ///
@@ -107,8 +107,8 @@ const PHYSICAL_EVIDENCE_POLLS: usize = 300;
 const PHYSICAL_EVIDENCE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A live memory-heavy Analytical query does not stop two tenants' bounded
-/// Interactive queries from being admitted and completing on the lowest
-/// supported Oracle rung.
+/// Interactive queries from being admitted and completing at the 4 GiB pod
+/// floor.
 ///
 /// # Panics
 ///
@@ -696,7 +696,7 @@ fn expected_analytical_grant(
             0.0,
         ),
     )?;
-    let granted = u64::try_from(envelope.granted_memory_bytes)?;
+    let granted = u64::try_from(envelope.execution().granted_memory_bytes())?;
     drop(envelope);
     Ok(granted)
 }
@@ -910,11 +910,12 @@ fn fixture_rows_ipc(start_id: i64, rows: i64, groups: i64) -> Result<bytes::Byte
 
 /// Memory observation injected on the smaller of the two heterogeneous Oracles.
 ///
-/// Above the 1 GiB server minimum a pod must leave, and far enough below its sibling that the two derived plans cannot coincide.
-const SMALL_ORACLE_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// The 4 GiB pod floor, far enough below its sibling that the two derived
+/// plans cannot coincide.
+const SMALL_ORACLE_MEMORY_BYTES: usize = vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES;
 
 /// Memory observation injected on the larger of the two heterogeneous Oracles.
-const LARGE_ORACLE_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const LARGE_ORACLE_MEMORY_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// Effective CPU injected on the smaller heterogeneous Oracle.
 const SMALL_ORACLE_CPU: usize = 2;
@@ -1204,7 +1205,14 @@ const REFUSAL_ROWS: i64 = 24;
 /// a live Scribe source.
 const REFUSAL_LIVE_ROWS: i64 = 8;
 
-/// Deadline the stalled memory holder is submitted with, in milliseconds.
+/// Stalled holder queries it takes to occupy the governed root.
+///
+/// One query's memory limit is half the root, so no single query can fill it;
+/// two holders at their limits less half the headroom each leave exactly
+/// [`REFUSAL_HOLDER_HEADROOM_BYTES`] free.
+const REFUSAL_HOLDERS: usize = 2;
+
+/// Deadline each stalled memory holder is submitted with, in milliseconds.
 ///
 /// Long enough that the refusal, the release, and the cancel below all happen
 /// inside one query's own lifetime rather than racing its deadline.
@@ -1213,12 +1221,12 @@ const REFUSAL_HOLDER_DEADLINE_MS: i64 = 60_000;
 /// Deadline the refused query is submitted with, in milliseconds.
 const REFUSAL_QUERY_DEADLINE_MS: i64 = 30_000;
 
-/// Governed bytes the hold deliberately leaves the stalled holder.
+/// Governed bytes the holds deliberately leave free in the root.
 ///
 /// One partition working set: exactly what the plan calls the minimum a query
 /// needs to produce a batch. Holding the whole root instead would refuse the
-/// holder itself before it could reach its schema frame, and there would be no
-/// occupied root for the refusal below to meet.
+/// last holder itself before it could reach its schema frame, and there would
+/// be no occupied root for the refusal below to meet.
 const REFUSAL_HOLDER_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bytes of filler each row of the refused query's sort key carries.
@@ -1262,10 +1270,8 @@ async fn memory_refusal_preserves_oracle_health_and_next_query() {
 ///
 /// Returns the first claim that broke.
 async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
-    // The lowest supported Oracle rung is the only one where a single query can
-    // occupy the whole governed root: at 1.25 GiB an Oracle-only pod has a
-    // 256 MiB shared cap, which equals the ceiling one query is granted.
-    // Above that rung no single query can fill the root, by design.
+    // At the 4 GiB pod floor one query's limit is half the 3 GiB root, so the
+    // root is occupied by two stalled holders rather than one.
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::three_oracles_one_scribe()
             .with_system_resources(oracle_floor_observation()),
@@ -1304,33 +1310,37 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     let root_limit = plan.managed_memory_bytes;
     let health = resources.oracle().ok_or("node hosts no Oracle")?.health();
 
-    // Both controls arm the same next query: it takes the whole governed root
+    // Both controls arm the same next query: it takes its share of the root
     // and then parks after its schema frame, so the occupancy the refusal below
-    // meets is one real query's own reservation rather than a harness counter.
-    server.stall_next_query_after_schema();
-    server.hold_next_query_memory(root_limit.saturating_sub(REFUSAL_HOLDER_HEADROOM_BYTES))?;
-    let holder = client(server, "memory-refusal-holder").await?;
-    let holder_query = wyrd_client::Bifrost::query_only(&holder);
-    let stream = holder_query
-        .query(&BifrostQueryRequest {
-            sql: format!("SELECT id FROM vala.bifrost.{table}"),
-            deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
-        })
-        .await
-        .map_err(|error| format!("holder query: {error}"))?;
-    let held_request_id = stream.request_id().clone();
-    let holder_task = tokio::spawn(async move {
-        let mut stream = stream;
-        let _ = stream.next_batch().await;
-    });
-    server.wait_query_schema_stall().await?;
-    server.wait_query_memory_hold().await?;
+    // meets is real queries' own reservations rather than a harness counter.
+    let held_floor = root_limit.saturating_sub(REFUSAL_HOLDER_HEADROOM_BYTES);
+    let mut holders = Vec::new();
+    for index in 0..REFUSAL_HOLDERS {
+        server.stall_next_query_after_schema();
+        server.hold_next_query_memory(held_floor / REFUSAL_HOLDERS)?;
+        let holder = client(server, &format!("memory-refusal-holder-{index}")).await?;
+        let holder_query = wyrd_client::Bifrost::query_only(&holder);
+        let stream = holder_query
+            .query(&BifrostQueryRequest {
+                sql: format!("SELECT id FROM vala.bifrost.{table}"),
+                deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
+            })
+            .await
+            .map_err(|error| format!("holder query {index}: {error}"))?;
+        let held_request_id = stream.request_id().clone();
+        let holder_task = tokio::spawn(async move {
+            let mut stream = stream;
+            let _ = stream.next_batch().await;
+        });
+        server.wait_query_schema_stall().await?;
+        server.wait_query_memory_hold().await?;
+        holders.push((holder_query, held_request_id, holder_task));
+    }
 
     let occupied = resources.snapshot().map_err(|error| error.to_string())?;
-    let held_floor = root_limit.saturating_sub(REFUSAL_HOLDER_HEADROOM_BYTES);
     if occupied.oracle_query_memory_used_bytes < held_floor {
         return Err(format!(
-            "the held reservation occupied {} of a {root_limit} byte root",
+            "the held reservations occupied {} of a {root_limit} byte root",
             occupied.oracle_query_memory_used_bytes
         )
         .into());
@@ -1354,17 +1364,19 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     }
 
     server.release_query_memory_hold()?;
-    holder_query.cancel(&held_request_id).await?;
-    holder_task.abort();
-    let _ = holder_task.await;
-    let released = server
-        .wait_bifrost_query_resources_released(
-            held_request_id.as_str(),
-            wyrd_testing::server::BifrostQueryResourceSnapshot::default(),
-        )
-        .await?;
-    if released != wyrd_testing::server::BifrostQueryResourceSnapshot::default() {
-        return Err(format!("the cancelled holder retained {released:?}").into());
+    for (holder_query, held_request_id, holder_task) in holders {
+        holder_query.cancel(&held_request_id).await?;
+        holder_task.abort();
+        let _ = holder_task.await;
+        let released = server
+            .wait_bifrost_query_resources_released(
+                held_request_id.as_str(),
+                wyrd_testing::server::BifrostQueryResourceSnapshot::default(),
+            )
+            .await?;
+        if released != wyrd_testing::server::BifrostQueryResourceSnapshot::default() {
+            return Err(format!("the cancelled holder retained {released:?}").into());
+        }
     }
 
     if let Some(reason) = health.reason() {
@@ -1456,9 +1468,8 @@ const FAILURE_ROWS: i64 = 16;
 
 /// Oracle slot units the memory-failure journey's pod is configured with.
 ///
-/// The smallest routable pod: a forwarding candidate must offer both classes,
-/// and three units is the least that seats one two-unit Analytical query
-/// beside the Interactive floor. Interactive work borrows all three, so three
+/// A routable pod: a forwarding candidate must offer both classes, which any
+/// pod above one unit does. Interactive work borrows all three units, so three
 /// parked Interactive queries saturate it and a fourth provably queues.
 const FAILURE_SLOTS: usize = 3;
 
@@ -1675,7 +1686,7 @@ const SCHEDULING_ROWS: i64 = 24;
 /// Also the row count the grouped Analytical statement must return.
 const SCHEDULING_GROUPS: i64 = 4;
 
-/// Concurrent Interactive queries the lowest supported Oracle rung seats.
+/// Concurrent Interactive queries the 4 GiB pod floor seats.
 ///
 /// The rung derives four slot units from two effective CPUs and protects one
 /// of them for Interactive work. Disk is provisioned rather than leased, so
@@ -2074,8 +2085,8 @@ async fn prove_both_classes_progress(
 ///
 /// A queue only forms when a request is refused a slot while its other demands
 /// are still fundable: a scratch refusal is immediate and never enqueues. Eight
-/// gibibytes is well past the four concurrent 256 MiB query leases this rung's
-/// slot units allow, so every refusal in this journey is a slot refusal.
+/// gibibytes funds every query this pod's slot units allow, so every refusal
+/// in this journey is a slot refusal.
 const QUEUE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Concurrent Interactive queries that consume every slot unit on the rung.

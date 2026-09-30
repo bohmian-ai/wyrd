@@ -139,8 +139,6 @@ pub(crate) struct NativeSliceProducer {
     request_id: Uuid,
     /// Zero-based ordinal assigned to the next slice.
     slice_index: u32,
-    /// Request-wide physical row ordinal assigned to the next decoded row.
-    next_row_ordinal: i32,
     /// Exact count established by the non-retaining first pass.
     slice_count: u32,
     /// Running decoded and stamped output checked against the expanded ceiling.
@@ -187,7 +185,6 @@ impl NativeSliceProducer {
             current: None,
             request_id,
             slice_index: 0,
-            next_row_ordinal: 0,
             slice_count: 0,
             output_bytes: 0,
             tenant,
@@ -247,7 +244,7 @@ impl NativeSliceProducer {
                 return Ok(None);
             };
             self.source_index += 1;
-            let rows = stamp_native_source(&rows, &self.source, self.next_row_ordinal)?;
+            let rows = stamp_native_source(&rows, &self.source)?;
             self.output_bytes = self
                 .output_bytes
                 .checked_add(crate::scribe::material_plan::retained_slice_bytes(&rows)?)
@@ -261,16 +258,6 @@ impl NativeSliceProducer {
                     limit: self.source.expanded_limit_bytes,
                 });
             }
-            // Advance only after stamping succeeded, so a refused record batch
-            // never consumes ordinals the accepted stream would have used.
-            self.next_row_ordinal = i32::try_from(rows.num_rows())
-                .ok()
-                .and_then(|count| self.next_row_ordinal.checked_add(count))
-                .ok_or(ScribeError::TooManyRows {
-                    rows: u64::try_from(self.next_row_ordinal).unwrap_or_default()
-                        + rows.num_rows() as u64,
-                    limit: (i32::MAX - 1) as u64,
-                })?;
             let partitions = plan_time_partitions(&rows, self.partition_granularity)?;
             self.current = Some(NativeCurrentSource {
                 rows,
@@ -391,7 +378,6 @@ fn decode_planned_native_source(
 fn stamp_native_source(
     rows: &RecordBatch,
     source: &NativeAdmittedRows,
-    start_row_ordinal: i32,
 ) -> Result<RecordBatch, ScribeError> {
     crate::scribe::execution_lanes::decode_native_batch(
         rows,
@@ -402,7 +388,6 @@ fn stamp_native_source(
             batch_id: source.batch_id,
             window: source.event_time_window,
             receipt_micros: Some(source.receipt_micros),
-            start_row_ordinal,
             definition: source.definition,
         },
     )

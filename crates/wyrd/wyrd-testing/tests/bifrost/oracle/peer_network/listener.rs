@@ -11,7 +11,7 @@ use wyrd_testing::bifrost::process_cluster::{
 };
 use wyrd_tonic::tonic::Code;
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
-use wyrd_tonic::wyrd::v1::{QueryClass, ReserveNodeSlotsRequest};
+use wyrd_tonic::wyrd::v1::{AnalyticalGraphRef, ReserveNodeSlotsRequest};
 
 use super::support::{
     DialIdentity, PeerDial, PeerJourneyError, polls_at, probe_oracle_lifecycle, probe_oracle_peer,
@@ -365,13 +365,14 @@ async fn a_trusted_certificate_alone_authorizes_nothing(
             query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
             leader_node_id: report.node_id.to_string(),
             leader_fencing_token,
-            query_class: QueryClass::Interactive as i32,
-            slot_units: 1,
             expires_at_unix_ms: u64::try_from(
                 (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis(),
             )?,
             context: None,
-            graph: None,
+            graph: Some(AnalyticalGraphRef {
+                public_query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+                datafusion_query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            }),
         };
         match OraclePeerServiceClient::new(channel)
             .reserve_slots(request)

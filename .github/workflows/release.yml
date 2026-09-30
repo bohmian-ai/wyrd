@@ -150,7 +150,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: "2_28"
-          args: --release --out dist
+          args: --profile dist --out dist
           rust-toolchain: stable
           docker-options: ${{ matrix.docker-options }}
           working-directory: sdks/wyrd-sdk-python
@@ -221,7 +221,7 @@ jobs:
         with:
           command: build
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --profile dist --out dist
           rust-toolchain: stable
           working-directory: sdks/wyrd-sdk-python
 
@@ -381,7 +381,7 @@ jobs:
         shell: bash
         run: |
           rm -f index.js wyrd.*.node
-          pnpm exec napi build --release --platform --target ${{ matrix.target }} --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json
+          pnpm exec napi build --profile dist --platform --target ${{ matrix.target }} --manifest-path ../native/Cargo.toml --output-dir . --package-json-path package.json
           test -f index.js && mv index.js index.generated.cjs
           cp index.d.ts index.d.cts
           pnpm exec tsc -p tsconfig.build.json

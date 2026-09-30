@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 14
+revision: 17
 status: approved
 ---
 
@@ -315,7 +315,11 @@ and the leader-owned stream lifetime without a separate follower permit or
 estimated memory pool. Oracle metadata reads hold no fixed 40-MiB memory slot;
 retained decoded metadata is charged by actual held bytes. Oracle peers keep
 the receiving pod's real running-slot reservation because several leaders can
-send work to one pod. They do not maintain another peer-waiter limit or poll
+send work to one pod. The only work an Oracle peer reserves or runs is one
+distributed Analytical graph; there is no separate fragment-worker path or
+worker quantum. Every query holds exactly one slot unit on each node it runs
+on, whatever its class, so the class selects capacity rules and never the
+charge. They do not maintain another peer-waiter limit or poll
 for slots: a genuine pre-accept capacity refusal carries retry timing, and
 only the leader may retry it within the same query deadline. Ambiguous or
 accepted work is never retried as a capacity refusal.
@@ -346,6 +350,50 @@ identities remain out of metric labels and may appear only as scrubbed trace
 context. Keep Forge's earned closed metric catalog and existing tracing,
 Prometheus, and OTLP infrastructure; introduce no new exporter or sampler.
 Operational metrics remain usable when trace sampling is configured.
+
+### REQ-013 — CPU-derived query parallelism, memory-only grants
+
+Every Oracle leader,
+Oracle peer, and distributed stage session sets its `DataFusion` target
+partitions from the node's effective CPU and the pinned input's locality before physical planning:
+one partition per core for fully local input, rising linearly to four per core
+for fully remote input, never below two. Available memory, the admitted grant,
+and the pinned file count do not change the partition count. Batch size is the
+engine's fixed default rather than a memory-derived value, and the optimizer's
+join preference is the engine default.
+
+The admitted grant supplies only the query's memory limit and the
+per-partition sort-merge reservation derived from it, which never exceeds the
+engine default. Every query's memory
+limit is half the pod's managed Bifrost budget, never below 256 MiB and never
+above the budget. It is not divided by concurrent load: queries compete for
+the one shared pod pool, which refuses growth once concurrent queries fill it.
+Every query's spill share is half the pod's scratch limit. Planning happens
+once; admission does not reshape or rebuild the physical plan. The retired
+32-MiB minimum-grant planning shape has no replacement.
+
+Every Wyrd pod has at least 4 GiB of memory. Boot refuses a detected pod
+below that floor. Test and benchmark pod envelopes model that floor or more.
+
+Every session that can spill, whether an Oracle leader, a leader-local live
+fragment, or a remote Oracle follower, spills only into its node's governed
+Oracle spill directory, under its query's spill share. The leader and its
+live fragments share one query spill budget. A Scribe follower owns no Oracle
+spill directory and never spills. A memory refusal names the consumer that
+asked and reports the pod's largest current holders.
+
+Every spilling query runtime caps each sort merge phase's spill-file fan-in,
+derived per query like its memory limit: all of a query's merges may hold at
+most half its memory limit in non-spillable read buffers, budgeted at 64 MiB
+per spill file and never fewer than two files. The cap widens as pods grow
+and is never a fixed file count.
+
+Pinned published and hot scan leaves honor the session's partition count. The
+pinned files are laid end to end and divided into contiguous, equal byte
+ranges, one per partition; each row group is read by exactly the partition
+whose range contains its midpoint, so a single large file and many small files
+both use every partition and no row is read twice or skipped. Scan telemetry
+counts each file once however many partitions read it.
 
 ## Invariants and boundaries
 
@@ -483,9 +531,25 @@ Do not add new persisted state or change write ACK timing.
   do not keep or scan shadow state for telemetry. Existing journey results
   and the standard read/write benchmark remain valid after the cleanup.
 
+- **AC-015:** A query's session partitions equal the CPU/locality formula
+  for its pinned input regardless of grant or file count. A single-file and a
+  many-file published scan, a hot scan, and a distributed query over split
+  leaves return exactly the same rows as the unsplit scan. Admission changes
+  only the memory ceiling and sort-merge reservation. The heavy full scan uses
+  more than one core, and the standard and heavy benchmarks are re-run with a
+  full table. A query's memory limit is half the managed budget whatever the
+  concurrent load; a pod below 4 GiB is refused at boot; a spilling query
+  whose sort input exceeds its limit completes at the 4 GiB floor with spill
+  confined to the governed directory; and a memory refusal names the
+  requesting consumer and the top holders.
+
 ## Open material decisions
 
-None. Revision 14's telemetry simplification was explicitly approved by the
+None. Revision 17's single execution path and one-unit slot charge were
+explicitly approved by the user on 2026-09-30. Revision 16's per-query memory limit, 4 GiB pod floor, and governed
+follower spill were explicitly approved by the user on 2026-09-30.
+Revision 15's CPU-derived parallelism was explicitly approved by the
+user on 2026-09-29. Revision 14's telemetry simplification was explicitly approved by the
 user on 2026-09-29. Revision 13's capacity-owner clarification was explicitly approved by
 the user on 2026-09-29. Revision 12's memory redesign was explicitly approved by the user on
 2026-09-29. The peer wording follows approved `SPEC-verified-change-contract`
@@ -551,6 +615,35 @@ on 2026-09-28.
   owner state and operation lifetimes, removes duplicate and misleading
   signals, and keeps traces readable by humans and agents. Approved by the
   user on 2026-09-29.
+- Revision 15 (2026-09-29): Replaces the memory-derived 32-MiB, two-partition
+  planning shape with CPU/locality session partitions, a fixed
+  batch size, memory-only grants, and partition-honoring byte-range scan
+  leaves, after the heavy full scan measured about one core on a four-core
+  node. Approved by the user on 2026-09-29 ("I approve.").
+- Revision 16 (2026-09-30): Replaces the load-divided grant with
+  a fixed per-query limit (half the managed budget, 256 MiB floor),
+  sets the per-query spill share to half the scratch limit, removes any
+  memory term from partitions, adds the 4 GiB hard pod floor, routes every
+  spilling session through the governed spill directory, and requires
+  consumer-named memory refusals. After the 4 GiB spill journey showed four
+  merging partitions holding about 288 MB each and refusing the query, it
+  caps spill-merge fan-in per query from its memory limit and partition
+  count (user chose "Add cap" and required it to scale with pod size on
+  2026-09-30). Follows the diagnosis that the Analytical spill journey
+  failed because unbounded multi-level spill merges held non-spillable
+  reservations that starved sibling sorters, not because of fair vs greedy
+  pooling. Approved by the user on 2026-09-30 ("the hard requirement for
+  running wyrd/bifrost is to always use at minimum 4 Gib", "ok go ahead. do
+  not add the cap for now. address all other directives and findings").
+- Revision 17 (2026-09-30): Deletes the unused Oracle fragment-worker path
+  (its attempt buffer, worker grant, and worker quantum): an Oracle peer
+  reserves and runs only distributed Analytical graphs, and a peer
+  reservation must name its graph. Every query now charges one slot unit per
+  node regardless of class, replacing the two-unit Analytical weight; memory
+  remains bounded by the per-query grant and the shared root. Approved by the
+  user on 2026-09-30 ("roll this deletion in with all other consoldiation
+  work"; "yes. drop it. our aim is to simplify without degrading
+  performance").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

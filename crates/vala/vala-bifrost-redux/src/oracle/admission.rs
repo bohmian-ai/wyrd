@@ -90,38 +90,6 @@ pub struct OracleShutdownReport {
     pub peer_running: u64,
 }
 
-/// Closed query classes independently scheduled by the pod-local owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum AdmissionClass {
-    /// Latency-sensitive interactive work.
-    Interactive,
-    /// Scan-heavy analytical work.
-    Analytical,
-}
-
-impl AdmissionClass {
-    /// Returns the slot units one query of this class occupies.
-    ///
-    /// These match [`crate::resources::OracleWorkerClass::slot_units`] exactly,
-    /// because the leader queue and the shared governor ledger must agree on
-    /// what one query costs.
-    const fn slot_units(self) -> u32 {
-        match self {
-            Self::Interactive => 1,
-            Self::Analytical => 2,
-        }
-    }
-}
-
-impl From<QueryClass> for AdmissionClass {
-    fn from(value: QueryClass) -> Self {
-        match value {
-            QueryClass::Interactive => Self::Interactive,
-            QueryClass::Analytical => Self::Analytical,
-        }
-    }
-}
-
 /// One queued admission request and its absolute grant deadline.
 struct Waiter {
     /// Monotonic queue identity used to remove a canceled waiter.
@@ -197,18 +165,16 @@ impl ClassState {
     ///
     /// Rotation starts at the cursor and visits every tenant once, so tenants
     /// take grants with equal weight. A tenant is eligible only when its FIFO
-    /// has a head and its fixed slot-unit cap can absorb `cost`; this is the
+    /// has a head and its fixed slot cap can absorb one more query; this is the
     /// whole tenant-fairness rule, with no contention-dependent ceiling.
-    fn next_eligible(&self, cost: u32) -> Option<usize> {
+    fn next_eligible(&self) -> Option<usize> {
         if self.tenants.is_empty() {
             return None;
         }
         (0..self.tenants.len()).find_map(|step| {
             let index = (self.cursor + step) % self.tenants.len();
             let (_, queue) = &self.tenants[index];
-            (!queue.waiters.is_empty()
-                && queue.active.saturating_add(cost) <= self.tenant_slot_limit)
-                .then_some(index)
+            (!queue.waiters.is_empty() && queue.active < self.tenant_slot_limit).then_some(index)
         })
     }
 
@@ -289,10 +255,10 @@ impl AdmissionState {
     }
 
     /// Returns the mutable class state charged by one admission class.
-    fn class_mut(&mut self, kind: AdmissionClass) -> &mut ClassState {
+    fn class_mut(&mut self, kind: QueryClass) -> &mut ClassState {
         match kind {
-            AdmissionClass::Interactive => &mut self.interactive,
-            AdmissionClass::Analytical => &mut self.analytical,
+            QueryClass::Interactive => &mut self.interactive,
+            QueryClass::Analytical => &mut self.analytical,
         }
     }
 
@@ -394,7 +360,7 @@ struct TenantCharge {
     /// Admission owner whose tenant ring holds the charge.
     shared: Arc<AdmissionShared>,
     /// Class whose tenant ring is charged.
-    class: AdmissionClass,
+    class: QueryClass,
     /// Tenant charged by the grant.
     tenant: DataTenantId,
 }
@@ -410,10 +376,9 @@ impl Drop for TenantCharge {
             tracing::error!("Oracle admission state lock poisoned during tenant release");
             return;
         };
-        let cost = self.class.slot_units();
         let class = state.class_mut(self.class);
         if let Some((_, queue)) = class.tenants.iter_mut().find(|(id, _)| *id == self.tenant) {
-            if let Some(active) = queue.active.checked_sub(cost) {
+            if let Some(active) = queue.active.checked_sub(1) {
                 queue.active = active;
             } else {
                 tracing::error!("Oracle admission tenant release underflow");
@@ -446,7 +411,7 @@ pub(crate) struct PreparedAdmission {
 /// Queued waiter state transferred from enqueueing into the async grant wait.
 struct PreparedWaiter {
     /// Class charged by the eventual grant and cancellation cleanup.
-    class_kind: AdmissionClass,
+    query_class: QueryClass,
     /// Tenant removed from the queue when cancellation wins.
     tenant: DataTenantId,
     /// Monotonic queue identity used by cancellation cleanup.
@@ -477,7 +442,7 @@ impl Drop for QueuedWaiter<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.admission.rollback_waiter(
-                self.waiter.class_kind,
+                self.waiter.query_class,
                 self.waiter.tenant,
                 self.waiter.waiter_id,
                 &mut self.waiter.receiver,
@@ -561,7 +526,7 @@ impl QueryResourceProbe {
             memory_bytes: 0,
             peer_slots: slot_units,
             granted_memory_bytes: resources.map_or(0, |resources| {
-                u64::try_from(resources.granted_memory_bytes).unwrap_or(u64::MAX)
+                u64::try_from(resources.execution().granted_memory_bytes()).unwrap_or(u64::MAX)
             }),
             pool_current_bytes: 0,
             pool_peak_bytes: 0,
@@ -569,11 +534,12 @@ impl QueryResourceProbe {
         Self {
             query_id,
             snapshot,
-            pool: resources.map(crate::resources::OracleQueryResources::memory_pool),
+            pool: resources.map(|resources| Arc::clone(resources.execution().memory_pool())),
             memory_peak_bytes: resources
                 .map(crate::resources::OracleQueryResources::memory_peak_bytes),
             park: std::sync::Mutex::new(resources.and_then(|resources| resources.park.clone())),
-            granted_memory_bytes: resources.map_or(0, |resources| resources.granted_memory_bytes),
+            granted_memory_bytes: resources
+                .map_or(0, |resources| resources.execution().granted_memory_bytes()),
         }
     }
 
@@ -713,6 +679,22 @@ impl OracleAdmission {
         Ok((task, startup_rx))
     }
 
+    /// Returns the target partitions a query with `local_ratio` plans with.
+    ///
+    /// Derived from this pod's effective CPU and the pinned locality before
+    /// admission, so the retained physical root is planned exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when the locality is
+    /// outside `[0, 1]` or the pod's CPU count cannot be represented.
+    pub(super) fn session_partitions(&self, local_ratio: f64) -> Result<usize, BifrostError> {
+        self.shared
+            .resources
+            .target_partitions(local_ratio)
+            .map_err(|_| BifrostError::QueryAdmissionRejected)
+    }
+
     /// Reports whether a live Oracle role and local class capacity are available.
     #[must_use]
     pub fn is_available(&self) -> bool {
@@ -838,12 +820,10 @@ impl OracleAdmission {
             deadline,
             cancellation,
         } = request;
-        let class_kind = AdmissionClass::from(query_class);
         let enqueue = Instant::now();
         let wait_deadline = deadline.min(enqueue + self.max_queue_wait());
         let waiter_telemetry = OracleTelemetry::start_admission_waiter(query_class);
-        let waiter =
-            self.enqueue_waiter(tenant, class_kind, local_ratio, wait_deadline, query_class)?;
+        let waiter = self.enqueue_waiter(tenant, query_class, local_ratio, wait_deadline)?;
         let resources = self
             .wait_for_grant(waiter, cancellation.clone(), query_class)
             .await?;
@@ -872,10 +852,9 @@ impl OracleAdmission {
     fn enqueue_waiter(
         &self,
         tenant: DataTenantId,
-        class_kind: AdmissionClass,
+        query_class: QueryClass,
         local_ratio: f64,
         wait_deadline: Instant,
-        query_class: QueryClass,
     ) -> Result<PreparedWaiter, BifrostError> {
         let (tx, receiver) = tokio::sync::oneshot::channel();
         let waiter_id = self.shared.next_waiter.fetch_add(1, Ordering::Relaxed);
@@ -903,7 +882,7 @@ impl OracleAdmission {
             // momentarily full; it is a class this pod does not offer. Rejecting
             // here keeps a caller from waiting out its whole deadline, and keeps
             // a query view and every peer contact off the path.
-            if class_kind == AdmissionClass::Analytical
+            if query_class == QueryClass::Analytical
                 && !self.shared.resources.class_split().admits_analytical()
             {
                 OracleTelemetry::record_admission(
@@ -935,7 +914,7 @@ impl OracleAdmission {
                 );
                 return Err(BifrostError::QueryQueueFull);
             }
-            let class = state.class_mut(class_kind);
+            let class = state.class_mut(query_class);
             let index = class.tenant_index(tenant);
             class.tenants[index].1.waiters.push_back(Waiter {
                 id: waiter_id,
@@ -948,7 +927,7 @@ impl OracleAdmission {
         };
         notify_grants(notifications);
         Ok(PreparedWaiter {
-            class_kind,
+            query_class,
             tenant,
             waiter_id,
             wait_deadline,
@@ -1009,12 +988,12 @@ impl OracleAdmission {
     /// so the drop returns the slot and the charge and wakes the queue.
     fn rollback_waiter(
         &self,
-        class_kind: AdmissionClass,
+        query_class: QueryClass,
         tenant: DataTenantId,
         waiter_id: u64,
         receiver: &mut tokio::sync::oneshot::Receiver<crate::resources::OracleQueryResources>,
     ) {
-        self.cancel_waiter(class_kind, tenant, waiter_id);
+        self.cancel_waiter(query_class, tenant, waiter_id);
         drop(receiver.try_recv());
     }
 
@@ -1072,9 +1051,9 @@ impl OracleAdmission {
     ///
     /// Runs no grant pass: a departing waiter frees a queue place, not
     /// execution capacity.
-    fn cancel_waiter(&self, class_kind: AdmissionClass, tenant: DataTenantId, waiter_id: u64) {
+    fn cancel_waiter(&self, query_class: QueryClass, tenant: DataTenantId, waiter_id: u64) {
         if let Ok(mut state) = self.shared.state.lock() {
-            let class = state.class_mut(class_kind);
+            let class = state.class_mut(query_class);
             if let Some((_, queue)) = class.tenants.iter_mut().find(|(id, _)| *id == tenant)
                 && let Some(index) = queue
                     .waiters
@@ -1145,30 +1124,22 @@ fn grant_waiters_with_clock(
         let expired = state.interactive.prune_expired(now) + state.analytical.prune_expired(now);
         state.queued = state.queued.saturating_sub(expired);
         let interactive = (!refused[0])
-            .then(|| {
-                state
-                    .interactive
-                    .next_eligible(AdmissionClass::Interactive.slot_units())
-            })
+            .then(|| state.interactive.next_eligible())
             .flatten();
         let analytical = (!refused[1])
-            .then(|| {
-                state
-                    .analytical
-                    .next_eligible(AdmissionClass::Analytical.slot_units())
-            })
+            .then(|| state.analytical.next_eligible())
             .flatten();
         let (kind, index) = match (interactive, analytical) {
             (Some(index), Some(other)) => {
                 if state.interactive.head_waiter_id(index) <= state.analytical.head_waiter_id(other)
                 {
-                    (AdmissionClass::Interactive, index)
+                    (QueryClass::Interactive, index)
                 } else {
-                    (AdmissionClass::Analytical, other)
+                    (QueryClass::Analytical, other)
                 }
             }
-            (Some(index), None) => (AdmissionClass::Interactive, index),
-            (None, Some(index)) => (AdmissionClass::Analytical, index),
+            (Some(index), None) => (QueryClass::Interactive, index),
+            (None, Some(index)) => (QueryClass::Analytical, index),
             (None, None) => break,
         };
         let local_ratio = state.class_mut(kind).tenants[index]
@@ -1178,7 +1149,7 @@ fn grant_waiters_with_clock(
             .expect("an eligible tenant has a FIFO head")
             .local_ratio;
         let Ok(resources) = acquire_waiter_resources(shared, kind, local_ratio) else {
-            refused[usize::from(kind == AdmissionClass::Analytical)] = true;
+            refused[usize::from(kind == QueryClass::Analytical)] = true;
             continue;
         };
         let waiter = state.class_mut(kind).tenants[index]
@@ -1204,13 +1175,13 @@ fn grant_waiters_with_clock(
 fn charge_tenant(
     shared: &Arc<AdmissionShared>,
     state: &mut AdmissionState,
-    kind: AdmissionClass,
+    kind: QueryClass,
     index: usize,
     mut resources: crate::resources::OracleQueryResources,
 ) -> crate::resources::OracleQueryResources {
     state.active_queries += 1;
     let class = state.class_mut(kind);
-    class.tenants[index].1.active += kind.slot_units();
+    class.tenants[index].1.active += 1;
     resources.attach_admission_charge(Box::new(TenantCharge {
         shared: Arc::clone(shared),
         class: kind,
@@ -1221,27 +1192,22 @@ fn charge_tenant(
 
 /// Asks the pod governor for one queued admission class's slot charge.
 ///
-/// What is acquired is slot units; the class memory quantum
-/// is validated for shape but reserves nothing. Governed memory is charged later,
-/// as the query's shared-pool consumers actually grow.
+/// What is acquired is the query's one slot unit; governed memory is charged
+/// later, as the query's shared-pool consumers actually grow.
 ///
 /// # Errors
 ///
 /// Returns [`crate::resources::BifrostResourceError`] when the root governor
-/// cannot seat the class's slot units.
+/// has no slot unit left for the class.
 fn acquire_waiter_resources(
     shared: &AdmissionShared,
-    kind: AdmissionClass,
+    kind: QueryClass,
     local_ratio: f64,
 ) -> Result<crate::resources::OracleQueryResources, crate::resources::BifrostResourceError> {
-    let query_class = match kind {
-        AdmissionClass::Interactive => QueryClass::Interactive,
-        AdmissionClass::Analytical => QueryClass::Analytical,
-    };
     shared
         .resources
         .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
-            query_class,
+            kind,
             local_ratio,
         ))
 }
@@ -1277,8 +1243,8 @@ pub(super) struct AdmittedQueryGuard {
     pub(super) live_reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
     /// Inactive Analytical graph and attempt ownership retained until cleanup.
     ///
-    /// Present only on an attempt that the production-unreachable Analytical
-    /// path leased a session for. Dropping this guard drops those owners, which
+    /// Present only on an attempt that the distributed Analytical path leased
+    /// a session for. Dropping this guard drops those owners, which
     /// is what returns the exchange-buffer and memory children to the query
     /// envelope and the envelope to the root capability.
     pub(super) analytical: Option<super::analytical::AnalyticalAttemptOwnership>,
@@ -1517,48 +1483,36 @@ impl AdmittedQueryGuard {
         Ok(())
     }
 
-    /// Returns the most bytes `DataFusion` may spill for this admitted query.
-    ///
-    /// Reads the guard's own envelope, so it is meaningful only before an
-    /// Analytical graph takes it; every caller runs before that transfer.
-    #[must_use]
-    pub(super) fn spill_limit_bytes(&self) -> u64 {
-        self.resources
-            .as_ref()
-            .map_or(0, |resources| resources.spill_limit_bytes)
-    }
-
-    /// Returns the tracked pool owned by this query's exact envelope.
+    /// Returns the execution this query's exact envelope was issued with.
     ///
     /// `None` once the envelope has moved to an Analytical graph.
     #[must_use]
-    pub(super) fn memory_pool(
-        &self,
-    ) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
+    pub(super) fn execution(&self) -> Option<&crate::resources::OracleExecution> {
         self.resources
             .as_ref()
-            .map(crate::resources::OracleQueryResources::memory_pool)
+            .map(crate::resources::OracleQueryResources::execution)
     }
 
-    /// Returns the memory ceiling admission granted this query.
+    /// Builds the sole execution `TaskContext` for a graphless retained root.
     ///
-    /// Falls back to the working-memory floor when the envelope is absent,
-    /// which is the same conservative direction every other accessor here
-    /// takes: a floor-sized session shape cannot over-commit memory.
-    #[must_use]
-    pub(super) fn granted_memory_bytes(&self) -> usize {
-        self.resources.as_ref().map_or(
-            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            |resources| resources.granted_memory_bytes,
-        )
-    }
-
-    /// Returns adaptive target partitions calculated with the admitted grant.
-    #[must_use]
-    pub(super) fn target_partitions(&self) -> usize {
-        self.resources
-            .as_ref()
-            .map_or(1, |resources| resources.target_partitions)
+    /// The admitted execution supplies the runtime, memory pool, partitions,
+    /// and sort-merge reservation. Planning used the same partition function
+    /// the grant did, so applying the grant's shape never reshapes a final plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when the admitted
+    /// envelope has already moved to an Analytical graph.
+    pub(super) fn execution_session(
+        &self,
+        config: datafusion::prelude::SessionConfig,
+    ) -> Result<datafusion::prelude::SessionContext, BifrostError> {
+        let execution = self
+            .execution()
+            .ok_or(BifrostError::QueryAdmissionRejected)?;
+        Ok(SessionContext::new_with_state(
+            execution.session_state(config),
+        ))
     }
 
     /// Returns the query-keyed ownership probe after live-tail drain completes.
@@ -1633,17 +1587,11 @@ pub(super) fn admitted_guard_for_test()
         .expect("composition must enable the Oracle capability"),
     });
     let tenant = DataTenantId::new_v7();
-    let granted = acquire_waiter_resources(&shared, AdmissionClass::Interactive, 1.0)
+    let granted = acquire_waiter_resources(&shared, QueryClass::Interactive, 1.0)
         .expect("the fixture governor grants one Interactive slot");
     let mut state = shared.state.lock().expect("state");
     let index = state.interactive.tenant_index(tenant);
-    let resources = charge_tenant(
-        &shared,
-        &mut state,
-        AdmissionClass::Interactive,
-        index,
-        granted,
-    );
+    let resources = charge_tenant(&shared, &mut state, QueryClass::Interactive, index, granted);
     drop(state);
     let cancellation = shared.root_cancel.child_token();
     let request_cancellation = CancellationToken::new();
@@ -1724,7 +1672,6 @@ type StartupResultReceiver = tokio::sync::oneshot::Receiver<Result<(), BifrostEr
 pub(in crate::oracle) mod tests {
     use super::*;
     use crate::cluster::ClusterSnapshot;
-    use crate::resources::ANALYTICAL_QUERY_SLOT_UNITS;
     use chrono::Utc;
     use wyrd_spec::vala::api::ClusterCapabilities;
     use wyrd_spec::vala::api::{
@@ -1761,12 +1708,13 @@ pub(in crate::oracle) mod tests {
     /// Returns the governor slot units each class holds: `(interactive, analytical)`.
     ///
     /// Slot capacity is the governor's alone, so tests read it from the
-    /// governor rather than from any admission counter.
+    /// governor rather than from any admission counter. Every query holds one
+    /// unit, so the live class counters are the charge.
     fn charged_units(shared: &AdmissionShared) -> (u32, u32) {
         let snapshot = shared.resources.snapshot().expect("resource snapshot");
         (
             snapshot.oracle_interactive_queries,
-            snapshot.oracle_analytical_queries * ANALYTICAL_QUERY_SLOT_UNITS,
+            snapshot.oracle_analytical_queries,
         )
     }
 
@@ -1857,7 +1805,12 @@ pub(in crate::oracle) mod tests {
                 .projection_facts()
                 .expect("checked projection facts")
                 .material_bytes;
-        let pool = admitted.memory_pool().expect("admitted query memory pool");
+        let pool = Arc::clone(
+            admitted
+                .execution()
+                .expect("admitted query execution")
+                .memory_pool(),
+        );
         let baseline = pool.reserved();
 
         admitted
@@ -1889,7 +1842,12 @@ pub(in crate::oracle) mod tests {
             crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans");
         let binding = crate::catalog::TenantTableBinding::resolve((tenant, table))
             .expect("tenant table binding");
-        let pool = admitted.memory_pool().expect("admitted query memory pool");
+        let pool = Arc::clone(
+            admitted
+                .execution()
+                .expect("admitted query execution")
+                .memory_pool(),
+        );
 
         admitted
             .retain_physical_bindings(std::iter::once(&binding))
@@ -2217,14 +2175,14 @@ pub(in crate::oracle) mod tests {
     /// Both scheduling classes contend for one allocator without resource silos.
     #[tokio::test]
     async fn oracle_classes_share_allocator_without_resource_silos() {
-        // Two total units express the contention this covers: one interactive
-        // query holds a unit and an analytical query needs both, so the classes
-        // must queue behind one shared ceiling rather than behind private silos.
+        // One total unit expresses the contention this covers: an interactive
+        // query holds it and an analytical query needs it, so the classes must
+        // queue behind one shared ceiling rather than behind private silos.
         let owner = owner(OracleAdmissionConfig {
             interactive_slots: 0,
-            analytical_slots: ANALYTICAL_QUERY_SLOT_UNITS,
-            tenant_interactive_slots: ANALYTICAL_QUERY_SLOT_UNITS,
-            tenant_analytical_slots: ANALYTICAL_QUERY_SLOT_UNITS,
+            analytical_slots: 1,
+            tenant_interactive_slots: 1,
+            tenant_analytical_slots: 1,
             ..Default::default()
         });
         let interactive = owner
@@ -2459,7 +2417,7 @@ pub(in crate::oracle) mod tests {
     fn tenant_charge_returns_with_its_resources() {
         let shared = shared(OracleAdmissionConfig::default());
         let tenant = DataTenantId::new_v7();
-        let resources = acquire_waiter_resources(&shared, AdmissionClass::Interactive, 0.0)
+        let resources = acquire_waiter_resources(&shared, QueryClass::Interactive, 0.0)
             .expect("the governor seats one Interactive query");
         let resources = {
             let mut state = shared.state.lock().expect("state");
@@ -2467,7 +2425,7 @@ pub(in crate::oracle) mod tests {
             charge_tenant(
                 &shared,
                 &mut state,
-                AdmissionClass::Interactive,
+                QueryClass::Interactive,
                 index,
                 resources,
             )
@@ -2490,7 +2448,7 @@ pub(in crate::oracle) mod tests {
     #[tokio::test]
     async fn local_admission_releases_once() {
         let owner = owner(OracleAdmissionConfig {
-            analytical_slots: ANALYTICAL_QUERY_SLOT_UNITS,
+            analytical_slots: 1,
             ..Default::default()
         });
         let guard = owner
@@ -2570,14 +2528,14 @@ pub(in crate::oracle) mod tests {
     /// issued beyond the governor's capacity.
     #[tokio::test]
     async fn local_admission_is_fair_and_work_conserving() {
-        // Six slot units of memory must actually exist, or a memory refusal
+        // Four slot units of memory must actually exist, or a memory refusal
         // would masquerade as a scheduling decision.
         let owner = owner_with_resources(
             OracleAdmissionConfig {
                 interactive_slots: 2,
-                analytical_slots: 4,
-                tenant_interactive_slots: 6,
-                tenant_analytical_slots: 4,
+                analytical_slots: 2,
+                tenant_interactive_slots: 4,
+                tenant_analytical_slots: 2,
                 ..Default::default()
             },
             crate::resources::BifrostRuntimeResources::composed_for_test(
@@ -2599,24 +2557,24 @@ pub(in crate::oracle) mod tests {
         // Analytical maximum, leaving the Interactive floor to the rest.
         let mut analytical_head = push_waiter(
             &shared,
-            AdmissionClass::Analytical,
+            QueryClass::Analytical,
             analytical_tenant,
             1,
             deadline,
         );
         let mut analytical_tail = push_waiter(
             &shared,
-            AdmissionClass::Analytical,
+            QueryClass::Analytical,
             analytical_tenant,
             2,
             deadline,
         );
         let mut first_tenant_head =
-            push_waiter(&shared, AdmissionClass::Interactive, tenant_b, 3, deadline);
+            push_waiter(&shared, QueryClass::Interactive, tenant_b, 3, deadline);
         let mut peer_tenant_head =
-            push_waiter(&shared, AdmissionClass::Interactive, tenant_c, 4, deadline);
+            push_waiter(&shared, QueryClass::Interactive, tenant_c, 4, deadline);
         let mut first_tenant_tail =
-            push_waiter(&shared, AdmissionClass::Interactive, tenant_b, 5, deadline);
+            push_waiter(&shared, QueryClass::Interactive, tenant_b, 5, deadline);
         drain_grants(&shared);
 
         let first_head_grant = first_tenant_head
@@ -2637,8 +2595,8 @@ pub(in crate::oracle) mod tests {
             .expect("remaining capacity keeps going to the oldest eligible class head");
         assert_eq!(
             charged_units(&shared),
-            (2, 2 * ANALYTICAL_QUERY_SLOT_UNITS),
-            "the floor is exactly two units and both analytical grants charge two"
+            (2, 2),
+            "the floor is exactly two units and each analytical grant charges one"
         );
         assert_eq!(
             shared.state.lock().expect("state").queued,
@@ -2660,9 +2618,9 @@ pub(in crate::oracle) mod tests {
         assert_eq!(shared.state.lock().expect("state").active_queries, 0);
     }
 
-    /// A follower worker release wakes the queued leader in arrival order.
+    /// A graph follower envelope release wakes the queued leader in arrival order.
     ///
-    /// Leader admission and follower acquisition charge one shared governor
+    /// Leader admission and a peer's graph envelope charge one shared governor
     /// ledger, so a follower that finishes is the only event that can free the
     /// leader's capacity. The queued leader must observe that release through
     /// its existing bounded wait and the queue must keep its arrival order.
@@ -2683,8 +2641,11 @@ pub(in crate::oracle) mod tests {
         let worker = owner
             .shared
             .resources
-            .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
-            .expect("a follower worker charges the one local slot unit");
+            .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
+                QueryClass::Interactive,
+                0.0,
+            ))
+            .expect("a follower graph envelope charges the one local slot unit");
         let request = || PreparedAdmission {
             tenant: DataTenantId::new_v7(),
             query_class: QueryClass::Interactive,
@@ -2746,16 +2707,16 @@ pub(in crate::oracle) mod tests {
     /// pass by hand.
     fn push_waiter(
         shared: &Arc<AdmissionShared>,
-        class_kind: AdmissionClass,
+        query_class: QueryClass,
         tenant: DataTenantId,
         id: u64,
         deadline: Instant,
     ) -> tokio::sync::oneshot::Receiver<crate::resources::OracleQueryResources> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut state = shared.state.lock().expect("state");
-        let class = match class_kind {
-            AdmissionClass::Interactive => &mut state.interactive,
-            AdmissionClass::Analytical => &mut state.analytical,
+        let class = match query_class {
+            QueryClass::Interactive => &mut state.interactive,
+            QueryClass::Analytical => &mut state.analytical,
         };
         let index = class.tenant_index(tenant);
         class.tenants[index].1.waiters.push_back(Waiter {
@@ -2815,7 +2776,7 @@ pub(in crate::oracle) mod tests {
 
         let mut live_head = push_waiter(
             &shared,
-            AdmissionClass::Interactive,
+            QueryClass::Interactive,
             tenant,
             1,
             Instant::now() + Duration::from_secs(30),
@@ -2823,13 +2784,8 @@ pub(in crate::oracle) mod tests {
         // An instant read before the grant pass reads its own is already in the
         // past by the time the pass compares them, so this waiter is
         // deterministically expired without any clock arithmetic.
-        let mut expired_tail = push_waiter(
-            &shared,
-            AdmissionClass::Interactive,
-            tenant,
-            2,
-            Instant::now(),
-        );
+        let mut expired_tail =
+            push_waiter(&shared, QueryClass::Interactive, tenant, 2, Instant::now());
         drain_grants(&shared);
 
         let head_grant = live_head.try_recv().expect("the live head must be granted");
@@ -2855,7 +2811,7 @@ pub(in crate::oracle) mod tests {
             .snapshot()
             .expect("root while the head owns its grant");
         assert_eq!(
-            after.oracle_query_slot_units - baseline.oracle_query_slot_units,
+            after.oracle_active_queries - baseline.oracle_active_queries,
             1,
             "exactly one Interactive slot grant is outstanding"
         );
@@ -2864,14 +2820,14 @@ pub(in crate::oracle) mod tests {
             resources
                 .snapshot()
                 .expect("root after the head releases")
-                .oracle_query_slot_units,
-            baseline.oracle_query_slot_units,
+                .oracle_active_queries,
+            baseline.oracle_active_queries,
             "no slot is stranded by the rejected expired waiter"
         );
 
         let mut next_live = push_waiter(
             &shared,
-            AdmissionClass::Interactive,
+            QueryClass::Interactive,
             tenant,
             3,
             Instant::now() + Duration::from_secs(30),
@@ -2909,14 +2865,14 @@ pub(in crate::oracle) mod tests {
 
         let mut live_head = push_waiter(
             &shared,
-            AdmissionClass::Interactive,
+            QueryClass::Interactive,
             tenant,
             1,
             start + Duration::from_secs(30),
         );
         let mut expiring_tail = push_waiter(
             &shared,
-            AdmissionClass::Interactive,
+            QueryClass::Interactive,
             tenant,
             2,
             start + Duration::from_secs(1),
@@ -2961,7 +2917,7 @@ pub(in crate::oracle) mod tests {
             .snapshot()
             .expect("root while the head owns its grant");
         assert_eq!(
-            after.oracle_query_slot_units - baseline.oracle_query_slot_units,
+            after.oracle_active_queries - baseline.oracle_active_queries,
             1,
             "exactly one Interactive slot grant is outstanding"
         );
@@ -2970,14 +2926,14 @@ pub(in crate::oracle) mod tests {
             resources
                 .snapshot()
                 .expect("root after the head releases")
-                .oracle_query_slot_units,
-            baseline.oracle_query_slot_units,
+                .oracle_active_queries,
+            baseline.oracle_active_queries,
             "no slot is stranded by the rejected waiter"
         );
 
         let mut next_live = push_waiter(
             &shared,
-            AdmissionClass::Interactive,
+            QueryClass::Interactive,
             tenant,
             3,
             Instant::now() + Duration::from_secs(30),
@@ -3005,9 +2961,9 @@ pub(in crate::oracle) mod tests {
         let resources = test_resources();
         let config = OracleAdmissionConfig {
             interactive_slots: 2,
-            analytical_slots: 2,
-            tenant_interactive_slots: 4,
-            tenant_analytical_slots: 2,
+            analytical_slots: 1,
+            tenant_interactive_slots: 3,
+            tenant_analytical_slots: 1,
             ..Default::default()
         };
         let owner = owner_with_resources(config, resources.clone());
@@ -3017,14 +2973,12 @@ pub(in crate::oracle) mod tests {
         let tenant_b = DataTenantId::new_v7();
         let deadline = Instant::now() + Duration::from_secs(30);
 
-        let mut analytical =
-            push_waiter(&shared, AdmissionClass::Analytical, tenant_a, 1, deadline);
+        let mut analytical = push_waiter(&shared, QueryClass::Analytical, tenant_a, 1, deadline);
         let mut tenant_a_head =
-            push_waiter(&shared, AdmissionClass::Interactive, tenant_a, 2, deadline);
+            push_waiter(&shared, QueryClass::Interactive, tenant_a, 2, deadline);
         let mut tenant_a_tail =
-            push_waiter(&shared, AdmissionClass::Interactive, tenant_a, 3, deadline);
-        let mut peer_head =
-            push_waiter(&shared, AdmissionClass::Interactive, tenant_b, 4, deadline);
+            push_waiter(&shared, QueryClass::Interactive, tenant_a, 3, deadline);
+        let mut peer_head = push_waiter(&shared, QueryClass::Interactive, tenant_b, 4, deadline);
         drain_grants(&shared);
 
         let analytical_grant = analytical.try_recv().expect("analytical class grant");
@@ -3038,7 +2992,7 @@ pub(in crate::oracle) mod tests {
             tenant_a_tail.try_recv().is_err(),
             "the shared slot ceiling holds tenant A's second interactive request"
         );
-        assert_eq!(charged_units(&shared), (2, ANALYTICAL_QUERY_SLOT_UNITS));
+        assert_eq!(charged_units(&shared), (2, 1));
         {
             let state = shared.state.lock().expect("state");
             assert_eq!(state.interactive.tenants[0].1.active, 1);
@@ -3102,31 +3056,13 @@ pub(in crate::oracle) mod tests {
             resources.clone(),
         );
         let mut held = rejecting
-            .enqueue_waiter(
-                tenant,
-                AdmissionClass::Interactive,
-                0.0,
-                deadline,
-                QueryClass::Interactive,
-            )
+            .enqueue_waiter(tenant, QueryClass::Interactive, 0.0, deadline)
             .expect("first interactive request is admitted");
         let mut waiting = rejecting
-            .enqueue_waiter(
-                tenant,
-                AdmissionClass::Interactive,
-                0.0,
-                deadline,
-                QueryClass::Interactive,
-            )
+            .enqueue_waiter(tenant, QueryClass::Interactive, 0.0, deadline)
             .expect("second interactive request occupies the finite queue");
         let before_rejection = resources.snapshot().expect("pre-rejection root");
-        let rejected = rejecting.enqueue_waiter(
-            tenant,
-            AdmissionClass::Interactive,
-            0.0,
-            deadline,
-            QueryClass::Interactive,
-        );
+        let rejected = rejecting.enqueue_waiter(tenant, QueryClass::Interactive, 0.0, deadline);
         assert!(matches!(rejected, Err(BifrostError::QueryQueueFull)));
         assert_eq!(charged_units(&rejecting.shared).0, 1);
         {
@@ -3167,7 +3103,7 @@ pub(in crate::oracle) mod tests {
     /// every later query of either class has to wait in the queue.
     async fn saturate(owner: &Arc<OracleAdmission>) -> Vec<AdmittedQueryGuard> {
         let mut held = Vec::new();
-        for _ in 0..ANALYTICAL_QUERY_SLOT_UNITS {
+        for _ in 0..2 {
             held.push(
                 owner
                     .admit(waiting_request(
@@ -3186,9 +3122,9 @@ pub(in crate::oracle) mod tests {
     fn saturable(queue_capacity: u32, max_queue_wait: Duration) -> OracleAdmissionConfig {
         OracleAdmissionConfig {
             interactive_slots: 0,
-            analytical_slots: ANALYTICAL_QUERY_SLOT_UNITS,
-            tenant_interactive_slots: ANALYTICAL_QUERY_SLOT_UNITS,
-            tenant_analytical_slots: ANALYTICAL_QUERY_SLOT_UNITS,
+            analytical_slots: 2,
+            tenant_interactive_slots: 2,
+            tenant_analytical_slots: 2,
             queue_capacity,
             max_queue_wait,
         }

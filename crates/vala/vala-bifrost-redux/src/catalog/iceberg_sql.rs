@@ -9,7 +9,18 @@ use iceberg_catalog_sql::{SqlBindStyle, SqlCatalog, SqlCatalogBuilder};
 
 use crate::catalog::BifrostCatalogError;
 
+/// Catalog pool property naming how long a connection may sit idle before
+/// checkout pings it.
+const CATALOG_POOL_TEST_IDLE_AFTER_MS: &str = "pool.test-idle-after-ms";
+
+/// Idle time, in milliseconds, after which a reused catalog connection is
+/// pinged before use; hotter reuse skips the round trip.
+const CATALOG_POOL_IDLE_PING_THRESHOLD_MS: &str = "1000";
+
 /// Build the Iceberg SQL catalog used by Redux Gate, Forge, and Oracle.
+///
+/// Uses `DollarNumeric` binds for Postgres and gates the pool's pre-checkout
+/// health ping on idle time, so hot connection reuse costs no extra round trip.
 ///
 /// # Errors
 /// Returns [`BifrostCatalogError::Iceberg`] when the catalog cannot be loaded.
@@ -25,6 +36,12 @@ pub async fn build_catalog<S: std::hash::BuildHasher>(
     properties.insert(
         iceberg_catalog_sql::SQL_CATALOG_PROP_BIND_STYLE.to_owned(),
         SqlBindStyle::DollarNumeric.to_string(),
+    );
+    // Snapshot preparation checks out a catalog connection on every query, so
+    // only a connection idle long enough to have been dropped pays a ping.
+    properties.insert(
+        CATALOG_POOL_TEST_IDLE_AFTER_MS.to_owned(),
+        CATALOG_POOL_IDLE_PING_THRESHOLD_MS.to_owned(),
     );
 
     SqlCatalogBuilder::default()

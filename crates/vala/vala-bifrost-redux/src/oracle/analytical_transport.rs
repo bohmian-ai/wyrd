@@ -1976,7 +1976,6 @@ mod tests {
         AnalyticalStageIngressConfig, DataFusionQueryId, PublicQueryId,
     };
     use super::super::peer::AuthorizedStage;
-    use super::super::spill::OracleSpillRuntime;
     use super::*;
 
     /// Builds one https destination entry for a cut fixture.
@@ -2375,7 +2374,7 @@ mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
-            scratch_root: std::path::PathBuf::new(),
+            scratch_root: None,
             volume_roots: None,
         };
         crate::resources::BifrostRuntimeResources::from_snapshot(snapshot, policy)
@@ -2431,10 +2430,6 @@ mod tests {
         fence: u64,
         /// The identity every fixture operation carries.
         identity: StageWireIdentity,
-        /// Spill owner kept alive for the ingress's runtime construction.
-        _spill: Arc<OracleSpillRuntime>,
-        /// Scratch root kept alive for the spill owner.
-        _root: tempfile::TempDir,
     }
 
     impl Fixture {
@@ -2442,14 +2437,8 @@ mod tests {
         ///
         /// # Panics
         ///
-        /// Panics when the injected observation cannot compose an Oracle role or
-        /// the pod spill owner cannot be created.
+        /// Panics when the injected observation cannot compose an Oracle role.
         fn new() -> Self {
-            let root = tempfile::tempdir().expect("fixture scratch root must exist");
-            let spill = Arc::new(
-                OracleSpillRuntime::new(root.path(), 2 * 1024 * 1024 * 1024)
-                    .expect("bounded spill owner must be created"),
-            );
             let authority_calls = Arc::new(AtomicUsize::new(0));
             let node_id = NodeId::new(Uuid::from_u128(2));
             let reservations = Arc::new(super::super::dispatcher::ReservationRegistry::new(
@@ -2472,23 +2461,21 @@ mod tests {
                         ),
                         leader_node_id: NodeId::new(Uuid::from_u128(1)),
                         leader_fencing_token: 3,
-                        query_class: wyrd_spec::vala::api::QueryClass::Analytical,
-                        slot_units: crate::oracle::analytical::ANALYTICAL_GRAPH_SLOT_UNITS,
                         expires_at: Utc::now() + chrono::Duration::seconds(60),
-                        graph: Some(wyrd_spec::vala::api::AnalyticalGraphRef {
+                        graph: wyrd_spec::vala::api::AnalyticalGraphRef {
                             public_query_id: graph.public_query_id.as_uuid(),
                             datafusion_query_id: graph.datafusion_query_id.as_uuid(),
-                        }),
+                        },
                     },
                     Utc::now(),
-                    Some(super::super::dispatcher::ReservedCapacity::Graph(Box::new(
+                    Box::new(
                         fixture_oracle_role()
                             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                                 wyrd_spec::vala::api::QueryClass::Analytical,
                                 0.0,
                             ))
                             .expect("an idle Oracle admits one analytical query"),
-                    ))),
+                    ),
                 )
                 .expect("an idle follower accepts one graph reservation");
             let ingress = AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
@@ -2501,7 +2488,6 @@ mod tests {
                     super::super::analytical_supervisor::AnalyticalSupervisor::new(),
                 ),
                 reservations: Arc::clone(&reservations),
-                spill: Arc::clone(&spill),
                 leaf: crate::oracle::codec::AnalyticalLeafBinding::new(
                     wyrd_spec::vala::api::ClusterRole::Oracle,
                     Arc::new(crate::oracle::follower::UnresolvableSource),
@@ -2533,8 +2519,6 @@ mod tests {
                 node_id,
                 fence: 7,
                 identity,
-                _spill: spill,
-                _root: root,
             }
         }
 

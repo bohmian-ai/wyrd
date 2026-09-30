@@ -328,14 +328,15 @@ impl ReservationPlane {
             query_id: query_id.as_bytes().to_vec(),
             leader_node_id: self.leader_node_id.to_string(),
             leader_fencing_token: self.leader_fence,
-            query_class: proto::QueryClass::Interactive as i32,
-            slot_units: 1,
             expires_at_unix_ms: u64::try_from(
                 (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis(),
             )
             .unwrap_or_default(),
             context: None,
-            graph: None,
+            graph: Some(proto::AnalyticalGraphRef {
+                public_query_id: query_id.as_bytes().to_vec(),
+                datafusion_query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            }),
         }
     }
 }

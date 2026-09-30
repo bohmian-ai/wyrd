@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{FixedSizeBinaryArray, Int32Array, Int64Array};
+use arrow::array::{FixedSizeBinaryArray, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -65,11 +65,11 @@ const TABLES_PER_TENANT: usize = 5;
 
 /// One row as a public reader can identify it after publication.
 ///
-/// The triple is the durable identity Scribe stamps on every accepted row plus
-/// the caller's own payload, so comparing complete sorted sets of these rejects
+/// The pair is the durable batch identity Scribe stamps on every accepted row
+/// plus the caller's own payload, so comparing complete sorted sets of these rejects
 /// a missing row, a duplicated row, a corrupted payload and a row that belongs
 /// to some other batch — none of which a row count can distinguish.
-type RowIdentity = (uuid::Uuid, i32, i64);
+type RowIdentity = (uuid::Uuid, i64);
 
 /// One batch as a journey submits it: the pod endpoint, its idempotency key,
 /// and the caller's payload values in row order.
@@ -90,7 +90,7 @@ type SubmissionsByIdentity = BTreeMap<(usize, usize), Vec<SubmittedBatch>>;
 /// in-flight ingress work simultaneously, which sequential writes to three
 /// endpoints cannot produce. It then requires each pod's durable
 /// acknowledgement total to have advanced, flushes every pod, and compares the
-/// complete `(batch id, row ordinal, value)` set a public read returns against
+/// complete `(batch id, value)` set a public read returns against
 /// the exact set that was submitted.
 ///
 /// # Panics
@@ -179,7 +179,7 @@ async fn multi_pod_concurrent_batches_are_owned_and_visible() {
 /// So this submits one immutable batch — one batch id over one byte-identical
 /// Arrow payload — to all three pod endpoints simultaneously from one barrier,
 /// and requires the public public read to return each
-/// `(batch id, row ordinal)` exactly once. Every attempt must still be
+/// `(batch id, value)` row exactly once. Every attempt must still be
 /// acknowledged: a suppressed duplicate is an idempotent success, not a refusal
 /// the caller has to interpret.
 ///
@@ -447,20 +447,15 @@ async fn append_values(client: &WyrdClient, table: &str, batch_id: uuid::Uuid, v
 fn expected_rows(batches: &[SubmittedBatch]) -> Vec<RowIdentity> {
     batches
         .iter()
-        .flat_map(|(_, batch_id, values)| {
-            values
-                .iter()
-                .enumerate()
-                .map(move |(ordinal, value)| (*batch_id, ordinal as i32, *value))
-        })
+        .flat_map(|(_, batch_id, values)| values.iter().map(move |value| (*batch_id, *value)))
         .collect()
 }
 
 /// Reads one table's complete durable identities through the public query route.
 ///
 /// A successful terminal is what makes this an authority read: the rows must
-/// come from whichever source currently owns them. The batch id and row ordinal
-/// are the identity Scribe itself stamped, so the returned set is comparable to
+/// come from whichever source currently owns them. The batch id is
+/// the identity Scribe itself stamped, so the returned set is comparable to
 /// the submitted set without the test inventing an identity of its own.
 ///
 /// # Panics
@@ -468,7 +463,7 @@ fn expected_rows(batches: &[SubmittedBatch]) -> Vec<RowIdentity> {
 /// Panics when the query cannot start or stream, or when a managed identity
 /// column is absent or of an unexpected Arrow type.
 async fn read_rows(client: &WyrdClient, table: &str) -> Vec<RowIdentity> {
-    let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
+    let sql = format!("SELECT wyrd_batch_id, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
             sql: sql.clone(),
@@ -488,12 +483,6 @@ async fn read_rows(client: &WyrdClient, table: &str) -> Vec<RowIdentity> {
             .as_any()
             .downcast_ref::<FixedSizeBinaryArray>()
             .expect("the managed batch id is a 16-byte key");
-        let ordinals = batch
-            .column_by_name(wyrd_spec::vala::managed_columns::WYRD_ROW_ORDINAL)
-            .expect("the result carries the managed row ordinal")
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("the managed row ordinal is Int32");
         let values = batch
             .column_by_name("value")
             .expect("the result carries the caller's value")
@@ -505,11 +494,7 @@ async fn read_rows(client: &WyrdClient, table: &str) -> Vec<RowIdentity> {
                 .value(row)
                 .try_into()
                 .expect("the managed batch id is exactly sixteen bytes");
-            rows.push((
-                uuid::Uuid::from_bytes(key),
-                ordinals.value(row),
-                values.value(row),
-            ));
+            rows.push((uuid::Uuid::from_bytes(key), values.value(row)));
         }
     }
     rows.sort_unstable();

@@ -676,7 +676,6 @@ mod tests {
 
         for reason in [
             "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-            "WYRD_VALA_413_INGEST_OVERSIZED",
             "WYRD_VALA_507_WAL_DISK_FULL",
         ] {
             let status = Status::with_error_details(

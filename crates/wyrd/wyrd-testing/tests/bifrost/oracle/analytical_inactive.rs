@@ -2,14 +2,13 @@
 //!
 //! Every journey here begins at raw SQL and runs the complete production
 //! attempt path — validation, classification, the participant cut, providers,
-//! audit, admission, terminal stream assembly — and differs from a routed query
-//! in exactly one place: the execution lease installs the query-owned runtime,
-//! the frozen worker set, and the signing channel resolver that make the plan
-//! distribute across followers through the real private transport.
+//! audit, admission, terminal stream assembly — and the execution lease that
+//! installs the query-owned runtime, the frozen worker set, and the signing
+//! channel resolver that make the plan distribute across followers through the
+//! real private transport.
 //!
-//! Nothing in routing can select this path. That is the point: the distributed
-//! engine is proved from raw SQL to drained result and back to a clean node
-//! before it is ever reachable.
+//! The caller fixes the attempt identity so each journey can inspect the graph
+//! and attempt owners from raw SQL to drained result and back to a clean node.
 //!
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
@@ -450,7 +449,10 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
     let (session, ownership) = engine
         .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
         .await?;
-    let spill_root = engine.analytical_spill_root().to_path_buf();
+    let spill_root = engine
+        .analytical_spill_root()
+        .ok_or("the test server composes an Oracle spill root")?
+        .to_path_buf();
     let scratch = session
         .runtime_env()
         .disk_manager

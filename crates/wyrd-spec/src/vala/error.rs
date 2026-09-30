@@ -508,21 +508,6 @@ pub enum BifrostError {
         limit: usize,
     },
 
-    /// The ingest request exceeded the aggregate row bound.
-    #[error("ingest request has too many rows ({rows} > {limit})")]
-    #[wyrd_error(
-        code = "WYRD_VALA_413_INGEST_OVERSIZED",
-        status = 413,
-        title = "Ingest request oversized",
-        remediation = "Reduce the number of rows in the request and retry."
-    )]
-    IngestOversized {
-        /// Number of rows observed in the request.
-        rows: u64,
-        /// Maximum rows allowed by the ingest contract.
-        limit: u64,
-    },
-
     /// An unexpected internal Bifrost failure occurred.
     #[error("internal bifrost failure: {detail}")]
     #[wyrd_error(

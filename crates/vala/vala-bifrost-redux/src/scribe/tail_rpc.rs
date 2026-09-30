@@ -801,26 +801,15 @@ mod tests {
         use crate::scribe::seal_key::SealKey;
         use crate::scribe::wal::ScribeAppendMeta;
 
-        // The managed row ordinal is part of every persisted append, and a fence
-        // cursor is derived from it, so the fixture carries it exactly as
-        // ingress would. It is excluded from the projected source fingerprint.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int64, false),
-            Field::new(
-                wyrd_spec::vala::managed_columns::WYRD_ROW_ORDINAL,
-                DataType::Int32,
-                false,
-            ),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
         let batch = |values: Vec<i64>| {
-            let ordinals = (0..i32::try_from(values.len()).expect("fixture row count fits i32"))
-                .collect::<Vec<_>>();
             RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(values)),
-                    Arc::new(arrow::array::Int32Array::from(ordinals)),
-                ],
+                vec![Arc::new(Int64Array::from(values))],
             )
             .expect("valid fixture batch")
         };

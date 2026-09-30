@@ -4,14 +4,14 @@ use crate::tables::CorrelationPolicy;
 use crate::tables::fields::{CanonicalField, CanonicalType, canonical_arrow_fields};
 use wyrd_spec::vala::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
 /// Append the Bifrost system columns (and policy-gated correlation columns)
 /// to the user fields of a pre-declared domain table.
 ///
 /// Column order: policy correlation columns first, then system timestamp
-/// columns, then `wyrd_batch_id`, `wyrd_row_ordinal`, and `data_tenant_id`.
+/// columns, then `wyrd_batch_id` and `data_tenant_id`.
 ///
 /// This is the single source of truth for what gets appended per policy.
 /// The appended columns here are excluded from `schema_fingerprint()`, which
@@ -55,7 +55,6 @@ pub fn ensure_managed_columns(
         DataType::FixedSizeBinary(16),
         false,
     ));
-    user_fields.push(Field::new(WYRD_ROW_ORDINAL, DataType::Int32, false));
     // Every physical table carries the tenant isolation key.
     user_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
 
@@ -64,15 +63,17 @@ pub fn ensure_managed_columns(
 
 /// The Observation envelope appended to every canonical signal table.
 ///
-/// These nine fields are physical schema authority: they carry stable ids
-/// 1000-1008 and the same names, types, order, and nullability
+/// These eight fields are physical schema authority: they carry stable ids
+/// 1000-1006 and 1008 and the same names, types, order, and nullability
 /// [`ensure_managed_columns`] appends for [`CorrelationPolicy::Observation`],
 /// so a canonical table's envelope and a pre-declared table's envelope remain
 /// one contract. They are stripped from the canonical user batch and stamped
 /// from trusted Gate context, never supplied by a client.
 ///
 /// The ids live in a range far above any signal ledger so a signal can add
-/// fields indefinitely without ever colliding with the envelope.
+/// fields indefinitely without ever colliding with the envelope. Id 1007 is
+/// retired: it named the removed batch-local row ordinal, and an envelope id is
+/// never reused for a different column.
 pub static CANONICAL_ENVELOPE_FIELDS: &[CanonicalField] = &[
     CanonicalField::meta(1000, RUN_ID, CanonicalType::Utf8, true),
     CanonicalField::meta(1001, CARD_UID, CanonicalType::Utf8, true),
@@ -96,7 +97,6 @@ pub static CANONICAL_ENVELOPE_FIELDS: &[CanonicalField] = &[
         CanonicalType::FixedSizeBinary(16),
         false,
     ),
-    CanonicalField::meta(1007, WYRD_ROW_ORDINAL, CanonicalType::Int32, false),
     CanonicalField::meta(1008, DATA_TENANT_ID, CanonicalType::Utf8, false),
 ];
 
@@ -137,7 +137,6 @@ mod tests {
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
                 WYRD_BATCH_ID,
-                WYRD_ROW_ORDINAL,
                 DATA_TENANT_ID
             ]
         );
@@ -220,7 +219,6 @@ mod tests {
                     false,
                 ),
                 ("wyrd_batch_id", &DataType::FixedSizeBinary(16), false),
-                ("wyrd_row_ordinal", &DataType::Int32, false),
                 ("data_tenant_id", &DataType::Utf8, false),
             ]
         );
@@ -232,27 +230,6 @@ mod tests {
             assert_eq!(
                 managed.last().map(|field| field.name().as_str()),
                 Some("data_tenant_id")
-            );
-            assert_eq!(
-                managed
-                    .iter()
-                    .find(|field| field.name() == "wyrd_row_ordinal")
-                    .map(|field| (field.data_type(), field.is_nullable())),
-                Some((&DataType::Int32, false))
-            );
-        }
-
-        for definition in crate::tables::builtin_tables() {
-            let schema = (definition.schema)();
-            let ordinal = schema
-                .field_with_name("wyrd_row_ordinal")
-                .expect("every initial built-in recipe carries row identity");
-            assert_eq!(
-                (ordinal.data_type(), ordinal.is_nullable()),
-                (&DataType::Int32, false),
-                "{}.{},",
-                definition.namespace,
-                definition.name,
             );
         }
     }

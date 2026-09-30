@@ -278,9 +278,6 @@ pub enum ScribeError {
         table: String,
     },
 
-    #[error("ingest request has too many rows: {rows} > {limit}")]
-    TooManyRows { rows: u64, limit: u64 },
-
     #[error("ingest frame validation failed")]
     InvalidFrame,
 
@@ -351,10 +348,6 @@ impl ScribeError {
             },
             Self::TableNotFound { table } => Self::TableNotFound {
                 table: table.clone(),
-            },
-            Self::TooManyRows { rows, limit } => Self::TooManyRows {
-                rows: *rows,
-                limit: *limit,
             },
             Self::InvalidFrame => Self::InvalidFrame,
             Self::EventTimeOutOfRange {

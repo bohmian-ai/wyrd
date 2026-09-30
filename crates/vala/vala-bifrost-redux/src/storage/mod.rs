@@ -20,8 +20,9 @@ use tokio_util::sync::CancellationToken;
 use wyrd_storage::handle::StorageHandle;
 
 use crate::resources::OracleMetadataResources;
-pub use crate::storage::cache::{HotMetadataKey, RetainedMetadata};
+pub use crate::storage::cache::{ObjectMetadataKey, RetainedMetadata};
 pub use crate::storage::error::BifrostStorageError;
+pub(crate) use crate::storage::error::error_chain_contains_not_found;
 pub use crate::storage::policy::{BifrostStorageConfig, BifrostStoragePolicy};
 pub use crate::storage::telemetry::{
     CacheEffect, CacheEffectReason, MetadataCacheSnapshot, MetadataLoadOutcome, StorageLifecycle,
@@ -366,8 +367,8 @@ impl BifrostStorage {
     /// Returns the latest instant a metadata load started now may still run.
     ///
     /// A caller that has no deadline of its own still must not hand
-    /// [`Self::hot_metadata`] an unbounded one. This is the owner's own bound —
-    /// the same figure `hot_metadata` would clamp any wider deadline to — so a
+    /// [`Self::object_metadata`] an unbounded one. This is the owner's own bound —
+    /// the same figure `object_metadata` would clamp any wider deadline to — so a
     /// caller without a budget inherits the process policy rather than
     /// inventing a constant.
     #[must_use]
@@ -398,9 +399,9 @@ impl BifrostStorage {
     /// when this caller's bounds elapse, including while it waits for a
     /// node-wide request permit, [`BifrostStorageError::Closed`] once
     /// the owner is shutting down, or the backend's own typed failure.
-    pub async fn hot_metadata<R, F>(
+    pub async fn object_metadata<R, F>(
         &self,
-        key: HotMetadataKey,
+        key: ObjectMetadataKey,
         reader: F,
         deadline: Instant,
         cancel: CancellationToken,
@@ -1644,7 +1645,7 @@ mod governed_request_tests {
         writer.write(&batch).expect("footer fixture write");
         writer.close().expect("footer fixture close");
         let object = Bytes::from(buffer);
-        let key = HotMetadataKey::new(
+        let key = ObjectMetadataKey::new(
             wyrd_spec::ids::DataTenantId::new_v7(),
             "vala.bifrost.events".to_owned(),
             "footer.parquet".to_owned(),
@@ -1655,7 +1656,7 @@ mod governed_request_tests {
         let key_bytes = usize::try_from(key.owned_bytes()).expect("key size fits usize");
 
         let retained = storage
-            .hot_metadata(
+            .object_metadata(
                 key,
                 move || std::io::Cursor::new(object.clone()),
                 Instant::now() + Duration::from_secs(30),

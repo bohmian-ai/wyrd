@@ -38,22 +38,19 @@ use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 /// instead would make every physical assertion a property of whichever machine
 /// ran the test.
 ///
-/// An Oracle pod is deliberately the tightest of the two: 1.25 GiB less the
-/// 1 GiB server minimum leaves a 256 MiB shared cap the query grant is derived
-/// from. A Scribe or Forge pod is sized to complete one table lifecycle instead, which
-/// its own boot-time capacity check refuses to do inside the Oracle envelope.
+/// Every target boots at the 4 GiB hard pod floor Bifrost refuses to run
+/// below: less the 1 GiB server minimum that leaves a 3 GiB shared cap, and
+/// one Oracle query's memory limit is half of it.
 ///
-/// `memory_limit_bytes` replaces that per-target envelope only for the
+/// `memory_limit_bytes` replaces that envelope only for the
 /// benchmark launch, whose container enforces the same bytes; every journey
 /// topology passes `None`.
 pub(super) const fn pod_system_resources(
-    target: ProcessNodeTarget,
     memory_limit_bytes: Option<usize>,
 ) -> vala_bifrost_redux::resources::SystemResourceSnapshot {
-    let memory_limit_bytes = match (memory_limit_bytes, target) {
-        (Some(bytes), _) => bytes,
-        (None, ProcessNodeTarget::Oracle) => 1280 * 1024 * 1024,
-        (None, _) => 3 * 1024 * 1024 * 1024,
+    let memory_limit_bytes = match memory_limit_bytes {
+        Some(bytes) => bytes,
+        None => vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES,
     };
     vala_bifrost_redux::resources::SystemResourceSnapshot {
         memory_limit_bytes,
@@ -73,7 +70,11 @@ const READY_DEADLINE: Duration = Duration::from_secs(60);
 /// Named rather than inlined because the parent's `CONTROL_TIMEOUT` is derived
 /// from it: the parent must outwait the whole budget one request may legitimately
 /// spend, or a slow-but-live statement reads as an unresponsive child.
-pub(super) const STATEMENT_DEADLINE_MS: u64 = 30_000;
+///
+/// Sized for the heaviest statement a journey runs: the Analytical spill
+/// baseline must sort more than one query's 1.5 GiB limit at the 4 GiB pod
+/// floor, which takes about a minute in an unoptimized test build.
+pub(super) const STATEMENT_DEADLINE_MS: u64 = 240_000;
 
 /// [`STATEMENT_DEADLINE_MS`] as the duration the parent's budget is built from.
 pub(super) const STATEMENT_DEADLINE: Duration = Duration::from_millis(STATEMENT_DEADLINE_MS);
@@ -211,14 +212,14 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     })?,
                 }
             }
-            ControlRequest::ScratchUsage => match oracle(&server)
-                .and_then(|engine| scratch_usage(engine.analytical_spill_root()))
-            {
-                Ok(usage) => emit(&ControlResponse::ScratchUsage(usage))?,
-                Err(error) => emit(&ControlResponse::Failed {
-                    detail: error.to_string(),
-                })?,
-            },
+            ControlRequest::ScratchUsage => {
+                match oracle(&server).and_then(|engine| scratch_usage(spill_root(&engine)?)) {
+                    Ok(usage) => emit(&ControlResponse::ScratchUsage(usage))?,
+                    Err(error) => emit(&ControlResponse::Failed {
+                        detail: error.to_string(),
+                    })?,
+                }
+            }
             ControlRequest::MetricTotals { families, labels } => {
                 match metric_totals(&telemetry, &families, &labels) {
                     Ok(totals) => emit(&ControlResponse::MetricTotals { totals })?,
@@ -678,8 +679,8 @@ fn accept_query_terminal(
         .map_err(|error| child(error.to_string()))?;
     if terminal.outcome != wyrd_spec::vala::api::QueryTerminalOutcome::Success {
         return Err(child(format!(
-            "the inactive attempt ended on a {:?} terminal",
-            terminal.outcome
+            "the inactive attempt ended on a {:?} terminal: {:?}",
+            terminal.outcome, terminal.error
         )));
     }
     decoder
@@ -830,10 +831,7 @@ impl ChildConfig {
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_data_root(self.data_root.clone())
-            .with_system_resources_for_test(pod_system_resources(
-                self.target,
-                self.memory_limit_bytes,
-            ));
+            .with_system_resources_for_test(pod_system_resources(self.memory_limit_bytes));
         let server = match self.oracle_query_slot_limit {
             Some(slots) => server.with_oracle_query_slot_limit_for_test(slots),
             None => server,
@@ -959,7 +957,7 @@ impl ChildConfig {
     ///
     /// The stream is drained to its terminal frame rather than dropped early,
     /// so the graph and attempt guards it carries settle before the parent
-    /// inspects the node. Nothing in routing reaches this seam; the child
+    /// inspects the node. The child
     /// authenticates the same way the public query service does and hands
     /// Oracle the identical context its own gRPC surface would have built.
     ///
@@ -1014,11 +1012,11 @@ impl ChildConfig {
                     ),
                 )
                 .map_err(|error| child(error.to_string()))?;
-            let granted = envelope.granted_memory_bytes;
+            let granted = envelope.execution().granted_memory_bytes();
             drop(envelope);
             u64::try_from(granted).unwrap_or(u64::MAX)
         };
-        let scratch_root = engine.analytical_spill_root().to_path_buf();
+        let scratch_root = spill_root(&engine)?.to_path_buf();
         let scratch_before = scratch_usage(&scratch_root)?;
 
         let supervisor = engine
@@ -1312,6 +1310,20 @@ fn oracle(
         .bifrost_query()
         .map(|query| Arc::clone(query.engine()))
         .ok_or_else(|| ProcessClusterError::Child("this target composes no Oracle".to_owned()))
+}
+
+/// Returns the node's Oracle spill child, which every child node composes.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when the node was composed without
+/// a scratch root and so cannot spill.
+fn spill_root(
+    engine: &vala_bifrost_redux::oracle::Oracle,
+) -> Result<&std::path::Path, ProcessClusterError> {
+    engine
+        .analytical_spill_root()
+        .ok_or_else(|| ProcessClusterError::Child("this node composes no spill root".to_owned()))
 }
 
 /// Drives one statement through the production inactive Analytical path.
@@ -1681,13 +1693,12 @@ fn ownership_snapshot(
         .role_resources()
         .snapshot()
         .map_err(|error| child(error.to_string()))?;
-    let scratch = scratch_usage(engine.analytical_spill_root())?;
+    let scratch = scratch_usage(spill_root(&engine)?)?;
     let gauges = metric_totals(
         telemetry,
         &[
             "bifrost_oracle_analytical_attempts_active".to_owned(),
             "bifrost_oracle_analytical_exchanges_active".to_owned(),
-            "oracle_fragments_active".to_owned(),
         ],
         &std::collections::BTreeMap::new(),
     )?;
@@ -1705,14 +1716,12 @@ fn ownership_snapshot(
         peer_running: runtime.peer_running,
         root_active_queries: root.oracle_active_queries,
         root_analytical_queries: root.oracle_analytical_queries,
-        root_query_slot_units: root.oracle_query_slot_units,
         root_query_memory_used_bytes: u64::try_from(root.oracle_query_memory_used_bytes)
             .unwrap_or(u64::MAX),
         root_query_active: root.oracle_query_active,
         scratch,
         attempts_active: gauge("bifrost_oracle_analytical_attempts_active"),
         exchanges_active: gauge("bifrost_oracle_analytical_exchanges_active"),
-        fragments_active: gauge("oracle_fragments_active"),
     })
 }
 

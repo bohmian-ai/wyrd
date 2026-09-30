@@ -40,16 +40,15 @@ const ROW_DIGEST_DOMAIN: &[u8] = b"wyrd.bifrost.journey.public-rows.v1";
 
 /// One acknowledged row, identified exactly as public ingest identified it.
 ///
-/// The value is payload; the identity is `(batch_id, row_ordinal)`. Holding
-/// them together is what makes a public read an *exactness* check rather than
-/// a multiset check: a promotion or rewrite that dropped one row and duplicated
-/// another would leave the sorted value column unchanged.
+/// A public read is compared as the multiset of `(batch_id, value)` pairs.
+/// Holding the batch identity beside the value is what makes it an
+/// *exactness* check rather than a value-column check: a promotion or rewrite
+/// that moved a row between batches, dropped one, or duplicated one changes
+/// the sorted pair multiset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ManagedRow {
     /// Batch identity the caller submitted with the append.
     pub(crate) batch_id: Uuid,
-    /// Zero-based position of the row within its submitted batch.
-    pub(crate) row_ordinal: i32,
     /// User payload column.
     pub(crate) value: i64,
 }
@@ -157,9 +156,7 @@ fn encode_ipc(batch: &arrow::record_batch::RecordBatch) -> Vec<u8> {
 ///
 /// The batch identity is supplied by the caller rather than generated here, so
 /// the journey can name every row it acknowledged before the server has said
-/// anything back. Returns the exact rows that append must later read back:
-/// the ordinal is the zero-based position within this submitted batch, which
-/// is the managed contract public ingest assigns.
+/// anything back. Returns the exact rows that append must later read back.
 ///
 /// # Panics
 ///
@@ -190,10 +187,8 @@ pub(crate) async fn append_values(
         .await
         .expect("the public append is acknowledged");
     rows.iter()
-        .enumerate()
-        .map(|(ordinal, value)| ManagedRow {
+        .map(|value| ManagedRow {
             batch_id,
-            row_ordinal: i32::try_from(ordinal).expect("a journey batch is small"),
             value: *value,
         })
         .collect()
@@ -202,8 +197,8 @@ pub(crate) async fn append_values(
 /// Computes the canonical digest of one ordered acknowledged-row vector.
 ///
 /// The encoding is domain-separated and length-delimited over raw identity
-/// bytes: the 16-byte batch identity, then the ordinal and value as fixed-width
-/// big-endian integers. Nothing about `Debug`, JSON, Arrow buffer layout, or
+/// bytes: the 16-byte batch identity, then the value as a fixed-width
+/// big-endian integer. Nothing about `Debug`, JSON, Arrow buffer layout, or
 /// iteration order can reach the hash, so the digest means the same thing
 /// whichever tier answered the read.
 pub(crate) fn rows_digest(rows: &[ManagedRow]) -> String {
@@ -212,7 +207,6 @@ pub(crate) fn rows_digest(rows: &[ManagedRow]) -> String {
     hasher.update((rows.len() as u64).to_be_bytes());
     for row in rows {
         hasher.update(row.batch_id.as_bytes());
-        hasher.update(row.row_ordinal.to_be_bytes());
         hasher.update(row.value.to_be_bytes());
     }
     hex::encode(hasher.finalize())
@@ -220,11 +214,10 @@ pub(crate) fn rows_digest(rows: &[ManagedRow]) -> String {
 
 /// Sorts an acknowledged-row vector into the journey's canonical order.
 ///
-/// `(batch_id, row_ordinal)` is the whole key; the value never participates,
-/// because a read that returned the right identities with a wrong payload must
-/// fail rather than sort itself back into agreement.
+/// Rows sort by `(batch_id, value)`, so the order depends only on which rows
+/// were read and never on which tier or file answered.
 pub(crate) fn canonical_order(mut rows: Vec<ManagedRow>) -> Vec<ManagedRow> {
-    rows.sort_unstable_by_key(|row| (row.batch_id, row.row_ordinal));
+    rows.sort_unstable();
     rows
 }
 
@@ -233,19 +226,19 @@ pub(crate) fn canonical_order(mut rows: Vec<ManagedRow>) -> Vec<ManagedRow> {
 /// Every query reads published and live sources, so a successful terminal is
 /// what makes the read an authority check: the answer must come from whichever tier currently owns the rows, so
 /// a promotion or a rewrite that lost, duplicated, or stranded a row shows up
-/// here rather than only in the catalog. The managed identity columns are
+/// here rather than only in the catalog. The managed batch identity is
 /// selected alongside the user column so the result is comparable by identity,
 /// and the rows are returned in the journey's canonical order.
 ///
 /// # Panics
 ///
 /// Panics when the query cannot start or stream, or when a result batch does
-/// not carry the three columns in their declared managed types.
+/// not carry the two columns in their declared managed types.
 pub(crate) async fn read_managed_rows(
     client: &wyrd_client::WyrdClient,
     table: &str,
 ) -> Vec<ManagedRow> {
-    let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
+    let sql = format!("SELECT wyrd_batch_id, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&public_query(sql.clone()))
         .await
@@ -270,7 +263,7 @@ pub(crate) async fn read_managed_rows(
 ///
 /// # Panics
 ///
-/// Panics when the batch does not carry the three columns in their declared
+/// Panics when the batch does not carry the two columns in their declared
 /// managed Arrow types, which would mean the public projection changed shape.
 ///
 /// Every decoded row is added to [`PUBLIC_ROWS_RETURNED`]. Both public read
@@ -283,12 +276,6 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
         .as_any()
         .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
         .expect("the managed batch identity stays FixedSizeBinary(16)");
-    let ordinals = batch
-        .column_by_name("wyrd_row_ordinal")
-        .expect("the result carries the managed row ordinal")
-        .as_any()
-        .downcast_ref::<arrow::array::Int32Array>()
-        .expect("the managed row ordinal stays Int32");
     let values = batch
         .column_by_name("value")
         .expect("the result carries the user column")
@@ -304,7 +291,6 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
                 .expect("the managed batch identity is exactly 16 bytes");
             ManagedRow {
                 batch_id: Uuid::from_bytes(raw),
-                row_ordinal: ordinals.value(row),
                 value: values.value(row),
             }
         })
@@ -328,7 +314,7 @@ pub(crate) async fn try_read(
     client: &wyrd_client::WyrdClient,
     table: &str,
 ) -> Result<Vec<ManagedRow>, wyrd_client::bifrost::BifrostClientError> {
-    let sql = format!("SELECT wyrd_batch_id, wyrd_row_ordinal, value FROM {table}");
+    let sql = format!("SELECT wyrd_batch_id, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&public_query(sql))
         .await?;

@@ -1119,7 +1119,7 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
 /// The customer oracle is the public read, and it is exact: at every one of the
 /// four cuts — before promotion, after promotion, across the uncertain commit,
 /// and after recovery — each tenant's public read must return the exact
-/// `(batch_id, row_ordinal, value)` multiset it acknowledged, with the matching
+/// `(batch_id, value)` multiset it acknowledged, with the matching
 /// canonical digest, and the neighbouring tenant's identically named table must
 /// be neither read, rewritten, nor disturbed.
 ///

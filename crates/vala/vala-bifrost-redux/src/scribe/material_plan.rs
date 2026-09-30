@@ -1106,7 +1106,7 @@ fn validate_offsets(
 ///
 /// The calculation includes the nullable `run_id`/`card_uid` validity and
 /// offsets, three non-null UTF-8 columns, one aliased receipt timestamp buffer,
-/// fixed batch identity, and row ordinals. Source-owned buffers remain in the
+/// and fixed batch identity. Source-owned buffers remain in the
 /// native body fact and are not charged twice.
 ///
 /// # Errors
@@ -1133,7 +1133,7 @@ fn managed_projection_bytes(rows: usize, request_id_bytes: usize) -> Result<usiz
         .and_then(|value| value.checked_add(rows.checked_mul(36)?))
         .ok_or_else(overflow)?;
     let fixed_values = rows
-        .checked_mul(size_of::<i64>() + 16 + size_of::<i32>())
+        .checked_mul(size_of::<i64>() + 16)
         .ok_or_else(overflow)?;
     let array_owners = size_of::<arrow::array::StringArray>()
         .checked_mul(5)
@@ -1141,7 +1141,6 @@ fn managed_projection_bytes(rows: usize, request_id_bytes: usize) -> Result<usiz
             value.checked_add(size_of::<arrow::array::TimestampMicrosecondArray>() * 2)
         })
         .and_then(|value| value.checked_add(size_of::<arrow::array::FixedSizeBinaryArray>()))
-        .and_then(|value| value.checked_add(size_of::<arrow::array::Int32Array>()))
         .ok_or_else(overflow)?;
     offsets
         .checked_mul(5)

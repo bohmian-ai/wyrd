@@ -106,13 +106,13 @@ message CancelOracleLifecycleRequest { string tenant_id = 1; string request_id =
 message CancelOracleLifecycleResponse { string request_id = 1; bool cancellation_started = 2; }
 message ReserveNodeSlotsRequest {
   bytes query_id = 1; string leader_node_id = 2; uint64 leader_fencing_token = 3;
-  QueryClass query_class = 4; uint32 slot_units = 5; uint64 expires_at_unix_ms = 6;
+  reserved 4, 5;
+  uint64 expires_at_unix_ms = 6;
   // Typed reservation context. The follower checks it against the encoded
   // request with this field cleared, before any capacity changes.
   PeerContext context = 7;
-  // Present only when the reservation is taken for one distributed Analytical
-  // graph. Absent for a fragment reservation, which charges a worker quantum
-  // rather than a whole query envelope.
+  // Required: the one distributed Analytical graph this reservation is taken
+  // for. Every reservation charges one query envelope on the follower.
   AnalyticalGraphRef graph = 8;
 }
 // Two-identity name of one distributed Analytical graph.

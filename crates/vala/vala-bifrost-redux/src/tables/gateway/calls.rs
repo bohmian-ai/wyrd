@@ -140,7 +140,7 @@ mod tests {
     use crate::tables::{DomainTable, builtin_table};
     use wyrd_spec::vala::{
         CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-        WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
+        WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     /// Pins the exact contract columns, their nullability, and the envelope.
@@ -190,7 +190,6 @@ mod tests {
                 (WYRD_EVENT_TIME, false),
                 (WYRD_INGESTED_AT, false),
                 (WYRD_BATCH_ID, false),
-                (WYRD_ROW_ORDINAL, false),
                 (DATA_TENANT_ID, false),
             ]
         );

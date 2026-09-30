@@ -291,9 +291,7 @@ impl ClaimAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    };
+    use arrow::array::{FixedSizeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::ids::DataTenantId;
 
@@ -319,7 +317,6 @@ mod tests {
                 false,
             ),
             Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
-            Field::new("wyrd_row_ordinal", DataType::Int32, false),
         ]))
     }
 
@@ -336,16 +333,12 @@ mod tests {
             TimestampMicrosecondArray::from_iter_values((0..rows).map(|row| row * 2 + offset));
         let batch_ids = FixedSizeBinaryArray::try_from_iter((0..rows).map(|_| [batch; 16]))
             .expect("fixture batch identity");
-        let ordinals = Int32Array::from_iter_values(
-            (0..rows).map(|row| i32::try_from(row).unwrap_or(i32::MAX)),
-        );
         let record = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(StringArray::from(vec![tenant_value.as_str(); count])),
                 Arc::new(times),
                 Arc::new(batch_ids),
-                Arc::new(ordinals),
             ],
         )
         .expect("fixture member batch");

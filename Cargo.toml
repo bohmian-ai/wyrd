@@ -224,17 +224,17 @@ lru = "=0.12.5"
 datafusion = "=55.0.0"
 datafusion-proto = "=55.0.0"
 parquet = "59.2"
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a2f7cd2fb53e06c750b782880f6b6b83f6324467" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a2f7cd2fb53e06c750b782880f6b6b83f6324467" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "a2f7cd2fb53e06c750b782880f6b6b83f6324467" }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 59 line as the workspace, so embedding it adds no second native
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "74e4937a40a3f09501b253a9e4587e5dd10dfabd" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "6773e192c995d4d9423536f44f05f99b6ea81e5a" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
@@ -258,9 +258,10 @@ module_name_repetitions = "allow"
 [profile.dev.package."*"]
 debug = "line-tables-only"
 
-# Published release binaries (`cargo build --profile dist`): whole-program LTO
-# and one codegen unit for the fastest, smallest server, at the cost of a much
-# slower build. Local image builds and test lanes stay on `release`.
+# Published release artifacts (`--profile dist`: the server binary, Python
+# wheels, and the TypeScript native addon): whole-program LTO and one codegen
+# unit for the fastest, smallest artifacts, at the cost of a much slower build.
+# Local image builds and test lanes stay on `release`.
 [profile.dist]
 inherits = "release"
 lto = "fat"

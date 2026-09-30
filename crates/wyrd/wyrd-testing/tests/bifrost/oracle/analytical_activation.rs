@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, Int64Array};
+use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use vala_bifrost_redux::oracle::Oracle;
@@ -41,26 +41,24 @@ const FIXTURE_ROWS: i64 = 12;
 /// Distinct `filter_key` groups the fixture rows fall into.
 const FIXTURE_GROUPS: i64 = 3;
 
-/// Exact ordered `(left_id, right_id, right_ordinal)` rows the journey's
+/// Exact ordered `(left_id, right_id)` rows the journey's
 /// same-table self-join must return.
 ///
 /// The left alias keeps `filter_key = 'group_0'`, which is ids `0, 3, 6, 9`.
 /// The join condition carries that group onto the right alias, whose own
 /// `id > 5` predicate leaves ids `6, 9`. Four left rows against two right rows
 /// is eight, and those eight pairs are these pairs only while each alias binds
-/// its own closure. This journey's process fixture writes all `FIXTURE_ROWS`
-/// in one ingest batch, and `wyrd_row_ordinal` is zero-based within a batch, so
-/// each right ordinal equals that row's own `id`; the right `id` is what
-/// distinguishes the two right-side rows.
-const SELF_JOIN_RESULT: [(i64, i64, i32); 8] = [
-    (0, 6, 6),
-    (0, 9, 9),
-    (3, 6, 6),
-    (3, 9, 9),
-    (6, 6, 6),
-    (6, 9, 9),
-    (9, 6, 6),
-    (9, 9, 9),
+/// its own closure; the right `id` is what distinguishes the two right-side
+/// rows.
+const SELF_JOIN_RESULT: [(i64, i64); 8] = [
+    (0, 6),
+    (0, 9),
+    (3, 6),
+    (3, 9),
+    (6, 6),
+    (6, 9),
+    (9, 6),
+    (9, 9),
 ];
 
 /// Builds one published-only strict request with the journey's deadline.
@@ -159,7 +157,7 @@ async fn await_admitted(
     for _ in 0..BASELINE_POLLS {
         if cluster.nodes_mut()[index]
             .ownership_snapshot()?
-            .root_query_slot_units
+            .root_active_queries
             >= units
         {
             return Ok(());
@@ -460,7 +458,7 @@ const PEER_SCRIBE: usize = 3;
 /// The activation topology starts each pod with one unit more than this, so a
 /// single held graph owns everything Analytical work can be granted while the
 /// remaining unit stays available to the Interactive floor.
-const ANALYTICAL_GRAPH_UNITS: u32 = 2;
+const ANALYTICAL_GRAPH_UNITS: u32 = 1;
 
 /// What one public query settled to over the real public HTTP surface.
 struct PublicSettlement {
@@ -517,17 +515,17 @@ async fn run_public_request(
 /// Drives the journey's same-table self-join and decodes its exact rows.
 ///
 /// Returns the ordinary public settlement alongside every decoded
-/// `(left_id, right_id, right_ordinal)` tuple in the order the server streamed
+/// `(left_id, right_id)` pair in the order the server streamed
 /// them, which the query's `ORDER BY` makes deterministic.
 ///
 /// # Errors
 ///
 /// Returns a transport, protocol, Arrow, or missing-terminal error, or a
-/// description when a batch does not carry the three expected column types.
+/// description when a batch does not carry the two expected column types.
 async fn run_self_join(
     client: &WyrdClient,
     sql: &str,
-) -> Result<(PublicSettlement, Vec<(i64, i64, i32)>), JourneyError> {
+) -> Result<(PublicSettlement, Vec<(i64, i64)>), JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&request(sql))
         .await?;
@@ -538,9 +536,8 @@ async fn run_self_join(
         rows += batch.num_rows();
         let left = column::<Int64Array>(&batch, 0, "left_id")?;
         let right = column::<Int64Array>(&batch, 1, "right_id")?;
-        let ordinal = column::<Int32Array>(&batch, 2, "right_ordinal")?;
         for index in 0..batch.num_rows() {
-            decoded.push((left.value(index), right.value(index), ordinal.value(index)));
+            decoded.push((left.value(index), right.value(index)));
         }
     }
     let terminal = stream
@@ -748,11 +745,11 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
         .collect::<Result<_, JourneyError>>()?;
     let self_join_sql = format!(
-        "SELECT l.id AS left_id, r.id AS right_id, r.wyrd_row_ordinal AS right_ordinal \
+        "SELECT l.id AS left_id, r.id AS right_id \
          FROM vala.bifrost.{table} l \
          JOIN vala.bifrost.{table} r ON l.filter_key = r.filter_key \
          WHERE l.filter_key = 'group_0' AND r.id > 5 \
-         ORDER BY left_id, right_id, right_ordinal"
+         ORDER BY left_id, right_id"
     );
     // Driven here rather than through `run_public` because the claim is about
     // the values: a count alone cannot tell an independently bound pair of
@@ -1050,9 +1047,9 @@ async fn public_query_selects_both_paths_and_preserves_interactive_floor() {
 ///
 /// Returns the first claim that broke.
 async fn prove_public_activation() -> Result<(), JourneyError> {
-    // Three slot units per pod is what makes the two claims below independent:
-    // an Analytical graph charges two units at the resource root, so one held
-    // graph owns every unit Analytical work can be granted, while the third
+    // Two slot units per pod is what makes the two claims below independent:
+    // an Analytical graph charges one unit at the resource root, so one held
+    // graph owns every unit Analytical work can be granted, while the second
     // unit remains for the Interactive floor. Stating the number rather than
     // deriving it from the injected memory envelope is what makes the refusal
     // a statement about admitted capacity instead of about whatever the
@@ -1066,7 +1063,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
                 wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
                 wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
             ],
-            Some(3),
+            Some(2),
         )
         .await?;
 
@@ -1479,7 +1476,6 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         peer_running: 0,
         root_active_queries: 0,
         root_analytical_queries: 0,
-        root_query_slot_units: 0,
         root_query_memory_used_bytes: 0,
         root_query_active: false,
         scratch: wyrd_testing::bifrost::process_cluster::ScratchUsage {
@@ -1488,7 +1484,6 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         },
         attempts_active: 0.0,
         exchanges_active: 0.0,
-        fragments_active: 0.0,
     };
     await_baseline(&mut cluster, COORDINATOR, idle).await?;
 

@@ -646,7 +646,7 @@ fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::Scri
                 scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                scratch_root: std::path::PathBuf::new(),
+                scratch_root: None,
                 volume_roots: None,
             },
             crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES.min(cap),
@@ -1857,7 +1857,6 @@ impl Scribe for ScribeImpl {
                     }
                     ScribeError::PayloadTooLarge { .. }
                     | ScribeError::DecodedPayloadTooLarge { .. }
-                    | ScribeError::TooManyRows { .. }
                     | ScribeError::InvalidFrame
                     | ScribeError::EventTimeOutOfRange { .. }
                     | ScribeError::FingerprintMismatch { .. }

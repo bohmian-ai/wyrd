@@ -6,12 +6,12 @@ distributed execution, managed compaction, memory, spill, or diagnostics.
 ## DataFusion is execution, not authority
 
 DataFusion planning receives an authenticated, tenant-qualified immutable cut
-before path-specific admission. It uses the exact `OracleSessionShape` derived
-from Oracle's guaranteed minimum successful grant and performs no row IO or
+before path-specific admission. Its session takes CPU- and locality-derived
+target partitions with default batch size and performs no row IO or
 query-memory retention. After the returned root selects its class, execution
-receives the admitted query-owned runtime and memory pool through `TaskContext`
-while retaining the planning `SessionConfig` unchanged; extra granted capacity
-may remain unused. Wyrd owns authorization, query-class routing, resource
+receives the admitted query-owned runtime, memory pool, and grant-derived
+sort-merge reservation through `TaskContext` while retaining the planned
+partitioning; memory never reshapes the plan. Wyrd owns authorization, query-class routing, resource
 grants, deadlines, failure policy, audit, and terminal semantics. A
 `SessionContext`, SQL parser, optimizer, or `TableProvider` is never an
 authorization boundary.
@@ -92,7 +92,13 @@ uncertain-outcome reconciliation.
 
 ## Memory, spill, and concurrency
 
-- Each Oracle query owns its memory-pool view and spill lifetime. The process
+- Each Oracle query owns its memory-pool view and spill lifetime. Every
+  spilling session (leader, live fragment, or remote follower) uses a
+  runtime whose disk manager points at the governed Oracle spill directory
+  with the query's spill share; no session spills to the OS temp directory.
+  That disk manager caps spill-merge fan-in per query from its grant and
+  partition count, since the unbounded default lets merges starve sibling
+  sorters. The process
   pool is the aggregate capacity root every Oracle consumer shares, not an
   operation-local grant, and a query view allocates no capacity of its own.
 - Only fallible reservation is hard-limited. Infallible growth is measured as

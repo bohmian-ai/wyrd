@@ -811,3 +811,46 @@ not complete this task.
   (1.3 cores), with ~267 ms server `first_row`.
 - **Seed ingest:** 557k rows/s on the first R13 run versus 676k and 681k on
   reruns of the same code, so it is host variance.
+
+### D10 — one execution path and one slot per query (spec revision 17)
+
+User-approved consolidation ("THERE SHOULD BE 1 CORRECT way to do something";
+"roll this deletion in with all other consoldiation work"; "yes. drop it").
+This supersedes this task's row at line 99 that kept `try_acquire_worker` and
+"fragment and graph leaders": no fragment leader exists in production.
+
+- **Deleted, Oracle fragment-worker path:** no production leader dispatched
+  Oracle-target fragments. Deleted `try_acquire_worker`,
+  `OracleWorkerResources`, `OracleWorkerClass`, `OracleSlotCharge`, the
+  attempt buffer (`oracle/attempt.rs`), the follower reader-authority install
+  (`FixedCohortResolver`, `install_reader_authority`, `AuthorityAlreadyInstalled`),
+  `PeerTicketClaims::execution_deadline`, `NoopPeerSecurityAudit`,
+  `FragmentTelemetry`, `record_slot`, `record_security`, `admission_limits`,
+  the `oracle_fragment_duration_seconds` bucket, and the harness
+  `fragments_active` gauge. The server refuses an Oracle-target fragment as
+  terminal.
+- **Deleted, class-weighted slot charge:** every query charges one unit on each
+  node it runs on. Deleted `ANALYTICAL_QUERY_SLOT_UNITS`,
+  `ANALYTICAL_GRAPH_SLOT_UNITS`, `OracleResourceRequest::{memory_bytes,
+  slot_units}` and their exact-quantum validation, the separate
+  `oracle_query_slot_units` / `oracle_analytical_slot_units` ledger (the live
+  query counters are the ledger), `charge_oracle_slots` /
+  `release_oracle_slots`, `AdmissionClass::slot_units`, and the below-two-unit
+  fold in `OracleClassSplit::derive` and calibration translation.
+  `max_concurrent_graphs` is the local slot total.
+- **Deleted, duplicate encodings:** `AdmissionClass` (admission uses the
+  derived `QueryClass`), `PendingReservation::query_class`,
+  `CommittedGraphActivation` (`PendingGraphActivation::commit` returns the
+  stream directly), `proposal_u32_allowing_zero`, and the unreachable
+  disabled-Analytical calibration branch. An Analytical tenant cap is now
+  `1..=analytical_slots`.
+- **Wire:** `ReserveNodeSlotsRequest.slot_units` removed (proto tag 5
+  reserved); `graph` is required (missing → `PrivateConversionError::Missing`).
+  `query_class` is removed (tag 4 reserved): only Analytical graphs reserve
+  peers, so the field carried no information. The persisted audit `BifrostQueryReadDecision.slot_units`
+  is kept and records `1`, so existing audit records' canonical hashes still
+  verify.
+- **Fixtures:** process journeys that sized a pod as "one two-unit graph plus
+  the Interactive floor" now use 2 units (`RETRY_RECEIVER_SLOTS`,
+  activation topology). Unit fixtures that saturated the Analytical class with
+  one query use `analytical_slots: 1`.

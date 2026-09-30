@@ -44,7 +44,6 @@ non-null columns:
 - `wyrd_event_time`: validated caller event time or server receipt time;
 - `wyrd_ingested_at`: server-stamped ingestion time;
 - `wyrd_batch_id`: immutable UUIDv7 identity of one accepted logical batch;
-- `wyrd_row_ordinal`: zero-based `Int32` position in the complete logical batch;
 - `wyrd_request_id`: server-minted or validated request correlation;
 - `data_tenant_id`: authenticated tenant-isolation identity.
 
@@ -58,23 +57,24 @@ attributes losslessly. The values use the existing `CardRef` and `RunId` text
 grammars. Any client Card UID is ignored; Scribe stamps only the UID from the
 verified principal scope.
 
-Within a tenant-qualified physical table, row identity is:
+Identity is batch-level. Within a tenant-qualified physical table, one
+accepted logical batch is:
 
 ```text
-(wyrd_batch_id, wyrd_row_ordinal)
+wyrd_batch_id
 ```
 
 Globally it is:
 
 ```text
-(data_tenant_id, logical_table, wyrd_batch_id, wyrd_row_ordinal)
+(data_tenant_id, logical_table, wyrd_batch_id)
 ```
 
-The ordinal is contiguous across request order and never resets at an Arrow
-batch, WAL segment, shard, staged run, Parquet row group, object, snapshot, or
-Forge rewrite. Gate validates the batch identity and routes the authenticated
-write. Scribe assigns request-wide ordinals while table-owned validation
-prevents payload columns from supplying server-owned fields. A retry preserves
+Bifrost stamps no per-row position. Rows inside a batch are addressed by their
+own payload; nothing downstream consumes a server-assigned row address, so none
+is stored. Gate validates the batch identity and routes the authenticated
+write, while table-owned validation prevents payload columns from supplying
+server-owned fields. A retry preserves
 the batch ID. Within the idempotency-retention window,
 reusing an accepted ID requires the same schema fingerprint, row count, row
 order, and payload digest; any mismatch is a stable batch-identity conflict.
@@ -277,8 +277,9 @@ node. Membership is deterministic and durable before merge; one member cannot
 be split across claims and a later member cannot join an existing claim.
 
 `ParquetBatchEncoder` performs a bounded external merge in canonical
-`PhysicalLayout` order with `(wyrd_batch_id, wyrd_row_ordinal)` as the stable
-tie-breaker. It writes Parquet row groups toward a soft 128 MiB target and
+`PhysicalLayout` order with `wyrd_batch_id` as the stable tie-breaker; rows
+that still tie keep claim-member order, then their position within the staged
+run, so the merged order is deterministic without a per-row column. It writes Parquet row groups toward a soft 128 MiB target and
 closes immutable hot objects around the 512 MiB whole-file target. A completed row group is
 indivisible, and a smaller object is valid for dwell, partition close,
 pressure, drain, or final residue. The 512 MiB target is independent of WAL,
@@ -416,9 +417,10 @@ never from a cluster-wide quota. Total slot units default to the smaller of two
 units per effective CPU and the Oracle memory budget divided by the 32 MiB
 working set a unit represents; an explicit operator limit replaces that
 derivation outright. The resulting total splits once at boot into
-`interactive_floor_units + analytical_max_units`. `analytical_max_units` of zero
-is valid on a pod too small to run one two-unit Analytical query: its Analytical
-admission is refused immediately rather than queued forever.
+`interactive_floor_units + analytical_max_units`, one unit for the Interactive
+floor and the remainder for Analytical. `analytical_max_units` of zero is valid
+on a single-unit pod: its Analytical admission is refused immediately rather
+than queued forever.
 
 Within each path, queries are FIFO per tenant and tenants are selected by
 weighted round robin. The arbiter first fills the protected Interactive floor,
@@ -430,18 +432,22 @@ Slots admit; the actual grant sizes only the execution memory ceiling. A slot
 unit represents the 32 MiB working set used to derive local capacity; it is not
 itself charged as resident query memory. Concurrency is governed by slot units,
 actual cooperative reservation by the shared memory root, and spill by the
-separately leased scratch share. Interactive work charges one unit and
-Analytical work two, with the selected physical plan owning the checked final
-cost. A query-local memory ceiling is derived once at admission:
+separately leased scratch share. Every query charges exactly one unit on each
+node it runs on, whatever its class: an Interactive query on its leader, and an
+Analytical query on its leader and on every participant that reserves its
+graph. The class decides only which capacity rules apply, never the charge, and
+a peer reservation therefore carries no demand of its own. A query-local memory ceiling
+is derived once at admission:
 
 ```text
-grant = oracle_budget * query_slots / sum(running_slots)
-grant = clamp(grant, 32 MiB, 256 MiB)
+grant = clamp(bifrost_budget / 2, 256 MiB, bifrost_budget)
+spill_share = scratch_limit / 2
 ```
 
-The denominator includes the candidate query's slots plus every running
-query's admitted slots. The grant is a non-reserved per-query ceiling held for
-the query lifetime and never recomputed under running operators. Every leader
+The grant is not divided by concurrent load: concurrent queries compete in the
+shared root, which refuses growth once they fill it. It is a non-reserved
+per-query ceiling held for the query lifetime and never recomputed under
+running operators. Every leader
 and follower query receives a private view over one process-wide Oracle memory
 root, never an independently sized pool: the view refuses growth past that
 query's own ceiling, and the root's single tracked spill-fair pool, bounded by
@@ -458,6 +464,9 @@ limit less that minimum, and `WYRD_BIFROST_MEMORY_LIMIT_BYTES` may only lower
 it. The minimum is accounting headroom, not preallocated memory and not a
 ceiling on other server work. A plan that cannot leave both the minimum and a
 positive Bifrost cap fails boot, so an 8-GiB pod defaults to a 7-GiB cap.
+Every Wyrd pod has at least 4 GiB of memory; boot refuses a detected limit
+below that floor, so the smallest supported pod has a 3-GiB cap and a
+1.5-GiB query grant.
 
 Only fallible cooperative reservation is hard-limited. Growth DataFusion does
 not let fail is still real memory, so it is charged to an explicit process
@@ -466,21 +475,44 @@ allocations outside cooperative reservation fall in the server minimum; the
 pool is the Bifrost safety boundary, not a guarantee against operating-system
 or cgroup OOM.
 
-The guaranteed minimum successful grant fixes one `OracleSessionShape` before
-physical planning: the 32 MiB minimum grant, the minimum two execution
-partitions narrowed by available cut work, and the resulting target partitions,
-batch size, spill reservation, and join preference. Oracle retains that exact
-`SessionConfig` with the single physical root. The actual grant chosen after
-root-derived admission supplies only the query-owned `RuntimeEnv` and
-`MemoryPool` ceiling; it does not reshape or rebuild the physical plan, and
-capacity above the retained shape may remain unused.
+Query parallelism comes from CPU, not memory. Before
+physical planning, every Oracle leader, Oracle peer, and distributed stage
+session sets its target partitions from the node's effective CPU and the pinned input's
+locality: `cpu + (4 * cpu - cpu) * (1 - local_ratio)`, never below two, where
+`local_ratio` is the pinned bytes held in the local hot tier. Neither the grant
+nor the pinned file count changes it. Batch size and join preference are the
+`DataFusion` defaults. Oracle retains the planning `SessionConfig` with the
+single physical root. The actual grant supplies only the query-owned
+`RuntimeEnv`, its `MemoryPool` ceiling, and a per-partition sort-merge
+reservation of half the grant's partition share, capped at the `DataFusion`
+default so a spilling sort can always merge; it does not reshape or rebuild
+the physical plan.
+
+Pinned published and hot scan leaves honor that partition count. The pinned
+files are laid end to end and cut into equal contiguous byte ranges, one per
+partition; a row group belongs to the partition whose range holds its
+midpoint, which is the same rule Iceberg's reader applies to a split
+`FileScanTask`. One large file and many small files therefore both use every
+partition, and each row group is read exactly once.
 
 Operators and exchange consumers share that issued query ceiling without
 separate sublimits. Admission refuses before dispatch when checked graph counts
 or scratch demand exceed their finite configured limits. Allocation or
 transport refusal after admission is a typed query-resource failure and
-cancels the full query; it never borrows from another query's ceiling. Scratch
+cancels the full query; it never borrows from another query's ceiling. A
+refusal names the requesting consumer and the pod's largest holders. Scratch
 space is separately reserved because spill consumes real disk.
+
+Every session that can spill, whether the leader, a leader-local live
+fragment, or a remote Oracle follower, spills only into its node's governed
+Oracle spill directory under its query's spill share; the leader and its live
+fragments share one runtime and therefore one share. A Scribe follower owns no
+Oracle spill directory and runs with spill disabled. Every spilling runtime
+caps each sort merge phase's fan-in at
+`max(2, grant / 2 / partitions / 64 MiB)` spill files: `DataFusion`'s unbounded
+default lets merging partitions reserve non-spillable read buffers until they
+hold the whole query limit, and deriving the cap from the grant widens it as
+pods grow.
 
 Tenant fairness is owned separately by per-tenant FIFO and weighted
 round-robin admission, scheduled pod-locally: tenant slot caps are local
@@ -502,10 +534,12 @@ class with no executable capacity on the pod is refused immediately. Public
 HTTP queries bypass the server's global load-shed and request-concurrency
 layers so they reach this queue; gRPC reaches it directly.
 
-Snapshot preparation has no admission gate of its own. Concurrent table
-lookup, metadata load, reader guard, revalidation, and hot-cut work wait on the
-bounded runtime PostgreSQL pool within the leader deadline, and each substep is
-timed on `oracle_query_phase_seconds` beside the pool's acquire histogram.
+Snapshot preparation has no admission gate of its own. Table lookup, reader
+guard, and hot-cut work wait on the bounded runtime PostgreSQL pool; the
+metadata pointer read and revalidation wait on the Iceberg SQL catalog's own
+bounded pool, which pings a reused connection only after it has sat idle. All
+wait within the leader deadline, and each substep is timed on
+`oracle_query_phase_seconds`.
 Remote peer work reuses one authenticated channel per ready peer incarnation and
 endpoint; a changed fence or endpoint connects anew and never inherits the
 prior peer's channel. Connect, fragment open, first remote frame, and terminal

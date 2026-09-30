@@ -1677,7 +1677,10 @@ pub struct TailStreamIdentity {
     pub writer_epoch: WriterEpoch,
 }
 
-/// Fenced request to reserve worker slots.
+/// Fenced request to reserve one participant's capacity for a distributed graph.
+///
+/// Every reservation charges exactly one query envelope, holding one slot unit,
+/// on the receiving node, so the request carries no demand of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ReserveNodeSlotsRequest {
@@ -1687,20 +1690,13 @@ pub struct ReserveNodeSlotsRequest {
     pub leader_node_id: NodeId,
     /// Leader Oracle-role fence.
     pub leader_fencing_token: FencingToken,
-    /// Required admission class.
-    pub query_class: QueryClass,
-    /// Requested worker slots.
-    pub slot_units: u32,
     /// Reservation expiry.
     pub expires_at: DateTime<Utc>,
     /// Distributed Analytical graph this reservation is taken for.
     ///
-    /// Present only for a graph reservation. A fragment reservation leaves it
-    /// absent, which is what keeps the two purposes distinguishable on one
-    /// wire: a follower charges a whole query envelope for a graph and a
-    /// worker quantum for a fragment, and it must not charge either for the
-    /// other.
-    pub graph: Option<AnalyticalGraphRef>,
+    /// A follower binds the reservation, and later the graph lease, to this
+    /// exact graph.
+    pub graph: AnalyticalGraphRef,
 }
 
 /// The two-identity name of one distributed Analytical graph.

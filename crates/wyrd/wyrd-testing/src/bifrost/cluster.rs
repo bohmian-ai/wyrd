@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
-use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, TonicOraclePeerTransport};
+use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
@@ -1066,31 +1066,6 @@ impl WyrdTestCluster {
             .connect()
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))
-    }
-
-    /// Builds the same registry-backed TLS peer transport used by server boot.
-    ///
-    /// # Errors
-    /// Returns a resource error when TLS is disabled, the leader is absent, or
-    /// the retained CA fixture cannot be read.
-    pub fn oracle_peer_transport(
-        &self,
-        leader_index: usize,
-    ) -> Result<TonicOraclePeerTransport, ClusterError> {
-        let (_, tls) = self
-            .oracle_peer_tls
-            .as_ref()
-            .ok_or_else(|| ClusterError::Resource("Oracle peer TLS is not enabled".to_owned()))?;
-        let server = self
-            .server(leader_index)
-            .ok_or_else(|| ClusterError::Resource("Oracle leader is absent".to_owned()))?;
-        Ok(TonicOraclePeerTransport::with_tls(
-            server
-                .state()
-                .oracle_cluster()
-                .ok_or_else(|| ClusterError::Resource("Oracle cluster is absent".to_owned()))?,
-            peer_tls_from_paths(tls)?,
-        ))
     }
 
     /// Refreshes every running node's authoritative immutable membership cut.
@@ -2655,7 +2630,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_restart_rederives_same_plan_from_retained_snapshot() {
         let observation = SystemResourceSnapshot {
-            memory_limit_bytes: 2 * 1024 * 1024 * 1024,
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             effective_cpu: 3,
             scratch_capacity_bytes: 1280 * 1024 * 1024,
             scratch_available_bytes: 1280 * 1024 * 1024,

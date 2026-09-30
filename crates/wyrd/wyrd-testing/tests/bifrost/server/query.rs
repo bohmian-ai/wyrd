@@ -867,7 +867,6 @@ fn assert_scheduled_owners_released(
                 .list(cluster.data_tenant_id())
                 .is_empty()
             || root.oracle_query_active
-            || root.oracle_query_slot_units != 0
             || root.oracle_query_memory_used_bytes != 0
         {
             return Err(format!("scheduled return retained ownership: {live:?}, {root:?}").into());

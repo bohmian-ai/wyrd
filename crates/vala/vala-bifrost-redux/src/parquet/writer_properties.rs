@@ -17,6 +17,16 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 /// declared `write.parquet.row-group-size-bytes` when one is set.
 pub const BIFROST_ROW_GROUP_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
+/// Encoded bytes at which a column chunk's dictionary page overflows to `PLAIN`.
+///
+/// A point lookup decompresses and decodes the whole dictionary page of every
+/// column chunk it reads, even when its selected pages are `PLAIN`, so this
+/// bound is a per-query CPU cost for high-cardinality columns. At parquet-rs's
+/// 1 MiB default the benchmark's identifier column spent ~0.66 ms per lookup
+/// on its dictionary; 256 KiB cuts that to ~0.17 ms and the file shrinks,
+/// while low-cardinality columns still fit their dictionaries.
+const BIFROST_DICTIONARY_PAGE_BYTES: usize = 256 * 1024;
+
 /// Target false-positive probability of every Bifrost Bloom filter.
 const BLOOM_FPP: f64 = 0.01;
 
@@ -45,8 +55,8 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 ///
 /// Dictionary encoding is on by default so low-cardinality string and
 /// identifier columns encode as `RLE_DICTIONARY`; parquet-rs owns dictionary
-/// page overflow and the fallback to `PLAIN`, so no sampler or cardinality
-/// estimate is computed here. `wyrd_event_time` is the one column that opts
+/// page overflow at [`BIFROST_DICTIONARY_PAGE_BYTES`] and the fallback to
+/// `PLAIN`, so no sampler or cardinality estimate is computed here. `wyrd_event_time` is the one column that opts
 /// out: it is monotonic microsecond data that `DELTA_BINARY_PACKED` encodes
 /// strictly better than a dictionary would.
 ///
@@ -129,6 +139,7 @@ fn recipe_builder(
         ))
         .set_max_row_group_bytes(Some(BIFROST_ROW_GROUP_TARGET_BYTES))
         .set_dictionary_enabled(true)
+        .set_dictionary_page_size_limit(BIFROST_DICTIONARY_PAGE_BYTES)
         .set_column_dictionary_enabled(ColumnPath::from(WYRD_EVENT_TIME), false)
         .set_column_encoding(
             ColumnPath::from(WYRD_EVENT_TIME),
@@ -168,9 +179,10 @@ mod tests {
     }
 
     /// The one writer recipe every Bifrost producer builds: dictionary
-    /// encoding on by default so low-cardinality columns compress, off for
-    /// `wyrd_event_time` so `DELTA_BINARY_PACKED` is its real encoding rather
-    /// than a post-overflow fallback.
+    /// encoding on by default so low-cardinality columns compress, bounded at
+    /// the per-lookup dictionary decode size, and off for `wyrd_event_time` so
+    /// `DELTA_BINARY_PACKED` is its real encoding rather than a post-overflow
+    /// fallback.
     #[test]
     fn writer_recipe_encoding_contract() {
         let bloom_columns = declared_recipe();
@@ -188,6 +200,12 @@ mod tests {
                 "{column} must leave encoding selection to parquet-rs"
             );
         }
+
+        assert_eq!(
+            properties.dictionary_page_size_limit(),
+            BIFROST_DICTIONARY_PAGE_BYTES,
+            "dictionary pages overflow at the bounded per-lookup decode size"
+        );
 
         let event_time = ColumnPath::from(WYRD_EVENT_TIME);
         assert!(

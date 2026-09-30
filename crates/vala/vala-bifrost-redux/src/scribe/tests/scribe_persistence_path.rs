@@ -182,21 +182,21 @@ fn ipc_stream(batches: &[RecordBatch]) -> Vec<u8> {
 
 /// Read every stamped row of one frame, keyed by its batch id.
 ///
+/// Rows are returned as `(metric_name, rendered quantile_values)` sorted by
+/// value: the layout sort interleaves the two frames' rows, and a stored row
+/// carries no position within its batch, so the comparison is between the
+/// frames' row multisets.
+///
 /// # Panics
 ///
-/// Panics when a managed column is absent or carries the wrong Arrow type.
-fn stamped_rows(
-    batches: &[RecordBatch],
-    batch_id: Uuid,
-) -> Vec<(i32, String, arrow::array::ArrayRef)> {
-    use arrow::array::{Array, FixedSizeBinaryArray, Int32Array, StringArray};
+/// Panics when a managed column is absent, carries the wrong Arrow type, or a
+/// quantile value cannot be rendered.
+fn stamped_rows(batches: &[RecordBatch], batch_id: Uuid) -> Vec<(String, String)> {
+    use arrow::array::{Array, FixedSizeBinaryArray, StringArray};
+    use arrow::util::display::array_value_to_string;
 
     let mut rows = Vec::new();
     for batch in batches {
-        let ordinals = batch
-            .column_by_name("wyrd_row_ordinal")
-            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
-            .expect("wyrd_row_ordinal is Int32");
         let ids = batch
             .column_by_name("wyrd_batch_id")
             .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
@@ -208,27 +208,26 @@ fn stamped_rows(
         let quantiles = batch
             .column_by_name("quantile_values")
             .expect("the nested canonical column survives the managed WAL path");
-        for row in 0..batch.num_rows() {
+        for row in 0..ids.len() {
             if ids.value(row) != batch_id.as_bytes() {
                 continue;
             }
             rows.push((
-                ordinals.value(row),
                 names.value(row).to_owned(),
-                quantiles.slice(row, 1),
+                array_value_to_string(quantiles, row).expect("quantile value renders"),
             ));
         }
     }
-    rows.sort_by_key(|(ordinal, _, _)| *ordinal);
+    rows.sort();
     rows
 }
 
-/// Assert both payload modes stamped one contiguous range and the same rows.
+/// Assert both payload modes stored every row and the same rows.
 ///
 /// # Panics
 ///
-/// Panics when either frame's ordinals are not `0..total_rows` in input order,
-/// or when the two frames do not read back identical user columns.
+/// Panics when either frame did not store exactly `total_rows` rows, or when
+/// the two frames do not read back identical user columns.
 fn assert_payload_modes_agree(
     stored: &[RecordBatch],
     canonical_batch_id: Uuid,
@@ -237,34 +236,19 @@ fn assert_payload_modes_agree(
 ) {
     let canonical_rows = stamped_rows(stored, canonical_batch_id);
     let arrow_rows = stamped_rows(stored, arrow_batch_id);
-    let expected_ordinals: Vec<i32> =
-        (0..i32::try_from(total_rows).expect("row count fits i32")).collect();
     assert_eq!(
-        canonical_rows
-            .iter()
-            .map(|(ordinal, _, _)| *ordinal)
-            .collect::<Vec<_>>(),
-        expected_ordinals,
-        "one canonical batch stamps one contiguous ordinal range"
+        canonical_rows.len(),
+        total_rows,
+        "one canonical batch stores every row"
     );
     assert_eq!(
-        arrow_rows
-            .iter()
-            .map(|(ordinal, _, _)| *ordinal)
-            .collect::<Vec<_>>(),
-        expected_ordinals,
-        "one Arrow IPC stream stamps one contiguous ordinal range across every record batch"
+        arrow_rows.len(),
+        total_rows,
+        "one Arrow IPC stream stores every row across every record batch"
     );
     assert_eq!(
-        canonical_rows
-            .iter()
-            .map(|(_, name, quantiles)| (name.clone(), quantiles.to_data()))
-            .collect::<Vec<_>>(),
-        arrow_rows
-            .iter()
-            .map(|(_, name, quantiles)| (name.clone(), quantiles.to_data()))
-            .collect::<Vec<_>>(),
-        "both payload modes read back identical user columns in input order"
+        canonical_rows, arrow_rows,
+        "both payload modes read back identical user columns"
     );
 }
 
@@ -277,7 +261,6 @@ const MANAGED_COLUMNS: &[&str] = &[
     "wyrd_event_time",
     "wyrd_ingested_at",
     "wyrd_batch_id",
-    "wyrd_row_ordinal",
     "data_tenant_id",
 ];
 

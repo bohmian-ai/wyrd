@@ -13,6 +13,7 @@ use chrono::Duration as ChronoDuration;
 use iceberg::Catalog;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::forge::{
     ForgeObjectStore, ForgeUnsettledOutput, ForgeWorker, ForgeWorkerConfig,
 };
@@ -26,7 +27,10 @@ use super::support::{
 
 /// Returns this fixture table's current Forge recipe root as an object key.
 fn forge_root(fixture: &PromotionIntegrationFixture) -> String {
-    format!("{}/data/forge/v1", fixture.binding.object_prefix)
+    format!(
+        "{}/data/forge/{FORGE_WRITER_RECIPE}",
+        fixture.binding.object_prefix
+    )
 }
 
 /// Writes one object directly into staging and returns its key.
@@ -87,7 +91,7 @@ pub(super) async fn seed_lookalikes(fixture: &PromotionIntegrationFixture) -> Ve
     for path in [
         format!("{prefix}/data/forge/{}-00001.parquet", Uuid::now_v7()),
         format!(
-            "{prefix}/data/forge/v2/{}-00000-{}.parquet",
+            "{prefix}/data/forge/v1/{}-00000-{}.parquet",
             Uuid::now_v7(),
             Uuid::now_v7()
         ),
@@ -678,7 +682,7 @@ async fn assert_recovered_pass_exhausts_the_prefix(
 /// A sibling table's Forge root is refused before any lease, catalog, or IO.
 ///
 /// The plan input is a delete authority. A prefix that is well shaped — same
-/// tenant, same warehouse, same `data/forge/v1` recipe root — but names a
+/// tenant, same warehouse, same current Forge recipe root — but names a
 /// different table would still authorise deleting that table's objects, and the
 /// dispatch's catalog-derived comparison only catches it after the worker has
 /// already taken the table fence and loaded metadata. The binding derived from

@@ -665,8 +665,8 @@ Consequences, stated so they stop drifting:
   request-scoped `data_tenant_id`, `wyrd_request_id`, and
   `wyrd_ingested_at`, validates caller-supplied `wyrd_event_time` against a
   bounded acceptance window and rejects out-of-range values (never clamps or
-  normalizes them), and assigns one `wyrd_row_ordinal` per row across the
-  complete logical batch.
+  normalizes them). Row identity is batch-level; no per-row position is
+  stamped.
 
 - **`card_ref` is optional and authorized, not trusted.** Its absence is valid
   generic telemetry and produces null `card_uid`; the authenticated publisher

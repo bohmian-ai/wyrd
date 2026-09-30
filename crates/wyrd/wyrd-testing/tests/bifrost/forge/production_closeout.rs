@@ -1039,16 +1039,10 @@ impl GeometryWorkload {
             .insert(table, batch_id, ipc)
             .await
             .expect("public append acknowledged");
-        self.expected.extend(
-            values
-                .iter()
-                .enumerate()
-                .map(|(ordinal, value)| ManagedRow {
-                    batch_id,
-                    row_ordinal: i32::try_from(ordinal).expect("bounded ordinal"),
-                    value: *value,
-                }),
-        );
+        self.expected.extend(values.iter().map(|value| ManagedRow {
+            batch_id,
+            value: *value,
+        }));
     }
 
     /// Builds the next bounded batch without changing production object geometry.

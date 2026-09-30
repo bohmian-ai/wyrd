@@ -79,22 +79,6 @@ impl PeerTicketClaims {
     pub fn to_context(&self) -> Result<PeerContext, PeerSecurityError> {
         encode_context(self, MAX_FRAGMENT_CONTEXT_BYTES)
     }
-
-    /// Validates the execution deadline without extending context acceptance.
-    ///
-    /// # Errors
-    ///
-    /// Rejects absent, unrepresentable, or contradictory deadline timestamps.
-    pub fn execution_deadline(&self) -> Result<DateTime<Utc>, PeerSecurityError> {
-        if self.execution_deadline_unix_ms <= 0
-            || self.execution_deadline_unix_ms < self.expires_at_ms
-            || DateTime::from_timestamp_millis(self.expires_at_ms).is_none()
-        {
-            return Err(PeerSecurityError::Claims);
-        }
-        DateTime::from_timestamp_millis(self.execution_deadline_unix_ms)
-            .ok_or(PeerSecurityError::Claims)
-    }
 }
 
 /// The closed set of private stage operations on the Analytical path.
@@ -763,36 +747,6 @@ pub trait PeerSecurityAudit: Send + Sync {
         tenant_id: DataTenantId,
         violation: BifrostSecurityViolationKind,
     ) -> Result<(), PeerSecurityAuditError>;
-}
-
-/// Explicit no-op peer audit used only by isolated Redux tests.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoopPeerSecurityAudit;
-
-#[async_trait]
-impl PeerSecurityAudit for NoopPeerSecurityAudit {
-    /// Accepts an unverified rejection without persistence in isolated tests.
-    ///
-    /// # Errors
-    /// This isolated implementation never fails.
-    async fn append_unverified_ticket_rejection(
-        &self,
-        _violation: BifrostSecurityViolationKind,
-    ) -> Result<(), PeerSecurityAuditError> {
-        Ok(())
-    }
-
-    /// Accepts a verified rejection without persistence in isolated tests.
-    ///
-    /// # Errors
-    /// This isolated implementation never fails.
-    async fn append_verified_ticket_violation(
-        &self,
-        _tenant_id: DataTenantId,
-        _violation: BifrostSecurityViolationKind,
-    ) -> Result<(), PeerSecurityAuditError> {
-        Ok(())
-    }
 }
 
 /// Narrow context verification capability implemented by the server authority.

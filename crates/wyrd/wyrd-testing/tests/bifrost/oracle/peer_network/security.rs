@@ -266,7 +266,7 @@ fn every_bound_identity_must_match(
     let digest = reservation_body_digest(&request.encode_to_vec())
         .map_err(|error| format!("reserve body digest: {error}"))?;
     let mut substituted = proto_with_context(request, &plane.reserve_binding(query_id), digest);
-    substituted.slot_units = 64;
+    substituted.expires_at_unix_ms -= 1;
     let outcome = reserve(cluster, &plane.destination, substituted.encode_to_vec())?;
     if !is_refusal(&outcome) {
         return Err(format!("a substituted request body was answered with {outcome}").into());

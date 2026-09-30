@@ -625,8 +625,6 @@ pub struct OracleOwnershipSnapshot {
     pub root_active_queries: u32,
     /// Live analytical-class Oracle query owners at that root.
     pub root_analytical_queries: u32,
-    /// Slot units retained by Oracle query owners.
-    pub root_query_slot_units: u32,
     /// Memory retained specifically by Oracle query owners.
     pub root_query_memory_used_bytes: u64,
     /// Whether at least one Oracle query owner is active.
@@ -637,8 +635,6 @@ pub struct OracleOwnershipSnapshot {
     pub attempts_active: f64,
     /// Live `bifrost_oracle_analytical_exchanges_active` production gauge.
     pub exchanges_active: f64,
-    /// Live `oracle_fragments_active` production gauge.
-    pub fragments_active: f64,
 }
 
 /// Cgroup files a child copies into its resource-evidence directory.
@@ -3094,17 +3090,13 @@ mod tests {
             );
         }
 
-        let journey = child::pod_system_resources(ProcessNodeTarget::All, None);
+        let journey = child::pod_system_resources(None);
         assert_eq!(
             (journey.effective_cpu, journey.memory_limit_bytes),
-            (4, 3 << 30),
-            "the journey constructor keeps its 4-CPU/3-GiB snapshot"
+            (4, 4 << 30),
+            "every journey pod boots at the 4-CPU/4-GiB hard floor"
         );
-        assert_eq!(
-            child::pod_system_resources(ProcessNodeTarget::Oracle, None).memory_limit_bytes,
-            1280 << 20
-        );
-        let benchmark = child::pod_system_resources(ProcessNodeTarget::All, Some(bytes));
+        let benchmark = child::pod_system_resources(Some(bytes));
         assert_eq!(
             (benchmark.effective_cpu, benchmark.memory_limit_bytes),
             (cpus, bytes)
@@ -3172,7 +3164,6 @@ mod tests {
             peer_running: 12,
             root_active_queries: 13,
             root_analytical_queries: 14,
-            root_query_slot_units: 15,
             root_query_memory_used_bytes: 16,
             root_query_active: true,
             scratch: ScratchUsage {
@@ -3181,7 +3172,6 @@ mod tests {
             },
             attempts_active: 20.0,
             exchanges_active: 21.0,
-            fragments_active: 22.0,
         };
 
         let encoded = serde_json::to_string(&ControlResponse::OracleOwnership(Box::new(snapshot)))
@@ -3211,7 +3201,7 @@ mod tests {
             };
         assert_eq!(
             fields.len(),
-            22,
+            19,
             "the ownership shape gained or lost a field without this pin moving"
         );
         assert!(

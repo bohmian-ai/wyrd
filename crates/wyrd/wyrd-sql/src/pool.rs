@@ -4,7 +4,16 @@ use std::env;
 use std::str::FromStr;
 use std::time::Duration;
 
+use sqlx::Connection as _;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+
+/// Idle time after which a pooled connection is pinged before it is handed out.
+///
+/// A connection released moments ago is live with overwhelming probability,
+/// so pinging it only adds a round-trip to every hot-path acquire. Past this
+/// threshold the server, a proxy, or the network may have dropped it, so the
+/// ping runs and a dead connection is closed before any caller sees it.
+const VALIDATE_IDLE_AFTER: Duration = Duration::from_secs(1);
 
 /// Role-specific Postgres pool configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +30,9 @@ pub struct PoolConfig {
     pub max_lifetime: Option<Duration>,
     /// Per-connection SQLx statement cache capacity.
     pub statement_cache_capacity: usize,
-    /// Whether SQLx tests a connection before handing it out.
+    /// Whether a connection idle longer than [`VALIDATE_IDLE_AFTER`] is
+    /// pinged before it is handed out; a failed ping closes it and the pool
+    /// acquires another.
     pub test_before_acquire: bool,
 }
 
@@ -156,6 +167,9 @@ pub async fn build_platform_admin_pool(database_url: &str) -> Result<PgPool, sql
 ///
 /// The provider is installed before SQLx parses or connects the DSN, ensuring
 /// every TLS-capable pool observes the same process-wide crypto implementation.
+/// SQLx's own `test_before_acquire` pings on every acquire; when the config
+/// enables validation the pool instead pings only connections idle longer
+/// than [`VALIDATE_IDLE_AFTER`], through the `before_acquire` hook.
 ///
 /// # Errors
 ///
@@ -172,15 +186,26 @@ pub(crate) async fn connect_pool(
     let options = PgConnectOptions::from_str(database_url)?
         .statement_cache_capacity(config.statement_cache_capacity);
 
-    PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(config.max_connections)
         .min_connections(config.min_connections)
         .acquire_timeout(config.acquire_timeout)
         .idle_timeout(config.idle_timeout)
         .max_lifetime(config.max_lifetime)
-        .test_before_acquire(config.test_before_acquire)
-        .connect_with(options)
-        .await
+        .test_before_acquire(false);
+    let pool = if config.test_before_acquire {
+        pool.before_acquire(|conn, meta| {
+            Box::pin(async move {
+                if meta.idle_for > VALIDATE_IDLE_AFTER {
+                    conn.ping().await?;
+                }
+                Ok(true)
+            })
+        })
+    } else {
+        pool
+    };
+    pool.connect_with(options).await
 }
 
 fn env_name(base: &str, suffix: &str) -> String {
@@ -244,9 +269,61 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use super::PoolConfig;
+    use sqlx::postgres::PgPoolOptions;
+
+    use super::{PoolConfig, VALIDATE_IDLE_AFTER, connect_pool};
+    use crate::dsn::APP_DSN_ENV;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A connection killed while idle past the threshold is replaced, not
+    /// handed out.
+    ///
+    /// The single pooled backend is terminated from a second pool, then left
+    /// idle beyond [`VALIDATE_IDLE_AFTER`]. The next acquire must ping it,
+    /// discard it, and answer from a fresh backend; without the idle-gated
+    /// validation the query would fail on the dead socket. Skipped when no
+    /// Postgres DSN is configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a pool cannot connect, a query fails, or the acquire
+    /// returns the terminated backend.
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_dead_connection_is_replaced_before_acquire() {
+        let Ok(url) = std::env::var(APP_DSN_ENV) else {
+            return;
+        };
+        let config = PoolConfig {
+            max_connections: 1,
+            min_connections: 0,
+            ..PoolConfig::app_defaults()
+        };
+        let pool = connect_pool(&url, config).await.expect("validated pool");
+        let backend_pid = "SELECT pg_backend_pid()";
+        let victim: i32 = sqlx::query_scalar(backend_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("first backend");
+        let killer = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .expect("killer pool");
+        let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+            .bind(victim)
+            .fetch_one(&killer)
+            .await
+            .expect("terminate backend");
+        assert!(terminated, "the pooled backend is terminated");
+        // Elapses the idle threshold the validation keys on; not a synchronization wait.
+        tokio::time::sleep(VALIDATE_IDLE_AFTER + Duration::from_millis(200)).await;
+        let replacement: i32 = sqlx::query_scalar(backend_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("an idle dead connection is replaced before acquire");
+        assert_ne!(replacement, victim);
+    }
 
     #[test]
     fn pool_defaults_match_locked_values() {

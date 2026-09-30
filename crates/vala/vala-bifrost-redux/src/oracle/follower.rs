@@ -13,9 +13,7 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::TaskContext;
-use datafusion::execution::memory_pool::MemoryPool;
-use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::execution::session_state::SessionState;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
@@ -62,9 +60,6 @@ pub enum PhysicalPlanFollowerError {
     /// The decoded plan could not create its output stream.
     #[error("physical-plan execution failed after decode: {0}")]
     Execution(String),
-    /// A second reader epoch was offered to a follower that already holds one.
-    #[error("follower reader authority is already installed")]
-    AuthorityAlreadyInstalled,
 }
 
 /// Why one role-bound source could not be resolved.
@@ -216,118 +211,43 @@ where
     }
 }
 
-/// Request-local session policy derived from one trusted admitted grant.
+/// Creates one request-local session and task context under `execution`.
 ///
 /// Every follower session — leader-local Oracle, remote Oracle peer, or Scribe
-/// hot-tail peer — is shaped by the grant its own admission produced, never by
-/// a process-wide constant and never by a value the requesting peer supplied.
-/// The three knobs come from one
-/// [`OracleSessionShape`](crate::resources::OracleSessionShape), the same type
-/// the leader's session uses, so a follower cannot end up with a partition
-/// count sized for one ceiling and a batch size sized for another.
-#[derive(Clone)]
-pub struct FollowerSessionFactory {
-    /// Bounded pool nested under the admission that granted this execution.
-    memory_pool: Arc<dyn MemoryPool>,
-    /// Trusted grant bytes backing `memory_pool`.
-    granted_memory_bytes: usize,
-    /// Partition ceiling admitted alongside that grant.
-    admitted_target_partitions: usize,
+/// hot-tail peer — runs under the execution its own admission issued, never a
+/// value the requesting peer supplied, so it opens the dispatched files with
+/// the same shape and Parquet read options the leader's session uses.
+fn request_session(
+    execution: &crate::resources::OracleExecution,
+) -> (SessionState, Arc<TaskContext>) {
+    let state = execution.session_state(datafusion::prelude::SessionConfig::new());
+    let task = Arc::new(TaskContext::from(&state));
+    (state, task)
 }
 
-impl std::fmt::Debug for FollowerSessionFactory {
-    /// Formats only the non-sensitive admitted execution bounds.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("FollowerSessionFactory")
-            .field("granted_memory_bytes", &self.granted_memory_bytes)
-            .field(
-                "admitted_target_partitions",
-                &self.admitted_target_partitions,
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-impl FollowerSessionFactory {
-    /// Binds one admitted grant to the session it is allowed to shape.
-    #[must_use]
-    pub fn for_grant(
-        memory_pool: Arc<dyn MemoryPool>,
-        granted_memory_bytes: usize,
-        admitted_target_partitions: usize,
-    ) -> Self {
-        Self {
-            memory_pool,
-            granted_memory_bytes,
-            admitted_target_partitions: admitted_target_partitions.max(1),
-        }
-    }
-
-    /// Returns the session shape this grant produces for `work_units`.
-    ///
-    /// Partitions narrow to the work this fragment was actually assigned, so a
-    /// one-file fragment does not open a wide plan it cannot fill.
-    #[must_use]
-    pub fn shape(&self, work_units: usize) -> crate::resources::OracleSessionShape {
-        crate::resources::OracleSessionShape::for_grant(
-            self.granted_memory_bytes,
-            self.admitted_target_partitions,
-            work_units,
-        )
-    }
-
-    /// Creates one request-local runtime, session state, and task context.
-    ///
-    /// # Errors
-    /// Returns a redacted error when `DataFusion` cannot construct the bounded runtime.
-    fn create(&self, work_units: usize) -> Result<(SessionState, Arc<TaskContext>), String> {
-        let runtime = Arc::new(
-            RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::clone(&self.memory_pool))
-                .build()
-                .map_err(|_| "governed follower runtime construction failed".to_owned())?,
-        );
-        // `session_config` applies the same fixed Parquet pushdown and indexing
-        // options the leader's session uses: this is the session that actually
-        // opens the dispatched files and prunes their row groups and pages.
-        let config = self.shape(work_units).session_config();
-        let state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(config)
-            .with_runtime_env(runtime)
-            .build();
-        let task = Arc::new(TaskContext::from(&state));
-        Ok((state, task))
-    }
-}
-
-/// Counts the independently scannable units one follower fragment was assigned.
+/// Refuses a follower fragment that was assigned nothing to scan.
 ///
-/// This is the follower's half of the leader's `scannable_work_units`: each
-/// dispatched persisted file and each assigned Scribe cut is one independently
-/// openable scan target, and `DataFusion` cannot usefully spread a fragment
-/// across more partitions than it has targets to read.
+/// Each dispatched persisted file and each assigned Scribe cut is one
+/// openable scan target; a fragment with none should never have been
+/// dispatched.
 ///
 /// # Errors
 ///
 /// Returns [`PhysicalPlanFollowerError::Preflight`] when the assignments carry
 /// no scannable work at all, which is a contract failure rather than an empty
-/// result: a fragment with nothing to scan should never have been dispatched.
-pub fn oracle_assigned_work_units(
+/// result.
+fn require_scannable_work(
     assignments: &[FollowerScanAssignment],
-) -> Result<usize, PhysicalPlanFollowerError> {
-    let units = assignments.iter().fold(0_usize, |total, assignment| {
-        total
-            .saturating_add(assignment.persisted.files.len())
-            .saturating_add(usize::from(assignment.scribe_provider_cut.is_some()))
+) -> Result<(), PhysicalPlanFollowerError> {
+    let scannable = assignments.iter().any(|assignment| {
+        !assignment.persisted.files.is_empty() || assignment.scribe_provider_cut.is_some()
     });
-    if units == 0 {
+    if !scannable {
         return Err(PhysicalPlanFollowerError::Preflight(
             "dispatched fragment carries no scannable work".to_owned(),
         ));
     }
-    Ok(units)
+    Ok(())
 }
 
 /// Validated IO-free request projection passed into provider resolution.
@@ -376,6 +296,52 @@ impl OracleCatalogResolver {
     #[must_use]
     pub fn new(catalog: Arc<BifrostCatalog>) -> Self {
         Self { catalog }
+    }
+
+    /// Builds the follower-governed hot leaf for a validated hot assignment.
+    ///
+    /// Every object identity, size, and assignment fence has been validated by
+    /// the caller, so the shared hot leaf is constructed in follower
+    /// governance: its reservations are charged to the request-local pool
+    /// backed by the retained worker lease. It is built at the closure schema,
+    /// so its Parquet column mask decodes only the signed columns, and split
+    /// across the session's target partitions by byte range.
+    ///
+    /// # Errors
+    /// Returns a scrubbed message when an assigned descriptor is not a hot
+    /// object bound to this assignment.
+    fn hot_leaf(
+        &self,
+        assignment: &FollowerScanAssignment,
+        assigned_locations: &[(PersistedFileDescriptor, String, String)],
+        required_schema: SchemaRef,
+        full_schema: SchemaRef,
+        session: &SessionState,
+        permit: &ReaderIoPermit,
+    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
+        let files = assigned_locations
+            .iter()
+            .map(|(descriptor, _, location)| {
+                signed_hot_source(descriptor, location, &assignment.binding)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ResolvedFollowerSource {
+            plan: Arc::new(
+                super::exec::HotParquetExec::new(
+                    files,
+                    self.catalog.gated_file_io(permit),
+                    Arc::clone(self.catalog.storage()),
+                    required_schema,
+                    super::exec::HotParquetPlan::Follower {
+                        memory_pool: session.runtime_env().memory_pool.clone(),
+                    },
+                    Arc::new(super::exec::OracleScanMetricsHandle::default()),
+                    assignment.predicates.clone(),
+                )
+                .with_partitions(session.config().target_partitions()),
+            ),
+            full_schema,
+        })
     }
 
     /// Resolves every assigned descriptor to its table-relative and absolute
@@ -538,32 +504,14 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         }
         let assigned_locations = self.assigned_locations(assignment, table)?;
         if source == super::AssignedPersistedSource::Hot {
-            let files = assigned_locations
-                .iter()
-                .map(|(descriptor, _, location)| {
-                    signed_hot_source(descriptor, location, &assignment.binding)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            // Every object identity, size, and assignment fence has been
-            // validated above, so the shared hot leaf is constructed in
-            // follower governance: its reservations are charged to the
-            // request-local pool backed by the retained worker lease. It is
-            // built at the closure schema, so its Parquet column mask decodes
-            // only the signed columns.
-            return Ok(ResolvedFollowerSource {
-                plan: Arc::new(super::exec::HotParquetExec::new(
-                    files,
-                    self.catalog.gated_file_io(permit),
-                    Arc::clone(self.catalog.storage()),
-                    required_schema,
-                    super::exec::HotParquetPlan::Follower {
-                        memory_pool: session.runtime_env().memory_pool.clone(),
-                    },
-                    Arc::new(super::exec::OracleScanMetricsHandle::default()),
-                    assignment.predicates.clone(),
-                )),
+            return self.hot_leaf(
+                assignment,
+                &assigned_locations,
+                required_schema,
                 full_schema,
-            });
+                session,
+                permit,
+            );
         }
         // Compacted assignments keep the catalog's own scan. Rebuild the leaf
         // from the closure the leader signed: the follower resolves its own
@@ -599,7 +547,25 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 )
             })
             .collect::<Vec<_>>();
-        let plan = restrict_plan_to_assigned_files(plan, &restriction)?;
+        let plan = restrict_plan_to_assigned_files(
+            plan,
+            &restriction,
+            session.config().target_partitions(),
+        )?;
+        // Footers load through the node's one governed cache, charged to the
+        // request-local pool the retained worker lease backs, like hot ranges.
+        let plan = super::exec::route_published_footers(
+            plan,
+            &super::exec::PublishedFooters::new(
+                Arc::clone(self.catalog.storage()),
+                assignment.binding.tenant_id,
+                assignment.binding.table.clone(),
+                super::exec::HotParquetPlan::Follower {
+                    memory_pool: session.runtime_env().memory_pool.clone(),
+                },
+            ),
+        )
+        .map_err(|_| "authenticated Oracle footer routing failed".to_owned())?;
         let plan = super::exec::project_plan_by_name(plan, &assignment.required_columns)
             .map_err(|_| "authenticated Oracle closure normalization failed".to_owned())?;
         Ok(ResolvedFollowerSource { plan, full_schema })
@@ -639,7 +605,7 @@ fn signed_hot_source(
         // Keyed on the leader's signed `vala.file_list` identity and decoded
         // checksum, the same identity the leader itself keys on, so a follower
         // reading the same durable object shares the node's one decode.
-        metadata_key: crate::storage::HotMetadataKey::new(
+        metadata_key: crate::storage::ObjectMetadataKey::new(
             binding.tenant_id,
             binding.table.clone(),
             hot.path.clone(),
@@ -653,92 +619,6 @@ fn signed_hot_source(
             crate::catalog::event_time::EventTimeBoundsDefect::Missing,
         ),
     })
-}
-
-/// Follower resolver that serves one fixed in-memory cohort for every
-/// assignment it receives.
-///
-/// Peer transport proofs — fencing, ticket verification, TLS, footer framing,
-/// reservation release — need a follower that produces a deterministic,
-/// schema-stable result without a tenant catalog or object storage behind it.
-/// The worker still runs the real decode, tenant tripwire, and footer path over
-/// whatever this returns, so only provider acquisition is short-circuited.
-#[cfg(feature = "test-support")]
-#[derive(Debug)]
-pub struct FixedCohortResolver {
-    /// Schema every resolved source reports; must match the fingerprint the
-    /// dispatched assignment carries or decode rejects the plan.
-    schema: SchemaRef,
-    /// Cohort replayed for each resolution, in one partition.
-    batches: Vec<arrow::record_batch::RecordBatch>,
-}
-
-#[cfg(feature = "test-support")]
-impl FixedCohortResolver {
-    /// Binds the cohort this resolver replays.
-    #[must_use]
-    pub fn new(schema: SchemaRef, batches: Vec<arrow::record_batch::RecordBatch>) -> Self {
-        Self { schema, batches }
-    }
-}
-
-#[cfg(feature = "test-support")]
-#[async_trait]
-impl FollowerSourceResolver for FixedCohortResolver {
-    /// Returns the bound cohort, narrowed to the signed closure, as a
-    /// single-partition in-memory source.
-    ///
-    /// The cohort is bound at the complete schema, so it is projected here for
-    /// the same reason a real leaf is: the transport proofs this resolver
-    /// serves run the real decode, which requires the published plan to expose
-    /// exactly the signed closure.
-    ///
-    /// # Errors
-    /// Returns a redacted message when the signed closure does not resolve
-    /// against the bound schema, or when `DataFusion` rejects the cohort.
-    async fn resolve(
-        &self,
-        _target_role: ClusterRole,
-        assignment: &FollowerScanAssignment,
-        _session: &SessionState,
-        _reader_io_permit: Option<&ReaderIoPermit>,
-    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
-        let required_schema =
-            signed_closure_schema(self.schema.as_ref(), &assignment.required_columns)?;
-        let projected = self
-            .batches
-            .iter()
-            .map(|batch| {
-                batch
-                    .project(
-                        &required_schema
-                            .fields()
-                            .iter()
-                            .map(|field| {
-                                batch.schema().index_of(field.name()).map_err(|_| {
-                                    "fixed cohort is missing a signed closure column".to_owned()
-                                })
-                            })
-                            .collect::<Result<Vec<_>, String>>()?,
-                    )
-                    .map_err(|_| "fixed cohort rejected the signed closure".to_owned())
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&projected),
-            Arc::clone(&required_schema),
-            None,
-        )
-        .map(|plan| ResolvedFollowerSource {
-            plan: plan as Arc<dyn ExecutionPlan>,
-            full_schema: Arc::clone(&self.schema),
-        })
-        .map_err(|_| {
-            FollowerResolutionError::Fault(
-                "fixed cohort resolver rejected its bound cohort".to_owned(),
-            )
-        })
-    }
 }
 
 /// Authenticated Scribe resolver backed by the unchanged pod-local live-tail service.
@@ -859,16 +739,14 @@ pub struct FollowerExecution {
     stream: SendableRecordBatchStream,
     /// Scan metric sets pinned before execution began.
     scan_stats: FollowerScanEvidence,
-    /// This fragment's local reader protection, released when it terminates.
-    reader_protection: Option<FollowerReaderProtection>,
 }
 
-/// One follower fragment's local reader-epoch protection.
+/// One Analytical leaf's local reader-epoch protection.
 ///
-/// Held for the fragment's whole life: the guard keeps this node's epoch
-/// protecting the signed snapshots, and the permit is what every object open
-/// in the resolved plan presents. Dropping it releases both, so the protection
-/// cannot outlive or under-live the reads it exists for.
+/// The guard keeps this node's epoch protecting the signed snapshots, and the
+/// permit is what every object open in the resolved leaf presents. Dropping
+/// the guard cancels the permit, so the protection cannot outlive or
+/// under-live the reads it exists for.
 pub struct FollowerReaderProtection {
     /// This node's durable claim on every snapshot the fragment reads.
     guard: ReaderQueryGuard,
@@ -886,12 +764,6 @@ impl std::fmt::Debug for FollowerReaderProtection {
 }
 
 impl FollowerReaderProtection {
-    /// Borrows the permit every resolved source must present.
-    #[must_use]
-    pub fn permit(&self) -> &ReaderIoPermit {
-        &self.permit
-    }
-
     /// Splits this protection into the durable guard and the clonable permit.
     ///
     /// Used only where the two halves need different owners: the Analytical
@@ -907,13 +779,11 @@ impl FollowerReaderProtection {
 
 /// Protects every snapshot a set of signed assignments names, under this epoch.
 ///
-/// Both follower paths share it: the Interactive path protects the whole
-/// fragment before decode, and the Analytical path protects its one lazily
-/// resolved leaf before that leaf opens a provider. The leader signed exactly
-/// which snapshot each scan reads, so this re-derives the same cuts and commits
-/// them under `authority`. An installed epoch also supplies the IO permit for
-/// hot-only or empty assignments, without adding snapshot protection; a Scribe
-/// follower has no Oracle epoch and yields `None`.
+/// The Analytical leaf calls it before opening a provider. The leader signed
+/// exactly which snapshot each scan reads, so this re-derives the same cuts and
+/// commits them under `authority`. An installed epoch also supplies the IO
+/// permit for hot-only or empty assignments, without adding snapshot
+/// protection; without an epoch and without snapshots it yields `None`.
 ///
 /// # Errors
 ///
@@ -979,14 +849,8 @@ impl FollowerExecution {
     /// The caller drains the stream, then finalizes the evidence; the split
     /// exists because those two steps happen in different scopes.
     #[must_use]
-    pub fn split(
-        self,
-    ) -> (
-        SendableRecordBatchStream,
-        FollowerScanEvidence,
-        Option<FollowerReaderProtection>,
-    ) {
-        (self.stream, self.scan_stats, self.reader_protection)
+    pub fn split(self) -> (SendableRecordBatchStream, FollowerScanEvidence) {
+        (self.stream, self.scan_stats)
     }
 }
 
@@ -1218,7 +1082,8 @@ fn assignment_table(binding: &TenantTableBinding) -> Result<TableRef, String> {
 ///
 /// The Iceberg provider remains responsible for schema, pruning, and tenant
 /// filtering. This final projection removes every unassigned manifest file and
-/// rejects assignments that do not correspond to a planned file.
+/// rejects assignments that do not correspond to a planned file. Each Iceberg
+/// leaf reads across `partitions`, the follower session's target partitions.
 ///
 /// # Errors
 /// Returns an error when the provider is not file-backed, an assigned location
@@ -1226,6 +1091,7 @@ fn assignment_table(binding: &TenantTableBinding) -> Result<TableRef, String> {
 fn restrict_plan_to_assigned_files(
     plan: Arc<dyn ExecutionPlan>,
     assigned_files: &[(String, String, String)],
+    partitions: usize,
 ) -> Result<Arc<dyn ExecutionPlan>, String> {
     let assigned = assigned_files
         .iter()
@@ -1253,7 +1119,8 @@ fn restrict_plan_to_assigned_files(
                 observed.extend(assigned.iter().cloned());
                 return Ok(Transformed::yes(Arc::new(
                     exec.clone()
-                        .with_assigned_files(assigned.clone(), relative_assignments.clone()),
+                        .with_assigned_files(assigned.clone(), relative_assignments.clone())
+                        .with_partitions(partitions),
                 )));
             }
             if node.is::<IcebergTableScan>() {
@@ -1263,7 +1130,8 @@ fn restrict_plan_to_assigned_files(
                             "authenticated Oracle Iceberg source failed".to_owned(),
                         )
                     })?
-                    .with_assigned_files(assigned.clone(), relative_assignments.clone());
+                    .with_assigned_files(assigned.clone(), relative_assignments.clone())
+                    .with_partitions(partitions);
                 file_leaves = file_leaves.saturating_add(1);
                 observed.extend(assigned.iter().cloned());
                 return Ok(Transformed::yes(Arc::new(restricted)));
@@ -1350,17 +1218,6 @@ pub struct PhysicalPlanFollower<R> {
     audit: Option<Arc<dyn super::OracleAudit>>,
     /// Maximum accepted protobuf size.
     maximum_plan_bytes: usize,
-    /// This node's own reader epoch, present on every Oracle follower.
-    ///
-    /// Empty on a Scribe pod, which runs the same follower over a live-tail
-    /// resolver that reads no snapshot. An Oracle assignment that names a
-    /// snapshot is refused while the cell is empty, so an unfilled cell is a
-    /// role distinction rather than a way to skip protection.
-    ///
-    /// The cell is single-assignment because the engine that owns the process
-    /// reader authority is constructed *after* this worker. Boot fills it once,
-    /// before startup or activation, and a second fill is a wiring defect.
-    reader_authority: std::sync::OnceLock<Arc<OracleReaderAuthority>>,
     /// Observable lifecycle-boundary effects used to prove fail-closed ordering.
     effects: FollowerEffects,
 }
@@ -1376,7 +1233,6 @@ where
             .field("resolver", &self.resolver)
             .field("audit", &self.audit.is_some())
             .field("maximum_plan_bytes", &self.maximum_plan_bytes)
-            .field("reader_authority", &self.reader_authority.get().is_some())
             .field("effects", &self.effects)
             .finish()
     }
@@ -1408,7 +1264,6 @@ where
             resolver,
             audit: None,
             maximum_plan_bytes: DEFAULT_MAX_PHYSICAL_PLAN_BYTES,
-            reader_authority: std::sync::OnceLock::new(),
             effects: FollowerEffects {
                 preflight: AtomicUsize::new(0),
                 resolver: AtomicUsize::new(0),
@@ -1426,82 +1281,6 @@ where
         self
     }
 
-    /// Installs this node's reader epoch, without which no snapshot is readable.
-    ///
-    /// Retained for callers that already own the authority at construction.
-    /// Boot cannot, so it uses [`Self::install_reader_authority`] instead.
-    #[must_use]
-    pub fn with_reader_authority(mut self, authority: Arc<OracleReaderAuthority>) -> Self {
-        self.reader_authority = std::sync::OnceLock::from(authority);
-        self
-    }
-
-    /// Installs this node's reader epoch exactly once, after construction.
-    ///
-    /// The one process reader authority is owned by the Oracle engine, which is
-    /// built after this follower, so boot fills the cell here before startup,
-    /// activation, or snapshot publication. Taking `&self` keeps the follower
-    /// shareable behind an `Arc` while remaining single-assignment.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PhysicalPlanFollowerError::AuthorityAlreadyInstalled`] when the
-    /// cell is already filled, so a repeated or late installation fails boot
-    /// rather than silently leaving a second authority unused.
-    pub fn install_reader_authority(
-        &self,
-        authority: Arc<OracleReaderAuthority>,
-    ) -> Result<(), PhysicalPlanFollowerError> {
-        self.reader_authority
-            .set(authority)
-            .map_err(|_| PhysicalPlanFollowerError::AuthorityAlreadyInstalled)
-    }
-
-    /// Inspects the installed epoch and source-boundary counters without driving IO.
-    #[cfg(feature = "test-support")]
-    pub(super) fn authority_inspection_for_test(
-        &self,
-    ) -> (Option<Arc<OracleReaderAuthority>>, usize, usize) {
-        (
-            self.reader_authority.get().map(Arc::clone),
-            self.effects.preflight.load(Ordering::SeqCst),
-            self.effects.resolver.load(Ordering::SeqCst),
-        )
-    }
-
-    /// Reconstructs the pre-installation follower with the same resolver and audit.
-    #[cfg(feature = "test-support")]
-    pub(super) fn without_reader_authority_for_test(&self) -> Self
-    where
-        R: Clone,
-    {
-        let mut follower = Self::new(self.resolver.clone());
-        follower.audit = self.audit.as_ref().map(Arc::clone);
-        follower
-    }
-
-    /// Protects every snapshot this fragment's assignments name, before decode.
-    ///
-    /// The leader signed exactly which snapshot each scan reads, and preflight
-    /// has already verified those signatures, so this re-derives the same cuts
-    /// and commits them under *this* node's epoch. An installed Oracle epoch
-    /// also supplies the IO permit for hot-only or empty assignments, without
-    /// adding snapshot protection. Scribe followers have no Oracle epoch.
-    ///
-    /// # Errors
-    /// Returns [`PhysicalPlanFollowerError::Preflight`] when an assignment names
-    /// a snapshot while this node has no reader epoch, when a signed cut targets
-    /// a different epoch fence than this node holds, when its binding is not
-    /// canonical, or when the local authority refuses the protection.
-    async fn protect_assignments(
-        &self,
-        assignments: &HashMap<String, FollowerScanAssignment>,
-    ) -> Result<Option<FollowerReaderProtection>, PhysicalPlanFollowerError> {
-        protect_reader_cuts(self.reader_authority.get(), assignments.values())
-            .await
-            .map_err(PhysicalPlanFollowerError::Preflight)
-    }
-
     /// Preflights, resolves, then synchronously decodes one authenticated plan.
     ///
     /// No resolver call occurs until the complete wire shape, role constraints,
@@ -1511,28 +1290,35 @@ where
     /// progress. Retry restarts preflight and every provider resolution.
     ///
     /// # Errors
-    /// Returns [`PhysicalPlanFollowerError`] for preflight, provider resolution,
-    /// or post-resolution native `DataFusion` decode failure.
+    /// Returns [`PhysicalPlanFollowerError::Preflight`] when preflight fails or
+    /// any assignment names a snapshot, which this epoch-less follower cannot
+    /// protect, and other [`PhysicalPlanFollowerError`] variants for provider
+    /// resolution or post-resolution native `DataFusion` decode failure.
     pub async fn decode(
         &self,
         request: &ExecuteFragmentRequest,
         authenticated: AuthenticatedFollowerContext<'_>,
         session: &SessionState,
         context: &TaskContext,
-    ) -> Result<(Arc<dyn ExecutionPlan>, Option<FollowerReaderProtection>), PhysicalPlanFollowerError>
-    {
+    ) -> Result<Arc<dyn ExecutionPlan>, PhysicalPlanFollowerError> {
         let preflight = self.preflight(request, &authenticated)?;
-        // Protection strictly precedes resolution: no provider, manifest, or
-        // object open happens before this node's own epoch covers every
-        // snapshot the leader signed into this fragment.
-        let protection = self.protect_assignments(&preflight.assignments).await?;
-        let permit = protection.as_ref().map(FollowerReaderProtection::permit);
+        // This follower holds no reader epoch, so a signed snapshot is refused
+        // before any provider, manifest, or object open could read it.
+        if preflight
+            .assignments
+            .values()
+            .any(|assignment| assignment.reader_cut.protects_a_snapshot())
+        {
+            return Err(PhysicalPlanFollowerError::Preflight(
+                "follower has no reader epoch for a snapshot-bearing assignment".to_owned(),
+            ));
+        }
         let mut providers = HashMap::with_capacity(preflight.assignments.len());
         for (scan_id, assignment) in preflight.assignments {
             self.effects.resolver.fetch_add(1, Ordering::SeqCst);
             let resolved = self
                 .resolver
-                .resolve(request.target_fence.role, &assignment, session, permit)
+                .resolve(request.target_fence.role, &assignment, session, None)
                 .await
                 .map_err(PhysicalPlanFollowerError::Resolution)?;
             // Two distinct schemas, checked in order. The fingerprint identifies
@@ -1583,7 +1369,7 @@ where
         codec
             .require_complete_consumption()
             .map_err(|error| PhysicalPlanFollowerError::PostResolutionDecode(error.to_string()))?;
-        Ok((plan, protection))
+        Ok(plan)
     }
 
     /// Preflights, resolves, synchronously decodes, and creates one output stream.
@@ -1598,13 +1384,11 @@ where
         &self,
         request: &ExecuteFragmentRequest,
         authenticated: AuthenticatedFollowerContext<'_>,
-        sessions: &FollowerSessionFactory,
+        execution: &crate::resources::OracleExecution,
     ) -> Result<FollowerExecution, PhysicalPlanFollowerError> {
-        let work_units = oracle_assigned_work_units(&request.assignments)?;
-        let (session, context) = sessions
-            .create(work_units)
-            .map_err(PhysicalPlanFollowerError::Execution)?;
-        let (plan, reader_protection) = self
+        require_scannable_work(&request.assignments)?;
+        let (session, context) = request_session(execution);
+        let plan = self
             .decode(request, authenticated, &session, &context)
             .await?;
         self.effects.execution.fetch_add(1, Ordering::SeqCst);
@@ -1619,7 +1403,6 @@ where
         Ok(FollowerExecution {
             stream,
             scan_stats: FollowerScanEvidence(scan_stats),
-            reader_protection,
         })
     }
 
@@ -1951,14 +1734,27 @@ pub(crate) mod tests {
     use crate::scribe::wal::WalLsn;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Builds one admitted follower session grant for in-process tests.
-    fn test_sessions(granted_memory_bytes: usize) -> FollowerSessionFactory {
-        FollowerSessionFactory::for_grant(
-            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+    /// Builds a non-spilling execution over a pool bounded to `granted_memory_bytes`.
+    ///
+    /// # Panics
+    /// Panics when `DataFusion` cannot construct the bounded runtime.
+    fn bounded_execution(
+        granted_memory_bytes: usize,
+        target_partitions: usize,
+    ) -> crate::resources::OracleExecution {
+        crate::resources::OracleExecution::new(
+            super::super::spill::build_query_runtime(
+                None,
+                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                    granted_memory_bytes,
+                )),
                 granted_memory_bytes,
-            )),
+                target_partitions,
+                0,
+            )
+            .expect("governed follower runtime"),
             granted_memory_bytes,
-            1,
+            target_partitions,
         )
     }
 
@@ -1972,6 +1768,7 @@ pub(crate) mod tests {
     use datafusion::datasource::physical_plan::ParquetSource;
     use datafusion::execution::context::SessionContext;
     use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::physical_plan::collect;
     use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
     use wyrd_spec::vala::api::{PeerContext, PersistedFileAssignment, ScribeProviderCut};
@@ -2040,6 +1837,7 @@ pub(crate) mod tests {
                 "assigned.parquet".to_owned(),
                 assigned.clone(),
             )],
+            1,
         )
         .expect("exact assigned file remains executable");
         assert_eq!(plan_files(&restricted), vec!["assigned.parquet"]);
@@ -2055,6 +1853,7 @@ pub(crate) mod tests {
                         "missing.parquet",
                     ),
                 )],
+                1
             )
             .is_err()
         );
@@ -2076,6 +1875,7 @@ pub(crate) mod tests {
                         ),
                     ),
                 ],
+                1
             )
             .is_err()
         );
@@ -2094,6 +1894,7 @@ pub(crate) mod tests {
                         assigned,
                     ),
                 ],
+                1
             )
             .is_err()
         );
@@ -2467,7 +2268,7 @@ pub(crate) mod tests {
             .execute(
                 &request,
                 authenticated(&request, &binding),
-                &test_sessions(1024 * 1024),
+                &bounded_execution(1024 * 1024, 1),
             )
             .await
             .expect("validated provider decodes and executes");
@@ -2585,10 +2386,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// partition count, batch size, and join preference all come from one
-    /// [`OracleSessionShape`](crate::resources::OracleSessionShape) derived from
-    /// the grant this node admitted, never from a fixed process constant and
-    /// never from a value the requesting peer supplied.
+    /// Proves a follower refuses empty fragments and that its partition count
+    /// and sort-merge reservation come from one
+    /// [`OracleSessionShape`](crate::resources::OracleSessionShape) built from
+    /// this node's own admission, never from a value the requesting peer
+    /// supplied.
     #[test]
     fn admitted_session_shape_contract() {
         let assignment = |files: usize, cut: bool| FollowerScanAssignment {
@@ -2612,71 +2414,32 @@ pub(crate) mod tests {
             reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
 
-        assert_eq!(
-            oracle_assigned_work_units(&[assignment(3, false)]).expect("three files"),
-            3
-        );
-        assert_eq!(
-            oracle_assigned_work_units(&[assignment(0, true)]).expect("one cut"),
-            1
-        );
-        assert_eq!(
-            oracle_assigned_work_units(&[assignment(2, false), assignment(0, true)])
-                .expect("files and a cut"),
-            3
-        );
+        for scannable in [
+            vec![assignment(3, false)],
+            vec![assignment(0, true)],
+            vec![assignment(2, false), assignment(0, true)],
+        ] {
+            require_scannable_work(&scannable).expect("scannable fragment");
+        }
         assert!(
-            oracle_assigned_work_units(&[assignment(0, false)]).is_err(),
+            require_scannable_work(&[assignment(0, false)]).is_err(),
             "a fragment with no scannable work is a contract failure"
         );
         assert!(
-            oracle_assigned_work_units(&[]).is_err(),
+            require_scannable_work(&[]).is_err(),
             "an empty assignment set is a contract failure"
         );
 
         let granted = crate::resources::ORACLE_PARTITION_MEMORY_BYTES;
-        let sessions = FollowerSessionFactory::for_grant(
-            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                granted,
-            )),
-            granted,
-            8,
-        );
-        let expected = crate::resources::OracleSessionShape::for_grant(granted, 8, 3);
-        assert_eq!(sessions.shape(3), expected);
-        let (state, _context) = sessions.create(3).expect("admitted follower session");
+        let execution = bounded_execution(granted, 8);
+        let expected = crate::resources::OracleSessionShape::for_grant(granted, 8);
+        assert_eq!(execution.shape(), expected);
+        let (state, _context) = request_session(&execution);
         let options = state.config().options();
+        assert_eq!(options.execution.target_partitions, 8);
         assert_eq!(
-            options.execution.target_partitions,
-            expected.target_partitions
-        );
-        assert_eq!(options.execution.batch_size.get(), expected.batch_size);
-        assert_eq!(
-            options.optimizer.prefer_hash_join,
-            expected.prefer_hash_join
-        );
-        assert_eq!(
-            expected.target_partitions, 3,
-            "partitions narrow to the work this fragment was assigned"
-        );
-        assert_ne!(
-            options.execution.batch_size.get(),
-            1_024,
-            "the removed fixed batch size is not the admitted shape"
-        );
-
-        let narrow = crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES;
-        let small = FollowerSessionFactory::for_grant(
-            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                narrow,
-            )),
-            narrow,
-            8,
-        );
-        assert_ne!(
-            small.shape(3).batch_size,
-            sessions.shape(3).batch_size,
-            "a smaller grant produces a smaller batch size"
+            options.execution.sort_spill_reservation_bytes,
+            expected.sort_spill_reservation_bytes
         );
     }
 
@@ -2686,9 +2449,7 @@ pub(crate) mod tests {
     /// residual `FilterExec` `DataFusion` keeps above the provider.
     #[tokio::test]
     async fn oracle_reader_session_options_contract() {
-        let (state, _context) = test_sessions(1024)
-            .create(1)
-            .expect("governed follower session context");
+        let (state, _context) = request_session(&bounded_execution(1024, 1));
         let parquet_options = &state.config().options().execution.parquet;
         assert!(parquet_options.pushdown_filters);
         assert!(parquet_options.reorder_filters);
@@ -2703,11 +2464,9 @@ pub(crate) mod tests {
     /// decode, unsupported-operator preflight, or stream construction.
     #[tokio::test]
     async fn oracle_resolver_builds_fresh_request_local_context() {
-        let sessions = test_sessions(1024);
-        let (first_state, first_context) =
-            sessions.create(2).expect("first governed request context");
-        let (second_state, second_context) =
-            sessions.create(2).expect("second governed request context");
+        let execution = bounded_execution(1024, 1);
+        let (first_state, first_context) = request_session(&execution);
+        let (second_state, second_context) = request_session(&execution);
         assert_ne!(first_state.session_id(), second_state.session_id());
         assert!(!Arc::ptr_eq(&first_context, &second_context));
         prove_role_local_providers_are_isolated_and_consumed_once().await;

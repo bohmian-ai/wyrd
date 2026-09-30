@@ -218,8 +218,8 @@ where
           (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The export does not match the registered schema \
           (WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH)", body = WyrdProblem),
-        (status = 413, description = "The frame or its decoded row count exceeds the ingest \
-          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE, WYRD_VALA_413_INGEST_OVERSIZED)",
+        (status = 413, description = "The frame or its decoded payload exceeds the ingest \
+          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE)",
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
@@ -330,8 +330,8 @@ async fn export_traces(
           (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The export does not match the registered schema \
           (WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH)", body = WyrdProblem),
-        (status = 413, description = "The frame or its decoded row count exceeds the ingest \
-          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE, WYRD_VALA_413_INGEST_OVERSIZED)",
+        (status = 413, description = "The frame or its decoded payload exceeds the ingest \
+          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE)",
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
@@ -443,8 +443,8 @@ async fn export_metrics(
           (WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The export does not match the registered schema \
           (WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH)", body = WyrdProblem),
-        (status = 413, description = "The frame or its decoded row count exceeds the ingest \
-          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE, WYRD_VALA_413_INGEST_OVERSIZED)",
+        (status = 413, description = "The frame or its decoded payload exceeds the ingest \
+          bounds (WYRD_VALA_413_PAYLOAD_TOO_LARGE)",
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
@@ -692,11 +692,6 @@ mod tests {
             (
                 IngestError::PayloadTooLarge { bytes: 2, limit: 1 },
                 "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-                413,
-            ),
-            (
-                IngestError::TooManyRows { rows: 2, limit: 1 },
-                "WYRD_VALA_413_INGEST_OVERSIZED",
                 413,
             ),
             (

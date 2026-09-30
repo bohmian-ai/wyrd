@@ -323,17 +323,16 @@ const INGEST_GROUPS: i64 = 1_000;
 
 /// Smallest possible in-memory size of the output sort's input, in bytes.
 ///
-/// 300,000 keys of 1,024 bytes, plus a 4-byte offset per key and one past the
+/// 300,000 keys of 6,144 bytes, plus a 4-byte offset per key and one past the
 /// end, plus one 8-byte count per row. Arrow cannot represent this input in
 /// less, so exceeding the grant is arithmetic rather than an observation.
-const SORT_INPUT_LOWER_BOUND: u64 = 307_200_000 + 1_200_004 + 2_400_000;
+const SORT_INPUT_LOWER_BOUND: u64 = 1_843_200_000 + 1_200_004 + 2_400_000;
 
-/// Memory ceiling the fixed pod envelope grants one Analytical query.
+/// Memory limit the fixed pod envelope grants one Analytical query.
 ///
-/// 1.25 GiB process memory less the 1 GiB server minimum leaves a 256 MiB
-/// shared cap, and one Analytical query holding both its slot units is
-/// granted all of it, clamped to the partition ceiling.
-const QUERY_GRANT_BYTES: u64 = 256 * 1024 * 1024;
+/// The 4 GiB pod floor less the 1 GiB server minimum leaves a 3 GiB shared
+/// cap, and every query's limit is half of it.
+const QUERY_GRANT_BYTES: u64 = 3 * 1024 * 1024 * 1024 / 2;
 
 /// Counters proving followers exchanged real data rather than empty stages.
 const EXCHANGE_COUNTERS: [&str; 2] = [
@@ -1467,10 +1466,10 @@ const RETRY_LEADER_SLOTS: usize = 8;
 
 /// Oracle slot units the receiving node admits with.
 ///
-/// One Analytical envelope charges two units and the root keeps one
+/// One Analytical envelope charges one unit and the root keeps one
 /// Interactive quantum, so exactly one graph fits and the second leader's
 /// reservation must be refused before it is accepted.
-const RETRY_RECEIVER_SLOTS: usize = 3;
+const RETRY_RECEIVER_SLOTS: usize = 2;
 
 /// Observations of a saturated receiver while the second leader retries.
 ///
@@ -1537,7 +1536,7 @@ async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyE
         cluster.nodes_mut()[index].refresh_snapshot()?;
     }
     let baseline = cluster.nodes_mut()[RETRY_RECEIVER].ownership_snapshot()?;
-    if baseline.root_query_slot_units != 0 {
+    if baseline.root_active_queries != 0 {
         return Err(format!("the receiver must start idle, held {baseline:?}").into());
     }
 
@@ -1562,7 +1561,7 @@ async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyE
     let receiver_slots = u32::try_from(RETRY_RECEIVER_SLOTS)?;
     for _ in 0..RETRY_OBSERVATION_POLLS {
         let receiving = cluster.nodes_mut()[RETRY_RECEIVER].ownership_snapshot()?;
-        if receiving.root_query_slot_units > receiver_slots
+        if receiving.root_active_queries > receiver_slots
             || receiving.root_analytical_queries > 1
             || receiving.follower_graphs > 1
         {
@@ -1688,7 +1687,7 @@ async fn await_root_released(
 ) -> Result<(), PeerJourneyError> {
     let mut last = cluster.nodes_mut()[index].ownership_snapshot()?;
     for _ in 0..CLEAN_LEASE_POLLS {
-        if last.root_query_slot_units == 0 && last.peer_running == 0 {
+        if last.root_active_queries == 0 && last.peer_running == 0 {
             return Ok(());
         }
         tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;

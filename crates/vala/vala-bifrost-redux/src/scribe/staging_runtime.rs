@@ -935,9 +935,7 @@ fn poisoned(owner: &'static str) -> ScribeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    };
+    use arrow::array::{FixedSizeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::ids::DataTenantId;
 
@@ -963,7 +961,6 @@ mod tests {
                 false,
             ),
             Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
-            Field::new("wyrd_row_ordinal", DataType::Int32, false),
         ]))
     }
 
@@ -983,9 +980,6 @@ mod tests {
                     FixedSizeBinaryArray::try_from_iter((0..rows).map(|_| [shard; 16]))
                         .expect("fixture batch identity"),
                 ),
-                Arc::new(Int32Array::from_iter_values(
-                    (0..rows).map(|row| i32::try_from(row).unwrap_or(i32::MAX)),
-                )),
             ],
         )
         .expect("fixture member batch");

@@ -6,8 +6,7 @@
 //! tests.
 
 use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    ArrayRef, FixedSizeBinaryBuilder, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -271,7 +270,6 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_timezone("UTC")),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_001_i64]).with_timezone("UTC")),
             Arc::new(batch_ids.finish()),
-            Arc::new(Int32Array::from(vec![0])),
             Arc::new(StringArray::from(vec![foreign.to_string()])),
         ],
     )?;
@@ -457,8 +455,8 @@ pub(crate) const ANALYTICAL_RIGHT_ROWS: i64 = 300_000;
 /// Digits the baseline query left-pads each id to.
 pub(crate) const ANALYTICAL_KEY_DIGITS: usize = 6;
 
-/// Filler characters appended to each key, making every key exactly 1 KiB.
-pub(crate) const ANALYTICAL_KEY_FILLER: usize = 1018;
+/// Filler characters appended to each key, making every key exactly 6 KiB.
+pub(crate) const ANALYTICAL_KEY_FILLER: usize = 6138;
 
 /// Builds the qualified Analytical baseline statement over two fixture tables.
 ///

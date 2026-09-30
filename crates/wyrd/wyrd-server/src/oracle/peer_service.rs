@@ -10,8 +10,8 @@ use std::sync::Arc;
 use datafusion::error::DataFusionError;
 use futures_util::{Stream, StreamExt};
 use vala_bifrost_redux::oracle::dispatcher::{
-    AttemptEncoder, DispatchError, EligibleSourceLossCause, LeaderAdmittedGrant,
-    OraclePeerTransport, PEER_PROTOCOL_VERSION, WorkerAttemptStream, WorkerExecution,
+    AttemptEncoder, DispatchError, EligibleSourceLossCause, OraclePeerTransport,
+    PEER_PROTOCOL_VERSION, WorkerAttemptStream, WorkerExecution,
 };
 use vala_bifrost_redux::oracle::follower::{
     AuthenticatedFollowerContext, FollowerResolutionError, PhysicalPlanFollowerError,
@@ -333,18 +333,23 @@ impl ScribeFragmentExecutor {
             tracing::error!(?error, "Scribe physical follower rejected the request");
             DispatchError::Terminal
         })?;
-        // The Scribe follower is shaped by its pool ceiling: one partition,
-        // because a hot-tail fragment is a single sequential cut, and the batch
-        // size that ceiling supports. Bytes are charged only as it grows.
-        let ceiling = vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES;
-        let sessions = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
-            scribe.resources().follower_memory_pool(ceiling),
-            ceiling,
-            1,
-        );
+        // The Scribe follower runs one partition, because a hot-tail fragment
+        // is a single sequential cut, under its pool ceiling. Bytes are
+        // charged only as it grows. It never spills: a Scribe node owns no
+        // governed Oracle spill directory.
+        let follower = scribe
+            .resources()
+            .follower_execution(
+                vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
+                1,
+            )
+            .map_err(|error| {
+                tracing::error!(%error, "Scribe follower execution could not be built");
+                DispatchError::Terminal
+            })?;
         let execution = scribe
             .fragment_follower()
-            .execute(&request, authenticated, &sessions)
+            .execute(&request, authenticated, &follower)
             .await
             .map_err(|error| {
                 tracing::warn!(?error, "Scribe physical follower could not start");
@@ -353,13 +358,10 @@ impl ScribeFragmentExecutor {
         scribe.record_fragment_execution();
         // Split now, finalize after drain: the scan counters are written during
         // execution, and the leader has no physical scan of its own to report.
-        let (mut batches, scan_evidence, reader_protection) = execution.split();
+        let (mut batches, scan_evidence) = execution.split();
         let plan_fingerprint = request.plan_fingerprint;
         let scribe_owner = Arc::clone(scribe);
         let output = async_stream::stream! {
-            // Retained through the whole attempt so a Scribe fragment that
-            // happens to name a snapshot keeps it protected until it is done.
-            let _reader_protection = reader_protection;
             let mut encoder = AttemptEncoder::default();
             match start_scribe_attempt(&mut encoder, batches.schema()) {
                 Ok(schema) => yield Ok(schema),
@@ -441,7 +443,6 @@ impl OraclePeerTransport for ScribeFragmentExecutor {
         &self,
         _worker: wyrd_spec::vala::api::NodeId,
         request: ExecuteFragmentRequest,
-        _admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         ScribeFragmentExecutor::execute(self, request)
             .await
@@ -534,10 +535,14 @@ impl OraclePeerService for OraclePeerGrpc {
         Ok(Response::new(proto::ReleaseNodeSlotsResponse {}))
     }
 
-    /// Executes verified immutable work and streams a footer-terminated attempt.
+    /// Executes one verified Scribe fragment and streams a footer-terminated attempt.
+    ///
+    /// Only Scribe owns fragment work: Oracle peers exchange Analytical stages,
+    /// so an Oracle-target fragment is refused before any decode.
     ///
     /// # Errors
-    /// Returns a conversion, security, or execution status.
+    /// Returns a conversion, security, or execution status, and a
+    /// permission-denied status for an Oracle-target fragment.
     async fn execute_fragment(
         &self,
         request: Request<proto::ExecuteFragmentRequest>,
@@ -545,10 +550,11 @@ impl OraclePeerService for OraclePeerGrpc {
         let request =
             ExecuteFragmentRequest::try_from(request.into_inner()).map_err(conversion_status)?;
         let WorkerExecution { mut stream } = match request.target_fence.role {
-            ClusterRole::Oracle => match self.bifrost.oracle_peer_service() {
-                Some(peer) => peer.worker().execute(request).await,
-                None => Err(DispatchError::Terminal),
-            },
+            // Oracle peers exchange Analytical stages, never fragments.
+            ClusterRole::Oracle => {
+                tracing::warn!("Oracle-target fragment refused: Oracle peers run no fragments");
+                Err(DispatchError::Terminal)
+            }
             ClusterRole::Scribe => match self.bifrost.scribe() {
                 Some(scribe) => {
                     ScribeFragmentExecutor::new(Arc::clone(scribe))
@@ -612,7 +618,6 @@ fn conversion_status(error: PrivateConversionError) -> Status {
 /// Maps peer pressure, retryable failures, and terminal contract failures separately.
 fn dispatch_status(error: DispatchError) -> Status {
     match error {
-        DispatchError::Partial { .. } => Status::deadline_exceeded(error.to_string()),
         DispatchError::Unavailable => Status::unavailable(error.to_string()),
         DispatchError::EligibleSourceLoss { .. } => Status::failed_precondition(error.to_string()),
         DispatchError::Capacity => Status::resource_exhausted(error.to_string()),
@@ -645,8 +650,7 @@ fn scribe_start_error(error: &PhysicalPlanFollowerError) -> DispatchError {
         PhysicalPlanFollowerError::Resolution(FollowerResolutionError::Fault(_))
         | PhysicalPlanFollowerError::Execution(_)
         | PhysicalPlanFollowerError::Preflight(_)
-        | PhysicalPlanFollowerError::PostResolutionDecode(_)
-        | PhysicalPlanFollowerError::AuthorityAlreadyInstalled => DispatchError::Terminal,
+        | PhysicalPlanFollowerError::PostResolutionDecode(_) => DispatchError::Terminal,
     }
 }
 
@@ -669,7 +673,6 @@ fn scribe_stream_error(error: &DataFusionError) -> DispatchError {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use vala_bifrost_redux::oracle::attempt::AttemptBuffer;
 
     /// Only source loss degrades a Scribe fragment; every other cause fails.
     ///
@@ -707,50 +710,6 @@ mod tests {
         ));
     }
 
-    /// The Scribe follower session is shaped by the lease this node charged.
-    ///
-    /// A hot-tail fragment runs under the Scribe follower lease acquired above,
-    /// so its session comes from that lease's granted bytes and the single
-    /// partition a sequential cut offers — never from a fixed batch size or a
-    /// value the leader supplied in the request.
-    #[test]
-    fn scribe_follower_session_shape_contract() {
-        let granted = vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES;
-        let sessions = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
-            std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                granted,
-            )),
-            granted,
-            1,
-        );
-        let expected = vala_bifrost_redux::resources::OracleSessionShape::for_grant(granted, 1, 1);
-
-        assert_eq!(sessions.shape(1), expected);
-        assert_eq!(
-            expected.target_partitions,
-            vala_bifrost_redux::resources::oracle_partitions_for_work(1, 1),
-            "a hot-tail cut is one sequential scan target under the shared floor"
-        );
-        assert_ne!(
-            expected.batch_size, 1_024,
-            "the removed fixed batch size is not the admitted shape"
-        );
-
-        let narrow = vala_bifrost_redux::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES;
-        let smaller = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
-            std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                narrow,
-            )),
-            narrow,
-            1,
-        );
-        assert_ne!(
-            smaller.shape(1).batch_size,
-            expected.batch_size,
-            "a smaller lease produces a smaller batch size"
-        );
-    }
-
     /// Proves the private tonic boundary preserves only stale-object failures as not-found.
     #[test]
     fn stale_object_dispatch_status_is_not_found() {
@@ -761,7 +720,7 @@ mod tests {
         assert_eq!(outage.code(), wyrd_tonic::tonic::Code::Unavailable);
     }
 
-    /// An explicit-empty Scribe result still emits schema then a validated complete footer.
+    /// An explicit-empty Scribe result still emits schema then a complete zero-row footer.
     #[test]
     fn empty_scribe_attempt_emits_schema_and_complete_footer() {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -786,12 +745,5 @@ mod tests {
             wyrd_spec::vala::api::WorkerAttemptFrame::Footer(footer)
                 if footer.completed && footer.row_count == 0
         ));
-
-        let mut attempt = AttemptBuffer::new(16 * 1_024);
-        attempt.push(schema_frame).expect("schema is first");
-        attempt.push(footer_frame).expect("footer is last");
-        let validated = attempt.finish().expect("zero-row footer validates");
-        assert_eq!(validated.footer.row_count, 0);
-        assert_eq!(validated.batches.count(), 0);
     }
 }

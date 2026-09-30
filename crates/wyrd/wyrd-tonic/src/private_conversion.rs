@@ -379,9 +379,8 @@ impl TryFrom<proto::ReserveNodeSlotsRequest> for domain::ReserveNodeSlotsRequest
     ///
     /// # Errors
     /// Returns [`PrivateConversionError`] for malformed identifiers, an
-    /// unknown class, zero capacity, or an invalid expiry timestamp.
+    /// unknown class, a missing graph, or an invalid expiry timestamp.
     fn try_from(value: proto::ReserveNodeSlotsRequest) -> Result<Self, Self::Error> {
-        positive(value.slot_units, "slot_units")?;
         Ok(Self {
             query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
             leader_node_id: domain::NodeId::new(uuid_string(
@@ -389,10 +388,12 @@ impl TryFrom<proto::ReserveNodeSlotsRequest> for domain::ReserveNodeSlotsRequest
                 "leader_node_id",
             )?),
             leader_fencing_token: value.leader_fencing_token,
-            query_class: query_class(value.query_class)?,
-            slot_units: value.slot_units,
             expires_at: datetime(value.expires_at_unix_ms, "expires_at_unix_ms")?,
-            graph: value.graph.map(analytical_graph_ref).transpose()?,
+            graph: analytical_graph_ref(
+                value
+                    .graph
+                    .ok_or(PrivateConversionError::Missing("graph"))?,
+            )?,
         })
     }
 }
@@ -423,15 +424,10 @@ impl From<domain::ReserveNodeSlotsRequest> for proto::ReserveNodeSlotsRequest {
             query_id: value.query_id.as_uuid().as_bytes().to_vec(),
             leader_node_id: value.leader_node_id.as_uuid().to_string(),
             leader_fencing_token: value.leader_fencing_token,
-            query_class: match value.query_class {
-                domain::QueryClass::Interactive => proto::QueryClass::Interactive as i32,
-                domain::QueryClass::Analytical => proto::QueryClass::Analytical as i32,
-            },
-            slot_units: value.slot_units,
             expires_at_unix_ms: unix_millis(value.expires_at),
-            graph: value.graph.map(|graph| proto::AnalyticalGraphRef {
-                public_query_id: graph.public_query_id.as_bytes().to_vec(),
-                datafusion_query_id: graph.datafusion_query_id.as_bytes().to_vec(),
+            graph: Some(proto::AnalyticalGraphRef {
+                public_query_id: value.graph.public_query_id.as_bytes().to_vec(),
+                datafusion_query_id: value.graph.datafusion_query_id.as_bytes().to_vec(),
             }),
         }
     }
@@ -1148,20 +1144,6 @@ impl From<domain::WorkerAttemptFrame> for proto::WorkerAttemptFrame {
     }
 }
 
-/// Decodes one required closed admission class.
-///
-/// # Errors
-/// Returns [`PrivateConversionError::RequiredEnum`] for zero or unknown values.
-fn query_class(value: i32) -> Result<domain::QueryClass, PrivateConversionError> {
-    match proto::QueryClass::try_from(value)
-        .map_err(|_| PrivateConversionError::RequiredEnum("query_class"))?
-    {
-        proto::QueryClass::Interactive => Ok(domain::QueryClass::Interactive),
-        proto::QueryClass::Analytical => Ok(domain::QueryClass::Analytical),
-        proto::QueryClass::Unspecified => Err(PrivateConversionError::RequiredEnum("query_class")),
-    }
-}
-
 /// Decodes a private runtime role without accepting protobuf's zero value.
 ///
 /// # Errors
@@ -1433,22 +1415,20 @@ mod tests {
         }
     }
 
-    /// Required private enum zero values fail closed.
+    /// A reservation that names no graph fails before reaching a follower.
     #[test]
-    fn reserve_slots_rejects_unspecified_query_class() {
+    fn reserve_slots_rejects_missing_graph() {
         let request = proto::ReserveNodeSlotsRequest {
             query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
             leader_node_id: uuid::Uuid::now_v7().to_string(),
             leader_fencing_token: 1,
-            query_class: 0,
-            slot_units: 1,
             expires_at_unix_ms: 1,
             context: None,
             graph: None,
         };
         assert!(matches!(
             domain::ReserveNodeSlotsRequest::try_from(request),
-            Err(PrivateConversionError::RequiredEnum("query_class"))
+            Err(PrivateConversionError::Missing("graph"))
         ));
     }
 
@@ -1498,13 +1478,11 @@ mod tests {
             query_id: domain::QueryId::new(uuid::Uuid::now_v7()),
             leader_node_id: domain::NodeId::new(uuid::Uuid::now_v7()),
             leader_fencing_token: 42,
-            query_class: domain::QueryClass::Analytical,
-            slot_units: 3,
             expires_at: chrono::DateTime::from_timestamp_millis(99).expect("valid timestamp"),
-            graph: Some(domain::AnalyticalGraphRef {
+            graph: domain::AnalyticalGraphRef {
                 public_query_id: uuid::Uuid::now_v7(),
                 datafusion_query_id: uuid::Uuid::now_v7(),
-            }),
+            },
         };
         let actual = domain::ReserveNodeSlotsRequest::try_from(
             proto::ReserveNodeSlotsRequest::from(expected.clone()),

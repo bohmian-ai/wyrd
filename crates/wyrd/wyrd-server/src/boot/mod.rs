@@ -21,12 +21,12 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
-    BifrostPeerTls, LocalOraclePeerTransport, OraclePeerTransportDirectory, OraclePeerWorker,
-    OraclePeerWorkerConfig, ReservationRegistry, TonicOraclePeerTransport,
+    BifrostPeerTls, OraclePeerTransportDirectory, OraclePeerWorker, ReservationRegistry,
+    TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::oracle::{
     Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
-    OracleSlotManager, OracleSpillRuntime,
+    OracleSlotManager,
 };
 use vala_bifrost_redux::resources::{
     BifrostRole, BifrostRoleResources, BifrostRuntimeResources, OracleClassSplit,
@@ -557,7 +557,7 @@ async fn build_bifrost_external_dependencies(
     let runtime_resources = BifrostRuntimeResources::detect_with_transport_message_limit(
         config.resources.policy(
             resource_roles,
-            data_root.oracle_spill().to_path_buf(),
+            Some(data_root.oracle_spill().to_path_buf()),
             Some(data_root.volume_roots()),
         ),
         config.scribe.ingest_request_bytes,
@@ -1057,7 +1057,6 @@ pub async fn compose_bifrost(
         cluster: Arc::clone(&cluster_registry),
         node_id,
         advertise_addr: &advertise_addr,
-        spill_root: data_root.oracle_spill().to_path_buf(),
         peer_tls: peer_tls.clone(),
         local_scribe: scribe.clone(),
         audit: query_audit.clone(),
@@ -1514,8 +1513,6 @@ struct OracleRoleBuilder<'a> {
     node_id: ClusterNodeId,
     /// Bound endpoint published in cluster membership.
     advertise_addr: &'a str,
-    /// Oracle spill directory derived from the one Bifrost data root.
-    spill_root: std::path::PathBuf,
     /// Cluster mTLS identity; present only in peer mode, where it is the sole
     /// trust boundary for every private call this Oracle sends or receives.
     peer_tls: Option<BifrostPeerTls>,
@@ -1566,7 +1563,6 @@ impl<'a> OracleRoleBuilder<'a> {
             cluster,
             node_id,
             advertise_addr,
-            spill_root,
             peer_tls,
             local_scribe,
             audit,
@@ -1724,8 +1720,6 @@ impl<'a> OracleRoleBuilder<'a> {
             tail_tls,
             local_scribe.as_ref().map(|scribe| scribe.tail_service()),
         ));
-        let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
-            authority.clone();
         let stage_authority: Arc<dyn vala_bifrost_redux::oracle::peer::OracleStageAuthority> =
             authority.clone();
         let role = cluster
@@ -1737,20 +1731,9 @@ impl<'a> OracleRoleBuilder<'a> {
                 "Oracle peer role requires root resource capability".to_owned(),
             )
         })?;
-        let follower_resolver = Arc::new(
-            vala_bifrost_redux::oracle::follower::OracleCatalogResolver::new(Arc::clone(&catalog)),
-        );
-        let worker = Arc::new(OraclePeerWorker::new_physical_with_resources(
-            OraclePeerWorkerConfig {
-                worker_node_id: node_id,
-                oracle_fence: role.fencing_token,
-                verifier,
-                security_audit: security_audit.clone(),
-                reservations: Arc::clone(&reservations),
-                oracle_resources: oracle_resources.clone(),
-                resolver: follower_resolver,
-                audit: audit.clone(),
-            },
+        let worker = Arc::new(OraclePeerWorker::new(
+            Arc::clone(&reservations),
+            oracle_resources.clone(),
         ));
         let peer = Arc::new(crate::oracle::OraclePeerRuntime::new(
             Arc::clone(&worker),
@@ -1758,24 +1741,14 @@ impl<'a> OracleRoleBuilder<'a> {
             lifecycle_transport,
             Arc::clone(&authority),
         ));
-        let local_transport = Arc::new(LocalOraclePeerTransport::new(Arc::clone(&worker)));
         let peer_transports = Arc::new(OraclePeerTransportDirectory::new(
             node_id,
-            local_transport,
             remote_transport,
             local_scribe.map(|scribe| {
                 Arc::new(crate::oracle::ScribeFragmentExecutor::new(scribe))
                     as Arc<dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerTransport>
             }),
         ));
-        let spill_runtime =
-            match OracleSpillRuntime::new(&spill_root, resource_plan.scratch_limit_bytes) {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    release_failed_oracle_role(&cluster, &role, "spill runtime construction").await;
-                    return Err(ServerBootError::OraclePeer(error.to_string()));
-                }
-            };
         let oracle = match OracleEngine::new(OracleBuildConfig {
             shutdown: shutdown.clone(),
             catalog: Arc::clone(&catalog),
@@ -1787,7 +1760,6 @@ impl<'a> OracleRoleBuilder<'a> {
                 resources,
                 reconciliation_limit_bytes,
             },
-            spill_runtime: Arc::new(spill_runtime),
             audit: audit.clone(),
             reservations,
             stage_authority: Some(stage_authority),
@@ -1804,16 +1776,6 @@ impl<'a> OracleRoleBuilder<'a> {
                 return Err(ServerBootError::OraclePeer(error.to_string()));
             }
         };
-        // The engine owns the one process reader authority and is built after
-        // this worker, so the follower's single-assignment cell is filled here
-        // — before startup reconciliation, activation, snapshot publication, or
-        // readiness. Until it succeeds a snapshot-bearing assignment fails
-        // closed, and a repeated or late installation fails boot outright.
-        if let Err(error) = worker.install_reader_authority(Arc::clone(oracle.reader_authority())) {
-            oracle.shutdown(std::time::Instant::now()).await;
-            release_failed_oracle_role(&cluster, &role, "reader authority installation").await;
-            return Err(ServerBootError::OraclePeer(error.to_string()));
-        }
         Ok(BuiltOracleRole {
             catalog,
             oracle,
@@ -2225,11 +2187,11 @@ fn check_card_recovery_pool_inner(
 /// Returns the query classes this pod's own local split can actually admit.
 ///
 /// Interactive is always served. Analytical is advertised only when the local
-/// split can cover one Analytical query's slot cost, because a leader that
+/// split reserves at least one Analytical slot, because a leader that
 /// deterministically selects a replica advertising a class it always refuses
 /// would fail a query a capable replica could have served.
 fn oracle_supported_classes(analytical_slots: u32) -> Vec<QueryClass> {
-    if analytical_slots >= vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS {
+    if analytical_slots > 0 {
         vec![QueryClass::Interactive, QueryClass::Analytical]
     } else {
         vec![QueryClass::Interactive]
@@ -2254,7 +2216,7 @@ mod tests {
             "a split that disables Analytical must not advertise it"
         );
         assert_eq!(
-            oracle_supported_classes(vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS),
+            oracle_supported_classes(1),
             vec![QueryClass::Interactive, QueryClass::Analytical]
         );
     }

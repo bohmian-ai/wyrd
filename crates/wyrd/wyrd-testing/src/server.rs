@@ -210,8 +210,11 @@ struct WyrdTestServerInner {
     query_stream_fault: QueryStreamFaultController,
     /// Atomic lifecycle-audit fault controls for causal query tests.
     query_control_audit_fault: wyrd_server::state::QueryControlAuditFaultController,
-    /// Current notification-backed schema stall used by cancellation journeys.
-    query_stream_stall: std::sync::Mutex<Option<Arc<wyrd_server::state::QueryStreamStall>>>,
+    /// Every notification-backed schema stall armed, newest last.
+    ///
+    /// Retained so a journey holding several stalled queries can still resolve
+    /// each one's lifecycle probe by its identity.
+    query_stream_stall: std::sync::Mutex<Vec<Arc<wyrd_server::state::QueryStreamStall>>>,
     /// Sole owner of the dedicated Scribe coordination runtime this server composed.
     ///
     /// The harness calls `compose_bifrost` directly, so a bound test server
@@ -1181,8 +1184,8 @@ impl WyrdTestServer {
     /// Stall the next query after its schema frame using test-tier notifications.
     pub fn stall_next_query_after_schema(&self) {
         let stall = self.inner.query_stream_fault.stall_next_after_schema();
-        if let Ok(mut current) = self.inner.query_stream_stall.lock() {
-            *current = Some(stall);
+        if let Ok(mut stalls) = self.inner.query_stream_stall.lock() {
+            stalls.push(stall);
         }
     }
 
@@ -1286,7 +1289,8 @@ impl WyrdTestServer {
             .query_stream_stall
             .lock()
             .map_err(|_| WyrdTestServerError::Start("query stall lock poisoned".to_owned()))?
-            .clone()
+            .last()
+            .cloned()
             .ok_or_else(|| WyrdTestServerError::Start("query stall is not scheduled".to_owned()))?;
         let deadline = Duration::from_millis(WyrdServerConfig::default().shutdown.drain_ms);
         tokio::time::timeout(deadline, stall.wait_entered())
@@ -1411,27 +1415,31 @@ impl WyrdTestServer {
 
     /// Resolves the lifecycle observation for one exact Oracle query identity.
     ///
+    /// Searches every armed stall for the one bound to `query_id`.
+    ///
     /// # Errors
     ///
-    /// Returns an error when no stalled query is bound or the identity differs.
+    /// Returns an error when the stall lock is poisoned or no stalled query
+    /// carries that identity.
     fn query_resource_probe(
         &self,
         query_id: &str,
     ) -> Result<Arc<vala_bifrost_redux::oracle::QueryResourceProbe>, WyrdTestServerError> {
-        let stall = self
+        let stalls = self
             .inner
             .query_stream_stall
             .lock()
             .map_err(|_| WyrdTestServerError::Start("query stall lock poisoned".to_owned()))?
-            .clone()
-            .ok_or_else(|| WyrdTestServerError::Start("query stall is not scheduled".to_owned()))?;
-        let probe = stall.resource_probe().map_err(WyrdTestServerError::Start)?;
-        if probe.query_id().as_uuid().to_string() != query_id {
-            return Err(WyrdTestServerError::Start(format!(
-                "query resource identity mismatch: requested {query_id}"
-            )));
-        }
-        Ok(probe)
+            .clone();
+        stalls
+            .iter()
+            .filter_map(|stall| stall.resource_probe().ok())
+            .find(|probe| probe.query_id().as_uuid().to_string() == query_id)
+            .ok_or_else(|| {
+                WyrdTestServerError::Start(format!(
+                    "query resource identity mismatch: requested {query_id}"
+                ))
+            })
     }
 
     /// Wake the already-running production Forge scheduler for a test pass.
@@ -4265,7 +4273,7 @@ impl WyrdTestServerBuilder {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: self.oracle_query_slot_limit,
-                    scratch_root,
+                    scratch_root: Some(scratch_root),
                     volume_roots,
                 },
                 self.scribe_ingest_limits.max_frame_bytes,
@@ -4486,7 +4494,7 @@ impl WyrdTestServerBuilder {
                 node_id,
                 query_stream_fault,
                 query_control_audit_fault,
-                query_stream_stall: std::sync::Mutex::new(None),
+                query_stream_stall: std::sync::Mutex::new(Vec::new()),
                 _coordination_runtime: coordination_runtime,
                 _compaction_runtime: compaction_runtime,
             },
@@ -5300,7 +5308,7 @@ mod production_composition_tests {
     #[test]
     fn test_server_uses_one_bifrost_composer_and_lifecycle() {
         let observation = SystemResourceSnapshot {
-            memory_limit_bytes: 3 * 1024 * 1024 * 1024,
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             effective_cpu: 6,
             scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
             scratch_available_bytes: 4 * 1024 * 1024 * 1024,
@@ -5319,7 +5327,7 @@ mod production_composition_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                scratch_root: scratch.path().to_owned(),
+                scratch_root: Some(scratch.path().to_owned()),
                 volume_roots: None,
             },
         )

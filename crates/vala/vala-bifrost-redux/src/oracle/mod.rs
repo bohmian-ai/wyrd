@@ -51,7 +51,6 @@ pub mod analytical;
 pub mod analytical_scan;
 pub mod analytical_supervisor;
 pub mod analytical_transport;
-pub mod attempt;
 mod bindings;
 pub mod codec;
 pub mod dispatcher;
@@ -80,7 +79,7 @@ pub(crate) mod pruning;
 mod query_stream;
 pub mod reader_pins;
 mod running;
-mod spill;
+pub(crate) mod spill;
 
 /// One stable aggregate-visible degraded partition entry.
 #[derive(Debug, Clone)]
@@ -95,7 +94,6 @@ pub(super) struct DegradedPartition {
 
 /// Query-scoped ordered degradation accumulated by distributed partitions.
 pub(super) type DegradedSourceAccumulator = Arc<std::sync::Mutex<Vec<DegradedPartition>>>;
-pub use spill::OracleSpillRuntime;
 
 /// Return the process-local query lifecycle observer used by test journeys.
 #[cfg(feature = "test-support")]
@@ -1133,8 +1131,6 @@ pub struct OracleBuildConfig {
     pub local_role: RegisteredRole,
     /// Parent memory and spill resources.
     pub memory: OracleMemoryResources,
-    /// Process-lifetime owner of pod-local Oracle query scratch.
-    pub spill_runtime: Arc<OracleSpillRuntime>,
     /// Read/security audit collaborator.
     pub audit: Arc<dyn OracleAudit>,
     /// Reservation owner this node's fragment and graph paths both charge against.
@@ -1430,8 +1426,6 @@ pub struct Oracle {
     vala: ValaPostgres,
     /// Parent-governed query memory and spill configuration.
     memory: OracleMemoryResources,
-    /// Process-lifetime owner used to construct bounded query disk managers.
-    spill_runtime: Arc<OracleSpillRuntime>,
     /// Process-owned planning-only runtime shared by every physical build.
     ///
     /// It has an unbounded pool and no disk manager because planning performs
@@ -1454,11 +1448,11 @@ pub struct Oracle {
     audit: Arc<dyn OracleAudit>,
     /// Optional distributed fragment owner assembled from server capabilities.
     fragment_dispatcher: Option<Arc<dispatcher::FragmentDispatcher>>,
-    /// Production-unreachable Analytical owners, composed but never routed to.
+    /// Distributed Analytical execution owners.
     ///
-    /// Present only when the server supplied a stage authority. Nothing in the
-    /// query path reads this field; it exists so the distributed path can be
-    /// mounted and exercised before it is ever selectable.
+    /// Present only when the server supplied both a stage authority and peer
+    /// mTLS. Without it, a query the planner classified Analytical still runs
+    /// on the leader and terminates with the Interactive execution path.
     analytical: Option<Arc<analytical::AnalyticalExecutionHandle>>,
     /// Production metrics owner shared by query execution and admission.
     telemetry: Arc<OracleTelemetry>,
@@ -1604,14 +1598,13 @@ fn validate_oracle_config(config: OracleConfig) -> Result<(), BifrostError> {
     validate_oracle_tenant_slots(config)
 }
 
-/// Validates the fixed pod-local per-tenant slot-unit caps against their classes.
+/// Validates the fixed pod-local per-tenant slot caps against their classes.
 ///
+/// Every query holds one slot unit, so each cap is a per-tenant query count.
 /// The Interactive cap must admit at least one query and may borrow up to the
 /// whole local total, which is the Interactive class maximum. The Analytical cap
-/// is either zero — the disabled class, where the raw units could not cover one
-/// two-unit query — or a value from one Analytical query's cost through the
-/// class maximum. A cap of one is rejected because it can never admit a query
-/// while still presenting the class as available.
+/// is zero exactly when the class is disabled, and otherwise lies between one
+/// and the class maximum.
 ///
 /// # Errors
 ///
@@ -1627,13 +1620,11 @@ fn validate_oracle_tenant_slots(config: OracleConfig) -> Result<(), BifrostError
                 .to_owned(),
         });
     }
-    let analytical_valid =
-        if config.analytical_slots < crate::resources::ANALYTICAL_QUERY_SLOT_UNITS {
-            config.analytical_slots == 0 && config.tenant_analytical_slots == 0
-        } else {
-            (crate::resources::ANALYTICAL_QUERY_SLOT_UNITS..=config.analytical_slots)
-                .contains(&config.tenant_analytical_slots)
-        };
+    let analytical_valid = if config.analytical_slots == 0 {
+        config.tenant_analytical_slots == 0
+    } else {
+        (1..=config.analytical_slots).contains(&config.tenant_analytical_slots)
+    };
     if !analytical_valid {
         return Err(BifrostError::Internal {
             detail:
@@ -1667,8 +1658,6 @@ struct AnalyticalCompositionInputs {
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// Directory this leader reserves each graph participant's envelope through.
     peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
-    /// Process-owned spill runtime every query-owned runtime is built from.
-    spill: Arc<OracleSpillRuntime>,
     /// Immutable peer identity every east-west channel is dialed through.
     peer_tls: dispatcher::BifrostPeerTls,
 }
@@ -1692,7 +1681,6 @@ fn compose_analytical_handle(
         reader_authority,
         reservations,
         peer_transports,
-        spill,
         peer_tls,
     } = inputs;
     let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
@@ -1715,7 +1703,6 @@ fn compose_analytical_handle(
             authority: Arc::clone(&authority),
             supervisor: Arc::clone(&supervisor),
             reservations,
-            spill: Arc::clone(&spill),
             leaf: leaf.clone(),
             egress,
         });
@@ -1723,7 +1710,6 @@ fn compose_analytical_handle(
         analytical::AnalyticalExecutionOwners {
             worker: Arc::clone(&worker),
             supervisor,
-            spill,
             peer_transports,
         },
         analytical::AnalyticalExecutionConfig {
@@ -1889,7 +1875,6 @@ impl Oracle {
                         reader_authority: Arc::clone(&reader_authority),
                         reservations: Arc::clone(&config.reservations),
                         peer_transports: config.peer_transports.as_ref().map(Arc::clone),
-                        spill: Arc::clone(&config.spill_runtime),
                     })
                 });
         Ok(Self {
@@ -1903,7 +1888,6 @@ impl Oracle {
             catalog: config.catalog,
             vala: config.vala,
             memory: config.memory,
-            spill_runtime: config.spill_runtime,
             planning_runtime: Self::planning_runtime()?,
             tail_discovery: config.tail_discovery,
             #[cfg(feature = "test-support")]
@@ -2050,17 +2034,15 @@ impl Oracle {
             .ok_or(BifrostError::QueryTimeout)
     }
 
-    /// Starts one raw-SQL query on the production-unreachable Analytical path.
+    /// Starts one raw-SQL query with a caller-fixed Analytical attempt identity.
     ///
-    /// Everything up to the execution lease is the production path unchanged:
-    /// the same validation, classification, participant cut, providers, audit,
-    /// admission, and terminal stream owner. Only the leased session differs,
-    /// and that difference is what makes the plan distribute across followers
-    /// through the real signed private transport rather than execute on the
-    /// leader.
+    /// Runs the production path unchanged: the same validation,
+    /// classification, participant cut, providers, audit, admission, lease,
+    /// and terminal stream owner.
     ///
-    /// Nothing in routing calls this. It exists so the distributed path can be
-    /// proved from raw SQL to drained result before it is ever selectable.
+    /// Production derives the attempt identity itself in [`Self::query_sql`];
+    /// this test seam lets a journey pin it so it can inspect the graph and
+    /// attempt owners it names.
     ///
     /// # Errors
     ///
@@ -2100,11 +2082,12 @@ impl Oracle {
     ///
     /// Terminal-cleanup and qualified-spill evidence needs to assert that an
     /// attempt's temporary files landed inside the node's own disposable child
-    /// and nowhere else, which is only checkable against this root.
+    /// and nowhere else, which is only checkable against this root. `None`
+    /// when this node was composed without a scratch root and cannot spill.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn analytical_spill_root(&self) -> &std::path::Path {
-        self.spill_runtime.spill_path()
+    pub fn analytical_spill_root(&self) -> Option<&std::path::Path> {
+        self.memory.resources.spill_path()
     }
 
     /// Leases one inactive Analytical attempt without executing anything.
@@ -2149,9 +2132,8 @@ impl Oracle {
             .build_physical_root(
                 &context,
                 &request.sql,
-                &planned.cuts,
+                &planned,
                 &mut roster,
-                work_units,
                 Instant::now()
                     + Duration::from_millis(
                         u64::try_from(deadline_ms - chrono::Utc::now().timestamp_millis())
@@ -2487,36 +2469,6 @@ impl Oracle {
         }
     }
 
-    /// Builds the sole execution `TaskContext` for a graphless retained root.
-    ///
-    /// Admission supplies the runtime and memory pool only. The retained
-    /// planning config is reused verbatim, so admitted capacity above the
-    /// minimum-grant shape the root was planned for stays unused rather than
-    /// reshaping a plan that is already final.
-    ///
-    /// # Errors
-    ///
-    /// Returns a stable execution error when `DataFusion` cannot construct the
-    /// query-owned runtime environment.
-    fn execution_session(
-        &self,
-        admitted: &AdmittedQueryGuard,
-        config: datafusion::prelude::SessionConfig,
-    ) -> Result<SessionContext, BifrostError> {
-        let pool = admitted
-            .memory_pool()
-            .ok_or(BifrostError::QueryAdmissionRejected)?;
-        let runtime = self
-            .spill_runtime
-            .build_query_runtime(pool, admitted.spill_limit_bytes())?;
-        let state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(config)
-            .with_runtime_env(runtime)
-            .build();
-        Ok(SessionContext::new_with_state(state))
-    }
-
     /// Pins one cut, builds one physical root, and derives this attempt's class.
     ///
     /// This is the whole pre-admission half of an attempt, kept together because
@@ -2544,14 +2496,7 @@ impl Oracle {
         } = input;
         let work_units = Self::scannable_work_units(&planned.cuts);
         let retained = self
-            .build_physical_root(
-                context,
-                &request.sql,
-                &planned.cuts,
-                &mut roster,
-                work_units,
-                deadline,
-            )
+            .build_physical_root(context, &request.sql, &planned, &mut roster, deadline)
             .await?;
         let query_class = exec::query_class_for_root(retained.root.as_ref());
         tracing::Span::current().record("query_class", query_class_label(query_class));
@@ -2757,7 +2702,7 @@ impl Oracle {
                 (handle, attempt)
             }
             _ => {
-                let session = self.execution_session(admitted, config)?;
+                let session = admitted.execution_session(config)?;
                 let scan_stats =
                     OracleQueryScanStats::from_plan(root.as_ref(), logical_bytes_selected);
                 let schema = root.schema();
@@ -2933,8 +2878,8 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryAdmissionRejected`] when the admitted query
-    /// holds no memory pool, and [`BifrostError::QueryAuditUnavailable`] when
-    /// the permission digest cannot be derived.
+    /// no longer holds its envelope, and [`BifrostError::QueryAuditUnavailable`]
+    /// when the permission digest cannot be derived.
     fn live_dispatch(
         &self,
         context: &AuthorizedQueryContext,
@@ -2946,10 +2891,6 @@ impl Oracle {
         let Some(dispatcher) = self.fragment_dispatcher.as_ref() else {
             return Ok(None);
         };
-        let query_memory_pool = admitted
-            .memory_pool()
-            .ok_or(BifrostError::QueryAdmissionRejected)?;
-        let granted_memory_bytes = admitted.granted_memory_bytes();
         Ok(Some(live::LiveDispatch::new(
             Arc::clone(dispatcher),
             dispatcher::DispatchContext {
@@ -2958,18 +2899,12 @@ impl Oracle {
                 leader_fence: admitted.leader.fencing_token,
                 tenant_id: context.data_tenant_id.as_uuid(),
                 query_class,
-                slot_units: admission_limits(u32::MAX, query_class).1,
                 permission_digest: scoped_permission_digest(
                     &context.permission,
                     &resolved_table_scopes(cuts),
                 )?
                 .as_str()
                 .to_owned(),
-                attempt_bytes: granted_memory_bytes,
-                attempt_memory_bytes: granted_memory_bytes,
-                query_memory_pool,
-                granted_memory_bytes,
-                admitted_target_partitions: admitted.target_partitions(),
                 cancellation: admitted.cancellation.clone(),
                 deadline: tokio::time::Instant::from_std(deadline),
             },
@@ -3374,14 +3309,13 @@ impl Oracle {
             .collect()
     }
 
-    /// Sums immutable selected file sizes before execution starts.
     /// Counts the independently scannable files pinned across one cut set.
     ///
-    /// This is the parallelism budget the cut actually offers. `DataFusion`
-    /// cannot usefully spread a scan across more partitions than there are
-    /// files to read, so this bounds the admitted partition ceiling before the
-    /// session is built. Both sealed Iceberg files and hot Scribe files count,
-    /// since each is an independently openable scan target.
+    /// An Analytical graph distributes whole files to remote tasks, so this
+    /// bounds how many stage tasks the cut can fill. Both sealed Iceberg files
+    /// and hot Scribe files count, since each is an independently openable
+    /// scan target. It does not bound session partitions: scan leaves split
+    /// files by byte range.
     fn scannable_work_units(cuts: &[PinnedSealedTable]) -> usize {
         cuts.iter().fold(0_usize, |total, cut| {
             total
@@ -3390,6 +3324,7 @@ impl Oracle {
         })
     }
 
+    /// Sums immutable selected file sizes before execution starts.
     fn logical_selected_bytes(cuts: &[PinnedSealedTable]) -> u64 {
         cuts.iter().fold(0_u64, |total, cut| {
             let iceberg = cut
@@ -3408,10 +3343,10 @@ impl Oracle {
 
     /// Builds the one physical root this query will execute.
     ///
-    /// Providers are registered on a planning-only session whose config comes
-    /// from the minimum grant admission can succeed with, so the retained root
-    /// is shaped by the cut rather than by whatever capacity the query is later
-    /// granted. When this node composed the Analytical owners the build runs
+    /// Providers are registered on a planning-only session whose partitions
+    /// come from this pod's CPU and the cut's locality, never from memory, so
+    /// the retained root is shaped once and a later grant sizes only its memory
+    /// ceiling. When this node composed the Analytical owners the build runs
     /// through the pinned distributed planner, which is what lets the root come
     /// back as a `DistributedExec`; the class is then read from that root alone.
     ///
@@ -3420,28 +3355,27 @@ impl Oracle {
     ///
     /// # Errors
     ///
-    /// Returns the mapped planning failure, which is terminal for this query:
-    /// there is no second build and no fallback path.
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when this pod's CPU
+    /// shape cannot be read, or the mapped planning failure, which is terminal
+    /// for this query: there is no second build and no fallback path.
     async fn build_physical_root(
         &self,
         context: &AuthorizedQueryContext,
         sql: &str,
-        cuts: &[PinnedSealedTable],
+        planned: &PlannedSqlCut,
         roster: &mut participant_cut::OracleQueryAttemptRoster,
-        work_units: usize,
         deadline: Instant,
     ) -> Result<RetainedPhysicalPlan, BifrostError> {
+        let cuts = planned.cuts.as_slice();
+        let work_units = Self::scannable_work_units(cuts);
+        let target_partitions = self.admission.session_partitions(planned.local_ratio)?;
         let listing_started = Instant::now();
         let live = self.discover_live_routes(roster, cuts, deadline).await?;
         QueryPhase::ScribeListing.record(listing_started);
         let oracles = roster.oracles();
         #[cfg(feature = "test-support")]
         record_physical_build(&roster.fingerprint());
-        let shape = crate::resources::OracleSessionShape::for_grant(
-            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
-            work_units,
-        );
+        let shape = crate::resources::OracleSessionShape::planning(target_partitions);
         // Installed empty before any planning happens. The lock owns no runtime
         // and no memory; it is the one place a planned leaf's concrete source,
         // grant, and drained batches arrive once, after admission.
@@ -4219,7 +4153,6 @@ fn read_decision(
             .max(1),
     )
     .map_err(|_| BifrostError::QueryAuditUnavailable)?;
-    let slot_units = admission_limits(u32::MAX, query_class).1;
     BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
         query_digest: audit_digest(sql)?,
         query_class,
@@ -4238,7 +4171,8 @@ fn read_decision(
         execution: QueryExecutionMode::Local,
         selected_node_count: 1,
         worker_count: 0,
-        slot_units,
+        // Every query holds one local slot unit.
+        slot_units: 1,
         // One attempt per logical query: the audit contract still carries the
         // ordinal, and Oracle now only ever writes its first value.
         retry_ordinal: 0,
@@ -4610,28 +4544,6 @@ async fn settle_attempt_output(
         running_query,
         reader_protection: Some(reader_protection),
     }))
-}
-
-/// Returns `(ceiling, demand)` for `class` on a node advertising `usable_slots`.
-/// The ceiling derivations are the locked D71 policy and are unchanged. The
-/// Analytical demand is clamped to `min(2, usable_slots.max(1))` so it upholds
-/// the schedulability invariant `demand <= running_capacity.max(1)` at the
-/// admission boundary: a node whose usable capacity is 1 must never advertise a
-/// per-node demand of 2, which would be structurally unschedulable against its
-/// own running semaphore. Interactive demand stays 1. Because every production
-/// producer calls this with `usable_slots = u32::MAX` (see the reserve-request
-/// builders in the dispatcher path), the transmitted Analytical wire demand is
-/// still 2; the clamp only takes effect for internal capacity-bounded callers,
-/// and the load-bearing peer-side clamp lives in
-/// [`ReservationRegistry::take_for_execute`].
-fn admission_limits(usable_slots: u32, class: QueryClass) -> (u32, u32) {
-    match class {
-        QueryClass::Interactive => ((usable_slots.saturating_mul(80) / 100).max(1), 1),
-        QueryClass::Analytical => (
-            (usable_slots.saturating_mul(40) / 100).max(2),
-            2.min(usable_slots.max(1)),
-        ),
-    }
 }
 
 /// Classifies typed planning refusals through context/diagnostic wrappers.
@@ -5415,45 +5327,6 @@ mod tests {
         );
     }
 
-    /// Class ceilings remain independent and analytical work is never downgraded.
-    #[test]
-    fn admission_class_ceiling_and_demand_are_locked() {
-        assert_eq!(admission_limits(10, QueryClass::Interactive), (8, 1));
-        assert_eq!(admission_limits(10, QueryClass::Analytical), (4, 2));
-        assert_eq!(admission_limits(1, QueryClass::Analytical), (2, 1));
-    }
-
-    /// `admission_limits` clamps Analytical demand to the node's own capacity.
-    ///
-    /// Proves the schedulability invariant `demand <= running_capacity.max(1)`
-    /// holds at the derivation boundary for every small topology: a capacity-1
-    /// node derives demand 1 (never the structurally unschedulable 2), and no
-    /// node derives a demand exceeding its usable capacity. Interactive demand
-    /// stays fixed at 1. The test name carries the `admission_limits` substring
-    /// so the focused verification filter selects it.
-    #[test]
-    fn admission_limits_clamp_analytical_demand_to_capacity() {
-        assert_eq!(admission_limits(1, QueryClass::Analytical).1, 1);
-        for usable_slots in 1..=8u32 {
-            let (_, analytical_demand) = admission_limits(usable_slots, QueryClass::Analytical);
-            assert!(
-                analytical_demand <= usable_slots.max(1),
-                "analytical demand {analytical_demand} exceeds capacity {usable_slots}"
-            );
-            assert!(
-                analytical_demand >= 1,
-                "analytical demand must never be zero (would bypass the semaphore)"
-            );
-            assert_eq!(
-                admission_limits(usable_slots, QueryClass::Interactive).1,
-                1,
-                "interactive demand is unchanged"
-            );
-        }
-        // Producers pass u32::MAX, so the transmitted wire demand stays 2.
-        assert_eq!(admission_limits(u32::MAX, QueryClass::Analytical).1, 2);
-    }
-
     /// Tenant tripwire rejects a foreign row instead of filtering it away.
     #[test]
     fn tenant_tripwire_rejects_foreign_rows() {
@@ -5547,11 +5420,11 @@ mod tests {
             ))
             .expect("one interactive query is admitted");
 
-        let pool = admitted.memory_pool();
+        let pool = Arc::clone(admitted.execution().memory_pool());
         let consumer = datafusion::execution::memory_pool::MemoryConsumer::new("metrics-governed")
             .register(&pool);
         consumer
-            .try_grow(admitted.granted_memory_bytes)
+            .try_grow(admitted.execution().granted_memory_bytes())
             .expect("the first query's full grant is fundable");
 
         // A second query fills the remaining governed root exactly, so the
@@ -5563,12 +5436,12 @@ mod tests {
                 0.0,
             ))
             .expect("a second query is admitted beneath the slot ledger");
-        let filler_pool = filler.memory_pool();
+        let filler_pool = Arc::clone(filler.execution().memory_pool());
         let filler_consumer =
             datafusion::execution::memory_pool::MemoryConsumer::new("metrics-filler")
                 .register(&filler_pool);
         filler_consumer
-            .try_grow(filler.granted_memory_bytes)
+            .try_grow(filler.execution().granted_memory_bytes())
             .expect("the second query's full grant is still fundable");
 
         let refused = oracle
@@ -5577,7 +5450,7 @@ mod tests {
                 0.0,
             ))
             .expect("a third query is admitted beneath the slot ledger");
-        let refused_pool = refused.memory_pool();
+        let refused_pool = Arc::clone(refused.execution().memory_pool());
         let refused_consumer =
             datafusion::execution::memory_pool::MemoryConsumer::new("metrics-refusal")
                 .register(&refused_pool);
@@ -5594,7 +5467,7 @@ mod tests {
         // DataFusion does not let fail charges the excess as infallible bytes,
         // which `memory_used` still counts.
         let before_infallible = memory_used();
-        consumer.grow(admitted.granted_memory_bytes);
+        consumer.grow(admitted.execution().granted_memory_bytes());
         let after_infallible = memory_used();
 
         // One real Analytical cut is what records the selected-worker count.

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::forge::{ForgeError, ForgeWorker, ForgeWorkerConfig};
 use wyrd_spec::DataTenantId;
 
@@ -806,7 +807,7 @@ async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
 /// Panics when the staging operator rejects the write.
 async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> String {
     let path = format!(
-        "{}/data/forge/v1/{}-00001-{}.parquet",
+        "{}/data/forge/{FORGE_WRITER_RECIPE}/{}-00001-{}.parquet",
         fixture.binding.object_prefix,
         Uuid::now_v7(),
         Uuid::now_v7()

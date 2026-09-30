@@ -8,8 +8,7 @@ use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
 use wyrd_spec::vala::managed_columns::{
-    DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_ROW_ORDINAL,
-    is_reserved_managed_column,
+    DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_managed_column,
 };
 
 pub mod audit;
@@ -311,7 +310,6 @@ pub fn reject_reserved_domain_fields(
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
                 WYRD_BATCH_ID,
-                WYRD_ROW_ORDINAL,
                 DATA_TENANT_ID,
             ]
             .contains(name)
@@ -2049,7 +2047,7 @@ mod tests {
         let reserved = physical
             .fields()
             .iter()
-            .find(|field| field.name() == WYRD_ROW_ORDINAL)
+            .find(|field| field.name() == WYRD_BATCH_ID)
             .expect("the physical schema carries the reserved envelope")
             .clone();
         duplicated.push(reserved);

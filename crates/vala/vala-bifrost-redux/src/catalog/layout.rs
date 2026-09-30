@@ -256,7 +256,7 @@ pub const WRITE_DATA_PATH_PROPERTY: &str = "write.data.path";
 /// recipe is reselected while an output produced under the current one is not.
 /// Advancing the recipe is therefore a deliberate act — bump this constant and
 /// every previously written object becomes obsolete by construction.
-pub const FORGE_WRITER_RECIPE: &str = "v1";
+pub const FORGE_WRITER_RECIPE: &str = "v2";
 
 /// Path segment separating recipe-tagged rewrite outputs from the data root.
 ///

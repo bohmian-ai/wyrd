@@ -143,30 +143,6 @@ impl OracleCancellationReason {
     }
 }
 
-/// Closed locality label for one fragment attempt.
-#[derive(Debug, Clone, Copy)]
-pub enum FragmentLocality {
-    /// Attempt executed on the leader node.
-    Local,
-    /// Attempt executed through a peer transport.
-    Remote,
-}
-
-impl FragmentLocality {
-    /// Returns the canonical low-cardinality metric label.
-    ///
-    /// Both the in-flight gauge and the terminal `bifrost_oracle_fragments_total`
-    /// counter tag their observations with this closed value so dashboards can
-    /// split fragment volume by where the attempt executed without unbounded
-    /// label cardinality.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Remote => "remote",
-        }
-    }
-}
-
 /// Closed terminal fragment outcome.
 #[derive(Debug, Clone, Copy)]
 pub enum FragmentOutcome {
@@ -199,10 +175,6 @@ pub enum PeerErrorClass {
     Availability,
     /// Security or closed-contract validation failed.
     Security,
-    /// Footer identity validation failed.
-    Footer,
-    /// Whole-attempt buffering or footer completeness failed.
-    Attempt,
 }
 
 impl PeerErrorClass {
@@ -217,94 +189,7 @@ impl PeerErrorClass {
             Self::None => "none",
             Self::Availability => "availability",
             Self::Security => "security",
-            Self::Footer => "footer",
-            Self::Attempt => "attempt",
         }
-    }
-}
-
-/// Closed worker-slot reservation outcome.
-#[derive(Debug, Clone, Copy)]
-pub enum SlotOutcome {
-    /// A pending slot was accepted.
-    Pending,
-    /// A pending reservation transitioned to running.
-    Running,
-    /// Capacity or fencing rejected the reservation.
-    Rejected,
-}
-
-/// Closed peer-security event boundary.
-#[derive(Debug, Clone, Copy)]
-pub enum SecurityEventClass {
-    /// Raw ticket authentication failed.
-    Ticket,
-    /// Verified claim structure failed.
-    Claims,
-    /// Fragment-bound verified claims failed.
-    Fragment,
-}
-
-/// Stream-scoped fragment metrics released on every exit path.
-pub struct FragmentTelemetry {
-    /// Closed locality label retained from `start` so the terminal
-    /// `bifrost_oracle_fragments_total` counter can attribute each fragment to
-    /// where it executed.
-    locality: FragmentLocality,
-    /// Fragment start used by the canonical duration histogram.
-    started_at: Instant,
-    /// Whether a terminal outcome has already been recorded.
-    finished: bool,
-}
-
-impl FragmentTelemetry {
-    /// Starts canonical in-flight and duration accounting.
-    ///
-    /// Increments the in-flight fragment gauge and captures the start instant.
-    /// The `locality` is retained on the guard so `finish` (and the `Drop`
-    /// fallback) can tag the terminal `bifrost_oracle_fragments_total` counter
-    /// with the same closed label.
-    #[must_use]
-    pub fn start(locality: FragmentLocality) -> Self {
-        metrics::gauge!("oracle_fragments_active").increment(1.0);
-        Self {
-            locality,
-            started_at: Instant::now(),
-            finished: false,
-        }
-    }
-
-    /// Records one terminal fragment outcome and admitted encoded bytes.
-    ///
-    /// Emits the closed `bifrost_oracle_fragments_total{locality,outcome}`
-    /// counter and the canonical duration histogram exactly once; repeat calls
-    /// after the first terminal outcome are ignored so the `Drop` fallback never
-    /// double-counts. `encoded_bytes` is accepted for caller symmetry but is
-    /// intentionally not projected into a metric here.
-    pub fn finish(&mut self, outcome: FragmentOutcome, encoded_bytes: u64) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-        metrics::counter!(
-            "bifrost_oracle_fragments_total",
-            "locality" => self.locality.as_str(),
-            "outcome" => outcome.as_str()
-        )
-        .increment(1);
-        metrics::histogram!("oracle_fragment_duration_seconds", "outcome" => outcome.as_str())
-            .record(self.started_at.elapsed().as_secs_f64());
-        let _ = encoded_bytes;
-    }
-}
-
-impl Drop for FragmentTelemetry {
-    /// Records cancellation/failure and closes the in-flight gauge.
-    fn drop(&mut self) {
-        if !self.finished {
-            self.finish(FragmentOutcome::Failed, 0);
-        }
-        metrics::gauge!("oracle_fragments_active").decrement(1.0);
     }
 }
 
@@ -321,16 +206,6 @@ pub fn record_peer_attempt(outcome: FragmentOutcome, error_class: PeerErrorClass
         "error_class" => error_class.as_str()
     )
     .increment(1);
-}
-
-/// Records one pending/running worker-slot reservation outcome.
-pub fn record_slot(query_class: QueryClass, outcome: SlotOutcome) {
-    let _ = (query_class, outcome);
-}
-
-/// Records one closed peer-security event class.
-pub fn record_security(event_class: SecurityEventClass) {
-    let _ = event_class;
 }
 
 /// Closed private stage-operation label for the Analytical execution path.
@@ -511,9 +386,9 @@ pub fn record_stage_operation(operation: AnalyticalStageOperation) {
 
 /// Attempt-scoped Analytical metrics released on every terminal path.
 ///
-/// Mirrors [`FragmentTelemetry`]: the in-flight gauge and duration histogram are
-/// owned by the guard, and `Drop` records a terminal outcome when a caller exits
-/// through cancellation, a deadline, an error, or a panic. That is what makes
+/// The in-flight gauge and duration histogram are owned by the guard, and
+/// `Drop` records a terminal outcome when a caller exits through cancellation,
+/// a deadline, an error, or a panic. That is what makes
 /// "zero retained attempts" an assertion a journey can make about the gauge
 /// rather than about a caller's discipline.
 pub struct AnalyticalAttemptTelemetry {
@@ -628,56 +503,6 @@ pub fn record_exchange_transfer(batches: u64, bytes: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A terminal `finish` emits the closed fragment counter with both the
-    /// retained locality and the terminal outcome, exactly once.
-    ///
-    /// Drives one `FragmentTelemetry` guard through an explicit `finish` under a
-    /// scoped benchmark recorder and asserts the
-    /// `bifrost_oracle_fragments_total{locality,outcome}` series carries a single
-    /// increment tagged with the locality captured at `start`.
-    #[test]
-    fn finish_emits_fragments_total_with_retained_locality() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let guard = metrics::set_default_local_recorder(&recorder);
-        let mut telemetry = FragmentTelemetry::start(FragmentLocality::Remote);
-        telemetry.finish(FragmentOutcome::Success, 4_096);
-        drop(guard);
-
-        let snapshot = recorder.snapshot();
-        assert_eq!(
-            snapshot
-                .counters
-                .get("bifrost_oracle_fragments_total{locality=\"remote\",outcome=\"success\"}")
-                .copied(),
-            Some(1),
-            "{snapshot:?}",
-        );
-    }
-
-    /// The `Drop` fallback records a failed terminal fragment when no explicit
-    /// terminal outcome was reported, without double-counting.
-    ///
-    /// Lets a guard drop without calling `finish` and asserts a single
-    /// failure-tagged increment on `bifrost_oracle_fragments_total` for the
-    /// retained locality.
-    #[test]
-    fn drop_without_finish_records_failed_fragment_once() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let guard = metrics::set_default_local_recorder(&recorder);
-        drop(FragmentTelemetry::start(FragmentLocality::Local));
-        drop(guard);
-
-        let snapshot = recorder.snapshot();
-        assert_eq!(
-            snapshot
-                .counters
-                .get("bifrost_oracle_fragments_total{locality=\"local\",outcome=\"failed\"}")
-                .copied(),
-            Some(1),
-            "{snapshot:?}",
-        );
-    }
 
     /// `record_peer_attempt` emits the closed peer-attempt counter with both the
     /// outcome and error-class labels.

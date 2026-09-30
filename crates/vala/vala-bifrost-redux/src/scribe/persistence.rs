@@ -2527,7 +2527,7 @@ mod tests {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: None,
-                    scratch_root: scratch_root.to_owned(),
+                    scratch_root: Some(scratch_root.to_owned()),
                     volume_roots: Some(crate::resources::BifrostVolumeRoots {
                         wal: wal_root.to_owned(),
                         scribe_stage,

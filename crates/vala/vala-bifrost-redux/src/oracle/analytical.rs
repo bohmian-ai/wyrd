@@ -1,15 +1,12 @@
-//! Oracle-owned, production-unreachable distributed analytical execution.
+//! Oracle-owned distributed Analytical execution.
 //!
-//! Bifrost's production query path is Interactive: [`crate::oracle::Oracle`]
-//! plans one physical plan and executes it on the leader, dispatching only leaf
-//! scans to followers. This module owns the *inactive* Analytical alternative —
-//! a full distributed physical plan whose stages execute on followers through
-//! Wyrd's already-authenticated Oracle peer ingress.
+//! An Interactive query executes its physical plan on the leader. A query whose
+//! physical root is distributed is Analytical: this module runs its stages on
+//! followers through Wyrd's already-authenticated Oracle peer ingress.
 //!
-//! Nothing in production routing reaches this module. Its leader entry point is
-//! [`AnalyticalExecutionHandle::lease_session`], reached only through Oracle's
-//! test-support raw-SQL harness, so a query that arrives on the public
-//! HTTP/gRPC/MCP surface still cannot select Analytical execution.
+//! The leader entry point is [`AnalyticalExecutionHandle::lease_session`].
+//! Oracle routes an Analytical-class query there whenever this node composed a
+//! handle, which requires peer mode (a stage authority plus peer mTLS).
 //!
 //! # Why the upstream crate rather than a Wyrd scheduler
 //!
@@ -25,9 +22,9 @@
 //!    [`HeaderMap`], and the same headers reach the worker before any plan is
 //!    decoded.
 //! 2. **Runtime.** [`AnalyticalSessionBuilder`] resolves the *query-owned*
-//!    [`RuntimeEnv`] — the memory pool and spill limit already admitted for
-//!    this query — and installs it on the follower session, replacing the
-//!    worker's process-lifetime runtime.
+//!    [`OracleExecution`] — the runtime, memory pool, and spill limit already
+//!    admitted for this query — and installs it on the follower session,
+//!    replacing the worker's process-lifetime runtime.
 //! 3. **Futures.** Upstream returns its task streams to the caller rather than
 //!    detaching them, so [`AnalyticalSupervisor`] can retain, cancel, and join
 //!    every descendant by exact attempt.
@@ -43,7 +40,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SessionState;
-use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 use datafusion_distributed::SessionStateBuilderExt as _;
@@ -74,18 +70,17 @@ use super::analytical_transport::{
     AnalyticalParticipantCut, AnalyticalStageSigning, StageWireIdentity, read_context,
 };
 use super::dispatcher::{
-    BifrostPeerTls, CommittedGraphActivation, GraphLeaseRequest, PendingGraphActivation,
-    ReservationRegistry,
+    BifrostPeerTls, GraphLeaseRequest, PendingGraphActivation, ReservationRegistry,
 };
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
-use super::spill::OracleSpillRuntime;
 use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
+use crate::resources::OracleExecution;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    AnalyticalGraphRef, FencingToken, QueryClass, QueryId, ReservationId, ReserveNodeSlotsRequest,
+    AnalyticalGraphRef, FencingToken, QueryId, ReservationId, ReserveNodeSlotsRequest,
 };
 
 /// Header carrying the client-visible query identity on every stage operation.
@@ -288,63 +283,6 @@ impl AnalyticalGraphKey {
     }
 }
 
-/// The query-owned execution material a follower must install for one graph.
-///
-/// Every value here is derived from the grant the leader already admitted for
-/// this query. A follower that cannot resolve one of these fails closed rather
-/// than falling back to a process-wide default.
-#[derive(Clone)]
-pub struct AnalyticalGraphRuntime {
-    /// The query's own `RuntimeEnv`: its admitted memory pool and the disk
-    /// manager bounded by its per-query spill limit.
-    ///
-    /// Exchanges allocate from this same pool rather than from a child budget.
-    /// A separate exchange grant would be a second ceiling inside a query that
-    /// already has one, and every byte an exchange holds is already charged to
-    /// the pool installed here.
-    runtime: Arc<RuntimeEnv>,
-    /// The grant-derived session shape every descendant stage must execute in.
-    ///
-    /// A follower receives the leader's *plan*, not the leader's session, so
-    /// without this it would run that plan under `DataFusion`'s own defaults:
-    /// far larger batches than the admitted grant was sized for, held by sort
-    /// merge reservations that cannot spill. The shape is the follower's own,
-    /// derived from the envelope it admitted for this graph.
-    shape: crate::resources::OracleSessionShape,
-}
-
-impl fmt::Debug for AnalyticalGraphRuntime {
-    /// Names the owner without rendering the pool's internal accounting.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AnalyticalGraphRuntime")
-            .finish_non_exhaustive()
-    }
-}
-
-impl AnalyticalGraphRuntime {
-    /// Names the query-owned runtime one graph installs on its descendants.
-    #[must_use]
-    pub const fn new(
-        runtime: Arc<RuntimeEnv>,
-        shape: crate::resources::OracleSessionShape,
-    ) -> Self {
-        Self { runtime, shape }
-    }
-
-    /// Returns the query-owned runtime installed on follower descendants.
-    #[must_use]
-    pub const fn runtime(&self) -> &Arc<RuntimeEnv> {
-        &self.runtime
-    }
-
-    /// Returns the session shape every descendant stage must execute in.
-    #[must_use]
-    pub const fn shape(&self) -> &crate::resources::OracleSessionShape {
-        &self.shape
-    }
-}
-
 /// The node-local map from an authenticated graph identity to its query-owned
 /// execution material.
 ///
@@ -356,7 +294,7 @@ impl AnalyticalGraphRuntime {
 #[derive(Debug, Default)]
 pub struct AnalyticalRuntimeRegistry {
     /// Live graphs and the query-owned material each one installs.
-    entries: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphRuntime>>,
+    entries: Mutex<HashMap<AnalyticalGraphKey, OracleExecution>>,
     /// Reader-epoch guards the graphs' decoded leaves acquired, by graph.
     ///
     /// A guard cannot live in the decoded plan: upstream drops a follower's
@@ -389,7 +327,7 @@ impl AnalyticalRuntimeRegistry {
     pub fn register(
         &self,
         key: AnalyticalGraphKey,
-        runtime: AnalyticalGraphRuntime,
+        runtime: OracleExecution,
     ) -> Result<(), BifrostError> {
         let mut entries = self.entries.lock().map_err(|_| poisoned_registry())?;
         entries.insert(key, runtime);
@@ -403,7 +341,7 @@ impl AnalyticalRuntimeRegistry {
     /// Returns [`BifrostError::QueryExecutionFailed`] when the graph is not
     /// registered — an invalidated attempt, a sibling graph, or a forged
     /// identity — and [`BifrostError::Internal`] on lock poisoning.
-    pub fn resolve(&self, key: AnalyticalGraphKey) -> Result<AnalyticalGraphRuntime, BifrostError> {
+    pub fn resolve(&self, key: AnalyticalGraphKey) -> Result<OracleExecution, BifrostError> {
         let entries = self.entries.lock().map_err(|_| poisoned_registry())?;
         entries
             .get(&key)
@@ -576,10 +514,7 @@ impl AnalyticalSessionBuilder {
     /// Returns [`BifrostError::QueryExecutionFailed`] when either identity
     /// header is absent or malformed, or when the named graph holds no
     /// registered material.
-    pub fn resolve_headers(
-        &self,
-        headers: &HeaderMap,
-    ) -> Result<AnalyticalGraphRuntime, BifrostError> {
+    pub fn resolve_headers(&self, headers: &HeaderMap) -> Result<OracleExecution, BifrostError> {
         self.registry
             .resolve(AnalyticalGraphKey::from_headers(headers)?)
     }
@@ -616,9 +551,7 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
         // too, because a leaf's assignment travels inside the plan and only
         // this codec knows how to rebuild it.
         let mut builder = ctx.builder;
-        let mut config = graph
-            .shape()
-            .apply(builder.config().clone().unwrap_or_default());
+        let mut config = graph.configure(builder.config().clone().unwrap_or_default());
         config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
             self.leaf.clone().for_graph(key, Arc::clone(&self.registry)),
         ));
@@ -1053,8 +986,6 @@ fn node_from_claim(claim: &[u8]) -> Result<NodeId, BifrostError> {
 pub struct GraphLease {
     /// Fixed authority every later message for this graph is checked against.
     binding: GraphLeaseBinding,
-    /// Reservation residue — the running permit — held for the graph's life.
-    activation: CommittedGraphActivation,
     /// Graph this lease is the sole follower-local owner of.
     graph: AnalyticalGraphKey,
     /// Node supervisor holding this graph's admitted envelope.
@@ -1206,7 +1137,7 @@ impl GraphLease {
         }
         tracing::debug!(
             public_query_id = %self.graph.public_query_id,
-            reservation_id = %self.activation.reservation_id().as_uuid(),
+            reservation_id = %self.binding.reservation_id.as_uuid(),
             reservation_expires_at = %self.binding.reservation_expires_at,
             outcome = ?outcome,
             "Oracle analytical follower is settling a graph"
@@ -1390,8 +1321,6 @@ pub struct AnalyticalStageIngressConfig {
     /// reserved on this node, which is what makes a follower's charge for a
     /// distributed plan the one the leader was told it would be.
     pub reservations: Arc<ReservationRegistry>,
-    /// Process spill owner that bounds each query runtime's disk manager.
-    pub spill: Arc<OracleSpillRuntime>,
     /// Capability every Analytical leaf decoded on this node resolves through.
     pub leaf: super::codec::AnalyticalLeafBinding,
     /// Outbound capability a middle stage on this node signs its peers with.
@@ -1426,8 +1355,6 @@ pub struct AnalyticalStageIngress {
     supervisor: Arc<AnalyticalSupervisor>,
     /// Reservation owner this follower activates graph leases from.
     reservations: Arc<ReservationRegistry>,
-    /// Process spill owner that bounds each query runtime's disk manager.
-    spill: Arc<OracleSpillRuntime>,
     /// Capability an Analytical leaf needs to resolve its own source locally.
     ///
     /// Retained rather than consumed once, because every graph builds its own
@@ -1629,7 +1556,6 @@ impl AnalyticalStageIngress {
             authority,
             supervisor,
             reservations,
-            spill,
             leaf,
             egress,
         } = config;
@@ -1660,7 +1586,6 @@ impl AnalyticalStageIngress {
                 authority,
                 supervisor,
                 reservations,
-                spill,
                 leaf,
                 graphs: Mutex::new(HashMap::new()),
                 egress,
@@ -1897,9 +1822,9 @@ impl AnalyticalStageIngress {
     /// Performs every fallible activation step and builds the graph's lease.
     ///
     /// Split out so the failure type carries the reservation back to the caller:
-    /// the runtime build, the retained binding, and the supervisor registration
-    /// are each recoverable, and the activation is only spent when all three
-    /// have succeeded.
+    /// the retained binding and the supervisor registration are each
+    /// recoverable, and the activation is only spent when both have succeeded.
+    /// The graph's runtime is the one its reserved envelope was issued with.
     ///
     /// # Errors
     ///
@@ -1923,28 +1848,13 @@ impl AnalyticalStageIngress {
         if let Err(error) = binding.authorize(authorized) {
             return Err((Box::new(activation), error));
         }
-        let envelope = activation.envelope();
-        let runtime = match self
-            .spill
-            .build_query_runtime(envelope.memory_pool(), envelope.spill_limit_bytes)
-        {
-            Ok(runtime) => AnalyticalGraphRuntime::new(
-                runtime,
-                crate::resources::OracleSessionShape::for_grant(
-                    envelope.granted_memory_bytes,
-                    envelope.target_partitions,
-                    envelope.target_partitions,
-                ),
-            ),
-            Err(error) => return Err((Box::new(activation), error)),
-        };
+        let runtime = activation.envelope().execution().clone();
         let supervisor = Arc::clone(&self.supervisor);
         let registered = runtime.clone();
-        let (committed, guard) = activation
+        let guard = activation
             .commit(move |resources| supervisor.register_graph(graph, resources, registered))?;
         Ok(Arc::new(GraphLease {
             binding,
-            activation: committed,
             graph,
             supervisor: Arc::clone(&self.supervisor),
             egress: Arc::clone(&self.egress),
@@ -3361,15 +3271,6 @@ impl AnalyticalGraphLifecycle {
     }
 }
 
-/// Slot units one distributed graph reserves on each participant.
-///
-/// A graph occupies a participant for the whole plan, not for one leaf, so it
-/// charges the Analytical class's full per-query demand. The receiving node
-/// clamps this to its own running capacity before charging, so a smaller peer
-/// still admits the graph rather than refusing a structurally unschedulable
-/// demand.
-pub(crate) const ANALYTICAL_GRAPH_SLOT_UNITS: u32 = 2;
-
 /// Follower ownership of one graph, held for one open coordinator call.
 ///
 /// Dropping it is the release signal. The release itself is asynchronous — an
@@ -3564,7 +3465,7 @@ pub fn analytical_cleanup_pause_for_test() -> std::sync::Arc<AnalyticalCleanupPa
 #[cfg(test)]
 fn install_graph_runtime(
     builder: datafusion::execution::SessionStateBuilder,
-    graph: &AnalyticalGraphRuntime,
+    graph: &OracleExecution,
 ) -> SessionState {
     builder
         .with_runtime_env(Arc::clone(graph.runtime()))
@@ -3576,13 +3477,9 @@ mod tests {
     use crate::oracle::follower::{FollowerResolutionError, ResolvedFollowerSource};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// One full-grant session shape for fixtures that do not vary the grant.
-    fn fixture_shape() -> crate::resources::OracleSessionShape {
-        crate::resources::OracleSessionShape::for_grant(
-            crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
-            4,
-            4,
-        )
+    /// Names one full-grant execution over `runtime` for fixtures that do not vary the grant.
+    fn fixture_execution(runtime: Arc<RuntimeEnv>) -> OracleExecution {
+        OracleExecution::new(runtime, crate::resources::ORACLE_PARTITION_MEMORY_BYTES, 4)
     }
 
     use crate::resources::{OracleResourceRequest, OracleResources};
@@ -3595,7 +3492,7 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
-    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
     use datafusion::execution::{SendableRecordBatchStream, TaskContext};
     use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, SchedulingType};
@@ -3612,6 +3509,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
 
     use super::*;
+    use wyrd_spec::vala::api::QueryClass;
 
     /// Counts batches only as the *caller* drives the returned stream.
     ///
@@ -3856,7 +3754,7 @@ mod tests {
             DataFusionQueryId::allocate(),
         );
         let query_runtime = query_owned_runtime();
-        let graph = AnalyticalGraphRuntime::new(Arc::clone(&query_runtime), fixture_shape());
+        let graph = fixture_execution(Arc::clone(&query_runtime));
         registry
             .register(key, graph.clone())
             .expect("the authorized graph registers its query-owned material");
@@ -3956,7 +3854,7 @@ mod tests {
     #[test]
     fn analytical_graph_runtime_installation_overrides_the_process_runtime() {
         let query_runtime = query_owned_runtime();
-        let graph = AnalyticalGraphRuntime::new(Arc::clone(&query_runtime), fixture_shape());
+        let graph = fixture_execution(Arc::clone(&query_runtime));
         let state = install_graph_runtime(
             SessionStateBuilder::new()
                 .with_default_features()
@@ -4121,7 +4019,7 @@ mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
-            scratch_root: std::path::PathBuf::new(),
+            scratch_root: None,
             volume_roots: None,
         };
         crate::resources::BifrostRuntimeResources::from_snapshot(snapshot, policy)
@@ -4194,10 +4092,6 @@ mod tests {
         participants: Vec<super::super::peer::StageParticipantV1>,
         /// Absolute deadline every fixture message carries.
         deadline_ms: i64,
-        /// Process spill owner the ingress builds each graph runtime from.
-        spill: Arc<OracleSpillRuntime>,
-        /// Scratch root kept alive for the spill owner.
-        _root: tempfile::TempDir,
     }
 
     impl GraphFixture {
@@ -4205,14 +4099,10 @@ mod tests {
         ///
         /// # Panics
         ///
-        /// Panics when the Oracle role, spill owner, or reservation cannot be
+        /// Panics when the Oracle role or reservation cannot be
         /// composed, which would make every assertion below vacuous.
         fn new(now: DateTime<Utc>) -> Self {
-            Self::compose(
-                now,
-                2 * 1024 * 1024 * 1024,
-                now + chrono::Duration::seconds(60),
-            )
+            Self::with_deadline(now, now + chrono::Duration::seconds(60))
         }
 
         /// Composes the same fixture whose graph carries an exact deadline.
@@ -4222,46 +4112,9 @@ mod tests {
         ///
         /// # Panics
         ///
-        /// Panics when the Oracle role, spill owner, or reservation cannot be
+        /// Panics when the Oracle role or reservation cannot be
         /// composed, which would make every assertion below vacuous.
         fn with_deadline(now: DateTime<Utc>, deadline: DateTime<Utc>) -> Self {
-            Self::compose(now, 2 * 1024 * 1024 * 1024, deadline)
-        }
-
-        /// Composes the same fixture over an exact process spill limit.
-        ///
-        /// A limit below the reserved envelope's scratch share is how a test
-        /// makes the graph runtime build — the first fallible activation step —
-        /// fail for a real reason rather than through an injected seam.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the Oracle role, spill owner, or reservation cannot be
-        /// composed, which would make every assertion below vacuous.
-        fn with_pod_spill_limit(now: DateTime<Utc>, pod_spill_limit_bytes: u64) -> Self {
-            Self::compose(
-                now,
-                pod_spill_limit_bytes,
-                now + chrono::Duration::seconds(60),
-            )
-        }
-
-        /// Composes the fixture over an exact spill limit and graph deadline.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the Oracle role, spill owner, or reservation cannot be
-        /// composed, which would make every assertion below vacuous.
-        fn compose(
-            now: DateTime<Utc>,
-            pod_spill_limit_bytes: u64,
-            deadline: DateTime<Utc>,
-        ) -> Self {
-            let root = tempfile::tempdir().expect("fixture scratch root must exist");
-            let spill = Arc::new(
-                OracleSpillRuntime::new(root.path(), pod_spill_limit_bytes)
-                    .expect("bounded spill owner must be created"),
-            );
             let resolutions = Arc::new(AtomicUsize::new(0));
             let node_id = NodeId::new(Uuid::from_u128(2));
             let fence = 7;
@@ -4276,7 +4129,6 @@ mod tests {
                 authority: Arc::new(VerifyingStageAuthority),
                 supervisor: Arc::clone(&supervisor),
                 reservations: Arc::clone(&reservations),
-                spill: Arc::clone(&spill),
                 leaf: super::super::codec::AnalyticalLeafBinding::new(
                     wyrd_spec::vala::api::ClusterRole::Oracle,
                     Arc::new(CountingSource {
@@ -4305,18 +4157,14 @@ mod tests {
                         query_id: QueryId::new(graph.public_query_id.as_uuid()),
                         leader_node_id,
                         leader_fencing_token: leader_fence,
-                        query_class: QueryClass::Analytical,
-                        slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
                         expires_at: deadline,
-                        graph: Some(AnalyticalGraphRef {
+                        graph: AnalyticalGraphRef {
                             public_query_id: graph.public_query_id.as_uuid(),
                             datafusion_query_id: graph.datafusion_query_id.as_uuid(),
-                        }),
+                        },
                     },
                     now,
-                    Some(super::super::dispatcher::ReservedCapacity::Graph(Box::new(
-                        resources,
-                    ))),
+                    Box::new(resources),
                 )
                 .expect("an idle follower accepts one graph reservation");
             // The cut names the middle-stage participants only. The reserving
@@ -4350,8 +4198,6 @@ mod tests {
                 reservation_id: reservation.reservation_id,
                 participants,
                 deadline_ms: deadline.timestamp_millis(),
-                spill,
-                _root: root,
             }
         }
 
@@ -4386,18 +4232,14 @@ mod tests {
                         query_id: QueryId::new(graph.public_query_id.as_uuid()),
                         leader_node_id: self.leader_node_id,
                         leader_fencing_token: self.leader_fence,
-                        query_class: QueryClass::Analytical,
-                        slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
                         expires_at: deadline,
-                        graph: Some(AnalyticalGraphRef {
+                        graph: AnalyticalGraphRef {
                             public_query_id: graph.public_query_id.as_uuid(),
                             datafusion_query_id: graph.datafusion_query_id.as_uuid(),
-                        }),
+                        },
                     },
                     now,
-                    Some(super::super::dispatcher::ReservedCapacity::Graph(Box::new(
-                        resources,
-                    ))),
+                    Box::new(resources),
                 )
                 .expect("an idle follower accepts a second graph reservation");
             let mut message = self.leader_message(StageOperationV1::ExecuteTask);
@@ -4436,7 +4278,6 @@ mod tests {
                 AnalyticalExecutionOwners {
                     worker: Arc::clone(&self.ingress),
                     supervisor: Arc::clone(&self.supervisor),
-                    spill: Arc::clone(&self.spill),
                     peer_transports,
                 },
                 AnalyticalExecutionConfig {
@@ -4530,16 +4371,14 @@ mod tests {
         }
     }
 
-    /// Builds the minimum-grant session configuration a leader plans with.
+    /// Builds the planning session configuration a leader plans with.
     ///
     /// Production retains the config its physical root was built with, so a
     /// lease test hands `lease_session` the same shape rather than letting the
     /// handle invent one.
     fn min_grant_lease_config() -> datafusion::prelude::SessionConfig {
-        crate::resources::OracleSessionShape::for_grant(
-            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+        crate::resources::OracleSessionShape::planning(
             crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
-            4,
         )
         .session_config()
     }
@@ -4591,7 +4430,7 @@ mod tests {
             ))
             .expect("an idle Oracle admits a second analytical query");
         assert!(
-            !Arc::ptr_eq(pool, &other.memory_pool()),
+            !Arc::ptr_eq(pool, other.execution().memory_pool()),
             "distinct queries never share one DataFusion pool"
         );
     }
@@ -4649,7 +4488,6 @@ mod tests {
         let directory = Arc::new(
             super::super::dispatcher::OraclePeerTransportDirectory::new_for_test(
                 fixture.node_id,
-                Arc::clone(&transport) as Arc<dyn super::super::dispatcher::OraclePeerTransport>,
                 Arc::clone(&transport) as Arc<dyn super::super::dispatcher::OraclePeerTransport>,
             ),
         );
@@ -5259,7 +5097,7 @@ mod tests {
                 0.0,
             ))
             .expect("an idle Oracle admits one analytical query");
-        let pool = resources.memory_pool();
+        let pool = Arc::clone(resources.execution().memory_pool());
         let admitted_once = oracle
             .snapshot()
             .expect("the fixture root reports live ownership");
@@ -5781,13 +5619,13 @@ mod tests {
 
     /// A failed activation publishes nothing and hands the reservation back.
     ///
-    /// Activation is a transaction across three fallible steps — the graph
-    /// runtime, the retained binding, and the supervisor registration — and a
-    /// failure in any of them must leave the follower exactly as it was: no
-    /// published graph, no charged envelope, and the pending reservation
-    /// restored under its own unchanged expiry so a serialized waiter can still
-    /// activate it. Past that expiry the reservation is not resurrected; its
-    /// permit and envelope are released instead.
+    /// Activation is a transaction across two fallible steps — the retained
+    /// binding and the supervisor registration — and a failure in either must
+    /// leave the follower exactly as it was: no published graph, no charged
+    /// envelope, and the pending reservation restored under its own unchanged
+    /// expiry so a serialized waiter can still activate it. Past that expiry
+    /// the reservation is not resurrected; its permit and envelope are released
+    /// instead. A registration refused because the graph is taken drives it.
     ///
     /// # Panics
     ///
@@ -5795,82 +5633,19 @@ mod tests {
     /// reservation before its expiry, or resurrects it after.
     #[tokio::test]
     async fn graph_activation_failure_rolls_back_without_publication() {
-        // A graph runtime that cannot be built inside the process spill limit.
-        let now = Utc::now();
-        let fixture = GraphFixture::with_pod_spill_limit(now, 1);
-        let message = fixture.leader_message(StageOperationV1::SetPlan);
-        assert!(
-            fixture.send(&message, now).await.is_err(),
-            "a graph whose runtime cannot be built is not activated"
-        );
-        assert!(
-            fixture.ingress.published(fixture.graph).is_err(),
-            "a failed activation published no graph"
-        );
-        assert_eq!(
-            fixture.reservations.graph_leases_activated_total(),
-            0,
-            "a failed activation charged no envelope"
-        );
-        assert_eq!(
-            fixture.reservations.cleanup_expired(now),
-            1,
-            "the reservation was restored under its own unchanged expiry"
-        );
-        // The waiter observes no published completion; it simply looks the
-        // restored reservation up again and fails for the same real reason.
-        assert!(
-            fixture
-                .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
-                .await
-                .is_err(),
-            "the restored reservation is still the one a later message finds"
-        );
-        assert_eq!(
-            fixture.reservations.cleanup_expired(now),
-            1,
-            "a second failure did not consume the restored reservation either"
-        );
-
-        graph_rollback_restores_a_reservation_only_before_its_expiry().await;
-    }
-
-    /// Proves a refused registration restores an activatable reservation.
-    ///
-    /// Split from the rollback test only to keep each phase readable; it is the
-    /// second half of the same scenario.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a refused registration publishes a graph, when the restored
-    /// reservation cannot be activated, or when an expired one is resurrected.
-    async fn graph_rollback_restores_a_reservation_only_before_its_expiry() {
         // A supervisor registration that is refused because the graph is taken.
         let now = Utc::now();
         let fixture = GraphFixture::new(now);
+        let occupying = fixture_oracle_role()
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                0.0,
+            ))
+            .expect("an idle Oracle admits one analytical query");
+        let occupying_runtime = occupying.execution().clone();
         let occupied = fixture
             .supervisor
-            .register_graph(
-                fixture.graph,
-                fixture_oracle_role()
-                    .try_acquire_query(OracleResourceRequest::for_class(
-                        QueryClass::Analytical,
-                        0.0,
-                    ))
-                    .expect("an idle Oracle admits one analytical query"),
-                AnalyticalGraphRuntime::new(
-                    fixture
-                        .spill
-                        .build_query_runtime(
-                            Arc::new(
-                                datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
-                            ),
-                            0,
-                        )
-                        .expect("an unbounded fixture runtime builds"),
-                    fixture_shape(),
-                ),
-            )
+            .register_graph(fixture.graph, occupying, occupying_runtime)
             .expect("the fixture supervisor accepts one direct registration");
         assert!(
             fixture
@@ -6170,7 +5945,7 @@ mod tests {
     fn single_slot_analytical_admission() -> Arc<super::super::admission::OracleAdmission> {
         super::super::admission::admission_owner_for_test(
             super::super::admission::OracleAdmissionConfig {
-                analytical_slots: crate::resources::ANALYTICAL_QUERY_SLOT_UNITS,
+                analytical_slots: 1,
                 max_queue_wait: Duration::from_secs(30),
                 ..super::super::admission::OracleAdmissionConfig::default()
             },
@@ -6895,7 +6670,6 @@ mod tests {
             &self,
             _worker: NodeId,
             _request: wyrd_spec::vala::api::ExecuteFragmentRequest,
-            _admitted_grant: Option<super::super::dispatcher::LeaderAdmittedGrant>,
         ) -> Result<
             super::super::dispatcher::WorkerAttemptStream,
             super::super::dispatcher::DispatchError,
@@ -6954,8 +6728,6 @@ mod tests {
                     graph.node_id,
                     Arc::clone(&transport)
                         as Arc<dyn super::super::dispatcher::OraclePeerTransport>,
-                    Arc::clone(&transport)
-                        as Arc<dyn super::super::dispatcher::OraclePeerTransport>,
                 ),
             );
             let remote = [
@@ -6986,17 +6758,10 @@ mod tests {
                     0.0,
                 ))
                 .expect("an idle Oracle admits one analytical query");
-            let runtime = graph
-                .spill
-                .build_query_runtime(resources.memory_pool(), resources.spill_limit_bytes)
-                .expect("the fixture spill owner builds one query runtime");
+            let runtime = resources.execution().clone();
             let graph_guard = graph
                 .supervisor
-                .register_graph(
-                    graph.graph,
-                    resources,
-                    AnalyticalGraphRuntime::new(runtime, fixture_shape()),
-                )
+                .register_graph(graph.graph, resources, runtime)
                 .map_err(|(_, error)| error)
                 .expect("an empty supervisor registers one graph");
             let signals = AnalyticalGraphLifecycle::start(
@@ -7008,13 +6773,11 @@ mod tests {
                     query_id: QueryId::new(graph.graph.public_query_id.as_uuid()),
                     leader_node_id: graph.leader_node_id,
                     leader_fencing_token: graph.leader_fence,
-                    query_class: QueryClass::Analytical,
-                    slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
                     expires_at,
-                    graph: Some(AnalyticalGraphRef {
+                    graph: AnalyticalGraphRef {
                         public_query_id: graph.graph.public_query_id.as_uuid(),
                         datafusion_query_id: graph.graph.datafusion_query_id.as_uuid(),
-                    }),
+                    },
                 },
                 deadline,
                 AnalyticalGraphLifecycleOwners {
@@ -8007,11 +7770,10 @@ pub struct AnalyticalShutdownInspection {
     pub follower: AnalyticalSupervisorInspection,
 }
 
-/// Production-unreachable owner of one node's distributed Analytical execution.
+/// Owner of one node's distributed Analytical execution.
 ///
-/// Nothing in Oracle's routing constructs or calls this owner; it exists so the
-/// distributed path can be proved end to end before it is ever selectable. It
-/// composes the owners that already exist — the follower ingress, the node
+/// Oracle composes it only in peer mode and routes Analytical-class queries to
+/// it. It composes the owners that already exist — the follower ingress, the node
 /// supervisor, the spill owner, and Oracle telemetry — and
 /// adds only the leader-side session and channel composition.
 pub struct AnalyticalExecutionHandle {
@@ -8019,8 +7781,6 @@ pub struct AnalyticalExecutionHandle {
     worker: Arc<AnalyticalStageIngress>,
     /// Node-local supervisor owning leader-side graphs and attempts.
     supervisor: Arc<AnalyticalSupervisor>,
-    /// Process spill owner bounding every query runtime this handle builds.
-    spill: Arc<OracleSpillRuntime>,
     /// Directory this leader reserves each graph participant's envelope through.
     ///
     /// Absent only where no peer transport was composed, which is a node that
@@ -8054,8 +7814,6 @@ pub struct AnalyticalExecutionOwners {
     pub worker: Arc<AnalyticalStageIngress>,
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
     pub supervisor: Arc<AnalyticalSupervisor>,
-    /// Process spill owner that bounds each query runtime's disk manager.
-    pub spill: Arc<OracleSpillRuntime>,
     /// Peer transports the leader reserves participant capacity through.
     pub peer_transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
 }
@@ -8081,13 +7839,11 @@ impl AnalyticalExecutionHandle {
         let AnalyticalExecutionOwners {
             worker,
             supervisor,
-            spill,
             peer_transports,
         } = owners;
         Self {
             worker,
             supervisor,
-            spill,
             peer_transports,
             config,
             leaf,
@@ -8171,8 +7927,7 @@ impl AnalyticalExecutionHandle {
     /// Returns [`BifrostError::QueryAdmissionRejected`] when `admitted` holds
     /// no live envelope to transfer, [`BifrostError::Internal`] when the
     /// supervisor is shutting down or a participant endpoint is not a valid
-    /// URL, and [`BifrostError::QueryExecutionFailed`] when `DataFusion` cannot
-    /// build the bounded query runtime.
+    /// URL.
     pub(super) fn lease_session(
         &self,
         inputs: AnalyticalLeaseInputs<'_>,
@@ -8198,23 +7953,8 @@ impl AnalyticalExecutionHandle {
         let resources = admitted
             .take_query_resources()
             .ok_or(BifrostError::QueryAdmissionRejected)?;
-        let granted_memory_bytes = resources.granted_memory_bytes;
-        let target_partitions = resources.target_partitions;
-        let runtime = self
-            .spill
-            .build_query_runtime(resources.memory_pool(), resources.spill_limit_bytes)?;
-        let graph_guard = match self.supervisor.register_graph(
-            graph,
-            resources,
-            AnalyticalGraphRuntime::new(
-                runtime,
-                crate::resources::OracleSessionShape::for_grant(
-                    granted_memory_bytes,
-                    target_partitions,
-                    target_partitions,
-                ),
-            ),
-        ) {
+        let runtime = resources.execution().clone();
+        let graph_guard = match self.supervisor.register_graph(graph, resources, runtime) {
             Ok(guard) => guard,
             // The refusal hands the envelope straight back rather than
             // consuming it, so it is restored to the same permit it was taken
@@ -8244,13 +7984,11 @@ impl AnalyticalExecutionHandle {
                 query_id: QueryId::new(graph.public_query_id.as_uuid()),
                 leader_node_id: self.config.node_id,
                 leader_fencing_token: self.config.oracle_fence,
-                query_class: QueryClass::Analytical,
-                slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
                 expires_at: cut.deadline(),
-                graph: Some(AnalyticalGraphRef {
+                graph: AnalyticalGraphRef {
                     public_query_id: graph.public_query_id.as_uuid(),
                     datafusion_query_id: graph.datafusion_query_id.as_uuid(),
-                }),
+                },
             },
             deadline,
             AnalyticalGraphLifecycleOwners {
@@ -8396,6 +8134,9 @@ impl AnalyticalExecutionHandle {
             work_units,
         } = inputs;
         let runtime = self.supervisor.graph_runtime(graph)?;
+        // The graph's grant sets only the execution-time sort-merge
+        // reservation; the retained partitions stay exactly as planned.
+        config = runtime.configure(config);
         let identity = Arc::new(AnalyticalCoordinatorIdentity {
             source_node_id: self.config.node_id,
             source_fence: self.config.oracle_fence,

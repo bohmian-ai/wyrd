@@ -6184,12 +6184,10 @@ mod tests {
                     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                     false,
                 ),
-                Field::new("wyrd_row_ordinal", DataType::Int32, false),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
                 Arc::new(TimestampMicrosecondArray::from(vec![event_micros]).with_timezone("UTC")),
-                Arc::new(arrow::array::Int32Array::from(vec![0_i32])),
             ],
         )
         .expect("owner prepared batch")

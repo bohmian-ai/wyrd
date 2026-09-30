@@ -854,3 +854,24 @@ This supersedes this task's row at line 99 that kept `try_acquire_worker` and
   the Interactive floor" now use 2 units (`RETRY_RECEIVER_SLOTS`,
   activation topology). Unit fixtures that saturated the Analytical class with
   one query use `analytical_slots: 1`.
+
+### D11 — the query class is the execution path
+
+User-approved ("consolidate QueryClass and QueryExecutionPath and delete
+query_sql_inactive_analytical"). Oracle installs the distributed planner only
+when it composed the Analytical handle (peer mode), so a `DistributedExec` root,
+and therefore `QueryClass::Analytical`, implies the distributed path runs.
+
+- **Deleted:** `QueryExecutionPath` (spec and proto enum). The terminal field
+  is `query_class: QueryClass` (proto field 8, same numeric values; JSON and
+  MCP key `query_class`). An Analytical class without a handle now fails with
+  `OracleRoleUnavailable` rather than running locally under the wrong class.
+- **Deleted:** `Oracle::query_sql_inactive_analytical` and the `analytical`
+  override threaded through `run_sql_query`, `SqlAttemptInput`, and
+  `ClassifyInput`; journeys call `query_sql`. The attempt identity is derived
+  exactly when the class is Analytical.
+- **Renamed:** the stale "inactive" Analytical vocabulary in Oracle docs and
+  the process-cluster harness (`ExecuteSql`, `StartSql`, `CancelSql`,
+  `AwaitSql`, `lease_analytical_attempt`, `analytical_lifecycle.rs`).
+- **Fixed:** the checked-in `wyrd.v1.bin` descriptor snapshot was stale since
+  the D10 wire change; regenerated (`check:proto-drift`).

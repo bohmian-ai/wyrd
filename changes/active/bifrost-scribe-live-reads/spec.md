@@ -538,9 +538,9 @@ Do not add new persisted state or change write ACK timing.
   only the memory ceiling. The heavy full scan uses
   more than one core, and the standard and heavy benchmarks are re-run with a
   full table. A query's memory limit is half the managed budget whatever the
-  concurrent load; a pod below 4 GiB is refused at boot; a spilling query
-  whose sort input exceeds its limit completes at the 4 GiB floor with spill
-  confined to the governed directory; and a memory refusal names the
+  concurrent load; a pod below 4 GiB is refused at boot; spill stays
+  confined to the governed directory; a query whose memory exceeds its limit
+  fails with typed `QueryResourcesExhausted`; and a memory refusal names the
   requesting consumer and the top holders.
 
 ## Open material decisions
@@ -653,7 +653,10 @@ on 2026-09-28.
   resource error. Approved by the user on 2026-09-30 ("agree on 1 and 2. and
   for 3 the decision is "fail with a typed resource error"). The
   grant-sized sort-merge reservation (`OracleSessionShape::for_grant`) is
-  deleted with it; the reservation is the `DataFusion` default ("delete").
+  deleted with it; the reservation is the `DataFusion` default ("delete"). AC-015
+  no longer requires an over-limit sort to complete; the peer baseline's
+  forced-spill fixture (6 KiB keys, sort-input lower bound, spill counters)
+  is deleted ("delete it"; "i want all invented complexity gone").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

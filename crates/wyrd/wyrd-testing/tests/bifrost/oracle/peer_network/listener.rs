@@ -525,7 +525,7 @@ fn fence_of(report: &NodeReport, node_id: uuid::Uuid) -> Result<u64, PeerJourney
 ///
 /// Interchangeability of the *Analytical coordinator* is proven where it is
 /// observable, by
-/// `peer_network::analytical::baseline_executes_join_group_spill_and_interchangeable_topology`,
+/// `peer_network::analytical::baseline_executes_join_group_sort_and_interchangeable_topology`,
 /// which runs the same physical query on two different Oracles of one cluster
 /// and compares their results. This scenario proves the configuration half:
 /// membership, addressing, listener isolation, and peer reachability.

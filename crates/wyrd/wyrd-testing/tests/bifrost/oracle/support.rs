@@ -432,24 +432,19 @@ pub(crate) const ANALYTICAL_LEFT_ROWS: i64 = 400_000;
 /// Right-table rows in the qualified Analytical baseline workload.
 ///
 /// The join key range that actually matches, and therefore the result's row
-/// count. Sized so the output sort's input exceeds one Analytical grant.
+/// count.
 pub(crate) const ANALYTICAL_RIGHT_ROWS: i64 = 300_000;
 
 /// Digits the baseline query left-pads each id to.
 pub(crate) const ANALYTICAL_KEY_DIGITS: usize = 6;
 
-/// Filler characters appended to each key, making every key exactly 6 KiB.
-pub(crate) const ANALYTICAL_KEY_FILLER: usize = 6138;
-
 /// Builds the qualified Analytical baseline statement over two fixture tables.
 ///
-/// One equi-join, one fixed-width grouped aggregate, and one output sort over a
-/// key wide enough that the sort's input cannot fit an Analytical grant. Shared
-/// by the physical baseline and by the contention qualification that reuses the
-/// same admitted workload, so both are provably running one statement.
+/// One equi-join, one fixed-width grouped aggregate, and one output sort over
+/// the zero-padded id, so string order equals numeric order.
 pub(crate) fn analytical_baseline_sql(left: &str, right: &str) -> String {
     format!(
-        "SELECT LPAD(CAST(l.id AS VARCHAR), {ANALYTICAL_KEY_DIGITS}, '0') ||          REPEAT('x', {ANALYTICAL_KEY_FILLER}) AS filter_key, COUNT(*) AS matched          FROM vala.bifrost.{left} AS l          JOIN vala.bifrost.{right} AS r ON l.id = r.id          GROUP BY l.id ORDER BY filter_key"
+        "SELECT LPAD(CAST(l.id AS VARCHAR), {ANALYTICAL_KEY_DIGITS}, '0') AS filter_key, COUNT(*) AS matched          FROM vala.bifrost.{left} AS l          JOIN vala.bifrost.{right} AS r ON l.id = r.id          GROUP BY l.id ORDER BY filter_key"
     )
 }
 
@@ -461,10 +456,7 @@ pub(crate) fn analytical_baseline_sql(left: &str, right: &str) -> String {
 pub(crate) fn expected_analytical_digest() -> String {
     let mut digest = Sha256::new();
     for id in 0..ANALYTICAL_RIGHT_ROWS {
-        let key = format!(
-            "{id:0ANALYTICAL_KEY_DIGITS$}{filler}",
-            filler = "x".repeat(ANALYTICAL_KEY_FILLER)
-        );
+        let key = format!("{id:0ANALYTICAL_KEY_DIGITS$}");
         digest.update(u32::try_from(key.len()).unwrap_or(u32::MAX).to_le_bytes());
         digest.update(key.as_bytes());
         digest.update(1_i64.to_le_bytes());

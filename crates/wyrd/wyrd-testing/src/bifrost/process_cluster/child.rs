@@ -947,18 +947,14 @@ impl ChildConfig {
 
     /// Runs one statement and collects everything its own pod can observe.
     ///
-    /// The grant is read before the statement runs from the live resource
-    /// plan through the same function admission applies, so it is not a
-    /// restatement of a constant and charges no slot.
-    /// Scratch is measured on both sides of the same statement, and the
-    /// physical evidence is folded by the graph lifecycle before the terminal
-    /// this call awaits, so it is already retained by the time it is read.
+    /// The physical evidence is folded by the graph lifecycle before the
+    /// terminal this call awaits, so it is already retained by the time it is
+    /// read.
     ///
     /// # Errors
     ///
     /// Returns [`ProcessClusterError::Child`] when this target composes no
-    /// Oracle or no Analytical handle, the resource ledger is poisoned, scratch
-    /// cannot be measured, the statement fails, or the
+    /// Oracle or no Analytical handle, the statement fails, or the
     /// statement's graph does not settle inside the bounded wait.
     async fn execute_analytical_baseline(
         &self,
@@ -967,19 +963,6 @@ impl ChildConfig {
     ) -> Result<super::AnalyticalBaselineEvidence, ProcessClusterError> {
         let child = ProcessClusterError::Child;
         let engine = oracle(server)?;
-        let managed_memory_bytes = engine
-            .role_resources()
-            .snapshot()
-            .map_err(|error| child(error.to_string()))?
-            .plan
-            .managed_memory_bytes;
-        let granted_memory_bytes = u64::try_from(
-            vala_bifrost_redux::resources::oracle_query_memory_limit(managed_memory_bytes),
-        )
-        .unwrap_or(u64::MAX);
-        let scratch_root = spill_root(&engine)?.to_path_buf();
-        let scratch_before = scratch_usage(&scratch_root)?;
-
         let supervisor = engine
             .analytical_execution()
             .ok_or_else(|| child("this target composes no Analytical handle".to_owned()))?
@@ -1015,16 +998,11 @@ impl ChildConfig {
             supervisor.settled_graph_count(),
             supervisor.settled_physical_evidence(),
         )?;
-        let scratch_after = scratch_usage(&scratch_root)?;
         Ok(super::AnalyticalBaselineEvidence {
             rows,
             result_digest: fold.digest(),
-            batch_memory_bytes: fold.batch_memory_bytes,
             counts_all_one: fold.counts_all_one,
             keys_strictly_increasing: fold.keys_strictly_increasing,
-            granted_memory_bytes,
-            scratch_before,
-            scratch_after,
             physical,
         })
     }
@@ -1032,15 +1010,12 @@ impl ChildConfig {
 
 /// Folds one ordered `(Utf8, Int64)` result into assertable evidence.
 ///
-/// Accumulated frame by frame rather than over a retained result set: the
-/// baseline's result is a third of a gigabyte of keys, and holding it to
-/// re-walk it later would change the very memory behavior under test.
+/// Accumulated frame by frame rather than over a retained result set, so the
+/// harness never holds a whole result in memory.
 #[derive(Debug)]
 struct ResultFold {
     /// Running digest over every ordered `(key, count)` pair.
     digest: Sha256,
-    /// Summed `RecordBatch::get_array_memory_size` over every accepted batch.
-    batch_memory_bytes: u64,
     /// Whether every count seen so far was exactly one.
     counts_all_one: bool,
     /// Whether keys have increased strictly across every batch boundary.
@@ -1054,7 +1029,6 @@ impl Default for ResultFold {
     fn default() -> Self {
         Self {
             digest: Sha256::new(),
-            batch_memory_bytes: 0,
             counts_all_one: true,
             keys_strictly_increasing: true,
             previous_key: None,
@@ -1065,13 +1039,9 @@ impl Default for ResultFold {
 impl ResultFold {
     /// Accepts one decoded batch, ignoring a batch of any other shape.
     ///
-    /// A statement whose result is not `(Utf8, Int64)` contributes only its
-    /// array memory size, so this fold stays usable by callers that want the
-    /// row count alone.
+    /// A statement whose result is not `(Utf8, Int64)` contributes nothing,
+    /// so this fold stays usable by callers that want the row count alone.
     fn accept(&mut self, batch: &arrow::record_batch::RecordBatch) {
-        self.batch_memory_bytes = self
-            .batch_memory_bytes
-            .saturating_add(batch.get_array_memory_size() as u64);
         // Column access is by position, so the arity check has to come first:
         // a projection with a single column is a shape this fold accepts and
         // ignores, not one it may index past.

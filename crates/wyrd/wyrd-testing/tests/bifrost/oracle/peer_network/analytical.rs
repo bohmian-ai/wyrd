@@ -321,34 +321,21 @@ const INGEST_CHUNK: i64 = 100_000;
 /// it only keeps the published files from being one trivial group.
 const INGEST_GROUPS: i64 = 1_000;
 
-/// Smallest possible in-memory size of the output sort's input, in bytes.
-///
-/// 300,000 keys of 6,144 bytes, plus a 4-byte offset per key and one past the
-/// end, plus one 8-byte count per row. Arrow cannot represent this input in
-/// less, so exceeding the grant is arithmetic rather than an observation.
-const SORT_INPUT_LOWER_BOUND: u64 = 1_843_200_000 + 1_200_004 + 2_400_000;
-
-/// Memory limit the fixed pod envelope grants one Analytical query.
-///
-/// The 4 GiB pod floor less the 1 GiB server minimum leaves a 3 GiB shared
-/// cap, and every query's limit is half of it.
-const QUERY_GRANT_BYTES: u64 = 3 * 1024 * 1024 * 1024 / 2;
-
 /// Counters proving followers exchanged real data rather than empty stages.
 const EXCHANGE_COUNTERS: [&str; 2] = [
     "bifrost_oracle_analytical_exchange_batches_total",
     "bifrost_oracle_analytical_exchange_bytes_total",
 ];
 
-/// A join whose grouped, ordered result cannot fit its grant spills on whichever
-/// Oracle coordinates it, and returns the same rows either way.
+/// A distributed join, grouped aggregate, and output sort returns the same rows
+/// on whichever Oracle coordinates it.
 ///
 /// # Panics
 ///
 /// Panics when the baseline cannot be driven across the process topology.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn baseline_executes_join_group_spill_and_interchangeable_topology() {
+async fn baseline_executes_join_group_sort_and_interchangeable_topology() {
     prove_physical_analytical_baseline()
         .await
         .expect("physical analytical baseline journey");
@@ -463,13 +450,6 @@ async fn coordinate_baseline(
 
     let evidence = cluster.nodes_mut()[coordinator].execute_analytical_baseline(sql)?;
 
-    if evidence.granted_memory_bytes != QUERY_GRANT_BYTES {
-        return Err(format!(
-            "coordinator {coordinator} admits an Analytical query at {} bytes, not {QUERY_GRANT_BYTES}",
-            evidence.granted_memory_bytes
-        )
-        .into());
-    }
     let expected_rows = usize::try_from(RIGHT_ROWS)?;
     if evidence.rows != expected_rows {
         return Err(format!(
@@ -490,22 +470,6 @@ async fn coordinate_baseline(
         )
         .into());
     }
-    if evidence.batch_memory_bytes < SORT_INPUT_LOWER_BOUND {
-        return Err(format!(
-            "coordinator {coordinator} sorted {} bytes, below the arithmetic minimum \
-             {SORT_INPUT_LOWER_BOUND}",
-            evidence.batch_memory_bytes
-        )
-        .into());
-    }
-    if evidence.batch_memory_bytes <= QUERY_GRANT_BYTES {
-        return Err(format!(
-            "coordinator {coordinator} sorted {} bytes, which its {QUERY_GRANT_BYTES}-byte grant \
-             could have held without spilling",
-            evidence.batch_memory_bytes
-        )
-        .into());
-    }
 
     let physical = evidence.physical.ok_or_else(|| {
         PeerJourneyError::from(format!(
@@ -523,13 +487,6 @@ async fn coordinate_baseline(
         return Err(format!(
             "coordinator {coordinator} ordered by {}, not ascending filter_key",
             physical.sort_ordering
-        )
-        .into());
-    }
-    if physical.spill_count == 0 || physical.spilled_bytes == 0 || physical.spilled_rows == 0 {
-        return Err(format!(
-            "coordinator {coordinator} reported no spill: {} spills, {} bytes, {} rows",
-            physical.spill_count, physical.spilled_bytes, physical.spilled_rows
         )
         .into());
     }
@@ -725,8 +682,6 @@ struct QueryStyle {
     ordered: bool,
     /// Whether every grouped count in the result must be exactly one.
     unique_counts: bool,
-    /// Whether the statement's sort input must exceed its grant and spill.
-    spills: bool,
 }
 
 /// Builds the four representative statements over one seeded fixture pair.
@@ -736,10 +691,9 @@ struct QueryStyle {
 /// so each claim below fails if the engine drops, duplicates, or silently
 /// converts a join.
 fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
-    let wide_key = format!(
-        "LPAD(CAST(l.id AS VARCHAR), {digits}, '0') || REPEAT('x', {filler})",
-        digits = crate::support::ANALYTICAL_KEY_DIGITS,
-        filler = crate::support::ANALYTICAL_KEY_FILLER
+    let key = format!(
+        "LPAD(CAST(l.id AS VARCHAR), {digits}, '0')",
+        digits = crate::support::ANALYTICAL_KEY_DIGITS
     );
     vec![
         QueryStyle {
@@ -752,7 +706,6 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             rows: usize::try_from(LEFT_ROWS / INGEST_GROUPS).unwrap_or(usize::MAX),
             ordered: false,
             unique_counts: false,
-            spills: false,
         },
         QueryStyle {
             name: "grouped aggregation",
@@ -763,7 +716,6 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             rows: usize::try_from(INGEST_GROUPS).unwrap_or(usize::MAX),
             ordered: false,
             unique_counts: false,
-            spills: false,
         },
         QueryStyle {
             name: "left equi-join",
@@ -771,7 +723,7 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             // return RIGHT_ROWS here. Only a left join keeps the unmatched ids,
             // and only a correct one keeps each of them exactly once.
             sql: format!(
-                "SELECT {wide_key} AS filter_key, COUNT(*) AS matched \
+                "SELECT {key} AS filter_key, COUNT(*) AS matched \
                  FROM vala.bifrost.{left} AS l \
                  LEFT JOIN vala.bifrost.{right} AS r ON l.id = r.id \
                  GROUP BY l.id ORDER BY filter_key"
@@ -779,19 +731,17 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             rows: usize::try_from(LEFT_ROWS).unwrap_or(usize::MAX),
             ordered: true,
             unique_counts: true,
-            spills: true,
         },
         QueryStyle {
             name: "sort with limit",
             sql: format!(
-                "SELECT {wide_key} AS filter_key, COUNT(*) AS matched \
+                "SELECT {key} AS filter_key, COUNT(*) AS matched \
                  FROM vala.bifrost.{left} AS l \
                  GROUP BY l.id ORDER BY filter_key LIMIT {SORT_LIMIT_ROWS}"
             ),
             rows: SORT_LIMIT_ROWS,
             ordered: true,
             unique_counts: true,
-            spills: false,
         },
     ]
 }
@@ -836,19 +786,10 @@ async fn execute_style(
         return Err(format!("{name} returned unordered keys").into());
     }
 
-    // Only a statement with an output sort carries physical evidence, and only
-    // one whose sort input exceeds its grant may spill. A style that claims
-    // either and produced neither is the failure.
+    // Only a statement with an output sort carries physical evidence. A style
+    // that claims a sort and produced no evidence is the failure.
     match (&evidence.physical, style.ordered) {
-        (Some(physical), true) => {
-            if style.spills && (physical.spill_count == 0 || physical.spilled_rows == 0) {
-                return Err(format!(
-                    "{name} reported no spill: {} spills, {} rows",
-                    physical.spill_count, physical.spilled_rows
-                )
-                .into());
-            }
-        }
+        (Some(_), true) => {}
         (None, true) => {
             return Err(format!("{name} recorded no output-sort evidence").into());
         }

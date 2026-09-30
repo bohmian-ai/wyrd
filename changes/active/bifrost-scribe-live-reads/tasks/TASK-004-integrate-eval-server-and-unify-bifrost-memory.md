@@ -984,3 +984,11 @@ diagnostician):
   owner, and were removed. Passed 3/3 alone. The typed over-limit contract is
   already covered by `memory_failure_is_query_local_and_typed` and
   `memory_refusal_preserves_oracle_health_and_next_query`.
+- **Peer baseline follow-up:** the baseline no longer forces an over-grant
+  sort. Deleted: the 6 KiB key filler, the sort-input lower bound, the
+  grant-equality and spill-counter assertions, `QueryStyle.spills`, and the
+  child's unused `batch_memory_bytes`, `granted_memory_bytes`, and scratch
+  before/after evidence. The test is renamed
+  `baseline_executes_join_group_sort_and_interchangeable_topology`. Spill
+  confinement stays proved by
+  `pg_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill`.

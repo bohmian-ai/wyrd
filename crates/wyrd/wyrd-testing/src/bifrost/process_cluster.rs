@@ -535,11 +535,9 @@ pub enum ControlResponse {
 
 /// Everything one analytical statement leaves observable inside its own pod.
 ///
-/// Assembled by the child around a single production execution: the grant is
-/// read from the live resource plan before the query runs, the scratch
-/// occupancy is measured on both sides of it, the result evidence is folded
-/// from the decoded Arrow frames, and the physical evidence is the executed
-/// plan's own retained metrics.
+/// Assembled by the child around a single production execution: the result
+/// evidence is folded from the decoded Arrow frames, and the physical evidence
+/// is the executed plan's own retained metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticalBaselineEvidence {
     /// Rows the statement produced.
@@ -550,18 +548,10 @@ pub struct AnalyticalBaselineEvidence {
     /// key's UTF-8 bytes, then the count as eight little-endian bytes, so no
     /// two distinct results can collide by re-splitting the same byte run.
     pub result_digest: String,
-    /// Summed `RecordBatch::get_array_memory_size` over every decoded batch.
-    pub batch_memory_bytes: u64,
     /// Whether every row's count column held exactly one.
     pub counts_all_one: bool,
     /// Whether the key column increased strictly across the whole result.
     pub keys_strictly_increasing: bool,
-    /// Memory ceiling the live resource plan grants one Analytical query.
-    pub granted_memory_bytes: u64,
-    /// Process-owned Oracle scratch occupancy before the statement ran.
-    pub scratch_before: ScratchUsage,
-    /// Process-owned Oracle scratch occupancy after its terminal.
-    pub scratch_after: ScratchUsage,
     /// The executed plan's own shape and retained spill counters.
     ///
     /// Absent when the plan carried no uniquely identifiable output sort, which

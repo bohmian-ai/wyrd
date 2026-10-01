@@ -1373,14 +1373,14 @@
           ]
         },
         {
-          "description": "Peer assignment-authority digest mismatch: the recomputed digest over the follower's actual dispatched assignments does not match the digest signed into the ticket claims, so the closed predicate and projection closure cannot be trusted.",
+          "description": "Peer assignment-authority digest mismatch: the recomputed digest over the follower's actual dispatched assignments does not match the digest carried in the peer context claims, so the closed predicate and projection closure cannot be trusted.",
           "type": "string",
           "enum": [
             "peer_assignment_authority"
           ]
         },
         {
-          "description": "Private stage-operation binding mismatch: a signed Analytical stage ticket did not match the receiving follower's own expectation for the operation, either query identity, the pinned snapshot, the stage, the task, the attempt, the reservation, or the authorized permissions, so the operation was refused before any plan decode, task-cache lookup, provider construction, or object I/O.",
+          "description": "Private stage-operation binding mismatch: an Analytical stage context did not match the receiving follower's own expectation for the operation, either query identity, the pinned snapshot, the stage, the task, the attempt, the reservation, or the authorized permissions, so the operation was refused before any plan decode, task-cache lookup, provider construction, or object I/O.",
           "type": "string",
           "enum": [
             "peer_stage_binding"

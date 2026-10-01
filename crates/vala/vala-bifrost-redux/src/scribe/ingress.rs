@@ -2,10 +2,11 @@
 
 use super::ScribeImpl;
 use crate::contracts::{FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame};
-use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
 use crate::scribe::material_plan::{MaterialPlan, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
-use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows, PreparedAppend};
+use crate::scribe::preprocess::{
+    AdmittedAppend, AdmittedRows, NativeAdmittedRows, PreparedAppend, prepare_append,
+};
 use crate::tables::AuditLogTable;
 
 use std::time::Instant;
@@ -465,25 +466,18 @@ impl ScribeImpl {
         )
     }
 
-    /// Preprocess one admitted append on the persistence CPU lane.
+    /// Preprocess one admitted append on the ingress CPU lane.
+    ///
+    /// Preprocessing is pre-ACK request work, so it shares the decode lane
+    /// rather than the persistence lane, where a long staging encode or claim
+    /// merge would hold every write behind it.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when the lane refuses the work or answers with a
-    /// result other than a prepared append.
+    /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated
+    /// and any preprocessing error from [`prepare_append`].
     async fn preprocess(&self, admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
-        match self
-            .persistence_cpu
-            .submit(ScribePersistenceCpuOp::Preprocess(Box::new(admitted)))
-            .await?
-        {
-            ScribePersistenceCpuResult::Prepared(value) => Ok(*value),
-            ScribePersistenceCpuResult::MemberStaged(_)
-            | ScribePersistenceCpuResult::ClaimAssembled(_)
-            | ScribePersistenceCpuResult::ReplayRestored(_) => Err(ScribeError::Internal {
-                detail: "persistence lane returned the wrong preparation result".to_owned(),
-            }),
-        }
+        self.ingress_cpu.run(move || prepare_append(admitted)).await
     }
 
     /// Prepares one request and dispatches its owned packet to its fixed shard.

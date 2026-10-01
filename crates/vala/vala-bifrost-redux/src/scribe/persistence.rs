@@ -1970,8 +1970,7 @@ impl PersistenceWorker {
             .await?
         {
             ScribePersistenceCpuResult::MemberStaged(staged) => *staged,
-            ScribePersistenceCpuResult::Prepared(_)
-            | ScribePersistenceCpuResult::ClaimAssembled(_)
+            ScribePersistenceCpuResult::ClaimAssembled(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
                     detail: "persistence lane returned the wrong staging result".to_owned(),
@@ -2229,8 +2228,7 @@ impl PersistenceWorker {
             .await?
         {
             ScribePersistenceCpuResult::ClaimAssembled(assembled) => *assembled,
-            ScribePersistenceCpuResult::Prepared(_)
-            | ScribePersistenceCpuResult::MemberStaged(_)
+            ScribePersistenceCpuResult::MemberStaged(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
                     detail: "persistence lane returned the wrong assembly result".to_owned(),

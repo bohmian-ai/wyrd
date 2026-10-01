@@ -20,7 +20,6 @@ use crate::resources::ScribeResources;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
 use crate::scribe::replay::ReplayedSealKey;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -282,7 +281,19 @@ impl ScribeIngressCpuPool {
         })?
     }
 
-    #[cfg(test)]
+    /// Runs one pre-ACK CPU job, such as preprocessing an admitted append, on
+    /// this lane.
+    ///
+    /// Request-path work stays here rather than on the persistence lane, so a
+    /// background staging encode or claim merge never queues ahead of a write.
+    /// The job is moved into the worker, so a cancelled caller still leaves the
+    /// job owning whatever memory it carries until it finishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated,
+    /// the job's own error, or [`ScribeError::Internal`] when the worker panics
+    /// or drops its result.
     pub(crate) async fn run<T, F>(&self, job: F) -> Result<T, ScribeError>
     where
         T: Send + 'static,
@@ -1286,7 +1297,6 @@ fn append_managed_columns(
 /// Closed set of CPU work permitted after admission has returned.
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuOp {
-    Preprocess(Box<AdmittedAppend>),
     /// Encode one frozen generation into durable staged runs.
     StageMember(Box<StageMemberOp>),
     /// Merge one claim's staged runs into rolling sealed objects.
@@ -1360,7 +1370,6 @@ pub(crate) struct AssembleClaimOp {
 /// Results produced by [`ScribePersistenceCpuPool`].
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuResult {
-    Prepared(Box<PreparedAppend>),
     ReplayRestored(Box<FrozenMemtable>),
     MemberStaged(Box<crate::scribe::member_stager::StagedRuns>),
     ClaimAssembled(Box<crate::scribe::claim_assembly::AssembledClaim>),
@@ -1378,16 +1387,8 @@ pub(crate) enum ScribePersistenceCpuResult {
 /// test-synchronization error produced by the selected operation.
 fn execute_persistence_operation(
     operation: ScribePersistenceCpuOp,
-    preprocess_delay: std::time::Duration,
 ) -> Result<ScribePersistenceCpuResult, ScribeError> {
     match operation {
-        ScribePersistenceCpuOp::Preprocess(append) => {
-            if !preprocess_delay.is_zero() {
-                std::thread::sleep(preprocess_delay);
-            }
-            prepare_append(*append)
-                .map(|prepared| ScribePersistenceCpuResult::Prepared(Box::new(prepared)))
-        }
         ScribePersistenceCpuOp::StageMember(operation) => stage_member(*operation),
         ScribePersistenceCpuOp::AssembleClaim(operation) => assemble_claim(*operation),
         ScribePersistenceCpuOp::RestoreReplay { replayed } => {
@@ -1495,7 +1496,6 @@ pub struct ScribePersistenceCpuPool {
     failed: Arc<AtomicU64>,
     saturation_events: Arc<AtomicU64>,
     drained: Arc<Notify>,
-    preprocess_delay: std::time::Duration,
     capacity: usize,
 }
 
@@ -1532,20 +1532,6 @@ impl ScribePersistenceCpuPool {
         worker_count: usize,
         capacity: usize,
     ) -> Result<Self, rayon::ThreadPoolBuildError> {
-        Self::with_capacity_and_delay(worker_count, capacity, std::time::Duration::ZERO)
-    }
-
-    /// Builds the bounded persistence pool with an optional test delay.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`rayon::ThreadPoolBuildError`] when Rayon cannot construct the
-    /// configured fixed worker pool.
-    fn with_capacity_and_delay(
-        worker_count: usize,
-        capacity: usize,
-        preprocess_delay: std::time::Duration,
-    ) -> Result<Self, rayon::ThreadPoolBuildError> {
         let capacity = capacity.max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
@@ -1562,7 +1548,6 @@ impl ScribePersistenceCpuPool {
             failed: Arc::new(AtomicU64::new(0)),
             saturation_events: Arc::new(AtomicU64::new(0)),
             drained: Arc::new(Notify::new()),
-            preprocess_delay,
             capacity,
         })
     }
@@ -1613,7 +1598,6 @@ impl ScribePersistenceCpuPool {
         let panics = Arc::clone(&self.panics);
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
-        let delay = self.preprocess_delay;
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("persistence");
@@ -1623,7 +1607,7 @@ impl ScribePersistenceCpuPool {
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("persistence");
             let result = catch_unwind(AssertUnwindSafe(|| {
-                execute_persistence_operation(operation, delay)
+                execute_persistence_operation(operation)
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);

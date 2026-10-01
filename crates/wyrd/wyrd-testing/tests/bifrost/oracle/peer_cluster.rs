@@ -216,7 +216,7 @@ impl PeerCluster {
     }
 
     /// Returns the seeded data tenant every fixture table belongs to.
-    fn tenant(&self) -> DataTenantId {
+    pub(crate) fn tenant(&self) -> DataTenantId {
         self.cluster.data_tenant_id()
     }
 

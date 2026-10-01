@@ -110,6 +110,8 @@ wiremock = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# The peer-context journey encodes a Scribe fragment exactly as a leader does.
+datafusion-proto = { workspace = true }
 # The continuous Eval journey builds its native judge Prompt and points the
 # production judge at a local OpenAI-compatible provider.
 skald-prompt = { workspace = true }

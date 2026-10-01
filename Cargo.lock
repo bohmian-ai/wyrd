@@ -11905,6 +11905,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "datafusion-proto",
  "ed25519-dalek",
  "futures-util",
  "hdrhistogram",

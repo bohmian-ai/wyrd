@@ -1,10 +1,26 @@
 //! Peer receiver context checks on the mTLS-only private plane.
 
+use std::sync::Arc;
+
+use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::oracle::assignment_schema_fingerprint;
+use vala_bifrost_redux::oracle::codec::{
+    OraclePhysicalExtensionCodec, RemoteSourcePlaceholderExec, physical_plan_fingerprint,
+};
+use vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION;
 use vala_bifrost_redux::oracle::peer::{
-    ReservationBinding, ReservationOperationV1, reservation_body_digest,
+    PeerTicketClaims, ReservationBinding, ReservationOperationV1,
+    assignment_authority_digest_for, reservation_body_digest,
 };
 use wyrd_server::config::BifrostTarget;
-use wyrd_spec::vala::api::NodeId;
+use wyrd_spec::vala::api::{
+    ClusterRole, ExecuteFragmentRequest, FollowerReaderCut, FollowerScanAssignment, NodeId,
+    OracleRoleFence, PeerContext, PersistedFileAssignment, ReservationId, ScribeProviderCut,
+    TenantTableBinding,
+};
+use wyrd_tonic::tonic;
 use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
@@ -53,6 +69,7 @@ async fn prove_peer_context_refusals() -> Result<(), PeerJourneyError> {
     the_correct_context_is_accepted(&cluster, &plane).await?;
     every_bound_identity_must_match(&cluster, &plane).await?;
     worker_discovery_is_always_refused(&cluster, &plane).await?;
+    a_foreign_tenant_context_reads_no_scribe_rows(&cluster, &plane).await?;
 
     cluster.shutdown().await?;
     Ok(())
@@ -286,6 +303,216 @@ async fn every_bound_identity_must_match(
         return Err(format!("a substituted request body was answered with {outcome}").into());
     }
     Ok(())
+}
+
+/// Scribe pod in [`prove_peer_context_refusals`]'s topology.
+const SCRIBE_POD: usize = 2;
+
+/// A Scribe fragment whose context names another tenant reads nothing.
+///
+/// The leader's context is unsigned, so the receiver's comparison of the
+/// context tenant with the tenant of every assignment it received is the only
+/// thing keeping one tenant's hot tail away from another. The same live
+/// fragment is sent twice over the Scribe's real peer listener: once with the
+/// correct context, which executes, and once with only the context tenant
+/// changed, which must be refused before the fragment executes or a row is
+/// streamed.
+///
+/// # Errors
+///
+/// Returns a message when the correct fragment does not execute, or the
+/// foreign-tenant fragment is answered or executes.
+async fn a_foreign_tenant_context_reads_no_scribe_rows(
+    cluster: &PeerCluster,
+    plane: &ReservationPlane,
+) -> Result<(), PeerJourneyError> {
+    let fragment = ScribeFragment::live(cluster, plane, "peer_tenant_probe").await?;
+    let mut client = OraclePeerServiceClient::new(
+        PeerDial::member(cluster.peer_ca(), cluster.peer_addr(SCRIBE_POD)?)
+            .connect()
+            .await?,
+    );
+
+    let before = cluster.scribe_fragments(SCRIBE_POD)?;
+    let mut accepted = client
+        .execute_fragment(fragment.request(cluster.tenant().as_uuid())?)
+        .await
+        .map_err(|status| format!("a correct Scribe fragment was refused with {status}"))?
+        .into_inner();
+    let mut frames = 0_usize;
+    while let Some(frame) = accepted.message().await? {
+        drop(frame);
+        frames += 1;
+    }
+    if frames == 0 || cluster.scribe_fragments(SCRIBE_POD)? != before + 1 {
+        return Err("a correct Scribe fragment did not execute".into());
+    }
+
+    let before = cluster.scribe_fragments(SCRIBE_POD)?;
+    match client
+        .execute_fragment(fragment.request(uuid::Uuid::now_v7())?)
+        .await
+    {
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {}
+        Err(status) => {
+            return Err(format!("a foreign-tenant fragment failed with {status}").into());
+        }
+        Ok(_) => return Err("a foreign-tenant fragment opened a row stream".into()),
+    }
+    if cluster.scribe_fragments(SCRIBE_POD)? != before {
+        return Err("a foreign-tenant fragment executed on the Scribe".into());
+    }
+    Ok(())
+}
+
+/// One live Scribe fragment built exactly as an Oracle leader builds it.
+struct ScribeFragment {
+    /// The fragment's single hot-provider assignment, owned by the real tenant.
+    assignment: FollowerScanAssignment,
+    /// Encoded placeholder plan the Scribe decodes.
+    plan: Vec<u8>,
+    /// Fingerprint of `plan`, bound by the context and the footer.
+    fingerprint: String,
+    /// Leader Oracle incarnation the fragment claims to come from.
+    leader: OracleRoleFence,
+    /// Scribe incarnation serving the live stream.
+    target: OracleRoleFence,
+}
+
+impl ScribeFragment {
+    /// Registers `table`, leaves rows live on the Scribe, and builds the
+    /// fragment for the one partition the Scribe reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the table cannot be written, the Scribe reports
+    /// no live partition, or the plan cannot be encoded.
+    async fn live(
+        cluster: &PeerCluster,
+        plane: &ReservationPlane,
+        table: &str,
+    ) -> Result<Self, PeerJourneyError> {
+        cluster.register_table(SCRIBE_POD, table).await?;
+        cluster.ingest_live_rows(SCRIBE_POD, table, 0, 8, 2).await?;
+        let state = cluster.server(SCRIBE_POD)?.state();
+        let catalog = state
+            .bifrost_catalog()
+            .ok_or("the Scribe pod composes no catalog")?;
+        let scribe = state
+            .bifrost_ingest()
+            .ok_or("the Scribe pod composes no Scribe")?;
+        let tenant = cluster.tenant();
+        let table_ref = TableRef::new(BifrostNamespace::Bifrost, table);
+        let binding = TenantTableBinding {
+            tenant_id: tenant,
+            namespace: "bifrost".to_owned(),
+            table: table.to_owned(),
+        };
+        let (partition, stream) = scribe
+            .tail_service()
+            .list_active_streams(&binding)?
+            .into_iter()
+            .next()
+            .ok_or("the Scribe reports no live partition")?;
+        let schema = catalog.assignment_schema(&table_ref, tenant).await?;
+        let schema_fingerprint = assignment_schema_fingerprint(&schema);
+        let projected = Arc::new(schema.project(&[schema.index_of("id")?])?);
+        let scan_id = format!(
+            "oracle:bifrost.{table}:scribe:{}:{}:live",
+            stream.node_id.as_uuid(),
+            stream.writer_epoch
+        );
+        let plan = physical_plan_to_bytes_with_extension_codec(
+            Arc::new(RemoteSourcePlaceholderExec::new(
+                scan_id.clone(),
+                schema_fingerprint.clone(),
+                projected,
+            )),
+            &OraclePhysicalExtensionCodec::encoder(),
+        )?
+        .to_vec();
+        let table_uid = catalog.table_uid(&table_ref, tenant).await?;
+        Ok(Self {
+            fingerprint: physical_plan_fingerprint(&plan),
+            plan,
+            assignment: FollowerScanAssignment {
+                reader_cut: FollowerReaderCut::no_snapshot(
+                    uuid::Uuid::from_bytes(*table_uid.as_bytes()),
+                    stream.writer_epoch,
+                ),
+                scan_id,
+                binding,
+                persisted: PersistedFileAssignment { files: Vec::new() },
+                scribe_provider_cut: Some(ScribeProviderCut {
+                    writer_epoch: stream.writer_epoch,
+                    start_partition: partition,
+                    end_partition: partition,
+                }),
+                schema_fingerprint,
+                required_columns: vec!["id".to_owned()],
+                predicates: Vec::new(),
+            },
+            leader: OracleRoleFence {
+                node_id: NodeId::new(plane.leader_node_id),
+                role: ClusterRole::Oracle,
+                fencing_token: plane.leader_fence,
+            },
+            target: OracleRoleFence {
+                node_id: stream.node_id,
+                role: ClusterRole::Scribe,
+                fencing_token: stream.writer_epoch,
+            },
+        })
+    }
+
+    /// Encodes the fragment with a context naming `context_tenant`.
+    ///
+    /// Every other claim is the leader's own, so a refusal is attributable to
+    /// the tenant alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the assignment-authority digest failure unchanged.
+    fn request(
+        &self,
+        context_tenant: uuid::Uuid,
+    ) -> Result<proto::ExecuteFragmentRequest, PeerJourneyError> {
+        let assignments = vec![self.assignment.clone()];
+        let deadline = (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis();
+        let claims = PeerTicketClaims {
+            protocol_version: PEER_PROTOCOL_VERSION,
+            audience: self.target.node_id.as_uuid().as_bytes().to_vec(),
+            worker_fence: self.target.fencing_token,
+            leader_node_id: self.leader.node_id.as_uuid().as_bytes().to_vec(),
+            leader_fence: self.leader.fencing_token,
+            query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            tenant_id: context_tenant.as_bytes().to_vec(),
+            expires_at_ms: deadline,
+            execution_deadline_unix_ms: deadline,
+            binding: format!(
+                "{}.{}",
+                self.assignment.binding.namespace, self.assignment.binding.table
+            ),
+            fragment_digest: self.fingerprint.clone(),
+            manifest_digest: self.fingerprint.clone(),
+            projection_digest: self.fingerprint.clone(),
+            permission_digest: "journey-permissions".to_owned(),
+            assignment_authority_digest: assignment_authority_digest_for(&assignments)
+                .map_err(|error| format!("assignment-authority digest: {error:?}"))?,
+        };
+        Ok(ExecuteFragmentRequest {
+            context: PeerContext {
+                claims_bytes: claims.encode_to_vec(),
+            },
+            physical_plan_bytes: self.plan.clone(),
+            reservation_id: ReservationId::new(uuid::Uuid::nil()),
+            leader_fence: self.leader.clone(),
+            target_fence: self.target.clone(),
+            assignments,
+            plan_fingerprint: self.fingerprint.clone(),
+        }
+        .into())
+    }
 }
 
 /// One claims-level change applied after an otherwise correct context is built.

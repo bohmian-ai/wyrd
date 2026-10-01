@@ -1173,3 +1173,11 @@ Status words: **replayed** (source behavior carried onto current Bifrost seams),
 | 15 owning structs | `OracleAuditWriter`, `ScribeWalFaultMonitor` | `mise run lints` | PASS |
 | 16 rustdoc | listed items | `mise run lints` | PASS |
 | 17 script task reference | `scripts/server/test-kind-autoscale.sh` | `rg TASK- scripts/server` is empty | PASS |
+
+### Diagnosis: intermittent "the Scribe reports no live partition" (peer_context_refusals)
+
+- **Symptom:** `mise run test:server:peer` sometimes failed in `a_foreign_tenant_context_reads_no_scribe_rows` because `list_active_streams` returned no partition right after an acknowledged `ingest_live_rows`.
+- **Evidence:** `ShardOwner::run` calls `publish_snapshot` only after `process_group` returns, and `process_group` acknowledges the write in `acknowledge_visible` before it returns. `ScribeShardRuntime::active_seal_keys_for_table` read those published snapshots. The row read path (`ScribeShardRuntime::snapshot`) reads memtables directly.
+- **Cause:** partition discovery read a copy that is republished only after the acknowledgement. A listing between the acknowledgement and the republish missed an acknowledged write, so a query issued in that window silently missed acknowledged rows.
+- **Fix site:** `active_seal_keys_for_table` now reads each shard memtable through `Memtable::seal_keys_for_table`, the same method the single-memtable branch of `active_partitions_for_table` uses. Its only caller is `active_partitions_for_table`, which serves both `list_active_streams` and the in-process live planner.
+- **Verification:** `vala-bifrost-redux` lib `tail_rpc|live_tail|shards::` (54/54, Postgres wrapper); `mise run test:server:peer` (11/11); `mise run fmt`; `mise run lints`.

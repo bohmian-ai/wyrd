@@ -865,28 +865,24 @@ pub(crate) struct ScribeShardStartConfig {
 impl ScribeShardRuntime {
     /// Returns every writable or pending immutable seal key for one tenant table.
     ///
-    /// The result is assembled from owner-published snapshots, so discovery
-    /// never traverses another shard's mutable state and remains safe for the
-    /// private list-active-streams RPC. Only `table`'s keys are collected; the
-    /// caller deduplicates.
+    /// Reads each shard's memtable directly, as [`Self::snapshot`] does for
+    /// rows. An owner inserts rows before it acknowledges them but republishes
+    /// its inspection snapshot only afterwards, so discovery from published
+    /// snapshots could omit the partition of an already acknowledged write.
+    /// Only `table`'s keys are collected; the caller deduplicates.
     ///
     /// # Errors
-    /// Returns [`ScribeError::Internal`] when an owner inspection snapshot is
-    /// poisoned or unavailable.
+    /// Returns [`ScribeError::Internal`] when a memtable lock is poisoned.
     pub(crate) fn active_seal_keys_for_table(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
     ) -> Result<Vec<crate::scribe::seal_key::SealKey>, ScribeError> {
-        Ok(self
-            .memtable_snapshots()?
-            .into_iter()
-            .flat_map(|snapshot| snapshot.bucket_memory)
-            .filter_map(|bucket| {
-                (bucket.seal_key.tenant == tenant && bucket.seal_key.table == *table)
-                    .then_some(bucket.seal_key)
-            })
-            .collect())
+        let mut keys = Vec::new();
+        for memtable in &self.memtables {
+            keys.extend(memtable.seal_keys_for_table(tenant, table)?);
+        }
+        Ok(keys)
     }
 
     /// Closes shard admission before any potentially stalled graceful wait.

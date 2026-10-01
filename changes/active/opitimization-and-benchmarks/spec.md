@@ -1,6 +1,6 @@
 ---
 id: SPEC-opitimization-and-benchmarks
-revision: 4
+revision: 5
 status: draft
 ---
 
@@ -17,10 +17,12 @@ Bifrost is both an analytical store and an observability store, so this
 change measures it in both roles. It does three things:
 
 1. It reproduces the ClickHouse benchmark (ClickBench) in full against the real
-   production `wyrd-server`, on the same machine type ClickBench uses. The
-   results are written in ClickBench's own result format and compared with
-   ClickHouse's already-published ClickBench results. We do not run
-   ClickHouse.
+   production `wyrd-server`, on the owner's local machine inside an
+   8-CPU/16-GiB envelope. The results are written in ClickBench's own result
+   format with a full description of the environment. For internal analysis
+   only, they are compared with ClickHouse's already-published ClickBench
+   results. We do not run ClickHouse, and we publish only Bifrost's numbers
+   against its own declared setup.
 2. It adds an observability benchmark that ClickBench does not cover: ingest
    rate per core (rows/s and MB/s), compression ratio, and query latency over
    fixed time windows on logs, traces, and metrics. This benchmark measures
@@ -108,20 +110,24 @@ documented, like ClickHouse's `ORDER BY`. The harness records the full
 registration request. Every query passes through normal authentication,
 authorization, admission, and read audit.
 
-**REQ-004 — Same machine as the published results.** The run declares its
-hardware. AC judgment runs on the ClickBench reference machine, an AWS
-c6a.4xlarge (16 vCPU, 32 GiB) with a 500 GB gp2 disk, with Bifrost (server
-plus its Postgres catalog) alone on it. Runs on other hardware, such as a
-16-vCPU/32-GiB systemd envelope on a larger local host, are for iteration only
-and never judge an AC, because the published numbers came from the reference
-machine. The output records the instance type, CPU model, storage device,
-filesystem, kernel, and any enforced limits.
+**REQ-004 — Benchmark machine and environment description.** Every run uses
+the owner's local host, with Bifrost (server plus its Postgres catalog)
+confined to an 8-CPU/16-GiB systemd scope, the same envelope as the internal
+capacity benchmark. Every result carries an environment description: CPU
+model and the CPUs the scope allows, enforced memory limit, storage device and
+filesystem, kernel, `wyrd-server` version and commit, dataset version, and
+the ClickBench commit. Published Bifrost numbers are always stated against
+this description.
 
-**REQ-005 — Published ClickHouse reference.** The reference is the ClickHouse
+**REQ-005 — Published ClickHouse reference (internal only).** The reference
+for internal analysis is the ClickHouse
 result JSON for c6a.4xlarge in the pinned ClickBench commit (the
 self-managed `clickhouse` entry). It supplies ClickHouse's load time, data
 size, and three runs per query. Bifrost's cold and hot times are derived from
 its own three runs exactly as ClickBench derives them from the published ones.
+The published run used a c6a.4xlarge (16 vCPU, 32 GiB, gp2 disk), not this
+machine, so the comparison is a rough internal yardstick, not an
+apples-to-apples result, and the report says so.
 
 **REQ-006 — ClickBench metrics and output.** Every Bifrost run produces:
 
@@ -132,13 +138,13 @@ its own three runs exactly as ClickBench derives them from the published ones.
   `(t_bifrost + 0.01 s) / (t_clickhouse + 0.01 s)`. The score is the geometric
   mean of those ratios, computed separately for cold and hot. Load time and
   data size get their own ratios. The ACs use this direct
-  Bifrost/ClickHouse ratio. The report also places Bifrost in the published
-  c6a.4xlarge ranking of the pinned commit, scored the way ClickBench scores
-  it (against the best published system per query).
+  Bifrost/ClickHouse ratio. These ratios live in an internal report only.
 
 The output is a result JSON in the pinned ClickBench schema (`system`, `date`,
 `machine`, `cluster_size`, `tags`, `load_time`, `data_size`, `result`),
-plus a human-readable report with the ratios and pass/fail per AC.
+carrying the REQ-004 environment description in `machine` and `tags`. That
+file holds Bifrost's numbers only and is the publishable artifact. A separate
+internal report holds the ClickHouse ratios and pass/fail per AC.
 It also includes the server log and a `/metrics` snapshot. A failed, rejected,
 or timed-out query is reported as `null`, as ClickBench does, and fails the run.
 
@@ -293,6 +299,9 @@ These hold whatever the architecture documents say:
 - Distributed or multi-node ClickBench runs. Only the single-node result
   counts.
 - Running ClickHouse. Comparison uses its published results only.
+- Publishing any Bifrost-versus-ClickHouse comparison. Only Bifrost's numbers
+  against its declared environment are published.
+- Matching ClickBench's reference hardware.
 - Submitting results upstream to the ClickBench repository. Producing
   submittable output is in scope; submitting it is not.
 - Making the benchmark a CI gate.
@@ -301,9 +310,10 @@ These hold whatever the architecture documents say:
 
 ## Expensive-to-reverse decisions fixed here
 
-- ClickBench ratios are judged against ClickHouse's published c6a.4xlarge
-  results, with Bifrost run on the same machine type. ClickHouse is never run
-  (REQ-004, REQ-005). The observability benchmark uses absolute targets.
+- Bifrost runs on the owner's machine in an 8-CPU/16-GiB envelope. ClickBench
+  ratios compare it with ClickHouse's published c6a.4xlarge results for
+  internal analysis only; ClickHouse is never run (REQ-004, REQ-005). The
+  observability benchmark uses absolute targets.
 - The benchmark uses only the public, default-configured server and public
   client surfaces (REQ-003, REQ-012).
 - Load time includes publication. Data size counts the published table
@@ -315,9 +325,10 @@ These hold whatever the architecture documents say:
 
 ## Acceptance criteria
 
-AC-2 to AC-6 are Bifrost on c6a.4xlarge divided by ClickHouse's published
-c6a.4xlarge results, using the ClickBench `+0.01 s` scoring. AC-8 to AC-12
-are absolute targets on Bifrost, on the same machine. The proposed targets need owner
+AC-2 to AC-6 are Bifrost in the 8-CPU/16-GiB envelope divided by ClickHouse's
+published c6a.4xlarge results, using the ClickBench `+0.01 s` scoring. They
+are internal targets. AC-8 to AC-12 are absolute targets on Bifrost in the
+same envelope. The proposed targets need owner
 confirmation (D-1).
 
 | ID | Criterion | Proposed target |
@@ -357,13 +368,11 @@ default.
    the leading Parquet-based engines on ClickBench. The cold target is looser because
    Iceberg and object-store metadata cost the most on a cold start. The AC-8 to
    AC-12 absolute targets are starting proposals for an observability store on
-   one 16-vCPU node; confirm or change each.
-2. **D-2 — Reference machine.** AC judgment needs an AWS c6a.4xlarge with a
-   500 GB gp2 disk (REQ-004). Decide how it is provisioned (owner-rented
-   instance or a CI runner of that type). Recommended: an owner-rented
-   instance for each AC-judging run, with the local 16-vCPU/32-GiB envelope for
-   day-to-day iteration. The local host's faster CPU and NVMe flatter Bifrost,
-   so local numbers never count.
+   one 8-CPU/16-GiB node; confirm or change each. The ClickBench ratios
+   compare an 8-CPU Bifrost with a 16-vCPU ClickHouse, so they are harder to
+   meet than on equal hardware.
+2. **D-2 — Machine (decided, revision 5).** The owner's local machine in an
+   8-CPU/16-GiB envelope, described in every result (REQ-004).
 3. **D-3 — Reference answers.** ClickBench publishes no query answers. Choose
    how the committed answer file (REQ-002) is produced: (a) from Bifrost's
    first complete run, hand-checked against facts known about `hits` (total
@@ -448,6 +457,12 @@ default.
   uses a committed reference answer file (REQ-002, D-3). The report places
   Bifrost in the published ranking. Draft; awaiting owner decisions D-1 to
   D-13.
+- Revision 5 (2026-10-01): Owner decisions. Benchmarks run on the owner's
+  machine in an 8-CPU/16-GiB envelope with a full environment description
+  (REQ-004, D-2 decided). The ClickHouse comparison is internal analysis only
+  and drops the published-ranking placement; only Bifrost's numbers against
+  its declared setup are published. Draft; awaiting owner decisions D-1 and
+  D-3 to D-13.
 
 ## Authority and context
 

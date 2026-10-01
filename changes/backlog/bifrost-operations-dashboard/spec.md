@@ -15,7 +15,7 @@ fail. The same health facts are available as one machine-readable call so an
 agent or script does not scrape and interpret Prometheus text.
 
 The dashboard reads the measurement contract fixed by
-`changes/active/bifrost-scribe-live-reads` TASK-005 (the six operator
+`changes/completed/2026/bifrost-scribe-live-reads.md` (the six operator
 questions and their production families). It does not create new telemetry,
 a metrics store, or a dashboard builder. This backlog draft does not authorize
 implementation.
@@ -217,7 +217,7 @@ None. This draft is ready for approval review.
 - `architecture/wyrd-design.md` — two administration planes; `Source` is a
   tenant read reference.
 - `architecture/bifrost-design.md` — Telemetry and Measurement meanings.
-- `changes/active/bifrost-scribe-live-reads/tasks/TASK-005-simplify-bifrost-telemetry.md`
+- `changes/completed/2026/bifrost-scribe-live-reads.md`
   — operator questions and dashboard measurement contract.
 - `changes/active/wyrd-ui-foundation/spec.md` — tenant navigation and route
   rules this console must stay outside of.

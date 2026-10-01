@@ -4303,6 +4303,17 @@ async fn token_calls(server: &wiremock::MockServer) -> usize {
         .count()
 }
 
+/// One issuer-binding callback case: its label, the provider's discovery
+/// document, extra provider response parameters, the `iss` sent (if any), and
+/// whether the login must complete.
+type IssuerCase<'a> = (
+    &'a str,
+    &'a Value,
+    &'a [(&'a str, &'a str)],
+    Option<&'a str>,
+    bool,
+);
+
 /// The common callback binds every authorization response to the issuer its
 /// login state recorded (RFC 9207), provider-agnostically:
 ///   1. a provider whose discovery does not advertise
@@ -4383,8 +4394,7 @@ async fn tenant_callback_issuer_binding_journey() {
         .expect("denied exchanges read")
     };
     let wrong_slash = format!("{issuer}/");
-    // (label, discovery, extra params, iss, completes)
-    let cases: Vec<(&str, &Value, &[(&str, &str)], Option<&str>, bool)> = vec![
+    let cases: Vec<IssuerCase> = vec![
         ("unadvertised, no iss", &silent, &[], None, true),
         ("unadvertised, exact iss", &silent, &[], Some(&issuer), true),
         (

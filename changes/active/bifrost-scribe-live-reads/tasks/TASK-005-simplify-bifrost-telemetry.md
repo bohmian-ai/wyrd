@@ -396,3 +396,102 @@ after a restart.
 - [Bifrost telemetry architecture](../../../../architecture/bifrost-design.md).
 - [Repository rules](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md),
   [testing workflows](../../../../architecture/references/languages/testing-workflows.md).
+
+## Implementation Evidence
+
+Status: `IMPLEMENTED`. Commits on `vcc/task-004`: `6ec15730c` (Scribe),
+`2abefa64d` and `c57398a49` (Gate/Oracle), `68ee0244c` (shared storage),
+`04e2ab499` (Forge), `0abb76304` (single failure event per write trace).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+| --- | --- | --- | --- |
+| 1. Write, local/remote query, and Forge traces read in order; one terminal outcome; failure reason once | `bifrost.gate.write` root; `bifrost.gate.query.stream` → `bifrost.gate.query` → `bifrost.oracle.query` → `bifrost.oracle.stream`/`bifrost.oracle.peer.fragment{role,outcome}` (`oracle/query_stream.rs`, `oracle/dispatcher.rs`, DataFusion `JoinSetTracer` in `oracle/telemetry.rs`); catalog commits nest under `bifrost.forge.task.execute`; `IngestError::report_internal_at_edge` replaces the mapping-time log | `telemetry::scribe_hot_path_telemetry_reconciles` (one WARN/ERROR per failed write *trace*), `published::…` phase 1b, `peer_network::analytical::remote_live_scribe_drop_releases_query`, `live_rewrite::forge_promoted_files_rewrite_and_remain_exact_across_recovery` 3b/3d | PASS |
+| 2. Metrics report owner facts; shadow, zero-only, duplicate families removed; Forge 17-family catalog and HPA metric kept; Degraded ≠ Success; waiting ≠ active; replay not new rows; restored staging in backlog | Scribe mirrors/registry removed, `memtable_rows_inserted_total` at insertion, staging gauges from `StagingAssembler`, `lane_queued` waiting-only; Oracle zero-only families and phase duplicates removed, `degraded` outcome, active gauge after admission; storage ledger removed (`storage/telemetry.rs` stateless); Forge `metrics.rs` unchanged | Scenario 1 three commands; `write_read::scribe_undialable_private_peer_degrades_live_coverage` (degraded=1, success=0); `capacity::saturated_query_waits_on_http_and_grpc` (queued=2 vs active from Oracle runtime); `forge::metrics::tests::forge_telemetry_is_closed_bounded_and_balanced` | PASS |
+| 3. No telemetry ledger, pruning walk, or telemetry-only settlement read decides or delays work | `MetadataCacheSnapshot`, Scribe ingress mirror, `FilePruningSource` per-file loop deleted; Forge `record_task_execution_telemetry` takes the committed `ForgeTaskResult` | Storage unit lane (20/20), `forge::` lib lane (86), Forge journey | PASS |
+| 4. Existing write, query, Forge journeys keep results | No ACK, WAL, Iceberg, admission, terminal, tenant, settlement, or SDK contract change | All Scenario 1–4 commands plus `write_read::scribe_write_flush_read_user_journey`; benchmark not run (caller-owned) | PASS |
+| 5. Every dashboard row has a real family/trace owner and focused assertion; request opening precedes stream terminal; no high-cardinality labels | Dashboard table below; labels are bounded enums only | `published::…` phase 1b asserts request success at open with zero stream terminals, then one terminal | PASS |
+
+Commands run (all PASS, final tree): the exact commands in Scenarios 1–4;
+`mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib` over
+`storage::`, `forge::`, `scribe::staging_runtime::`, `gate::`, `oracle::`;
+`wyrd-server --lib otlp`; `wyrd-testing --lib`; `mise run fmt`;
+`mise run lints`; `mise run docs:check`; `git diff --check`. Benchmarks,
+`mise run gate`, and whole journey lanes were not run.
+
+Material notes:
+
+- RED was observed rather than produced by reverting: captured traces before
+  the fixes showed the remote fragment as a trace root, a Degraded terminal
+  counted as success, and a failed write trace with two failure events
+  (`Bifrost write failed` WARN plus `Scribe ingest failed after transport
+  validation` ERROR on the child span).
+- Peer trace context is not propagated across processes (protocol change, a
+  stop condition); remote work is traced by the leader's fragment span.
+- Forge keeps its durable read only where this owner cannot know what
+  committed: a slot-fatal error, a release matching no row, or a claim retained
+  after an effect (`ShutdownRetained`). Known outcomes use the settlement.
+- Storage footer decodes run outside the request guard and are not counted in
+  `bifrost_storage_requests_total`; `ScribeStorageDrainObservationV1` now
+  serializes lifecycle plus five live counts only.
+- Request attempt counters include idempotent client retries. Process counters
+  restart at zero and are not exact durable accounting after a restart;
+  durable batch, file, and task rows answer that question.
+
+### Dashboard measurement contract
+
+| Operator question | Production family {labels} or trace | Unit and meaning | Focused test |
+| --- | --- | --- | --- |
+| Are writes arriving and getting durable responses? | `bifrost_gate_requests_total{operation,outcome}`, `bifrost_gate_request_duration_seconds`, `bifrost_gate_rejections_total{reason}`; `bifrost_scribe_ack_seconds`; `bifrost_scribe_wal_append_total`/`_bytes_total`/`_seconds`, `bifrost_scribe_wal_fsync_total{outcome}`/`_seconds` | Counts/seconds of request attempts (retries included) and WAL work | `telemetry::scribe_hot_path_telemetry_reconciles` |
+| Is new data entering a shard and moving out of memory? | `bifrost_scribe_memtable_rows_inserted_total`; `bifrost_scribe_active_memtable_bytes`, `_immutable_memtable_bytes`, `_immutable_generation_count`; `bifrost_scribe_lane_queued{lane}` (waiting), `_lane_active{lane}` (running) | Rows newly inserted this process; bytes resident; jobs waiting vs running | `telemetry::scribe_hot_path_telemetry_reconciles`, `write_read::acknowledged_rows_survive_stage_pressure_and_restart` |
+| Is staging or publication falling behind? | `bifrost_scribe_staging_live_members`, `_live_bytes`, `_oldest_member_timestamp_seconds`, `_outstanding_claims`; `bifrost_scribe_publication_files_total`, `_bytes_total`; `bifrost_scribe_seal_failed_total` | Current backlog from assembler ownership (restored included); committed publication output | `scribe::staging_runtime::pg_tests::restored_stage_republishes_backlog`, `write_read::acknowledged_rows_survive_stage_pressure_and_restart` |
+| Is Forge keeping up? | `bifrost_forge_pending_tasks{task_type}`, `_oldest_pending_task_timestamp_seconds{task_type}`, `_active_tasks{task_type}`, `_task_attempts_total{task_type,result}`, `_output_files_total`/`_output_bytes_total{task_type}`, compaction debt; trace `bifrost.forge.task.execute{result}` | Backlog, age, committed attempt result, output | `live_rewrite::forge_promoted_files_rewrite_and_remain_exact_across_recovery` |
+| Are clients getting answers promptly? | `bifrost_gate_query_streams_total{outcome}`, `bifrost_gate_query_stream_duration_seconds{outcome}`; trace `bifrost.gate.query.stream` | Server-edge stream terminal and lifetime; request success means stream opened | `published::published_cache_pruning_and_shutdown_are_production_governed` (phase 1b), `write_read::scribe_undialable_private_peer_degrades_live_coverage` |
+| Where is query work waiting or failing? | `oracle_queries_queued`, `oracle_queries_active`, `oracle_admission_total{class,outcome,reason}`, `oracle_admission_queue_duration_seconds`, `oracle_query_duration_seconds{class,outcome}` (HPA), `oracle_query_cancellations_total{reason}`, scan files/bytes counters; storage `bifrost_storage_metadata_cache_effects_total{effect,reason}`, `bifrost_storage_requests_total{operation}`, `_request_terminals_total{operation,outcome}`, `_request_seconds`, `_request_retries_total`, `_active_requests`; trace `bifrost.oracle.peer.fragment{role,outcome}` | Waiting vs admitted work, queue wait, Oracle execution by class and true outcome, scan and storage I/O (a cache hit adds no request) | `capacity::saturated_query_waits_on_http_and_grpc`, `published::…`, `peer_network::analytical::remote_live_scribe_drop_releases_query`, `storage::cache::tests::metadata_cache_reconciles_single_flight_identity_and_bypass` |
+
+### Captured traces (test production capture; ids truncated)
+
+Scribe write — success (`telemetry::scribe_hot_path_telemetry_reconciles`):
+
+```text
+trace=912a18a9 bifrost.gate.write        29.7ms outcome=success
+trace=912a18a9 └ dispatch_native_frame   29.1ms
+```
+
+Scribe write — failure (WAL sync fault, after `0abb76304`):
+
+```text
+trace=9efba549 bifrost.gate.write        14.1ms outcome=failed events=[WARN "Bifrost write failed" error=…]
+trace=9efba549 └ dispatch_native_frame   13.3ms events=[]
+```
+
+Oracle query — local success (`published::…`):
+
+```text
+trace=5b5b2c03 bifrost.gate.query.stream 30.6ms outcome=success
+trace=5b5b2c03 └ bifrost.gate.query      15.6ms operation=query
+trace=5b5b2c03   └ bifrost.oracle.query  10.3ms
+trace=5b5b2c03     └ bifrost.oracle.stream 18.3ms outcome=success
+trace=5b5b2c03       └ bifrost.oracle.source 3.7ms outcome=success
+```
+
+Oracle query — remote failure (`remote_live_scribe_drop_releases_query`):
+
+```text
+trace=ccd400a9 bifrost.gate.query.stream 27.0ms outcome=failed
+trace=ccd400a9 └ bifrost.gate.query      21.7ms
+trace=ccd400a9   └ bifrost.oracle.query  17.5ms
+trace=ccd400a9     ├ bifrost.oracle.peer.fragment 10.8ms role=scribe outcome=failed events=["h2 protocol error: …"]
+trace=ccd400a9     └ bifrost.oracle.stream 12.8ms outcome=failed status=Error events=["Oracle query stream execution failed"]
+trace=ccd400a9       └ bifrost.oracle.source 7.9ms outcome=success
+```
+
+Forge task — released failure, then recovery success
+(`live_rewrite::forge_promoted_files_rewrite_and_remain_exact_across_recovery`):
+
+```text
+trace=89dcbb03 bifrost.forge.task.execute 1704ms result=<none> events=[WARN "Forge compaction plan failed"]
+trace=89dcbb03 └ bifrost.forge.catalog.commit ×3 (156/1610/1637ms) result=failed
+               WARN "Forge task released: an operation's acceptance is unknown…"
+trace=c54985ba bifrost.forge.task.execute 157ms result=succeeded events=[]
+               INFO log for the run: only "Forge worker started" / "Forge worker stopped"
+```

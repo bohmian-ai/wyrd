@@ -13,6 +13,7 @@ use url::Url;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
+use wyrd_auth::sealing::SealedSecretRewrap;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::WyrdAuthVerifySettings;
 use wyrd_cli::auth::trusted_issuer::{self, AddArgs as TrustedIssuerAddArgs, TrustedIssuerCommand};
@@ -1259,7 +1260,33 @@ async fn authorization_code_for(
     username: &str,
     password: &str,
 ) -> ProviderReturn {
-    let flow = new_flow();
+    authorization_code_bound(
+        srv,
+        tenant_slug,
+        new_flow(),
+        keycloak,
+        client_id,
+        username,
+        password,
+    )
+    .await
+}
+
+/// [`authorization_code_for`] with a caller-chosen browser flow binding, so a
+/// journey that holds the raw BFF flow id can later complete the browser
+/// session it names.
+///
+/// # Panics
+/// Panics exactly as [`authorization_code_for`] does.
+async fn authorization_code_bound(
+    srv: &WyrdTestServer,
+    tenant_slug: &str,
+    flow: Sha256Hex,
+    keycloak: &OidcIssuerFixture,
+    client_id: &str,
+    username: &str,
+    password: &str,
+) -> ProviderReturn {
     let (status, body) = begin_login(
         srv,
         "attacker.example.net",
@@ -2853,6 +2880,371 @@ async fn tenant_connection_rotation_journey() {
         .await
         .expect("K2-only replica shuts down");
     replica_b.shutdown().await.expect("replica B shuts down");
+}
+
+/// Raw BFF service key the browser-session rotation journey mounts the
+/// private channel with.
+const ROTATION_BFF_KEY: &str = "browser-session-rotation-bff-key";
+
+/// A fresh 256-bit lowercase-hex value, the shape of every raw BFF flow id
+/// and CSRF token.
+fn random_hex_256() -> String {
+    Sha256Hex::digest(Uuid::new_v4().as_bytes()).to_string()
+}
+
+/// The browser-session owner a server's BFF channel serves through.
+///
+/// # Panics
+/// Panics when the server was started without a BFF service key.
+fn browser_sessions(srv: &WyrdTestServer) -> wyrd_auth::browser_sessions::BrowserSessions {
+    srv.state()
+        .auth
+        .bff
+        .as_ref()
+        .expect("the BFF channel is mounted")
+        .sessions
+        .clone()
+}
+
+/// Every non-null sealed column of the browser session `session_id` names,
+/// read as superuser in a stable column order.
+///
+/// # Panics
+/// Panics when the read fails or no session row exists.
+async fn session_envelopes(superuser: &PgPool, session_id: &SecretString) -> Vec<Vec<u8>> {
+    let row: (
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    ) = sqlx::query_as(
+        "SELECT access_token_sealed, refresh_token_sealed, api_key_sealed, csrf_token_sealed \
+             FROM wyrd.auth_browser_sessions WHERE id_hash = $1",
+    )
+    .bind(
+        Sha256Hex::digest(session_id.expose_secret().as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .fetch_one(superuser)
+    .await
+    .expect("session row reads");
+    [row.0, row.1, row.2, row.3].into_iter().flatten().collect()
+}
+
+/// Make the stored access token of `session_id` stale so its next use renews
+/// through the session's mode-specific issuance path.
+///
+/// # Panics
+/// Panics when the update does not touch exactly one row.
+async fn expire_session_access(superuser: &PgPool, session_id: &SecretString) {
+    let updated = sqlx::query(
+        "UPDATE wyrd.auth_browser_sessions \
+         SET access_expires_at = statement_timestamp() - interval '1 minute' \
+         WHERE id_hash = $1",
+    )
+    .bind(
+        Sha256Hex::digest(session_id.expose_secret().as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(superuser)
+    .await
+    .expect("access expiry updates");
+    assert_eq!(updated.rows_affected(), 1, "exactly one session is stale");
+}
+
+/// Live browser sessions survive canonical sealing-key rotation.
+///
+/// One tenant has an Active Keycloak connection and a K1-only server with the
+/// BFF channel mounted. The journey proves:
+///   1. an SSO session (completed from a real Keycloak login bound to the raw
+///      BFF flow id) and an OIDC-off API-key session are created, with every
+///      sealed column (access, refresh or API key, CSRF) under K1;
+///   2. the canonical `SealedSecretRewrap` pass with K2 written and K1
+///      retained races a concurrent K1 renewal of the SSO access token: the
+///      pass's compare-and-swap blocks on the renewal's row lock, loses to
+///      it, and reports `remaining == 1` rather than overwriting it;
+///   3. a later pass reseals that late write and reports `remaining == 0`,
+///      leaving every session envelope current under K2;
+///   4. a keyless boot still refuses while those live envelopes exist;
+///   5. a K2-only replica reads both sessions with their original CSRF
+///      tokens, renews each through its mode (refresh rotation, API-key
+///      re-exchange), and performs each mode-specific logout: the SSO
+///      session's refresh token is revoked with it, while the API key that
+///      signed in stays valid;
+///   6. once both sessions are revoked no envelope remains, so a keyless boot
+///      proceeds.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn browser_session_sealing_rotation_journey() {
+    let (k1, k2) = ([0x31_u8; 32], [0x32_u8; 32]);
+    let k1_only = std::sync::Arc::new(SealingKeyring::new(SecretKey::from_bytes(k1)));
+    let k2_only = std::sync::Arc::new(SealingKeyring::new(SecretKey::from_bytes(k2)));
+    let rotating = std::sync::Arc::new(
+        SealingKeyring::new(SecretKey::from_bytes(k2)).with_retained(SecretKey::from_bytes(k1)),
+    );
+    let srv = human_server_builder()
+        .with_sealing_keyring(std::sync::Arc::clone(&k1_only))
+        .with_bff_service_key(ROTATION_BFF_KEY)
+        .start_in_process()
+        .await
+        .expect("K1 server starts");
+    let admin = tenant_admin(&srv, srv.data_tenant_id(), "session-rotation-admin").await;
+    activate_keycloak_connection(&srv, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let operator = srv.pg_fixture().operator_pool().clone();
+    let tenant_key =
+        wyrd_spec::ids::TenantSlug::new(FIXTURE_TENANT_SLUG.to_owned()).expect("slug is valid");
+
+    // 1. Both session modes are created under K1.
+    let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
+    let flow_id = SecretString::from(random_hex_256());
+    let provider = authorization_code_bound(
+        &srv,
+        FIXTURE_TENANT_SLUG,
+        Sha256Hex::digest(flow_id.expose_secret().as_bytes()),
+        &keycloak,
+        PUBLIC_HUMAN_CLIENT,
+        "alice",
+        "alice-password",
+    )
+    .await;
+    let reply = callback_reply(
+        &srv,
+        &provider.code,
+        &provider.state,
+        "attacker.example.net",
+    )
+    .await;
+    assert_browser_completion(&reply, &provider.code);
+    let k1_sessions = browser_sessions(&srv);
+    let sso_csrf = SecretString::from(random_hex_256());
+    let sso = k1_sessions
+        .complete(&flow_id, &sso_csrf)
+        .await
+        .expect("the SSO browser session completes")
+        .session_id;
+    let key_csrf = SecretString::from(random_hex_256());
+    let key_session = k1_sessions
+        .exchange_api_key(&tenant_key, &admin.api_key, &key_csrf, "rotation-sign-in")
+        .await
+        .expect("the API-key browser session signs in")
+        .session_id;
+    for (session, columns) in [(&sso, 3), (&key_session, 3)] {
+        let envelopes = session_envelopes(&superuser, session).await;
+        assert_eq!(
+            envelopes.len(),
+            columns,
+            "a live session seals its mode's credentials"
+        );
+        for envelope in &envelopes {
+            assert!(
+                k2_only.open(envelope).is_err(),
+                "K1 sealed every session envelope"
+            );
+        }
+    }
+
+    // 2. A K1 renewal holding the SSO row lock wins against the canonical pass.
+    let sso_hash = Sha256Hex::digest(sso.expose_secret().as_bytes());
+    let mut renewal = superuser.begin().await.expect("renewal transaction begins");
+    let (stale_access,): (Vec<u8>,) = sqlx::query_as(
+        "SELECT access_token_sealed FROM wyrd.auth_browser_sessions \
+         WHERE id_hash = $1 FOR UPDATE",
+    )
+    .bind(sso_hash.as_bytes().as_slice())
+    .fetch_one(&mut *renewal)
+    .await
+    .expect("the renewal locks the session row");
+    let racing = SealedSecretRewrap::new(operator.clone(), Some(std::sync::Arc::clone(&rotating)));
+    let pass = tokio::spawn(async move { racing.run().await });
+    let mut blocked = false;
+    for _ in 0..300 {
+        let (waiting,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query LIKE '%SET access_token_sealed = $4%'",
+        )
+        .fetch_one(&superuser)
+        .await
+        .expect("activity reads");
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+    assert!(
+        blocked,
+        "the pass's access-token swap waits on the renewal's row lock"
+    );
+    let renewed_under_k1 = k1_only
+        .seal(
+            &k1_only
+                .open(&stale_access)
+                .expect("K1 opens the stale access token"),
+        )
+        .expect("K1 reseals the renewal");
+    sqlx::query(
+        "UPDATE wyrd.auth_browser_sessions SET access_token_sealed = $2 WHERE id_hash = $1",
+    )
+    .bind(sso_hash.as_bytes().as_slice())
+    .bind(&renewed_under_k1)
+    .execute(&mut *renewal)
+    .await
+    .expect("the renewal rewrites the access token");
+    renewal.commit().await.expect("the renewal commits");
+    let raced = pass
+        .await
+        .expect("the pass task joins")
+        .expect("the racing pass completes");
+    assert_eq!(
+        raced.remaining, 1,
+        "the swap that lost to the renewal stays remaining: {raced:?}"
+    );
+
+    // 3. The next canonical pass repairs the late write and reaches zero.
+    let settled = SealedSecretRewrap::new(operator.clone(), Some(std::sync::Arc::clone(&rotating)))
+        .run()
+        .await
+        .expect("the follow-up pass completes");
+    assert_eq!(settled.remaining, 0, "nothing still needs K1: {settled:?}");
+    assert_eq!(
+        settled.rewrapped, 1,
+        "only the late renewal was resealed: {settled:?}"
+    );
+    for session in [&sso, &key_session] {
+        for envelope in session_envelopes(&superuser, session).await {
+            assert_eq!(
+                k2_only
+                    .rewrap(&envelope)
+                    .expect("K2 opens every session envelope"),
+                None,
+                "every session envelope is current under K2"
+            );
+        }
+    }
+
+    // 4. Live session envelopes keep a keyless boot from proceeding.
+    let refused = wyrd_server::boot::rewrap_sealed_secrets(Some(operator.clone()), None)
+        .await
+        .expect_err("a keyless boot refuses while live session envelopes exist");
+    assert!(
+        matches!(refused, wyrd_server::boot::ServerBootError::SealingKey(_)),
+        "{refused:?}"
+    );
+
+    // 5. A K2-only replica serves both sessions once the K1 writer is gone.
+    let replica = srv
+        .start_replica(
+            human_server_builder()
+                .with_sealing_keyring(std::sync::Arc::clone(&k2_only))
+                .with_bff_service_key(ROTATION_BFF_KEY),
+        )
+        .await
+        .expect("a K2-only replica starts");
+    srv.shutdown().await.expect("the K1 server shuts down");
+    let sessions = browser_sessions(&replica);
+    for (session, csrf, label) in [
+        (&sso, &sso_csrf, "sso"),
+        (&key_session, &key_csrf, "api-key"),
+    ] {
+        let view = sessions
+            .read(session, "rotation-read")
+            .await
+            .unwrap_or_else(|error| panic!("{label}: K2 reads the session: {error:?}"));
+        assert_eq!(
+            view.csrf_token.expose_secret(),
+            csrf.expose_secret(),
+            "{label}: the CSRF token survives rotation"
+        );
+        let before = sessions
+            .authority(session, "rotation-authority")
+            .await
+            .unwrap_or_else(|error| panic!("{label}: K2 opens the access token: {error:?}"));
+        expire_session_access(&superuser, session).await;
+        let renewed = sessions
+            .authority(session, "rotation-renew")
+            .await
+            .unwrap_or_else(|error| panic!("{label}: K2 renews the session: {error:?}"));
+        assert_ne!(
+            renewed.access_token.expose_secret(),
+            before.access_token.expose_secret(),
+            "{label}: renewal minted a successor access token"
+        );
+        sessions
+            .read(session, "rotation-read-renewed")
+            .await
+            .unwrap_or_else(|error| panic!("{label}: the renewed session reads: {error:?}"));
+    }
+    assert_v1_delegated_write_ok(
+        &replica,
+        sessions
+            .authority(&sso, "rotation-write")
+            .await
+            .expect("the SSO session has authority")
+            .access_token
+            .expose_secret(),
+        "browser-session-k2",
+    )
+    .await;
+    let refresh = k2_only
+        .open(&session_envelopes(&superuser, &sso).await[1])
+        .expect("K2 opens the current refresh token");
+    let refresh = String::from_utf8(refresh).expect("refresh token is UTF-8");
+    sessions.logout(&sso).await.expect("SSO logout succeeds");
+    // Logout revoked the refresh token K2 opened, so presenting it is a
+    // replay of a dead family member.
+    let (status, body) = post_refresh(&replica, &refresh).await;
+    assert_refused(
+        status,
+        &body,
+        StatusCode::UNAUTHORIZED,
+        "WYRD_AUTH_401_REFRESH_REUSED",
+    );
+    assert!(
+        body.get("refresh_token").is_none() && body.get("access_token").is_none(),
+        "a logged-out SSO session's refresh token renews nothing: {body}"
+    );
+    sessions
+        .logout(&key_session)
+        .await
+        .expect("API-key logout succeeds");
+    for session in [&sso, &key_session] {
+        assert!(
+            sessions
+                .read(session, "rotation-after-logout")
+                .await
+                .is_err(),
+            "a logged-out session no longer reads"
+        );
+        assert!(
+            session_envelopes(&superuser, session).await.is_empty(),
+            "logout wiped every sealed value"
+        );
+    }
+
+    // 6. With every session revoked no envelope remains for a keyless boot.
+    wyrd_server::boot::rewrap_sealed_secrets(Some(operator), None)
+        .await
+        .expect("a keyless boot proceeds once no session envelope remains");
+    sessions
+        .exchange_api_key(
+            &tenant_key,
+            &admin.api_key,
+            &key_csrf,
+            "rotation-sign-in-again",
+        )
+        .await
+        .expect("the API key that signed in stays valid after its session's logout");
+    replica.shutdown().await.expect("replica shuts down");
 }
 
 /// Read the id of `principal`'s one API key — the credential id its

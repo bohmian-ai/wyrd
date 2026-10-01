@@ -2,7 +2,7 @@
 id: TASK-008
 title: Delete the per-row tenant column; prove the tenant per file
 kind: implementation
-status: ready
+status: implemented
 spec: SPEC-bifrost-scribe-live-reads
 spec_revision: 20
 requirements: [REQ-015]
@@ -121,3 +121,6 @@ Static gates on the same tree: `mise run fmt`, `mise run lints` (exit 0),
 (clean after the TASK-008-R1 import and panic-doc fixes), `git diff --check`.
 Deferred to the caller: the full `mise run test:bifrost` lane and the
 capacity benchmark, run once after review.
+
+**Status (2026-10-01):** implemented in `83ccbc634` ("serve live reads from
+one Parquet scan with per-file tenant proof"), already on `origin/main`.

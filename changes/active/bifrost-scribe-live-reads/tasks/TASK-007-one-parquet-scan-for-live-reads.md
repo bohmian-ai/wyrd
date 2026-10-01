@@ -2,7 +2,7 @@
 id: TASK-007
 title: Read staged runs with the published Parquet scan
 kind: implementation
-status: ready
+status: implemented
 spec: SPEC-bifrost-scribe-live-reads
 spec_revision: 20
 requirements: [REQ-014]
@@ -162,3 +162,6 @@ coalesce/repartition channels are item-bounded on every path. Base
 TASK-007 regression. Exact in-flight accounting (rewrapping Arrow buffers
 with a charge-carrying owner) would be a separate, owner-wide change covering
 published and staged scans together; it is not part of revision 20.
+
+**Status (2026-10-01):** implemented in `83ccbc634` ("serve live reads from
+one Parquet scan with per-file tenant proof"), already on `origin/main`.

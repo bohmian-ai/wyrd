@@ -2,7 +2,7 @@
 id: TASK-006
 title: Benchmark real wyrd-server processes and delete the process harness
 kind: implementation
-status: in-progress
+status: implemented
 spec: SPEC-bifrost-scribe-live-reads
 spec_revision: 19
 requirements: [REQ-008]
@@ -99,3 +99,7 @@ therefore proves its "remote Scribe lost" ending at the leader's 120 s deadline
 | Absolute data root | `boot/data_root.rs` | `boot::data_root::tests::prepare_resolves_a_relative_root_to_absolute_paths` (RED without fix, GREEN with) | PASS |
 | Shutdown ends peer streams | `oracle/peer_service.rs`, `grpc/mod.rs` | `peer_network::analytical::remote_live_scribe_drop_releases_query` 12.5s | PASS |
 | Contracts | proto `.bin` regenerated | `mise run codegen:check`, `fmt`, `lints`, `git diff --check` | PASS |
+
+**Status (2026-10-01):** implemented. The harness is deleted and the
+`bifrost_query_capacity` benchmark exists. Rows 1-3 stay pending until the
+benchmark is run and its result is recorded.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local Kubernetes autoscaling journey for the official image (kind).
 #
-# Required for TASK-006 (AC-037) and runnable on demand; not a default CI gate.
+# Runnable on demand; not a default CI gate.
 # Run it through the example task in deploy/kubernetes/kind/mise.local.toml.example.
 #
 #   1. One ready peer-mode Oracle-only replica (`wyrd-oracle`) beside the fixed

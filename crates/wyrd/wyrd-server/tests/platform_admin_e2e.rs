@@ -190,23 +190,26 @@ async fn initialization_happens_at_most_once() {
 
 /// Point a child `wyrd-server` operator command at this test's database.
 ///
-/// The binary resolves its DSNs from the environment, so the only thing the
-/// child needs is the lane's `WYRD_DATABASE_URL` with the database swapped for
-/// the fixture's. Every other credential and password is inherited.
+/// The binary resolves both its runtime and platform DSNs from the
+/// environment, so the child gets the lane's `WYRD_DATABASE_URL` and
+/// `WYRD_PLATFORM_DATABASE_URL` with the database swapped for the fixture's.
+/// Leaving either at the lane database would let `init` write the platform
+/// root into the shared database. Every other credential is inherited.
 ///
 /// # Panics
 ///
-/// Panics when the lane did not set `WYRD_DATABASE_URL`, or when its value is
-/// not a Postgres DSN naming its database after the last slash.
+/// Panics when the lane did not set either DSN, or when a value is not a
+/// Postgres DSN naming its database after the last slash.
 fn operator_command(subcommand: &str, database: &str) -> Command {
-    let base = env::var("WYRD_DATABASE_URL").expect("the journey lane sets WYRD_DATABASE_URL");
-    let (prefix, _) = base
-        .rsplit_once('/')
-        .expect("a Postgres DSN names its database after the last slash");
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_wyrd-server"));
-    command
-        .arg(subcommand)
-        .env("WYRD_DATABASE_URL", format!("{prefix}/{database}"));
+    command.arg(subcommand);
+    for name in ["WYRD_DATABASE_URL", "WYRD_PLATFORM_DATABASE_URL"] {
+        let base = env::var(name).unwrap_or_else(|_| panic!("the journey lane sets {name}"));
+        let (prefix, _) = base
+            .rsplit_once('/')
+            .expect("a Postgres DSN names its database after the last slash");
+        command.env(name, format!("{prefix}/{database}"));
+    }
     command
 }
 

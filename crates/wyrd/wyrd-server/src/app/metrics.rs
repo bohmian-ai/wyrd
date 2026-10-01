@@ -50,8 +50,6 @@ pub const BIFROST_SCRIBE_LANE_JOB_SECONDS: &str = "bifrost_scribe_lane_job_secon
 /// Scribe persistence publication latency.
 pub const BIFROST_SCRIBE_PERSISTENCE_PUBLICATION_SECONDS: &str =
     "bifrost_scribe_persistence_publication_seconds";
-/// Scribe seal-stage latency.
-pub const BIFROST_SCRIBE_SEAL_STAGE_SECONDS: &str = "bifrost_scribe_seal_stage_seconds";
 /// Scribe physical WAL append latency.
 pub const BIFROST_SCRIBE_WAL_APPEND_SECONDS: &str = "bifrost_scribe_wal_append_seconds";
 /// Scribe physical WAL fsync latency.
@@ -90,7 +88,6 @@ const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
     BIFROST_SCRIBE_QUEUE_WAIT_SECONDS,
     BIFROST_SCRIBE_LANE_JOB_SECONDS,
     BIFROST_SCRIBE_PERSISTENCE_PUBLICATION_SECONDS,
-    BIFROST_SCRIBE_SEAL_STAGE_SECONDS,
     BIFROST_SCRIBE_WAL_APPEND_SECONDS,
     BIFROST_SCRIBE_WAL_FSYNC_SECONDS,
     BIFROST_FORGE_TASK_DURATION_SECONDS,

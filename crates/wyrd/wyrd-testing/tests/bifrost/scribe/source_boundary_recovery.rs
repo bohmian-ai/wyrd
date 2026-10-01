@@ -1,4 +1,5 @@
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::memory::MemoryCategory;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
@@ -236,23 +237,17 @@ async fn published_generations(server: &WyrdTestServer, tenant: DataTenantId, na
 ///
 /// # Panics
 ///
-/// Panics when the Scribe cannot be inspected or when any generation
-/// reservation, active byte, or immutable byte survives the settled publication.
+/// Panics when the Scribe cannot be inspected or when any active or immutable
+/// generation byte survives the settled publication.
 fn assert_no_leaked_scribe_ownership(server: &WyrdTestServer, boundary: &str) {
     let snapshot = server
         .scribe_inspection_snapshot()
         .expect("the production Scribe exposes its observation snapshot");
-    let lifecycle = &snapshot.generation_lifecycle;
-    assert_eq!(
-        lifecycle.reservations, lifecycle.releases,
-        "{boundary} must release every generation reservation it adopted: {lifecycle:?}"
-    );
-    assert_eq!(
-        lifecycle.active_bytes, 0,
-        "{boundary} must retain no active generation bytes: {lifecycle:?}"
-    );
-    assert_eq!(
-        lifecycle.immutable_bytes, 0,
-        "{boundary} must retain no immutable generation bytes: {lifecycle:?}"
-    );
+    let memory = &snapshot.memory_by_category;
+    for category in [MemoryCategory::Active, MemoryCategory::Immutable] {
+        assert_eq!(
+            memory[category as usize], 0,
+            "{boundary} must retain no {category:?} generation bytes: {memory:?}"
+        );
+    }
 }

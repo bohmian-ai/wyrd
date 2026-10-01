@@ -359,22 +359,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         allowed_label_values: &[],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("gate.rows"),
-        selected_label_values: &[TelemetrySelectedLabel {
-            key: "status",
-            value: "accepted",
-        }],
-        family: "bifrost_gate_rows_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "status",
-            values: &["accepted", "rejected"],
-        }],
-    },
-    TelemetryBinding {
         id: TelemetryBindingId("gate.active"),
         selected_label_values: &[],
         family: "bifrost_gate_active_streams",
@@ -529,15 +513,12 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     TelemetryBinding {
         id: TelemetryBindingId("scribe.rows"),
         selected_label_values: &[],
-        family: "bifrost_scribe_rows_total",
+        family: "bifrost_scribe_memtable_rows_inserted_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "status",
-            values: &["accepted"],
-        }],
+        allowed_label_values: &[],
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.backlog_peak"),
@@ -594,27 +575,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("scribe.seal_rows"),
-        selected_label_values: &[TelemetrySelectedLabel {
-            key: "stage",
-            value: "file_list_transaction",
-        }],
-        family: "bifrost_scribe_seal_rows_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("scribe"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "stage",
-            values: &[
-                "freeze",
-                "parquet_encode",
-                "object_store_put",
-                "file_list_transaction",
-            ],
-        }],
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.publications"),
@@ -945,8 +905,6 @@ enum EvaluatedBindingValue {
 /// Canonical crate-local phase evidence shared by journey consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClusterPhaseTelemetryEvidence {
-    /// Gate rows accepted in the sampled phase.
-    pub(crate) gate_rows: u64,
     /// Gate frame bytes received in the sampled phase.
     pub(crate) gate_bytes: u64,
     /// Aggregate successful Gate request terminals.
@@ -967,7 +925,7 @@ pub(crate) struct ClusterPhaseTelemetryEvidence {
     pub(crate) gate_query_stream_terminals: u64,
     /// Final active Gate query streams.
     pub(crate) gate_active_streams: u64,
-    /// Scribe rows accepted in the sampled phase.
+    /// Rows newly inserted into Scribe memtables in the sampled phase.
     pub(crate) scribe_rows: u64,
     /// Rows returned by successful Oracle streams.
     pub(crate) oracle_stream_rows: u64,
@@ -1106,8 +1064,6 @@ pub(crate) struct ClusterTraceTelemetryEvidence {
 /// Exact counters consumed by client, audit, and durable-state reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClusterReconciliationTelemetryEvidence {
-    /// Rows sealed durably by Scribe.
-    pub(crate) sealed_rows: u64,
     /// Successful query request terminals.
     pub(crate) successful_queries: u64,
 }
@@ -2039,7 +1995,6 @@ fn project_cluster_phase_evidence(
         _ => 0,
     };
     ClusterPhaseTelemetryEvidence {
-        gate_rows: counter("gate.rows"),
         gate_bytes: counter("gate.bytes"),
         gate_success: counter("gate.requests.success"),
         gate_rejected: counter("gate.requests.rejected"),
@@ -2122,7 +2077,6 @@ impl ClusterTelemetryProjection {
             process,
             traces,
             reconciliation: ClusterReconciliationTelemetryEvidence {
-                sealed_rows: binding_counter(&bindings, "scribe.seal_rows").unwrap_or(0),
                 successful_queries: binding_counter(&bindings, "gate.requests.query_success")
                     .unwrap_or(0),
             },
@@ -2212,9 +2166,7 @@ fn binding_gauge_final(
 /// Map one exact production span name to its canonical operation.
 fn cluster_trace_operation(name: &str) -> Option<ClusterTraceOperation> {
     match name {
-        "bifrost.gate.write" | "bifrost.scribe.wal.append" => {
-            Some(ClusterTraceOperation::DurableWrite)
-        }
+        "bifrost.gate.write" => Some(ClusterTraceOperation::DurableWrite),
         "bifrost.scribe.visibility.publish" | "bifrost.forge.catalog.commit" => {
             Some(ClusterTraceOperation::FlushToVisible)
         }
@@ -2866,6 +2818,7 @@ mod tests {
                 .collect(),
             duration_nanos: 1,
             status: wyrd_telemetry::CapturedSpanStatus::Unset,
+            events: Vec::new(),
         }
     }
 
@@ -3626,18 +3579,6 @@ mod tests {
                 destination: "phase.gate_bytes",
             },
             EmitterContractFixture {
-                id: "gate.rows",
-                selectors: &[("status", "accepted")],
-                family: "bifrost_gate_rows_total",
-                kind: Counter,
-                keys: &["status"],
-                domains: &[("status", &["accepted", "rejected"])],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Always,
-                destination: "reconciliation.gate_rows(status=accepted)",
-            },
-            EmitterContractFixture {
                 id: "gate.active",
                 selectors: &[],
                 family: "bifrost_gate_active_streams",
@@ -3778,10 +3719,10 @@ mod tests {
             EmitterContractFixture {
                 id: "scribe.rows",
                 selectors: &[],
-                family: "bifrost_scribe_rows_total",
+                family: "bifrost_scribe_memtable_rows_inserted_total",
                 kind: Counter,
-                keys: &["status"],
-                domains: &[("status", &["accepted"])],
+                keys: &[],
+                domains: &[],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("scribe"),
@@ -3872,26 +3813,6 @@ mod tests {
                 aggregation: Delta,
                 requirement: Role("scribe"),
                 destination: "pillars.scribe_wal_bytes",
-            },
-            EmitterContractFixture {
-                id: "scribe.seal_rows",
-                selectors: &[("stage", "file_list_transaction")],
-                family: "bifrost_scribe_seal_rows_total",
-                kind: Counter,
-                keys: &["stage"],
-                domains: &[(
-                    "stage",
-                    &[
-                        "freeze",
-                        "parquet_encode",
-                        "object_store_put",
-                        "file_list_transaction",
-                    ],
-                )],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("scribe"),
-                destination: "reconciliation.sealed_rows(stage=file_list_transaction)",
             },
             EmitterContractFixture {
                 id: "forge.publications",
@@ -4396,31 +4317,12 @@ mod tests {
         assert!(!selectors_match_allowed_domains(&inconsistent));
     }
 
-    /// Prove rejected Gate rows never inflate the accepted-row destination.
-    #[test]
-    fn gate_rows_projection_selects_only_accepted_status() {
-        let mut delta = canonical_binding_delta();
-        delta.metrics.push(BifrostMetricSample {
-            family: "bifrost_gate_rows_total".to_owned(),
-            labels: BTreeMap::from([("status".to_owned(), "rejected".to_owned())]),
-            value: 99.0,
-            kind: BifrostMetricKind::Counter,
-        });
-        assert_eq!(
-            evaluate_cluster_bindings(&delta)
-                .expect("emitter-aligned fixture evaluates")
-                .get("gate.rows"),
-            Some(&EvaluatedBindingValue::Counter(1))
-        );
-    }
-
     /// Proves every matrix phase field is read from its exact evaluated binding.
     #[test]
     fn canonical_phase_projection_retains_exact_matrix_destinations() {
         let delta = canonical_binding_delta();
         let bindings = evaluate_cluster_bindings(&delta).expect("complete bindings evaluate");
         let phase = project_cluster_phase_evidence(&bindings);
-        assert_eq!(phase.gate_rows, 1);
         assert_eq!(phase.gate_bytes, 1);
         assert_eq!(phase.gate_query_request_success, 1);
         assert_eq!(phase.gate_write_request_cancelled, 1);

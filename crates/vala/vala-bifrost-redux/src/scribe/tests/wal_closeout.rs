@@ -273,25 +273,32 @@ fn assert_rejection(recorder: &wyrd_bench::BenchmarkRecorder, reason: &str, coun
     }));
 }
 
-/// Assert every admitted ingress root has one terminal release and no live child.
+/// Assert every admitted request settled and released its ingress memory.
+///
+/// Reads the production owners directly: the admission controller's
+/// in-flight item count and the governor's raw, decode, prepared, and queued
+/// memory categories, which together hold every pre-insertion ingress byte.
 fn assert_ingress_owners_settled(scribe: &crate::scribe::ScribeImpl) {
-    let lifecycle = scribe
+    assert_eq!(scribe.inflight_items_for_test(), 0);
+    let memory = scribe
         .inspection_snapshot()
         .expect("settled ingress inspection")
-        .ingress_lifecycle;
-    assert_eq!(lifecycle.active_attempts, 0);
-    assert_eq!(lifecycle.active_reservations, 0);
-    assert_eq!(lifecycle.active_reserved_bytes, 0);
-    assert_eq!(lifecycle.active_materializations, 0);
-    assert_eq!(lifecycle.active_materialized_bytes, 0);
-    assert_eq!(lifecycle.active_shard_transfers, 0);
-    assert_eq!(lifecycle.active_shard_transferred_bytes, 0);
-    assert_eq!(lifecycle.reservations, lifecycle.releases);
-    assert_eq!(lifecycle.reserved_bytes, lifecycle.released_bytes);
-    assert_eq!(lifecycle.shard_transfers, lifecycle.reservations);
-    assert_eq!(lifecycle.shard_transferred_bytes, lifecycle.reserved_bytes);
-    assert!(lifecycle.transfers <= lifecycle.materializations);
-    assert!(lifecycle.transferred_bytes <= lifecycle.materialized_bytes);
+        .memory_by_category;
+    assert_eq!(ingress_bytes(&memory), 0);
+}
+
+/// Sum the pre-insertion ingress memory categories of one inspection.
+fn ingress_bytes(memory: &[usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT]) -> usize {
+    use crate::scribe::memory::MemoryCategory;
+    [
+        MemoryCategory::Raw,
+        MemoryCategory::Decode,
+        MemoryCategory::Prepared,
+        MemoryCategory::Queued,
+    ]
+    .into_iter()
+    .map(|category| memory[category as usize])
+    .sum()
 }
 
 /// Pinning ingress at its sublimit trips exactly one D84 ceiling-labelled reason.
@@ -553,12 +560,12 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
         () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
     }
     assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 0);
+    assert_eq!(scribe.inflight_items_for_test(), 1);
     let retained = scribe
         .inspection_snapshot()
         .expect("retained post-COMMIT owner")
-        .ingress_lifecycle;
-    assert_eq!(retained.active_attempts, 1);
-    assert!(retained.active_reserved_bytes > 0);
+        .memory_by_category;
+    assert!(ingress_bytes(&retained) > 0);
 
     let retry = ingest_as(&scribe, retry_principal, "post_sync_failure", batch_id);
     let (first_result, retry_result) = tokio::join!(first, retry);

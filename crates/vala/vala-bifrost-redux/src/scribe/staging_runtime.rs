@@ -85,12 +85,6 @@ pub struct ScribeStagingRuntime {
     contexts: Mutex<HashMap<ScribeAssemblyKey, ClaimContext>>,
     /// Approximate encoded size at which one published object closes.
     target_object_bytes: u64,
-    /// Pod-wide observation owner, when this runtime belongs to a pod.
-    ///
-    /// A fixture runtime built without one publishes no staged lifecycle
-    /// effects; production always binds the same owner admission publishes to,
-    /// so the pod has one set of reconcilable totals rather than two.
-    telemetry: Option<Arc<crate::scribe::telemetry::ScribeTelemetry>>,
     /// Pod-wide authority registry, when this runtime belongs to a pod.
     ///
     /// Staging and publication are the two moments a generation's rows change
@@ -138,7 +132,6 @@ impl ScribeStagingRuntime {
             assembly: Mutex::new(StagingAssembler::new(config)),
             contexts: Mutex::new(HashMap::new()),
             target_object_bytes: config.target_file_size_bytes(),
-            telemetry: None,
             hot_sources: None,
             #[cfg(any(test, feature = "test-support"))]
             published_claims: Mutex::new(Vec::new()),
@@ -160,42 +153,31 @@ impl ScribeStagingRuntime {
         self
     }
 
-    /// Binds this runtime to its pod's single observation owner.
+    /// Publishes the staged-backlog gauges from the assembler's ownership.
     ///
-    /// Production wiring calls this before the runtime stages anything, so
-    /// every durable transition it performs is published through the same owner
-    /// admission and contention publish through.
-    #[must_use]
-    pub(crate) fn with_telemetry(
-        mut self,
-        telemetry: Arc<crate::scribe::telemetry::ScribeTelemetry>,
-    ) -> Self {
-        self.telemetry = Some(telemetry);
-        self
+    /// Called after every transition that changes ownership — durable
+    /// registration, claim take, settlement, and completed restoration — so the
+    /// gauges always describe the members this runtime actually holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the ready index is poisoned.
+    fn publish_backlog(&self) -> Result<(), ScribeError> {
+        self.backlog()?.publish();
+        Ok(())
     }
 
-    /// Publishes one staged or claim lifecycle effect, when a pod owns this runtime.
-    fn observe(
-        &self,
-        effect: crate::scribe::telemetry::StagingEffect,
-        facts: crate::scribe::telemetry::StagingFacts,
-    ) {
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.record_staging(effect, facts);
-        }
-    }
-
-    /// Publishes the effect one released claim records, whatever released it.
-    fn observe_claim(&self, effect: crate::scribe::telemetry::StagingEffect, claim: &StagingClaim) {
-        self.observe(
-            effect,
-            crate::scribe::telemetry::StagingFacts {
-                members: claim.members().len(),
-                bytes: claim.encoded_bytes(),
-                artifacts: 0,
-                cause: Some(claim.cause().label()),
-            },
-        );
+    /// Returns the staged backlog the assembler currently owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the ready index is poisoned.
+    pub fn backlog(&self) -> Result<crate::scribe::assembly::StagingBacklog, ScribeError> {
+        Ok(self
+            .assembly
+            .lock()
+            .map_err(|_| poisoned("staged ready index"))?
+            .backlog())
     }
 
     /// Encodes one frozen bucket into durable, preflighted local runs.
@@ -262,14 +244,7 @@ impl ScribeStagingRuntime {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("register the staged member as ready: {error}"),
             })?;
-        self.observe(
-            crate::scribe::telemetry::StagingEffect::MemberStaged,
-            crate::scribe::telemetry::StagingFacts {
-                members: 1,
-                bytes,
-                ..crate::scribe::telemetry::StagingFacts::default()
-            },
-        );
+        self.publish_backlog()?;
         self.advance_authority(
             &key,
             member,
@@ -321,13 +296,6 @@ impl ScribeStagingRuntime {
                     member.generation()
                 ),
             })?;
-        self.observe(
-            crate::scribe::telemetry::StagingEffect::SourceTransitioned,
-            crate::scribe::telemetry::StagingFacts {
-                members: 1,
-                ..crate::scribe::telemetry::StagingFacts::default()
-            },
-        );
         Ok(())
     }
 
@@ -347,8 +315,8 @@ impl ScribeStagingRuntime {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("take the next due staging claim: {error}"),
             })?;
-        if let Some(claim) = &claim {
-            self.observe_claim(crate::scribe::telemetry::StagingEffect::ClaimTaken, claim);
+        if claim.is_some() {
+            self.publish_backlog()?;
         }
         Ok(claim)
     }
@@ -438,8 +406,8 @@ impl ScribeStagingRuntime {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("take the residue claim for a staged key: {error}"),
             })?;
-        if let Some(claim) = &claim {
-            self.observe_claim(crate::scribe::telemetry::StagingEffect::ClaimTaken, claim);
+        if claim.is_some() {
+            self.publish_backlog()?;
         }
         Ok(claim)
     }
@@ -484,9 +452,6 @@ impl ScribeStagingRuntime {
             })?;
         let mut restored = 0;
         for (key, members) in recovered {
-            let staged_bytes = members.iter().fold(0_u64, |total, member| {
-                total.saturating_add(member.record().encoded_bytes())
-            });
             self.restore_authorities(&key, &members)?;
             let terminal = self
                 .publisher
@@ -525,15 +490,8 @@ impl ScribeStagingRuntime {
                     .map_err(|_| poisoned("staged claim context registry"))?
                     .insert(key.clone(), context);
             }
-            self.observe(
-                crate::scribe::telemetry::StagingEffect::StagingRestored,
-                crate::scribe::telemetry::StagingFacts {
-                    members: members.len(),
-                    bytes: staged_bytes,
-                    ..crate::scribe::telemetry::StagingFacts::default()
-                },
-            );
         }
+        self.publish_backlog()?;
         Ok(restored)
     }
 
@@ -744,7 +702,7 @@ impl ScribeStagingRuntime {
     ) -> Result<PublishedClaim, ScribeError> {
         let context = self.context_for(claim.key())?;
         let object_base = claim_object_base(claim, runs, &context)?;
-        let published = match self
+        let published = self
             .publisher
             .publish(PublishClaimRequest {
                 claim,
@@ -754,36 +712,29 @@ impl ScribeStagingRuntime {
                 object_base: &object_base,
                 actor_stream,
             })
-            .await
-        {
-            Ok(published) => published,
-            Err(error) => {
-                self.observe_claim(crate::scribe::telemetry::StagingEffect::ClaimFailed, claim);
-                return Err(error);
-            }
-        };
+            .await?;
+        Self::record_committed_claim(assembled);
         #[cfg(any(test, feature = "test-support"))]
         self.record_published_claim(claim, &published);
-        self.observe(
-            crate::scribe::telemetry::StagingEffect::ClaimPublished,
-            crate::scribe::telemetry::StagingFacts {
-                members: claim.members().len(),
-                bytes: claim.encoded_bytes(),
-                artifacts: published.object_identities.len(),
-                cause: Some(claim.cause().label()),
-            },
-        );
-        self.observe(
-            crate::scribe::telemetry::StagingEffect::MemberRetired,
-            crate::scribe::telemetry::StagingFacts {
-                members: claim.members().len(),
-                bytes: claim.encoded_bytes(),
-                artifacts: 0,
-                cause: Some(claim.cause().label()),
-            },
-        );
-        self.settle(claim.id(), published.released_bytes)?;
+        self.settle(claim.id())?;
         Ok(published)
+    }
+
+    /// Counts one committed claim and the objects it published.
+    ///
+    /// Runs only after the fenced `file_list` transaction committed, so
+    /// `bifrost_scribe_staging_claims_published_total`,
+    /// `bifrost_scribe_publication_files_total`, and
+    /// `bifrost_scribe_publication_bytes_total` describe committed output, not
+    /// attempts. A claim reconciled after a lost commit response is counted
+    /// once by the attempt that observed the commit.
+    fn record_committed_claim(assembled: &AssembledClaim) {
+        let artifacts = assembled.artifacts.as_slice();
+        metrics::counter!("bifrost_scribe_staging_claims_published_total").increment(1);
+        metrics::counter!("bifrost_scribe_publication_files_total")
+            .increment(u64::try_from(artifacts.len()).unwrap_or(u64::MAX));
+        metrics::counter!("bifrost_scribe_publication_bytes_total")
+            .increment(artifacts.iter().map(|artifact| artifact.file_size).sum());
     }
 
     /// Records which shards produced the members of one committed claim.
@@ -823,13 +774,13 @@ impl ScribeStagingRuntime {
             .clone()
     }
 
-    /// Returns the claim slot and records the staged bytes a settled claim released.
+    /// Returns the claim slot and republishes the staged backlog.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the ready index is unavailable
     /// or the claim is unknown.
-    fn settle(&self, claim: StagingClaimId, released_bytes: u64) -> Result<(), ScribeError> {
+    fn settle(&self, claim: StagingClaimId) -> Result<(), ScribeError> {
         self.assembly
             .lock()
             .map_err(|_| poisoned("staged ready index"))?
@@ -837,14 +788,7 @@ impl ScribeStagingRuntime {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("settle a published staging claim: {error}"),
             })?;
-        self.observe(
-            crate::scribe::telemetry::StagingEffect::ClaimSettled,
-            crate::scribe::telemetry::StagingFacts {
-                bytes: released_bytes,
-                ..crate::scribe::telemetry::StagingFacts::default()
-            },
-        );
-        Ok(())
+        self.publish_backlog()
     }
 
     /// Returns the encoding context recorded when the key first staged a member.
@@ -953,7 +897,7 @@ mod tests {
     use crate::scribe::stream_identity::{NodeId, WriterEpoch};
 
     /// Physical schema the fixture member is staged and merged under.
-    fn runtime_schema() -> SchemaRef {
+    pub(super) fn runtime_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
@@ -965,7 +909,7 @@ mod tests {
     }
 
     /// Freezes one bucket of `rows` rows for the fixture tenant and shard.
-    fn frozen_member(tenant: DataTenantId, rows: i64, shard: u8) -> FrozenMemtable {
+    pub(super) fn frozen_member(tenant: DataTenantId, rows: i64, shard: u8) -> FrozenMemtable {
         let schema = runtime_schema();
         let record = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -998,7 +942,7 @@ mod tests {
     }
 
     /// Resolves the hourly layout the fixture member is encoded under.
-    fn runtime_layout(schema: &Schema) -> PhysicalLayout {
+    pub(super) fn runtime_layout(schema: &Schema) -> PhysicalLayout {
         PhysicalLayout::resolve(
             "vala.bifrost.test",
             schema,
@@ -1015,7 +959,11 @@ mod tests {
     /// The fixture never reaches the fenced transaction, so the pool is opened
     /// lazily and never connected: what the test exercises is the lifecycle up
     /// to assembly, which is exactly the part that owns no durable catalog.
-    fn publisher(stage: Arc<ScribeHotStage>, wal_root: &Path, node: NodeId) -> ClaimPublisher {
+    pub(super) fn publisher(
+        stage: Arc<ScribeHotStage>,
+        wal_root: &Path,
+        node: NodeId,
+    ) -> ClaimPublisher {
         let operator = opendal::Operator::new(opendal::services::Memory::default())
             .expect("memory operator")
             .finish();
@@ -1302,37 +1250,18 @@ mod tests {
         );
     }
 
-    /// The staged registry is closed and its production totals reconcile.
+    /// The staged backlog counts ready and claimed members from real ownership.
     ///
-    /// AC21's registry is only worth having if every entry is distinguishable
-    /// and every emission moves a total a maintainer can check against durable
-    /// state. This drives the runtime's own public surfaces and asserts what
-    /// the transitions published, rather than asserting a counter directly.
+    /// A durable member is live once registered; taking a claim moves it into
+    /// the claim without shrinking the backlog, and only opens one outstanding
+    /// claim. Each value is read from the assembler that owns the members.
     ///
     /// # Panics
     ///
-    /// Panics when two registry entries share a stage/decision pair, when a
-    /// durable transition publishes nothing, or when the reconcilable totals
-    /// disagree with the members and claims the runtime actually holds.
+    /// Panics when staging fails or the backlog disagrees with the members and
+    /// claims the runtime actually holds.
     #[tokio::test(flavor = "current_thread")]
-    async fn staged_lifecycle_effects_are_closed_and_totals_reconcile() {
-        use crate::scribe::telemetry::{ScribeTelemetry, StagingEffect};
-
-        let mut seen = std::collections::HashSet::new();
-        for effect in StagingEffect::ALL {
-            assert!(
-                seen.insert((effect.stage(), effect.decision())),
-                "two staged registry entries share the stage/decision pair {}/{}",
-                effect.stage(),
-                effect.decision()
-            );
-            assert_eq!(
-                StagingEffect::ALL[effect.index()],
-                effect,
-                "every entry indexes its own position"
-            );
-        }
-
+    async fn staged_backlog_counts_ready_and_claimed_members() {
         let root = tempfile::tempdir().expect("runtime root");
         let stage_root = root.path().join("stage");
         let wal_root = root.path().join("member-wal");
@@ -1341,7 +1270,6 @@ mod tests {
         }
         let node_id = NodeId::new(uuid::Uuid::from_u128(0xd2a3));
         let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
-        let telemetry = Arc::new(ScribeTelemetry::default());
         let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
         let runtime = ScribeStagingRuntime::new(
             Arc::clone(&stage),
@@ -1349,8 +1277,7 @@ mod tests {
             StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
                 .expect("assembler controls"),
         )
-        .with_hot_sources(Arc::clone(&hot_sources))
-        .with_telemetry(Arc::clone(&telemetry));
+        .with_hot_sources(Arc::clone(&hot_sources));
 
         let schema = runtime_schema();
         let layout = runtime_layout(schema.as_ref());
@@ -1392,33 +1319,34 @@ mod tests {
             .await
             .expect("member becomes durable and ready");
 
-        let staged_totals = telemetry.staging_snapshot();
-        assert_eq!(staged_totals.count(StagingEffect::MemberStaged), 1);
-        assert_eq!(staged_totals.count(StagingEffect::SourceTransitioned), 1);
+        let staged_backlog = runtime.backlog().expect("staged backlog");
         assert_eq!(
-            staged_totals.live_members(),
-            1,
-            "one durable member is staged and none has been retired"
+            staged_backlog.live_members, 1,
+            "one durable member is staged and none has been published"
         );
-        assert_eq!(staged_totals.outstanding_claims(), 0);
+        assert!(staged_backlog.live_bytes > 0);
+        assert_eq!(staged_backlog.outstanding_claims, 0);
 
         let claim = runtime
             .take_residue(&key, ClaimCause::Drain)
             .expect("the ready key releases a residue claim")
             .expect("a residue claim is due");
-        let claimed = telemetry.staging_snapshot();
-        assert_eq!(claimed.count(StagingEffect::ClaimTaken), 1);
+        let claimed = runtime.backlog().expect("claimed backlog");
         assert_eq!(
-            claimed.outstanding_claims(),
-            1,
-            "the claim is outstanding until it settles or fails"
+            claimed.live_members, 1,
+            "taking a claim does not publish its member"
+        );
+        assert_eq!(claimed.live_bytes, staged_backlog.live_bytes);
+        assert_eq!(
+            claimed.outstanding_claims, 1,
+            "the claim is outstanding until it settles"
         );
         assert_eq!(claim.members().len(), 1);
     }
 
-    /// Stages four shards of one partition through `runtime` and drives each to
-    /// durable, ready state, returning the shared assembly key and the staged
-    /// member ids in shard order.
+    /// Stages one member per shard of one partition through `runtime` and
+    /// drives each to durable, ready state at `ready_at`, returning the shared
+    /// assembly key and the staged member ids in shard order.
     ///
     /// Recovery owners need a claim whose members can be moved into different
     /// terminal states independently, so the fixture stages real members rather
@@ -1427,17 +1355,19 @@ mod tests {
     /// # Panics
     ///
     /// Panics when a member fails to resolve its binding, encode, or register,
-    /// or when the four members do not share one assembly key.
-    async fn stage_four_durable_members(
+    /// or when the members do not share one assembly key.
+    pub(super) async fn stage_durable_members(
         runtime: &ScribeStagingRuntime,
         tenant: DataTenantId,
         node_id: NodeId,
-        schema: &SchemaRef,
-        layout: &PhysicalLayout,
+        shards: std::ops::RangeInclusive<u8>,
+        ready_at: DateTime<Utc>,
     ) -> (ScribeAssemblyKey, Vec<StagedMemberId>) {
+        let schema = &runtime_schema();
+        let layout = &runtime_layout(schema.as_ref());
         let mut key = None;
         let mut member_ids = Vec::new();
-        for shard in 1_u8..=4 {
+        for shard in shards {
             let frozen = frozen_member(tenant, 64, shard);
             let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
                 .expect("tenant binding");
@@ -1469,7 +1399,7 @@ mod tests {
             key.get_or_insert_with(|| staged.key().clone());
             member_ids.push(staged.member());
             runtime
-                .register_member(staged, chrono::Utc::now())
+                .register_member(staged, ready_at)
                 .await
                 .expect("member becomes durable and ready");
         }
@@ -1591,10 +1521,8 @@ mod tests {
                 .expect("assembler controls"),
         );
         let tenant = DataTenantId::new_v7();
-        let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
         let (key, member_ids) =
-            stage_four_durable_members(&runtime, tenant, node_id, &schema, &layout).await;
+            stage_durable_members(&runtime, tenant, node_id, 1..=4, chrono::Utc::now()).await;
         let claim = runtime
             .take_residue(&key, ClaimCause::Drain)
             .expect("residue claim")
@@ -1633,5 +1561,150 @@ mod tests {
         assert!(stage.recover().await.expect("stage rescans").is_empty());
         assert_no_restored_authority_survives(&hot_sources, &key, &member_ids);
         assert_eq!(recovered.restore(&pool).await.expect("cleanup replays"), 0);
+    }
+}
+
+/// Postgres-backed recovery proofs for the staged backlog gauges.
+#[cfg(test)]
+mod pg_tests {
+    use super::tests::{publisher, runtime_layout, runtime_schema, stage_durable_members};
+    use super::*;
+    use crate::scribe::stream_identity::NodeId;
+
+    /// Registers the control row recovery re-resolves the fixture recipe from.
+    async fn register_control_row(database: &wyrd_dev_fixtures::pg::PgFixture) {
+        let table = crate::catalog::TableRef::new(
+            crate::namespaces::BifrostNamespace::Bifrost,
+            "staged_runtime",
+        );
+        let fqn = table.fqn();
+        let schema = runtime_schema();
+        let mut conn = database
+            .vala_postgres()
+            .tenant_conn(database.data_tenant_id())
+            .await
+            .expect("fixture tenant connection");
+        vala_sql::queries::olap_catalog::upsert_table(
+            &mut conn,
+            uuid::Uuid::now_v7().as_bytes(),
+            &fqn,
+            &[0_u8; 32],
+            &serde_json::to_value(runtime_layout(schema.as_ref()).to_wire())
+                .expect("fixture layout encodes"),
+        )
+        .await
+        .expect("register the fixture control row");
+        conn.commit().await.expect("commit the fixture control row");
+    }
+
+    /// Restoration publishes the recovered staged backlog before Scribe serves.
+    ///
+    /// Two members are claimed durably and two more stay ready. A replacement
+    /// runtime over the retained namespace restores them under a fresh,
+    /// isolated recorder: the staged gauges are absent before the actual
+    /// asynchronous restore and afterwards equal the durable members' count,
+    /// encoded bytes, oldest persisted ready time, and outstanding claim.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage, claim, or restore, or when the
+    /// published gauges disagree with the durable members.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restored_stage_republishes_backlog() {
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        register_control_row(&database).await;
+        let tenant = database.data_tenant_id();
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xb4c7));
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let config =
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls");
+        let oldest = DateTime::from_timestamp(1_780_000_000, 0).expect("fixture ready time");
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            config,
+        );
+        let (key, _) = stage_durable_members(&runtime, tenant, node_id, 1..=2, oldest).await;
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("residue claim")
+            .expect("two ready members form one claim");
+        runtime
+            .gather(&claim)
+            .await
+            .expect("the claim's membership becomes durable");
+        stage_durable_members(
+            &runtime,
+            tenant,
+            node_id,
+            3..=4,
+            oldest + chrono::Duration::seconds(60),
+        )
+        .await;
+        drop(runtime);
+
+        let durable = stage.recover().await.expect("durable members");
+        let durable_bytes = durable
+            .values()
+            .flatten()
+            .map(|member| member.record().encoded_bytes())
+            .sum::<u64>();
+        let durable_members = durable.values().map(Vec::len).sum::<usize>();
+        assert_eq!(durable_members, 4);
+
+        let replacement = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            config,
+        );
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let staged_families = [
+            "bifrost_scribe_staging_live_members",
+            "bifrost_scribe_staging_live_bytes",
+            "bifrost_scribe_staging_oldest_member_timestamp_seconds",
+            "bifrost_scribe_staging_outstanding_claims",
+        ];
+        let before = recorder.snapshot();
+        assert!(
+            staged_families
+                .iter()
+                .all(|family| !before.gauges.contains_key(*family)),
+            "no staged gauge exists before restoration"
+        );
+
+        let restored = replacement
+            .restore(database.operator_pool().pool())
+            .await
+            .expect("staged namespace restores");
+        assert_eq!(restored, durable_members);
+
+        let after = recorder.snapshot();
+        let gauge = |family: &str| after.gauges.get(family).copied();
+        assert_eq!(
+            gauge("bifrost_scribe_staging_live_members"),
+            Some(durable_members as f64)
+        );
+        assert_eq!(
+            gauge("bifrost_scribe_staging_live_bytes"),
+            Some(durable_bytes as f64)
+        );
+        assert_eq!(
+            gauge("bifrost_scribe_staging_oldest_member_timestamp_seconds"),
+            Some(oldest.timestamp() as f64)
+        );
+        assert_eq!(
+            gauge("bifrost_scribe_staging_outstanding_claims"),
+            Some(1.0)
+        );
     }
 }

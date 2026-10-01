@@ -4,7 +4,6 @@
 //! [`crate::resources::ScribeResources`] and
 //! [`crate::resources::ScribeMemoryLease`] values.
 
-use num_traits::ToPrimitive;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -221,29 +220,6 @@ impl MemorySnapshot {
         self
     }
 
-    /// Exports the closed Scribe ingress-watermark lifecycle gauges.
-    ///
-    /// Emitted from the production steady-state age scanner on every tick so a
-    /// dashboard can read the D83 ingress watermarks without a debugger.
-    /// `bifrost_scribe_ingress_watermark_bytes` carries the four D83 ingress
-    /// marks under a closed `mark` label `{occupancy, limit, high_water,
-    /// low_water}` — the exact numerator, denominator, and hysteresis band the
-    /// pressure-seal decision keys on. No label carries tenant, table, or
-    /// request identity. The snapshot should already be watermarked via
-    /// [`Self::with_ingress_watermarks`]; an unwatermarked snapshot reports the
-    /// two watermark marks as `0`.
-    pub fn emit_ingress_watermark_gauges(self) {
-        let as_f64 = |bytes: usize| bytes.to_f64().unwrap_or(f64::MAX);
-        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "occupancy")
-            .set(as_f64(self.ingress_occupancy_bytes));
-        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "limit")
-            .set(as_f64(self.ingress_limit_bytes));
-        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "high_water")
-            .set(as_f64(self.ingress_high_water_bytes));
-        metrics::gauge!("bifrost_scribe_ingress_watermark_bytes", "mark" => "low_water")
-            .set(as_f64(self.ingress_low_water_bytes));
-    }
-
     /// Decide the pressure-seal release target from the ingress watermarks.
     ///
     /// This is the single, pure hysteresis decision shared by the admission
@@ -327,8 +303,6 @@ pub struct ScribeOwnership {
     active: Arc<Mutex<crate::resources::ScribeMemoryLease>>,
     /// Root-backed lease owning frozen and replay-generation Arrow bytes.
     immutable: Arc<Mutex<crate::resources::ScribeMemoryLease>>,
-    /// Scalar observations emitted only after the corresponding lease transition.
-    lifecycle: Arc<Mutex<ScribeGenerationLifecycleSnapshot>>,
 }
 
 /// Move-only replay identity lease temporarily adopted by immutable ownership.
@@ -377,39 +351,6 @@ impl Drop for ReplayIdentityOwnership {
     }
 }
 
-/// Fixed-size lifecycle observations emitted by the enforcing generation owner.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ScribeGenerationLifecycleSnapshot {
-    /// Active or replay generations planned from exact Arrow ownership.
-    pub plans: u64,
-    /// Exact bytes represented by completed generation plans.
-    pub planned_bytes: usize,
-    /// Active or replay reservations adopted by the generation ledger.
-    pub reservations: u64,
-    /// Exact bytes adopted by those reservations.
-    pub reserved_bytes: usize,
-    /// Materialized active or replay generations admitted to the memtable.
-    pub materializations: u64,
-    /// Exact Arrow bytes materialized by those generations.
-    pub materialized_bytes: usize,
-    /// Active generations transferred into immutable persistence ownership.
-    pub transfers: u64,
-    /// Exact Arrow bytes transferred into immutable ownership.
-    pub transferred_bytes: usize,
-    /// Replay generations reconstructed directly into immutable ownership.
-    pub replay_materializations: u64,
-    /// Exact Arrow bytes reconstructed during replay.
-    pub replay_materialized_bytes: usize,
-    /// Generation reservations terminally released.
-    pub releases: u64,
-    /// Exact active or immutable bytes terminally released.
-    pub released_bytes: usize,
-    /// Exact active Arrow bytes currently retained.
-    pub active_bytes: usize,
-    /// Exact immutable Arrow bytes currently retained through persistence or retirement.
-    pub immutable_bytes: usize,
-}
-
 impl ScribeOwnership {
     /// Create zero-sized active and immutable reservations on one governor.
     ///
@@ -426,7 +367,6 @@ impl ScribeOwnership {
             immutable: Arc::new(Mutex::new(
                 governor.try_reserve_maintenance(MemoryCategory::Immutable, 0)?,
             )),
-            lifecycle: Arc::new(Mutex::new(ScribeGenerationLifecycleSnapshot::default())),
         })
     }
 
@@ -482,37 +422,7 @@ impl ScribeOwnership {
             .map_err(|error| ScribeError::Internal {
                 detail: error.to_string(),
             })?;
-        self.observe(|lifecycle| {
-            lifecycle.plans = lifecycle.plans.saturating_add(1);
-            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
-            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
-            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
-            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
-            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
-            lifecycle.replay_materializations = lifecycle.replay_materializations.saturating_add(1);
-            lifecycle.replay_materialized_bytes =
-                lifecycle.replay_materialized_bytes.saturating_add(bytes);
-            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_add(bytes);
-        });
         Ok(())
-    }
-
-    /// Applies one scalar observation transition without creating a second governor.
-    fn observe(&self, update: impl FnOnce(&mut ScribeGenerationLifecycleSnapshot)) {
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        update(&mut lifecycle);
-    }
-
-    /// Returns the generation lifecycle facts emitted by this enforcing owner.
-    #[must_use]
-    pub(crate) fn lifecycle_snapshot(&self) -> ScribeGenerationLifecycleSnapshot {
-        *self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Grow the active Arrow ownership reservation.
@@ -532,15 +442,6 @@ impl ScribeOwnership {
                 detail: "active memory ledger byte count overflow".to_owned(),
             })?;
         active.resize_ingress(target)?;
-        self.observe(|lifecycle| {
-            lifecycle.plans = lifecycle.plans.saturating_add(1);
-            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
-            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
-            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
-            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
-            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
-            lifecycle.active_bytes = lifecycle.active_bytes.saturating_add(bytes);
-        });
         Ok(())
     }
 
@@ -558,7 +459,6 @@ impl ScribeOwnership {
         &self,
         mut reservation: crate::resources::ScribeMemoryLease,
     ) -> Result<(), ScribeError> {
-        let bytes = reservation.bytes();
         reservation.transfer_category(MemoryCategory::Active)?;
         reservation
             .clear_identity_attribution()
@@ -573,15 +473,6 @@ impl ScribeOwnership {
             .map_err(|error| ScribeError::Internal {
                 detail: error.to_string(),
             })?;
-        self.observe(|lifecycle| {
-            lifecycle.plans = lifecycle.plans.saturating_add(1);
-            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
-            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
-            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
-            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
-            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
-            lifecycle.active_bytes = lifecycle.active_bytes.saturating_add(bytes);
-        });
         Ok(())
     }
 
@@ -602,11 +493,6 @@ impl ScribeOwnership {
                 detail: "active memory ledger byte count underflow".to_owned(),
             })?;
         active.resize_ingress(target)?;
-        self.observe(|lifecycle| {
-            lifecycle.releases = lifecycle.releases.saturating_add(1);
-            lifecycle.released_bytes = lifecycle.released_bytes.saturating_add(bytes);
-            lifecycle.active_bytes = lifecycle.active_bytes.saturating_sub(bytes);
-        });
         Ok(())
     }
 
@@ -657,12 +543,6 @@ impl ScribeOwnership {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?;
         active.transfer_bytes_to(&mut immutable, bytes)?;
-        self.observe(|lifecycle| {
-            lifecycle.transfers = lifecycle.transfers.saturating_add(1);
-            lifecycle.transferred_bytes = lifecycle.transferred_bytes.saturating_add(bytes);
-            lifecycle.active_bytes = lifecycle.active_bytes.saturating_sub(bytes);
-            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_add(bytes);
-        });
         Ok(())
     }
 
@@ -709,11 +589,6 @@ impl ScribeOwnership {
                 detail: "immutable memory ledger byte count underflow".to_owned(),
             })?;
         immutable.resize_ingress(target)?;
-        self.observe(|lifecycle| {
-            lifecycle.releases = lifecycle.releases.saturating_add(1);
-            lifecycle.released_bytes = lifecycle.released_bytes.saturating_add(bytes);
-            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_sub(bytes);
-        });
         Ok(())
     }
 
@@ -760,18 +635,6 @@ impl ScribeOwnership {
                 detail: "immutable memory ledger byte count overflow".to_owned(),
             })?;
         immutable.resize_ingress(target)?;
-        self.observe(|lifecycle| {
-            lifecycle.plans = lifecycle.plans.saturating_add(1);
-            lifecycle.planned_bytes = lifecycle.planned_bytes.saturating_add(bytes);
-            lifecycle.reservations = lifecycle.reservations.saturating_add(1);
-            lifecycle.reserved_bytes = lifecycle.reserved_bytes.saturating_add(bytes);
-            lifecycle.materializations = lifecycle.materializations.saturating_add(1);
-            lifecycle.materialized_bytes = lifecycle.materialized_bytes.saturating_add(bytes);
-            lifecycle.replay_materializations = lifecycle.replay_materializations.saturating_add(1);
-            lifecycle.replay_materialized_bytes =
-                lifecycle.replay_materialized_bytes.saturating_add(bytes);
-            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_add(bytes);
-        });
         Ok(())
     }
 
@@ -906,40 +769,35 @@ mod tests {
         );
     }
 
-    /// Generation observations follow the enforcing active/immutable owner exactly.
+    /// Generation transfers, replay, and retirement move exact root category bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transition leaves bytes in the wrong category or any byte
+    /// behind after retirement.
     #[test]
-    fn generation_lifecycle_reconciles_transfer_replay_and_retirement() {
+    fn generation_ownership_moves_exact_category_bytes() {
         let resources =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let ownership = ScribeOwnership::new(&resources).expect("generation owner");
+        let category =
+            |category: MemoryCategory| resources.memory_snapshot().categories[category as usize];
 
         ownership.reserve_active(128).expect("active reservation");
+        assert_eq!(category(MemoryCategory::Active), 128);
         ownership
             .move_active_to_immutable(128)
             .expect("persistence transfer");
+        assert_eq!(category(MemoryCategory::Active), 0);
+        assert_eq!(category(MemoryCategory::Immutable), 128);
         ownership
             .release_immutable(128)
             .expect("retirement release");
         ownership
             .reserve_immutable(64)
             .expect("replay materialization");
+        assert_eq!(category(MemoryCategory::Immutable), 64);
         ownership.release_immutable(64).expect("replay retirement");
-
-        let lifecycle = ownership.lifecycle_snapshot();
-        assert_eq!(lifecycle.plans, 2);
-        assert_eq!(lifecycle.planned_bytes, 192);
-        assert_eq!(lifecycle.reservations, 2);
-        assert_eq!(lifecycle.reserved_bytes, 192);
-        assert_eq!(lifecycle.materializations, 2);
-        assert_eq!(lifecycle.materialized_bytes, 192);
-        assert_eq!(lifecycle.transfers, 1);
-        assert_eq!(lifecycle.transferred_bytes, 128);
-        assert_eq!(lifecycle.replay_materializations, 1);
-        assert_eq!(lifecycle.replay_materialized_bytes, 64);
-        assert_eq!(lifecycle.releases, 2);
-        assert_eq!(lifecycle.released_bytes, 192);
-        assert_eq!(lifecycle.active_bytes, 0);
-        assert_eq!(lifecycle.immutable_bytes, 0);
         assert_eq!(resources.memory_snapshot().total_bytes(), 0);
     }
 

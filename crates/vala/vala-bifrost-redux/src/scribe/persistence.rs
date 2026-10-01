@@ -10,6 +10,7 @@ use num_traits::ToPrimitive;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
+use tracing::Instrument;
 use vala_sql::ValaPostgres;
 
 use crate::catalog::{TenantTableBinding, TenantTableKey};
@@ -34,10 +35,9 @@ use crate::scribe::staging::{
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
 
-/// Publishes the unlabeled persistence queue gauges before workers accept jobs.
+/// Publishes the unlabeled persistence queue-depth gauge before workers accept jobs.
 fn register_idle_persistence_queue() {
     metrics::gauge!("bifrost_scribe_persistence_queue_depth").set(0.0);
-    metrics::gauge!("bifrost_scribe_persistence_queue_bytes").set(0.0);
 }
 
 /// Removes one claim's scratch directory after a known-unpublished terminal.
@@ -73,29 +73,21 @@ async fn discard_claim_scratch(scratch: crate::resources::ScribeClaimScratch) {
 ///
 /// The end-to-end `bifrost_scribe_persistence_publication_seconds` histogram
 /// measures closed-to-published latency but cannot say which stage dominates.
-/// This extends — never replaces — that histogram with a per-stage split under
-/// `bifrost_scribe_persist_stage_seconds{stage}`, where `stage` is closed to
-/// `{parquet, put, sql_commit}`: the Parquet encode, the object-store put, and
-/// the SQL file-list commit. Each is recorded only after its stage
-/// completes successfully, so a stage that errors and returns early contributes
-/// no sample. The label carries no tenant, table, or object-path identity.
+/// `bifrost_scribe_persist_stage_seconds{stage}` splits it under the closed
+/// `{stage_member, assemble_claim}` set: durably staging one generation's
+/// member, and assembling a claim's members into publication output. Each is
+/// recorded only after its stage completes successfully, so a stage that
+/// errors and returns early contributes no sample. The label carries no
+/// tenant, table, or object-path identity.
 fn record_persist_stage(stage: &'static str, started: std::time::Instant) {
     metrics::histogram!("bifrost_scribe_persist_stage_seconds", "stage" => stage)
         .record(started.elapsed().as_secs_f64());
 }
 
-/// Emits the per-generation compression telemetry pair after a Parquet encode.
+/// Counts one generation's Parquet-encoded bytes after a durable encode.
 ///
-/// Sets `bifrost_scribe_persistence_compression_ratio` (raw Arrow bytes /
-/// encoded Parquet bytes; skipped when `file_size` is zero to avoid division
-/// by zero) and increments
-/// `bifrost_scribe_persistence_encoded_bytes_total` by `file_size`.
-fn emit_compression_telemetry(arrow_bytes: usize, file_size: usize) {
-    if file_size > 0 {
-        let arrow = arrow_bytes.to_f64().unwrap_or(f64::MAX);
-        let encoded = file_size.to_f64().unwrap_or(f64::MAX);
-        metrics::gauge!("bifrost_scribe_persistence_compression_ratio").set(arrow / encoded);
-    }
+/// Increments `bifrost_scribe_persistence_encoded_bytes_total` by `file_size`.
+fn record_encoded_bytes(file_size: usize) {
     metrics::counter!("bifrost_scribe_persistence_encoded_bytes_total")
         .increment(u64::try_from(file_size).unwrap_or(u64::MAX));
 }
@@ -546,8 +538,6 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) geometry: crate::scribe::geometry::ScribeGeometry,
     /// Pod-wide registry the staging runtime moves generation authority in.
     pub(crate) hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
-    /// Pod-wide observation owner the staged and claim lifecycle publishes to.
-    pub(crate) telemetry: Arc<crate::scribe::telemetry::ScribeTelemetry>,
     /// Deterministic fault points used only by test-tier persistence paths.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) faults: PersistenceFaults,
@@ -692,8 +682,7 @@ impl PersistenceRuntime {
         );
         Some(Arc::new(
             crate::scribe::staging_runtime::ScribeStagingRuntime::new(stage, publisher, config)
-                .with_hot_sources(Arc::clone(&context.hot_sources))
-                .with_telemetry(Arc::clone(&context.telemetry)),
+                .with_hot_sources(Arc::clone(&context.hot_sources)),
         ))
     }
 
@@ -715,13 +704,6 @@ impl PersistenceRuntime {
                 metrics::gauge!("bifrost_scribe_persistence_queue_depth").set(
                     state
                         .queued
-                        .load(Ordering::Acquire)
-                        .to_f64()
-                        .unwrap_or(f64::MAX),
-                );
-                metrics::gauge!("bifrost_scribe_persistence_queue_bytes").set(
-                    state
-                        .queued_bytes
                         .load(Ordering::Acquire)
                         .to_f64()
                         .unwrap_or(f64::MAX),
@@ -819,12 +801,6 @@ impl PersistenceRuntime {
             Ok(()) => {
                 metrics::gauge!("bifrost_scribe_persistence_queue_depth").set(
                     self.queued
-                        .load(Ordering::Acquire)
-                        .to_f64()
-                        .unwrap_or(f64::MAX),
-                );
-                metrics::gauge!("bifrost_scribe_persistence_queue_bytes").set(
-                    self.queued_bytes
                         .load(Ordering::Acquire)
                         .to_f64()
                         .unwrap_or(f64::MAX),
@@ -1015,6 +991,24 @@ impl PersistenceRuntime {
             .and_then(|worker| worker.staging.as_ref())
             .map(|staging| staging.published_claims_for_test())
             .unwrap_or_default()
+    }
+
+    /// Returns this pod's staged backlog read from the staging owner.
+    ///
+    /// Default when the pod has no persistence worker or no staging volume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the staging assembler lock is
+    /// poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn staging_backlog_for_test(
+        &self,
+    ) -> Result<crate::scribe::assembly::StagingBacklog, ScribeError> {
+        self.worker
+            .as_ref()
+            .and_then(|worker| worker.staging.as_ref())
+            .map_or(Ok(Default::default()), |staging| staging.backlog())
     }
 
     /// Aborts every retained persistence worker without touching the async join registry.
@@ -1489,11 +1483,33 @@ impl VisibilityPublishGuard {
         Self {
             span: tracing::info_span!(
                 "bifrost.scribe.visibility.publish",
+                tenant = tracing::field::Empty,
+                table = tracing::field::Empty,
+                shard_id = tracing::field::Empty,
+                generation = tracing::field::Empty,
                 outcome = tracing::field::Empty
             ),
             drop_outcome: "failed",
             terminal: false,
         }
+    }
+
+    /// Records the generation this publication persists on its span.
+    ///
+    /// The scrubbed tenant/table pair, shard, and member generation correlate
+    /// the publication with the write trace and the durable staged member.
+    fn correlate(&self, generation: &ImmutableGeneration) {
+        self.span
+            .record("tenant", tracing::field::display(&generation.table_key.0));
+        self.span
+            .record("table", tracing::field::display(&generation.table_key.1));
+        self.span.record("shard_id", generation.shard_id);
+        self.span.record("generation", generation.generation_id.0);
+    }
+
+    /// Returns the publication span so persistence work runs inside it.
+    fn span(&self) -> &tracing::Span {
+        &self.span
     }
 
     /// Changes abandonment after successful pre-commit into cancellation.
@@ -1676,16 +1692,7 @@ impl PersistenceWorker {
         let mut visibility = VisibilityPublishGuard::new();
         visibility.arm_cancellation();
         let generation = Arc::clone(&job.generation);
-        tracing::info!(
-            tenant = %generation.table_key.0,
-            table = %generation.table_key.1,
-            shard_id = generation.shard_id,
-            writer_epoch = generation.stream.writer_epoch.as_i64(),
-            shard_generation = generation.wal_lsn_min.as_u64(),
-            member_generation = generation.generation_id.0,
-            terminal = false,
-            "Scribe immutable generation persistence started"
-        );
+        visibility.correlate(&generation);
         tracing::debug!(
             generation_id = generation.generation_id.0,
             seal_key = %generation.seal_key,
@@ -1693,7 +1700,10 @@ impl PersistenceWorker {
             wal_lsn_max = generation.wal_lsn_max.as_u64(),
             "persisting immutable Scribe generation"
         );
-        let result = self.persist_generation(&generation, &job).await;
+        let result = self
+            .persist_generation(&generation, &job)
+            .instrument(visibility.span().clone())
+            .await;
         let status = if result.is_ok() {
             "published"
         } else {
@@ -1706,12 +1716,13 @@ impl PersistenceWorker {
             "failed"
         };
         if let Err(error) = &result {
-            tracing::warn!(
-                error = %error,
-                generation_id = generation.generation_id.0,
-                seal_key = %generation.seal_key,
-                "persistence job failed"
-            );
+            visibility.span().in_scope(|| {
+                tracing::warn!(
+                    error = %error,
+                    seal_key = %generation.seal_key,
+                    "Scribe generation staging failed"
+                );
+            });
             if let Ok(mut failures) = self.failures.lock() {
                 failures.push(error.to_string());
             }
@@ -1724,17 +1735,6 @@ impl PersistenceWorker {
                 .as_secs_f64(),
         );
         let publication_succeeded = result.is_ok();
-        tracing::info!(
-            tenant = %generation.table_key.0,
-            table = %generation.table_key.1,
-            shard_id = generation.shard_id,
-            writer_epoch = generation.stream.writer_epoch.as_i64(),
-            shard_generation = generation.wal_lsn_min.as_u64(),
-            member_generation = generation.generation_id.0,
-            terminal = true,
-            outcome = if publication_succeeded { "committed" } else { "failed" },
-            "Scribe immutable generation persistence settled"
-        );
         let replay_identity = generation
             .replay_identity
             .lock()
@@ -1952,10 +1952,7 @@ impl PersistenceWorker {
             }
         };
         record_persist_stage("stage_member", staged_started);
-        emit_compression_telemetry(
-            frozen.arrow_bytes,
-            usize::try_from(staged.staged_bytes()).unwrap_or(usize::MAX),
-        );
+        record_encoded_bytes(usize::try_from(staged.staged_bytes()).unwrap_or(usize::MAX));
         let member = staged.member();
         staging.register_member(staged, chrono::Utc::now()).await?;
         Ok(member)
@@ -1967,8 +1964,7 @@ impl PersistenceWorker {
     /// tick, so a key that reached target publishes within one tick and a key
     /// whose writes stopped still publishes once its dwell expires. Concurrent
     /// callers are safe: the assembler hands each due claim to
-    /// exactly one caller. Every published claim counts once in
-    /// `bifrost_scribe_staging_claims_published_total`.
+    /// exactly one caller.
     ///
     /// # Errors
     ///
@@ -1980,7 +1976,6 @@ impl PersistenceWorker {
         let mut published = Vec::new();
         while let Some(claim) = staging.take_claim(chrono::Utc::now())? {
             published.push(self.publish_claim(&staging, &claim).await?);
-            metrics::counter!("bifrost_scribe_staging_claims_published_total").increment(1);
         }
         Ok(published)
     }
@@ -2607,7 +2602,6 @@ mod tests {
                     staging_file_publisher: None,
                     geometry: crate::scribe::geometry::ScribeGeometry::default(),
                     hot_sources: Arc::clone(&hot_sources),
-                    telemetry: Arc::new(crate::scribe::telemetry::ScribeTelemetry::default()),
                     faults: PersistenceFaults::default(),
                 },
                 &Handle::current(),
@@ -2811,18 +2805,12 @@ mod tests {
                 .keys()
                 .filter(|series| series.starts_with("bifrost_scribe_persistence_queue_"))
                 .count(),
-            2
+            1
         );
         assert_eq!(
             snapshot
                 .gauges
                 .get("bifrost_scribe_persistence_queue_depth"),
-            Some(&0.0)
-        );
-        assert_eq!(
-            snapshot
-                .gauges
-                .get("bifrost_scribe_persistence_queue_bytes"),
             Some(&0.0)
         );
 
@@ -2833,99 +2821,30 @@ mod tests {
             drained.gauges.get("bifrost_scribe_persistence_queue_depth"),
             Some(&0.0)
         );
-        assert_eq!(
-            drained.gauges.get("bifrost_scribe_persistence_queue_bytes"),
-            Some(&0.0)
-        );
     }
 
-    /// Per-generation compression telemetry is recorded after a durable persist.
+    /// Per-generation encoded bytes are counted after a durable persist.
     ///
     /// Drives one complete `persist_once` through the real persistence runtime
-    /// using the [`IdlePersistenceFixture`] and asserts that:
-    /// - `bifrost_scribe_persistence_compression_ratio` gauge is set and
-    ///   positive (arrow bytes / encoded bytes > 0);
-    /// - `bifrost_scribe_persistence_encoded_bytes_total` counter is
-    ///   incremented by a positive amount (the Parquet-encoded size).
+    /// using the [`IdlePersistenceFixture`] and asserts that
+    /// `bifrost_scribe_persistence_encoded_bytes_total` is incremented by a
+    /// positive amount (the Parquet-encoded size).
     #[tokio::test(flavor = "current_thread")]
     #[cfg(feature = "test-support")]
-    async fn persist_once_emits_compression_telemetry() {
+    async fn persist_once_counts_encoded_bytes() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         let _guard = metrics::set_default_local_recorder(&recorder);
         let fixture = IdlePersistenceFixture::start().await;
         fixture.submit_and_drain().await;
 
-        let snapshot = recorder.snapshot();
-        let ratio = snapshot
-            .gauges
-            .get("bifrost_scribe_persistence_compression_ratio");
-        assert!(
-            ratio.is_some(),
-            "compression ratio gauge must be set after persist_once"
-        );
-        assert!(
-            *ratio.expect("ratio is present") > 0.0,
-            "compression ratio must be positive"
-        );
-        let encoded_bytes = snapshot
+        let encoded_bytes = recorder
+            .snapshot()
             .counters
-            .get("bifrost_scribe_persistence_encoded_bytes_total");
+            .get("bifrost_scribe_persistence_encoded_bytes_total")
+            .copied();
         assert!(
-            encoded_bytes.is_some(),
-            "encoded bytes counter must be set after persist_once"
-        );
-        assert!(
-            *encoded_bytes.expect("counter is present") > 0_u64,
-            "encoded bytes must be positive"
-        );
-    }
-
-    /// Compression telemetry pins the exact ratio orientation, the exact
-    /// counter increment, and the zero-byte gauge skip in isolation.
-    ///
-    /// [`persist_once_emits_compression_telemetry`] proves the pair is wired
-    /// into a real `persist_once`, but a fixed `arrow_bytes: 1` there cannot
-    /// distinguish a correct `arrow / encoded` orientation from an inverted
-    /// `encoded / arrow` one, nor a `file_size`-valued counter increment from
-    /// a constant one. This test calls [`emit_compression_telemetry`]
-    /// directly with values that make each of those regressions observable.
-    #[test]
-    fn emit_compression_telemetry_pins_formula_and_zero_edge() {
-        let recorder = wyrd_bench::BenchmarkRecorder::new();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-
-        emit_compression_telemetry(400, 100);
-        let snapshot = recorder.snapshot();
-        assert_eq!(
-            snapshot
-                .gauges
-                .get("bifrost_scribe_persistence_compression_ratio"),
-            Some(&4.0),
-            "ratio must be arrow_bytes / file_size, not the inverse"
-        );
-        assert_eq!(
-            snapshot
-                .counters
-                .get("bifrost_scribe_persistence_encoded_bytes_total"),
-            Some(&100_u64),
-            "counter must increment by file_size, not a constant amount"
-        );
-
-        emit_compression_telemetry(400, 0);
-        let snapshot = recorder.snapshot();
-        assert_eq!(
-            snapshot
-                .gauges
-                .get("bifrost_scribe_persistence_compression_ratio"),
-            Some(&4.0),
-            "gauge must be skipped (left unchanged) when file_size is zero"
-        );
-        assert_eq!(
-            snapshot
-                .counters
-                .get("bifrost_scribe_persistence_encoded_bytes_total"),
-            Some(&100_u64),
-            "counter must still increment by zero, leaving the total unchanged"
+            encoded_bytes.is_some_and(|bytes| bytes > 0),
+            "encoded bytes must be counted after persist_once"
         );
     }
 
@@ -2999,28 +2918,25 @@ mod tests {
     ///
     /// Proves [`record_persist_stage`] records into
     /// `bifrost_scribe_persist_stage_seconds{stage}` under the closed
-    /// `{parquet, put, sql_commit}` set and carries no identity labels, so the
+    /// `{stage_member, assemble_claim}` set and carries no identity labels, so the
     /// split extends the end-to-end publication histogram without leaking tenant
     /// or table dimensions.
     #[test]
     fn persist_stage_histograms_split_by_stage() {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         metrics::with_local_recorder(&recorder, || {
-            record_persist_stage("parquet", std::time::Instant::now());
-            record_persist_stage("put", std::time::Instant::now());
-            record_persist_stage("sql_commit", std::time::Instant::now());
+            record_persist_stage("stage_member", std::time::Instant::now());
+            record_persist_stage("assemble_claim", std::time::Instant::now());
         });
         let snapshot = recorder.snapshot();
-        for stage in ["parquet", "put", "sql_commit"] {
+        for stage in ["stage_member", "assemble_claim"] {
             let key = format!("bifrost_scribe_persist_stage_seconds{{stage=\"{stage}\"}}");
             assert!(
                 snapshot.histograms.contains_key(&key),
                 "missing stage histogram {key}"
             );
         }
-        // Match forbidden label *keys* (`name="`), not value substrings: the
-        // legitimate `stage="sql_commit"` value contains "sql" but carries no
-        // sql identity label.
+        // Match forbidden label *keys* (`name="`), not value substrings.
         assert!(!snapshot.histograms.keys().any(|key| {
             ["tenant", "table", "path", "request", "node", "error", "sql"]
                 .iter()

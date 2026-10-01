@@ -77,6 +77,18 @@ pub struct CapturedSpan {
     pub duration_nanos: u64,
     /// Terminal OpenTelemetry status retained without collapsing unset and success.
     pub status: CapturedSpanStatus,
+    /// Events recorded inside this span, in emission order.
+    pub events: Vec<CapturedSpanEvent>,
+}
+
+/// One `tracing` event the production pipeline attached to a finished span.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedSpanEvent {
+    /// Event message as exported by the OpenTelemetry layer.
+    pub name: String,
+    /// Scrubbed event fields, including the exported `level`.
+    pub attributes: BTreeMap<String, String>,
 }
 
 /// Closed terminal status of one captured OpenTelemetry span.
@@ -138,6 +150,23 @@ impl TestTraceCapture {
                             .map_or(0, |duration| {
                                 u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
                             }),
+                        events: span
+                            .events
+                            .iter()
+                            .map(|event| CapturedSpanEvent {
+                                name: event.name.to_string(),
+                                attributes: event
+                                    .attributes
+                                    .iter()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_owned(),
+                                            attribute.value.to_string(),
+                                        )
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
                         status: match &span.status {
                             opentelemetry::trace::Status::Unset => CapturedSpanStatus::Unset,
                             opentelemetry::trace::Status::Ok => CapturedSpanStatus::Ok,

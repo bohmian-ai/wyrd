@@ -1503,7 +1503,7 @@ impl WalSegment {
     /// is poisoned or another write failure occurs.
     pub fn append(&self, record: &WalRecord) -> Result<(), ScribeError> {
         let span =
-            tracing::info_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
+            tracing::debug_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
         let _entered = span.enter();
         let encoded = record.encode();
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
@@ -1539,7 +1539,7 @@ impl WalSegment {
         encoded_len: usize,
     ) -> Result<(), ScribeError> {
         let span =
-            tracing::info_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
+            tracing::debug_span!("bifrost.scribe.wal.append", outcome = tracing::field::Empty);
         let _entered = span.enter();
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (borrowed append)".to_owned(),
@@ -1593,7 +1593,8 @@ impl WalSegment {
 
     /// Force all appended data for this segment to stable storage.
     pub fn sync_data(&self) -> Result<(), ScribeError> {
-        let span = tracing::info_span!("bifrost.scribe.wal.fsync", outcome = tracing::field::Empty);
+        let span =
+            tracing::debug_span!("bifrost.scribe.wal.fsync", outcome = tracing::field::Empty);
         let _entered = span.enter();
         let file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (sync_data)".to_string(),

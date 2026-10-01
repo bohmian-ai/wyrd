@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::contracts::ScribeError;
 use crate::resources::ScribeResources;
-use crate::scribe::telemetry::ScribeTelemetry;
 
 /// Fixed request overhead charged to every accepted append.
 pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
@@ -149,8 +148,6 @@ struct AdmissionInner {
     items: Mutex<usize>,
     /// Shared memory root whose poison refuses new work.
     memory: ScribeResources,
-    /// The pod's one staging and lifecycle observation owner.
-    telemetry: Arc<ScribeTelemetry>,
 }
 
 /// Pod-global admission controller.
@@ -187,18 +184,8 @@ impl AdmissionController {
                 config,
                 items: Mutex::new(0),
                 memory,
-                telemetry: Arc::new(ScribeTelemetry::default()),
             }),
         }
-    }
-
-    /// Returns the pod's one staging and lifecycle observation owner.
-    ///
-    /// Persistence records through the same instance so staged-member and
-    /// claim totals reconcile against one owner.
-    #[must_use]
-    pub(crate) fn telemetry_handle(&self) -> Arc<ScribeTelemetry> {
-        Arc::clone(&self.inner.telemetry)
     }
 
     /// Reserve one in-flight request item without waiting.

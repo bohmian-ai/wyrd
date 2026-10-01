@@ -1010,11 +1010,7 @@ fn assert_recovery_telemetry(
     // presence of their metric families: a registered family carrying only
     // zero-valued samples would satisfy a presence check while proving that
     // this journey never traversed either production owner.
-    let accepted = counter_delta(
-        journey,
-        "bifrost_scribe_rows_total",
-        &[("status", "accepted")],
-    );
+    let accepted = counter_delta(journey, "bifrost_scribe_memtable_rows_inserted_total", &[]);
     // The counter is process-wide and carries no table label, and this process
     // also publishes its own retained audit history through the same Scribe, so
     // the journey's rows are a floor rather than the whole count. Row-for-row
@@ -1022,7 +1018,7 @@ fn assert_recovery_telemetry(
     // which compare identities and a digest, not a volume.
     assert!(
         accepted >= facts.acknowledged_rows as f64,
-        "the production Scribe accepted at least the rows public ingest acknowledged: \
+        "the production Scribe inserted at least the rows public ingest acknowledged: \
          {accepted} vs {}",
         facts.acknowledged_rows
     );

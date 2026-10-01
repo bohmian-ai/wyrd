@@ -65,8 +65,7 @@ use crate::scribe::tail_rpc::FetchLiveTailService;
 pub use crate::scribe::tail_rpc::TonicTailReadTransport;
 
 use crate::scribe::telemetry::{
-    ScribeBucketMemorySnapshot, ScribeIngressLifecycle, ScribeInspectionSnapshot,
-    ScribeRuntimeSnapshot,
+    ScribeBucketMemorySnapshot, ScribeInspectionSnapshot, ScribeRuntimeSnapshot,
 };
 use async_trait::async_trait;
 #[cfg(any(test, feature = "test-support"))]
@@ -243,8 +242,6 @@ struct PersistenceDependencies {
     geometry: geometry::ScribeGeometry,
     /// Pod-wide registry the staging runtime moves generation authority in.
     hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
-    /// Pod-wide observation owner the staged and claim lifecycle publishes to.
-    telemetry: Arc<telemetry::ScribeTelemetry>,
 }
 
 pub struct ScribeImpl {
@@ -285,8 +282,6 @@ pub struct ScribeImpl {
     /// compiled out of a production build.
     #[cfg(any(test, feature = "test-support"))]
     geometry: geometry::ScribeGeometry,
-    /// Shared active/immutable Arrow ownership ledger.
-    memory_ownership: memory::ScribeOwnership,
     /// Bounded persistence CPU lane retained for replay and seal preparation.
     persistence_cpu: ScribePersistenceCpuPool,
     /// Bounded WAL IO lane retained for recovery and writer execution.
@@ -295,8 +290,6 @@ pub struct ScribeImpl {
     ingress_cpu: ScribeIngressCpuPool,
     /// Fixed sixteen-lane shard owners for the live ingest path.
     shards: Arc<shards::ScribeShardRuntime>,
-    /// Fixed-size lifecycle ledger shared by move-only ingress root owners.
-    ingress_lifecycle: Arc<ScribeIngressLifecycle>,
     /// Lifecycle gate closed before shard draining begins.
     closed: AtomicBool,
     /// Coordinates the recoverable running/draining/finalizing/stopped lifecycle.
@@ -1085,7 +1078,6 @@ impl ScribeImpl {
             staging_file_publisher,
             geometry,
             hot_sources,
-            telemetry,
         } = dependencies;
         persistence::PersistenceRuntime::start(
             config,
@@ -1099,7 +1091,6 @@ impl ScribeImpl {
                 staging_file_publisher,
                 geometry,
                 hot_sources,
-                telemetry,
                 #[cfg(any(test, feature = "test-support"))]
                 faults,
             },
@@ -1160,7 +1151,6 @@ impl ScribeImpl {
                     staging_file_publisher: staging_file_publisher.clone(),
                     geometry,
                     hot_sources: Arc::clone(&hot_sources),
-                    telemetry: admission.telemetry_handle(),
                 },
                 &coordination_runtime,
             )
@@ -1175,7 +1165,7 @@ impl ScribeImpl {
                 persistence: persistence.clone(),
                 control_postgres,
                 stream,
-                memory_ownership: memory_ownership.clone(),
+                memory_ownership,
                 hot_sources: Arc::clone(&hot_sources),
             },
             &coordination_runtime,
@@ -1193,13 +1183,11 @@ impl ScribeImpl {
             pressure_config: ScribePressureConfig::new(75, 50, seal_max_age),
             #[cfg(any(test, feature = "test-support"))]
             geometry,
-            memory_ownership,
             hot_sources,
             persistence_cpu,
             wal_io,
             ingress_cpu,
             shards,
-            ingress_lifecycle: Arc::new(ScribeIngressLifecycle::default()),
             closed: AtomicBool::new(false),
             shutdown_state: std::sync::atomic::AtomicU8::new(SHUTDOWN_RUNNING),
             shutdown_notify: tokio::sync::Notify::new(),
@@ -1697,8 +1685,8 @@ impl ScribeImpl {
     /// The independent WAL-disk soft-pressure branch is unchanged.
     ///
     /// As the production steady-state tick, it first exports the governor and
-    /// memtable gauges (D84) so per-child occupancy, the D83 ingress watermarks,
-    /// and the memtable seal-decision inputs are observable every tick. It also
+    /// memtable gauges (D84) so per-child occupancy and the memtable
+    /// seal-decision inputs are observable every tick. It also
     /// emits one debug-level governor snapshot line per tick — child totals,
     /// the derived parent-only remainder, and every per-category total — so a
     /// saturated ceiling can be attributed to its holder from logs alone
@@ -1709,7 +1697,6 @@ impl ScribeImpl {
     pub fn check_age(&self, now: std::time::Instant) {
         let snapshot = self.pressure_snapshot();
         self.memory.emit_root_resource_gauges();
-        snapshot.emit_ingress_watermark_gauges();
         tracing::debug!(
             scribe_total = snapshot.scribe_total_bytes,
             oracle_total = snapshot.oracle_total_bytes,
@@ -2223,17 +2210,25 @@ mod telemetry_tests {
 }
 
 impl ScribeImpl {
-    /// Reports the pod's closed staged-member and claim registry totals.
+    /// Reports the pod's staged backlog from the staging owner.
     ///
-    /// The pod's one retained observation owner records the durability half of
-    /// the pod, so a reconciliation case reads staged
-    /// minus retired members and claims taken minus claims closed from here
-    /// rather than inferring a durable transition from a published object.
-    /// Read-only: nothing here stages, claims, publishes, or retires.
+    /// Live members are every durable staged member not yet retired, ready
+    /// or claimed; outstanding claims are taken and not yet settled. A pod
+    /// without staging reports the empty backlog. Read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the staging assembler lock is
+    /// poisoned.
     #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn staging_totals_for_test(&self) -> crate::scribe::telemetry::ScribeStagingSnapshot {
-        self.admission.telemetry_handle().staging_snapshot()
+    pub fn staging_backlog_for_test(
+        &self,
+    ) -> Result<crate::scribe::assembly::StagingBacklog, ScribeError> {
+        self.persistence
+            .as_ref()
+            .map_or(Ok(Default::default()), |persistence| {
+                persistence.staging_backlog_for_test()
+            })
     }
 
     /// Install a one-shot test barrier at the public write seam.
@@ -2377,8 +2372,6 @@ impl ScribeImpl {
             ingress_memory_limit: memory.ingress_limit_bytes,
             ingress_high_water_memory: memory.ingress_high_water_bytes,
             ingress_low_water_memory: memory.ingress_low_water_bytes,
-            ingress_lifecycle: self.ingress_lifecycle.snapshot(),
-            generation_lifecycle: self.memory_ownership.lifecycle_snapshot(),
         })
     }
 
@@ -2489,19 +2482,19 @@ impl ScribeImpl {
         }
         if let Some(persistence) = &self.persistence {
             let restored = persistence.restore_staging().await?;
-            tracing::info!(
+            tracing::debug!(
                 restored,
                 stream = %self.stream,
                 "Scribe staged members restored before WAL replay"
             );
             let recovered = persistence.recover_staged_publications().await?;
-            tracing::info!(
+            tracing::debug!(
                 recovered,
                 stream = %self.stream,
                 "Scribe staged publications reconciled before WAL replay"
             );
             let resumed = persistence.resume_staging_claims().await?;
-            tracing::info!(
+            tracing::debug!(
                 resumed,
                 stream = %self.stream,
                 "Scribe durable claims resumed before WAL replay"

@@ -3,7 +3,8 @@
 //! Wyrd stores every Slack, PagerDuty, and HTTP credential in Postgres as
 //! envelope ciphertext. [`OperatorKeys`] owns the only other half: reading the
 //! 32-byte KEK that wraps each credential's data key from the configured
-//! source (environment, owner-only file, or HashiCorp Vault KV v2), sealing
+//! source (environment, owner-only file, or HashiCorp Vault KV v2 through the
+//! shared [`wyrd_vault::VaultKv2`] reader the gateway also uses), sealing
 //! and opening secrets under the canonical context, and rewrapping rows onto
 //! the active key version. Keys are read at use and never cached across
 //! operations, so a rotated file or Vault secret takes effect on the next read.
@@ -21,9 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
-use reqwest::Client;
-use secrecy::ExposeSecret as _;
-use serde_json::Value;
+use secrecy::{ExposeSecret as _, SecretString};
 use sqlx::Error as SqlxError;
 use tokio::time::Instant;
 use wyrd_crypt::{EncryptedPayload, Envelope, SecretKey};
@@ -37,12 +36,10 @@ use wyrd_sql::queries::operator_connections::{
 };
 use wyrd_sql::queries::platform::tenants::list_active_tenant_ids;
 use wyrd_sql::{OperatorPool, TenantConn, WyrdPostgres};
+use wyrd_vault::{VaultError, VaultKv2};
 use zeroize::Zeroizing;
 
 use crate::config::{BifrostTarget, OperatorKeySource, OperatorKeysConfig};
-
-/// Deadline of one Vault key read.
-const VAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Rows one tenant rewrap transaction moves at most.
 const REWRAP_BATCH: i64 = 100;
@@ -121,9 +118,9 @@ pub enum KeyError {
         /// Key version used.
         version: i32,
     },
-    /// The Vault HTTP client could not be built with its timeout and
-    /// no-redirect policy, so key reads would run unbounded or follow
-    /// redirects; construction refuses instead.
+    /// The Vault reader could not be built with its bounds and screened,
+    /// non-redirecting egress, or its address is not a URL, so key reads
+    /// would run unbounded or unscreened; construction refuses instead.
     #[error("the Operator key provider HTTP client could not be built")]
     Client,
     /// The configured active version exceeds the persisted `i32` key-version
@@ -220,10 +217,8 @@ fn parts(context: &[String; 5]) -> [&str; 5] {
 
 /// Owner of Operator KEK reads, sealing, opening, and rewrap.
 ///
-/// The derived `Debug` stays selector-free: the configuration prints through
-/// its own redacting `Debug`, and the Vault client holds no default headers
-/// because the token is attached per request.
-#[derive(Debug)]
+/// The configuration prints through its own redacting `Debug`; the Vault
+/// reader is omitted from `Debug` because its address locates key material.
 pub struct OperatorKeys {
     /// Configured source and active version.
     config: OperatorKeysConfig,
@@ -233,9 +228,20 @@ pub struct OperatorKeys {
     /// `i32::MAX`, so the persisted `i32` key version names the same external
     /// key the operator configured.
     active_version: i32,
-    /// Bounded, non-redirecting HTTP client for Vault reads; built only for
+    /// Shared bounded, screened, and pinned KV v2 reader; built only for
     /// the Vault source.
-    http: Option<Client>,
+    vault: Option<VaultKv2>,
+}
+
+impl std::fmt::Debug for OperatorKeys {
+    /// Selector-free debug: the configuration redacts itself and the Vault
+    /// reader is not printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperatorKeys")
+            .field("config", &self.config)
+            .field("active_version", &self.active_version)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for OperatorKeys {
@@ -244,7 +250,7 @@ impl Default for OperatorKeys {
         Self {
             config: OperatorKeysConfig::default(),
             active_version: 1,
-            http: None,
+            vault: None,
         }
     }
 }
@@ -271,36 +277,32 @@ impl OperatorKeys {
 
     /// Build the owner over `config`.
     ///
-    /// The Vault source gets a client with the read deadline and no redirect
-    /// policy after installing Wyrd's Rustls provider, like every other
-    /// server HTTP client; other sources build none.
+    /// The Vault source builds the shared [`VaultKv2`] reader over the
+    /// configured address and mount; other sources build none.
     ///
     /// # Errors
-    /// Returns [`KeyError::Client`] when the TLS provider cannot be installed
-    /// or the client cannot be built, so a Vault read never runs without its
-    /// timeout and redirect policy, and [`KeyError::VersionOutOfRange`] when
+    /// Returns [`KeyError::Client`] when the Vault address is not a URL or the
+    /// reader cannot be built, so a Vault read never runs without its bounds
+    /// and screening, and [`KeyError::VersionOutOfRange`] when
     /// `config.active_version` exceeds `i32::MAX` because the caller skipped
     /// [`OperatorKeysConfig`] validation.
     pub fn new(config: OperatorKeysConfig) -> Result<Self, KeyError> {
         let active_version =
             i32::try_from(config.active_version.get()).map_err(|_| KeyError::VersionOutOfRange)?;
-        let http = match config.source {
-            OperatorKeySource::Vault => {
-                wyrd_tls::install_crypto_provider().map_err(|_| KeyError::Client)?;
+        let vault = match (config.source, &config.vault) {
+            (OperatorKeySource::Vault, Some(vault)) => {
+                let address = url::Url::parse(&vault.addr).map_err(|_| KeyError::Client)?;
                 Some(
-                    Client::builder()
-                        .timeout(VAULT_TIMEOUT)
-                        .redirect(reqwest::redirect::Policy::none())
-                        .build()
+                    VaultKv2::new(address, &vault.mount, None, None)
                         .map_err(|_| KeyError::Client)?,
                 )
             }
-            OperatorKeySource::Env | OperatorKeySource::File => None,
+            _ => None,
         };
         Ok(Self {
             config,
             active_version,
-            http,
+            vault,
         })
     }
 
@@ -351,56 +353,44 @@ impl OperatorKeys {
         decode_key(&encoded).map_err(|failure| self.unavailable(version, failure))
     }
 
-    /// Read `<mount>/data/<prefix>/<tenant>/<version>` field `key` from Vault.
+    /// Read `<mount>/data/<prefix>/<tenant>/<version>` field `key` from Vault
+    /// through the shared reader.
     ///
     /// The token file passes the same owner-only check as key files before
     /// any request is sent.
     ///
     /// # Errors
-    /// Returns the [`KeyFailure`] for a missing Vault section or token, an
-    /// unreadable or loose token file, a transport failure, a 404 (missing)
-    /// or other non-success status, or a response without a string `key`.
+    /// Returns [`KeyFailure::NotConfigured`] for a missing Vault section or
+    /// token, the token file's read failure, [`KeyFailure::Missing`] for an
+    /// absent secret, version, or `key` field, [`KeyFailure::Refused`] for a
+    /// refused read or blocked address, and [`KeyFailure::Transport`] when
+    /// Vault is unreachable or answers unusably.
     async fn vault_key(
         &self,
         tenant: DataTenantId,
         version: i32,
     ) -> Result<Zeroizing<String>, KeyFailure> {
-        let (Some(vault), Some(http)) = (&self.config.vault, &self.http) else {
+        let (Some(vault), Some(reader)) = (&self.config.vault, &self.vault) else {
             return Err(KeyFailure::NotConfigured);
         };
         let token = match (&vault.token_file, &vault.token) {
             (Some(path), _) => {
                 let token = read_owner_only(path.clone()).await?;
-                Zeroizing::new(token.trim().to_owned())
+                SecretString::from(token.as_str())
             }
-            (None, Some(token)) => Zeroizing::new(token.expose_secret().to_owned()),
+            (None, Some(token)) => token.clone(),
             (None, None) => return Err(KeyFailure::NotConfigured),
         };
-        let url = format!(
-            "{}/v1/{}/data/{}/{tenant}/{version}",
-            vault.addr.trim_end_matches('/'),
-            vault.mount.trim_matches('/'),
-            vault.prefix.trim_matches('/')
-        );
-        let response = http
-            .get(url)
-            .header("X-Vault-Token", token.as_str())
-            .send()
+        let path = format!("{}/{tenant}/{version}", vault.prefix.trim_matches('/'));
+        let key = reader
+            .read_field(&token, &path, "key")
             .await
-            .map_err(|_| KeyFailure::Transport)?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(KeyFailure::Missing);
-        }
-        if !status.is_success() {
-            return Err(KeyFailure::Refused);
-        }
-        let body: Value = response.json().await.map_err(|_| KeyFailure::Malformed)?;
-        let key = body
-            .pointer("/data/data/key")
-            .and_then(Value::as_str)
-            .ok_or(KeyFailure::Malformed)?;
-        Ok(Zeroizing::new(key.to_owned()))
+            .map_err(|error| match error {
+                VaultError::Missing => KeyFailure::Missing,
+                VaultError::Refused => KeyFailure::Refused,
+                VaultError::Unavailable => KeyFailure::Transport,
+            })?;
+        Ok(Zeroizing::new(key.expose_secret().to_owned()))
     }
 
     /// Prove the active key of every active provisioned tenant is readable
@@ -676,7 +666,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
-    use secrecy::SecretString;
     use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
     use wiremock::matchers::{header, method, path};

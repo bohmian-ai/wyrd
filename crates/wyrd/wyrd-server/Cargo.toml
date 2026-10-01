@@ -98,6 +98,7 @@ wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
 wyrd-gateway = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-tls = { workspace = true }
+wyrd-vault = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 

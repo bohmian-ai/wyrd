@@ -1,6 +1,6 @@
 ---
 id: SPEC-opitimization-and-benchmarks
-revision: 5
+revision: 6
 status: draft
 ---
 
@@ -18,7 +18,8 @@ change measures it in both roles. It does three things:
 
 1. It reproduces the ClickHouse benchmark (ClickBench) in full against the real
    production `wyrd-server`, on the owner's local machine inside an
-   8-CPU/16-GiB envelope. The results are written in ClickBench's own result
+   16-vCPU/32-GiB envelope, the same shape as ClickBench's reference machine.
+   The results are written in ClickBench's own result
    format with a full description of the environment. For internal analysis
    only, they are compared with ClickHouse's already-published ClickBench
    results. We do not run ClickHouse, and we publish only Bifrost's numbers
@@ -112,8 +113,10 @@ authorization, admission, and read audit.
 
 **REQ-004 — Benchmark machine and environment description.** Every run uses
 the owner's local host, with Bifrost (server plus its Postgres catalog)
-confined to an 8-CPU/16-GiB systemd scope, the same envelope as the internal
-capacity benchmark. Every result carries an environment description: CPU
+confined to a 16-CPU/32-GiB systemd scope, matching the CPU and memory of
+ClickBench's c6a.4xlarge reference. The host (Ryzen 9 9950X, 32 threads,
+91 GiB) fits that scope. The internal capacity benchmark keeps its own
+8-CPU/16-GiB envelope (REQ-010, AC-7). Every result carries an environment description: CPU
 model and the CPUs the scope allows, enforced memory limit, storage device and
 filesystem, kernel, `wyrd-server` version and commit, dataset version, and
 the ClickBench commit. Published Bifrost numbers are always stated against
@@ -125,8 +128,8 @@ result JSON for c6a.4xlarge in the pinned ClickBench commit (the
 self-managed `clickhouse` entry). It supplies ClickHouse's load time, data
 size, and three runs per query. Bifrost's cold and hot times are derived from
 its own three runs exactly as ClickBench derives them from the published ones.
-The published run used a c6a.4xlarge (16 vCPU, 32 GiB, gp2 disk), not this
-machine, so the comparison is a rough internal yardstick, not an
+The published run used a c6a.4xlarge (16 vCPU, 32 GiB, gp2 disk). Our scope
+matches its CPU count and memory but not its CPU model or disk, so the comparison is a rough internal yardstick, not an
 apples-to-apples result, and the report says so.
 
 **REQ-006 — ClickBench metrics and output.** Every Bifrost run produces:
@@ -310,7 +313,7 @@ These hold whatever the architecture documents say:
 
 ## Expensive-to-reverse decisions fixed here
 
-- Bifrost runs on the owner's machine in an 8-CPU/16-GiB envelope. ClickBench
+- Bifrost runs on the owner's machine in a 16-CPU/32-GiB envelope. ClickBench
   ratios compare it with ClickHouse's published c6a.4xlarge results for
   internal analysis only; ClickHouse is never run (REQ-004, REQ-005). The
   observability benchmark uses absolute targets.
@@ -325,7 +328,7 @@ These hold whatever the architecture documents say:
 
 ## Acceptance criteria
 
-AC-2 to AC-6 are Bifrost in the 8-CPU/16-GiB envelope divided by ClickHouse's
+AC-2 to AC-6 are Bifrost in the 16-CPU/32-GiB envelope divided by ClickHouse's
 published c6a.4xlarge results, using the ClickBench `+0.01 s` scoring. They
 are internal targets. AC-8 to AC-12 are absolute targets on Bifrost in the
 same envelope. The proposed targets need owner
@@ -368,11 +371,11 @@ default.
    the leading Parquet-based engines on ClickBench. The cold target is looser because
    Iceberg and object-store metadata cost the most on a cold start. The AC-8 to
    AC-12 absolute targets are starting proposals for an observability store on
-   one 8-CPU/16-GiB node; confirm or change each. The ClickBench ratios
-   compare an 8-CPU Bifrost with a 16-vCPU ClickHouse, so they are harder to
-   meet than on equal hardware.
-2. **D-2 — Machine (decided, revision 5).** The owner's local machine in an
-   8-CPU/16-GiB envelope, described in every result (REQ-004).
+   one 16-CPU/32-GiB node; confirm or change each. The local CPU and NVMe are
+   faster than c6a.4xlarge's CPU and gp2 disk, which flatters the ClickBench
+   ratios, most of all the cold runs.
+2. **D-2 — Machine (decided, revision 6).** The owner's local machine in a
+   16-CPU/32-GiB envelope, described in every result (REQ-004).
 3. **D-3 — Reference answers.** ClickBench publishes no query answers. Choose
    how the committed answer file (REQ-002) is produced: (a) from Bifrost's
    first complete run, hand-checked against facts known about `hits` (total
@@ -463,6 +466,10 @@ default.
   and drops the published-ranking placement; only Bifrost's numbers against
   its declared setup are published. Draft; awaiting owner decisions D-1 and
   D-3 to D-13.
+- Revision 6 (2026-10-01): Owner decision. ClickBench and the observability
+  benchmark run in a 16-CPU/32-GiB envelope, matching ClickBench's reference
+  CPU count and memory; the internal capacity benchmark stays at
+  8-CPU/16-GiB. Draft; awaiting owner decisions D-1 and D-3 to D-13.
 
 ## Authority and context
 

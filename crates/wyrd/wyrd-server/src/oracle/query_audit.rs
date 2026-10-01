@@ -69,12 +69,15 @@ impl OracleQueryAudit {
         let pending = Arc::new(AtomicUsize::new(0));
         let stop = CancellationToken::new();
         let writer = TaskTracker::new();
-        writer.spawn(write_batches(
-            vala,
-            decisions,
-            Arc::clone(&pending),
-            stop.clone(),
-        ));
+        writer.spawn(
+            OracleAuditWriter {
+                vala,
+                decisions,
+                pending: Arc::clone(&pending),
+                stop: stop.clone(),
+            }
+            .run(),
+        );
         writer.close();
         Arc::new(Self {
             queue,
@@ -117,61 +120,79 @@ impl OracleQueryAudit {
     }
 }
 
-/// The writer loop: takes every waiting decision, up to [`BATCH_EVENTS`],
-/// and commits it, until stopped and the queue is empty.
+/// Background writer that drains [`OracleQueryAudit`]'s queue into the
+/// tenant audit outbox.
 ///
-/// After `stop` the queue refuses new decisions, and the writer keeps
-/// committing what was already queued before it exits.
-async fn write_batches(
+/// It is moved into its one task by [`OracleQueryAudit::new`] and owns the
+/// receiving half of the queue for the task's lifetime.
+struct OracleAuditWriter {
+    /// Vala Postgres owner the batches commit through.
     vala: ValaPostgres,
-    mut decisions: mpsc::Receiver<(DataTenantId, AuditEvent)>,
+    /// Receiving half of the decision queue.
+    decisions: mpsc::Receiver<(DataTenantId, AuditEvent)>,
+    /// Count shared with the owner; decremented once a batch is committed or
+    /// counted lost.
     pending: Arc<AtomicUsize>,
+    /// Cancelled by the owner's shutdown to close the queue.
     stop: CancellationToken,
-) {
-    let mut batch = Vec::with_capacity(BATCH_EVENTS);
-    loop {
-        let received = tokio::select! {
-            biased;
-            received = decisions.recv_many(&mut batch, BATCH_EVENTS) => received,
-            () = stop.cancelled() => {
-                decisions.close();
-                decisions.recv_many(&mut batch, BATCH_EVENTS).await
-            }
-        };
-        if received == 0 {
-            return;
-        }
-        commit_batch(&vala, &mut batch).await;
-        pending.fetch_sub(received, Ordering::AcqRel);
-    }
 }
 
-/// Commits one drained batch, one transaction per tenant, in queue order.
-///
-/// A tenant whose acquire, append, or commit fails has each of its decisions
-/// counted and logged as lost; other tenants in the batch still commit.
-/// Leaves `batch` empty.
-async fn commit_batch(vala: &ValaPostgres, batch: &mut Vec<(DataTenantId, AuditEvent)>) {
-    // ponytail: linear tenant grouping; a map when one batch spans many tenants.
-    let mut tenants: Vec<(DataTenantId, Vec<AuditEvent>)> = Vec::new();
-    for (tenant, event) in batch.drain(..) {
-        match tenants.iter_mut().find(|(owner, _)| *owner == tenant) {
-            Some((_, events)) => events.push(event),
-            None => tenants.push((tenant, vec![event])),
+impl OracleAuditWriter {
+    /// The writer loop: takes every waiting decision, up to [`BATCH_EVENTS`],
+    /// and commits it, until stopped and the queue is empty.
+    ///
+    /// After `stop` the queue refuses new decisions, and the writer keeps
+    /// committing what was already queued before it exits.
+    async fn run(mut self) {
+        let mut batch = Vec::with_capacity(BATCH_EVENTS);
+        loop {
+            let received = tokio::select! {
+                biased;
+                received = self.decisions.recv_many(&mut batch, BATCH_EVENTS) => received,
+                () = self.stop.cancelled() => {
+                    self.decisions.close();
+                    self.decisions.recv_many(&mut batch, BATCH_EVENTS).await
+                }
+            };
+            if received == 0 {
+                return;
+            }
+            self.commit_batch(&mut batch).await;
+            self.pending.fetch_sub(received, Ordering::AcqRel);
         }
     }
-    for (tenant, events) in tenants {
-        let committed = async {
-            let mut conn = vala.tenant_conn(tenant).await.map_err(|e| e.to_string())?;
-            append_audit_batch(&mut conn, &events)
-                .await
-                .map_err(|e| e.to_string())?;
-            conn.commit().await.map_err(|e| e.to_string())
+
+    /// Commits one drained batch, one transaction per tenant, in queue order.
+    ///
+    /// A tenant whose acquire, append, or commit fails has each of its
+    /// decisions counted and logged as lost; other tenants in the batch still
+    /// commit. Leaves `batch` empty.
+    async fn commit_batch(&self, batch: &mut Vec<(DataTenantId, AuditEvent)>) {
+        // ponytail: linear tenant grouping; a map when one batch spans many tenants.
+        let mut tenants: Vec<(DataTenantId, Vec<AuditEvent>)> = Vec::new();
+        for (tenant, event) in batch.drain(..) {
+            match tenants.iter_mut().find(|(owner, _)| *owner == tenant) {
+                Some((_, events)) => events.push(event),
+                None => tenants.push((tenant, vec![event])),
+            }
         }
-        .await;
-        if let Err(error) = committed {
-            for event in &events {
-                record_commit_failure(event, &error);
+        for (tenant, events) in tenants {
+            let committed = async {
+                let mut conn = self
+                    .vala
+                    .tenant_conn(tenant)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                append_audit_batch(&mut conn, &events)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                conn.commit().await.map_err(|e| e.to_string())
+            }
+            .await;
+            if let Err(error) = committed {
+                for event in &events {
+                    record_commit_failure(event, &error);
+                }
             }
         }
     }

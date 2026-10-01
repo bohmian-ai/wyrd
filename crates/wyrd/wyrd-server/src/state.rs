@@ -834,30 +834,44 @@ where
 /// Withdraws this Scribe role once its WAL faults.
 ///
 /// A WAL integrity or ambiguous-mutation fault is role-local: the writer has
-/// already refused new appends, so this closes local readiness, stops the
-/// heartbeat advertising it, and marks the exact durable fence unready so no
-/// peer routes ingest or live-tail reads here. Accepted work keeps draining
+/// already refused new appends, so the monitor closes local readiness, stops
+/// the heartbeat advertising it, and marks the exact durable fence unready so
+/// no peer routes ingest or live-tail reads here. Accepted work keeps draining
 /// through the running shard and persistence owners, WAL and staged files are
 /// kept, and the process supervisor is never asked to exit. Only a restart,
 /// whose replay finishes before Scribe reports ready, restores the role.
-async fn run_scribe_wal_fault_monitor(
+struct ScribeWalFaultMonitor {
+    /// Cancelled by the WAL writer when it faults.
     fault: CancellationToken,
+    /// Durable cluster registry holding this Scribe's fence.
     cluster: Arc<ClusterRegistry>,
+    /// Exact fence registration withdrawn on fault.
     registered_role: RegisteredRole,
+    /// Local Scribe lifecycle moved to draining on fault.
     lifecycle: RoleLifecycle,
+    /// Readiness flag the heartbeat advertises; cleared on fault.
     advertise_ready: Arc<AtomicBool>,
+    /// Role shutdown; ends the monitor without withdrawing anything.
     shutdown: CancellationToken,
-) {
-    tokio::select! {
-        () = shutdown.cancelled() => return,
-        () = fault.cancelled() => {}
-    }
-    advertise_ready.store(false, Ordering::Release);
-    lifecycle.begin_draining();
-    metrics::gauge!("bifrost_role_ready", "role" => "scribe").set(0.0);
-    tracing::error!("Scribe WAL faulted; withdrawing Scribe readiness and its cluster fence");
-    if let Err(error) = cluster.deactivate(&registered_role).await {
-        tracing::error!(%error, "failed to withdraw the Scribe fence after a WAL fault");
+}
+
+impl ScribeWalFaultMonitor {
+    /// Waits for the WAL fault or role shutdown, and on a fault withdraws
+    /// local readiness, the heartbeat advertisement, and the durable fence.
+    ///
+    /// A failed fence withdrawal is logged; local readiness is already closed.
+    async fn run(self) {
+        tokio::select! {
+            () = self.shutdown.cancelled() => return,
+            () = self.fault.cancelled() => {}
+        }
+        self.advertise_ready.store(false, Ordering::Release);
+        self.lifecycle.begin_draining();
+        metrics::gauge!("bifrost_role_ready", "role" => "scribe").set(0.0);
+        tracing::error!("Scribe WAL faulted; withdrawing Scribe readiness and its cluster fence");
+        if let Err(error) = self.cluster.deactivate(&self.registered_role).await {
+            tracing::error!(%error, "failed to withdraw the Scribe fence after a WAL fault");
+        }
     }
 }
 
@@ -928,14 +942,17 @@ impl Scribe {
         let heartbeat_abort = heartbeat.abort_handle();
         let snapshot_poller_abort = snapshot_poller.abort_handle();
         let lifecycle = RoleLifecycle::serving();
-        let wal_fault_monitor = tokio::spawn(run_scribe_wal_fault_monitor(
-            ingest.wal_fault(),
-            Arc::clone(&cluster),
-            registered_role.clone(),
-            lifecycle.clone(),
-            Arc::clone(&advertise_ready),
-            role_shutdown.clone(),
-        ));
+        let wal_fault_monitor = tokio::spawn(
+            ScribeWalFaultMonitor {
+                fault: ingest.wal_fault(),
+                cluster: Arc::clone(&cluster),
+                registered_role: registered_role.clone(),
+                lifecycle: lifecycle.clone(),
+                advertise_ready: Arc::clone(&advertise_ready),
+                shutdown: role_shutdown.clone(),
+            }
+            .run(),
+        );
         let wal_fault_monitor_abort = wal_fault_monitor.abort_handle();
         Self {
             ingest,

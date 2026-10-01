@@ -314,3 +314,42 @@ failure without weakening the gate.
 Route this task directly to `$wyrd-implement`. A later `$wyrd-task-review`
 must reassess the complete original base-to-remediated-candidate range against
 TASK-003 and approved spec revision 5.
+
+## Implementation evidence
+
+Status: `IMPLEMENTED`. FIND-TASK-003-1 and R1-AC-01 follow the human direction
+`human-direction-FIND-TASK-003-1.md` (commit `87c190b76`), which replaces the
+strict-refusal correction above: RFC 9207 is applied conditionally and no
+provider is refused for not advertising issuer support.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R1-AC-01 (per human direction) | `CallbackQuery.iss` (`wyrd-spec/src/auth/oidc.rs`); `ProviderMetadata.authorization_response_iss_parameter_supported` (`wyrd-auth-oidc/src/provider.rs`); `verify_response_issuer` before token IO in `AuthorizationCodeExchange` (`wyrd-auth/src/callback.rs`); route forwards `iss`; residual exposure documented in `architecture/wyrd-security-posture.md` and `self-hosting/sso-and-oidc.svx`; schemas regenerated | `auth::oidc::tests::callback_query_retains_the_response_issuer`, `..._tolerates_unrelated_provider_parameters`, `callback::response_issuer_tests::response_issuer_is_bound_exactly_and_required_only_when_advertised`, `provider::tests::discover_projects_authorization_response_issuer_support`, journey `tenant_callback_issuer_binding_journey` (non-advertising provider tested+activated; matching/absent completes; mismatched / trailing-slash / absent-from-advertiser refused with 0 token calls, audited, state consumed); `codegen:check` | PASS |
+| R1-AC-02 | `BrowserSessions::exchange_api_key` routes through `ExchangeApiKey::execute` or one `verify_presented(.., None)` | `exchange_api_key::pg_tests::every_browser_api_key_sign_in_costs_exactly_one_verification` and `..::every_invalid_api_key_costs_exactly_one_verification` (task's `tests::` selector does not exist; module is `pg_tests`) | PASS |
+| R1-AC-03 | `ServerSessions.metadata` resolves hints via `read` | vitest `production chooser lists only server-verified tenant sessions`, `production chooser clears forged, expired, duplicate and mismatched hints`; journey `production multi-provider tenant switch` | PASS |
+| R1-AC-04 | `SealedSecretTable` browser-session variants (`wyrd-sql/.../human_connections.rs`), CAS on old bytes, keyless boot; docs updated | `boot::sealing_boot_pg_tests::keyless_boot_refuses_while_a_browser_session_envelope_remains`, `..::keyless_boot_refuses_only_when_ciphertext_is_stored`; journey `browser_session_sealing_rotation_journey` | PASS |
+| R1-AC-05 | `serverUrl()` in `upstream.ts` | vitest `https server origin is accepted`, `loopback http server origin is accepted`, `non-loopback http server origin is refused before fetch` | PASS |
+| R1-AC-06 | `identity_ui_e2e.rs` host tenants; `production-auth.integration.test.ts` scenarios | filtered UI journeys `production multi-provider tenant switch`, `production provider replacement settings`, `production SSO crosses replicas`, `OIDC-off credential UI` | PASS |
+| R1-AC-07 | rustdoc on `BrowserSessions` `Debug::fmt`, `CreatedResponse::from`, `env_opt`, `parse_bff_service_key_hashes` | `config::tests::bff_service_key_hashes_accept_at_most_two_digests`; `lints` | PASS |
+| R1-AC-08 | `BrowserSessionView.tenant_id`, `ReadResponse.tenant_id`, TS `Read`/`ServerSession`, `context()` | vitest `production tenant context carries the server tenant id outside page metadata` | PASS |
+| R1-AC-09 | `SessionLifetime` deleted; one `Duration` bind, `statement_timestamp()` expiry | `test:sql`; no `SessionLifetime` symbol in `crates/` | PASS |
+
+Broader verification, all exit 0 in this session after the last code commit
+(`1cf0124f6`): `pnpm test` (wyrd-ui), `pnpm check`, `mise run
+test:identity:journey` (UI 4/4, identity_e2e 30/30), `mise run test:wyrd`
+(2342 passed), `mise run test:sql`, `mise run codegen:check`, `mise run
+check:tenant-isolation`, `mise run docs:check`, `mise run fmt`, `mise run
+lints`, `git diff --check`.
+
+Notes and limits:
+- The second AC-003 provider is Keycloak realm `wyrd-test-2`, not Dex: Dex
+  ignores `prompt=none`, so it fails Wyrd's existing connection test
+  (`409 WYRD_AUTH_409_CONNECTION_NOT_TESTED`). Dex is therefore not activatable
+  today; that is unchanged by this remediation.
+- `iss` is compared exactly with `LoginState.issuer`, which is stored without a
+  trailing slash; a provider that sends `iss` with a trailing slash would be
+  refused.
+- Expired, unpurged browser-session rows are excluded from the rewrap inventory
+  and the keyless-boot decision; they cannot be opened.
+- Non-goals remained excluded; no new dependency, feature, harness, callback
+  route, or compatibility alias was added.

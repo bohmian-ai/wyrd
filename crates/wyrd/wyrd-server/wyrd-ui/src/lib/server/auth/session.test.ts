@@ -36,10 +36,14 @@ test('cookie is opaque and page metadata excludes session authority', () => {
 test('request hook rejects expiry and disabled local identity before tenant loads execute', async () => {
   const resolve = vi.fn();
   const expired = sessions.create(Date.now() - sessionLifetime);
-  const cookies = { get: vi.fn(() => expired), delete: vi.fn() };
+  const cookies = {
+    get: vi.fn((name: string) => (name === 'wyrd_session' ? expired : undefined)),
+    delete: vi.fn()
+  };
   const event = {
     locals: {},
     params: { tenantKey: 'acme' },
+    route: { id: '/t/[tenantKey]' },
     cookies,
     setHeaders: vi.fn(),
     request: new Request('http://localhost/t/acme', { method: 'POST' }),
@@ -62,7 +66,7 @@ test('request hook rejects expiry and disabled local identity before tenant load
   });
   expect(resolve).not.toHaveBeenCalled();
   const id = sessions.create();
-  cookies.get.mockReturnValue(id);
+  cookies.get.mockImplementation((name: string) => (name === 'wyrd_session' ? id : undefined));
   env.WYRD_UI_LOCAL_AUTH = 'false';
   try {
     await expect(handle({ event, resolve })).rejects.toMatchObject({ status: 401 });

@@ -76,14 +76,15 @@ const COMPLETE_LOGIN_STATE_SQL: &str = r#"
 /// Redeem a completed login once by its initiation binding.
 ///
 /// Deletes the RLS tenant's completed, unexpired row bound to either the
-/// browser flow hash or the CLI handoff id and returns its sealed session.
-/// Deletion is the one-use guarantee: a second redemption matches nothing.
+/// browser flow hash or the CLI handoff id and returns its sealed session and
+/// the connection the login went through. Deletion is the one-use guarantee:
+/// a second redemption matches nothing.
 const REDEEM_LOGIN_COMPLETION_SQL: &str = r#"
     DELETE FROM wyrd.auth_login_state
      WHERE (browser_flow_hash = $1 OR cli_handoff_id = $2)
        AND completion_sealed IS NOT NULL
        AND expires_at > statement_timestamp()
-    RETURNING completion_sealed
+    RETURNING completion_sealed, connection_id
 "#;
 
 /// The `(browser_flow_hash, cli_handoff_id)` column pair of an initiation;
@@ -136,6 +137,16 @@ pub struct LoginState {
     pub nonce: String,
     /// How the login was initiated and what redeems its completion.
     pub initiation: LoginInitiation,
+}
+
+/// A completed login removed by [`redeem_login_completion`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RedeemedLogin {
+    /// The issued session, sealed under the deployment keyring.
+    #[sqlx(rename = "completion_sealed")]
+    pub sealed: Vec<u8>,
+    /// The human connection the login went through.
+    pub connection_id: Uuid,
 }
 
 /// Raw consumed row as returned by [`CONSUME_LOGIN_STATE_SQL`].
@@ -255,7 +266,8 @@ pub async fn complete_login_state(
 }
 
 /// Delete this tenant's completed, unexpired row recorded for `initiation`
-/// and return its sealed completion; `None` when there is none.
+/// and return its sealed completion and login connection; `None` when there
+/// is none.
 ///
 /// The delete is the single use: a second redemption finds nothing.
 ///
@@ -264,9 +276,9 @@ pub async fn complete_login_state(
 pub async fn redeem_login_completion(
     conn: &mut TenantConn<'_>,
     initiation: &LoginInitiation,
-) -> Result<Option<Vec<u8>>, sqlx::Error> {
+) -> Result<Option<RedeemedLogin>, sqlx::Error> {
     let (flow_hash, handoff_id) = initiation_columns(initiation);
-    sqlx::query_scalar::<_, Vec<u8>>(REDEEM_LOGIN_COMPLETION_SQL)
+    sqlx::query_as::<_, RedeemedLogin>(REDEEM_LOGIN_COMPLETION_SQL)
         .bind(flow_hash)
         .bind(handoff_id)
         .fetch_optional(&mut **conn.transaction())

@@ -38,7 +38,8 @@
     ['Cards', '/cards'],
     ['Observe', '/observe'],
     ['Changes', '/changes'],
-    ['Query', '/query']
+    ['Query', '/query'],
+    ['Settings', '/settings']
   ];
   let base = $derived(`/t/${encodeURIComponent(tenant.key)}`);
   let area = $derived(
@@ -83,7 +84,7 @@
         {#if session.tenants.length > 1}
           <details class="tenant-menu">
             <summary aria-label="Current tenant">{tenant.name}</summary>
-            <TenantChooser {session} />
+            <TenantChooser {session} from={tenant.key} />
           </details>
         {:else}
           <span aria-label="Current tenant">{tenant.name}</span>
@@ -92,6 +93,7 @@
           <summary>{session.subject.name}</summary>
           <form method="POST" action="/?/logout">
             <input type="hidden" name="csrf" value={session.csrf} />
+            <input type="hidden" name="tenantKey" value={tenant.key} />
             <button class="app-control" type="submit">Sign out</button>
           </form>
         </details>

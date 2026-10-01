@@ -44,7 +44,13 @@
         <details class="error-details"><summary>Technical details</summary><code>{issue.code}</code></details>
       </div>
     {/if}
-    {#if !data.session}
+    {#if !data.session && data.tenantEntry}
+      <form class="tenant-entry" method="POST" action="?/tenant">
+        <label for="tenant-key">Tenant</label>
+        <input id="tenant-key" class="app-input" name="tenantKey" required autocomplete="organization" placeholder="acme" pattern="[a-z0-9][a-z0-9_\-]{0,62}" />
+        <button class="app-control primary sign-in" type="submit">Continue to sign-in</button>
+      </form>
+    {:else if !data.session}
       <form method="POST" action="?/login"><button class="app-control primary sign-in" type="submit">Sign in with SSO</button></form>
     {:else if reauthentication}
       <p>This tenant requires a fresh sign-in before you continue.</p>
@@ -189,6 +195,13 @@
     display: block;
     margin-top: 8px;
     overflow-wrap: anywhere;
+  }
+  .tenant-entry {
+    display: grid;
+    gap: 10px;
+  }
+  .tenant-entry label {
+    font: 700 11px var(--font-mono);
   }
   .access-help {
     text-align: center;

@@ -8,6 +8,7 @@
 //! query-file macros.
 
 pub mod api_keys;
+pub mod browser_sessions;
 pub mod human_connections;
 pub mod login_state;
 pub mod refresh_tokens;
@@ -23,6 +24,10 @@ pub mod workload_bindings;
 pub use api_keys::{
     ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, revoke_api_key,
 };
+pub use browser_sessions::{
+    BrowserSessionMode, BrowserSessionWrite, LockedBrowserSession, SessionLifetime,
+    insert_browser_session, lock_browser_session, revoke_browser_session, rotate_browser_session,
+};
 pub use human_connections::{
     HumanConnectionWrite, SealedSecretRow, SealedSecretTable, deactivate_active_human_connection,
     human_candidate_test_is_current, human_connection_in_state, human_connection_is_active,
@@ -31,7 +36,7 @@ pub use human_connections::{
     sealed_tenant_secrets, stamp_human_candidate_tested, swap_sealed_tenant_secret,
 };
 pub use login_state::{
-    LoginState, complete_login_state, consume_login_state, insert_login_state,
+    LoginState, RedeemedLogin, complete_login_state, consume_login_state, insert_login_state,
     redeem_login_completion,
 };
 pub use refresh_tokens::{

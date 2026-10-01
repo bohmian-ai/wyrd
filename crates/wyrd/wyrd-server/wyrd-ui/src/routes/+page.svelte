@@ -47,7 +47,7 @@
     {#if !data.session && data.tenantEntry}
       <form class="tenant-entry" method="POST" action="?/tenant">
         <label for="tenant-key">Tenant</label>
-        <input id="tenant-key" class="app-input" name="tenantKey" required autocomplete="organization" placeholder="acme" pattern="[a-z0-9][a-z0-9_\-]{0,62}" />
+        <input id="tenant-key" class="app-input" name="tenantKey" required autocomplete="organization" placeholder="acme" pattern={'[a-z0-9][a-z0-9_\\-]{0,62}'} />
         <button class="app-control primary sign-in" type="submit">Continue to sign-in</button>
       </form>
     {:else if !data.session}

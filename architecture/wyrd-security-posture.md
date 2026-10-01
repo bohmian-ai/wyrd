@@ -208,6 +208,28 @@ credential.
   administrative credential.
 - Unknown issuers, unknown keys after one bounded refresh, unavailable JWKS,
   invalid claims, and ambiguous claim mappings fail authentication.
+- Every tenant shares one human-login callback, so authorization responses are
+  bound to their issuer (RFC 9207) after the login state is consumed and
+  before any token-endpoint request: a present `iss` must equal the issuer the
+  login state recorded, byte for byte, and an absent `iss` is refused when the
+  provider's discovery advertises
+  `authorization_response_iss_parameter_supported`. Either refusal is audited
+  as a denied exchange and stores no completion or session. Support is not
+  required to test or activate a connection, so providers that neither send
+  nor advertise `iss` (Microsoft Entra ID, Okta, Auth0) still work; for them
+  server-bound state, PKCE, and ID-token issuer validation are the controls.
+- Residual mix-up exposure: an authorization response without `iss` cannot
+  be attributed to an issuer before the code is redeemed. Exploiting that
+  requires a malicious tenant connection on the shared callback: a person
+  begins login through the attacker's connection, its provider bounces them
+  to an honest provider that sends no `iss`, and Wyrd redeems the honest
+  provider's code, with the login's PKCE verifier, at the attacker's token
+  endpoint. That can disclose a code the attacker may redeem at the honest
+  provider for a public client; it never yields a Wyrd session for the
+  victim, because the ID token must still verify under the attacker
+  connection's own issuer and tenant. Honest providers that send `iss` are
+  not exposed. Per-connection callback URLs would close the gap and are the
+  upgrade path if it ever needs closing.
 
 ## Wyrd signing keys and JWKS
 

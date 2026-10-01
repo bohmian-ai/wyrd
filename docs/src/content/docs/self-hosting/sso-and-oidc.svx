@@ -50,6 +50,12 @@ PUT /v1/identity/oidc/candidate
 
 Activation is guarded twice. The Candidate must carry an unexpired test for exactly that revision, so a stale or failed test, or a provider outage, fails closed with `WYRD_AUTH_409_CONNECTION_NOT_TESTED`. And `recovery_api_key` must be a live API key of a headless principal in the same tenant that holds `identity_connections:write`. That proves a way back in exists that does not depend on the new IdP. The key is checked and discarded: it is never stored, logged, or audited. A stale revision, an invalid recovery key, or a competing change returns `WYRD_AUTH_409_CONNECTION_CONFLICT`.
 
+### Issuer binding on the shared callback
+
+Every tenant shares `/auth/callback`, so Wyrd binds each authorization response to its issuer ([RFC 9207](https://www.rfc-editor.org/rfc/rfc9207)) before it redeems the code. If the provider returns `iss`, it must equal the connection's issuer exactly. If the provider's discovery document advertises `authorization_response_iss_parameter_supported: true`, `iss` is also required. Either refusal is `WYRD_AUTH_401_INVALID_TOKEN`, is audited, and makes no token-endpoint request; the person starts a new login. Providers that do not advertise support, such as Microsoft Entra ID, Okta, and Auth0, still test, activate, and sign in normally; for them, Wyrd relies on its server-bound login state, PKCE, and ID-token issuer validation. Other response parameters, such as Keycloak's `session_state`, are ignored.
+
+For those providers one mix-up path remains: someone who controls another tenant's connection could have a code from an honest provider that sends no `iss` redeemed at their token endpoint. It does not give them a Wyrd session for the victim. Per-connection callback URLs would close this gap and are the planned upgrade if it ever needs closing.
+
 Every replica reads the Active connection from Postgres on each login, so activation, rotation, and deactivation take effect on all replicas without a restart. Replacing or deactivating a connection stops its users' refresh immediately; access tokens already issued stay valid until they expire, at most five minutes. A user from a replacement provider is a new User even when the email matches, and group-map changes apply at the user's next token issuance.
 
 ### Upgrading from Human trusted issuers

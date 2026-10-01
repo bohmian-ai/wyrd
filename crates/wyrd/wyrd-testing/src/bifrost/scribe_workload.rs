@@ -686,84 +686,59 @@ pub struct ScribeDrainObservationV1 {
     pub wal_streams: u64,
     /// Supervised tasks still retained when the pod stopped.
     pub supervised_tasks: u64,
-    /// Storage-owner reconciliation the pod's production teardown left behind.
+    /// Storage-owner state the pod's production teardown left behind.
     ///
     /// Optional because a topology with no composed storage owner still drains;
     /// present for every real pod. Carried here rather than reduced to a
-    /// boolean so a consumer can assert the owner's lifecycle, its balanced
-    /// starts and terminals, and its zero anomalies rather than a summary of
-    /// them.
+    /// boolean so a consumer can assert the owner's lifecycle and each live
+    /// count rather than a summary of them.
     #[serde(default)]
     pub storage: Option<ScribeStorageDrainObservationV1>,
 }
 
-/// One pod's terminal storage-owner reconciliation, in wire-portable form.
+/// One pod's terminal storage-owner state, in wire-portable form.
 ///
-/// A serializable projection of the production owner's retained snapshot: the
-/// record travels between processes, and the owner's own snapshot type is a
-/// live in-process observation rather than a contract. Every field is a total
-/// or a settled live count, so a drained pod's state is a set of equalities.
+/// A serializable projection of the owners' own state — the request
+/// settlement teardown waits on and the metadata cache's state lock — read
+/// after production teardown. Rates and totals are not part of it: those are
+/// process-lifetime production metrics, read from the telemetry capture.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScribeStorageDrainObservationV1 {
-    /// The owner's retained lifecycle label at teardown.
+    /// The owner's lifecycle label at teardown.
     pub lifecycle: String,
-    /// Metadata loads started by an owning caller.
-    pub load_starts: u64,
-    /// Terminal metadata loads, summed across outcomes.
-    pub load_terminals: u64,
-    /// Successful entries still retained.
+    /// Successful metadata entries still retained.
     pub resident_entries: u64,
-    /// Charged bytes still retained.
+    /// Charged metadata bytes still retained.
     pub resident_bytes: u64,
-    /// Loads with an owner and no terminal result.
+    /// Metadata loads with an owner and no terminal result.
     pub inflight_loads: u64,
-    /// Callers still joined to another caller's load.
+    /// Callers still joined to an in-flight metadata load.
     pub waiters: u64,
-    /// Logical governed storage requests admitted.
-    pub request_starts: u64,
-    /// Terminal governed storage requests, summed across outcomes.
-    pub request_terminals: u64,
-    /// Logical requests still admitted with no terminal.
+    /// Logical governed storage requests still admitted.
     pub active_requests: u64,
-    /// Attempts admitted after a logical read's first attempt.
-    pub request_retries: u64,
-    /// Lookups a resident entry satisfied.
-    pub cache_hits: u64,
-    /// Lookups that elected this caller as the loader.
-    pub cache_misses: u64,
-    /// Lookups that joined another caller's in-flight load.
-    pub cache_joins: u64,
-    /// Lookups the cache did not participate in.
-    pub cache_bypasses: u64,
-    /// Bypasses taken because this composition booted with no cache at all.
-    pub cache_bypasses_disabled: u64,
-    /// Settlements that had no matching admission; always zero when correct.
-    pub anomalies: u64,
 }
 
 impl ScribeStorageDrainObservationV1 {
-    /// Projects one production owner snapshot into the portable record.
+    /// Projects one production owner inspection into the portable record.
+    ///
+    /// A composition with no metadata cache reports every cache count as zero,
+    /// which is exactly what it holds.
     #[must_use]
-    pub fn from_snapshot(snapshot: &vala_bifrost_redux::storage::MetadataCacheSnapshot) -> Self {
-        use vala_bifrost_redux::storage::{CacheEffect, CacheEffectReason};
+    pub fn from_inspection(inspection: &vala_bifrost_redux::storage::StorageInspection) -> Self {
+        use vala_bifrost_redux::storage::StorageLifecycle;
+        let cache = inspection.metadata_cache;
         Self {
-            lifecycle: snapshot.lifecycle().as_str().to_owned(),
-            load_starts: snapshot.load_starts(),
-            load_terminals: snapshot.load_terminals(),
-            resident_entries: snapshot.resident_entries(),
-            resident_bytes: snapshot.resident_bytes(),
-            inflight_loads: snapshot.inflight_loads(),
-            waiters: snapshot.waiters(),
-            request_starts: snapshot.request_starts(),
-            request_terminals: snapshot.request_terminals(),
-            active_requests: snapshot.active_requests(),
-            request_retries: snapshot.request_retries(),
-            cache_hits: snapshot.effect(CacheEffect::Hit),
-            cache_misses: snapshot.effect(CacheEffect::Miss),
-            cache_joins: snapshot.effect(CacheEffect::Join),
-            cache_bypasses: snapshot.effect(CacheEffect::Bypass),
-            cache_bypasses_disabled: snapshot.reason(CacheEffectReason::Disabled),
-            anomalies: snapshot.anomalies(),
+            lifecycle: match inspection.lifecycle {
+                StorageLifecycle::Open => "open",
+                StorageLifecycle::Closing => "closing",
+                StorageLifecycle::Closed => "closed",
+            }
+            .to_owned(),
+            resident_entries: cache.map_or(0, |cache| cache.resident_entries),
+            resident_bytes: cache.map_or(0, |cache| cache.resident_bytes),
+            inflight_loads: cache.map_or(0, |cache| cache.inflight_loads),
+            waiters: cache.map_or(0, |cache| cache.waiters),
+            active_requests: u64::try_from(inspection.active_requests).unwrap_or(u64::MAX),
         }
     }
 }
@@ -1694,7 +1669,7 @@ impl crate::bifrost::WyrdTestCluster {
                         storage: inspection
                             .storage
                             .first()
-                            .map(ScribeStorageDrainObservationV1::from_snapshot),
+                            .map(ScribeStorageDrainObservationV1::from_inspection),
                     });
                 }
                 ScribeWorkloadOperationV1::Checkpoint { name } => {

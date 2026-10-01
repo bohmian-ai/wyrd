@@ -565,13 +565,13 @@ pub struct ClusterShutdownInspection {
     pub forge_active_attempts: u64,
     /// Supervised server tasks retained after every server owner is dropped.
     pub supervised_tasks: u64,
-    /// Each stopped node's terminal storage-owner snapshot, in stop order.
+    /// Each stopped node's terminal storage-owner state, in stop order.
     ///
     /// Kept per node rather than summed: the storage owner is a per-node
     /// resource, and adding two nodes' counts together would turn a per-node
     /// reconciliation into a cluster-wide one that no single owner ever has to
     /// satisfy.
-    pub storage: Vec<vala_bifrost_redux::storage::MetadataCacheSnapshot>,
+    pub storage: Vec<vala_bifrost_redux::storage::StorageInspection>,
 }
 
 /// One parsed production Prometheus series.

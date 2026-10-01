@@ -244,12 +244,12 @@ pub struct ServerShutdownInspection {
     pub listeners_stopped: bool,
     /// Supervisor join handles still retained after shutdown.
     pub supervised_tasks: u64,
-    /// Final storage-owner reconciliation snapshot when this process had one.
+    /// Final storage-owner state, read from its owners, when this process had one.
     ///
     /// Captured after the bound production serve task joins and before the
     /// harness drops, so it is the state production teardown actually left
     /// rather than the state a test-invoked second shutdown produced.
-    pub storage: Option<vala_bifrost_redux::storage::MetadataCacheSnapshot>,
+    pub storage: Option<vala_bifrost_redux::storage::StorageInspection>,
 }
 
 /// Exact query-owned resources inspected by test-tier cancellation journeys.
@@ -917,7 +917,7 @@ impl WyrdTestServer {
             .state
             .bifrost
             .bifrost_storage()
-            .map(|storage| storage.telemetry_snapshot());
+            .map(|storage| storage.inspect());
         let inspection = ServerShutdownInspection {
             scribe,
             scribe_inflight,

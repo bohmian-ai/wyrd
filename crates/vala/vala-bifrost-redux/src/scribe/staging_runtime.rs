@@ -1570,6 +1570,7 @@ mod pg_tests {
     use super::tests::{publisher, runtime_layout, runtime_schema, stage_durable_members};
     use super::*;
     use crate::scribe::stream_identity::NodeId;
+    use num_traits::ToPrimitive as _;
 
     /// Registers the control row recovery re-resolves the fixture recipe from.
     async fn register_control_row(database: &wyrd_dev_fixtures::pg::PgFixture) {
@@ -1692,15 +1693,15 @@ mod pg_tests {
         let gauge = |family: &str| after.gauges.get(family).copied();
         assert_eq!(
             gauge("bifrost_scribe_staging_live_members"),
-            Some(durable_members as f64)
+            durable_members.to_f64()
         );
         assert_eq!(
             gauge("bifrost_scribe_staging_live_bytes"),
-            Some(durable_bytes as f64)
+            durable_bytes.to_f64()
         );
         assert_eq!(
             gauge("bifrost_scribe_staging_oldest_member_timestamp_seconds"),
-            Some(oldest.timestamp() as f64)
+            oldest.timestamp().to_f64()
         );
         assert_eq!(
             gauge("bifrost_scribe_staging_outstanding_claims"),

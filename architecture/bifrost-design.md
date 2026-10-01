@@ -894,6 +894,18 @@ across a restart; durable batch, file, and task rows answer that question.
   client-facing stream's one terminal — `success`, `degraded`, `failed`,
   `rejected`, or `cancelled` — at the server edge. Neither includes client
   network or SDK time.
+- **Scribe.** `bifrost_scribe_ack_seconds` measures each ACK attempt.
+  `bifrost_scribe_memtable_rows_inserted_total` counts rows the shard inserted
+  into the live memtable in this process; an idempotent same-process retry adds
+  zero, and replay after restart counts again in the new process. Receipt
+  `accepted_rows` is a client contract, not a newly-stored-row measure.
+  `bifrost_scribe_staging_live_members`, `_live_bytes`,
+  `_oldest_member_timestamp_seconds`, and `_outstanding_claims` are published
+  from the staging assembler's own state, so members restored after restart
+  appear in backlog. `bifrost_scribe_lane_queued{lane}` is waiting jobs only;
+  `bifrost_scribe_lane_active{lane}` is running jobs.
+  `bifrost_scribe_publication_files_total` and `_bytes_total` count committed
+  publication output after its catalog transaction commits.
 - **Oracle.** `oracle_query_duration_seconds{class,outcome}` starts after Gate
   dispatch and measures Oracle execution through its terminal; the production
   HPA and query reports read it. Outcomes are `success`, `degraded`, `failed`,
@@ -906,6 +918,18 @@ across a restart; durable batch, file, and task rows answer that question.
   groups. `bifrost_oracle_file_pruning_total{outcome}` counts hot-object
   exclusions decided from declared bounds; Iceberg pruning happens inside its
   own scan planning and is not re-walked for telemetry.
+- **Storage.** `bifrost_storage_metadata_cache_effects_total{effect,reason}`
+  counts cache decisions (hit, miss, join, bypass, evict) — logical lookups,
+  not backend I/O. `bifrost_storage_metadata_cache_loads_total{outcome}`,
+  `bifrost_storage_metadata_load_seconds`, and
+  `bifrost_storage_metadata_wait_seconds` measure footer decodes and the time
+  callers waited on them. `bifrost_storage_requests_total{operation}`,
+  `bifrost_storage_request_terminals_total{operation,outcome}`,
+  `bifrost_storage_request_seconds`, and
+  `bifrost_storage_request_retries_total` measure governed backend requests; a
+  cache hit adds none. Resident entries/bytes and in-flight loads are set from
+  the cache's own state, and `bifrost_storage_active_requests` moves at request
+  admission and settlement. No telemetry copy of cache or request state exists.
 - **Traces.** A query is one trace: `bifrost.gate.query.stream` spans the
   client-facing stream through terminal or drop, with `bifrost.gate.query`
   dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through

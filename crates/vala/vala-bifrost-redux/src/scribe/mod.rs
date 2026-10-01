@@ -2224,11 +2224,10 @@ impl ScribeImpl {
     pub fn staging_backlog_for_test(
         &self,
     ) -> Result<crate::scribe::assembly::StagingBacklog, ScribeError> {
-        self.persistence
-            .as_ref()
-            .map_or(Ok(Default::default()), |persistence| {
-                persistence.staging_backlog_for_test()
-            })
+        self.persistence.as_ref().map_or(
+            Ok(crate::scribe::assembly::StagingBacklog::default()),
+            |persistence| persistence.staging_backlog_for_test(),
+        )
     }
 
     /// Install a one-shot test barrier at the public write seam.

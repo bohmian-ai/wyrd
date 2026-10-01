@@ -1008,7 +1008,10 @@ impl PersistenceRuntime {
         self.worker
             .as_ref()
             .and_then(|worker| worker.staging.as_ref())
-            .map_or(Ok(Default::default()), |staging| staging.backlog())
+            .map_or(
+                Ok(crate::scribe::assembly::StagingBacklog::default()),
+                |staging| staging.backlog(),
+            )
     }
 
     /// Aborts every retained persistence worker without touching the async join registry.

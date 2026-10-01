@@ -2452,13 +2452,21 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
             .sum()
     };
     let admitted = server.oracle_runtime_inspection()?.active_queries;
-    assert_eq!(gauge("oracle_queries_queued"), 2.0, "two waiters are queue depth");
+    assert_eq!(
+        gauge("oracle_queries_queued"),
+        2.0,
+        "two waiters are queue depth"
+    );
     assert_eq!(
         gauge("oracle_queries_active"),
         f64::from(u32::try_from(admitted)?),
         "the active gauge is the owner's admitted work and excludes waiters"
     );
-    assert_eq!(usize::try_from(admitted)?, QUEUE_HOLDS, "only the parked holds are admitted");
+    assert_eq!(
+        usize::try_from(admitted)?,
+        QUEUE_HOLDS,
+        "only the parked holds are admitted"
+    );
 
     let released = held.pop().ok_or("no held envelope to release")?;
     released.abort();

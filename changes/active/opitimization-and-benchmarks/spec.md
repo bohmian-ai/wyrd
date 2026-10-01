@@ -1,6 +1,6 @@
 ---
 id: SPEC-opitimization-and-benchmarks
-revision: 9
+revision: 10
 status: draft
 ---
 
@@ -278,28 +278,10 @@ human-readable report.
 
 ### Human readability
 
-**REQ-018 — A human can follow every run.** As with the
-`bifrost:query-capacity` report, a person who has not read the code must be
-able to tell from the output alone what was done, what was measured, what the
-target was, and whether it passed.
-
-- **Before the run**, the output states in plain words the environment
-  (REQ-004), the dataset and its size, how it is loaded, and each step about
-  to happen.
-- **During the run**, each step prints one plain line saying what it is doing
-  and its progress (for example, "loading hits: 40,000,000 of 99,997,497
-  rows").
-- **After the run**, each benchmark prints one table. Every row names its
-  query or measurement in plain words alongside any ID (for example, "Q19 —
-  look up one user's page views"), and shows the measured value with its
-  unit, the target, PASS or FAIL, and, for a FAIL, the reason in one sentence.
-- Abbreviations, internal type names, and metric names that only make sense
-  with the source code are not allowed in the output.
-
-The harness code meets the same bar. Its steps are named after what they do
-and follow the order the output describes, so a reviewer can map each line of
-output to the code that produced it. The owner rejects a harness whose output
-or code is not obvious to a human.
+**REQ-018 — Readable code.** The output follows ClickBench's own output and
+adds nothing beyond REQ-006 and REQ-017. The harness code must be readable:
+a reviewer can see what each step does without help. The owner rejects a
+harness whose code is not obvious to a human.
 
 ## Invariants
 
@@ -371,7 +353,7 @@ confirmation (D-1).
 | AC-10 | Compression ratio, per signal (REQ-015) | logs ≥ 10×, traces ≥ 8×, metrics ≥ 10× |
 | AC-11 | Time-window warm p50 and p95, every query (REQ-016) | 5 min: p95 ≤ 50 ms; 1 h: p95 ≤ 200 ms; 24 h: p95 ≤ 1 s; trace-id lookup p95 ≤ 20 ms at every window |
 | AC-12 | Time-window warm p99, every query, with answers matching the generator | p99 ≤ 2× the AC-11 p95 target; 100% of answers match |
-| AC-13 | Human readability (REQ-018): the owner reads one complete run's output and the harness code and can follow both without help | owner accepts |
+| AC-13 | Readable harness code (REQ-018) | owner accepts |
 
 **Evidence classes.** For each AC, the evidence is:
 
@@ -507,6 +489,10 @@ default.
   code must be readable by a person without the source, like the
   `bifrost:query-capacity` report (REQ-018, AC-13). Draft; awaiting owner
   decisions D-1 and D-3 to D-13.
+- Revision 10 (2026-10-01): Owner simplification. Output follows ClickBench's
+  own output with no extra formatting rules; REQ-018 and AC-13 now require
+  only readable harness code. Draft; awaiting owner decisions D-1 and D-3 to
+  D-13.
 
 ## Authority and context
 

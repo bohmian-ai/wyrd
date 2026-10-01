@@ -21,6 +21,11 @@ SQL_CRATES = [
     ROOT / "crates/vala/vala-sql",
 ]
 
+# TenantConn is the single owner of tenant transactions. It alone may send raw
+# transaction control: its begin statement binds the tenant and opens the
+# transaction in one round trip.
+TRANSACTION_CONTROL_OWNER = ROOT / "crates/wyrd/wyrd-sql/src/tenant_conn.rs"
+
 PLATFORM_QUERY_ALLOWLIST = {
     "crates/wyrd/wyrd-sql/src/queries/platform/tenant_resolver.rs",
 }
@@ -415,6 +420,8 @@ def check_sql_source_hygiene(failures: list[str]) -> None:
     }
     for label, pattern in forbidden_patterns.items():
         for path in source_files(combined_sql_paths):
+            if label == "raw transaction control" and path == TRANSACTION_CONTROL_OWNER:
+                continue
             text = path.read_text(errors="ignore")
             if re.search(pattern, strip_line_comments(text), re.IGNORECASE):
                 failures.append(f"{rel(path)}: {label}")

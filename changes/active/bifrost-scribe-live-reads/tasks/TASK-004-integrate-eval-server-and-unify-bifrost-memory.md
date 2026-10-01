@@ -992,3 +992,112 @@ diagnostician):
   `baseline_executes_join_group_sort_and_interchangeable_topology`. Spill
   confinement stays proved by
   `pg_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill`.
+
+### D15 — heavy benchmark OOM: cgroup detection read the hierarchy root
+
+- **Symptom:** the heavy benchmark was OOM-killed at 8 GiB during the
+  100M-row write on every run.
+- **Evidence:** boot logged host RAM (91 GiB) as the memory bound and 32 CPU
+  workers under the benchmark's systemd scope.
+- **Cause:** memory and CPU detection read only `/sys/fs/cgroup/memory.max`
+  and `cpu.max` at the hierarchy root. Under a Kubernetes cgroup namespace the
+  root is the pod; under a systemd scope the limit sits on an ancestor slice.
+- **Fix site:** `resources::MemoryCgroup` and `detect_cgroup_cpu` resolve the
+  process's own cgroup from `/proc/self/cgroup`, walk its ancestors, and take
+  the tightest `memory.max`/`cpu.max`; usage is read from the bounding group.
+  Scribe's duplicate cgroup readers were deleted (db4bddd34). Test:
+  `resources::tests::memory_cgroup_is_the_tightest_limit_above_the_process`.
+
+### D16 — heavy benchmark OOM: publishing blocked age and pressure seals
+
+- **Symptom:** with D15 fixed, boot detected 4 CPUs and 7 GiB, and governed
+  Scribe bytes still grew about 200 MB/s until the OOM.
+- **Cause:** d5dd6f0f8 made the 1 s lifecycle tick await `publish_due`, which
+  awaits a claim merge (25+ s for about 200 staged runs). `check_age` (age
+  seals, pressure seals, gauges) did not run for that time.
+- **Fix site:** `app::server` runs `check_age` and `publish_due` on separate
+  loops; the publisher races shutdown (dfc90f393). Verified: redux lib
+  811/811, `test:bifrost:integration:redux` 874/874,
+  `test:bifrost:journey:scribe` 20/20, `test:bifrost:journey:server` 26/26.
+
+### Spec revisions 22 and 23 (user-approved 2026-10-01)
+
+- Revision 22: reads while writing are judged against each case's absolute
+  target; the read-only p95 is reported beside it (c61552ed1). Reads and
+  writes share 4 CPUs, so the former 20% rise measured CPU sharing.
+- Revision 23: selective latency is judged at one client and a 600 qps floor
+  at the sweep's busiest point (364e5d8dd). One client reaches p50 6.9 ms at
+  143 qps; 4 CPUs saturate near 660 qps.
+- Report logic test: `report::tests::sweep_and_errors_are_judged`.
+
+### Spec revision 24: 8-CPU/16-GiB benchmark node (user-approved 2026-10-01)
+
+The benchmark node is 8 CPUs / 16 GiB, replacing 4/8, and throughput floors
+double: selective 1,200 qps peak, small aggregate 200, medium 40, heavy scan
+1,000 MB/s, ingest 200,000 rows/s; the memory ceiling is 15 GiB (f0365f9ea).
+
+### D17 — selective peak below 1,200 qps at 8 CPUs
+
+- **Symptom:** selective peak 1,018 qps; CPU per lookup rose from 6.3 ms
+  (4 CPUs) to 8.1 ms (8 CPUs) even at one client.
+- **Evidence:** frame-pointer `perf` of selective@1: 13.5% in
+  `iceberg::Table::reader_builder` → `std::thread::available_parallelism`
+  (cgroup file reads), 9.5% in `ArrowReaderMetadata::try_new` from
+  `tenant_proven_reader_metadata`. Both ran once per partition, and the
+  session partition count follows CPUs. Phase metrics: `first_row` 2.8 →
+  4.1 ms at one client.
+- **Cause:** `OracleIcebergScanExec::start_stream` built one Iceberg reader per
+  partition; `hot_stream` converted every owned file's footer into Arrow
+  reader metadata before range ownership and pruning.
+- **Fix site:** `OracleIcebergScanExec` builds one reader per scan in a shared
+  `OnceCell` (the `planned` pattern) and partitions clone it;
+  `hot_piece_metadata` proves the tenant, prunes on the cached footer, and
+  converts only for pieces with surviving row groups (61d1b5cd1). No test,
+  timeout, retry, or concurrency was touched. Verified: redux lib 811/811,
+  `test:bifrost:integration:redux` 874/874, `test:bifrost:journey:oracle`
+  42/42.
+- **Result:** selective peak 1,222 qps, one-client 6.8/8.2/8.9 ms.
+
+### D18 — gate: stale snapshot-burst lock and uncovered SQL code
+
+- `capacity::three_concurrent_snapshots_are_not_refused` locked
+  `vala.bifrost_tables`, which 3d6b53ed0's uid cache no longer reads per
+  query. A fresh diagnostician confirmed the cause; the test now holds the
+  uncached `iceberg_catalog.iceberg_tables` pointer read (fb934d6b4).
+- `check:error-coverage`: `WYRD_SQL_503_SCHEMA_NOT_READY` lacked a mapping
+  test; added to `metadata_codes_and_statuses_match_sql_catalog`.
+- `check:workspace-hack` drift regenerated (c58e25b03).
+
+### Final benchmark evidence (8 CPU / 16 GiB, after 61d1b5cd1)
+
+Standard, 10M rows: every row PASS. Write 1,081,154 rows/s; selective target
+PASS (one client 6.8/8.2/8.9 ms, peak 1,222.3 qps at 32 clients);
+small-aggregate met at 4–32 clients (peak 554.7 qps); 1m-aggregate 231.5 qps
+p95 41.8 ms; table-aggregate p95 62.6 ms; reads while writing PASS
+(small 226.5 qps p95 20.9 ms; 1m 118.4 qps p95 38.2 ms) with writes at
+1.0–1.1M rows/s; full queue PASS; peak 4.96 GiB; shutdown 1.1 s.
+
+Heavy, 100M rows: every row PASS. Write 880,073 rows/s, peak 6.37 GiB, no
+OOM; broad-window p99 332.9 ms; full scan p99 1,082.7 ms at 7.97 cores.
+Reports: `target/bifrost-query-capacity/{standard,heavy}/`.
+
+The audit publisher's `audit_chain_head` lock warning under load is designed
+behavior: `freeze_publication_range` uses `NOWAIT`, skips a busy tenant, and
+retries next sweep (`held_chain_head_fails_immediately_and_retries_unchanged`).
+
+### D19 — One-round-trip tenant begin (gate fix and latent pool-poisoning bug)
+
+- **Symptom:** `check:tenant-isolation` failed on `tenant_conn.rs: raw transaction control`. 1a6ec2554 had changed `TenantConn::acquire` to begin with `BEGIN; SELECT set_config(...)`.
+- **Cause:** that order had a real bug as well as tripping the check. On a begin failure, SQLx queues `ROLLBACK` only when transaction depth > 0, and depth is still 0 during begin. A failed bind therefore sent the connection back to the pool inside an aborted transaction. Proven: with that order, the next `TenantConn::acquire` on a one-connection pool fails with `25P02 current transaction is aborted`.
+- **Fix (owner approved one round trip, a rollback test and a doc update):**
+  - `TenantConn` now sends `SELECT set_config('app.current_tenant', '<uuid>', true); BEGIN`. Postgres runs both as one implicit transaction that `BEGIN` makes explicit. If the bind fails, `BEGIN` never runs and Postgres rolls back by itself.
+  - A Postgres rejection maps to `TxFailed`; pool and IO failures map to `Connect`.
+  - `check_tenant_isolation.py` names `tenant_conn.rs` as the single owner allowed raw transaction control.
+  - `architecture/v1/00-foundations/sql-foundation.md` documents the statement and why its order matters.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Tenant begin and bind in one round trip | `tenant_conn.rs` `begin_tenant_sql`, `begin_bound` | `tenant_conn::tests::begin_tenant_sql_binds_then_begins` | PASS |
+| Failed bind leaves no hanging transaction | statement order | `tenant_conn::tests::failed_bind_rolls_back_and_the_connection_stays_usable` (PG); fails with 25P02 when the order is reversed | PASS |
+| Binding is transaction-local | same test: visible inside, empty after commit | same | PASS |
+| Gate and docs | check script owner exemption; sql-foundation.md | `mise run check:tenant-isolation`, `mise run lints`, `mise run py:lints`, `mise run test:sql` (173/6/114/2 passed) | PASS |

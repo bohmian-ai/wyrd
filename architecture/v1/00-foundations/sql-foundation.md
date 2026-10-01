@@ -21,13 +21,23 @@ tenant key in their foreign keys, including cross-schema references.
 
 Postgres row-level security is the authoritative tenant boundary. Runtime
 tenant traffic uses the `wyrd_app` login role without `BYPASSRLS`. Every
-tenant-scoped logical operation acquires one `TenantConn`, which opens a
-transaction and binds the verified `DataTenantId` through transaction-local
-configuration:
+tenant-scoped logical operation acquires one `TenantConn`, which binds the
+verified `DataTenantId` through transaction-local configuration and opens the
+transaction in one round trip:
 
 ```sql
-SELECT set_config('app.current_tenant', $1, true)
+SELECT set_config('app.current_tenant', '<tenant uuid>', true); BEGIN
 ```
+
+The binding precedes `BEGIN` deliberately. Postgres runs the two statements as
+one implicit transaction that `BEGIN` turns explicit, so the binding survives
+into it; if the binding fails, `BEGIN` never runs and Postgres rolls everything
+back, returning the pooled connection idle. `BEGIN` first would leave a failed
+binding inside an aborted transaction that SQLx does not roll back, poisoning
+the next borrower. A simple query takes no parameters, so the tenant is inlined
+from the typed `DataTenantId`, whose UUID rendering cannot contain a quote.
+`TenantConn` is the only code that builds this statement and the only code
+allowed raw transaction control.
 
 RLS policies use the strict `wyrd.current_tenant()` helper and apply both
 `USING` and `WITH CHECK` predicates:
@@ -41,8 +51,9 @@ CREATE POLICY tenant_isolation ON wyrd.example
 ```
 
 A missing tenant binding fails rather than returning an empty cross-tenant
-result. Tenant identity is parameter-bound; callers do not build tenant SQL
-strings or add a second hand-written tenant predicate.
+result. Outside `TenantConn`'s begin statement, tenant identity is
+parameter-bound; callers do not build tenant SQL strings or add a second
+hand-written tenant predicate.
 
 ## Transaction discipline
 

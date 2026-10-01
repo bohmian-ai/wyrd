@@ -1,14 +1,15 @@
-//! Closed scan-predicate/literal vocabulary and the v2 signed
+//! Closed scan-predicate/literal vocabulary and the v2
 //! assignment-authority digest.
 //!
 //! This module is the Arrow-free, IO-free contract for the predicate and
 //! index pushdown closure: the exact leaf predicate/literal enums the
 //! `OracleTableProvider` classifier recognizes as `Inexact`-supported, and
-//! the deterministic byte encoding hashed into the signed
+//! the deterministic byte encoding hashed into the
 //! `assignment-authority` digest that binds a follower's projection,
-//! predicates, files, and Scribe cut to the leader's ticket before any
-//! object I/O. Every byte-level rule here is normative: the digest is a
-//! security boundary, not an optimization hint, so its encoding must be
+//! predicates, files, and Scribe cut to the leader's peer context before any
+//! object I/O. The context is unsigned; the digest proves the context and the
+//! dispatched assignments agree, and origin comes from the mTLS cluster
+//! identity. Every byte-level rule here is normative, so its encoding must be
 //! reproduced exactly by any producer or verifier.
 
 use serde::{Deserialize, Serialize};
@@ -500,9 +501,9 @@ pub fn encode_assignment_authority_bytes(
 /// Computes the lowercase-hex SHA-256 assignment-authority digest for the
 /// given assignments, in request order.
 ///
-/// This is the value a leader signs into the ticket claims and a follower
-/// recomputes and compares before resolving any provider or issuing object
-/// I/O — see the validation-precedence contract on the follower ticket path.
+/// This is the value a leader places in the peer context claims and a
+/// follower recomputes and compares before resolving any provider or issuing
+/// object I/O — see the validation-precedence contract on the follower path.
 ///
 /// # Errors
 /// Returns [`AssignmentDigestError`] under the same conditions as

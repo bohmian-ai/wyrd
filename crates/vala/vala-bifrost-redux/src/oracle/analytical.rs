@@ -18,9 +18,9 @@
 //! leaves to its embedder, and this module owns all three:
 //!
 //! 1. **Authority.** Wyrd's own [`AnalyticalChannelResolver`] is the coordinator
-//!    transport, so every stage operation carries a Wyrd-signed ticket in its
-//!    [`HeaderMap`], and the same headers reach the worker before any plan is
-//!    decoded.
+//!    transport, so every stage operation carries a typed, unsigned Wyrd peer
+//!    context in its [`HeaderMap`] over the mTLS peer plane, and the worker
+//!    checks it against its own state before any plan is decoded.
 //! 2. **Runtime.** [`AnalyticalSessionBuilder`] resolves the *query-owned*
 //!    [`OracleExecution`] — the runtime, memory pool, and spill limit already
 //!    admitted for this query — and installs it on the follower session,
@@ -1635,7 +1635,7 @@ impl AnalyticalStageIngress {
     /// `framed_message` is the complete encoded gRPC message — five-byte prefix
     /// included — exactly as it arrived on the wire. It is the digest input and
     /// nothing else: it is not decoded here, and it does not establish peer
-    /// identity, which peer mTLS and workload authentication already did.
+    /// identity, which the mTLS cluster identity of the peer plane already did.
     ///
     /// Everything downstream depends on this returning first. Nothing decodes a
     /// plan, consults the task cache, constructs a provider, admits a resource,

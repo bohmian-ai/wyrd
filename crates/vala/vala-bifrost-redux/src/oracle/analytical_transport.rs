@@ -115,8 +115,8 @@ pub(crate) fn governed_operation(path: &str) -> Option<StageOperationV1> {
 /// Reasons the first message of a governed request could not be bound.
 ///
 /// Every variant is terminal and fails the request closed. None of them are
-/// retried: a caller that framed its message wrongly, or oversized it, does not
-/// get a second attempt against the same single-use nonce.
+/// retried: a caller that framed its message wrongly, or oversized it, gets the
+/// closed refusal and must send a new request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum StageFramingError {
     /// The declared or accumulated message length exceeds the hard bound.
@@ -137,8 +137,8 @@ impl From<StageFramingError> for PeerSecurityError {
     /// Projects a framing failure onto the closed peer-security refusal.
     ///
     /// Framing failures are body failures: the receiver could not establish
-    /// which bytes the signature was supposed to cover, which is the same
-    /// refusal as a body that does not match its digest.
+    /// which bytes the context's body digest was supposed to cover, which is
+    /// the same refusal as a body that does not match its digest.
     fn from(_: StageFramingError) -> Self {
         Self::Body
     }
@@ -456,15 +456,16 @@ pub(crate) fn decode_context_bytes(value: &str) -> Result<Vec<u8>, PeerSecurityE
 
 /// The stage identity that travels beside a governed message.
 ///
-/// Every field here is also covered by the ticket signature, so the wire copy is
-/// an *echo*: the follower re-derives its expectation from these values and the
-/// signed claims must match field for field. Tampering with any of them
-/// therefore produces a binding refusal rather than a different authorization.
+/// Every field here is also carried in the unsigned context claims, so the wire
+/// copy is an *echo*: the follower re-derives its expectation from these values
+/// and the claims must match field for field. A mismatch therefore produces a
+/// binding refusal rather than a different authorization. Origin comes only
+/// from the mTLS cluster identity, not from these fields.
 ///
 /// The two fields that are deliberately *not* here are the destination node
-/// identity and its role fence. The receiver supplies those from itself, which
-/// is what stops a ticket minted for one follower from being replayed at
-/// another, or a ticket minted before a restart from being accepted after it.
+/// identity and its role fence. The receiver supplies those from itself, so a
+/// context built for one follower is refused at another, and one built before
+/// a restart is refused after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StageWireIdentity {
     /// Coordinator node that minted the ticket.
@@ -675,22 +676,17 @@ fn parse_u64(value: &str) -> Result<u64, PeerSecurityError> {
     value.parse().map_err(|_| PeerSecurityError::Claims)
 }
 
-/// Everything a coordinator needs to mint tickets for one worker channel.
-///
-/// One minter serves exactly one target follower, because the destination node
-/// identity and role fence it signs are that follower's. Reusing a minter across
-/// targets would mint tickets that the receiving follower correctly refuses.
 /// The frozen destination set one Analytical attempt is allowed to address.
 ///
 /// Built once by the leader from its pinned attempt cut and thereafter carried
-/// inside every signed stage ticket, so a follower acting as a coordinator
+/// inside every stage context, so a follower acting as a coordinator
 /// adopts the leader's cut verbatim instead of re-reading live membership. A
 /// destination is identified by endpoint *and* fence: a node that restarts
 /// under a new fence is a different incarnation and is simply absent from this
 /// cut, which fails the resolution locally rather than redirecting the request
 /// to the replacement.
 pub(crate) struct AnalyticalParticipantCut {
-    /// Signed wire form, stamped verbatim into every ticket minted from it.
+    /// Wire form, stamped verbatim into every context built from it.
     wire: Vec<StageParticipantV1>,
     /// Endpoint index every outbound channel resolves its audience through.
     by_url: HashMap<Url, AnalyticalDestination>,
@@ -831,7 +827,7 @@ impl AnalyticalParticipantCut {
         self.by_url.keys().cloned().collect()
     }
 
-    /// Returns the signed wire form stamped into every ticket.
+    /// Returns the wire form stamped into every context.
     #[must_use]
     pub(crate) fn wire(&self) -> &[StageParticipantV1] {
         &self.wire
@@ -880,10 +876,10 @@ impl AnalyticalParticipantCut {
 
 /// Orders one cut so its encoding depends only on membership.
 ///
-/// The signed claims — and therefore the signature — must not vary with the
-/// iteration order of the map a leader froze its cut from, and the same order is
-/// what makes [`AnalyticalParticipantCut::fingerprint`] comparable across two
-/// tickets. One ordering serves both; there is no second one.
+/// The context claims must not vary with the iteration order of the map a
+/// leader froze its cut from, and the same order is what makes
+/// [`AnalyticalParticipantCut::fingerprint`] comparable across two contexts.
+/// One ordering serves both; there is no second one.
 fn canonically_order(wire: &mut [StageParticipantV1]) {
     wire.sort_by(|left, right| {
         (&left.address, &left.node_id, left.fence).cmp(&(
@@ -970,7 +966,8 @@ impl AnalyticalStageMinter {
     }
 }
 
-/// Tower layer that signs governed stage operations leaving this coordinator.
+/// Tower layer that attaches the typed peer context to governed stage
+/// operations leaving this coordinator.
 #[derive(Clone)]
 pub(crate) struct AnalyticalStageMintLayer {
     /// Shared minter for the one follower this channel targets.
@@ -989,7 +986,7 @@ impl<S> tower::Layer<S> for AnalyticalStageMintLayer {
     /// The minting service wrapping one worker channel.
     type Service = AnalyticalStageMint<S>;
 
-    /// Wraps `inner` so every governed request leaves signed.
+    /// Wraps `inner` so every governed request leaves with its context.
     fn layer(&self, inner: S) -> Self::Service {
         AnalyticalStageMint {
             inner,
@@ -998,7 +995,8 @@ impl<S> tower::Layer<S> for AnalyticalStageMintLayer {
     }
 }
 
-/// Signs the first message of every governed request before it is sent.
+/// Binds the first message of every governed request to its context before it
+/// is sent.
 #[derive(Clone)]
 pub(crate) struct AnalyticalStageMint<S> {
     /// The channel this layer wraps.
@@ -1026,7 +1024,8 @@ where
         self.inner.poll_ready(cx)
     }
 
-    /// Signs the first message of a governed request, then forwards it.
+    /// Binds the first message of a governed request to its context, then
+    /// forwards it.
     ///
     /// An ungoverned path is forwarded with an empty replay, which is a
     /// structural no-op: the body is not read and its frames pass through. The
@@ -1315,8 +1314,8 @@ impl<S> tower::Layer<S> for AnalyticalStageAuthLayer {
 /// independence, trailers, body errors, cancellation, and backpressure.
 ///
 /// Every failure path — an unsupported method, malformed or incomplete framing,
-/// an oversized message, a body error, an absent or invalid ticket, a binding or
-/// digest mismatch, a replayed nonce, or a refused admission — returns the closed
+/// an oversized message, a body error, an absent or invalid context, a binding
+/// or digest mismatch, an expired context, or a refused admission — returns the closed
 /// `PermissionDenied` refusal without calling the inner service at all.
 #[derive(Clone)]
 pub struct AnalyticalStageAuth<S> {
@@ -2122,8 +2121,8 @@ mod tests {
     /// unrecognized path cannot be bound to a stage ticket and therefore
     /// cannot be authorized. Worker metadata is named explicitly because it is
     /// the one real upstream method that legitimately carries no graph
-    /// identity; it still reaches a follower only through peer mTLS and
-    /// workload authentication, like every other east-west call.
+    /// identity; it still reaches a follower only through the mTLS peer plane,
+    /// like every other east-west call.
     #[test]
     fn governed_operation_names_only_the_two_stage_paths() {
         assert_eq!(

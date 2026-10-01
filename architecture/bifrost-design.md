@@ -308,7 +308,7 @@ Every local path a node owns derives from its one exclusively locked
 Oracle never opens another node's local path and does not use WAL as its normal
 query source. Scribe executes authenticated local DataFusion scan fragments
 over active, immutable, or staged rows and streams Arrow batches through the
-existing peer protocol. Projection, signed predicate, physical partition,
+existing peer protocol. Projection, predicate, physical partition,
 writer epoch, deadline, and cancellation are enforced. A live snapshot is
 shallow references to rows the Scribe already holds, so it carries no batch or
 byte limit; the query's execution memory pool governs what execution retains.
@@ -360,17 +360,21 @@ spill behavior without claiming exhaustive operator coverage.
 
 The analytical path uses streamed exchanges parameterized by DataFusion
 `Partitioning`. It adds no materialized shuffle service, independent scheduler,
-or query-job subsystem. Every stage assignment is versioned, signed, replay
-protected, and binds:
+or query-job subsystem. Every stage assignment travels in a versioned, typed
+peer context that binds:
 
 - tenant and permission digest;
 - public query, DataFusion query, stage, task, and attempt identities;
 - pinned snapshot and fragment digests;
 - leader and worker fences and audience;
-- reservation identity, request digest, nonce, and absolute deadline.
+- reservation identity, request digest, and absolute deadline.
 
-Peer TLS and workload authentication complete before the bounded first frame is
-accepted. Claims and body digests are verified before lazy plan decode, task
+The context is unsigned. Peer mTLS with the fixed `wyrd-peer` cluster identity
+is the only peer authentication and completes before the bounded first frame is
+accepted. The receiver compares every context field with its own state: its
+node identity and fence, the exact bytes received, and the expiry, which is an
+admission window rather than replay state. A compromised cluster member is out
+of scope. Claims and body digests are verified before lazy plan decode, task
 cache lookup, provider creation, or source IO. Every worker replaces its
 process runtime with the exact query-admitted `RuntimeEnv`, `MemoryPool`, spill
 share, cancellation token, and deadline. Query-owned leases remain alive until

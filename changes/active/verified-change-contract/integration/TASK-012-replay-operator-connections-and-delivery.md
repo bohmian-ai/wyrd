@@ -229,3 +229,83 @@ or repairable red gate alone is not a material stop condition.
 - `architecture/wyrd-security-posture.md`
 - `architecture/agent-rules.md`
 - `AGENTS.md`
+
+## Implementation Evidence
+
+Status: `IMPLEMENTED` — routed to a fresh `$wyrd-task-review`. This record does
+not approve the task. Source R6 PASS covered `cd002ab13` under revision 36 and
+does not cover this integration.
+
+Heads: target before merge `fd886e7f8` (revision 45 approved); source
+`vcc/task-007` tip `c6301fd83`; merge `ee93903ff` (`git merge --no-ff
+--no-commit`, conflicts resolved per file, no branch-wide `ours`/`theirs`).
+Integrated candidate: the commit that records this evidence.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Gateway and Operator delivery import one Vault KV v2 reader from `crates/shared/wyrd-vault`; no private reader in either; values stay distinct | `crates/shared/wyrd-vault/src/lib.rs` (`VaultKv2::read_field`, screened/pinned resolver, bounds); `wyrd-gateway/src/vault.rs` (`VaultBackend { reader: VaultKv2 }`, provider credential mapping); `wyrd-server/src/components/operators/keys.rs` (`vault: Option<VaultKv2>`, 32-byte KEK validation, tenant/version path); Task 007 reqwest Vault reader removed | `wyrd-vault` lib tests (3), `wyrd-gateway vault::tests` (2), `wyrd-server components::operators::keys::tests` (6), `test:gateway:vault` journey — all in `mise run gate` | PASS |
+| Multi-tenant production uses Vault and fails startup without active tenant keys; env dev-only; restrictive files single-tenant; rotation keeps old versions decryptable | `wyrd-server/src/config.rs` `OperatorKeysConfig::validate`; `boot/mod.rs` `verify_operator_keys` + `ServerBootError::OperatorKeys`; rewrap in `verification/operators.rs` | `config::tests::operator_key_source_follows_deployment`, `production_vault_requires_https`; `pg_operator_delivery` boot-gate, rotation, and rewrap journeys (wyrd family lane) | PASS |
+| HTTP, SDKs, CLI, MCP create/replace credentials and list/get redacted metadata only; no read/export; tenant and permission denials; rotation | `wyrd-spec/src/operator_connection.rs`; `components/operators/routes.rs`; `wyrd-client/src/operator_connections.rs`; Rust/Python/TS SDK projections; CLI `operator-connection`; MCP `operators.*` (catalog reconciled with Gateway tools, 31 tools) | `pg_operator_connection_routes` (5), `wyrd-sql::pg_operator_connections` (2), MCP connectivity/discovery tests, Rust `sdks/wyrd-sdk-rust/tests/operator_connections.rs`, `py:test:integration` (`test_operator_connections_journey.py`), `ts:test:integration` (`operator-connections.test.ts`), `pg_openapi_contract` | PASS |
+| Failed-only dispatch, bounded independent delivery, audit, SSRF pinning, retries, lifecycle pass on the current tree; Gateway and verification journeys do not regress | `verification/claims.rs` shared `ClaimLoop` adopted by Runner and OperatorWorker; `verification/mod.rs` composes Scheduler, Fitter, OperatorWorker, Runner; `FeatureDriftReport.evidence` seam | `pg_operator_delivery` (8 + 2 ignored live smokes), `pg_verification_runtime` (24), `wyrd-testing --test server` Eval journeys, `test:gateway:gate`, `test:bifrost:gate` | PASS |
+| Analytical follower grants never outlive their leader stream; held grants are visible; an abandoned plan returns the follower to baseline | `dispatcher.rs` `HeldGraphGrant`/`ParticipantGrant`, `peer_service.rs` streaming `ReserveSlots`, `analytical.rs` `AnalyticalParticipantGrants` and `GraphLease.grant_closed`, `OracleRuntimeInspection.held_grants`; `PENDING_TTL`, `ReleaseSlots`, retained release removed; `STAGE_PROTOCOL_VERSION` 2 (`3322efcaf`) | `vala-bifrost-redux` oracle unit tests; `peer_network::security::peer_context_refusals` (abandoned-grant journey); `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`; `test:bifrost:gate` in `mise run gate` | PASS |
+| No obsolete spec/architecture text, duplicate reader, generated hand edits, unrelated changes, or R6 coverage claim | `architecture/wyrd-design.md` Operator connections paragraph names `wyrd-vault` and drops the deferred `SecretRef` resolver; schemas/stubs/napi declarations regenerated (`codegen:regen`, `ts:build`) | `codegen:check`, `ts:napi:check`, `docs:check`, `check:*` in gate; `git diff --check` | PASS |
+
+### Integration seams found and fixed
+
+- **Migration version collision:** source `20260601000032_operator_connections.sql`
+  duplicated the target's drift-baselines version; renumbered to
+  `20261001000000_operator_connections.sql` (`c8d830fa9`).
+- **Eval journey Operator shape:** target-side fixture used the pre-connection
+  Slack shape that Task 007 made invalid; the journey only counts dispatches,
+  so it now uses an unauthenticated HTTP Operator (`d79a58a5e`).
+  Independent diagnosis confirmed no other stale Operator fixtures.
+- **Production config fixtures:** target-side peer-pod test failed the
+  approved Vault key-source rule; three calibration rejection tests were
+  passing on that rule instead of their own condition. All four now carry
+  Vault keys (`3b767972b`).
+- **Mock scope:** relocated Vault tests and Task 007's test-only wiremock
+  seams added through the check's allowlist (`ecb2b8d49`).
+- **Migration lease stranded reconnect (latent, exposed):**
+  - **Symptom:** nine `pg_router_smoke` SIGABRTs plus a ~61 s cluster-wide stall of wyrd-sql fixture tests in `test:wyrd`.
+  - **Evidence:** Postgres log `still waiting for backend with PID … to accept ProcSignalBarrier` on every `DROP DATABASE … WITH (FORCE)` until `canceling authentication due to timeout`.
+  - **Cause:** `OperatorPool::migration_lease` detached a pooled connection, so sqlx began a background reconnect; a fixture drop blocking the current-thread runtime stranded it mid-login.
+  - **Fix site:** the lease now opens its own `PgConnection` from the pool's options (`fdfaa94ca`). Every lease caller routes through it.
+  - **Note:** an earlier field-order hypothesis (`166f85f5d`) was unproven and reverted (`32702dc5a`).
+- **Keycloak host port:** the identity journey lane failed because another
+  worktree's server held host port 8080. The test Keycloak first moved to
+  `127.0.0.1:18080` (`b24505671`), which then took a reserved `WyrdTestServer`
+  port mid-gate: the harness reserves from `[ip_local_port_range.low/2, low)`
+  and 18080 is inside it. It now publishes on `127.0.0.1:8180` (`3dc98bfa7`).
+  Dex is unchanged.
+- **Analytical follower grants outlived their leaders (latent, exposed):**
+  - **Symptom:** `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants` found a follower above its ownership baseline (an extra spill directory and envelope) after its queries ended.
+  - **Evidence:** the Analytical leader reserved each participant before dispatch. The follower answered by creating a pending entry holding a query envelope, runtime, and spill directory, and freed it only on lazy `PENDING_TTL` expiry or an explicit `ReleaseSlots`. A leader that abandoned its plan, or whose release was lost, left the entry charged. The test counted no pending entries, so this was consistent with the symptom but not yet proven.
+  - **Cause:** follower capacity was owned by a timer-bounded pending entry instead of by the leader. Nothing tied a grant's lifetime to its leader.
+  - **Fix site:** `ReserveSlots` is now a server stream that holds a `HeldGraphGrant` (`dispatcher.rs`, `peer_service.rs`). The grant ends when the stream closes, at the query deadline, or at shutdown (`ReservationRegistry::close_all`), and it cancels the graph built on it (`GraphLease.grant_closed`). Callers checked:
+    - the leader lifecycle (`AnalyticalParticipantGrants`, where dropping releases),
+    - the Scribe executor (never granted),
+    - shutdown,
+    - follower activation (single-use envelope; rollback never restores a closed grant).
+    `PENDING_TTL`, `ReleaseSlots`, and retained-release expiry are deleted. `STAGE_PROTOCOL_VERSION` 1→2 refuses mixed peers.
+  - **Proof:** held grants appear in `OracleRuntimeInspection` and the ownership snapshot. `peer_network::security::peer_context_refusals` now includes the abandoned-grant journey (admit, drop, follower back to baseline including spill directories within 5 s against a 30 s deadline). The capacity journey passes.
+- **Generated docs drift:** the schema inventory and `llms-full.txt` were
+  regenerated for Operator connections and Gateway (`f2cb96efd`).
+
+### Non-goals
+
+No new provider, cloud SDK, cipher, broker, credential cache, Alert resource,
+executable Workflow action, plaintext export, compatibility route, generic
+secret resolver, or `SecretRef` Operator-key contract was added. Source
+historical review files remain prior evidence only.
+
+### Commands
+
+```bash
+mise run gate          # PASS (final run on 3dc98bfa7, 2093 s)
+git diff --check       # clean
+mise run test:wyrd     # 2292 passed after the lease fix
+mise run test:sql      # 179 + 6 + 114 + 2 passed after the renumber
+```
+
+Credentialed Slack/PagerDuty live smokes remain gated release evidence and
+were not run.

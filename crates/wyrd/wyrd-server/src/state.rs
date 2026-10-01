@@ -14,7 +14,6 @@ use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::Gate;
-use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
@@ -149,11 +148,6 @@ pub struct ScribeBuildInputs {
     pub fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Audit sink for refused inbound fragment requests.
     pub fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Audit outbox writer for follower tenant tripwires.
-    pub fragment_query_audit: Arc<crate::oracle::OracleQueryAudit>,
-    /// Whether this role owns `fragment_query_audit`'s shutdown, which it does
-    /// only when no local Oracle role shares the publisher.
-    pub owns_fragment_query_audit: bool,
     /// Role-scoped cancellation signal.
     pub role_shutdown: CancellationToken,
     /// Whether boot already activated the fence; `false` keeps heartbeats
@@ -421,10 +415,6 @@ pub struct Scribe {
     fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Durable security audit for rejected Scribe fragment authority.
     fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Process-owned query audit required by decoded tenant tripwires.
-    fragment_query_audit: Arc<crate::oracle::OracleQueryAudit>,
-    /// Retains audit shutdown ownership only when this process has no Oracle owner.
-    owns_fragment_query_audit: bool,
     /// Cancels the recurring heartbeat and snapshot tasks before role removal.
     role_shutdown: CancellationToken,
     /// Retains the heartbeat task so teardown can prove it stopped before unregister.
@@ -916,8 +906,6 @@ impl Scribe {
             registered_role,
             fragment_verifier,
             fragment_security_audit,
-            fragment_query_audit,
-            owns_fragment_query_audit,
             role_shutdown,
             activated,
         } = inputs;
@@ -926,13 +914,10 @@ impl Scribe {
                 .tail_service()
                 .expect("constructed Scribe must retain a valid UUID stream identity"),
         );
-        let fragment_follower = Arc::new(
-            PhysicalPlanFollower::new(ScribeTailResolver::new(
-                Arc::clone(&tail_service),
-                Arc::clone(&catalog),
-            ))
-            .with_audit(fragment_query_audit.clone()),
-        );
+        let fragment_follower = Arc::new(PhysicalPlanFollower::new(ScribeTailResolver::new(
+            Arc::clone(&tail_service),
+            Arc::clone(&catalog),
+        )));
         let advertise_ready = Arc::new(AtomicBool::new(activated));
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
@@ -965,8 +950,6 @@ impl Scribe {
             catalog,
             fragment_verifier,
             fragment_security_audit,
-            fragment_query_audit,
-            owns_fragment_query_audit,
             role_shutdown,
             heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
             heartbeat_abort,
@@ -1134,12 +1117,6 @@ impl Scribe {
         if !self.ingest.shutdown(deadline).await {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
                 detail: "Scribe shutdown did not flush every retained owner".to_owned(),
-            });
-        }
-        if self.owns_fragment_query_audit && self.fragment_query_audit.shutdown(deadline).await != 0
-        {
-            return Err(wyrd_spec::vala::error::BifrostError::Internal {
-                detail: "Scribe shutdown retained tenant-tripwire audit state".to_owned(),
             });
         }
         await_role_task(&self.heartbeat, deadline, "scribe heartbeat").await?;
@@ -1691,7 +1668,7 @@ impl Bifrost {
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
                     &token_verifier,
                 )),
-                IngestLimits::default(),
+                vala_bifrost_redux::gate::limits::IngestLimits::default(),
             ),
             scribe: None,
             forge: None,
@@ -1724,7 +1701,7 @@ impl Bifrost {
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
                     &token_verifier,
                 )),
-                IngestLimits::default(),
+                vala_bifrost_redux::gate::limits::IngestLimits::default(),
             ),
             scribe: None,
             forge: None,

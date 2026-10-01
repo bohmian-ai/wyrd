@@ -1,26 +1,24 @@
 //! Parquet writer for frozen memtable snapshots.
 //!
-//! `encode_batch` stamps the authenticated tenant before encoding a
-//! `FrozenMemtable` snapshot to Parquet. Every file uses sort order
-//! `(data_tenant_id, wyrd_event_time)` and takes its partition day from the
-//! seal-key (never from row min/max).
+//! `encode_batch` encodes a `FrozenMemtable` snapshot to Parquet. Every file
+//! is sorted by the table's registered physical layout, records the
+//! authenticated tenant in its footer rather than in any column, and takes its
+//! partition day from the seal-key (never from row min/max).
 
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, StringArray};
 use arrow::compute::SortColumn;
 use arrow::compute::concat_batches;
 use arrow::compute::lexsort_to_indices;
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::RowGroupMetaData;
 use sha2::{Digest, Sha256};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
@@ -237,8 +235,8 @@ pub struct RowGroupStats {
 /// transaction).
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] when the binding, tenant column, tenant
-/// values, sort keys, or Parquet encoding is invalid.
+/// Returns [`ScribeError::Internal`] when the binding, sort keys, or Parquet
+/// encoding is invalid.
 pub(crate) fn encode_batch(
     frozen: &FrozenMemtable,
     binding: &TenantTableBinding,
@@ -281,6 +279,8 @@ pub struct ArtifactPlan<'a> {
     pub first_ordinal: usize,
     /// Approximate encoded size at which one artifact closes and the next opens.
     pub target_object_bytes: u64,
+    /// Authenticated tenant recorded in every sealed artifact's footer.
+    pub tenant: DataTenantId,
 }
 
 /// Encodes one claim's already ordered rows into rolling hot objects.
@@ -322,7 +322,7 @@ struct ParquetBatchEncoder<'a> {
     frozen: &'a FrozenMemtable,
     /// Tenant-qualified physical binding validated before materialization.
     binding: &'a TenantTableBinding,
-    /// Authenticated tenant stamped into the physical batch.
+    /// Authenticated tenant recorded in every sealed artifact's footer.
     seal_tenant: DataTenantId,
     /// Ordered whole-batch candidates owned by this operation.
     candidates: Vec<FileCandidate>,
@@ -349,6 +349,7 @@ impl<'a> ParquetBatchEncoder<'a> {
             layout: self.layout,
             first_ordinal: self.first_ordinal,
             target_object_bytes: self.target_object_bytes,
+            tenant: self.seal_tenant,
         }
     }
 
@@ -374,12 +375,12 @@ impl<'a> ParquetBatchEncoder<'a> {
         })
     }
 
-    /// Validates physical identity and builds the tenant-stamped sorted batch.
+    /// Validates physical identity and builds the sorted candidate batch.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when identity, concatenation, tenant
-    /// stamping, or sort-key validation fails.
+    /// Returns [`ScribeError::Internal`] when identity, concatenation, or
+    /// sort-key validation fails.
     fn prepare_sorted_candidate(
         &self,
         candidate: FileCandidate,
@@ -410,8 +411,7 @@ impl<'a> ParquetBatchEncoder<'a> {
             detail: format!("failed to materialize frozen memtable for encoding: {error}"),
         })?;
         debug_assert_eq!(encoder_batch.num_rows(), candidate.rows);
-        let stamped_batch = stamp_tenant(&encoder_batch, self.seal_tenant)?;
-        sort_batch(&stamped_batch, self.layout)
+        sort_batch(&encoder_batch, self.layout)
     }
 }
 
@@ -600,7 +600,7 @@ impl<'a> RollingArtifactWriter<'a> {
             mut writer,
             rows,
         } = open;
-        for field in BifrostFooterIdentity::new(schema.as_ref(), &object_identity)
+        for field in BifrostFooterIdentity::new(schema.as_ref(), &object_identity, self.plan.tenant)
             .map_err(|detail| ScribeError::Internal { detail })?
             .key_values()
         {
@@ -619,8 +619,13 @@ impl<'a> RollingArtifactWriter<'a> {
                 detail: "Scribe Parquet sealed artifact is empty".to_owned(),
             });
         }
-        let evidence =
-            inspect_sealed_artifact(&scratch_path, schema.as_ref(), &object_identity, file_size)?;
+        let evidence = inspect_sealed_artifact(
+            &scratch_path,
+            schema.as_ref(),
+            &object_identity,
+            self.plan.tenant,
+            file_size,
+        )?;
         let SealedArtifactEvidence {
             row_group_stats,
             data_file_metrics,
@@ -653,64 +658,11 @@ impl<'a> RollingArtifactWriter<'a> {
     }
 }
 
-fn stamp_tenant(
-    batch: &RecordBatch,
-    seal_tenant: DataTenantId,
-) -> Result<RecordBatch, ScribeError> {
-    let schema = batch.schema();
-    let tenant_idx = schema
-        .index_of(DATA_TENANT_ID)
-        .map_err(|_| ScribeError::Internal {
-            detail: format!("{DATA_TENANT_ID} column not found after system-column construction"),
-        })?;
-    let tenant_array = batch
-        .column(tenant_idx)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ScribeError::Internal {
-            detail: format!("{DATA_TENANT_ID} column must be Utf8"),
-        })?;
-    let expected = seal_tenant.to_string();
-
-    for row_index in 0..tenant_array.len() {
-        if !tenant_array.is_null(row_index) {
-            let observed = tenant_array.value(row_index);
-            if observed != expected {
-                return Err(ScribeError::Internal {
-                    detail: format!(
-                        "{DATA_TENANT_ID} mismatch at row {row_index}: expected `{expected}`, observed `{observed}`"
-                    ),
-                });
-            }
-        }
-    }
-
-    let mut fields: Vec<_> = schema.fields.iter().cloned().collect();
-    fields[tenant_idx] = Arc::new(
-        fields[tenant_idx]
-            .as_ref()
-            .clone()
-            .with_data_type(DataType::Utf8)
-            .with_nullable(false),
-    );
-    let stamped_schema = Arc::new(Schema {
-        fields: fields.into(),
-        metadata: schema.metadata.clone(),
-    });
-    let mut columns = batch.columns().to_vec();
-    columns[tenant_idx] = Arc::new(StringArray::from(vec![expected; batch.num_rows()]));
-
-    RecordBatch::try_new(stamped_schema, columns).map_err(|error| ScribeError::Internal {
-        detail: format!("failed to stamp {DATA_TENANT_ID}: {error}"),
-    })
-}
-
 /// Sort a `RecordBatch` by the table's registered physical sort order.
 ///
-/// The canonical order always begins with the injected `data_tenant_id`
-/// ascending nulls-last prefix and continues with the table's declared keys in
-/// declaration order, so the rows Scribe writes match the sort order stamped on
-/// the destination Iceberg table.
+/// The canonical order is the table's declared keys in declaration order, so
+/// the rows Scribe writes match the sort order stamped on the destination
+/// Iceberg table.
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] when a sort column named by the resolved
@@ -788,6 +740,7 @@ fn inspect_sealed_artifact(
     path: &Path,
     expected_schema: &Schema,
     expected_object_identity: &str,
+    tenant: DataTenantId,
     file_size: u64,
 ) -> Result<SealedArtifactEvidence, ScribeError> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -800,7 +753,7 @@ fn inspect_sealed_artifact(
     })?;
 
     let metadata = reader.metadata();
-    BifrostFooterIdentity::new(expected_schema, expected_object_identity)
+    BifrostFooterIdentity::new(expected_schema, expected_object_identity, tenant)
         .and_then(|identity| identity.verify(metadata.file_metadata()))
         .map_err(|detail| ScribeError::Internal { detail })?;
     let mut row_group_stats = Vec::new();
@@ -1082,8 +1035,7 @@ mod tests {
     ///
     /// The fixture schema carries none of the floor columns, so the Bloom
     /// intent is declared explicitly. `wyrd_event_time` is a legal declared
-    /// Bloom column and, unlike `data_tenant_id`, is not constant within a
-    /// file.
+    /// Bloom column and is not constant within a file.
     ///
     /// # Panics
     /// Panics when the schema cannot carry the built-in declaration.
@@ -1102,11 +1054,11 @@ mod tests {
     fn build_test_frozen(
         seal_partition: TimePartition,
         seal_tenant: DataTenantId,
-        tenant_ids: Vec<&str>,
+        services: Vec<&str>,
         timestamps: Vec<i64>,
     ) -> FrozenMemtable {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
+            Field::new("service", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -1117,7 +1069,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(tenant_ids)),
+                Arc::new(StringArray::from(services)),
                 Arc::new(TimestampMicrosecondArray::from(timestamps)),
             ],
         )
@@ -1164,23 +1116,17 @@ mod tests {
     }
 
     /// Builds one whole stored batch retained as one candidate input boundary.
-    fn whole_member_batch(tenant: &str, first_timestamp: i64, rows: usize) -> RecordBatch {
+    fn whole_member_batch(first_timestamp: i64, rows: usize) -> RecordBatch {
         let row_count = i64::try_from(rows).expect("test row count fits i64");
         RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("data_tenant_id", DataType::Utf8, false),
-                Field::new(
-                    "wyrd_event_time",
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
-                    false,
-                ),
-            ])),
-            vec![
-                Arc::new(StringArray::from(vec![tenant; rows])),
-                Arc::new(TimestampMicrosecondArray::from_iter_values(
-                    first_timestamp..first_timestamp + row_count,
-                )),
-            ],
+            Arc::new(Schema::new(vec![Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            )])),
+            vec![Arc::new(TimestampMicrosecondArray::from_iter_values(
+                first_timestamp..first_timestamp + row_count,
+            ))],
         )
         .expect("whole member batch")
     }
@@ -1190,16 +1136,12 @@ mod tests {
     #[test]
     fn forced_seal_multi_candidate_member_has_one_deterministic_artifact_set() {
         let tenant = DataTenantId::new_v7();
-        let tenant_string = tenant.to_string();
         let day = crate::test_support::day_partition(2026, 7, 14);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
-            Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
         let frozen = FrozenMemtable {
             seal_id: 41,
             seal_key: SealKey::new(
@@ -1210,8 +1152,8 @@ mod tests {
             shard_id: 3,
             schema,
             batches: vec![
-                whole_member_batch(&tenant_string, 0, 60 * 1024),
-                whole_member_batch(&tenant_string, 60 * 1024, 50 * 1024),
+                whole_member_batch(0, 60 * 1024),
+                whole_member_batch(60 * 1024, 50 * 1024),
             ],
             metas: vec![],
             opened_at: std::time::Instant::now(),
@@ -1240,20 +1182,15 @@ mod tests {
     /// both a dictionary page and its index stream, and ZSTD cannot recover
     /// either, so the encoded size tracks the row count.
     fn incompressible_frozen(tenant: DataTenantId, rows: usize) -> FrozenMemtable {
-        let tenant_value = tenant.to_string();
-        let mut fields = vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
-            Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ];
+        let mut fields = vec![Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )];
         let row_count = i64::try_from(rows).expect("test row count fits i64");
-        let mut columns: Vec<arrow::array::ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![tenant_value.as_str(); rows])),
-            Arc::new(TimestampMicrosecondArray::from_iter_values(0..row_count)),
-        ];
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(
+            TimestampMicrosecondArray::from_iter_values(0..row_count),
+        )];
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
         for column in 0..INCOMPRESSIBLE_PAYLOAD_COLUMNS {
             fields.push(Field::new(
@@ -1464,12 +1401,13 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a field is missing, names another artifact, or a retired
-    /// field is present.
+    /// Panics when a field is missing, names another artifact or tenant, or a
+    /// retired field is present.
     fn assert_footer_identity_names_this_artifact(
         fields: &std::collections::BTreeMap<String, String>,
         artifact: &BoundedParquetArtifact,
         sealed_fingerprint: &str,
+        tenant: DataTenantId,
     ) {
         assert_eq!(
             fields
@@ -1487,10 +1425,17 @@ mod tests {
         );
         assert_eq!(
             fields
+                .get(crate::parquet::footer::KEY_TENANT)
+                .map(String::as_str),
+            Some(tenant.to_string().as_str()),
+            "the footer records the authenticated seal tenant"
+        );
+        assert_eq!(
+            fields
                 .keys()
                 .filter(|key| key.starts_with("wyrd.bifrost."))
                 .count(),
-            2,
+            3,
             "only the identity fields are stamped: {fields:?}"
         );
     }
@@ -1572,6 +1517,7 @@ mod tests {
                 &fields,
                 artifact,
                 &hex::encode(crate::parquet::footer::schema_fingerprint(frozen.schema.as_ref()).0),
+                tenant,
             );
 
             assert_row_group_stats_match_footer(metadata, artifact);
@@ -1706,14 +1652,20 @@ mod tests {
         );
     }
 
-    /// Reads one encoded artifact and proves its tenant and timestamp order.
-    fn assert_encoded_rows(encoded: &ParquetEncoded, tenant: &str, expected_times: &[i64]) {
+    /// Reads one encoded artifact and proves its footer tenant and timestamp
+    /// order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the artifact cannot be decoded, its footer does not record
+    /// `tenant`, or its event times differ from `expected_times`.
+    fn assert_encoded_rows(encoded: &ParquetEncoded, tenant: DataTenantId, expected_times: &[i64]) {
         let file =
             std::fs::File::open(&encoded.artifacts[0].scratch_path).expect("encoded artifact");
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .expect("encoded parquet")
-            .build()
-            .expect("encoded reader");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).expect("encoded parquet");
+        crate::parquet::footer::verify_footer_tenant(reader.metadata().file_metadata(), tenant)
+            .expect("the footer records the seal tenant");
+        let mut reader = reader.build().expect("encoded reader");
         let batch = reader
             .next()
             .expect("encoded row group")
@@ -1725,14 +1677,11 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .expect("timestamp column")
             .values();
-        let tenants = batch
-            .column_by_name(DATA_TENANT_ID)
-            .expect("tenant column")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("string tenant");
         assert_eq!(times, expected_times);
-        assert!((0..tenants.len()).all(|index| tenants.value(index) == tenant));
+        assert!(
+            batch.schema().index_of("data_tenant_id").is_err(),
+            "no per-row tenant column is written"
+        );
     }
 
     /// Every sealed artifact carries Iceberg metrics that agree with the exact
@@ -1751,10 +1700,9 @@ mod tests {
     #[test]
     fn sealed_artifacts_carry_footer_agreeing_iceberg_metrics() {
         let tenant = DataTenantId::new_v7();
-        let tenant_string = tenant.to_string();
         let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
+            Field::new("service", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -1764,7 +1712,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(StringArray::from(vec![tenant_string.as_str(); 4])),
+                Arc::new(StringArray::from(vec!["api"; 4])),
                 Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 30, 40])),
             ],
         )
@@ -1840,8 +1788,8 @@ mod tests {
         );
     }
 
-    /// Generation encoding sorts every stored batch together, stamps the
-    /// authenticated tenant, numbers artifacts from zero, and refuses a
+    /// Generation encoding sorts every stored batch together, records the
+    /// authenticated tenant in the footer, numbers artifacts from zero, and refuses a
     /// mismatched tenant before materialization.
     ///
     /// The generation is the encoding unit: its stored batches are one sorted
@@ -1858,26 +1806,16 @@ mod tests {
     #[test]
     fn generation_encoding_preserves_sort_tenant_and_artifact_identity() {
         let tenant = DataTenantId::new_v7();
-        let tenant_string = tenant.to_string();
         let day = crate::test_support::day_partition(2026, 7, 14);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
-            Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
         let stored_batch = |timestamps: Vec<i64>| {
             RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![
-                    Arc::new(StringArray::from(vec![
-                        tenant_string.as_str();
-                        timestamps.len()
-                    ])),
-                    Arc::new(TimestampMicrosecondArray::from(timestamps)),
-                ],
+                vec![Arc::new(TimestampMicrosecondArray::from(timestamps))],
             )
             .expect("stored batch")
         };
@@ -1907,7 +1845,7 @@ mod tests {
                 .object_identity
                 .ends_with("-00000.parquet")
         );
-        assert_encoded_rows(&encoded, &tenant_string, &[10, 20, 30, 40]);
+        assert_encoded_rows(&encoded, tenant, &[10, 20, 30, 40]);
 
         let mismatch_scratch = tempfile::tempdir().expect("mismatch scratch");
         let layout = test_layout(frozen.schema.as_ref());
@@ -1931,11 +1869,10 @@ mod tests {
         // Regression test for C2: partition = seal_key.partition, not row min/max
         let seal_partition = crate::test_support::day_partition(2026, 7, 14);
         let tenant = DataTenantId::new_v7();
-        let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
             seal_partition,
             tenant,
-            vec![tenant_string.as_str(), tenant_string.as_str()],
+            vec!["api", "api"],
             vec![1_000_000, 2_000_000], // timestamps don't matter for the partition
         );
 
@@ -1950,17 +1887,11 @@ mod tests {
     fn parquet_writer_honors_sort_order() {
         // Round-trip: write shuffled input, verify sort order in column stats
         let tenant = DataTenantId::new_v7();
-        let tenant_string = tenant.to_string();
 
         let frozen = build_test_frozen(
             crate::test_support::day_partition(2026, 7, 14),
             tenant,
-            vec![
-                tenant_string.as_str(),
-                tenant_string.as_str(),
-                tenant_string.as_str(),
-                tenant_string.as_str(),
-            ],
+            vec!["a", "b", "c", "d"],
             vec![400, 100, 300, 200], // Shuffled timestamps
         );
 
@@ -1975,8 +1906,8 @@ mod tests {
         let mut reader = builder.build().unwrap();
         let batch = reader.next().unwrap().unwrap();
 
-        let tenant_col = batch
-            .column_by_name("data_tenant_id")
+        let service_col = batch
+            .column_by_name("service")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
@@ -1989,28 +1920,20 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
 
-        // Every row is stamped with the seal tenant; timestamps are the second sort key.
-        assert_eq!(tenant_col.value(0), tenant_string);
-        assert_eq!(time_col.value(0), 100);
-
-        assert_eq!(tenant_col.value(1), tenant_string);
-        assert_eq!(time_col.value(1), 200);
-
-        assert_eq!(tenant_col.value(2), tenant_string);
-        assert_eq!(time_col.value(2), 300);
-
-        assert_eq!(tenant_col.value(3), tenant_string);
-        assert_eq!(time_col.value(3), 400);
+        // Rows travel with their event time, the declared sort key.
+        assert_eq!((service_col.value(0), time_col.value(0)), ("b", 100));
+        assert_eq!((service_col.value(1), time_col.value(1)), ("d", 200));
+        assert_eq!((service_col.value(2), time_col.value(2)), ("c", 300));
+        assert_eq!((service_col.value(3), time_col.value(3)), ("a", 400));
     }
 
     #[test]
     fn parquet_writer_writes_bloom_and_page_index() {
         let tenant = DataTenantId::new_v7();
-        let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
             crate::test_support::day_partition(2026, 7, 14),
             tenant,
-            vec![tenant_string.as_str(), tenant_string.as_str()],
+            vec!["api", "api"],
             vec![1_000_000, 2_000_000],
         );
 
@@ -2027,14 +1950,14 @@ mod tests {
 
         // Verify page index (offset index) is present
         let rg = metadata.row_groups().first().unwrap();
-        let tenant_col = rg
+        let service_col = rg
             .columns()
             .iter()
-            .find(|column| column.column_descr().name() == DATA_TENANT_ID)
+            .find(|column| column.column_descr().name() == "service")
             .unwrap();
         assert!(
-            tenant_col.bloom_filter_offset().is_none(),
-            "the tenant column is constant within a file and must not be Bloomed"
+            service_col.bloom_filter_offset().is_none(),
+            "an undeclared column must not be Bloomed"
         );
 
         let col = rg
@@ -2058,11 +1981,10 @@ mod tests {
     fn parquet_writer_returns_envelopes_unmodified() {
         // Encoding does not touch the `ScribeAppendMeta` list
         let tenant = DataTenantId::new_v7();
-        let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
             crate::test_support::day_partition(2026, 7, 14),
             tenant,
-            vec![tenant_string.as_str()],
+            vec!["api"],
             vec![1_000_000],
         );
 
@@ -2102,7 +2024,7 @@ mod tests {
     #[test]
     fn sort_batch_uses_one_key_for_every_table() {
         let schema = Arc::new(Schema::new(vec![
-            arrow::datatypes::Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+            arrow::datatypes::Field::new("service", DataType::Utf8, false),
             arrow::datatypes::Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
@@ -2112,7 +2034,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(vec!["tenant-b", "tenant-a", "tenant-a"])),
+                Arc::new(StringArray::from(vec!["c", "b", "a"])),
                 Arc::new(TimestampMicrosecondArray::from(vec![3, 2, 1])),
             ],
         )
@@ -2120,8 +2042,8 @@ mod tests {
 
         let layout = test_layout(batch.schema().as_ref());
         let sorted = sort_batch(&batch, &layout).unwrap();
-        let tenants = sorted
-            .column_by_name(DATA_TENANT_ID)
+        let services = sorted
+            .column_by_name("service")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
@@ -2132,106 +2054,25 @@ mod tests {
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
-        assert_eq!((tenants.value(0), times.value(0)), ("tenant-a", 1));
-        assert_eq!((tenants.value(1), times.value(1)), ("tenant-a", 2));
-        assert_eq!((tenants.value(2), times.value(2)), ("tenant-b", 3));
-    }
-
-    #[test]
-    fn missing_tenant_column_fails_closed() {
-        let tenant = DataTenantId::new_v7();
-        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-            "wyrd_event_time",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(TimestampMicrosecondArray::from(vec![1]))],
-        )
-        .unwrap();
-        let frozen = FrozenMemtable {
-            seal_id: 0,
-            seal_key: SealKey::new(
-                tenant,
-                TableRef::new(BifrostNamespace::Bifrost, "events"),
-                crate::test_support::day_partition(2026, 7, 14),
-            ),
-            shard_id: 0,
-            schema,
-            batches: vec![batch],
-            metas: vec![],
-            opened_at: std::time::Instant::now(),
-            closed_at: std::time::Instant::now(),
-            arrow_bytes: 0,
-        };
-        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).unwrap();
-
-        let scratch = tempfile::tempdir().unwrap();
-        let layout = test_layout(frozen.schema.as_ref());
-        let error = encode_batch(
-            &frozen,
-            &binding,
-            tenant,
-            scratch.path(),
-            "object",
-            &layout,
-            crate::resources::ScribeResources::for_test(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(error, ScribeError::Internal { detail } if detail.contains(DATA_TENANT_ID))
-        );
-    }
-
-    #[test]
-    fn mismatched_tenant_value_fails_closed() {
-        let expected = DataTenantId::new_v7();
-        let observed = DataTenantId::new_v7();
-        let expected_string = expected.to_string();
-        let observed_string = observed.to_string();
-        let frozen = build_test_frozen(
-            crate::test_support::day_partition(2026, 7, 14),
-            expected,
-            vec![expected_string.as_str(), observed_string.as_str()],
-            vec![1, 2],
-        );
-        let binding =
-            TenantTableBinding::resolve((expected, frozen.seal_key.table.clone())).unwrap();
-
-        let scratch = tempfile::tempdir().unwrap();
-        let layout = test_layout(frozen.schema.as_ref());
-        let error = encode_batch(
-            &frozen,
-            &binding,
-            expected,
-            scratch.path(),
-            "object",
-            &layout,
-            crate::resources::ScribeResources::for_test(),
-        )
-        .unwrap_err();
-        assert!(matches!(error, ScribeError::Internal { detail }
-            if detail.contains("row 1")
-                && detail.contains(&expected.to_string())
-                && detail.contains(&observed.to_string())));
+        assert_eq!((services.value(0), times.value(0)), ("a", 1));
+        assert_eq!((services.value(1), times.value(1)), ("b", 2));
+        assert_eq!((services.value(2), times.value(2)), ("c", 3));
     }
 
     /// A real sealed file proves the writer recipe on its own footer rather
     /// than on the builder that produced it: the low-cardinality
-    /// `data_tenant_id` column encodes through a dictionary, `wyrd_event_time`
+    /// `service` column encodes through a dictionary, `wyrd_event_time`
     /// encodes as `DELTA_BINARY_PACKED` with no dictionary page, and every row
     /// decodes back exactly as written.
     #[test]
     fn sealed_file_footer_encoding_contract() {
         let tenant = DataTenantId::new_v7();
-        let tenant_text = tenant.to_string();
         let rows = 4_096;
         let timestamps: Vec<i64> = (0..rows).map(|row| 1_767_312_000_000_000 + row).collect();
         let frozen = build_test_frozen(
             crate::test_support::day_partition(2026, 7, 14),
             tenant,
-            vec![tenant_text.as_str(); usize::try_from(rows).expect("row count fits usize")],
+            vec!["api"; usize::try_from(rows).expect("row count fits usize")],
             timestamps.clone(),
         );
         let binding =
@@ -2253,7 +2094,7 @@ mod tests {
             for column in group.columns() {
                 let name = column.column_path().string();
                 let encodings = column.encodings().collect::<Vec<_>>();
-                if name == DATA_TENANT_ID {
+                if name == "service" {
                     saw_dictionary = true;
                     assert!(
                         encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
@@ -2309,7 +2150,7 @@ mod tests {
         let frozen = build_test_frozen(
             crate::test_support::day_partition(2026, 7, 14),
             seal_tenant,
-            vec![seal_tenant.to_string().as_str()],
+            vec!["api"],
             vec![1],
         );
         let binding =

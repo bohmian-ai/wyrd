@@ -947,6 +947,36 @@ impl PersistenceRuntime {
         worker.publish_residue(cause).await
     }
 
+    /// Publishes every staged claim that target or dwell has made due.
+    ///
+    /// A generation becoming durable already publishes the claims it made due,
+    /// but a key that stops receiving writes never produces another durable
+    /// generation, so its dwell would never be re-evaluated. The server's
+    /// lifecycle scanner calls this on its tick so dwell is a wall-clock bound
+    /// that holds without new data. A pod without a persistence worker or a
+    /// staging volume publishes nothing and reports zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a due claim cannot be gathered, admitted,
+    /// merged, or published. The claim stays outstanding and its members stay
+    /// durable, so a later tick or startup recovery retries it.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future stops between claims or leaves one claim in
+    /// flight; its uploaded objects and publication manifest converge on retry
+    /// and its rows stay authoritative in the WAL.
+    pub(crate) async fn publish_due(&self) -> Result<usize, ScribeError> {
+        let Some(worker) = &self.worker else {
+            return Ok(0);
+        };
+        if worker.staging.is_none() {
+            return Ok(0);
+        }
+        Ok(worker.publish_due_claims().await?.len())
+    }
+
     /// Publishes only the staged residue belonging to one physical partition.
     ///
     /// Returns zero when the pod has no persistence worker or no staging
@@ -1594,16 +1624,12 @@ impl ScribePublicationReconciler {
 
 impl PersistenceWorker {
     /// Reports whether the test fault injector refuses the next SQL commit.
+    ///
+    /// Compiled only for tests and `test-support`; production has no injector.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     fn fail_before_sql_commit(&self) -> bool {
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            self.faults.take_sql_commit()
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
-        {
-            false
-        }
+        self.faults.take_sql_commit()
     }
 
     /// Builds a persistence worker from its complete durable dependencies.
@@ -1754,18 +1780,17 @@ impl PersistenceWorker {
             .await
     }
 
-    /// Records the claims one settled generation published and returns its member.
+    /// Logs the claims one settled generation published and returns its member.
     ///
-    /// Publishing is decoupled from staging, so the count belongs to the
-    /// generation that happened to make those claims due rather than to any one
-    /// of their members. Zero is the normal steady state for a key still
-    /// filling toward its object target.
+    /// Publishing is decoupled from staging, so the log names the generation
+    /// that happened to make those claims due rather than any one of their
+    /// members. Zero is the normal steady state for a key still filling toward
+    /// its object target; the published-claims counter is recorded where each
+    /// claim publishes, in `publish_due_claims`.
     fn record_published_claims(
         generation: &ImmutableGeneration,
         outcome: &StagedGenerationOutcome,
     ) -> crate::scribe::assembly::StagedMemberId {
-        metrics::counter!("bifrost_scribe_staging_claims_published_total")
-            .increment(outcome.published.len() as u64);
         if !outcome.published.is_empty() {
             tracing::info!(
                 shard_id = generation.shard_id,
@@ -1963,12 +1988,15 @@ impl PersistenceWorker {
         Ok(member)
     }
 
-    /// Publishes every claim that is due after this generation became durable.
+    /// Publishes every claim that target or dwell has made due.
     ///
-    /// Draining the assembler here rather than on a separate timer keeps the
-    /// pod's publication rate tied to its ingest rate: a key that has reached
+    /// Runs after each generation becomes durable, so a key that has reached
     /// target publishes as soon as the member that completed it is durable, and
-    /// a key that has not stays staged at no cost to this worker.
+    /// from [`PersistenceRuntime::publish_due`] on the server's lifecycle tick,
+    /// so a key whose writes stopped still publishes once its dwell expires.
+    /// Concurrent callers are safe: the assembler hands each due claim to
+    /// exactly one caller. Every published claim counts once in
+    /// `bifrost_scribe_staging_claims_published_total`.
     ///
     /// # Errors
     ///
@@ -1980,19 +2008,18 @@ impl PersistenceWorker {
         let mut published = Vec::new();
         while let Some(claim) = staging.take_claim(chrono::Utc::now())? {
             published.push(self.publish_claim(&staging, &claim).await?);
+            metrics::counter!("bifrost_scribe_staging_claims_published_total").increment(1);
         }
         Ok(published)
     }
 
     /// Publishes every staged member that target and dwell would still hold.
     ///
-    /// Drain is the one point where waiting costs more than publishing: no
-    /// further member will arrive to complete a partial key, and its dwell
-    /// would expire against a runtime that is gone. Sweeping every ready key as
-    /// residue therefore settles the staging volume instead of leaving durable
-    /// members for the next process to rediscover. Publication is still the
-    /// same fenced transaction, so a member that cannot publish stays durable
-    /// and staged rather than being dropped.
+    /// This is the explicit flush: it sweeps every ready key as residue rather
+    /// than waiting for target or dwell. Shutdown does not call it; staged
+    /// members survive a restart. Publication is still the same fenced
+    /// transaction, so a member that cannot publish stays durable and staged
+    /// rather than being dropped.
     ///
     /// Returns the number of claims published.
     ///
@@ -2174,6 +2201,7 @@ impl PersistenceWorker {
         runs: &crate::scribe::claim_assembly::ClaimRuns,
         scratch_dir: &std::path::Path,
     ) -> Result<crate::scribe::claim_assembly::AssembledClaim, ScribeError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.fail_before_sql_commit() {
             return Err(ScribeError::Internal {
                 detail: "test SQL failure before the first COMMIT attempt".to_owned(),
@@ -2686,11 +2714,6 @@ mod tests {
         fn fixture_schema() -> Arc<arrow::datatypes::Schema> {
             Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(
-                    wyrd_spec::vala::managed_columns::DATA_TENANT_ID,
-                    arrow::datatypes::DataType::Utf8,
-                    false,
-                ),
-                arrow::datatypes::Field::new(
                     wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
                     arrow::datatypes::DataType::Timestamp(
                         arrow::datatypes::TimeUnit::Microsecond,
@@ -2760,9 +2783,6 @@ mod tests {
                 arrow::record_batch::RecordBatch::try_new(
                     Arc::clone(&schema),
                     vec![
-                        Arc::new(arrow::array::StringArray::from(vec![
-                            self.tenant.to_string(),
-                        ])),
                         Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
                             1_767_225_600_000_000_i64,
                         ])),

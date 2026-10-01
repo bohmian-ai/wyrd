@@ -25,6 +25,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -372,8 +374,8 @@ pub struct AnalyticalSupervisor {
     /// Most recently settled graph's own output-sort evidence.
     ///
     /// Test-tier only. Production reports the same values as counters; a
-    /// process-cluster journey needs the exact per-operator numbers its own
-    /// query produced, which no counter family can attribute.
+    /// test needs the exact per-operator numbers its own query produced,
+    /// which no counter family can attribute.
     #[cfg(feature = "test-support")]
     physical_evidence: Mutex<Option<super::analytical::AnalyticalPhysicalEvidence>>,
     /// Graphs whose metric fold has settled on this node.
@@ -384,6 +386,13 @@ pub struct AnalyticalSupervisor {
     /// settled. This counter can, and it advances for every settled graph.
     #[cfg(feature = "test-support")]
     settled_graphs: std::sync::atomic::AtomicU64,
+    /// Attempts this node admitted, and how many of them settled successfully.
+    ///
+    /// Test-tier only. The attempt counter family is process-wide, so a
+    /// journey running several pods in one process cannot attribute it to one
+    /// node; this pair is the same count scoped to this supervisor.
+    #[cfg(feature = "test-support")]
+    attempt_counts: (AtomicU64, AtomicU64),
 }
 
 impl fmt::Debug for AnalyticalSupervisor {
@@ -411,6 +420,8 @@ impl AnalyticalSupervisor {
             physical_evidence: Mutex::new(None),
             #[cfg(feature = "test-support")]
             settled_graphs: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            attempt_counts: (AtomicU64::new(0), AtomicU64::new(0)),
         }
     }
 
@@ -728,13 +739,12 @@ impl AnalyticalSupervisor {
         graphs.get_mut(&graph)?.state_mut().metric_fold.take()
     }
 
-    /// Records one settled graph and whatever output-sort evidence it carried.
+    /// Retains the most recently settled graph's output-sort evidence.
     ///
     /// Test-tier only: production publishes the same evidence as counters from
-    /// [`super::telemetry::record_output_sort_spill`]. A journey needs the exact
+    /// [`super::telemetry::record_output_sort_spill`]. A test needs the exact
     /// per-operator values its own query produced, and a counter family cannot
-    /// answer "which sort" — so the settled evidence is kept verbatim for the
-    /// process-cluster control protocol to project.
+    /// answer "which sort", so the settled evidence is kept verbatim.
     ///
     /// `evidence` is `None` for a plan with no uniquely identifiable output
     /// sort. That case still advances [`Self::settled_graph_count`] and clears
@@ -759,6 +769,16 @@ impl AnalyticalSupervisor {
     pub fn settled_graph_count(&self) -> u64 {
         self.settled_graphs
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Reports `(admitted, succeeded)` Analytical attempts on this node.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn attempt_counts(&self) -> (u64, u64) {
+        (
+            self.attempt_counts.0.load(Ordering::Acquire),
+            self.attempt_counts.1.load(Ordering::Acquire),
+        )
     }
 
     /// Reports the most recently settled graph's output-sort evidence.
@@ -1121,6 +1141,8 @@ impl AnalyticalSupervisor {
         }
         let cancel = self.root_cancel.child_token();
         let egressed = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
+        self.attempt_counts.0.fetch_add(1, Ordering::AcqRel);
         let telemetry = AnalyticalAttemptTelemetry::start(
             &key.public_query_id.to_string(),
             &key.datafusion_query_id.to_string(),
@@ -1225,6 +1247,10 @@ impl AnalyticalSupervisor {
             egressed: state.egressed.load(Ordering::Acquire),
         };
         state.telemetry.finish(outcome);
+        #[cfg(feature = "test-support")]
+        if outcome == AnalyticalAttemptOutcome::Success {
+            self.attempt_counts.1.fetch_add(1, Ordering::AcqRel);
+        }
         tracing::debug!(
             public_query_id = %key.public_query_id,
             datafusion_query_id = %key.datafusion_query_id,

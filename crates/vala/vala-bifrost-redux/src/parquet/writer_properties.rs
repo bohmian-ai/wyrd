@@ -6,6 +6,7 @@ use parquet::file::properties::{
     DEFAULT_MAX_ROW_GROUP_ROW_COUNT, EnabledStatistics, WriterProperties,
 };
 use parquet::schema::types::ColumnPath;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Estimated encoded bytes at which a Bifrost writer closes a row group.
@@ -106,7 +107,10 @@ pub fn bifrost_writer_properties_with_metadata(
 /// encoded row-group target is the table's resolved
 /// `write.parquet.row-group-size-bytes` instead of
 /// [`BIFROST_ROW_GROUP_TARGET_BYTES`]. The row-count default is kept as well;
-/// whichever bound is reached first flushes the group.
+/// whichever bound is reached first flushes the group. `tenant` comes from the
+/// table binding the rewrite executes under and is carried forward into every
+/// output footer, so a rewritten file proves its tenant exactly as the staged
+/// file it replaces did.
 ///
 /// # Panics
 ///
@@ -115,11 +119,13 @@ pub fn bifrost_writer_properties_with_metadata(
 pub fn bifrost_rewrite_writer_properties(
     row_group_target_bytes: u64,
     bloom_columns: &[String],
+    tenant: DataTenantId,
 ) -> WriterProperties {
     recipe_builder(DEFAULT_MAX_ROW_GROUP_ROW_COUNT, bloom_columns)
         .set_max_row_group_bytes(Some(
             usize::try_from(row_group_target_bytes).unwrap_or(usize::MAX),
         ))
+        .set_key_value_metadata(Some(vec![crate::parquet::footer::tenant_key_value(tenant)]))
         .build()
 }
 
@@ -166,16 +172,10 @@ mod tests {
     /// The canonical union a traces table resolves: managed floor plus the
     /// declaration-only correlation columns.
     fn declared_recipe() -> Vec<String> {
-        [
-            "data_tenant_id",
-            "run_id",
-            "card_uid",
-            "trace_id",
-            "span_id",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+        ["run_id", "card_uid", "trace_id", "span_id"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The one writer recipe every Bifrost producer builds: dictionary
@@ -188,7 +188,7 @@ mod tests {
         let bloom_columns = declared_recipe();
         let properties = bifrost_writer_properties(50_000, &bloom_columns);
 
-        for column in ["service_name", "run_id", "message", "data_tenant_id"] {
+        for column in ["service_name", "run_id", "message", "card_uid"] {
             let path = ColumnPath::from(column);
             assert!(
                 properties.dictionary_enabled(&path),
@@ -283,7 +283,7 @@ mod tests {
     /// footer recipe.
     #[test]
     fn writer_recipe_blooms_exactly_the_resolved_union() {
-        let floor = ["data_tenant_id".to_owned(), "run_id".to_owned()];
+        let floor = ["card_uid".to_owned(), "run_id".to_owned()];
         let properties = bifrost_writer_properties(50_000, &floor);
         for column in &floor {
             assert!(
@@ -293,7 +293,7 @@ mod tests {
                 "resolved column {column} must have a bloom filter"
             );
         }
-        for column in ["trace_id", "span_id", "card_uid"] {
+        for column in ["trace_id", "span_id", "wyrd_event_time"] {
             assert!(
                 properties
                     .bloom_filter_properties(&ColumnPath::from(column))
@@ -351,7 +351,11 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             &mut bytes,
             schema,
-            Some(bifrost_rewrite_writer_properties(target, &[])),
+            Some(bifrost_rewrite_writer_properties(
+                target,
+                &[],
+                wyrd_spec::DataTenantId::new_v7(),
+            )),
         )
         .expect("writer");
         writer.write(&batch).expect("an oversized row is written");

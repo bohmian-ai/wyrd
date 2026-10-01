@@ -3724,7 +3724,6 @@ mod tests {
         super::super::codec::AnalyticalLeafBinding::new(
             wyrd_spec::vala::api::ClusterRole::Oracle,
             Arc::new(super::super::follower::UnresolvableSource),
-            Arc::new(crate::oracle::AcceptingOracleAudit),
             None,
         )
     }
@@ -4131,7 +4130,6 @@ mod tests {
                     Arc::new(CountingSource {
                         resolutions: Arc::clone(&resolutions),
                     }),
-                    Arc::new(crate::oracle::AcceptingOracleAudit),
                     None,
                 ),
                 egress: fixture_egress(),

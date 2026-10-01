@@ -103,6 +103,10 @@ pub struct TestOracleResources {
     pub data_root_parent: Option<PathBuf>,
     /// Complete raw process observation retained across node restarts.
     pub system_resources: Option<SystemResourceSnapshot>,
+    /// Oracle query slot units the node admits with, replacing the count its
+    /// resource plan derives. `None` keeps the derived count; a journey sets
+    /// it only to saturate an admission class deterministically.
+    pub oracle_query_slot_limit: Option<usize>,
 }
 
 /// Concrete role and identity descriptor for one Bifrost pod.
@@ -314,6 +318,48 @@ impl BifrostClusterSpec {
         nodes.extend((4..=6).map(|id| Self::node(id, [BifrostRuntimeRole::ForgeWorker])));
         Self {
             nodes,
+            scribe_geometry_for_test: None,
+            scribe_persistence_faults_for_test: None,
+            storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
+        }
+    }
+
+    /// Construct one node per public process target, in order.
+    ///
+    /// Node `n` (zero-based) gets the deterministic identity `n + 1` and
+    /// exactly the roles `target` selects, so a topology reads the way a
+    /// deployment's pod list does. Every node boots at the Bifrost pod floor —
+    /// [`vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES`] of memory,
+    /// four CPUs, and 4 GiB of scratch — so grants, partition counts, and
+    /// spill thresholds are the same numbers on every host rather than a
+    /// property of whichever machine ran the journey.
+    #[must_use]
+    pub fn for_targets(targets: &[BifrostTarget]) -> Self {
+        let pod_floor = SystemResourceSnapshot {
+            memory_limit_bytes: vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES,
+            effective_cpu: 4,
+            scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+            memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+            cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+        };
+        Self {
+            nodes: (1_u128..)
+                .zip(targets)
+                .map(|(id, target)| BifrostNodeSpec {
+                    node_id: NodeId::new(uuid::Uuid::from_u128(id)),
+                    roles: wyrd_server::config::BifrostRoles::for_target(*target)
+                        .iter()
+                        .copied()
+                        .collect(),
+                    oracle: Some(TestOracleResources {
+                        system_resources: Some(pod_floor),
+                        ..TestOracleResources::default()
+                    }),
+                    role_timing: None,
+                })
+                .collect(),
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
@@ -718,6 +764,9 @@ struct NodeResources {
     http_addr: std::net::SocketAddr,
     /// Fixed private/public gRPC bind retained across a restart.
     grpc_addr: std::net::SocketAddr,
+    /// Private peer bind retained across a restart, so a restarted node comes
+    /// back at the address membership already published for it.
+    peer_addr: std::net::SocketAddr,
     /// Closed production process role derived from the component set.
     process_role: BifrostTarget,
 }
@@ -820,6 +869,9 @@ pub struct WyrdTestCluster {
     telemetry: BifrostTelemetryCapture,
     /// Optional retained TLS fixture directory and paths for real peer transport.
     oracle_peer_tls: Option<(Arc<tempfile::TempDir>, TestBifrostPeerTls)>,
+    /// Authority every node's peer leaf chains to, retained so a journey can
+    /// mint member, foreign, expired, and misnamed identities against it.
+    peer_ca: crate::bifrost::peer_ca::BifrostPeerCa,
     /// Shared observer for supervised Forge worker completions.
     forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Shared uncertainty-injection catalog wrapper, when enabled.
@@ -964,10 +1016,10 @@ impl WyrdTestCluster {
     /// proves the two fences a replacement must advance before any assertion
     /// about replay can mean anything: the node is reachable only at addresses
     /// the terminated process never held, and a Scribe owner comes back at a
-    /// strictly greater writer epoch. Both addresses are reserved and compared
-    /// before the replacement boots, so a reused address leaves the node stopped
-    /// rather than running behind an error, and a boot failure restores the
-    /// addresses the node was configured with.
+    /// strictly greater writer epoch. The HTTP, gRPC, and peer addresses are
+    /// all reserved and compared before the replacement boots, so a reused
+    /// address leaves the node stopped rather than running behind an error, and
+    /// a boot failure restores the addresses the node was configured with.
     ///
     /// # Errors
     ///
@@ -1009,7 +1061,12 @@ impl WyrdTestCluster {
         // node must stay stopped rather than run behind this error.
         let http_addr = reserve_loopback_addr()?;
         let grpc_addr = reserve_loopback_addr()?;
-        if http_addr == previous_http_addr || grpc_addr == previous_grpc_addr {
+        let peer_addr = reserve_loopback_addr()?;
+        let previous_peer_addr = resources.peer_addr;
+        if http_addr == previous_http_addr
+            || grpc_addr == previous_grpc_addr
+            || peer_addr == previous_peer_addr
+        {
             return Err(ClusterError::Resource(
                 "replacement node did not advance its listener addresses".to_owned(),
             ));
@@ -1017,12 +1074,14 @@ impl WyrdTestCluster {
         let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
         resources.http_addr = http_addr;
         resources.grpc_addr = grpc_addr;
+        resources.peer_addr = peer_addr;
         let server = match self.build_node(node_id).await {
             Ok(server) => server,
             Err(error) => {
                 let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
                 resources.http_addr = previous_http_addr;
                 resources.grpc_addr = previous_grpc_addr;
+                resources.peer_addr = previous_peer_addr;
                 return Err(error);
             }
         };
@@ -1066,6 +1125,27 @@ impl WyrdTestCluster {
             .connect()
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))
+    }
+
+    /// Returns the authority every node's peer leaf chains to.
+    ///
+    /// A peer-plane journey mints its own member, foreign, expired, and
+    /// misnamed client identities from it rather than borrowing a node's leaf.
+    #[must_use]
+    pub const fn peer_ca(&self) -> &crate::bifrost::peer_ca::BifrostPeerCa {
+        &self.peer_ca
+    }
+
+    /// Returns the private peer address a configured node binds and advertises.
+    ///
+    /// Available for a stopped or not-yet-booted slot too, so a journey can
+    /// hold the socket before the node starts and prove boot refuses to serve
+    /// without its private listener.
+    #[must_use]
+    pub fn peer_addr(&self, node_id: NodeId) -> Option<std::net::SocketAddr> {
+        self.nodes
+            .get(&node_id)
+            .map(|resources| resources.peer_addr)
     }
 
     /// Refreshes every running node's authoritative immutable membership cut.
@@ -1584,15 +1664,14 @@ impl WyrdTestCluster {
         // authority is minted once per cluster and shared. The peer plane is
         // mandatory for a Scribe- or Oracle-bearing target, so this is
         // unconditional rather than gated on a per-test flag.
+        let peer_ca =
+            crate::bifrost::peer_ca::BifrostPeerCa::generate(wyrd_server::config::PEER_SERVER_NAME)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let oracle_peer_tls = {
             let root = Arc::new(
                 tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
             );
-            let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate(
-                wyrd_server::config::PEER_SERVER_NAME,
-            )
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            let tls = authority
+            let tls = peer_ca
                 .materialize(root.path(), "cluster")
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             Some((root, tls))
@@ -1616,6 +1695,7 @@ impl WyrdTestCluster {
                     data_root,
                     http_addr: reserve_loopback_addr()?,
                     grpc_addr: reserve_loopback_addr()?,
+                    peer_addr: reserve_loopback_addr()?,
                     process_role,
                 },
             );
@@ -1642,6 +1722,7 @@ impl WyrdTestCluster {
             faults: OracleFaultController::default(),
             telemetry: process.forge_capture.clone(),
             oracle_peer_tls,
+            peer_ca,
             forge_completion_observer: options.completion_observer.clone(),
             commit_uncertainty_catalog: commit_uncertainty_catalog.clone(),
             forge_config: options.config.clone(),
@@ -1671,6 +1752,7 @@ impl WyrdTestCluster {
             .with_bifrost_node(node_id, resources.spec.roles.clone())
             .with_bifrost_data_dir(Some(Arc::clone(&resources.data_root)))
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
+            .with_peer_bind(resources.peer_addr)
             .with_bifrost_storage_io_for_test(self.storage_io)
             .with_telemetry(Arc::clone(&process_telemetry()?.guard));
         if let Some(timing) = resources.spec.role_timing {
@@ -1683,6 +1765,14 @@ impl WyrdTestCluster {
             .and_then(|oracle| oracle.system_resources)
         {
             builder = builder.with_system_resources_for_test(snapshot);
+        }
+        if let Some(slots) = resources
+            .spec
+            .oracle
+            .as_ref()
+            .and_then(|oracle| oracle.oracle_query_slot_limit)
+        {
+            builder = builder.with_oracle_query_slot_limit_for_test(slots);
         }
         if let Some(oracle) = self.oracle_runtime.clone() {
             builder = builder.with_oracle_runtime_for_test(oracle);

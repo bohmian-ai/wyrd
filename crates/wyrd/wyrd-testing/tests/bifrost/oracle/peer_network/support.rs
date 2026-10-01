@@ -1,24 +1,23 @@
 //! Fixtures shared by the peer-network journeys.
 //!
-//! Everything here dials a running child over a real socket. Nothing composes
-//! a server in-process, because a peer-plane claim proved against an
-//! in-process router is not a claim about the deployed trust boundary.
+//! Everything here dials a running pod over its real private socket under real
+//! mTLS. Nothing calls a peer router directly, because a peer-plane claim
+//! proved against a router rather than a listener is not a claim about the
+//! deployed trust boundary.
 
 use std::net::SocketAddr;
 
 use vala_bifrost_redux::oracle::peer::{
     ReservationBinding, ReservationOperationV1, ReservationTicketClaims, reservation_body_digest,
 };
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::NodeId;
-use wyrd_testing::bifrost::process_cluster::{
-    BifrostProcessCluster, MembershipEntry, PeerProbePlan,
-};
+use wyrd_testing::bifrost::peer_ca::{BifrostPeerCa, BifrostPeerLeaf};
 use wyrd_tonic::prost::Message as _;
+use wyrd_tonic::tonic;
 use wyrd_tonic::wyrd::v1 as proto;
 
-use wyrd_testing::bifrost::peer_ca::{BifrostPeerCa, BifrostPeerLeaf};
-use wyrd_testing::bifrost::process_cluster::ProcessNodeTarget;
-use wyrd_tonic::tonic;
+use crate::peer_cluster::{MembershipEntry, PeerCluster, PeerProbePlan};
 use wyrd_tonic::tonic::transport::Channel;
 
 /// Boxed error carried by every peer-network fixture that can fail.
@@ -52,7 +51,7 @@ pub(crate) enum DialIdentity {
     Misnamed,
 }
 
-/// One dial against a child's private peer socket.
+/// One dial against a pod's private peer socket.
 ///
 /// Owns the trust decisions a peer client makes — which root it verifies, which
 /// name it requires, and which identity it presents — so a scenario states the
@@ -205,8 +204,8 @@ pub(crate) async fn probe_oracle_lifecycle(channel: Channel) -> Result<(), tonic
 /// A dedicated Forge worker composes neither HTTP nor public gRPC: it pulls
 /// work from Postgres and object storage and answers no caller.
 #[must_use]
-pub(crate) fn target_serves_public_listener(target: ProcessNodeTarget) -> bool {
-    target != ProcessNodeTarget::ForgeWorker
+pub(crate) fn target_serves_public_listener(target: BifrostTarget) -> bool {
+    target != BifrostTarget::ForgeWorker
 }
 
 /// Reports whether a target composes a private peer plane at all.
@@ -214,51 +213,11 @@ pub(crate) fn target_serves_public_listener(target: ProcessNodeTarget) -> bool {
 /// A Forge worker owns neither a Scribe nor an Oracle, so it has nothing to
 /// answer on the peer plane and must not open a listener for it.
 #[must_use]
-pub(crate) fn target_serves_peer_plane(target: ProcessNodeTarget) -> bool {
+pub(crate) fn target_serves_peer_plane(target: BifrostTarget) -> bool {
     matches!(
         target,
-        ProcessNodeTarget::All
-            | ProcessNodeTarget::Server
-            | ProcessNodeTarget::Oracle
-            | ProcessNodeTarget::Scribe
+        BifrostTarget::All | BifrostTarget::Server | BifrostTarget::Oracle | BifrostTarget::Scribe
     )
-}
-
-/// Reads how many request bodies the pod at `index` has polled on its peer plane.
-///
-/// # Errors
-///
-/// Returns the control-protocol failure unchanged.
-pub(crate) fn polls_at(
-    cluster: &mut BifrostProcessCluster,
-    index: usize,
-) -> Result<u64, PeerJourneyError> {
-    Ok(cluster.nodes_mut()[index].peer_body_polls()?)
-}
-
-/// Sends one probe from the pod at `index` and reports the destination's outcome.
-///
-/// # Errors
-///
-/// Returns the control-protocol failure unchanged.
-pub(crate) fn probe_from(
-    cluster: &mut BifrostProcessCluster,
-    index: usize,
-    plan: &PeerProbePlan,
-) -> Result<String, PeerJourneyError> {
-    Ok(cluster.nodes_mut()[index].peer_probe(plan)?)
-}
-
-/// Sends one probe from the first pod and reports the destination's outcome.
-///
-/// # Errors
-///
-/// Returns the control-protocol failure unchanged.
-pub(crate) fn probe(
-    cluster: &mut BifrostProcessCluster,
-    plan: &PeerProbePlan,
-) -> Result<String, PeerJourneyError> {
-    probe_from(cluster, 0, plan)
 }
 
 /// The two fenced Oracle incarnations one reservation travels between.
@@ -282,20 +241,20 @@ pub(crate) struct ReservationPlane {
 impl ReservationPlane {
     /// Projects both Oracle incarnations out of a freshly taken membership cut.
     ///
-    /// The cut is re-inspected rather than read from the ready report: the
-    /// leader answered readiness before the follower had registered, so its
-    /// startup report knows only itself. A reservation ticket binds both
-    /// fences, so the observation has to be as live as the tickets it feeds.
+    /// The cut is refreshed from Postgres on pod 0 at observation time: a
+    /// reservation ticket binds both fences, so the observation has to be as
+    /// live as the tickets it feeds. Pod 0 leads and pod 1 follows.
     ///
     /// # Errors
     ///
-    /// Returns a message naming the role that is absent from membership.
-    pub(crate) fn observe(cluster: &mut BifrostProcessCluster) -> Result<Self, PeerJourneyError> {
-        let leader = cluster.nodes_mut()[0].inspect()?;
-        let follower_node_id = cluster.nodes()[1].ready_report().node_id;
+    /// Returns the membership refresh failure, or a message naming the role
+    /// that is absent from membership.
+    pub(crate) async fn observe(cluster: &PeerCluster) -> Result<Self, PeerJourneyError> {
+        let membership = cluster.membership(0).await?;
+        let leader_node_id = cluster.node_id(0).as_uuid();
+        let follower_node_id = cluster.node_id(1).as_uuid();
         let oracle = |node_id: uuid::Uuid| -> Result<&MembershipEntry, PeerJourneyError> {
-            leader
-                .membership
+            membership
                 .iter()
                 .find(|entry| entry.node_id == node_id && entry.role == "oracle")
                 .ok_or_else(|| format!("no live Oracle lease for {node_id}").into())
@@ -305,15 +264,58 @@ impl ReservationPlane {
             destination: follower.address.clone(),
             follower_fence: follower.fencing_token,
             follower_node_id,
-            leader_fence: oracle(leader.node_id)?.fencing_token,
-            leader_node_id: leader.node_id,
+            leader_fence: oracle(leader_node_id)?.fencing_token,
+            leader_node_id,
         })
     }
 
     /// Returns the binding a correct reserve context must carry.
     pub(crate) fn reserve_binding(&self, query_id: uuid::Uuid) -> ReservationBinding {
+        self.binding(ReservationOperationV1::ReserveSlots, query_id)
+    }
+
+    /// Returns the release the leader sends for one accepted reservation.
+    ///
+    /// The context is built exactly as for a reserve, over the context-free
+    /// release encoding and bound to the release operation, so the follower
+    /// authorizes it on the same terms and returns the reservation's units.
+    ///
+    /// # Errors
+    ///
+    /// Returns the digest failure unchanged.
+    pub(crate) fn release_request(
+        &self,
+        reservation_id: Vec<u8>,
+        query_id: uuid::Uuid,
+    ) -> Result<proto::ReleaseNodeSlotsRequest, PeerJourneyError> {
+        let mut request = proto::ReleaseNodeSlotsRequest {
+            reservation_id,
+            query_id: query_id.as_bytes().to_vec(),
+            leader_node_id: self.leader_node_id.to_string(),
+            leader_fencing_token: self.leader_fence,
+            context: None,
+        };
+        let digest = reservation_body_digest(&request.encode_to_vec())
+            .map_err(|error| format!("release body digest: {error}"))?;
+        let claims = ReservationTicketClaims::for_binding(
+            &self.binding(ReservationOperationV1::ReleaseSlots, query_id),
+            digest,
+            context_expiry(),
+        );
+        request.context = Some(proto::PeerContext {
+            claims_bytes: claims.encode_to_vec(),
+        });
+        Ok(request)
+    }
+
+    /// Binds one operation on `query_id` between the observed incarnations.
+    fn binding(
+        &self,
+        operation: ReservationOperationV1,
+        query_id: uuid::Uuid,
+    ) -> ReservationBinding {
         ReservationBinding {
-            operation: ReservationOperationV1::ReserveSlots,
+            operation,
             source_node_id: NodeId::new(self.leader_node_id),
             source_fence: self.leader_fence,
             destination_node_id: NodeId::new(self.follower_node_id),
@@ -397,15 +399,18 @@ fn with_claims(
     request
 }
 
-/// Sends one reserve payload from the leader and returns the follower's verdict.
+/// Sends one reserve payload under a member identity and returns the
+/// follower's verdict.
 ///
 /// # Errors
 ///
-/// Returns the control-protocol failure unchanged.
-pub(crate) fn reserve(
-    cluster: &mut BifrostProcessCluster,
+/// Returns the dial or send failure when the follower never answered.
+pub(crate) async fn reserve(
+    cluster: &PeerCluster,
     destination: &str,
     payload: Vec<u8>,
 ) -> Result<String, PeerJourneyError> {
-    probe(cluster, &PeerProbePlan::own(destination).carrying(payload))
+    cluster
+        .probe(&PeerProbePlan::own(destination).carrying(payload))
+        .await
 }

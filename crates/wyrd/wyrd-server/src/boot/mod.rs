@@ -889,14 +889,12 @@ pub async fn compose_bifrost(
     let forge = if roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
         || roles.contains(&BifrostRuntimeRole::ForgeWorker)
     {
-        let (mut forge_config, maintenance_interval) = resolve_forge_config(&forge_runtime);
+        let (forge_config, maintenance_interval) = resolve_forge_config(&forge_runtime);
         #[cfg(feature = "test-support")]
-        if let Some(config) = test_controls
+        let forge_config = test_controls
             .as_ref()
             .and_then(|controls| controls.forge_config.clone())
-        {
-            forge_config = config;
-        }
+            .unwrap_or(forge_config);
         let staging = Arc::new(storage.operator().clone());
         #[cfg(feature = "test-support")]
         let object_store: Arc<dyn ForgeObjectStore> = test_controls
@@ -1006,13 +1004,9 @@ pub async fn compose_bifrost(
         None
     };
 
-    let query_audit = if roles.contains(&BifrostRuntimeRole::Oracle)
-        || roles.contains(&BifrostRuntimeRole::Scribe)
-    {
-        Some(OracleQueryAudit::new(postgres.vala().clone()))
-    } else {
-        None
-    };
+    let query_audit = roles
+        .contains(&BifrostRuntimeRole::Oracle)
+        .then(|| OracleQueryAudit::new(postgres.vala().clone()));
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres)
@@ -1034,12 +1028,6 @@ pub async fn compose_bifrost(
             registered_role: parts.scribe_role,
             fragment_verifier: fragment_authority,
             fragment_security_audit,
-            fragment_query_audit: query_audit.clone().ok_or_else(|| {
-                ServerBootError::Scribe(
-                    "selected Scribe role has no tenant-tripwire audit owner".to_owned(),
-                )
-            })?,
-            owns_fragment_query_audit: !roles.contains(&BifrostRuntimeRole::Oracle),
             role_shutdown: shutdown.clone(),
             activated: peer_tls.is_none(),
         })))
@@ -1517,7 +1505,7 @@ struct OracleRoleBuilder<'a> {
     peer_tls: Option<BifrostPeerTls>,
     /// Co-located Scribe a process-local Oracle lists and reads in-process.
     local_scribe: Option<Arc<crate::state::Scribe>>,
-    /// Shared query audit used by the leader and role-local tenant tripwires.
+    /// Query audit for the leader's read decisions and tenant refusals.
     audit: Option<Arc<OracleQueryAudit>>,
     /// One process-wide shutdown token injected into every Oracle owner.
     shutdown: CancellationToken,

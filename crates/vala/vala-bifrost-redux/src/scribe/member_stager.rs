@@ -393,7 +393,7 @@ fn fsync_directory(path: &Path) -> Result<(), ScribeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow::array::{RecordBatch, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::ids::DataTenantId;
 
@@ -403,22 +403,17 @@ mod tests {
 
     /// Builds one frozen bucket with the managed columns the encoder requires.
     fn frozen_member(tenant: DataTenantId, rows: usize) -> FrozenMemtable {
-        let tenant_value = tenant.to_string();
         let row_count = i64::try_from(rows).expect("test row count fits i64");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
-            Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec![tenant_value.as_str(); rows])),
-                Arc::new(TimestampMicrosecondArray::from_iter_values(0..row_count)),
-            ],
+            vec![Arc::new(TimestampMicrosecondArray::from_iter_values(
+                0..row_count,
+            ))],
         )
         .expect("frozen member fixture");
         FrozenMemtable {

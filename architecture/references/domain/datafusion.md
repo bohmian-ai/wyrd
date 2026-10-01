@@ -19,8 +19,9 @@ authorization boundary.
 A provider owns schema, exact snapshot-bound file facts, statistics, scan
 construction, and truthful pushdown claims. Advertise `Exact` filtering only
 when the scan enforces the expression for every row; manifest, file, or
-row-group pruning alone is normally `Inexact`. Retain the plan-root tenant
-predicate and terminal `TenantTripwireExec`. Project only requested columns and
+row-group pruning alone is normally `Inexact`. Prove each Parquet file's
+footer tenant against the authenticated binding before decoding any row; never
+add a per-row tenant column or check. Project only requested columns and
 map fields by name or stable field identity.
 
 ## Oracle execution paths

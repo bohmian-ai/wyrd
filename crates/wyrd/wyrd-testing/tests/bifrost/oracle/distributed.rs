@@ -4,26 +4,35 @@
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
-use vala_bifrost_redux::oracle::{
-    iceberg_projection_probe, set_live_fragment_batch_bound_for_test,
-};
+use parquet::arrow::ARROW_SCHEMA_META_KEY;
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::metadata::KeyValue;
+use vala_bifrost_redux::oracle::iceberg_projection_probe;
+use vala_bifrost_redux::parquet::footer::tenant_key_value;
+use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
+use vala_bifrost_redux::scribe::hot_source::HotAuthority;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::BifrostClientError;
+use wyrd_server::config::BifrostTarget;
 use wyrd_server::oracle::{
     ScribeFragmentFault, arm_scribe_fragment_fault_for_test, arm_tail_listing_stale_for_test,
     arm_tail_listing_stall_for_test,
 };
+use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning,
 };
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_testing::bifrost::process_cluster::{BifrostProcessCluster, ProcessNodeTarget};
+use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
+use crate::peer_cluster::PeerCluster;
 use crate::support::*;
 
 /// Bound on polls waiting for the Oracle graph to release every reservation.
@@ -50,7 +59,7 @@ enum PruningExpectation {
 
 /// A selective predicate and a narrow projection each prune physical local and
 /// distributed Oracle reads while preserving exact residual rows, and the
-/// tenant tripwire still fails closed once both are in effect.
+/// per-file footer tenant proof still fails closed once both are in effect.
 ///
 /// This is the hot-Parquet owner of the projection half. The cut is asserted
 /// to hold hot files and no compacted file immediately before the queries run,
@@ -88,7 +97,7 @@ async fn pg_bifrost_selective_predicate_and_projection_prune_distributed_reads()
 /// Drives one topology through a three-file selective-predicate fixture,
 /// proving strictly fewer scanned bytes than an unfiltered scan, the pruning
 /// signal `expectation` names, identical residual-filtered rows, and a
-/// fail-closed tenant tripwire.
+/// fail-closed footer tenant proof.
 ///
 /// # Errors
 ///
@@ -297,8 +306,9 @@ async fn prove_selective_predicate_pruning(
         .into());
     }
 
-    // Tripwire: a physically scanned foreign-tenant row must refuse the
-    // query with the tenant-isolation reason intact and deliver no rows.
+    // Footer tenant proof: a scanned file whose footer names a foreign tenant
+    // must refuse the query with the tenant-isolation reason intact and
+    // deliver no rows, even for a count(*) that reads no payload column.
     //
     // Asserted through `query_terminal_either_surface` because the refusal may
     // land on the pre-byte lookahead (early typed error) or after the first
@@ -316,19 +326,19 @@ async fn prove_selective_predicate_pruning(
         ingest_server.node_id().as_uuid(),
     )
     .await?;
-    let (tripwire_rows, tripwire_outcome, tripwire_error) = query_terminal_either_surface(
+    let (refused_rows, refused_outcome, refused_error) = query_terminal_either_surface(
         &reader,
         format!("SELECT count(*) AS total FROM {table_fqn}"),
     )
     .await?;
-    if tripwire_rows != 0 {
-        return Err(format!("foreign row reached a SQL operator under predicate pushdown: rows={tripwire_rows} outcome={tripwire_outcome:?} error={tripwire_error:?}").into());
+    if refused_rows != 0 {
+        return Err(format!("foreign file reached a SQL operator under predicate pushdown: rows={refused_rows} outcome={refused_outcome:?} error={refused_error:?}").into());
     }
-    if tripwire_outcome != QueryTerminalOutcome::Failed
-        || tripwire_error != Some(QueryTerminalErrorCode::QueryTenantInvariant)
+    if refused_outcome != QueryTerminalOutcome::Failed
+        || refused_error != Some(QueryTerminalErrorCode::QueryTenantInvariant)
     {
         return Err(format!(
-            "tenant tripwire did not fail closed: {tripwire_outcome:?} {tripwire_error:?}"
+            "footer tenant proof did not fail closed: {refused_outcome:?} {refused_error:?}"
         )
         .into());
     }
@@ -749,16 +759,12 @@ async fn prove_compacted_only_projection(
         )
         .into());
     }
-    // The hidden tenant column survives to the reader on both, because the
-    // tripwire downstream cannot enforce isolation on a column that was never
-    // read.
+    // Tenancy is proven per file from the footer, so neither closure reads a
+    // per-row tenant column.
     for (label, closure) in [("broad", &broad_closure), ("narrow", &narrow_closure)] {
-        if !closure
-            .iter()
-            .any(|name| name == wyrd_spec::vala::managed_columns::DATA_TENANT_ID)
-        {
+        if closure.iter().any(|name| name == "data_tenant_id") {
             return Err(format!(
-                "the {label} Iceberg closure dropped the hidden tenant column: {closure:?}"
+                "the {label} Iceberg closure read a per-row tenant column: {closure:?}"
             )
             .into());
         }
@@ -1040,9 +1046,6 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     Ok(())
 }
 
-/// Test-node binary every process-cluster pod runs.
-const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
-
 /// Drains one public grouped count into `(filter_key, matched)` rows and its path.
 ///
 /// # Errors
@@ -1085,16 +1088,23 @@ async fn grouped_counts(
 }
 
 /// A filtered aggregate over published files and live rows on two Scribes is
-/// one Analytical plan: published scans run on the Oracle workers while each
-/// Scribe executes exactly one live fragment, and the result counts both.
+/// one Analytical plan: the published scan runs on the one Oracle worker the
+/// table's cut is frozen to while each Scribe executes exactly one live
+/// fragment, and the result counts both.
+///
+/// The live leaf caps its stage at one task, so the aggregate above the union
+/// stays on the coordinator and only the published leaf stage is remote. A
+/// published table is bound to one destination, so exactly one worker leases a
+/// graph for it.
 ///
 /// Published rows alone, or live rows drained anywhere but the two Scribe
 /// fragments, cannot produce these counts and deltas together.
 ///
 /// # Errors
 ///
-/// Returns an error when the process cluster, ingest, publication, or query
-/// fails, or when counts or per-node fragment deltas differ.
+/// Returns an error when the peer cluster, ingest, publication, or query
+/// fails, when counts or per-node fragment deltas differ, or when other than
+/// exactly one published worker leased a graph for the query.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), JourneyError> {
@@ -1104,46 +1114,51 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
     const WORKERS: [usize; 2] = [1, 2];
     /// Scribe pods that each hold live rows.
     const SCRIBES: [usize; 2] = [3, 4];
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
+    let cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+        BifrostTarget::Scribe,
+    ])
     .await?;
     let api_key = cluster
         .provision_public_api_key("live-share-reader")
         .await?;
     let table = format!("live_share_{}", uuid::Uuid::now_v7().simple());
-    let nodes = cluster.nodes_mut();
-    nodes[SCRIBES[0]].register_table(&table)?;
-    // Two published objects of ids 0..12 give every group 8 published rows
-    // and the cut real work to split across both workers.
-    nodes[SCRIBES[0]].ingest_rows(&table, 0, 12, 3)?;
-    nodes[SCRIBES[0]].ingest_rows(&table, 0, 12, 3)?;
+    cluster.register_table(SCRIBES[0], &table).await?;
+    // Two published objects of ids 0..12 give every group 8 published rows.
+    cluster.ingest_rows(SCRIBES[0], &table, 0, 12, 3).await?;
+    cluster.ingest_rows(SCRIBES[0], &table, 0, 12, 3).await?;
     // Six live rows per Scribe add 2 + 2 to every group, plus one negative id
     // per Scribe that the filter must remove.
-    nodes[SCRIBES[0]].ingest_live_rows(&table, 100, 6, 3)?;
-    nodes[SCRIBES[1]].ingest_live_rows(&table, 200, 6, 3)?;
-    nodes[SCRIBES[0]].ingest_live_rows(&table, -1, 1, 3)?;
-    nodes[SCRIBES[1]].ingest_live_rows(&table, -2, 1, 3)?;
-    for node in nodes.iter_mut() {
-        node.refresh_snapshot()?;
-    }
-    let polls_before = WORKERS
+    cluster
+        .ingest_live_rows(SCRIBES[0], &table, 100, 6, 3)
+        .await?;
+    cluster
+        .ingest_live_rows(SCRIBES[1], &table, 200, 6, 3)
+        .await?;
+    cluster
+        .ingest_live_rows(SCRIBES[0], &table, -1, 1, 3)
+        .await?;
+    cluster
+        .ingest_live_rows(SCRIBES[1], &table, -2, 1, 3)
+        .await?;
+    cluster.refresh_snapshots().await?;
+    // A published scan task runs on a worker only under a graph lease that
+    // worker activated, so the per-worker activation delta attributes the
+    // work; the process-wide body-poll delta proves it crossed a peer socket.
+    let leases_before = WORKERS
         .iter()
-        .map(|index| cluster.nodes_mut()[*index].peer_body_polls())
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|index| Ok(cluster.graph_leases(*index)?.0))
+        .collect::<Result<Vec<_>, JourneyError>>()?;
+    let polls_before = cluster.peer_body_polls();
     let fragments_before = SCRIBES
         .iter()
-        .map(|index| cluster.nodes_mut()[*index].scribe_fragments())
+        .map(|index| cluster.scribe_fragments(*index))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
     let (rows, path) = grouped_counts(
         &client,
         format!(
@@ -1166,15 +1181,24 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
             format!("the distributed published scan must stay Analytical, saw {path:?}").into(),
         );
     }
+    let mut leased = Vec::new();
     for (offset, index) in WORKERS.into_iter().enumerate() {
-        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
-        if polls <= polls_before[offset] {
-            return Err(format!("published worker {index} admitted no peer work").into());
+        if cluster.graph_leases(index)?.0 > leases_before[offset] {
+            leased.push(index);
         }
+    }
+    if leased.len() != 1 {
+        return Err(format!(
+            "the published scan must run on its one frozen worker, saw leases on {leased:?}"
+        )
+        .into());
+    }
+    if cluster.peer_body_polls() <= polls_before {
+        return Err("no published work crossed the private peer plane".into());
     }
     let fragments = SCRIBES
         .iter()
-        .map(|index| cluster.nodes_mut()[*index].scribe_fragments())
+        .map(|index| cluster.scribe_fragments(*index))
         .collect::<Result<Vec<_>, _>>()?;
     let delta = execution_delta(&fragments_before, &fragments);
     if delta != vec![1, 1] {
@@ -1182,7 +1206,7 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
             format!("each Scribe must execute exactly one live fragment, saw {delta:?}").into(),
         );
     }
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -1795,13 +1819,6 @@ async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
                 expect_failed(case, &observed)?;
             }
         }
-
-        // Three separate live appends are three memtable batches, so a signed
-        // ceiling of one makes the real bounded snapshot refuse for capacity.
-        set_live_fragment_batch_bound_for_test(Some(1));
-        let over_bound = observe_query(&reader, &sql).await;
-        set_live_fragment_batch_bound_for_test(None);
-        expect_failed("live snapshot over its batch bound", &over_bound?)?;
     }
 
     let stopped = cluster.server(0).ok_or("missing node 0")?.node_id();
@@ -1837,5 +1854,152 @@ async fn live_query_terminal_failure_matrix() -> Result<(), JourneyError> {
         "published data file lost",
         &observe_query(&reader, &sql).await?,
     )?;
+    Ok(())
+}
+
+/// A remote Scribe's staged run whose footer names another tenant fails the
+/// query closed with the tenant reason and exactly one leader refusal audit.
+///
+/// The footer proof runs when the remote fragment stream is first polled,
+/// after its schema frame, so the refusal ends an already-open peer stream.
+/// The row is sealed to a staged run first, so the refused run is the only
+/// source and no data row precedes the refusal: a stream status that lost its
+/// tenant class there would let the leader omit the route and report a
+/// successful or degraded query instead.
+///
+/// # Errors
+///
+/// Returns an error when the cluster, ingest, seal, run rewrite, or query
+/// fails, or when the query succeeds, degrades, returns rows, carries another
+/// error, or audits the refusal other than exactly once.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn remote_staged_footer_refusal_fails_closed() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_staged_refusal");
+    let table_fqn = format!("vala.bifrost.{table}");
+    let leader = cluster.server(0).ok_or("missing node 0")?;
+    let scribe = cluster.server(1).ok_or("missing node 1")?;
+    register_table(leader, tenant, &table).await?;
+    let writer = client(scribe, "staged-refusal-writer").await?;
+    append_event_time_row(
+        &writer,
+        &table_fqn,
+        1,
+        chrono::Utc::now().timestamp_micros(),
+    )
+    .await?;
+    scribe.seal_bifrost_writable_for_test().await?;
+    let runs = staged_runs(scribe, tenant, &table).await?;
+    let foreign = cluster.add_tenant("oracle-staged-foreign").await?;
+    for run in &runs {
+        rewrite_footer_tenant(run, foreign)?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+
+    let reader = client(leader, "staged-refusal-reader").await?;
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| error.to_string())?;
+    let (rows, outcome, error) =
+        query_terminal_either_surface(&reader, format!("SELECT id FROM {table_fqn}")).await?;
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .map_err(|error| error.to_string())?;
+    if rows != 0
+        || outcome != QueryTerminalOutcome::Failed
+        || error != Some(QueryTerminalErrorCode::QueryTenantInvariant)
+    {
+        return Err(format!(
+            "staged foreign footer did not fail closed: rows={rows} {outcome:?} {error:?}"
+        )
+        .into());
+    }
+    let audits: f64 = delta
+        .metrics
+        .iter()
+        .filter(|sample| {
+            sample.family == "bifrost_oracle_security_events_total"
+                && sample.labels.get("event_class").map(String::as_str) == Some("tenant_file")
+        })
+        .map(|sample| sample.value)
+        .sum();
+    if (audits - 1.0).abs() > f64::EPSILON {
+        return Err(format!("expected one leader tenant_file audit, saw {audits}").into());
+    }
+    Ok(())
+}
+
+/// Returns the staged run paths serving `table` on `server`, once its rows have
+/// left the memtable.
+///
+/// Staging completes after the seal returns, so the authority is polled under
+/// a bound rather than sampled once.
+///
+/// # Errors
+///
+/// Returns an error when the authority registry is unreadable, or when the
+/// table is not served only by staged runs within the bound.
+async fn staged_runs(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+) -> Result<Vec<PathBuf>, JourneyError> {
+    for _ in 0..200 {
+        let mut runs = Vec::new();
+        let mut memtable = false;
+        for live in server.bifrost_live_authorities_for_test()? {
+            if live.key.tenant != tenant || live.key.table.name != table {
+                continue;
+            }
+            match live.authority {
+                HotAuthority::StagedRun { runs: staged, .. } => runs.extend(staged),
+                HotAuthority::Memtable => memtable = true,
+                _ => {}
+            }
+        }
+        if !runs.is_empty() && !memtable {
+            return Ok(runs);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("{table} never became served only by staged runs").into())
+}
+
+/// Rewrites one staged run in place so its footer names `foreign` as tenant.
+///
+/// Rows, schema and every other footer key are copied unchanged, so the
+/// footer tenant proof is the only check the rewritten run can fail.
+///
+/// # Errors
+///
+/// Returns a filesystem, Arrow, or Parquet error.
+fn rewrite_footer_tenant(run: &Path, foreign: DataTenantId) -> Result<(), JourneyError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(run)?)?;
+    let tenant = tenant_key_value(foreign);
+    let mut metadata: Vec<KeyValue> = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|entry| entry.key != tenant.key && entry.key != ARROW_SCHEMA_META_KEY)
+        .collect();
+    metadata.push(tenant);
+    let rows = usize::try_from(builder.metadata().file_metadata().num_rows())?;
+    let schema = builder.schema().clone();
+    let batches = builder.build()?.collect::<Result<Vec<_>, _>>()?;
+    let mut parquet = Vec::new();
+    let properties = bifrost_writer_properties_with_metadata(rows, metadata, &[]);
+    let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
+    for batch in &batches {
+        writer.write(batch)?;
+    }
+    writer.close()?;
+    std::fs::write(run, parquet)?;
     Ok(())
 }

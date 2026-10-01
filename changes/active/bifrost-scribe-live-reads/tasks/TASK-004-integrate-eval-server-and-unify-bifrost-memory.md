@@ -959,7 +959,7 @@ diagnostician):
   intermittently failed with `QueryResourcesExhausted`: a 1.5 GiB query held
   an in-memory `ExternalSorterMerge[0]` of 673 MB and a spill
   `ExternalSorterMerge[1]` of 625 MB.
-- **Cause:** 16224df5b added `spill_merge_fan_in`, turning a file count into
+- **Cause:** 1a6ec2554 added `spill_merge_fan_in`, turning a file count into
   bytes with a fixed 64 MiB-per-file guess. DataFusion seats two buffers per
   file, so the cap over-reserved; any fixed guess is wrong for data shapes
   Bifrost cannot know. The cap also contradicted the user's recorded "do not

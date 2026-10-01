@@ -50,7 +50,6 @@ pub(crate) fn projected_source_schema_fingerprint(
                     | wyrd_spec::vala::CARD_UID
                     | wyrd_spec::vala::PRINCIPAL_ID
                     | "run_id"
-                    | "data_tenant_id"
             ) && !field.name().starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())

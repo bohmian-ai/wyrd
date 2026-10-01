@@ -5,8 +5,8 @@
   "type": "object",
   "properties": {
     "base_url": {
-      "description": "Base URL for all ingest routes. Must be non-empty. Ingest routes (`/api/v1/observations`, `/api/v1/records`, etc.) are appended at call time.\n\nExample: `\"https://wyrd-ingest.example.com\"`. Default: [`HTTP_DEFAULT_BASE_URL`] (`\"http://localhost:50050\"`).",
-      "default": "http://localhost:50050",
+      "description": "Base URL for all ingest routes. Must be non-empty. Ingest routes (`/api/v1/observations`, `/api/v1/records`, etc.) are appended at call time.\n\nExample: `\"https://wyrd-ingest.example.com\"`. Default: [`HTTP_DEFAULT_BASE_URL`] (`\"http://localhost:8080\"`).",
+      "default": "http://localhost:8080",
       "type": "string"
     },
     "compression": {

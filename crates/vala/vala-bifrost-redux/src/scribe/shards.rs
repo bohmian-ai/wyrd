@@ -18,8 +18,7 @@ use crate::scribe::execution_lanes::{
 };
 use crate::scribe::memory::{MemoryCategory, ScribeOwnership};
 use crate::scribe::memtable::{
-    BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate, ReadableBatchLimits,
-    SealTriggerReason,
+    BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate, SealTriggerReason,
 };
 use crate::scribe::persistence::{
     ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
@@ -1152,8 +1151,7 @@ impl ScribeShardRuntime {
         if self.closed.load(Ordering::Acquire) {
             return Err(ScribeError::IngressClosed);
         }
-        let mut merged = Vec::with_capacity(request.max_batches);
-        let mut retained_bytes = 0_usize;
+        let mut merged = Vec::new();
         for sender in &self.senders {
             let (response, result) = tokio::sync::oneshot::channel();
             let command = ShardCommand::Snapshot {
@@ -1172,26 +1170,6 @@ impl ScribeShardRuntime {
             let batches = result.await.map_err(|_| ScribeError::Internal {
                 detail: "shard dropped live-tail snapshot response".to_owned(),
             })??;
-            let batch_bytes = batches.iter().try_fold(0_usize, |bytes, batch| {
-                bytes
-                    .checked_add(batch.rows.get_array_memory_size())
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "live-tail retained byte count overflow".to_owned(),
-                    })
-            })?;
-            retained_bytes =
-                retained_bytes
-                    .checked_add(batch_bytes)
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "live-tail retained byte count overflow".to_owned(),
-                    })?;
-            if merged.len().saturating_add(batches.len()) > request.max_batches
-                || retained_bytes > request.max_retained_bytes
-            {
-                return Err(ScribeError::IngestBusy {
-                    table: request.binding.table_ref.fqn(),
-                });
-            }
             merged.extend(batches);
         }
         Ok(merged)
@@ -1493,7 +1471,7 @@ impl ShardOwner {
         false
     }
 
-    /// Builds a bounded live-tail projection from this owner's readable memtable rows.
+    /// Builds a shallow live-tail projection from this owner's readable memtable rows.
     ///
     /// # Errors
     ///
@@ -1506,10 +1484,6 @@ impl ShardOwner {
                 start_partition: request.start_partition,
                 end_partition: request.end_partition,
                 required_columns: &request.required_columns,
-                limits: ReadableBatchLimits {
-                    max_batches: request.max_batches,
-                    max_retained_bytes: request.max_retained_bytes,
-                },
             },
         )?;
         Ok(readable
@@ -7257,9 +7231,6 @@ mod tests {
                     start_partition: key.partition,
                     end_partition: key.partition,
                     required_columns: vec!["value".to_owned()],
-                    predicates: Vec::new(),
-                    max_batches: 4,
-                    max_retained_bytes: 1 << 20,
                 },
                 response: snapshot_response,
             })

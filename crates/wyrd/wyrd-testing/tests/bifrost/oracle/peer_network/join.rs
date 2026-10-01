@@ -2,18 +2,12 @@
 
 use std::time::{Duration, Instant};
 
-use wyrd_client::WyrdClient;
-use wyrd_client::config::ClientConfig;
-use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::BifrostQueryRequest;
-use wyrd_testing::bifrost::process_cluster::{
-    BifrostProcessCluster, NodeReport, ProcessNode, ProcessNodeTarget,
-};
 
-use super::support::{PeerJourneyError, polls_at};
-
-/// Path of the compiled child every simulated pod runs.
-const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
+use super::support::PeerJourneyError;
+use crate::peer_cluster::{MembershipEntry, PeerCluster};
+use crate::support::public_client;
 
 /// `all` pod running before the join; it owns the only Scribe and Forge roles.
 const FIRST: usize = 0;
@@ -67,28 +61,33 @@ async fn peer_join_and_remote_query() {
         .expect("peer join journey");
 }
 
-/// Drives the join, remote work, and departure against real processes.
+/// Drives the join, remote work, and departure against live pods.
 ///
 /// # Errors
 ///
 /// Returns the first claim that broke.
 async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[ProcessNodeTarget::All, ProcessNodeTarget::Oracle],
-    )
+    let mut cluster = PeerCluster::start_with_joiner(&[
+        BifrostTarget::All,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+    ])
     .await?;
-    let first_pid = cluster.nodes()[FIRST].pid();
-    let members: Vec<uuid::Uuid> = cluster
-        .nodes()
-        .iter()
-        .map(|node| node.ready_report().node_id)
-        .collect();
+    let members = [
+        cluster.node_id(FIRST).as_uuid(),
+        cluster.node_id(SECOND).as_uuid(),
+    ];
+    let joined_node_id = cluster.node_id(JOINED).as_uuid();
 
     // A replica that fails before its private listener serves must never be
     // routable: its reserved roles stay out of every ready snapshot.
-    cluster.join_with_peer_socket_held(ProcessNodeTarget::Oracle)?;
-    let snapshot = cluster.nodes_mut()[FIRST].inspect()?.membership;
+    {
+        let _held = std::net::TcpListener::bind(cluster.peer_addr(JOINED)?)?;
+        if cluster.join(JOINED).await.is_ok() {
+            return Err("a replica whose private peer socket is held started serving".into());
+        }
+    }
+    let snapshot = cluster.membership(FIRST).await?;
     if let Some(entry) = snapshot
         .iter()
         .find(|entry| !members.contains(&entry.node_id))
@@ -98,32 +97,46 @@ async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
         );
     }
 
-    let joined = cluster.join(ProcessNodeTarget::Oracle)?.clone();
-    if joined.advertise_addr == cluster.nodes()[FIRST].ready_report().advertise_addr {
+    // The first pod's fenced incarnations: a restart would re-register every
+    // role under an advanced fence.
+    let first_node_id = cluster.node_id(FIRST).as_uuid();
+    let first_fences = |membership: &[MembershipEntry]| -> Vec<(String, u64)> {
+        membership
+            .iter()
+            .filter(|entry| entry.node_id == first_node_id)
+            .map(|entry| (entry.role.clone(), entry.fencing_token))
+            .collect()
+    };
+    let fences_before = first_fences(&snapshot);
+    cluster.join(JOINED).await?;
+    let joined_addr = format!("https://{}", cluster.peer_addr(JOINED)?);
+    if joined_addr == cluster.advertise_addr(FIRST).await? {
         return Err("the joined pod advertises the first pod's address".into());
     }
 
-    await_membership(&mut cluster, "the join", |report| {
-        report.membership.iter().any(|entry| {
-            entry.node_id == joined.node_id
+    await_membership(&cluster, "the join", |membership| {
+        membership.iter().any(|entry| {
+            entry.node_id == joined_node_id
                 && entry.role == "oracle"
                 && entry.ready
-                && entry.address == joined.advertise_addr
+                && entry.address == joined_addr
         })
     })
     .await?;
-    if cluster.nodes()[FIRST].pid() != first_pid {
+    if first_fences(&cluster.membership(FIRST).await?) != fences_before {
         return Err("the first pod was restarted to discover the joined pod".into());
     }
 
     let table = format!("join_{}", uuid::Uuid::now_v7().simple());
-    cluster.nodes_mut()[FIRST].register_table(&table)?;
+    cluster.register_table(FIRST, &table).await?;
     let batch_rows = ROWS / BATCHES;
     for batch in 0..BATCHES {
-        cluster.nodes_mut()[FIRST].ingest_rows(&table, batch * batch_rows, batch_rows, GROUPS)?;
+        cluster
+            .ingest_rows(FIRST, &table, batch * batch_rows, batch_rows, GROUPS)
+            .await?;
     }
     for index in [FIRST, SECOND, JOINED] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
     let sql = format!("SELECT id FROM vala.bifrost.{table} WHERE id < {ROWS}");
     let expected = usize::try_from(ROWS)?;
@@ -134,8 +147,10 @@ async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
     let grouped = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
     );
-    let leases_before = cluster.nodes_mut()[FIRST].graph_leases()?.0;
-    let evidence = cluster.nodes_mut()[JOINED].execute_analytical_baseline(&grouped)?;
+    let leases_before = cluster.graph_leases(FIRST)?.0;
+    let evidence = cluster
+        .execute_analytical_baseline(JOINED, &grouped)
+        .await?;
     if evidence.rows != usize::try_from(GROUPS)? {
         return Err(format!(
             "the remote graph returned {} groups, not {GROUPS}",
@@ -143,41 +158,41 @@ async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
         )
         .into());
     }
-    if cluster.nodes_mut()[FIRST].graph_leases()?.0 <= leases_before {
+    if cluster.graph_leases(FIRST)?.0 <= leases_before {
         return Err("the joined pod ran the graph without leasing the first pod".into());
     }
 
     // A fused public read discovers live Scribe tail on every Scribe member;
     // the joiner has none, so its read must cross to the first pod over mTLS.
+    // The body-poll counter is process-wide; the only Scribe peer answering
+    // tail requests is the first pod, so an advance is its tail being read.
     let api_key = cluster.provision_public_api_key("peer-join").await?;
-    let polls_before = polls_at(&mut cluster, FIRST)?;
-    let rows = fused_row_count(&cluster.nodes()[JOINED], &api_key, &sql).await?;
+    let polls_before = cluster.peer_body_polls();
+    let rows = fused_row_count(cluster.server(JOINED)?, &api_key, &sql).await?;
     if rows != expected {
         return Err(format!("the fused read returned {rows} rows, not {expected}").into());
     }
-    if polls_at(&mut cluster, FIRST)? == polls_before {
+    if cluster.peer_body_polls() == polls_before {
         return Err("the joined pod's fused read never reached the first pod's tail".into());
     }
 
     // An abrupt departure: a query issued before membership notices must fail
     // or return everything, never a partial result.
-    let mut departed = cluster.remove(JOINED)?;
-    departed.kill()?;
-    match fused_row_count(&cluster.nodes()[FIRST], &api_key, &sql).await {
+    cluster.kill(JOINED).await?;
+    match fused_row_count(cluster.server(FIRST)?, &api_key, &sql).await {
         Ok(rows) if rows != expected => {
             return Err(format!("a broken remote call returned {rows} of {expected} rows").into());
         }
         Ok(_) | Err(_) => {}
     }
-    await_membership(&mut cluster, "the departure", |report| {
-        report
-            .membership
+    await_membership(&cluster, "the departure", |membership| {
+        membership
             .iter()
-            .all(|entry| entry.node_id != joined.node_id)
+            .all(|entry| entry.node_id != joined_node_id)
     })
     .await?;
 
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -186,22 +201,21 @@ async fn prove_peer_join_and_remote_query() -> Result<(), PeerJourneyError> {
 /// # Errors
 ///
 /// Returns a failure naming `change` and the last cut seen when the deadline
-/// passes, or the control-protocol failure unchanged.
+/// passes, or the membership refresh failure unchanged.
 async fn await_membership(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &PeerCluster,
     change: &str,
-    observed: impl Fn(&NodeReport) -> bool,
+    observed: impl Fn(&[MembershipEntry]) -> bool,
 ) -> Result<(), PeerJourneyError> {
     let deadline = Instant::now() + MEMBERSHIP_DEADLINE;
     loop {
-        let report = cluster.nodes_mut()[FIRST].inspect()?;
-        if observed(&report) {
+        let membership = cluster.membership(FIRST).await?;
+        if observed(&membership) {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "the first pod never observed {change}; last membership {:?}",
-                report.membership
+                "the first pod never observed {change}; last membership {membership:?}"
             )
             .into());
         }
@@ -216,23 +230,11 @@ async fn await_membership(
 /// Returns a failure when the query is refused, a batch fails, or the stream
 /// ends without a terminal frame.
 async fn fused_row_count(
-    node: &ProcessNode,
+    node: &wyrd_testing::WyrdTestServer,
     api_key: &secrecy::SecretString,
     sql: &str,
 ) -> Result<usize, PeerJourneyError> {
-    let client = WyrdClient::with_config(ClientConfig {
-        grpc: GrpcConfig {
-            endpoint: format!("http://{}", node.grpc_addr()),
-            connect_retries: 0,
-            ..GrpcConfig::default()
-        },
-        http: HttpConfig {
-            base_url: format!("http://{}", node.http_addr()),
-            ..HttpConfig::default()
-        },
-        credential: Some(api_key.clone()),
-        ..ClientConfig::default()
-    })?;
+    let client = public_client(node, api_key)?;
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),

@@ -10307,6 +10307,7 @@ dependencies = [
  "iceberg-catalog-sql",
  "iceberg-compaction-core",
  "iceberg-datafusion",
+ "iceberg-storage-opendal",
  "lru",
  "metrics",
  "num-traits",

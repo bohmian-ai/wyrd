@@ -31,8 +31,8 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
@@ -46,8 +46,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use datafusion_distributed::NetworkBoundaryExt as _;
 use futures_util::FutureExt;
@@ -59,20 +58,21 @@ use iceberg::io::{FileIO, FileRead};
 use iceberg::scan::FileScanTask;
 use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::BifrostError;
 
+use crate::scribe::hot_source::StagedSourceLease;
 use crate::storage::error_chain_contains_not_found;
-use wyrd_spec::vala::api::{BifrostSecurityPhase, BifrostSecurityViolationKind, QueryClass};
-use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
+use wyrd_spec::vala::api::{QueryClass, WorkerScanStats};
+use wyrd_spec::vala::assignment_authority::ScanPredicate;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
-use super::{
-    AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit, OracleMemoryResources,
-    OracleTelemetry, VerifiedSecurityContext,
-};
+use super::live::LiveScribeExec;
+use super::{AuthorizedQueryContext, OracleMemoryResources, OracleTelemetry};
 
 #[cfg(feature = "test-support")]
 static REMOTE_PARTITION_ATTEMPTS: std::sync::atomic::AtomicU64 =
@@ -285,7 +285,11 @@ pub(crate) struct RemoteScanMetrics {
 
 impl RemoteScanMetrics {
     /// Folds one completed participant's footer evidence into the running total.
-    fn record_footer(&self, stats: wyrd_spec::vala::api::WorkerScanStats) {
+    ///
+    /// Called once per completed participant: a distributed fold records its
+    /// whole cut once, and a live Scribe fragment records its footer or
+    /// in-process completion once, when that completion validates.
+    pub(super) fn record_footer(&self, stats: WorkerScanStats) {
         if let Some(bytes) = stats.bytes_scanned {
             self.bytes_scanned.fetch_add(bytes, Ordering::Relaxed);
             self.bytes_available.store(true, Ordering::Release);
@@ -441,6 +445,9 @@ impl OracleQueryScanStats {
         if let Some(source) = plan.downcast_ref::<HotParquetExec>() {
             stats.scan_handles.push(Arc::clone(source.metrics()));
         }
+        if let Some(source) = plan.downcast_ref::<LiveScribeExec>() {
+            stats.remote_handles.push(Arc::clone(source.scan_metrics()));
+        }
         // A remote placeholder hides the leaf it substituted from `children`
         // so the distributed planner keeps scaling it as one. The leader still
         // executes that leaf whenever the stage stays in the head, so scan
@@ -569,7 +576,7 @@ pub(crate) async fn record_distributed_scan_metrics(
         datafusion_distributed::DistributedMetricsFormat::Aggregated,
     )
     .await?;
-    let mut totals = wyrd_spec::vala::api::WorkerScanStats::default();
+    let mut totals = WorkerScanStats::default();
     fold_distributed_scan_metrics(&with_metrics, &mut totals);
     sink.record_footer(totals);
     Ok(with_metrics)
@@ -582,10 +589,7 @@ pub(crate) async fn record_distributed_scan_metrics(
 /// plain child walk sees only the coordinator's own stage and reports a query
 /// that scanned nothing. Descending both edges is what reaches the follower
 /// leaves where the reads actually happened.
-fn fold_distributed_scan_metrics(
-    node: &Arc<dyn ExecutionPlan>,
-    totals: &mut wyrd_spec::vala::api::WorkerScanStats,
-) {
+fn fold_distributed_scan_metrics(node: &Arc<dyn ExecutionPlan>, totals: &mut WorkerScanStats) {
     if let Some(metrics) = node.metrics() {
         let metrics = metrics.aggregate_by_name();
         for name in ["bytes_scanned", WYRD_BYTES_SCANNED_METRIC] {
@@ -972,17 +976,22 @@ struct PublishedFooterLoader {
 }
 
 impl iceberg::arrow::ParquetMetadataLoader for PublishedFooterLoader {
-    /// Loads one data file's footer through the governed cache.
+    /// Loads one data file's footer through the governed cache and proves its
+    /// tenant.
     ///
     /// A miss reads the footer and page index through the same governed,
     /// range-reserving reader the hot tier uses; its range observations go to
-    /// a scratch handle because they are not hot-tier reads.
+    /// a scratch handle because they are not hot-tier reads. Every load, hit
+    /// or miss, compares the footer tenant with the authenticated tenant before
+    /// the reader sees the metadata.
     ///
     /// # Errors
     ///
     /// The returned future fails with the storage owner's closed error as the
     /// Iceberg error's source, so a vanished object keeps its not-found cause
-    /// for stale-object classification.
+    /// for stale-object classification, and with
+    /// [`BifrostError::QueryTenantInvariant`] as the source when the footer
+    /// tenant is missing or foreign.
     fn load(
         &self,
         path: &str,
@@ -1013,6 +1022,7 @@ impl iceberg::arrow::ParquetMetadataLoader for PublishedFooterLoader {
         let storage = Arc::clone(&self.storage);
         let cancel = self.cancel.clone();
         let retained = Arc::clone(&self.retained);
+        let tenant = self.tenant_id;
         async move {
             let loaded = storage
                 .object_metadata(key, build_reader, storage.metadata_deadline(), cancel)
@@ -1025,6 +1035,15 @@ impl iceberg::arrow::ParquetMetadataLoader for PublishedFooterLoader {
                     .with_source((*error).clone())
                 })?;
             let metadata = Arc::clone(loaded.metadata());
+            // Checked before the metadata reaches the reader, so a foreign or
+            // unproven file yields no row group, page, or row.
+            verify_scanned_footer_tenant(&metadata, tenant).map_err(|error| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    "scanned data-file footer violates the tenant invariant",
+                )
+                .with_source(error)
+            })?;
             retained
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1082,12 +1101,61 @@ where
     }
 }
 
-/// Detects the tenant tripwire's terminal refusal anywhere in an execution
-/// error chain.
+/// Proves one scanned object's footer names the authenticated tenant.
 ///
-/// [`TenantTripwireExec`] fails a stream with
-/// [`BifrostError::QueryTenantInvariant`] the moment a physically scanned row
-/// carries a foreign tenant. That refusal is a security outcome, not a
+/// This is the one tenant check of the shared Parquet scan: published Iceberg
+/// footers, hot objects, and Scribe staged runs all reach it before any row
+/// group is decoded. The comparison happens once per opened object, so its
+/// cost is independent of row count.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryTenantInvariant`] when the footer carries no
+/// tenant, more than one tenant, or a tenant other than `tenant`.
+fn verify_scanned_footer_tenant(
+    metadata: &ParquetMetaData,
+    tenant: DataTenantId,
+) -> Result<(), BifrostError> {
+    crate::parquet::footer::verify_footer_tenant(metadata.file_metadata(), tenant).map_err(
+        |detail| {
+            tracing::error!(
+                detail = %detail,
+                "scanned object footer does not prove the authenticated tenant"
+            );
+            BifrostError::QueryTenantInvariant
+        },
+    )
+}
+
+/// Proves a hot object's retained footer names `tenant`, then wraps it for
+/// the Arrow reader.
+///
+/// The proof runs before the reader metadata exists, so a hot or staged object
+/// whose footer is missing or foreign yields no row group, page, or row.
+///
+/// # Errors
+///
+/// Returns an external [`BifrostError::QueryTenantInvariant`] when the footer
+/// does not prove `tenant`, or the Parquet error when the footer cannot be
+/// projected into Arrow reader metadata.
+fn tenant_proven_reader_metadata(
+    metadata: &Arc<ParquetMetaData>,
+    tenant: DataTenantId,
+) -> DataFusionResult<ArrowReaderMetadata> {
+    verify_scanned_footer_tenant(metadata, tenant)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new(
+        Arc::clone(metadata),
+        ArrowReaderOptions::new(),
+    )
+    .map_err(|error| DataFusionError::External(Box::new(error)))
+}
+
+/// Detects the footer tenant refusal anywhere in an execution error chain.
+///
+/// [`verify_scanned_footer_tenant`] fails a scan with
+/// [`BifrostError::QueryTenantInvariant`] the moment an opened object's footer
+/// is missing or names a foreign tenant. That refusal is a security outcome, not a
 /// transport failure, so every layer that classifies a stream error must
 /// recognize it here rather than collapsing it into a retryable class and
 /// losing the reason the query was refused.
@@ -1342,20 +1410,29 @@ impl OracleIcebergScanExec {
     ///
     /// Every partition awaits the same planned task list, then reads only the
     /// byte ranges [`partition_byte_ranges`] assigns it; the reader keeps each
-    /// row group whose midpoint lies in a task's range. `footers`, when
-    /// present, is the resolved governed footer loader the reader loads every
-    /// unencrypted data file's metadata through.
+    /// row group whose midpoint lies in a task's range. `footers` is the
+    /// resolved governed footer loader the reader loads, and tenant-proves,
+    /// every data file's metadata through.
     ///
     /// # Errors
     ///
     /// Returns a typed `DataFusion` error when task planning, reader
-    /// construction, or object-store reads fail.
+    /// construction, or object-store reads fail, and
+    /// [`BifrostError::QueryTenantInvariant`] when a planned file carries key
+    /// metadata, because the reader opens such a file without the loader.
     async fn start_stream(
         &self,
         partition: usize,
-        footers: Option<Arc<PublishedFooterLoader>>,
+        footers: Arc<PublishedFooterLoader>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let planned = self.planned.get_or_try_init(|| self.plan_tasks()).await?;
+        // Bifrost writes no encrypted data file. One that claims key metadata
+        // would bypass the tenant-proving loader, so it is refused outright.
+        if planned.iter().any(|task| task.key_metadata.is_some()) {
+            return Err(DataFusionError::External(Box::new(
+                BifrostError::QueryTenantInvariant,
+            )));
+        }
         let sizes = planned.iter().map(|task| task.length).collect::<Vec<_>>();
         let partitions = self.properties.partitioning.partition_count();
         let tasks = partition_byte_ranges(&sizes, partition, partitions)
@@ -1371,10 +1448,11 @@ impl OracleIcebergScanExec {
         // Row selection turns each task predicate into a page-index selection,
         // so a point lookup decodes the matching pages instead of every page
         // of each surviving row group. The reader defaults it off.
-        let mut reader = self.table.reader_builder().with_row_selection_enabled(true);
-        if let Some(footers) = footers {
-            reader = reader.with_parquet_metadata_loader(footers);
-        }
+        let reader = self
+            .table
+            .reader_builder()
+            .with_row_selection_enabled(true)
+            .with_parquet_metadata_loader(footers);
         let metrics = reader
             .build()
             .read(Box::pin(tasks.map_ok({
@@ -1486,12 +1564,14 @@ impl ExecutionPlan for OracleIcebergScanExec {
             )));
         }
         // Resolved here, never at planning time: the admitted pool, class,
-        // cancellation, and deadline all arrive with this task.
+        // cancellation, and deadline all arrive with this task. The loader is
+        // mandatory because it is what proves every opened footer's tenant; a
+        // scan without it would read files no check has seen.
         let footers = self
             .footers
             .as_ref()
-            .map(|footers| footers.loader(self.table.file_io().clone(), context.as_ref()))
-            .transpose()?;
+            .ok_or_else(|| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?
+            .loader(self.table.file_io().clone(), context.as_ref())?;
         let source = self.clone();
         let future = async move { source.start_stream(partition, footers).await };
         let stream = futures_util::stream::once(future).try_flatten();
@@ -1508,12 +1588,15 @@ impl ExecutionPlan for OracleIcebergScanExec {
 /// the object's location, because the location is a path and two distinct
 /// durable objects must never share a decode. A row without a usable writer
 /// checksum is refused here rather than keyed on a zero digest, which would let
-/// every unchecksummed object collide on one entry.
+/// every unchecksummed object collide on one entry. The key's tenant is the
+/// authenticated binding's, never the row's, because the scan proves each
+/// object's footer against it.
 ///
 /// # Errors
 /// Returns `BifrostError::MetadataMismatch` when the row carries no decodable
 /// nonzero SHA-256.
 pub(super) fn hot_metadata_key(
+    tenant: DataTenantId,
     file: &vala_sql::row_types::file_list::HotFileRow,
     size_bytes: usize,
 ) -> Result<crate::storage::ObjectMetadataKey, BifrostError> {
@@ -1530,11 +1613,7 @@ pub(super) fn hot_metadata_key(
             detail: "hot file row carries no usable object checksum".to_owned(),
         })?;
     Ok(crate::storage::ObjectMetadataKey::new(
-        wyrd_spec::DataTenantId::new(file.data_tenant_id).map_err(|_| {
-            BifrostError::MetadataMismatch {
-                detail: "hot file row carries a non-v7 tenant identity".to_owned(),
-            }
-        })?,
+        tenant,
         file.table_name.clone(),
         file.file_path.clone(),
         file.id,
@@ -1601,12 +1680,10 @@ pub(crate) struct OracleTableInputs {
     /// applies the identical bounds when it plans the scan, so this is the
     /// leader's own statement of a decision the reader then enforces.
     pub(crate) iceberg_event_times: Vec<crate::catalog::event_time::EventTimeStatistics>,
-    /// Authenticated request context retained by the tenant tripwire.
+    /// Authenticated request context whose tenant every scanned footer must name.
     pub(crate) context: AuthorizedQueryContext,
     /// Canonical table name used in security diagnostics.
     pub(crate) table_name: String,
-    /// Mandatory audit collaborator.
-    pub(crate) audit: Arc<dyn OracleAudit>,
     /// Frozen remote owner of this cut's persisted sources, when the cut chose
     /// one. `None` keeps every persisted leaf leader-local.
     pub(crate) remote: Option<OracleRemoteSource>,
@@ -1627,16 +1704,12 @@ pub(crate) struct OracleTableProvider {
     file_io: FileIO,
     /// The node's one storage owner, handed to every hot leaf this builds.
     storage: Arc<crate::storage::BifrostStorage>,
-    /// Full physical schema, including the hidden tenant column.
+    /// Full physical schema, which is also the caller-visible schema.
     physical_schema: SchemaRef,
-    /// Caller-visible schema after the tripwire removes its tenant column.
-    public_schema: SchemaRef,
-    /// Authenticated request context used by the security audit.
+    /// Authenticated request context whose tenant every scanned footer must name.
     context: AuthorizedQueryContext,
     /// Canonical table name included in scrubbed security diagnostics.
     table: String,
-    /// Standard read/security audit collaborator.
-    audit: Arc<dyn OracleAudit>,
     /// Frozen remote owner of this cut's persisted sources, when the cut chose
     /// one. `None` keeps every persisted leaf leader-local.
     remote: Option<OracleRemoteSource>,
@@ -1740,7 +1813,7 @@ impl OracleTableProvider {
     /// # Errors
     ///
     /// Returns a `DataFusion` error when Iceberg cannot construct its static
-    /// provider or the physical schema lacks the required tenant column.
+    /// provider.
     pub(crate) async fn try_new(inputs: OracleTableInputs) -> DataFusionResult<Self> {
         let OracleTableInputs {
             table,
@@ -1749,7 +1822,6 @@ impl OracleTableProvider {
             iceberg_event_times,
             context,
             table_name,
-            audit,
             remote,
             live,
         } = inputs;
@@ -1758,7 +1830,6 @@ impl OracleTableProvider {
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let physical_schema = iceberg.schema();
-        let public_schema = schema_without(&physical_schema, DATA_TENANT_ID)?;
         Ok(Self {
             iceberg,
             hot_files,
@@ -1766,10 +1837,8 @@ impl OracleTableProvider {
             file_io,
             storage,
             physical_schema,
-            public_schema,
             context,
             table: table_name,
-            audit,
             remote,
             live,
             scan_occurrences: std::sync::atomic::AtomicU64::new(0),
@@ -2016,9 +2085,10 @@ fn classify_filter_for_schema(physical_schema: &Schema, filter: &Expr) -> Filter
 
 #[async_trait]
 impl TableProvider for OracleTableProvider {
-    /// Returns the caller-visible schema with no tenant selector column.
+    /// Returns the table's complete physical schema, which is also the
+    /// caller-visible schema.
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.public_schema)
+        Arc::clone(&self.physical_schema)
     }
 
     /// Oracle tables are durable base tables.
@@ -2044,7 +2114,7 @@ impl TableProvider for OracleTableProvider {
             .collect())
     }
 
-    /// Builds the exact `Iceberg + hot + live -> tripwire` disjoint source.
+    /// Builds the exact `Iceberg + hot + live` disjoint source.
     ///
     /// Row IO remains lazy in returned execution plans. Iceberg and hot Parquet
     /// bytes are first accessed only when `DataFusion` executes the already
@@ -2083,7 +2153,6 @@ impl TableProvider for OracleTableProvider {
         // operator above. Nothing downstream recomputes a column set or order.
         let scan_projection = OracleScanProjection::try_new(
             &self.physical_schema,
-            &self.public_schema,
             projection,
             &supported_predicates,
         )?;
@@ -2113,204 +2182,30 @@ impl TableProvider for OracleTableProvider {
                     scan_projection.required_columns.clone(),
                     supported_predicates.clone(),
                     Arc::clone(&required_schema),
+                    state.config().target_partitions(),
                 )));
             }
         }
         let union = UnionExec::try_new(inputs)?;
-        let tripwire = Arc::new(TenantTripwireExec::new(
-            union,
-            self.context.clone(),
-            self.table.clone(),
-            Arc::clone(&self.audit),
-        )?);
         // Provider-local filter over the closed predicates. This is a real
         // pruning aid, not a substitute for correctness: pushdown is reported
         // `Inexact`, so DataFusion still applies its own residual copy above
         // this provider regardless of what happens here.
         let physical_predicates = supported_predicates
             .iter()
-            .map(|predicate| scan_predicate_physical_expr(predicate, &tripwire.schema()))
+            .map(|predicate| scan_predicate_physical_expr(predicate, &union.schema()))
             .collect::<DataFusionResult<Vec<_>>>()?;
         let filtered: Arc<dyn ExecutionPlan> =
             match conjoin_physical_predicates(physical_predicates) {
                 Some(predicate) => Arc::new(
-                    datafusion::physical_plan::filter::FilterExec::try_new(predicate, tripwire)?,
+                    datafusion::physical_plan::filter::FilterExec::try_new(predicate, union)?,
                 ),
-                None => tripwire,
+                None => union,
             };
         // Resolved by name against the filter's actual output, which is the
-        // closure minus the tenant column — never against the original
-        // full-public-schema ordinals the caller supplied.
+        // closure — never against the full-schema ordinals the caller
+        // supplied.
         project_plan_by_name(filtered, &scan_projection.output_names)
-    }
-}
-
-/// Runtime tenant assertion surrounding one complete physical table source union.
-pub struct TenantTripwireExec {
-    /// Tagged `Iceberg + hot + live` source union.
-    input: Arc<dyn ExecutionPlan>,
-    /// Authenticated query context retained for standard security audit.
-    context: AuthorizedQueryContext,
-    /// Canonical table identifier with no object path.
-    table: String,
-    /// Standard audit collaborator used before a mismatch becomes visible.
-    audit: Arc<dyn OracleAudit>,
-    /// Output properties after the hidden tenant column is stripped.
-    properties: Arc<PlanProperties>,
-}
-
-impl fmt::Debug for TenantTripwireExec {
-    /// Redacts authenticated and audit state from physical-plan diagnostics.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TenantTripwireExec")
-            .field("table", &self.table)
-            .finish_non_exhaustive()
-    }
-}
-
-impl TenantTripwireExec {
-    /// Creates a tripwire around one complete table source union.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` plan error when the input lacks `data_tenant_id`.
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
-        context: AuthorizedQueryContext,
-        table: String,
-        audit: Arc<dyn OracleAudit>,
-    ) -> DataFusionResult<Self> {
-        let schema = schema_without(&input.schema(), DATA_TENANT_ID)?;
-        let partition_count = input.output_partitioning().partition_count();
-        Ok(Self {
-            input,
-            context,
-            table,
-            audit,
-            properties: plan_properties_with_partitions(schema, partition_count),
-        })
-    }
-
-    /// Borrows the authenticated context encoded into a follower subtree.
-    pub(crate) const fn context(&self) -> &AuthorizedQueryContext {
-        &self.context
-    }
-
-    /// Borrows the canonical table label encoded into a follower subtree.
-    pub(crate) fn table(&self) -> &str {
-        &self.table
-    }
-}
-
-impl DisplayAs for TenantTripwireExec {
-    /// Renders the invariant boundary without tenant values.
-    fn fmt_as(
-        &self,
-        _format: DisplayFormatType,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        write!(formatter, "TenantTripwireExec")
-    }
-}
-
-impl ExecutionPlan for TenantTripwireExec {
-    /// Visits every physical expression this plan owns.
-    ///
-    /// This plan owns no `PhysicalExpr`, so the traversal reports
-    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
-    ///
-    /// # Errors
-    /// Never returns an error; the signature is fixed by the trait.
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(
-            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-        ) -> DataFusionResult<TreeNodeRecursion>,
-    ) -> DataFusionResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    /// Returns the stable physical operator name.
-    fn name(&self) -> &'static str {
-        "TenantTripwireExec"
-    }
-
-    /// Returns cached bounded plan properties.
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    /// Returns the complete source union as the sole child.
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    /// Rebuilds the tripwire around exactly one replacement union.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` plan error unless exactly one child is supplied.
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let [input] = children.try_into().map_err(|_| {
-            DataFusionError::Plan("TenantTripwireExec requires one child".to_owned())
-        })?;
-        Ok(Arc::new(Self::new(
-            input,
-            self.context.clone(),
-            self.table.clone(),
-            Arc::clone(&self.audit),
-        )?))
-    }
-
-    /// Validates every row, audits a mismatch fail-closed, then strips tenant.
-    ///
-    /// No mismatched batch is yielded. If the security audit also fails, the
-    /// query still fails closed and the audit failure is surfaced.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` execution error for source failure, malformed
-    /// tenant data, mismatch, security-audit failure, or Arrow projection.
-    fn execute(
-        &self,
-        partition: usize,
-        task: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut input = self.input.execute(partition, task)?;
-        let schema = self.schema();
-        let context = self.context.clone();
-        let audit = Arc::clone(&self.audit);
-        let stream = async_stream::try_stream! {
-            while let Some(batch) = input.next().await {
-                let batch = batch?;
-                if tenant_mismatch_row(&batch, context.data_tenant_id)?.is_some() {
-                    metrics::counter!(
-                        "bifrost_oracle_security_events_total",
-                        "event_class" => "tenant_row"
-                    )
-                    .increment(1);
-                    audit.append_security_violation(
-                        VerifiedSecurityContext {
-                            query: context.clone(),
-                            query_digest: None,
-                        },
-                        BifrostSecurityViolation {
-                            violation: BifrostSecurityViolationKind::TenantRow,
-                            phase: BifrostSecurityPhase::Source,
-                        },
-                    );
-                    Err::<(), _>(DataFusionError::External(Box::new(
-                        BifrostError::QueryTenantInvariant,
-                    )))?;
-                }
-                yield remove_column(&batch, DATA_TENANT_ID)?;
-            }
-        };
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
@@ -2770,6 +2665,12 @@ pub(super) struct HotParquetExec {
     /// Closed predicate conjunction used to skip a file whose footer
     /// statistics prove no row group can satisfy every leaf.
     predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+    /// Lease keeping Scribe staged runs on disk while any partition reads them.
+    ///
+    /// `None` for durable hot objects, which need no lease. Each partition
+    /// stream holds a clone, so the lease is released once the plan and every
+    /// stream it produced are dropped.
+    staged_lease: Option<Arc<StagedSourceLease>>,
     /// Deterministic reader injected only by focused unit tests.
     #[cfg(test)]
     reader_override: Option<HotReadOverride>,
@@ -2794,6 +2695,9 @@ impl HotParquetExec {
     /// Callers must have already authenticated the assignment, validated every
     /// object identity and size, and chosen the governance mode that matches
     /// their role; this constructor performs no IO and no authorization.
+    /// Each file's metadata key must carry the authenticated binding's tenant:
+    /// every opened object's footer is compared with it before a row is
+    /// decoded.
     pub(super) fn new(
         files: Vec<HotFileSource>,
         file_io: FileIO,
@@ -2810,6 +2714,7 @@ impl HotParquetExec {
             governance,
             metrics,
             predicates,
+            staged_lease: None,
             #[cfg(test)]
             reader_override: None,
             properties: plan_properties(Arc::clone(&schema)),
@@ -2824,6 +2729,15 @@ impl HotParquetExec {
     pub(super) fn with_partitions(mut self, partitions: usize) -> Self {
         self.properties =
             plan_properties_with_partitions(Arc::clone(&self.schema), partitions.max(1));
+        self
+    }
+
+    /// Holds `lease` for as long as this leaf or any of its streams lives.
+    ///
+    /// The Scribe follower reads its own staged runs through this leaf; the
+    /// lease is what keeps publication from deleting a run mid-read.
+    pub(super) fn with_staged_lease(mut self, lease: StagedSourceLease) -> Self {
+        self.staged_lease = Some(Arc::new(lease));
         self
     }
 
@@ -2959,7 +2873,8 @@ impl ExecutionPlan for HotParquetExec {
 ///
 /// The partition's byte ranges are read sequentially. The piece holding a
 /// file's first byte publishes its file observation before the footer is
-/// touched; each piece keeps only the row groups whose midpoint lies in its
+/// touched; every piece proves the footer's tenant before decoding anything,
+/// then keeps only the row groups whose midpoint lies in its
 /// range, prunes those and then pages against the closed predicates, decodes
 /// at the session `batch_size`, projects to the
 /// authenticated physical schema, and holds one governed reservation for
@@ -2977,6 +2892,7 @@ fn hot_stream(
     let schema = Arc::clone(&exec.schema);
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
+    let staged_lease = exec.staged_lease.clone();
     #[cfg(test)]
     let reader_override = exec.reader_override.clone();
     // Cancelling the query drops this stream, which drops the guard and
@@ -2986,6 +2902,7 @@ fn hot_stream(
     let cancel_on_drop = cancel.clone().drop_guard();
     async_stream::try_stream! {
         let _cancel_on_drop = cancel_on_drop;
+        let _staged_lease = staged_lease;
         for (file, range) in pieces {
             let size = u64::try_from(file.size_bytes).map_err(|_| {
                 DataFusionError::Execution("hot object size exceeds u64".to_owned())
@@ -3040,11 +2957,8 @@ fn hot_stream(
                 .map_err(|error| {
                     DataFusionError::External(Box::new((*error).clone()))
                 })?;
-            let metadata = parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new(
-                Arc::clone(retained.metadata()),
-                ArrowReaderOptions::new(),
-            )
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            let metadata =
+                tenant_proven_reader_metadata(retained.metadata(), file.metadata_key.tenant_id())?;
             let builder =
                 ParquetRecordBatchStreamBuilder::new_with_metadata(build_reader(), metadata);
             let owned = row_groups_in_byte_range(builder.metadata(), &range);
@@ -3107,29 +3021,6 @@ fn hot_projection_mask(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     parquet::arrow::ProjectionMask::roots(parquet_schema, indices)
-}
-
-/// Returns the first tenant mismatch row, or `None` for a valid batch.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` error when the managed tenant column is absent or has
-/// a non-UTF8 physical type.
-fn tenant_mismatch_row(
-    batch: &RecordBatch,
-    tenant: wyrd_spec::DataTenantId,
-) -> DataFusionResult<Option<usize>> {
-    let index = batch
-        .schema()
-        .index_of(DATA_TENANT_ID)
-        .map_err(|_| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?;
-    let values = batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?;
-    let expected = tenant.to_string();
-    Ok((0..values.len()).find(|row| values.is_null(*row) || values.value(*row) != expected))
 }
 
 /// Result of classifying one `DataFusion` filter expression against the
@@ -3326,20 +3217,20 @@ fn classify_literal(expr: &Expr) -> Option<wyrd_spec::vala::assignment_authority
 ///
 /// A repeated requested ordinal stays repeated: the caller's output shape is
 /// the caller's business, and only the leaf closure derived from these names is
-/// deduplicated. A `None` projection means every public column plus the hidden
-/// tenant column below it; it never means zero columns.
+/// deduplicated. A `None` projection means every table column; it never means
+/// zero columns.
 ///
 /// # Errors
 ///
 /// Returns a `DataFusion` plan error when a requested ordinal falls outside the
-/// public schema, which is a planner contract failure rather than a column the
+/// table schema, which is a planner contract failure rather than a column the
 /// scan may quietly drop.
 fn scan_output_names(
-    public_schema: &Schema,
+    schema: &Schema,
     projection: Option<&Vec<usize>>,
 ) -> DataFusionResult<Vec<String>> {
     let Some(projection) = projection else {
-        return Ok(public_schema
+        return Ok(schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
@@ -3348,7 +3239,7 @@ fn scan_output_names(
     projection
         .iter()
         .map(|index| {
-            public_schema
+            schema
                 .fields()
                 .get(*index)
                 .map(|field| field.name().clone())
@@ -3361,27 +3252,29 @@ fn scan_output_names(
 
 /// Computes the canonical `required_columns` closure: the requested scan output
 /// names, followed by the first occurrence of each predicate column in filter
-/// order, followed by the always-present hidden tenant column — stably
-/// deduplicated.
+/// order — stably deduplicated.
+///
+/// A closure is never empty. A request that reads no column, such as
+/// `COUNT(*)`, still needs every leaf to report row counts, so it reads the
+/// always-present non-null `wyrd_event_time` instead of producing zero-column
+/// batches across Iceberg, Parquet, IPC, and distributed frames.
 fn required_columns_closure(
     output_names: &[String],
     predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
 ) -> Vec<String> {
     let mut required = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for name in output_names
-        .iter()
-        .cloned()
-        .chain(
-            predicates
-                .iter()
-                .map(|predicate| predicate.column().to_string()),
-        )
-        .chain(std::iter::once(DATA_TENANT_ID.to_string()))
-    {
+    for name in output_names.iter().cloned().chain(
+        predicates
+            .iter()
+            .map(|predicate| predicate.column().to_string()),
+    ) {
         if seen.insert(name.clone()) {
             required.push(name);
         }
+    }
+    if required.is_empty() {
+        required.push(WYRD_EVENT_TIME.to_owned());
     }
     required
 }
@@ -3437,17 +3330,18 @@ pub(super) fn select_schema_by_name(
 ///
 /// [`OracleTableProvider::scan`] builds this once from the complete physical
 /// schema and the caller's request, then hands the same value to every union
-/// leaf, the remote placeholders, the tenant tripwire, the provider-local
-/// filter, and the final public projection. No leaf recomputes its own column
+/// leaf, the remote placeholders, the provider-local filter, and the final
+/// output projection. No leaf recomputes its own column
 /// set or order: a follower revalidates the signed closure against the schema
 /// its own catalog resolves, so two components deriving the same set in a
 /// different order would refuse each other's assignments.
 #[derive(Debug)]
 struct OracleScanProjection {
-    /// Public column names this scan outputs, in requested order, with a
-    /// repeated requested ordinal preserved.
+    /// Column names this scan outputs, in requested order, with a repeated
+    /// requested ordinal preserved.
     output_names: Vec<String>,
-    /// Stable-deduplicated leaf closure: outputs, predicate columns, tenant.
+    /// Stable-deduplicated, never-empty leaf closure: outputs, then predicate
+    /// columns.
     required_columns: Vec<String>,
     /// Complete-schema fields selected by `required_columns`, in that order.
     required_schema: SchemaRef,
@@ -3465,11 +3359,10 @@ impl OracleScanProjection {
     /// name is absent from it.
     fn try_new(
         physical_schema: &Schema,
-        public_schema: &Schema,
         projection: Option<&Vec<usize>>,
         predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
     ) -> DataFusionResult<Self> {
-        let output_names = scan_output_names(public_schema, projection)?;
+        let output_names = scan_output_names(physical_schema, projection)?;
         let required_columns = required_columns_closure(&output_names, predicates);
         let (required_schema, physical_indices) =
             select_schema_by_name(physical_schema, &required_columns)?;
@@ -3663,64 +3556,25 @@ fn conjoin_physical_predicates(
         .reduce(|left, right| Arc::new(BinaryExpr::new(left, Operator::And, right)))
 }
 
-/// Compiled conjunction of one assignment's signed closed predicates,
-/// evaluated directly over Arrow batches that never pass through a
-/// `DataFusion` plan.
+/// Compiles one assignment's signed closed predicates into a single physical
+/// conjunction over `schema`, or `None` when the assignment carries none.
 ///
-/// Persisted follower scans get their predicates enforced by the physical
-/// plan itself, but the Scribe live-tail snapshot is assembled inside the
-/// Scribe pod and shipped back as ready Arrow. Compiling the closure once
-/// here lets that path apply the same signed filter to every hot batch
-/// before it is returned, so a selective query sends only matching rows
-/// into follower attempt encoding instead of the whole tail.
-#[derive(Debug)]
-pub(crate) struct ScanPredicateFilter {
-    /// The conjunction, or `None` when the assignment carries no predicates
-    /// and every row is retained unchanged.
-    predicate: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
-}
-
-impl ScanPredicateFilter {
-    /// Compiles the signed predicate list against the batch schema it will
-    /// be evaluated over.
-    ///
-    /// # Errors
-    /// Returns a `DataFusion` error when a predicate names a column absent
-    /// from `schema` or compares it against an incompatible literal.
-    pub(crate) fn compile(
-        schema: &SchemaRef,
-        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-    ) -> DataFusionResult<Self> {
-        let compiled = predicates
-            .iter()
-            .map(|predicate| scan_predicate_physical_expr(predicate, schema))
-            .collect::<DataFusionResult<Vec<_>>>()?;
-        Ok(Self {
-            predicate: conjoin_physical_predicates(compiled),
-        })
-    }
-
-    /// Returns only the rows of `batch` satisfying the conjunction.
-    ///
-    /// Rows whose predicate evaluates to `NULL` are dropped, matching SQL
-    /// `WHERE` semantics and the `FilterExec` the leader would otherwise
-    /// have applied above the provider.
-    ///
-    /// # Errors
-    /// Returns a `DataFusion` error when the conjunction cannot be evaluated
-    /// against `batch` or does not produce a boolean mask.
-    pub(crate) fn retain(
-        &self,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> DataFusionResult<arrow::record_batch::RecordBatch> {
-        let Some(predicate) = &self.predicate else {
-            return Ok(batch);
-        };
-        let rows = batch.num_rows();
-        let evaluated = predicate.evaluate(&batch)?.into_array(rows)?;
-        let mask = datafusion::common::cast::as_boolean_array(&evaluated)?;
-        arrow::compute::filter_record_batch(&batch, mask).map_err(Into::into)
-    }
+/// The Scribe follower places it in a `FilterExec` above its live leaf, so a
+/// selective query ships only matching rows back to the leader. Rows whose
+/// conjunction evaluates to `NULL` are dropped, matching SQL `WHERE`.
+///
+/// # Errors
+/// Returns a `DataFusion` plan error when a predicate names a column absent
+/// from `schema`.
+pub(super) fn scan_predicate_conjunction(
+    predicates: &[ScanPredicate],
+    schema: &SchemaRef,
+) -> DataFusionResult<Option<Arc<dyn PhysicalExpr>>> {
+    let compiled = predicates
+        .iter()
+        .map(|predicate| scan_predicate_physical_expr(predicate, schema))
+        .collect::<DataFusionResult<Vec<_>>>()?;
+    Ok(conjoin_physical_predicates(compiled))
 }
 
 /// One statistic bound value in the closed subset this pruning path
@@ -4021,11 +3875,10 @@ pub(super) fn select_row_groups_for_predicates(
 /// Projects one physical batch to the pinned schema by field name.
 ///
 /// The row count is carried explicitly rather than inferred from the columns,
-/// because the pinned schema is legitimately allowed to be empty: `count(*)`
-/// requests no output column, so its closure is the hidden tenant column alone
-/// and the batch that survives the tripwire has zero columns and a real row
-/// count. Arrow cannot recover that count from the columns, so dropping it
-/// would turn a valid narrow scan into an execution failure.
+/// because a projected schema is legitimately allowed to be empty: an output
+/// projection for `count(*)` has zero columns and a real row count. Arrow
+/// cannot recover that count from the columns, so dropping it would turn a
+/// valid narrow scan into an execution failure.
 ///
 /// # Errors
 ///
@@ -4053,59 +3906,6 @@ pub(super) fn project_batch(
             }
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
-    RecordBatch::try_new_with_options(
-        schema,
-        columns,
-        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-    )
-    .map_err(DataFusionError::from)
-}
-
-/// Removes one named physical field from a schema.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` plan error when the field is absent.
-fn schema_without(schema: &Schema, name: &str) -> DataFusionResult<SchemaRef> {
-    let index = schema
-        .index_of(name)
-        .map_err(|_| DataFusionError::Plan(format!("physical schema missing `{name}`")))?;
-    let fields = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(ordinal, _)| *ordinal != index)
-        .map(|(_, field)| field.as_ref().clone())
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    )))
-}
-
-/// Removes one named array from a batch without copying retained arrays.
-///
-/// The row count is carried explicitly so a batch whose only column was the
-/// hidden tenant column — the closure of a `count(*)` scan — survives the
-/// tripwire as a zero-column batch with its real row count intact.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` execution error when the field is absent or Arrow
-/// rejects the projected batch.
-fn remove_column(batch: &RecordBatch, name: &str) -> DataFusionResult<RecordBatch> {
-    let index = batch
-        .schema()
-        .index_of(name)
-        .map_err(|_| DataFusionError::Execution(format!("batch missing `{name}`")))?;
-    let schema = schema_without(&batch.schema(), name)?;
-    let columns = batch
-        .columns()
-        .iter()
-        .enumerate()
-        .filter(|(ordinal, _)| *ordinal != index)
-        .map(|(_, column)| Arc::clone(column))
-        .collect();
     RecordBatch::try_new_with_options(
         schema,
         columns,
@@ -4152,8 +3952,8 @@ mod tests {
     use datafusion::common::tree_node::TreeNode;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::logical_expr::{col, lit};
-    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
+    use parquet::file::properties::WriterProperties;
     use wyrd_runtime::Principal;
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_spec::DataTenantId;
@@ -4164,186 +3964,6 @@ mod tests {
     use wyrd_spec::vala::api::QueryStreamFrame;
 
     use crate::oracle::live::LiveTableRoutes;
-
-    /// Tenant validation finds foreign rows at every batch position.
-    #[test]
-    fn tripwire_detects_first_middle_and_last_foreign_rows() {
-        let tenant = wyrd_spec::DataTenantId::new_v7();
-        let foreign = wyrd_spec::DataTenantId::new_v7();
-        for position in 0..3 {
-            let values = (0..3)
-                .map(|row| {
-                    if row == position {
-                        foreign.to_string()
-                    } else {
-                        tenant.to_string()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                DATA_TENANT_ID,
-                DataType::Utf8,
-                false,
-            )]));
-            let batch = RecordBatch::try_new(
-                schema,
-                vec![Arc::new(StringArray::from(values)) as ArrayRef],
-            )
-            .expect("test tenant batch");
-            assert_eq!(
-                tenant_mismatch_row(&batch, tenant).expect("tenant column is valid"),
-                Some(position)
-            );
-        }
-    }
-
-    /// A `count(*)` closure survives the tripwire as a zero-column batch and
-    /// still refuses a foreign row.
-    ///
-    /// `count(*)` requests no output column, so its signed closure is the
-    /// hidden tenant column alone and the batch the tripwire emits has zero
-    /// columns. Arrow cannot infer a row count from no columns, so the count
-    /// has to be carried explicitly; when it was not, the leaf failed with
-    /// `must either specify a row count or at least one column` and the query
-    /// surfaced as a degraded partition rather than as the tenant refusal it
-    /// actually was. Both halves are pinned here: the owning-tenant scan keeps
-    /// its rows, and the foreign row is still classified as a tenant invariant.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture plan cannot be built or executed, or when the
-    /// tripwire loses the row count or the refusal.
-    #[tokio::test]
-    async fn count_star_closure_keeps_its_row_count_through_the_tripwire() {
-        let tenant = wyrd_spec::DataTenantId::new_v7();
-        let foreign = wyrd_spec::DataTenantId::new_v7();
-        for (owner_rows, expect_refusal) in [(3_usize, false), (3, true)] {
-            let values = (0..owner_rows)
-                .map(|row| {
-                    if expect_refusal && row == 1 {
-                        foreign.to_string()
-                    } else {
-                        tenant.to_string()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                DATA_TENANT_ID,
-                DataType::Utf8,
-                false,
-            )]));
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(StringArray::from(values)) as ArrayRef],
-            )
-            .expect("tenant-only closure batch");
-            let source =
-                MemorySourceConfig::try_new_exec(std::slice::from_ref(&vec![batch]), schema, None)
-                    .expect("closure source");
-            let principal = Principal {
-                id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: wyrd_runtime::PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
-                effective_permissions: PermissionSet::default(),
-                credential_id: None,
-            };
-            let context = AuthorizedQueryContext::try_new(
-                principal,
-                tenant,
-                RequestId::now_v7(),
-                None,
-                AuthMethod::Internal,
-                wyrd_runtime::Permission::bifrost_query_read(),
-            )
-            .expect("query context");
-            let tripwire = TenantTripwireExec::new(
-                source,
-                context,
-                "vala.traces.spans".to_owned(),
-                Arc::new(crate::oracle::AcceptingOracleAudit),
-            )
-            .expect("tripwire plan");
-            assert_eq!(
-                tripwire.schema().fields().len(),
-                0,
-                "a count(*) closure leaves the tripwire with no output column"
-            );
-            let stream = tripwire
-                .execute(0, Arc::new(TaskContext::default()))
-                .expect("tripwire stream");
-            let collected = futures_util::TryStreamExt::try_collect::<Vec<_>>(stream).await;
-            if expect_refusal {
-                let error = collected.expect_err("a foreign row must refuse the scan");
-                assert!(
-                    is_tenant_invariant_error(&error),
-                    "the refusal must stay a tenant invariant: {error}"
-                );
-            } else {
-                let batches = collected.expect("an owning-tenant closure scan succeeds");
-                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-                assert_eq!(rows, owner_rows, "the zero-column batch kept its row count");
-                assert!(
-                    batches.iter().all(|batch| batch.num_columns() == 0),
-                    "the tenant column must not survive the tripwire"
-                );
-            }
-        }
-    }
-
-    /// Keeps the tenant tripwire immediately above an unordered source union.
-    #[test]
-    fn unordered_union_has_no_mandatory_reconciliation_sort() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            DATA_TENANT_ID,
-            DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(StringArray::from(vec![
-                wyrd_spec::DataTenantId::new_v7().to_string(),
-            ])) as ArrayRef],
-        )
-        .expect("source batch");
-        let source: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(std::slice::from_ref(&vec![batch]), schema, None)
-                .expect("source batch schema");
-        let tenant = wyrd_spec::DataTenantId::new_v7();
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: wyrd_runtime::PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::default(),
-            credential_id: None,
-        };
-        let context = AuthorizedQueryContext::try_new(
-            principal,
-            tenant,
-            RequestId::now_v7(),
-            None,
-            AuthMethod::Internal,
-            wyrd_runtime::Permission::bifrost_query_read(),
-        )
-        .expect("query context");
-        let source_union =
-            UnionExec::try_new(vec![Arc::clone(&source), source]).expect("source union");
-        let tripwire = Arc::new(
-            TenantTripwireExec::new(
-                source_union,
-                context,
-                "vala.traces.spans".to_owned(),
-                Arc::new(crate::oracle::AcceptingOracleAudit),
-            )
-            .expect("tripwire plan"),
-        );
-        assert_eq!(tripwire.name(), "TenantTripwireExec");
-        assert_eq!(tripwire.children()[0].name(), "UnionExec");
-        let tripwire_plan: Arc<dyn ExecutionPlan> = Arc::clone(&tripwire) as Arc<dyn ExecutionPlan>;
-        assert!(tripwire_plan.downcast_ref::<SortExec>().is_none());
-        assert!(tripwire.children()[0].downcast_ref::<SortExec>().is_none());
-    }
 
     /// Composes one Oracle capability for hot-read resource tests.
     /// Event-time statistics for a fixture whose pruning decision is not the
@@ -4365,6 +3985,20 @@ mod tests {
         crate::storage::BifrostStorage::for_test(&root.keep(), true)
     }
 
+    /// The one tenant every fixture object is written for and read as.
+    static FIXTURE_TENANT: std::sync::LazyLock<DataTenantId> =
+        std::sync::LazyLock::new(DataTenantId::new_v7);
+
+    /// Builds the production writer recipe with a footer proving
+    /// [`FIXTURE_TENANT`], the way every Bifrost producer writes.
+    fn fixture_writer_properties(row_count: usize, bloom_columns: &[String]) -> WriterProperties {
+        crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
+            row_count,
+            vec![crate::parquet::footer::tenant_key_value(*FIXTURE_TENANT)],
+            bloom_columns,
+        )
+    }
+
     /// Builds one immutable metadata identity for a fixture object.
     ///
     /// The checksum is derived from the name so two differently named fixture
@@ -4377,7 +4011,7 @@ mod tests {
         }
         checksum[31] = 1;
         crate::storage::ObjectMetadataKey::new(
-            wyrd_spec::DataTenantId::new_v7(),
+            *FIXTURE_TENANT,
             "vala.traces.spans".to_owned(),
             name.to_owned(),
             uuid::Uuid::now_v7(),
@@ -4610,10 +4244,7 @@ mod tests {
     /// size-driven fixture could produce two groups at unit scale.
     fn write_grouped_fixture(schema: &SchemaRef, blocks: &[RecordBatch]) -> bytes::Bytes {
         let rows: usize = blocks.iter().map(RecordBatch::num_rows).sum();
-        let properties = crate::parquet::writer_properties::bifrost_writer_properties(
-            rows,
-            &["service_name".to_owned()],
-        );
+        let properties = fixture_writer_properties(rows, &["service_name".to_owned()]);
         let mut sink = Vec::new();
         let mut writer =
             parquet::arrow::ArrowWriter::try_new(&mut sink, Arc::clone(schema), Some(properties))
@@ -4902,8 +4533,7 @@ mod tests {
         batch: &RecordBatch,
         context: &str,
     ) {
-        let properties =
-            crate::parquet::writer_properties::bifrost_writer_properties(batch.num_rows(), &[]);
+        let properties = fixture_writer_properties(batch.num_rows(), &[]);
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(path).unwrap_or_else(|error| panic!("{context} file: {error}")),
             schema,
@@ -5093,6 +4723,9 @@ mod tests {
         .expect("split fixture batch");
         let properties = parquet::file::properties::WriterProperties::builder()
             .set_max_row_group_row_count(Some(2))
+            .set_key_value_metadata(Some(vec![crate::parquet::footer::tenant_key_value(
+                *FIXTURE_TENANT,
+            )]))
             .build();
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(path).expect("split fixture file"),
@@ -5196,6 +4829,107 @@ mod tests {
         }
     }
 
+    /// A hot object whose footer is missing or names a foreign tenant fails
+    /// the scan with the tenant invariant before any row is yielded.
+    ///
+    /// The first file is written by the fixture tenant but read under another
+    /// tenant's authenticated binding; the second carries no footer tenant at
+    /// all. Both must refuse with [`BifrostError::QueryTenantInvariant`] and
+    /// yield zero rows, so no per-row check is needed downstream.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either object yields a row, completes without error, or
+    /// fails with anything other than the tenant invariant.
+    #[tokio::test]
+    async fn hot_parquet_refuses_foreign_or_missing_footer_tenant_before_any_row() {
+        let directory = tempfile::tempdir().expect("tenant fixture directory");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let foreign_path = directory.path().join("foreign.parquet");
+        let foreign_size = write_split_fixture(&foreign_path, &schema, &[1, 2, 3]);
+        let missing_path = directory.path().join("missing.parquet");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(&missing_path).expect("missing-tenant fixture file"),
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("missing-tenant fixture writer");
+        writer
+            .write(
+                &RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![4, 5])) as ArrayRef],
+                )
+                .expect("missing-tenant fixture batch"),
+            )
+            .expect("missing-tenant fixture write");
+        writer.close().expect("missing-tenant fixture close");
+        let missing_size = usize::try_from(
+            std::fs::metadata(&missing_path)
+                .expect("missing-tenant fixture size")
+                .len(),
+        )
+        .expect("fixture size fits usize");
+        let reading_tenant = DataTenantId::new_v7();
+        let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
+        let telemetry = Arc::new(OracleTelemetry::new());
+        for (path, size_bytes, tenant) in [
+            (&foreign_path, foreign_size, reading_tenant),
+            (&missing_path, missing_size, *FIXTURE_TENANT),
+        ] {
+            let location = path.to_string_lossy().into_owned();
+            let file = HotFileSource {
+                metadata_key: crate::storage::ObjectMetadataKey::new(
+                    tenant,
+                    "vala.traces.spans".to_owned(),
+                    location.clone(),
+                    uuid::Uuid::now_v7(),
+                    [7; 32],
+                    u64::try_from(size_bytes).expect("fixture size fits u64"),
+                ),
+                location,
+                size_bytes,
+                event_time: unusable_event_time(),
+            };
+            let exec = HotParquetExec::new(
+                vec![file],
+                FileIO::new_with_fs(),
+                fixture_storage(),
+                Arc::clone(&schema),
+                HotParquetPlan::Leader,
+                Arc::new(OracleScanMetricsHandle::default()),
+                Vec::new(),
+            );
+            let context = bound_leader_task(
+                oracle_memory_resources(&governor, 1024 * 1024),
+                &telemetry,
+                crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+            );
+            let mut stream = exec.execute(0, context).expect("tenant fixture stream");
+            let mut rows = 0;
+            let mut refusal = None;
+            while let Some(batch) = stream.next().await {
+                match batch {
+                    Ok(batch) => rows += batch.num_rows(),
+                    Err(error) => {
+                        refusal = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(rows, 0, "an unproven file yields no row");
+            let refusal = refusal.expect("an unproven file fails the scan");
+            assert!(
+                is_tenant_invariant_error(&refusal),
+                "an unproven file is a tenant refusal, saw {refusal}"
+            );
+        }
+    }
+
     /// Byte-range pieces handed to Iceberg's reader return every row once.
     ///
     /// This pins the contract between [`partition_byte_ranges`] and the
@@ -5293,9 +5027,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot file"),
             Arc::clone(&schema),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties(batch.num_rows(), &[]),
-            ),
+            Some(fixture_writer_properties(batch.num_rows(), &[])),
         )
         .expect("hot writer");
         writer.write(&batch).expect("hot batch write");
@@ -5400,9 +5132,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot causal file"),
             Arc::clone(&schema),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties(batch.num_rows(), &[]),
-            ),
+            Some(fixture_writer_properties(batch.num_rows(), &[])),
         )
         .expect("hot causal writer");
         writer.write(&batch).expect("hot causal write");
@@ -5619,12 +5349,10 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("compressible file"),
             Arc::clone(&schema),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties(
-                    usize::try_from(requests * rows_per_request).expect("rows fit usize"),
-                    &[],
-                ),
-            ),
+            Some(fixture_writer_properties(
+                usize::try_from(requests * rows_per_request).expect("rows fit usize"),
+                &[],
+            )),
         )
         .expect("compressible writer");
         for request in 0..requests {
@@ -6004,9 +5732,7 @@ mod tests {
     ///
     /// Covers: supported `AND` conjunction of typed comparisons and a null
     /// leaf; a literal-on-the-left comparison normalized by reversing the
-    /// operator; the exact stable-dedup closure order (scan output, then
-    /// first-occurrence predicate columns, then the always-present hidden
-    /// tenant column); and every closed-subset-violating shape (`OR`, `NOT`,
+    /// operator; and every closed-subset-violating shape (`OR`, `NOT`,
     /// cast, column-to-column, non-finite float) reported `Unsupported`.
     #[test]
     fn closed_predicate_projection_contract() {
@@ -6018,7 +5744,6 @@ mod tests {
             Field::new("service_name", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
             Field::new("wyrd_event_time", DataType::Int64, true),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
         ]);
 
         // Supported AND conjunction: comparison + null-check, and a
@@ -6103,8 +5828,8 @@ mod tests {
         );
     }
 
-    /// The projection closure is `scan output + predicate columns + hidden
-    /// tenant column`, in that order, stably deduplicated.
+    /// The projection closure is `scan output + predicate columns`, in that
+    /// order, stably deduplicated, and never empty.
     ///
     /// Order is part of the contract, not an implementation detail: the
     /// closure is hashed into the assignment-authority digest, so two
@@ -6118,27 +5843,24 @@ mod tests {
             Field::new("service_name", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
             Field::new("wyrd_event_time", DataType::Int64, true),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
         ]);
-        let public_schema = schema_without(&physical_schema, DATA_TENANT_ID).unwrap();
         let supported = col("service_name")
             .eq(lit("api"))
             .and(col("duration_ms").is_not_null());
 
         // Projection-closure order: requested scan output first, then the
-        // first occurrence of each predicate column in filter order, then
-        // the always-present hidden tenant column, stably deduplicated
-        // (`duration_ms` appears in both the projection and the predicates).
+        // first occurrence of each predicate column in filter order, stably
+        // deduplicated (`duration_ms` appears in both the projection and the predicates).
         let leaves = match classify_filter(&supported) {
             FilterClassification::Supported(leaves) => leaves,
             FilterClassification::Unsupported => unreachable!(),
         };
         let projection = vec![
-            public_schema.index_of("duration_ms").unwrap(),
-            public_schema.index_of("wyrd_event_time").unwrap(),
+            physical_schema.index_of("duration_ms").unwrap(),
+            physical_schema.index_of("wyrd_event_time").unwrap(),
         ];
         let closure = required_columns_closure(
-            &scan_output_names(&public_schema, Some(&projection)).expect("valid ordinals"),
+            &scan_output_names(&physical_schema, Some(&projection)).expect("valid ordinals"),
             &leaves,
         );
         assert_eq!(
@@ -6147,13 +5869,12 @@ mod tests {
                 "duration_ms".to_string(),
                 "wyrd_event_time".to_string(),
                 "service_name".to_string(),
-                DATA_TENANT_ID.to_string(),
             ]
         );
 
-        // A `None` projection closes over every public column.
+        // A `None` projection closes over every table column.
         let full_closure = required_columns_closure(
-            &scan_output_names(&public_schema, None).expect("full public projection"),
+            &scan_output_names(&physical_schema, None).expect("full projection"),
             &[],
         );
         assert_eq!(
@@ -6162,9 +5883,16 @@ mod tests {
                 "service_name".to_string(),
                 "duration_ms".to_string(),
                 "wyrd_event_time".to_string(),
-                DATA_TENANT_ID.to_string(),
             ]
         );
+
+        // A `count(*)` scan requests no column, so its closure reads the
+        // always-present event time rather than producing zero-column leaves.
+        let count_closure = required_columns_closure(
+            &scan_output_names(&physical_schema, Some(&Vec::new())).expect("empty projection"),
+            &[],
+        );
+        assert_eq!(count_closure, vec!["wyrd_event_time".to_string()]);
     }
 
     /// Column ownership, not qualification, decides pushdown eligibility.
@@ -6183,10 +5911,7 @@ mod tests {
         use datafusion::logical_expr::{col, lit};
         use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
 
-        let physical_schema = Schema::new(vec![
-            Field::new("service_name", DataType::Utf8, true),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
-        ]);
+        let physical_schema = Schema::new(vec![Field::new("service_name", DataType::Utf8, true)]);
 
         let qualified_owned = Expr::Column(Column::new(
             Some(TableReference::full("vala", "bifrost", "events")),
@@ -6269,9 +5994,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot batch fixture file"),
             Arc::clone(&schema),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties(batch.num_rows(), &[]),
-            ),
+            Some(fixture_writer_properties(batch.num_rows(), &[])),
         )
         .expect("hot batch fixture writer");
         writer.write(&batch).expect("hot batch fixture write");
@@ -6341,7 +6064,7 @@ mod tests {
         .build();
         let footers = PublishedFooters::new(
             storage,
-            wyrd_spec::DataTenantId::new_v7(),
+            *FIXTURE_TENANT,
             "vala.traces.spans".to_owned(),
             HotParquetPlan::Follower {
                 memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
@@ -7170,11 +6893,6 @@ mod tests {
                     "duration_ms",
                     IcebergType::Primitive(PrimitiveType::Long),
                 )),
-                Arc::new(NestedField::required(
-                    3,
-                    DATA_TENANT_ID,
-                    IcebergType::Primitive(PrimitiveType::String),
-                )),
             ])
             .build()
             .expect("fixture Iceberg schema");
@@ -7232,7 +6950,6 @@ mod tests {
             iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
-            audit: Arc::new(crate::oracle::AcceptingOracleAudit),
             remote: None,
             live: None,
         })
@@ -7414,11 +7131,6 @@ mod tests {
                 optional(1, "unused_payload", PrimitiveType::String),
                 optional(2, "duration_ms", PrimitiveType::Long),
                 optional(3, "status_code", PrimitiveType::String),
-                Arc::new(NestedField::required(
-                    4,
-                    DATA_TENANT_ID,
-                    IcebergType::Primitive(PrimitiveType::String),
-                )),
             ])
             .build()
             .expect("fixture Iceberg schema");
@@ -7474,10 +7186,9 @@ mod tests {
 
     /// Builds the pinned wide-table provider the closure owner scans.
     ///
-    /// The live batch carries the full four-column physical schema —
-    /// `unused_payload`, `duration_ms`, `status_code`, `data_tenant_id` — with
-    /// one `STATUS_CODE_ERROR` row and one `STATUS_CODE_OK` row, both owned by
-    /// `tenant`. Keeping fixture construction here leaves the owning test to
+    /// The live batch carries the full three-column physical schema —
+    /// `unused_payload`, `duration_ms`, `status_code` — with one
+    /// `STATUS_CODE_ERROR` row and one `STATUS_CODE_OK` row, read as `tenant`. Keeping fixture construction here leaves the owning test to
     /// assert only closure behavior.
     ///
     /// # Panics
@@ -7509,7 +7220,6 @@ mod tests {
             Field::new("unused_payload", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
             Field::new("status_code", DataType::Utf8, true),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
         ]));
         let live = RecordBatch::try_new(
             Arc::clone(&live_schema),
@@ -7519,10 +7229,6 @@ mod tests {
                 Arc::new(StringArray::from(vec![
                     "STATUS_CODE_ERROR",
                     "STATUS_CODE_OK",
-                ])) as ArrayRef,
-                Arc::new(StringArray::from(vec![
-                    tenant.to_string(),
-                    tenant.to_string(),
                 ])) as ArrayRef,
             ],
         )
@@ -7534,7 +7240,6 @@ mod tests {
             iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
-            audit: Arc::new(crate::oracle::AcceptingOracleAudit),
             remote,
             live: live_routes,
         })
@@ -7574,21 +7279,20 @@ mod tests {
     }
 
     /// One leader-owned closure governs every leaf, the placeholder, the
-    /// tripwire, the provider-local filter, and the public result.
+    /// provider-local filter, and the result.
     ///
     /// This is the production Interactive leader path for
     /// `SELECT duration_ms FROM ... WHERE status_code = 'STATUS_CODE_ERROR'`.
-    /// The closure is `[duration_ms, status_code, data_tenant_id]`: the
-    /// requested output, the predicate-only column that must survive to the
-    /// provider-local filter, and the hidden tenant column that must survive to
-    /// the tripwire. `unused_payload` is requested by nobody and must not
-    /// appear in any leaf.
+    /// The closure is `[duration_ms, status_code]`: the requested output and
+    /// the predicate-only column that must survive to the provider-local
+    /// filter. `unused_payload` is requested by nobody and must not appear in
+    /// any leaf.
     ///
     /// # Panics
     /// Panics if provider construction, scan planning, or execution violates
     /// the closure contract this owner pins.
     #[tokio::test]
-    async fn projected_leaf_union_preserves_predicate_and_tenant_columns() {
+    async fn projected_leaf_union_preserves_predicate_columns() {
         use datafusion::execution::context::SessionContext;
         use datafusion::logical_expr::{col, lit};
         use datafusion::physical_plan::collect;
@@ -7614,23 +7318,11 @@ mod tests {
         let filter = filtered
             .downcast_ref::<FilterExec>()
             .expect("provider keeps its local filter over the closed predicates");
-        let tripwire_plan = Arc::clone(filter.children()[0]);
-        let tripwire = tripwire_plan
-            .downcast_ref::<TenantTripwireExec>()
-            .expect("tripwire sits directly under the provider-local filter");
-
-        // The tripwire consumes the tenant column and never emits it.
-        let union = Arc::clone(tripwire.children()[0]);
-        let closure = vec![
-            "duration_ms".to_string(),
-            "status_code".to_string(),
-            DATA_TENANT_ID.to_string(),
-        ];
+        // The source union sits directly under the provider-local filter.
+        let union = Arc::clone(filter.children()[0]);
+        assert!(union.downcast_ref::<UnionExec>().is_some());
+        let closure = vec!["duration_ms".to_string(), "status_code".to_string()];
         assert_eq!(column_names(&union), closure);
-        assert_eq!(
-            column_names(&tripwire_plan),
-            vec!["duration_ms".to_string(), "status_code".to_string()]
-        );
 
         // Every union child — the published Iceberg leaf and the live Scribe
         // leaf alike — exposes exactly the closure, in closure order.

@@ -31,6 +31,7 @@ mod analytical_lifecycle;
 mod capacity;
 mod distributed;
 mod mcp;
+mod peer_cluster;
 mod peer_network;
 mod published;
 mod support;

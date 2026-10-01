@@ -149,10 +149,9 @@ message IcebergFileDescriptor {
 }
 message ScribeProviderCut {
   uint64 writer_epoch = 1; TimePartition start_partition = 2; TimePartition end_partition = 3;
-  reserved 4, 5, 6;
-  reserved "required_columns", "persisted_cursor", "persisted_ranges";
-  uint32 maximum_batch_count = 7;
-  uint64 maximum_retained_bytes = 8;
+  reserved 4, 5, 6, 7, 8;
+  reserved "required_columns", "persisted_cursor", "persisted_ranges",
+    "maximum_batch_count", "maximum_retained_bytes";
 }
 enum ScanPredicateOp {
   SCAN_PREDICATE_OP_UNSPECIFIED = 0;

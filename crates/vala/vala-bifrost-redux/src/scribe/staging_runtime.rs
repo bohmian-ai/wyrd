@@ -719,6 +719,7 @@ impl ScribeStagingRuntime {
             object_base: &object_base,
             target_object_bytes: self.target_object_bytes,
             memory: request.memory,
+            tenant: context.binding.tenant,
         })
     }
 
@@ -935,7 +936,7 @@ fn poisoned(owner: &'static str) -> ScribeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{FixedSizeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow::array::{FixedSizeBinaryArray, RecordBatch, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::ids::DataTenantId;
 
@@ -954,7 +955,6 @@ mod tests {
     /// Physical schema the fixture member is staged and merged under.
     fn runtime_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -967,12 +967,9 @@ mod tests {
     /// Freezes one bucket of `rows` rows for the fixture tenant and shard.
     fn frozen_member(tenant: DataTenantId, rows: i64, shard: u8) -> FrozenMemtable {
         let schema = runtime_schema();
-        let tenant_value = tenant.to_string();
-        let count = usize::try_from(rows).expect("fixture row count fits usize");
         let record = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(StringArray::from(vec![tenant_value.as_str(); count])),
                 Arc::new(TimestampMicrosecondArray::from_iter_values(
                     (0..rows).map(|row| row * 2 + i64::from(shard)),
                 )),
@@ -1216,8 +1213,8 @@ mod tests {
     }
 
     /// Members that reach neither target nor dwell are invisible to
-    /// [`ScribeStagingRuntime::take_claim`] but are exactly what drain must
-    /// settle, so every ready key is reachable as residue and each key stops
+    /// [`ScribeStagingRuntime::take_claim`] but are exactly what an explicit
+    /// flush must settle, so every ready key is reachable as residue and each key stops
     /// being ready once its residue is claimed.
     #[tokio::test]
     async fn drain_reaches_every_ready_key_target_and_dwell_would_hold() {

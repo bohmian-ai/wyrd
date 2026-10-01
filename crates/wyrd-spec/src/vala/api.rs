@@ -1958,17 +1958,15 @@ pub struct ScribeProviderCut {
     pub start_partition: TimePartitionWire,
     /// Inclusive final partition in the provider projection.
     pub end_partition: TimePartitionWire,
-    /// Maximum Arrow batches retained by the provider.
-    pub maximum_batch_count: u32,
-    /// Maximum bytes retained by the provider.
-    pub maximum_retained_bytes: u64,
 }
 
 impl ScribeProviderCut {
     /// Validates the canonical Scribe memory-provider cut.
     ///
-    /// The cut bounds which partitions a follower may read from memory, on which
-    /// writer incarnation, and how much it may retain. It carries no statement
+    /// The cut bounds which partitions a follower may read from memory and on
+    /// which writer incarnation. It carries no size limit: the read references
+    /// rows the Scribe already holds, and the query's own memory pool governs
+    /// what execution retains. It carries no statement
     /// about which rows are already published: Scribe decides that from the
     /// generation authority it owns, and a WAL interval on the wire would be a
     /// second, weaker answer that a reader could mistake for ownership.
@@ -1977,8 +1975,6 @@ impl ScribeProviderCut {
         self.writer_epoch > 0
             && self.start_partition.granularity() == self.end_partition.granularity()
             && self.start_partition <= self.end_partition
-            && self.maximum_batch_count > 0
-            && self.maximum_retained_bytes > 0
     }
 }
 

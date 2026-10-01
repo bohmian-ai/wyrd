@@ -370,21 +370,22 @@ impl VerificationRuntimeBuilder<'_> {
         };
         let postgres = self.state.postgres.wyrd();
         let queue = VerifierRunQueue::default();
-        let mut scheduler = VerificationScheduler::new(
+        let scheduler = VerificationScheduler::new(
             postgres.clone(),
             operator.clone(),
             queue,
             self.limits.poll_interval,
         );
         #[cfg(feature = "test-support")]
-        if let Some(crash) = &self.crash {
-            scheduler = scheduler.with_crash(crash.clone());
-        }
+        let scheduler = match &self.crash {
+            Some(crash) => scheduler.with_crash(crash.clone()),
+            None => scheduler,
+        };
         let permits = Arc::new(VerifierPermits::new(
             self.limits.global_permits,
             self.limits.tenant_permits,
         ));
-        let mut fitter = BaselineFitter::new(
+        let fitter = BaselineFitter::new(
             postgres.clone(),
             operator.clone(),
             Arc::clone(&self.state.storage),
@@ -392,9 +393,10 @@ impl VerificationRuntimeBuilder<'_> {
             &self.limits,
         );
         #[cfg(feature = "test-support")]
-        if let Some(crash) = &self.crash {
-            fitter = fitter.with_crash(crash.clone());
-        }
+        let fitter = match &self.crash {
+            Some(crash) => fitter.with_crash(crash.clone()),
+            None => fitter,
+        };
         let mut capabilities = vec![
             Capability::Scheduler(Arc::new(scheduler)),
             Capability::Fitter(Arc::new(fitter)),
@@ -412,7 +414,7 @@ impl VerificationRuntimeBuilder<'_> {
                     Some(fault) => publisher.with_fault(fault),
                     None => publisher,
                 };
-                let mut runner = VerifierRunner::new(
+                let runner = VerifierRunner::new(
                     postgres.clone(),
                     operator,
                     queue,
@@ -430,14 +432,15 @@ impl VerificationRuntimeBuilder<'_> {
                     self.limits,
                 );
                 #[cfg(feature = "test-support")]
-                {
-                    if let Some(script) = self.engine_script {
-                        runner = runner.with_engine_script(script);
-                    }
-                    if let Some(crash) = self.crash {
-                        runner = runner.with_crash(crash);
-                    }
-                }
+                let runner = match self.engine_script {
+                    Some(script) => runner.with_engine_script(script),
+                    None => runner,
+                };
+                #[cfg(feature = "test-support")]
+                let runner = match self.crash {
+                    Some(crash) => runner.with_crash(crash),
+                    None => runner,
+                };
                 capabilities.push(Capability::Runner(Arc::new(runner)));
             }
             (None, _) => {

@@ -1280,7 +1280,7 @@ fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTermi
         return QueryTerminalErrorCode::QueryTimeout;
     }
     let message = error.to_string().to_ascii_lowercase();
-    if message.contains("tenant invariant") {
+    if super::is_tenant_refusal(error) {
         QueryTerminalErrorCode::QueryTenantInvariant
     } else if message.contains("reconciliation invariant") {
         QueryTerminalErrorCode::QueryReconciliationInvariant

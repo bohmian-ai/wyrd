@@ -8,7 +8,6 @@ use crate::namespaces::BifrostNamespace;
 use crate::scribe::ScribeImpl;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::geometry::DEFAULT_SHARD_COUNT;
-use crate::scribe::staged_tail::tests::unbounded_pool;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
 use crate::scribe::wal::{WalConfig, WalWriter};
@@ -261,7 +260,6 @@ const MANAGED_COLUMNS: &[&str] = &[
     "wyrd_event_time",
     "wyrd_ingested_at",
     "wyrd_batch_id",
-    "data_tenant_id",
 ];
 
 /// Assert every stored managed column is the table's own `Field` and value.
@@ -274,9 +272,9 @@ const MANAGED_COLUMNS: &[&str] = &[
 /// # Panics
 ///
 /// Panics when a managed column is absent from the stored projection, when its
-/// stored `Field` differs from the table-owned physical field, or when the
-/// tenant isolation key does not carry the authenticated tenant.
-fn assert_managed_columns_are_table_owned(stored: &[RecordBatch], tenant: DataTenantId) {
+/// stored `Field` differs from the table-owned physical field, or when a
+/// per-row tenant column reappears.
+fn assert_managed_columns_are_table_owned(stored: &[RecordBatch]) {
     let definition =
         crate::tables::builtin_table("metrics", "points").expect("the points built-in resolves");
     let physical = (definition.schema)();
@@ -295,23 +293,10 @@ fn assert_managed_columns_are_table_owned(stored: &[RecordBatch], tenant: DataTe
                 "{name} is stored as the table-owned physical field"
             );
         }
-        let tenants = batch
-            .column(
-                batch
-                    .schema()
-                    .index_of("data_tenant_id")
-                    .expect("tenant column"),
-            )
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("the tenant key is the declared Utf8 column");
-        for row in 0..tenants.len() {
-            assert_eq!(
-                tenants.value(row),
-                tenant.to_string(),
-                "every stored row carries the authenticated tenant"
-            );
-        }
+        assert!(
+            batch.schema().index_of("data_tenant_id").is_err(),
+            "tenant ownership is proved by the file footer, never a row column"
+        );
     }
 }
 
@@ -420,16 +405,13 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
                 .map(|name| (*name).to_owned())
                 .chain(["metric_name".to_owned(), "quantile_values".to_owned()])
                 .collect(),
-            predicates: Vec::new(),
-            max_batches: 64,
-            max_retained_bytes: 64 * 1024 * 1024,
         },
         "hot snapshot",
     )
     .await;
 
     assert_payload_modes_agree(&stored, canonical_batch_id, arrow_batch_id, total_rows);
-    assert_managed_columns_are_table_owned(&stored, tenant);
+    assert_managed_columns_are_table_owned(&stored);
 
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
@@ -510,9 +492,6 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         start_partition: day,
         end_partition: day,
         required_columns: vec!["value".to_owned()],
-        predicates: Vec::new(),
-        max_batches: 64,
-        max_retained_bytes: 64 * 1024 * 1024,
     };
     let hot = live_rows(&scribe, request.clone(), "hot snapshot").await;
     assert_eq!(hot.len(), 1);
@@ -630,9 +609,6 @@ async fn assert_pointer_identity(
             start_partition: day,
             end_partition: day,
             required_columns: vec!["value".to_owned()],
-            predicates: Vec::new(),
-            max_batches: 64,
-            max_retained_bytes: 64 * 1024 * 1024,
         },
         "pointer hot snapshot",
     )
@@ -681,9 +657,6 @@ async fn assert_cross_day_materialization(
         start_partition: day,
         end_partition: day,
         required_columns: vec!["value".to_owned()],
-        predicates: Vec::new(),
-        max_batches: 64,
-        max_retained_bytes: 64 * 1024 * 1024,
     };
     let day_one_hot = live_rows(scribe, read_day(day_one), "day one snapshot").await;
     let day_two_hot = live_rows(scribe, read_day(day_two), "day two snapshot").await;
@@ -695,26 +668,27 @@ async fn assert_cross_day_materialization(
     assert_eq!(hot_value(&day_two_hot[0]), 202);
 }
 
-/// Opens one live read on `scribe` and drains every batch it produces.
+/// Opens one live read on `scribe` and returns its memtable rows.
+///
+/// These fixtures never stage a generation, so the memtable cut is the whole
+/// read.
 ///
 /// # Panics
-/// Panics with `context` when the read cannot open or a batch fails.
+/// Panics with `context` when the read cannot open or names a staged run.
 async fn live_rows(
     scribe: &ScribeImpl,
     request: FetchLiveTailRequest,
     context: &str,
 ) -> Vec<RecordBatch> {
-    futures_util::TryStreamExt::try_collect(
-        scribe
-            .tail_service()
-            .expect("tail service")
-            .open_live_batches(request)
-            .await
-            .expect(context)
-            .into_stream(unbounded_pool()),
-    )
-    .await
-    .expect(context)
+    let (rows, runs, _lease) = scribe
+        .tail_service()
+        .expect("tail service")
+        .open_live_batches(request)
+        .await
+        .expect(context)
+        .into_parts();
+    assert!(runs.is_empty(), "{context}: the fixture staged no run");
+    rows
 }
 
 /// Read the fixture's single hot value.
@@ -745,9 +719,6 @@ async fn assert_other_tenant_isolated(
             start_partition: day,
             end_partition: day,
             required_columns: vec!["value".to_owned()],
-            predicates: Vec::new(),
-            max_batches: 64,
-            max_retained_bytes: 64 * 1024 * 1024,
         },
         "other tenant snapshot",
     )

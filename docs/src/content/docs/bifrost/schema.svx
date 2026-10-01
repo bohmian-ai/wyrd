@@ -18,9 +18,9 @@ All tables are pre-declared `DomainTable` instances registered at boot. The phys
 
 **Partitioning:** `Day(event_time) + Bucket(tenant, 64)`
 
-**Tenant isolation:** `data_tenant_id` column + bucket + `FilterExec` (via `TenantPredicateRule`)
+**Tenant isolation:** tenant-qualified physical table + per-file footer tenant proof
 
-All tenants write to the same physical Iceberg table. The `data_tenant_id` column + partitioning bucket enforce tenant isolation at scan time.
+Each tenant writes to its own tenant-qualified physical table. Every Parquet file records its tenant in its footer, and Oracle proves it against the authenticated tenant before reading any row.
 
 ### Tenant-scoped dynamic datasets
 
@@ -28,7 +28,7 @@ All tenants write to the same physical Iceberg table. The `data_tenant_id` colum
 
 **Partitioning:** `Day(event_time) + Bucket(tenant, 64)` (collapses to 1 slot for single-tenant tables)
 
-**Tenant isolation:** Physical namespace + `data_tenant_id` + `FilterExec`
+**Tenant isolation:** Physical namespace + per-file footer tenant proof
 
 User-defined datasets for high-volume custom observability writes. Each tenant gets its own physical table namespace. Schema defined at Data Card registration.
 
@@ -36,7 +36,6 @@ User-defined datasets for high-volume custom observability writes. Each tenant g
 
 | Column | Physical type | Description |
 |---|---|---|
-| `data_tenant_id` | `Utf8` | Tenant isolation key (server-stamped) |
 | `wyrd_event_time` | `Timestamp(µs, UTC)` | Canonical event time for partitioning and windowing |
 | `wyrd_ingested_at` | `Timestamp(µs, UTC)` | Server-side flush wall clock |
 | `wyrd_batch_id` | `FixedSizeBinary(16)` | Batch deduplication key |

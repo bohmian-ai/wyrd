@@ -76,7 +76,7 @@ impl ClientConfig {
     /// Build from environment variables and built-in defaults.
     ///
     /// - `WYRD_SERVER_URL` overrides the HTTP base URL (default:
-    ///   `http://localhost:50050`).
+    ///   `http://localhost:8080`).
     /// - `WYRD_GRPC_URL` overrides the gRPC endpoint (default: the server
     ///   URL's scheme and host on the public gRPC port `50051`).
     ///

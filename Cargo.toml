@@ -230,6 +230,9 @@ iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
 iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
 iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
+# Non-blocking local-filesystem Iceberg storage for Scribe staged-run reads;
+# already in the graph through the managed compaction core.
+iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f", default-features = false, features = ["opendal-fs"] }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 59 line as the workspace, so embedding it adds no second native

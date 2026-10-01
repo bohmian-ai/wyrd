@@ -1310,10 +1310,10 @@
           ]
         },
         {
-          "description": "Runtime row tenant mismatch.",
+          "description": "A scanned file's footer tenant is missing or foreign.",
           "type": "string",
           "enum": [
-            "tenant_row"
+            "tenant_file"
           ]
         },
         {

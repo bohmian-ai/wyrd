@@ -199,6 +199,7 @@ impl ForgeManagedRewrite {
             self.attempt_id.to_string(),
             &bloom_columns,
             self.core.config.max_concurrent_reads,
+            self.binding.tenant,
         )?;
         let compaction = NonCommittingCompaction::new(
             Arc::clone(&self.core.catalog) as Arc<dyn Catalog>,
@@ -285,6 +286,7 @@ impl ForgeManagedRewrite {
             self.attempt_id.to_string(),
             &bloom_columns,
             self.core.config.max_concurrent_reads,
+            self.binding.tenant,
         )?;
         let compaction = NonCommittingCompaction::new(
             Arc::clone(&self.core.catalog) as Arc<dyn Catalog>,
@@ -530,7 +532,12 @@ mod tests {
 
         // The shipped configuration must not carry a plan cap at all.
         let config = policy
-            .to_core_config("attempt".to_owned(), &[], 2)
+            .to_core_config(
+                "attempt".to_owned(),
+                &[],
+                2,
+                wyrd_spec::DataTenantId::new_v7(),
+            )
             .expect("the shipped core configuration builds");
         let CompactionPlanningConfig::WyrdIdentityAware(planning) = &config.planning else {
             panic!("Forge plans through the identity-aware policy");

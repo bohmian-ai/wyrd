@@ -1,7 +1,14 @@
 //! Shutdown ownership: what a pod publishes before it stops and what it keeps.
 
+use std::time::Duration;
+
 use uuid::Uuid;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::geometry::{
+    DEFAULT_GENERATION_ROTATION_BYTES, DEFAULT_SHARD_COUNT, DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
+    DEFAULT_WAL_SEGMENT_BYTES, ScribeGeometry,
+};
+use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use super::support::{
@@ -9,14 +16,97 @@ use super::support::{
     tenant_client, unique_table,
 };
 
-/// A stopping pod either publishes its acknowledged rows or retains them.
+/// Retention the idle-publication case configures.
 ///
-/// Acknowledged rows outlive the process that accepted them, and there are
-/// exactly two honest ways for that to be true. A pod told to stop drains: it
-/// sweeps every staged member it is still holding into published objects, so
-/// nothing is left for the next process to rediscover. A pod that is killed
-/// cannot drain, so the WAL it already fsynced stays authoritative and its
-/// replacement replays it. This owner drives both against one table and holds
+/// The value an operator sets with `WYRD_MAX_FILE_RETENTION_TIME`; it bounds
+/// both how long a generation stays writable and how long a staged member
+/// waits for its object target, so a short value keeps the case fast without
+/// touching any size threshold.
+const RETENTION: Duration = Duration::from_secs(2);
+
+/// Longest the idle-publication case waits for the pod to publish on its own.
+///
+/// Two retention periods (seal, then staging dwell) plus the one-second
+/// lifecycle tick, with headroom for the publication itself.
+const IDLE_PUBLICATION_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Rows a table stops receiving writes with still publish on the pod's own clock.
+///
+/// Every other production control stays at its default, so the 512 MiB object
+/// target is never reached: the only way these rows publish is the pod's
+/// lifecycle tick expiring the generation's age and then the staged member's
+/// dwell. No flush, snapshot refresh, drain, or further write is issued; the
+/// case only waits and observes, exactly as an application that wrote once and
+/// went quiet would. The audit publisher is kept off because it is the one
+/// other writer in the pod, and its generations would publish the table
+/// without the tick.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, when an append or read fails, or when
+/// the acknowledged rows are not published exactly once within
+/// [`IDLE_PUBLICATION_DEADLINE`].
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_publishes_idle_rows_on_its_own_clock() {
+    let geometry = ScribeGeometry::new(
+        DEFAULT_SHARD_COUNT,
+        DEFAULT_WAL_SEGMENT_BYTES,
+        DEFAULT_GENERATION_ROTATION_BYTES,
+        RETENTION,
+        None,
+        None,
+        DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
+    )
+    .expect("default geometry with a short retention is valid");
+    // The audit publisher writes its own table into the same Scribe, and each
+    // of its durable generations re-checks every key's dwell. With it running
+    // this case would pass on audit traffic alone; without it, the lifecycle
+    // tick is the only thing that can publish the idle table.
+    let server = WyrdTestServer::builder()
+        .with_scribe_geometry_for_test(geometry)
+        .without_audit_publication_for_test()
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts");
+    let tenant = server.data_tenant_id();
+    let name = unique_table("idle_publication");
+    let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
+    let client = tenant_client(&server, tenant).await;
+    let expected: Vec<i64> = (0..64).collect();
+    append_values(&client, &table, Uuid::now_v7(), &expected)
+        .await
+        .expect("the append is acknowledged");
+
+    let deadline = tokio::time::Instant::now() + IDLE_PUBLICATION_DEADLINE;
+    while published_rows(&server, tenant, &name).await < expected.len() as u64 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rows of an idle table were not published within {IDLE_PUBLICATION_DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        published_rows(&server, tenant, &name).await,
+        expected.len() as u64,
+        "idle publication must publish every acknowledged row exactly once"
+    );
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        expected,
+        "publication may not change which rows are readable"
+    );
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// A stopping pod retains its acknowledged rows for the next process.
+///
+/// Acknowledged rows outlive the process that accepted them. A pod told to
+/// stop drains admitted work and leaves its staged members durable; the
+/// restarted process restores them and the publish tick publishes them later.
+/// A pod that is killed cannot drain, so the WAL it already fsynced stays
+/// authoritative and its replacement replays it. This owner drives both against one table and holds
 /// the same invariant across them — a strict public read returns exactly the
 /// acknowledged rows, once each — because a pod that loses rows on the way down
 /// and a pod that resurrects them on the way up are the same defect seen from
@@ -29,8 +119,8 @@ use super::support::{
 /// # Panics
 ///
 /// Panics when the cluster cannot start, stop, or restart a pod, when a public
-/// append or read fails, or when a shutdown loses, duplicates, or fails to
-/// publish an acknowledged row.
+/// append or read fails, or when a shutdown loses or duplicates an acknowledged
+/// row or publishes part of a claim.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_shutdown_drains_or_preserves_replay() {
@@ -55,7 +145,7 @@ async fn scribe_shutdown_drains_or_preserves_replay() {
             .expect("the first append is acknowledged");
     }
 
-    // A pod told to stop owes its staged rows a publication.
+    // A pod told to stop keeps its staged rows durable for the restart.
     cluster
         .stop_node(node)
         .await
@@ -67,10 +157,9 @@ async fn scribe_shutdown_drains_or_preserves_replay() {
     let preserved: Vec<i64> = (100..124).collect();
     {
         let server = cluster.server(0).expect("the restarted pod is running");
-        // A stopping pod either drains its staged rows into published objects
-        // or leaves all of them for replay, and which one happens depends on
-        // whether the bounded drain outlives the work. What it may never do is
-        // publish part of a claim, so that is what this holds.
+        // After restart the staged rows are either still staged or already
+        // published by the tick, depending on timing. What may never happen is
+        // publishing part of a claim, so that is what this holds.
         let published = published_rows(server, tenant, &name).await;
         assert!(
             published == 0 || published == drained.len() as u64,

@@ -863,9 +863,7 @@ impl Memtable {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the requested range is inverted,
-    /// [`ScribeError::IngestBusy`] before projection when the batch or
-    /// retained-byte ceiling is exhausted, or an internal error when locks,
-    /// checked arithmetic, column selection, or Arrow projection fail.
+    /// or when locks, column selection, or Arrow projection fail.
     pub(crate) fn readable_batches_for_range(
         &self,
         tenant: DataTenantId,
@@ -873,7 +871,6 @@ impl Memtable {
         start_partition: crate::catalog::layout::TimePartition,
         end_partition: crate::catalog::layout::TimePartition,
         required_columns: &[String],
-        limits: ReadableBatchLimits,
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         if start_partition > end_partition {
             return Err(ScribeError::Internal {
@@ -885,7 +882,6 @@ impl Memtable {
             table,
             Some(&(start_partition..=end_partition)),
             required_columns,
-            limits,
         )
     }
 
@@ -899,16 +895,14 @@ impl Memtable {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::IngestBusy`] before projection when the batch or
-    /// retained-byte ceiling is exhausted, or an internal error when locks,
-    /// checked arithmetic, column selection, or Arrow projection fail.
+    /// Returns an internal error when locks, column selection, or Arrow
+    /// projection fail.
     fn collect_readable_batches(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
         partitions: Option<&std::ops::RangeInclusive<crate::catalog::layout::TimePartition>>,
         required_columns: &[String],
-        limits: ReadableBatchLimits,
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let selects = |seal_key: &SealKey| {
             seal_key.tenant == tenant
@@ -921,8 +915,7 @@ impl Memtable {
         let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
-        let mut batches =
-            ReadableBatchCollector::new(limits.max_batches, limits.max_retained_bytes);
+        let mut batches = Vec::new();
 
         for (seal_key, bucket) in writable.iter() {
             if selects(seal_key) {
@@ -949,7 +942,7 @@ impl Memtable {
                 }
             }
         }
-        Ok(batches.finish())
+        Ok(batches)
     }
 
     /// Captures one atomic active-plus-immutable provider cut.
@@ -973,8 +966,8 @@ impl Memtable {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when the requested range, owner locks, capacity
-    /// bounds, checked arithmetic, or Arrow projection is invalid.
+    /// Returns [`ScribeError`] when the requested range, owner locks, or Arrow
+    /// projection is invalid.
     pub(crate) fn readable_batches_for_provider_cut(
         &self,
         tenant: DataTenantId,
@@ -987,7 +980,6 @@ impl Memtable {
             cut.start_partition,
             cut.end_partition,
             cut.required_columns,
-            cut.limits,
         )?;
         Ok(batches)
     }
@@ -1000,17 +992,7 @@ impl Memtable {
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
-        let stats = self.stats()?;
-        self.collect_readable_batches(
-            tenant,
-            table,
-            None,
-            &[],
-            ReadableBatchLimits {
-                max_batches: stats.writable_rows.saturating_add(stats.immutable_rows),
-                max_retained_bytes: stats.writable_bytes.saturating_add(stats.immutable_bytes),
-            },
-        )
+        self.collect_readable_batches(tenant, table, None, &[])
     }
 
     /// Mark a prepared generation durable after its staged member is published.
@@ -1434,15 +1416,15 @@ impl MemtableBucket {
         }
     }
 
-    /// Appends this active bucket through the bounded shallow collector.
+    /// Appends this active bucket's shallow projected batches to `output`.
     ///
     /// # Errors
     ///
-    /// Returns the collector capacity or Arrow projection error unchanged.
+    /// Returns the column-selection or Arrow projection error unchanged.
     fn append_readable_batches(
         &self,
         required_columns: &[String],
-        output: &mut ReadableBatchCollector,
+        output: &mut Vec<ReadableBatch>,
     ) -> Result<(), ScribeError> {
         let projection = projection_indices(&self.schema, required_columns)?;
         append_projected_batches(
@@ -1589,15 +1571,6 @@ pub struct ReadableBatch {
     pub generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
 }
 
-/// Immutable count and byte ceilings for one shallow live-tail snapshot.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ReadableBatchLimits {
-    /// Maximum number of projected batch descriptors returned to the caller.
-    pub(crate) max_batches: usize,
-    /// Maximum source-derived Arrow bytes retained by the returned batches.
-    pub(crate) max_retained_bytes: usize,
-}
-
 /// Manifest-pinned bounds defining one atomic hot-provider query cut.
 pub(crate) struct ProviderCut<'a> {
     /// First included event day.
@@ -1606,8 +1579,6 @@ pub(crate) struct ProviderCut<'a> {
     pub(crate) end_partition: crate::catalog::layout::TimePartition,
     /// Requested projection in caller order.
     pub(crate) required_columns: &'a [String],
-    /// Count and retained-byte bounds for the shallow snapshot.
-    pub(crate) limits: ReadableBatchLimits,
 }
 
 /// Inclusive WAL range eligible for retirement after a committed sweep.
@@ -1682,12 +1653,12 @@ impl FrozenMemtable {
     ///
     /// # Errors
     ///
-    /// Returns the collector capacity or Arrow projection error unchanged.
+    /// Returns the column-selection or Arrow projection error unchanged.
     fn append_readable_batches(
         &self,
         required_columns: &[String],
         generation: crate::scribe::hot_source::GenerationOrdinal,
-        output: &mut ReadableBatchCollector,
+        output: &mut Vec<ReadableBatch>,
     ) -> Result<(), ScribeError> {
         let projection = projection_indices(&self.schema, required_columns)?;
         append_projected_batches(
@@ -1701,24 +1672,23 @@ impl FrozenMemtable {
     }
 }
 
-/// Appends shallow projected batches only after source-derived capacity checks.
+/// Appends shallow projected batches, each referencing its source columns.
+///
+/// Each batch carries `generation`, the serving immutable generation or
+/// `None` for a writable bucket.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::IngestBusy`] before projection when the configured
-/// batch or retained-byte ceiling would be exceeded, or an internal error when
-/// byte arithmetic or Arrow projection fails. Each batch carries `generation`,
-/// the serving immutable generation or `None` for a writable bucket.
+/// Returns an internal error when Arrow projection fails.
 fn append_projected_batches(
     batches: &[RecordBatch],
     metas: &[ScribeAppendMeta],
     partition_day: crate::catalog::layout::TimePartition,
     generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
     projection: &[usize],
-    output: &mut ReadableBatchCollector,
+    output: &mut Vec<ReadableBatch>,
 ) -> Result<(), ScribeError> {
     for (batch, meta) in batches.iter().zip(metas) {
-        output.preflight(batch.get_array_memory_size())?;
         let batch = batch
             .project(projection)
             .map_err(|error| ScribeError::Internal {
@@ -1732,69 +1702,6 @@ fn append_projected_batches(
         });
     }
     Ok(())
-}
-
-/// Owns one exact-capacity shallow live-tail snapshot under configured bounds.
-struct ReadableBatchCollector {
-    /// Maximum number of shallow batches accepted by this snapshot.
-    max_batches: usize,
-    /// Maximum source-derived Arrow bytes retained by this snapshot.
-    max_retained_bytes: usize,
-    /// Source-derived bytes accepted so far.
-    retained_bytes: usize,
-    /// Exact-capacity result backing filled only after each preflight.
-    output: Vec<ReadableBatch>,
-}
-
-impl ReadableBatchCollector {
-    /// Creates an empty collector with its complete batch descriptor capacity.
-    fn new(max_batches: usize, max_retained_bytes: usize) -> Self {
-        Self {
-            max_batches,
-            max_retained_bytes,
-            retained_bytes: 0,
-            output: Vec::with_capacity(max_batches),
-        }
-    }
-
-    /// Refuses a candidate before Arrow projection when either ceiling is exhausted.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::IngestBusy`] when the candidate exceeds a
-    /// configured ceiling, or [`ScribeError::Internal`] when byte arithmetic
-    /// overflows.
-    fn preflight(&mut self, source_bytes: usize) -> Result<(), ScribeError> {
-        if self.output.len() == self.max_batches {
-            return Err(ScribeError::IngestBusy {
-                table: "live-tail snapshot".to_owned(),
-            });
-        }
-        let next_bytes = self
-            .retained_bytes
-            .checked_add(source_bytes)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "live-tail retained byte count overflow".to_owned(),
-            })?;
-        if next_bytes > self.max_retained_bytes {
-            return Err(ScribeError::IngestBusy {
-                table: "live-tail snapshot".to_owned(),
-            });
-        }
-        self.retained_bytes = next_bytes;
-        Ok(())
-    }
-
-    /// Appends one post-preflight shallow projection without growing capacity.
-    fn push(&mut self, batch: ReadableBatch) {
-        debug_assert!(self.output.len() < self.output.capacity());
-        self.output.push(batch);
-    }
-
-    /// Consumes the collector and returns its bounded shallow snapshot.
-    fn finish(self) -> Vec<ReadableBatch> {
-        self.output
-    }
 }
 
 /// Resolve and validate the bounded projection requested by Oracle.
@@ -1998,10 +1905,6 @@ mod tests {
         memtable
             .insert(&key, make_test_meta(31), make_test_batch(1))
             .expect("active insert");
-        let limits = ReadableBatchLimits {
-            max_batches: 8,
-            max_retained_bytes: usize::MAX,
-        };
         let cut = |memtable: &Memtable| {
             memtable
                 .readable_batches_for_provider_cut(
@@ -2011,7 +1914,6 @@ mod tests {
                         start_partition: key.partition,
                         end_partition: key.partition,
                         required_columns: &[],
-                        limits,
                     },
                 )
                 .expect("provider cut")
@@ -2152,64 +2054,6 @@ mod tests {
             vec![WalLsn::new(20)],
             "a staged generation is served by its staged member, not by the retained Arrow copy"
         );
-    }
-
-    /// Live-tail snapshots refuse count and byte overflow before projection growth.
-    #[test]
-    fn live_tail_snapshot_enforces_preallocated_count_and_byte_bounds() {
-        let memtable = Memtable::new();
-        let seal_key = make_test_seal_key();
-        for lsn in [10, 20] {
-            memtable
-                .insert(&seal_key, make_test_meta(lsn), make_test_batch(1))
-                .expect("bounded fixture insert");
-        }
-        let tenant = crate::test_support::tenant();
-        let rows = memtable
-            .readable_batches_for_range(
-                tenant,
-                &seal_key.table,
-                seal_key.partition,
-                seal_key.partition,
-                &[],
-                ReadableBatchLimits {
-                    max_batches: 2,
-                    max_retained_bytes: usize::MAX,
-                },
-            )
-            .expect("exact batch ceiling");
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows.capacity(), 2);
-
-        assert!(matches!(
-            memtable.readable_batches_for_range(
-                tenant,
-                &seal_key.table,
-                seal_key.partition,
-                seal_key.partition,
-                &[],
-                ReadableBatchLimits {
-                    max_batches: 1,
-                    max_retained_bytes: usize::MAX,
-                },
-            ),
-            Err(ScribeError::IngestBusy { .. })
-        ));
-        let first_bytes = rows[0].batch.get_array_memory_size();
-        assert!(matches!(
-            memtable.readable_batches_for_range(
-                tenant,
-                &seal_key.table,
-                seal_key.partition,
-                seal_key.partition,
-                &[],
-                ReadableBatchLimits {
-                    max_batches: 2,
-                    max_retained_bytes: first_bytes.saturating_sub(1),
-                },
-            ),
-            Err(ScribeError::IngestBusy { .. })
-        ));
     }
 
     /// Verifies that a committed generation retires on the first sweep after commit,

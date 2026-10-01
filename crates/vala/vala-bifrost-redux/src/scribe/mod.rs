@@ -27,7 +27,6 @@ pub mod replay;
 pub mod routing;
 pub mod seal_key;
 pub mod shards;
-pub(crate) mod staged_tail;
 pub(crate) mod staging;
 pub mod staging_runtime;
 pub mod stream_identity;
@@ -594,21 +593,19 @@ pub struct ScribeEmbeddedConfig {
 }
 
 impl ScribeEmbeddedConfig {
-    /// Derives the geometry an embedded Scribe runs under.
+    /// Derives the default geometry an embedded Scribe runs under.
     ///
     /// The WAL segment target is read back from the already-constructed writer
     /// rather than re-declared, so an embedded Scribe can never rotate its
-    /// shards against a segment size the writer does not actually use.
+    /// shards against a segment size the writer does not actually use. Test
+    /// builds let `geometry_for_test` replace the result at the
+    /// embedded constructors.
     ///
     /// # Panics
     ///
     /// Panics when the embedded default rotation targets are not a coherent
     /// geometry, which is a construction invariant rather than an input.
-    fn geometry(&self, wal: &wal::WalWriter) -> geometry::ScribeGeometry {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(geometry) = self.geometry_for_test {
-            return geometry;
-        }
+    fn default_geometry(wal: &wal::WalWriter) -> geometry::ScribeGeometry {
         geometry::ScribeGeometry::for_uniform_shard_rotation(
             wal.segment_bytes(),
             memtable::MEMTABLE_ROTATION_BYTES,
@@ -858,7 +855,9 @@ impl ScribeImpl {
         sync_delay: std::time::Duration,
         config: ScribeEmbeddedConfig,
     ) -> Result<Self, String> {
-        let geometry = config.geometry(&wal);
+        let geometry = ScribeEmbeddedConfig::default_geometry(&wal);
+        #[cfg(any(test, feature = "test-support"))]
+        let geometry = config.geometry_for_test.unwrap_or(geometry);
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(
                 config.lane_config.ingress_cpu_threads,
@@ -999,7 +998,9 @@ impl ScribeImpl {
         writer_epoch: i64,
         config: ScribeEmbeddedConfig,
     ) -> Self {
-        let geometry = config.geometry(&wal);
+        let geometry = ScribeEmbeddedConfig::default_geometry(&wal);
+        #[cfg(any(test, feature = "test-support"))]
+        let geometry = config.geometry_for_test.unwrap_or(geometry);
         let stream = stream_identity::StreamIdentity::new(
             stream_identity::NodeId::new(
                 uuid::Uuid::parse_str(node_id).expect("embedded Scribe node_id must be a UUID"),
@@ -1364,13 +1365,9 @@ impl ScribeImpl {
         if graceful && let Some(persistence) = &self.persistence {
             graceful = await_shutdown_phase(deadline, persistence.drain()).await;
         }
-        // Every accepted generation is now durable on the staging volume, but a
-        // key that never reached its object target would sit there waiting for
-        // a dwell this process will not outlive. Publish that residue while the
-        // CPU, WAL, and object lanes are still open.
-        if graceful {
-            graceful = Box::pin(self.publish_staged_residue(deadline)).await;
-        }
+        // Every accepted generation is now durable on the staging volume. Staged
+        // members below their object target stay staged: startup restores them
+        // and the publish tick settles them, so shutdown re-encodes nothing.
         self.close_lanes();
         if graceful {
             graceful = await_shutdown_phase(deadline, self.shards.shutdown(deadline)).await;
@@ -1466,33 +1463,23 @@ impl ScribeImpl {
         self.shutdown_notify.notify_waiters();
     }
 
-    /// Publishes the staged members graceful drain would otherwise strand.
+    /// Publishes every staged claim whose target or dwell has made it due.
     ///
-    /// Runs after the persistence queue is empty, so every accepted generation
-    /// is already durable and the only members left are the ones target and
-    /// dwell were still holding. Returns whether the sweep completed within the
-    /// deadline; a pod without staging publishes nothing and succeeds. A member
-    /// that fails to publish stays durable and staged, so reporting the failure
-    /// downgrades shutdown to non-graceful rather than losing rows.
-    async fn publish_staged_residue(&self, deadline: std::time::Instant) -> bool {
-        let Some(persistence) = &self.persistence else {
-            return true;
-        };
-        match timed_shutdown_phase(
-            deadline,
-            Box::pin(persistence.publish_residue(crate::scribe::assembly::ClaimCause::Drain)),
-        )
-        .await
-        {
-            Some(Ok(published)) => {
-                tracing::info!(published, "Scribe drain published its staged residue");
-                true
-            }
-            Some(Err(error)) => {
-                tracing::warn!(%error, "Scribe drain left staged members unpublished");
-                false
-            }
-            None => false,
+    /// The server's lifecycle scanner calls this once per tick, after
+    /// [`Self::check_age`], so a staged key whose writes stopped still
+    /// publishes once its dwell expires instead of waiting for another durable
+    /// generation or for shutdown. Returns the number of claims published; a
+    /// Scribe without persistence or staging publishes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a due claim cannot be published. Its
+    /// members stay durable and staged, and the WAL stays authoritative for
+    /// their rows, so the next tick retries.
+    pub async fn publish_due(&self) -> Result<usize, ScribeError> {
+        match &self.persistence {
+            Some(persistence) => persistence.publish_due().await,
+            None => Ok(0),
         }
     }
 

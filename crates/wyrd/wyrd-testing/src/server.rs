@@ -521,24 +521,32 @@ impl TestBifrostPeerTls {
 
     /// Loads this identity into the production outbound peer TLS owner.
     ///
+    /// The bundle is read by the production peer configuration loader over
+    /// [`Self::dir`], so an incomplete or unreadable bundle fails composition
+    /// exactly as it fails a deployed `wyrd-server` start.
+    ///
     /// # Errors
     ///
-    /// Returns [`WyrdTestServerError::Start`] when a PEM file is unreadable or
-    /// the private key is not PEM text.
+    /// Returns [`WyrdTestServerError::Start`] when the production loader
+    /// refuses the bundle: `ca.crt`, `tls.crt`, or `tls.key` is unreadable,
+    /// or the key is not PEM text.
     pub fn bifrost_peer_tls(
         &self,
     ) -> Result<vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls, WyrdTestServerError> {
-        let read = |path: &std::path::Path| {
-            std::fs::read(path).map_err(|error| WyrdTestServerError::Start(error.to_string()))
-        };
-        let key = String::from_utf8(read(&self.private_key_path)?).map_err(|error| {
-            WyrdTestServerError::Start(format!("peer private key is not PEM text: {error}"))
+        let bundle = wyrd_server::config::BifrostPeerConfig {
+            tls_dir: Some(self.dir.clone()),
+            ..wyrd_server::config::BifrostPeerConfig::default()
+        }
+        .read_bundle()
+        .map_err(WyrdTestServerError::Start)?
+        .ok_or_else(|| {
+            WyrdTestServerError::Start("peer TLS directory enables no peer bundle".to_owned())
         })?;
         Ok(vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls::new(
-            read(&self.ca_path)?,
+            bundle.ca_certificate,
             self.server_name.clone(),
-            read(&self.certificate_path)?,
-            SecretString::from(key),
+            bundle.certificate_chain,
+            bundle.private_key,
         ))
     }
 }
@@ -3977,11 +3985,11 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Mount a caller-owned durable Bifrost data root that outlives the process.
+    /// Mount a caller-owned durable Bifrost data root that outlives the server.
     ///
-    /// A simulated pod in a multi-process cluster is restarted by launching a
-    /// new child over the same directory, which is what makes a Scribe's
-    /// volume-coupled identity observable across restart.
+    /// A pod restarted on its own volume is a new server composed over the
+    /// same directory, which is what makes a Scribe's volume-coupled identity
+    /// observable across restart.
     #[must_use]
     pub fn with_durable_bifrost_data_root(mut self, data_root: std::path::PathBuf) -> Self {
         self.bifrost_data_path = Some(data_root);
@@ -4069,9 +4077,9 @@ impl WyrdTestServerBuilder {
 
     /// Pin the exact private peer address this server binds and advertises.
     ///
-    /// A multi-process harness gives each simulated pod a distinct loopback
-    /// address on the canonical peer port so membership records one exact
-    /// pod-like endpoint rather than a load-balanced one.
+    /// A cluster pins it per node so a restarted node comes back at the
+    /// address membership already published for it, as a pod restarted on its
+    /// own network identity does.
     #[must_use]
     pub fn with_peer_bind(mut self, bind: std::net::SocketAddr) -> Self {
         self.peer_bind = Some(bind);
@@ -4840,8 +4848,7 @@ fn claim_port(port: u16) -> Result<bool, WyrdTestServerError> {
 /// staging backend that cannot resume a bounded orphan scan. A Local fixture
 /// stands in for a production object store, so it declares the support it
 /// actually has; every other backend is opened unchanged, and a caller wanting
-/// the incapable backend supplies its own plain storage handle instead. Both
-/// the in-process server and every process-cluster child open storage here.
+/// the incapable backend supplies its own plain storage handle instead.
 ///
 /// # Errors
 ///
@@ -4930,85 +4937,6 @@ async fn grant_role(
                 .map_err(sql)
         }
     }
-}
-
-/// Seeds one tenant-scoped Service principal directly against a fixture.
-///
-/// The multi-process harness has no in-process `WyrdTestServer` to bootstrap
-/// through, but a peer-network journey still has to drive a real public query
-/// against a child's public listener. This is the fixture-level equivalent of
-/// [`WyrdTestServer::bootstrap_service_in_tenant`]: it seeds the tenant's
-/// built-in roles, ensures the fixture admin exists, and returns the new
-/// principal's API key.
-///
-/// # Errors
-///
-/// Returns an error when role seeding, principal or key persistence, hashing,
-/// or the role grant fails.
-pub(crate) async fn provision_tenant_service_principal(
-    fixture: &PgFixture,
-    tenant_id: DataTenantId,
-    name: &str,
-    roles: &[&str],
-) -> Result<SecretString, WyrdTestServerError> {
-    let creator_id = fixture_admin_id(tenant_id);
-    let principal_id = Uuid::now_v7();
-    let service_ref = card_ref(CardKind::Service, name)?;
-    let api_key = WyrdApiKey::generate(tenant_id);
-    let raw = api_key.secret.clone();
-    let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-        .await
-        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
-        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
-    let mut conn = fixture.tenant_conn_for(tenant_id).await.map_err(sql)?;
-    seed_builtin_roles_for_tenant(&mut conn, tenant_id)
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    let email = format!("fixture-admin-{}@test.wyrd", creator_id.simple());
-    insert_user(&mut conn, creator_id, Some(&email), "password", None)
-        .await
-        .or_else(|error| {
-            if is_unique_violation(&error) {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-        .map_err(sql)?;
-    seed_machine_card(&mut conn, &service_ref, creator_id).await?;
-    insert_service_account(
-        &mut conn,
-        principal_id,
-        "service",
-        Some(&service_ref),
-        name,
-        None,
-        creator_id,
-    )
-    .await
-    .map_err(sql)?;
-    insert_api_key(
-        &mut conn,
-        Uuid::now_v7(),
-        principal_id,
-        &api_key.prefix,
-        &key_hash,
-        creator_id,
-        Some(std::time::Duration::from_secs(24 * 60 * 60)),
-    )
-    .await
-    .map_err(sql)?;
-    for role in roles {
-        grant_role(
-            &mut conn,
-            principal_id,
-            PrincipalTable::ServiceAccount,
-            role,
-        )
-        .await?;
-    }
-    conn.commit().await.map_err(sql)?;
-    Ok(api_key.secret)
 }
 
 async fn lookup_role_id(

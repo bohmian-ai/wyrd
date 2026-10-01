@@ -21,8 +21,6 @@ use sha2::{Digest as _, Sha256};
 pub const ORACLE_PHYSICAL_CODEC_VERSION: u32 = 1;
 /// Only extension type accepted by the Oracle follower.
 pub const ORACLE_REMOTE_SCAN_TAG: &str = "wyrd.oracle.remote_scan";
-/// Extension type for the authenticated tenant tripwire surrounding follower sources.
-pub const ORACLE_TENANT_TRIPWIRE_TAG: &str = "wyrd.oracle.tenant_tripwire";
 
 /// Fingerprints the exact versioned physical-plan bytes shared by all followers.
 #[must_use]
@@ -101,33 +99,6 @@ pub(crate) struct RemoteScanPayload {
     /// Output partitions the placeholder advertises. Zero is normalized to one.
     #[prost(uint32, tag = "5")]
     pub(crate) partitions: u32,
-}
-
-/// Serialized authenticated tripwire facts; its input remains a native extension child.
-#[derive(Clone, PartialEq, Message)]
-struct TenantTripwirePayload {
-    /// JSON-encoded internal authenticated query context.
-    #[prost(bytes, tag = "1")]
-    context_json: Vec<u8>,
-    /// Canonical tenant-free table label used by security audit.
-    #[prost(string, tag = "2")]
-    table: String,
-}
-
-/// IO-free description of one supported physical extension.
-pub(crate) enum PreflightExtension {
-    /// One authenticated role-local source placeholder.
-    RemoteScan(RemoteScanPayload),
-    /// One tenant tripwire whose child remains in the native plan tree.
-    TenantTripwire {
-        /// Authenticated query facts encoded by the leader.
-        ///
-        /// Boxed because this context dwarfs every sibling variant; keeping it
-        /// inline would make each `PreflightExtension` pay its full size.
-        context: Box<super::AuthorizedQueryContext>,
-        /// Canonical table label used by security audit.
-        table: String,
-    },
 }
 
 /// The one pinned source occurrence a placeholder was planned against.
@@ -512,8 +483,6 @@ impl ExecutionPlan for RemoteSourcePlaceholderExec {
 pub struct OraclePhysicalExtensionCodec {
     /// Complete role-local provider registry, consumed once per scan.
     providers: Mutex<HashMap<String, Arc<dyn ExecutionPlan>>>,
-    /// Exact follower audit owner used only when decoding a tenant tripwire.
-    audit: Option<Arc<dyn super::OracleAudit>>,
     /// Analytical leaf binding, present only on an Analytical follower session.
     ///
     /// Interactive followers resolve every provider before decode and register
@@ -539,8 +508,6 @@ pub struct AnalyticalLeafBinding {
     role: wyrd_spec::vala::api::ClusterRole,
     /// Process resolver that turns a signed assignment into a local provider.
     resolver: Arc<dyn super::follower::FollowerSourceResolver>,
-    /// Audit owner the tenant tripwire above each source fails closed against.
-    audit: Arc<dyn super::OracleAudit>,
     /// This node's reader epoch, which every decoded leaf protects under.
     ///
     /// `None` only on a node that runs no Oracle epoch, where a decoded leaf
@@ -562,13 +529,11 @@ impl AnalyticalLeafBinding {
     pub fn new(
         role: wyrd_spec::vala::api::ClusterRole,
         resolver: Arc<dyn super::follower::FollowerSourceResolver>,
-        audit: Arc<dyn super::OracleAudit>,
         reader_authority: Option<Arc<super::reader_pins::OracleReaderAuthority>>,
     ) -> Self {
         Self {
             role,
             resolver,
-            audit,
             reader_authority,
             guard_sink: None,
         }
@@ -603,11 +568,11 @@ impl fmt::Debug for AnalyticalLeafBinding {
 }
 
 impl std::fmt::Debug for OraclePhysicalExtensionCodec {
-    /// Redacts providers and audit internals while preserving codec shape.
+    /// Redacts provider internals while preserving codec shape.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OraclePhysicalExtensionCodec")
-            .field("audit", &self.audit.is_some())
+            .field("analytical", &self.analytical.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -617,7 +582,6 @@ impl Default for OraclePhysicalExtensionCodec {
     fn default() -> Self {
         Self {
             providers: Mutex::new(HashMap::new()),
-            audit: None,
             analytical: None,
             bindings: None,
         }
@@ -636,7 +600,6 @@ impl OraclePhysicalExtensionCodec {
     pub fn decoder(providers: HashMap<String, Arc<dyn ExecutionPlan>>) -> Self {
         Self {
             providers: Mutex::new(providers),
-            audit: None,
             analytical: None,
             bindings: None,
         }
@@ -651,7 +614,6 @@ impl OraclePhysicalExtensionCodec {
     pub fn analytical(binding: AnalyticalLeafBinding) -> Self {
         Self {
             providers: Mutex::new(HashMap::new()),
-            audit: Some(Arc::clone(&binding.audit)),
             analytical: Some(binding),
             bindings: None,
         }
@@ -670,20 +632,6 @@ impl OraclePhysicalExtensionCodec {
     ) -> Self {
         self.bindings = Some(bindings);
         self
-    }
-
-    /// Creates a decoding codec with exact providers and follower security audit ownership.
-    #[must_use]
-    pub fn decoder_with_audit(
-        providers: HashMap<String, Arc<dyn ExecutionPlan>>,
-        audit: Arc<dyn super::OracleAudit>,
-    ) -> Self {
-        Self {
-            providers: Mutex::new(providers),
-            audit: Some(audit),
-            analytical: None,
-            bindings: None,
-        }
     }
 
     /// Requires the native decoder to consume every authenticated provider exactly once.
@@ -743,35 +691,19 @@ impl OraclePhysicalExtensionCodec {
             .map_err(|error| DataFusionError::Plan(format!("invalid remote scan payload: {error}")))
     }
 
-    /// Decodes one supported extension for the follower's IO-free preflight.
+    /// Decodes the one supported extension, a remote scan, for the follower's
+    /// IO-free preflight.
     ///
     /// # Errors
-    /// Returns a plan error when the envelope, payload, or tripwire context is invalid.
-    pub(crate) fn preflight_extension(bytes: &[u8]) -> Result<PreflightExtension> {
+    /// Returns a plan error when the envelope or payload is invalid, or the
+    /// extension is not a remote scan.
+    pub(crate) fn preflight_extension(bytes: &[u8]) -> Result<RemoteScanPayload> {
         let envelope = Self::decode_envelope(bytes)?;
         match envelope.type_tag.as_str() {
             ORACLE_REMOTE_SCAN_TAG => RemoteScanPayload::decode(envelope.payload.as_slice())
-                .map(PreflightExtension::RemoteScan)
                 .map_err(|error| {
                     DataFusionError::Plan(format!("invalid remote scan payload: {error}"))
                 }),
-            ORACLE_TENANT_TRIPWIRE_TAG => {
-                let payload = TenantTripwirePayload::decode(envelope.payload.as_slice()).map_err(
-                    |error| DataFusionError::Plan(format!("invalid tripwire payload: {error}")),
-                )?;
-                let context = serde_json::from_slice(&payload.context_json).map_err(|error| {
-                    DataFusionError::Plan(format!("invalid tripwire context: {error}"))
-                })?;
-                if payload.table.trim().is_empty() {
-                    return Err(DataFusionError::Plan(
-                        "tenant tripwire table is empty".to_owned(),
-                    ));
-                }
-                Ok(PreflightExtension::TenantTripwire {
-                    context: Box::new(context),
-                    table: payload.table,
-                })
-            }
             _ => Err(DataFusionError::Plan(
                 "unsupported Oracle physical extension type".to_owned(),
             )),
@@ -944,28 +876,6 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                     partitions,
                 )))
             }
-            ORACLE_TENANT_TRIPWIRE_TAG => {
-                let [input] = inputs else {
-                    return Err(DataFusionError::Plan(
-                        "tenant tripwire extension requires one input".to_owned(),
-                    ));
-                };
-                let payload = TenantTripwirePayload::decode(envelope.payload.as_slice()).map_err(
-                    |error| DataFusionError::Plan(format!("invalid tripwire payload: {error}")),
-                )?;
-                let context = serde_json::from_slice(&payload.context_json).map_err(|error| {
-                    DataFusionError::Plan(format!("invalid tripwire context: {error}"))
-                })?;
-                let audit = self.audit.as_ref().ok_or_else(|| {
-                    DataFusionError::Plan("follower tripwire audit owner is absent".to_owned())
-                })?;
-                Ok(Arc::new(super::exec::TenantTripwireExec::new(
-                    Arc::clone(input),
-                    context,
-                    payload.table,
-                    Arc::clone(audit),
-                )?))
-            }
             _ => Err(DataFusionError::Plan(
                 "unsupported Oracle physical extension type".to_owned(),
             )),
@@ -982,33 +892,21 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
         buf: &mut Vec<u8>,
         _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> Result<()> {
-        let (type_tag, payload) = if let Some(scan) =
-            node.downcast_ref::<RemoteSourcePlaceholderExec>()
-        {
-            (
-                ORACLE_REMOTE_SCAN_TAG,
-                remote_scan_payload(scan, self.bindings.as_deref())?.encode_to_vec(),
-            )
-        } else if node.downcast_ref::<super::live::LiveScribeExec>().is_some() {
-            return Err(DataFusionError::Plan(
-                "leader-owned live Scribe source cannot cross the wire".to_owned(),
-            ));
-        } else if let Some(tripwire) = node.downcast_ref::<super::exec::TenantTripwireExec>() {
-            (
-                ORACLE_TENANT_TRIPWIRE_TAG,
-                TenantTripwirePayload {
-                    context_json: serde_json::to_vec(tripwire.context()).map_err(|error| {
-                        DataFusionError::Plan(format!("tripwire context encoding failed: {error}"))
-                    })?,
-                    table: tripwire.table().to_owned(),
-                }
-                .encode_to_vec(),
-            )
-        } else {
-            return Err(DataFusionError::Plan(
-                "unsupported Oracle physical extension".to_owned(),
-            ));
-        };
+        let (type_tag, payload) =
+            if let Some(scan) = node.downcast_ref::<RemoteSourcePlaceholderExec>() {
+                (
+                    ORACLE_REMOTE_SCAN_TAG,
+                    remote_scan_payload(scan, self.bindings.as_deref())?.encode_to_vec(),
+                )
+            } else if node.downcast_ref::<super::live::LiveScribeExec>().is_some() {
+                return Err(DataFusionError::Plan(
+                    "leader-owned live Scribe source cannot cross the wire".to_owned(),
+                ));
+            } else {
+                return Err(DataFusionError::Plan(
+                    "unsupported Oracle physical extension".to_owned(),
+                ));
+            };
         OracleExtensionEnvelope {
             codec_version: ORACLE_PHYSICAL_CODEC_VERSION,
             type_tag: type_tag.to_owned(),

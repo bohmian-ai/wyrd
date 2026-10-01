@@ -14,7 +14,7 @@
 
 use std::fs::{File, TryLockError};
 use std::io::Error as IoError;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, absolute};
 
 use vala_bifrost_redux::resources::BifrostVolumeRoots;
 
@@ -72,6 +72,11 @@ impl BifrostDataRoot {
     /// Creates every managed path below `root`, locks the root exclusively, and
     /// proves each managed directory writable.
     ///
+    /// A relative `root` is resolved against the working directory once, here,
+    /// so every derived path is absolute: staged members are later read back
+    /// through object-store readers that interpret paths without a working
+    /// directory.
+    ///
     /// Directories are created before locking so a fresh root needs no manual
     /// provisioning. Creation is idempotent; existing WAL, staged, and identity
     /// contents are never removed here. Forge spill is disposable attempt
@@ -83,11 +88,16 @@ impl BifrostDataRoot {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostDataRootError::Unusable`] when a managed directory or
-    /// the lock file cannot be created or locked, stale Forge spill cannot be
+    /// Returns [`BifrostDataRootError::Unusable`] when the working directory
+    /// cannot resolve a relative root, a managed directory or the lock file
+    /// cannot be created or locked, stale Forge spill cannot be
     /// removed, or a directory rejects the write probe, and
     /// [`BifrostDataRootError::InUse`] when another process holds the root.
     pub fn prepare(root: &Path) -> Result<Self, BifrostDataRootError> {
+        let root = &absolute(root).map_err(|source| BifrostDataRootError::Unusable {
+            path: root.to_path_buf(),
+            source,
+        })?;
         let roots = BifrostVolumeRoots {
             wal: root.to_path_buf(),
             scribe_stage: root.join("scribe-stage"),
@@ -247,6 +257,30 @@ mod tests {
                 "{}",
                 path.display()
             );
+        }
+    }
+
+    /// A relative root yields only absolute managed paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be created, preparation fails, or a
+    /// derived path is relative.
+    #[test]
+    fn prepare_resolves_a_relative_root_to_absolute_paths() {
+        let base = tempfile::tempdir_in(".").expect("relative root fixture");
+        let root = Path::new(base.path().file_name().expect("fixture has a name")).join("bifrost");
+        assert!(root.is_relative(), "{}", root.display());
+        let prepared = BifrostDataRoot::prepare(&root).expect("relative root prepares");
+        let roots = prepared.volume_roots();
+        for path in [
+            &roots.wal,
+            &roots.scribe_stage,
+            &roots.scribe_output_scratch,
+            prepared.oracle_spill(),
+            prepared.forge_spill(),
+        ] {
+            assert!(path.is_absolute(), "{}", path.display());
         }
     }
 

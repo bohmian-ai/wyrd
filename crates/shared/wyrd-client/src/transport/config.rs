@@ -138,7 +138,7 @@ impl GrpcConfig {
 /// Default base URL for [`HttpConfig`]. Matches the local-development
 /// gateway port. HTTP is the secondary path; this default mirrors
 /// [`GrpcConfig`] for parity with predecessor row D.
-pub const HTTP_DEFAULT_BASE_URL: &str = "http://localhost:50050";
+pub const HTTP_DEFAULT_BASE_URL: &str = "http://localhost:8080";
 /// Default per-request timeout (ms) for [`HttpConfig`].
 pub const HTTP_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -159,7 +159,7 @@ pub struct HttpConfig {
     /// call time.
     ///
     /// Example: `"https://wyrd-ingest.example.com"`.
-    /// Default: [`HTTP_DEFAULT_BASE_URL`] (`"http://localhost:50050"`).
+    /// Default: [`HTTP_DEFAULT_BASE_URL`] (`"http://localhost:8080"`).
     #[serde(default = "default_base_url")]
     pub base_url: String,
 
@@ -352,15 +352,15 @@ mod tests {
     #[test]
     fn cleartext_remote_flags_plaintext_non_loopback() {
         assert!(is_cleartext_remote("http://wyrd.example.com"));
-        assert!(is_cleartext_remote("http://wyrd.example.com:50050/api"));
+        assert!(is_cleartext_remote("http://wyrd.example.com:8080/api"));
         assert!(is_cleartext_remote("http://10.0.0.5:8080"));
     }
 
     #[test]
     fn cleartext_remote_exempts_https_and_loopback() {
         assert!(!is_cleartext_remote("https://wyrd.example.com"));
-        assert!(!is_cleartext_remote("http://localhost:50050"));
-        assert!(!is_cleartext_remote("http://127.0.0.1:50050"));
-        assert!(!is_cleartext_remote("http://[::1]:50050"));
+        assert!(!is_cleartext_remote("http://localhost:8080"));
+        assert!(!is_cleartext_remote("http://127.0.0.1:8080"));
+        assert!(!is_cleartext_remote("http://[::1]:8080"));
     }
 }

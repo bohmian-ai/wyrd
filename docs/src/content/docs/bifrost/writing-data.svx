@@ -77,7 +77,6 @@ If a tenant has redaction enabled (server-side policy), Scribe zeroes the sensit
 
 Gate stamps:
 
-- `data_tenant_id`: from the authenticated principal's tenant claim.
 - `wyrd_event_time`: first observation timestamp in the batch (or `wyrd_ingested_at` if absent).
 - `wyrd_batch_id`: UUIDv7 unique per batch.
 - `run_id`, `card_uid`, `principal_id`: from the row's optional `Correlation` and the authenticated principal.

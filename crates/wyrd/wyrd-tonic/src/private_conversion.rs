@@ -957,21 +957,19 @@ impl TryFrom<proto::ScribeProviderCut> for domain::ScribeProviderCut {
 
     /// Decodes the bounded Scribe provider projection.
     ///
-    /// The cut bounds partitions, writer incarnation, and retention only. It
+    /// The cut bounds partitions and writer incarnation only. It
     /// carries no published-WAL statement, because Scribe's generation
     /// authority is the exact answer to what a follower may still read from
     /// memory and a wire-carried interval would be a weaker second one.
     ///
     /// # Errors
     /// Returns a conversion error when either partition endpoint is absent or
-    /// the complete cut violates its canonical ordering or signed bounds.
+    /// the complete cut violates its canonical ordering.
     fn try_from(value: proto::ScribeProviderCut) -> Result<Self, Self::Error> {
         let cut = Self {
             writer_epoch: value.writer_epoch,
             start_partition: time_partition(value.start_partition, "start_partition")?,
             end_partition: time_partition(value.end_partition, "end_partition")?,
-            maximum_batch_count: value.maximum_batch_count,
-            maximum_retained_bytes: value.maximum_retained_bytes,
         };
         if !cut.is_valid() {
             return Err(PrivateConversionError::Invalid {
@@ -989,8 +987,6 @@ impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
             writer_epoch: value.writer_epoch,
             start_partition: Some(time_partition_proto(value.start_partition)),
             end_partition: Some(time_partition_proto(value.end_partition)),
-            maximum_batch_count: value.maximum_batch_count,
-            maximum_retained_bytes: value.maximum_retained_bytes,
         }
     }
 }
@@ -1530,8 +1526,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
-            maximum_batch_count: 16,
-            maximum_retained_bytes: 1_048_576,
         };
         assert_eq!(
             domain::ScribeProviderCut::try_from(proto::ScribeProviderCut::from(cut.clone()))

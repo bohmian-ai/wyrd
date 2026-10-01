@@ -14,7 +14,7 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 /// `vala.drift.result_features` — one row per scored feature of one Drift run.
 ///
 /// These are the per-feature details of a row in `vala.verification.results`,
-/// joined on (`data_tenant_id`, `result_id`). The binding, owner, subject,
+/// joined on `result_id` inside the tenant's own namespace. The binding, owner, subject,
 /// window, and method are repeated on every row so a cross-run query over one
 /// feature or one method never has to join back to the parent result. The
 /// managed `run_id` is the Verifier run and the managed `card_uid` is the

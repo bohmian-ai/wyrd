@@ -126,28 +126,17 @@ opentelemetry = { workspace = true, features = ["logs", "metrics"] }
 opentelemetry_sdk = { workspace = true, features = ["logs", "metrics"] }
 opentelemetry-otlp = { workspace = true, features = ["logs", "metrics"] }
 # Journey plumbing only: the Oracle MCP journey drives a real MCP client against
-# a process-cluster pod's `/mcp` endpoint, so it needs the protocol client the
+# a peer-cluster pod's `/mcp` endpoint, so it needs the protocol client the
 # way an agent would use it. No `wyrd-testing` library code speaks MCP.
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
 
-# One test-support binary, not a test target. Registering it is what makes
-# Cargo hand `CARGO_BIN_EXE_bifrost_peer_test_node` to the Oracle integration
-# test, which is how `BifrostProcessCluster` launches each simulated pod as a
-# real child process instead of shelling out to Cargo.
-[[bin]]
-name = "bifrost_peer_test_node"
-path = "src/bin/bifrost_peer_test_node.rs"
-test = false
-bench = false
-
 # The opt-in single-pod query capacity benchmark. Run only through
-# `mise run bench:bifrost:query-capacity`; it is part of no test, gate, or
-# verify lane.
+# `mise run bench:bifrost:query-capacity`; only its unit tests run in a lane,
+# with the crate's other tests.
 [[bin]]
 name = "bifrost_query_capacity"
-path = "src/bin/bifrost_query_capacity.rs"
-test = false
+path = "src/bin/bifrost_query_capacity/main.rs"
 bench = false

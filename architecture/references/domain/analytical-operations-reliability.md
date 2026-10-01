@@ -39,8 +39,10 @@ while an admitted competitor waits.
 Scribe preserves acknowledged authority under downstream pressure. It rejects
 new work with a typed retryable response before WAL, stage, scratch, or object
 storage exhausts. Shutdown closes admission, rotates active work, stages
-immutable members, closes residue claims, and drains admitted publication up
-to one absolute deadline; unsettled work retains exact replay evidence.
+immutable members, and drains admitted publication up to one absolute
+deadline; unsettled work retains exact replay evidence. Staged members below
+their target stay staged; startup restores them and the publish tick
+publishes them.
 
 Oracle derives Interactive or Analytical from the one physical root returned by
 the pinned planner, then admits their slots separately under one atomic total

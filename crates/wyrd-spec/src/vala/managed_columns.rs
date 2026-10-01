@@ -6,8 +6,6 @@ pub const WYRD_INGESTED_AT: &str = "wyrd_ingested_at";
 pub const WYRD_BATCH_ID: &str = "wyrd_batch_id";
 /// Arrow column name for the server-minted request correlation id.
 pub const WYRD_REQUEST_ID: &str = "wyrd_request_id";
-/// Arrow column name for the tenant isolation key on every physical table.
-pub const DATA_TENANT_ID: &str = "data_tenant_id";
 
 /// Ordered list of column names reserved for server-managed storage.
 pub const RESERVED_MANAGED_COLUMNS: &[&str] = &[
@@ -15,7 +13,6 @@ pub const RESERVED_MANAGED_COLUMNS: &[&str] = &[
     WYRD_INGESTED_AT,
     WYRD_BATCH_ID,
     WYRD_REQUEST_ID,
-    DATA_TENANT_ID,
 ];
 
 /// Arrow column name for the client-supplied run correlation id.

@@ -288,6 +288,7 @@ impl Forge {
                 readiness.publish(!outcome.standby && !outcome.incomplete);
                 if outcome.standby {
                     tracing::debug!(triggered, "Forge scheduler remains on standby");
+                    #[cfg(feature = "test-support")]
                     self.record_completed_pass();
                     return true;
                 }
@@ -308,6 +309,7 @@ impl Forge {
                 readiness.publish(false);
             }
         }
+        #[cfg(feature = "test-support")]
         self.record_completed_pass();
         true
     }
@@ -326,8 +328,10 @@ impl Forge {
     }
 
     /// Reports one completed pass to the deterministic test trigger, if any.
+    ///
+    /// Compiled only with `test-support`; production passes carry no trigger.
+    #[cfg(feature = "test-support")]
     fn record_completed_pass(&self) {
-        #[cfg(feature = "test-support")]
         if let Some(trigger) = &self.core.scheduler_trigger {
             trigger.record_completed_pass();
         }

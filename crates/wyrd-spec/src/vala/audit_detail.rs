@@ -357,8 +357,8 @@ pub enum BifrostSecurityViolationKind {
     TenantBinding,
     /// Tenant-scoped object path mismatch.
     TenantPath,
-    /// Runtime row tenant mismatch.
-    TenantRow,
+    /// A scanned file's footer tenant is missing or foreign.
+    TenantFile,
     /// Invalid peer signature.
     PeerSignature,
     /// Unknown peer key identifier.

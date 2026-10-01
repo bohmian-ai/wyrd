@@ -487,8 +487,11 @@ struct AdmittedRewrite {
 
 /// What starting one claimed attempt produced.
 enum AttemptStart {
-    /// The attempt settled inside its own frame; carries whether an effect landed.
-    Settled(bool),
+    /// The attempt settled inside its own frame.
+    ///
+    /// Carries the durably settled execution result: whether an effect landed,
+    /// or the execution failure the attempt settled as a healthy outcome.
+    Settled(Result<bool, ForgeError>),
     /// The attempt planned compaction work the worker pool must admit.
     Planned(Box<AdmittedRewrite>),
 }
@@ -2220,8 +2223,9 @@ impl ForgeWorker {
         // pushes the composed server future past rustc's layout-query budget.
         let started = Instant::now();
         let result = Box::pin(self.execute_claim(claim, shutdown)).await;
-        self.record_settled_claim(task_id, strategy, started, result)
-            .await?;
+        #[cfg(feature = "test-support")]
+        self.pause_after_attempt_for_test(task_id).await;
+        self.record_settled_claim(task_id, &strategy, started, result)?;
         Ok(true)
     }
 
@@ -2492,8 +2496,9 @@ impl ForgeWorker {
                 // The attempt's plans are on the queue; it settles when they drain.
                 ClaimStep::Admitted => {}
                 ClaimStep::Closed(result) => {
-                    self.record_settled_claim(task_id, strategy, started, result)
-                        .await?;
+                    #[cfg(feature = "test-support")]
+                    self.pause_after_attempt_for_test(task_id).await;
+                    self.record_settled_claim(task_id, &strategy, started, result)?;
                 }
             }
             // This claim consumed one unit of the turn's allowance, and the
@@ -2785,23 +2790,26 @@ impl ForgeWorker {
         let strategy = state.open.claim.strategy.clone();
         let started = state.open.started;
         let result = self.finish_admitted_attempt(state, shutdown).await;
-        self.record_settled_claim(task_id, strategy, started, result)
-            .await
+        #[cfg(feature = "test-support")]
+        self.pause_after_attempt_for_test(task_id).await;
+        self.record_settled_claim(task_id, &strategy, started, result)
     }
 
     /// Records one settled episode and decides whether this owner keeps going.
     ///
     /// Only a settled effect is a completion; a superseded envelope, a
     /// terminalized payload, and a settled execution failure are all healthy
-    /// exits that permit the next claim.
+    /// exits that permit the next claim. With `test-support`, callers first
+    /// apply the observer's passive returned-attempt barrier, and a completion
+    /// is published to the observer; production builds only log the outcome.
     ///
     /// # Errors
     ///
     /// Returns `result`'s failure unchanged, which stops this owner.
-    async fn record_settled_claim(
+    fn record_settled_claim(
         &self,
         task_id: Uuid,
-        strategy: ForgeClaimStrategy,
+        strategy: &ForgeClaimStrategy,
         started: Instant,
         result: Result<bool, ForgeError>,
     ) -> Result<(), ForgeError> {
@@ -2813,11 +2821,10 @@ impl ForgeWorker {
             elapsed_ms = started.elapsed().as_millis(),
             "Forge task settled"
         );
-        #[cfg(feature = "test-support")]
-        self.pause_after_attempt_for_test(task_id).await;
         match result {
+            #[cfg(feature = "test-support")]
             Ok(true) => self.record_completion(task_id, strategy),
-            Ok(false) => {}
+            Ok(_) => {}
             Err(error) => return Err(error),
         }
         Ok(())
@@ -2852,21 +2859,23 @@ impl ForgeWorker {
         else {
             return Ok(false);
         };
-        let task_id = prepared.task.task_id;
-        let strategy = ForgeClaimStrategy::Known(prepared.task.strategy);
+        #[cfg(feature = "test-support")]
+        let (task_id, strategy) = (
+            prepared.task.task_id,
+            ForgeClaimStrategy::Known(prepared.task.strategy),
+        );
         let result = self.reconcile_prepared(prepared, shutdown).await;
         #[cfg(feature = "test-support")]
         self.pause_after_attempt_for_test(task_id).await;
-        match result {
-            Ok(()) => self.record_completion(task_id, strategy),
-            Err(error) => {
-                tracing::error!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
-                // A Prepared attempt already produced durable evidence a reader
-                // can observe. Continuing past an unresolved one would let this
-                // owner start another effect over unreconciled state.
-                return Err(error);
-            }
+        if let Err(error) = result {
+            tracing::error!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
+            // A Prepared attempt already produced durable evidence a reader
+            // can observe. Continuing past an unresolved one would let this
+            // owner start another effect over unreconciled state.
+            return Err(error);
         }
+        #[cfg(feature = "test-support")]
+        self.record_completion(task_id, &strategy);
         Ok(true)
     }
 
@@ -2885,24 +2894,16 @@ impl ForgeWorker {
     ///
     /// This is deliberately called after the full durable execution path
     /// returns, so test observation cannot acknowledge or alter a task.
-    #[cfg(not(feature = "test-support"))]
-    fn record_completion(&self, _task_id: Uuid, _strategy: ForgeClaimStrategy) {}
-
-    /// Publish one observer event after a successful worker execution.
     #[cfg(feature = "test-support")]
-    fn record_completion(&self, task_id: Uuid, strategy: ForgeClaimStrategy) {
+    fn record_completion(&self, task_id: Uuid, strategy: &ForgeClaimStrategy) {
         if let Some(observer) = &self.completion_observer {
             observer.record_lifecycle(ForgeLifecycleEvent::Terminal {
                 task_id,
                 worker_id: self.owner,
             });
-            observer.record(self.owner, task_id, strategy);
+            observer.record(self.owner, task_id, strategy.clone());
         }
     }
-
-    /// Publish one passive observer event after any supervised attempt returns.
-    #[cfg(not(feature = "test-support"))]
-    fn record_attempt(&self, _error: Option<&ForgeError>) {}
 
     /// Publish one passive observer event after any supervised attempt returns.
     #[cfg(feature = "test-support")]
@@ -3388,13 +3389,8 @@ impl ForgeWorker {
         shutdown: &CancellationToken,
         pool: &mut ForgeAttemptPool,
     ) -> ClaimStep {
-        // Exactly one passive observation per attempt. An execution failure the
-        // attempt durably settled is reported at close even though the attempt
-        // itself returns a healthy boolean, so the failure stays observable
-        // without turning a settled outcome into a slot-fatal error.
-        let mut settled_failure = None;
         let started = tracing::Instrument::instrument(
-            self.begin_claim_attempt(&open.claim, shutdown, &mut settled_failure),
+            self.begin_claim_attempt(&open.claim, shutdown),
             open.span.clone(),
         )
         .await;
@@ -3433,14 +3429,10 @@ impl ForgeWorker {
                     None => ClaimStep::Admitted,
                 }
             }
-            Ok(AttemptStart::Settled(settled)) => ClaimStep::Closed(
-                self.close_claim_episode(open, settled_failure, Ok(settled))
-                    .await,
-            ),
-            Err(error) => ClaimStep::Closed(
-                self.close_claim_episode(open, settled_failure, Err(error))
-                    .await,
-            ),
+            Ok(AttemptStart::Settled(settled)) => {
+                ClaimStep::Closed(self.close_claim_episode(open, Ok(settled)).await)
+            }
+            Err(error) => ClaimStep::Closed(self.close_claim_episode(open, Err(error)).await),
         }
     }
 
@@ -3451,14 +3443,20 @@ impl ForgeWorker {
     /// row before the active-task gauge is released, so a reader never sees a
     /// task counted as active after its result was recorded.
     ///
+    /// `outcome` is either the slot-fatal failure or the durably settled
+    /// execution result. Exactly one passive observation is made per attempt:
+    /// a settled execution failure is observed even though the episode closes
+    /// with a healthy `false`, so the failure stays observable without turning
+    /// a settled outcome into a slot-fatal error.
+    ///
     /// # Errors
     ///
-    /// Returns `outcome` unchanged; observation is diagnostic-only.
+    /// Returns `outcome`'s slot-fatal failure unchanged; observation is
+    /// diagnostic-only.
     async fn close_claim_episode(
         &self,
         open: OpenClaim,
-        settled_failure: Option<ForgeError>,
-        outcome: Result<bool, ForgeError>,
+        outcome: Result<Result<bool, ForgeError>, ForgeError>,
     ) -> Result<bool, ForgeError> {
         let OpenClaim {
             claim,
@@ -3484,15 +3482,20 @@ impl ForgeWorker {
         )
         .await;
         drop(span);
-        self.record_attempt(settled_failure.as_ref().or(outcome.as_ref().err()));
+        #[cfg(feature = "test-support")]
+        self.record_attempt(match &outcome {
+            Ok(settled) => settled.as_ref().err(),
+            Err(error) => Some(error),
+        });
         drop(active);
-        outcome
+        outcome.map(|settled| settled.unwrap_or(false))
     }
 
-    /// Runs one claimed attempt, reporting a durably settled execution failure.
+    /// Runs one claimed attempt, returning its durably settled execution result.
     ///
-    /// `settled_failure` receives the execution error whenever this attempt
-    /// settled it durably and therefore returns a healthy boolean.
+    /// A settled execution failure is returned inside
+    /// [`AttemptStart::Settled`] rather than as this method's error, because
+    /// durable settlement makes it a healthy worker outcome.
     ///
     /// # Errors
     ///
@@ -3501,7 +3504,6 @@ impl ForgeWorker {
         &self,
         claim: &ForgeTaskClaim,
         shutdown: &CancellationToken,
-        settled_failure: &mut Option<ForgeError>,
     ) -> Result<AttemptStart, ForgeError> {
         let task = claim;
         if claim.execution_tenant_id != task.data_tenant_id {
@@ -3529,7 +3531,7 @@ impl ForgeWorker {
                     .await?;
                 // Terminalizing a malformed payload is a healthy worker outcome
                 // that produced no effect.
-                return Ok(AttemptStart::Settled(false));
+                return Ok(AttemptStart::Settled(Ok(false)));
             }
         };
         // An orphan-cleanup prefix is a delete authority, and a well-shaped one
@@ -3576,25 +3578,23 @@ impl ForgeWorker {
             Ok(OpenedFrame::Complete(settled)) => Ok(settled),
             Err(error) => Err(error),
         };
-        self.settle_claim_execution(
-            ClaimExecutionOutcome {
-                task,
-                attempt,
-                stage,
-                lease,
-                result,
-            },
-            settled_failure,
-        )
+        self.settle_claim_execution(ClaimExecutionOutcome {
+            task,
+            attempt,
+            stage,
+            lease,
+            result,
+        })
         .await
         .map(AttemptStart::Settled)
     }
 
     /// Settles failure and releases one task's table lease before outer observation.
     ///
-    /// Returns whether the requested effect settled. An execution failure whose
-    /// durable settlement and lease release both commit is a healthy outcome
-    /// reported through `settled_failure` rather than through the return value.
+    /// Returns the execution result once it is durably settled: whether the
+    /// requested effect landed, or the execution failure whose durable
+    /// settlement and lease release both committed, which is a healthy outcome
+    /// rather than a reason to stop claiming.
     ///
     /// # Errors
     ///
@@ -3605,8 +3605,7 @@ impl ForgeWorker {
     async fn settle_claim_execution(
         &self,
         outcome: ClaimExecutionOutcome<'_>,
-        settled_failure: &mut Option<ForgeError>,
-    ) -> Result<bool, ForgeError> {
+    ) -> Result<Result<bool, ForgeError>, ForgeError> {
         let ClaimExecutionOutcome {
             task,
             attempt,
@@ -3651,15 +3650,11 @@ impl ForgeWorker {
         if let Some(error) = fatal {
             return Err(error);
         }
-        // The failure committed to durable state, so the caller reports it as
-        // an observed attempt failure rather than as a reason to stop claiming.
-        if let Err(error) = result {
-            *settled_failure = Some(error);
-            return Ok(false);
-        }
+        // A failure committed to durable state, so the caller reports it as an
+        // observed attempt failure rather than as a reason to stop claiming.
         // The durable row is the authority for what happened; the boolean only
         // reports whether the requested effect settled successfully.
-        Ok(result.unwrap_or(false))
+        Ok(result)
     }
 
     /// Records one completed ownership episode from the durable task row.
@@ -3827,6 +3822,7 @@ impl ForgeWorker {
         )
         .await;
         drop(span);
+        #[cfg(feature = "test-support")]
         self.record_attempt(result.as_ref().err());
         result
     }
@@ -4643,6 +4639,7 @@ impl ForgeWorker {
             .await?;
         self.settle_rewrite_recovery(claim, binding, lease, &state, shutdown)
             .await?;
+        #[cfg(feature = "test-support")]
         self.record_rewrite_evidence(claim, &evidence);
         let settled = matches!(state, ForgeExecutionEvidenceState::Settled);
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)
@@ -4768,10 +4765,6 @@ impl ForgeWorker {
     /// test observation cannot acknowledge or alter a task before its effect is
     /// committed. The catalog-committed event is emitted only when the evidence
     /// carries a committed snapshot.
-    #[cfg(not(feature = "test-support"))]
-    fn record_rewrite_evidence(&self, _claim: &ForgeTaskClaim, _evidence: &ForgeTaskEvidence) {}
-
-    /// Publishes the rewrite and catalog-commit observer events.
     #[cfg(feature = "test-support")]
     fn record_rewrite_evidence(&self, claim: &ForgeTaskClaim, evidence: &ForgeTaskEvidence) {
         let Some(observer) = &self.completion_observer else {
@@ -5407,22 +5400,16 @@ impl ForgeWorker {
                 shutdown,
             )
             .await;
-        let mut settled_failure = None;
         let settled = self
-            .settle_claim_execution(
-                ClaimExecutionOutcome {
-                    task: &open.claim,
-                    attempt,
-                    stage,
-                    lease,
-                    result,
-                },
-                &mut settled_failure,
-            )
+            .settle_claim_execution(ClaimExecutionOutcome {
+                task: &open.claim,
+                attempt,
+                stage,
+                lease,
+                result,
+            })
             .await;
-        let closed = self
-            .close_claim_episode(open, settled_failure, settled)
-            .await;
+        let closed = self.close_claim_episode(open, settled).await;
         drop(shared);
         closed
     }

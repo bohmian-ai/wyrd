@@ -1,0 +1,39 @@
+# Focused follow-up: staged decoded-memory lifetime
+
+Result: **RESOLVED**. Proposal **CONC-002 is confirmed**, with correction scope narrowed below. This is independent discovery; final finding validation remains required.
+
+Subject: base `a7582db587c6170a290760f1741673125612b797`, candidate `f7bebf704d6f3b1dd20d041e70c6ca512c0da307`. HEAD remained unchanged. Reviewed only the uniquely raised CONC-002 path. No builds, Postgres wrappers, full lanes, source edits, or commits.
+
+## Authority and source coverage
+
+Read the original task and approved revision-20 requirements, repository agent rules, spec-driven development and maintainer references, and Arrow analytical ownership reference. TASK-007 requirement 5 expressly says memory stays charged to the query grant. Spec INV-005/006 forbid an ungoverned in-flight batch or faster path skipping memory governance; REQ-011 says count a buffer once while held, with ownership transfer rather than duplicate charges. Bifrost design's admission/memory authority says cooperative reservations arbitrate what all live queries hold together.
+
+Inspected the cumulative TASK-007 scan/transport diff; complete bodies of `ScribeTailResolver::live_leaf`, `PhysicalPlanFollower::execute`, `HotParquetGovernance::{reserve_decoded,own_range}`, `hot_stream`, `ScribeFragmentExecutor::execute`, the remote fragment encoder adapter, `LiveFrameDecoder::accept`, and the live leader producer. Checked sibling leader/follower HotParquet governance and the predecessor `LiveTailPartition`, `LiveTailBatches::into_stream`, and `StagedRun::next_rows`. Inspected locked dependency source: DataFusion physical-plan 55.1.0 and Arrow buffer 59.3.0. No CodeGraph directory exists.
+
+## Required reachable path
+
+1. A normal staged-only Scribe snapshot is resolved by `live_leaf` (`oracle/follower.rs:827–841`) into `HotParquetExec` with the Scribe session's partition count and follower query pool. The no-predicate branch returns this plan directly (:861). CPU-derived local partitioning has at least two partitions, so no unusual query or artificial test hook is needed.
+2. `hot_stream` (`oracle/exec.rs:3100–3105`) reserves the decoded batch's array memory in `HotDecodedReservation`, yields a plain `RecordBatch`, then drops that reservation on its **next producer poll**. The reservation is a separate local variable, not an Arrow-buffer owner. Neither the yielded batch nor its arrays keep it alive.
+3. `PhysicalPlanFollower::execute` (:1473) invokes DataFusion `execute_stream`. Locked `execution_plan.rs:1772–1789` wraps any multi-partition root in `CoalescePartitionsExec`. Locked `coalesce_partitions.rs:240–251` creates an item-bounded receiver and spawns one producer per partition. Locked `stream.rs:355–377` sends the batch into the receiver, then polls the child again. There is no memory-pool reservation for the receiver's queued batches.
+4. Consequently the source may reach EOF and drop every decoded reservation while a successfully sent decoded batch still sits in that receiver. A receiver with capacity equal to partition count permits this even before the leader consumes anything. Backpressure bounds item count but does not preserve the byte charge.
+5. The candidate's local `ScribeFragmentExecutor` (`wyrd-server/src/oracle/peer_service.rs:375`) passes that exact batch as `LiveFrame::Batch`; the enum (`oracle/dispatcher.rs:594`) carries no separate retained charge. `LiveFrameDecoder::accept` (:751) returns it directly. The leader projects and yields it (:589–593), also without restoring its decoded-buffer reservation. Retaining a batch or a projection/array clone can therefore keep those same buffers resident beyond follower producer completion or stream drop.
+
+This establishes a failure before any filtering or leader aggregate: a staged scan with no signed predicate suffices. It is not a hypothetical unlimited queue, disabled-memory fixture, remote outage, or caller violating a pull protocol.
+
+## Difference from the predecessor
+
+The old `StagedRun::next_rows` also released its decoded charge on the next producer pull; that convention was not general Arrow-lifetime ownership. The task does not need an unrelated audit of all old output memory.
+
+The old Scribe provider specifically had one `StreamingTableExec` partition (`HEAD~1` follower resolver and `LiveTailPartition`, approximately :984–1048). Its local executor IPC-encoded each batch before polling for the next. The new multi-partition staged leaf introduces the independent DataFusion producers and receiver described above; a next producer pull now demonstrably occurs while the original decoded batch is queued and unconsumed. The new local handoff additionally retains those original Arrow buffers on the leader rather than consuming them into IPC. Although `hot_stream` predates this change for published scans, applying it to this newly parallel Scribe path without satisfying requirement 5 is a TASK-007 acceptance defect. The finding is INCORRECT, not a claim that every reservation line was newly written.
+
+## Predicate output and correction boundary
+
+Attaching ownership only to the initial Parquet arrays is insufficient for the candidate's predicate branch. `live_leaf` places `FilterExec` above the staged and memory sources (:864–868). Locked `filter.rs:1309–1310` calls `filter_record_batch` and retains its resulting arrays in its batch coalescer; copied arrays have their own lifetimes and do not inherit an owner attached to the source buffers. This branch is required by the task's same-pushdown obligation. This is a preservation constraint on the correction, not a separate demand to redesign all DataFusion operators.
+
+Keep the correction inside the existing live scan/governance ownership boundary, before batches escape into asynchronous coalescing and direct transport. Replace next-poll-based ownership for staged decoded buffers with actual retained-buffer ownership tied to the existing follower pool, and ensure the live leaf's final predicate result buffers retain that same governed ownership when filtering copies them. Count shared buffers once, preserve existing range reservations, and avoid double-charging a transferred batch on the leader. Source ownership is necessary because a transport-only wrapper runs **after** the uncharged coalescing queue. A stream-held reservation list also fails the retained-clone case and artificially retains already freed buffers.
+
+Existing `HotParquetGovernance::own_range` and `PooledRangeOwner` show the appropriate ownership principle. Arrow already has an allocation-owner mechanism (`Buffer::from_custom_allocation`, locked `immutable.rs:158`); no new dependency or public contract is needed. This report does not require a particular helper layout or an audit of unrelated published operators. Reusing the shared HotParquet governance must preserve its existing leader mode and range charging. Preserve session parallelism, no local IPC/hash, terminal checks, staged leases, and cancellation; do not serialize the scan to hide the accounting gap.
+
+## Smallest closure proof
+
+Use a real governed follower pool and staged no-predicate plan with at least two partitions. Execute through `execute_stream`, retain a received batch and a projected/array clone, then drain/drop the producer. The pool must still reflect the retained decoded buffers and release their charge only after their final owner drops. Also inspect or exercise slow-consumer coalescing: queued decoded buffers must remain charged and the finite query ceiling must still refuse growth. Add the same retained-output check for a predicate that creates filtered arrays. Existing cancellation and range-owner tests remain regressions; the 18 focused passes and scoped clippy recorded by the orchestrator do not cover this lifetime property.

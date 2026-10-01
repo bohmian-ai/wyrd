@@ -3,18 +3,16 @@
 use vala_bifrost_redux::oracle::peer::{
     ReservationBinding, ReservationOperationV1, reservation_body_digest,
 };
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::NodeId;
-use wyrd_testing::bifrost::process_cluster::{
-    BifrostProcessCluster, PeerProbeFraming, PeerProbePlan, PeerProbeService, ProcessNodeTarget,
-};
 use wyrd_tonic::prost::Message as _;
+use wyrd_tonic::wyrd::v1 as proto;
+use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
 use super::support::{
-    PeerJourneyError, ReservationPlane, polls_at, probe, proto_with_context, reserve, stamped,
+    PeerDial, PeerJourneyError, ReservationPlane, proto_with_context, reserve, stamped,
 };
-
-/// Path of the compiled child every simulated pod runs.
-const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
+use crate::peer_cluster::{PeerCluster, PeerProbeFraming, PeerProbePlan, PeerProbeService};
 
 /// A cluster member reaches both private adapters, and every operation it
 /// sends is still checked against the receiver's own state before any
@@ -41,25 +39,22 @@ async fn prove_peer_context_refusals() -> Result<(), PeerJourneyError> {
     // Two Oracles so one pod calls another over the real peer listener, and
     // one Scribe so the topology owns a catalog and a tail source exactly as a
     // deployment that serves queries does.
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
+    let cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
-    let destination = cluster.nodes()[1].ready_report().advertise_addr.clone();
+    let destination = cluster.advertise_addr(1).await?;
 
-    a_cluster_member_reaches_both_adapters(&mut cluster, &destination)?;
-    first_frame_layout_does_not_change_admission(&mut cluster, &destination)?;
-    let plane = ReservationPlane::observe(&mut cluster)?;
-    the_correct_context_is_accepted(&mut cluster, &plane)?;
-    every_bound_identity_must_match(&mut cluster, &plane)?;
-    worker_discovery_is_always_refused(&mut cluster, &plane)?;
+    a_cluster_member_reaches_both_adapters(&cluster, &destination).await?;
+    first_frame_layout_does_not_change_admission(&cluster, &destination).await?;
+    let plane = ReservationPlane::observe(&cluster).await?;
+    the_correct_context_is_accepted(&cluster, &plane).await?;
+    every_bound_identity_must_match(&cluster, &plane).await?;
+    worker_discovery_is_always_refused(&cluster, &plane).await?;
 
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -69,36 +64,28 @@ const ADAPTERS: [PeerProbeService; 2] = [
     PeerProbeService::AnalyticalWorker,
 ];
 
-/// Reads the destination's body-poll counter through its own control channel.
-///
-/// # Errors
-///
-/// Returns the control-protocol failure unchanged.
-fn body_polls(cluster: &mut BifrostProcessCluster) -> Result<u64, PeerJourneyError> {
-    polls_at(cluster, 1)
-}
-
 /// A certificate from the cluster authority reaches the body on both adapters.
 ///
 /// mTLS is the only peer trust, so admission is observed as a body poll: the
 /// request reached the plane that decodes and checks its typed context. The
 /// verdict itself cannot carry the claim, because this probe deliberately
 /// carries no operation context and each adapter refuses it after reading it.
+/// The poll counter is process-wide; the idle topology sends no peer traffic
+/// of its own, so the only request that can advance it is this probe.
 ///
 /// # Errors
 ///
 /// Returns a message naming the adapter that never reached a body.
-fn a_cluster_member_reaches_both_adapters(
-    cluster: &mut BifrostProcessCluster,
+async fn a_cluster_member_reaches_both_adapters(
+    cluster: &PeerCluster,
     destination: &str,
 ) -> Result<(), PeerJourneyError> {
     for adapter in ADAPTERS.iter() {
-        let before = body_polls(cluster)?;
-        probe(
-            cluster,
-            &PeerProbePlan::own(destination).against(adapter.clone()),
-        )?;
-        if body_polls(cluster)? == before {
+        let before = cluster.peer_body_polls();
+        cluster
+            .probe(&PeerProbePlan::own(destination).against(adapter.clone()))
+            .await?;
+        if cluster.peer_body_polls() == before {
             return Err(
                 format!("{adapter:?} admitted a cluster member without reaching a body").into(),
             );
@@ -116,13 +103,15 @@ fn a_cluster_member_reaches_both_adapters(
 /// # Errors
 ///
 /// Returns a message naming the layout whose verdict diverged.
-fn first_frame_layout_does_not_change_admission(
-    cluster: &mut BifrostProcessCluster,
+async fn first_frame_layout_does_not_change_admission(
+    cluster: &PeerCluster,
     destination: &str,
 ) -> Result<(), PeerJourneyError> {
-    let baseline = probe(cluster, &PeerProbePlan::own(destination))?;
+    let baseline = cluster.probe(&PeerProbePlan::own(destination)).await?;
     for framing in [PeerProbeFraming::SplitHeader, PeerProbeFraming::Coalesced] {
-        let outcome = probe(cluster, &PeerProbePlan::own(destination).framed(framing))?;
+        let outcome = cluster
+            .probe(&PeerProbePlan::own(destination).framed(framing))
+            .await?;
         if outcome != baseline {
             return Err(format!(
                 "a {framing:?} first frame answered {outcome}, but a whole frame answered {baseline}"
@@ -133,27 +122,52 @@ fn first_frame_layout_does_not_change_admission(
     Ok(())
 }
 
-/// The reservation context the leader would send is accepted.
+/// The reservation context the leader would send is accepted and released.
 ///
 /// This is the baseline that makes every refusal below attributable to its
-/// one deviation rather than to a context the follower never accepts.
+/// one deviation rather than to a context the follower never accepts. The
+/// accepted reservation is then released exactly as its leader would release
+/// it, so the follower returns every charged unit rather than holding a
+/// reservation no leader will ever claim.
 ///
 /// # Errors
 ///
-/// Returns a message when the follower refuses the correct context.
-fn the_correct_context_is_accepted(
-    cluster: &mut BifrostProcessCluster,
+/// Returns a message when the follower refuses the correct reserve or release
+/// context, or still charges units after the release.
+async fn the_correct_context_is_accepted(
+    cluster: &PeerCluster,
     plane: &ReservationPlane,
 ) -> Result<(), PeerJourneyError> {
     let query_id = uuid::Uuid::new_v4();
-    let payload = stamped(
-        plane.reserve_request(query_id),
-        &plane.reserve_binding(query_id),
-        |_| {},
+    let request = proto::ReserveNodeSlotsRequest::decode(
+        stamped(
+            plane.reserve_request(query_id),
+            &plane.reserve_binding(query_id),
+            |_| {},
+        )?
+        .as_slice(),
     )?;
-    let outcome = reserve(cluster, &plane.destination, payload)?;
-    if is_refusal(&outcome) {
-        return Err(format!("a correct reserve context was refused with {outcome}").into());
+    let mut client = OraclePeerServiceClient::new(
+        PeerDial::member(cluster.peer_ca(), cluster.peer_addr(1)?)
+            .connect()
+            .await?,
+    );
+    let accepted = client
+        .reserve_slots(request)
+        .await
+        .map_err(|status| format!("a correct reserve context was refused with {status}"))?
+        .into_inner();
+    let Some(proto::reserve_node_slots_response::Outcome::Pending(pending)) = accepted.outcome
+    else {
+        return Err(format!("a correct reserve context was not held: {accepted:?}").into());
+    };
+    client
+        .release_slots(plane.release_request(pending.reservation_id, query_id)?)
+        .await
+        .map_err(|status| format!("a correct release context was refused with {status}"))?;
+    let held = cluster.ownership_snapshot(1)?.peer_running;
+    if held != 0 {
+        return Err(format!("the follower still charges {held} units after release").into());
     }
     Ok(())
 }
@@ -180,8 +194,8 @@ type BindingDeviation = Box<dyn Fn(&mut ReservationBinding)>;
 /// # Errors
 ///
 /// Returns a message naming the deviation the follower accepted.
-fn every_bound_identity_must_match(
-    cluster: &mut BifrostProcessCluster,
+async fn every_bound_identity_must_match(
+    cluster: &PeerCluster,
     plane: &ReservationPlane,
 ) -> Result<(), PeerJourneyError> {
     let foreign = uuid::Uuid::new_v4();
@@ -228,7 +242,7 @@ fn every_bound_identity_must_match(
         let mut binding = plane.reserve_binding(query_id);
         deviate(&mut binding);
         let payload = stamped(plane.reserve_request(query_id), &binding, |_| {})?;
-        let outcome = reserve(cluster, &plane.destination, payload)?;
+        let outcome = reserve(cluster, &plane.destination, payload).await?;
         if !is_refusal(&outcome) {
             return Err(format!("{description} was answered with {outcome}").into());
         }
@@ -253,7 +267,7 @@ fn every_bound_identity_must_match(
             &plane.reserve_binding(query_id),
             deviate,
         )?;
-        let outcome = reserve(cluster, &plane.destination, payload)?;
+        let outcome = reserve(cluster, &plane.destination, payload).await?;
         if !is_refusal(&outcome) {
             return Err(format!("{description} was answered with {outcome}").into());
         }
@@ -267,7 +281,7 @@ fn every_bound_identity_must_match(
         .map_err(|error| format!("reserve body digest: {error}"))?;
     let mut substituted = proto_with_context(request, &plane.reserve_binding(query_id), digest);
     substituted.expires_at_unix_ms -= 1;
-    let outcome = reserve(cluster, &plane.destination, substituted.encode_to_vec())?;
+    let outcome = reserve(cluster, &plane.destination, substituted.encode_to_vec()).await?;
     if !is_refusal(&outcome) {
         return Err(format!("a substituted request body was answered with {outcome}").into());
     }
@@ -287,14 +301,15 @@ type ClaimsDeviation = fn(&mut vala_bifrost_redux::oracle::peer::ReservationTick
 /// # Errors
 ///
 /// Returns a message when the private listener answers the call.
-fn worker_discovery_is_always_refused(
-    cluster: &mut BifrostProcessCluster,
+async fn worker_discovery_is_always_refused(
+    cluster: &PeerCluster,
     plane: &ReservationPlane,
 ) -> Result<(), PeerJourneyError> {
-    let outcome = probe(
-        cluster,
-        &PeerProbePlan::own(&plane.destination).on_path("/worker.WorkerService/GetWorkerInfo"),
-    )?;
+    let outcome = cluster
+        .probe(
+            &PeerProbePlan::own(&plane.destination).on_path("/worker.WorkerService/GetWorkerInfo"),
+        )
+        .await?;
     if outcome == "Ok" {
         return Err("worker discovery was answered on the private peer plane".into());
     }

@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
@@ -66,8 +65,6 @@ pub mod follower;
 mod live;
 #[cfg(feature = "test-support")]
 pub use live::live_source_batches_for_test;
-#[cfg(feature = "test-support")]
-pub use live::set_live_fragment_batch_bound_for_test;
 mod participant_cut;
 pub mod peer;
 pub mod planner;
@@ -108,7 +105,6 @@ use admission::AdmittedQueryGuard;
 pub use admission::OracleAdmission;
 #[cfg(feature = "test-support")]
 pub use admission::{QueryResourceProbe, QueryResourceSnapshot};
-pub use exec::TenantTripwireExec;
 use exec::{HotFileSource, OracleQueryScanStats, OracleTableInputs, OracleTableProvider};
 pub use participant_cut::{
     OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryAttemptRoster,
@@ -866,7 +862,7 @@ pub trait OracleAudit: Send + Sync {
         decision: BifrostQueryReadDecision,
     );
 
-    /// Stages a tenant-tripwire security event.
+    /// Stages a tenant or peer security event.
     fn append_security_violation(
         &self,
         context: VerifiedSecurityContext,
@@ -1246,8 +1242,8 @@ pub struct Oracle {
     /// Immutable membership registry retained for planning and worker selection.
     cluster: Arc<ClusterRegistry>,
     /// Reservation owner this node's Analytical graphs charge against; the
-    /// engine reads it only for test-tier inspection.
-    #[cfg(feature = "test-support")]
+    /// engine drains its pending entries at shutdown and reads it for
+    /// test-tier inspection.
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// One process-local lifecycle registry shared with private controls.
     running_queries: Arc<RunningQueryRegistry>,
@@ -1442,8 +1438,6 @@ struct AnalyticalCompositionInputs {
     fence: u64,
     /// Catalog the follower leaf binding resolves sources through.
     catalog: Arc<BifrostCatalog>,
-    /// Audit owner every refused stage message records through.
-    audit: Arc<dyn OracleAudit>,
     /// This node's reader epoch, which every decoded Analytical leaf protects under.
     reader_authority: Arc<reader_pins::OracleReaderAuthority>,
     /// Reservation owner this node's Analytical graphs charge against.
@@ -1469,7 +1463,6 @@ fn compose_analytical_handle(
         node_id,
         fence,
         catalog,
-        audit,
         reader_authority,
         reservations,
         peer_transports,
@@ -1479,7 +1472,6 @@ fn compose_analytical_handle(
     let leaf = codec::AnalyticalLeafBinding::new(
         wyrd_spec::vala::api::ClusterRole::Oracle,
         Arc::new(follower::OracleCatalogResolver::new(catalog)),
-        audit,
         Some(reader_authority),
     );
     let egress = Arc::new(analytical::AnalyticalStageEgress::new(
@@ -1573,16 +1565,12 @@ impl Oracle {
     }
 
     /// Consumes an armed one-shot distributed-planning refusal, if any.
+    ///
+    /// Compiled only with `test-support`; production planning has no refusal.
+    #[cfg(feature = "test-support")]
     fn take_analytical_plan_failure(&self) -> bool {
-        #[cfg(feature = "test-support")]
-        {
-            self.fail_next_analytical_plan
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
-        }
-        #[cfg(not(feature = "test-support"))]
-        {
-            false
-        }
+        self.fail_next_analytical_plan
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Acquires this process's one reader epoch for the local Oracle role.
@@ -1655,7 +1643,6 @@ impl Oracle {
                         node_id: admission.local_role.key.node_id,
                         fence: admission.local_role.fencing_token,
                         catalog: Arc::clone(&config.catalog),
-                        audit: Arc::clone(&config.audit),
                         reader_authority: Arc::clone(&reader_authority),
                         reservations: Arc::clone(&config.reservations),
                         peer_transports: config.peer_transports.as_ref().map(Arc::clone),
@@ -1665,7 +1652,6 @@ impl Oracle {
             planner,
             admission,
             cluster,
-            #[cfg(feature = "test-support")]
             reservations: Arc::clone(&config.reservations),
             running_queries,
             reader_authority,
@@ -2432,6 +2418,7 @@ impl Oracle {
                 let schema = root.schema();
                 let batches = execute_stream(root, session.task_ctx())
                     .map_err(|error| map_datafusion_error(&error))?;
+                let batches = self.audit_tenant_refusal(context, batches);
                 return Ok(CutExecution {
                     schema,
                     batches,
@@ -2469,6 +2456,7 @@ impl Oracle {
         let schema = root.schema();
         let batches = execute_stream(Arc::clone(&root), leader.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
+        let batches = self.audit_tenant_refusal(context, batches);
         if let Some(ownership) = admitted.analytical.as_ref() {
             ownership.retain_metric_fold(analytical::AnalyticalGraphMetricFold::new(
                 root,
@@ -2482,6 +2470,52 @@ impl Oracle {
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
             query_class: QueryClass::Analytical,
         })
+    }
+
+    /// Audits the first footer-tenant refusal `batches` fails with, once.
+    ///
+    /// Every tier proves each opened file's footer tenant inside the shared
+    /// Parquet scan, on this leader or on a follower; the refusal then reaches
+    /// the leader as a stream error. Auditing here, where the authenticated
+    /// context lives, is what makes one query produce exactly one
+    /// `tenant_file` security event however many leaves refused. The error
+    /// itself is passed through unchanged, so the query still fails closed
+    /// with `WYRD_VALA_500_QUERY_TENANT_INVARIANT`.
+    fn audit_tenant_refusal(
+        &self,
+        context: &AuthorizedQueryContext,
+        batches: SendableRecordBatchStream,
+    ) -> SendableRecordBatchStream {
+        let schema = batches.schema();
+        let audit = Arc::clone(&self.audit);
+        let mut context = Some(context.clone());
+        let stream = batches.inspect(move |item| {
+            let Err(error) = item else {
+                return;
+            };
+            if !is_tenant_refusal(error) {
+                return;
+            }
+            let Some(query) = context.take() else {
+                return;
+            };
+            metrics::counter!(
+                "bifrost_oracle_security_events_total",
+                "event_class" => "tenant_file"
+            )
+            .increment(1);
+            audit.append_security_violation(
+                VerifiedSecurityContext {
+                    query,
+                    query_digest: None,
+                },
+                BifrostSecurityViolation {
+                    violation: BifrostSecurityViolationKind::TenantFile,
+                    phase: BifrostSecurityPhase::Source,
+                },
+            );
+        });
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
     }
 
     /// Publishes the one binding set every planned leaf resolves through.
@@ -2853,6 +2887,15 @@ impl Oracle {
                 "Oracle analytical follower ownership did not release during shutdown"
             );
         }
+        // Pending reservations hold capacity for graphs no leader can still
+        // activate here, so they are released rather than left to expire.
+        let drained = self.reservations.drain_pending();
+        if drained != 0 {
+            tracing::debug!(
+                drained,
+                "Oracle shutdown released pending peer reservations"
+            );
+        }
         let report = self.admission.shutdown(deadline).await;
         if report.active_queries != 0 || report.queued_queries != 0 || report.peer_running != 0 {
             tracing::warn!(
@@ -2963,7 +3006,6 @@ impl Oracle {
                     .collect(),
                 context: context.clone(),
                 table_name,
-                audit: Arc::clone(&self.audit),
                 remote,
                 live,
             })
@@ -2996,7 +3038,7 @@ impl Oracle {
                     }
                 })?;
                 Ok(HotFileSource {
-                    metadata_key: exec::hot_metadata_key(file, size_bytes)?,
+                    metadata_key: exec::hot_metadata_key(cut.binding.tenant, file, size_bytes)?,
                     location: self
                         .catalog
                         .object_location(&cut.binding, &file.file_path)
@@ -3109,6 +3151,7 @@ impl Oracle {
             Some(handle) => handle.planning_session(&planning, oracles, work_units)?,
             None => planning,
         };
+        #[cfg(feature = "test-support")]
         if self.take_analytical_plan_failure() {
             return Err(BifrostError::QueryExecutionFailed);
         }
@@ -3708,31 +3751,6 @@ fn failed_terminal_on_path(
     }
 }
 
-/// Validates every row's hidden tenant column without filtering mismatches.
-///
-/// # Errors
-/// Returns [`BifrostError::QueryTenantInvariant`] when the managed column is
-/// absent, null, or differs from the authenticated tenant.
-pub fn validate_tenant_batch(
-    batch: &RecordBatch,
-    tenant: DataTenantId,
-) -> Result<(), BifrostError> {
-    let index = batch
-        .schema()
-        .index_of("data_tenant_id")
-        .map_err(|_| BifrostError::QueryTenantInvariant)?;
-    let values = batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .ok_or(BifrostError::QueryTenantInvariant)?;
-    let expected = tenant.to_string();
-    if (0..values.len()).any(|row| values.is_null(row) || values.value(row) != expected) {
-        return Err(BifrostError::QueryTenantInvariant);
-    }
-    Ok(())
-}
-
 /// Parses one exact SQL query and returns its distinct canonical table references.
 ///
 /// # Errors
@@ -4292,7 +4310,7 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
         return BifrostError::QueryResourcesExhausted;
     }
     let message = error.to_string().to_ascii_lowercase();
-    if message.contains("tenant invariant") {
+    if is_tenant_refusal(error) {
         BifrostError::QueryTenantInvariant
     } else if message.contains("reconciliation invariant") {
         BifrostError::QueryReconciliationInvariant
@@ -4301,6 +4319,20 @@ fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostEr
     } else {
         BifrostError::QueryExecutionFailed
     }
+}
+
+/// Reports whether an execution error is a footer-tenant refusal.
+///
+/// A local refusal carries the typed [`BifrostError::QueryTenantInvariant`] in
+/// its chain. A follower's refusal arrives as a transport error whose message
+/// is all that survives the wire, so the stable message fragment is accepted
+/// as well.
+pub(super) fn is_tenant_refusal(error: &DataFusionError) -> bool {
+    exec::is_tenant_invariant_error(error)
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("tenant invariant")
 }
 
 /// Reports whether any typed `DataFusion` source in an execution error chain is
@@ -4354,7 +4386,7 @@ pub fn is_stale_iceberg_object_error(error: &datafusion::error::DataFusionError)
     exec::is_stale_iceberg_object_error(error)
 }
 
-/// Reports whether an execution error carries the tenant tripwire's refusal.
+/// Reports whether an execution error carries the footer tenant proof's refusal.
 ///
 /// Re-exported for the private peer service, which classifies follower stream
 /// errors outside this crate and must preserve the tenant-invariant outcome
@@ -4664,7 +4696,6 @@ mod tests {
         assert_ne!(one, narrower);
     }
 
-    use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::Utc;
     use std::sync::atomic::AtomicUsize;
@@ -5083,27 +5114,6 @@ mod tests {
                 "vala.bifrost.spans".to_owned(),
             ]
         );
-    }
-
-    /// Tenant tripwire rejects a foreign row instead of filtering it away.
-    #[test]
-    fn tenant_tripwire_rejects_foreign_rows() {
-        let tenant = DataTenantId::new_v7();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::UInt64, false),
-            Field::new("data_tenant_id", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(UInt64Array::from(vec![1])) as Arc<dyn Array>,
-                Arc::new(StringArray::from(vec![tenant.to_string()])) as Arc<dyn Array>,
-            ],
-        )
-        .expect("test batch has matching schema");
-        assert!(validate_tenant_batch(&batch, tenant).is_ok());
-        let foreign = DataTenantId::new_v7();
-        assert!(validate_tenant_batch(&batch, foreign).is_err());
     }
 
     /// Late execution failure produces one closed failed terminal shape.

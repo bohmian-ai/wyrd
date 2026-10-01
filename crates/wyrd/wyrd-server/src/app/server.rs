@@ -27,7 +27,7 @@ use crate::components::health::readiness_loop;
 use crate::config::{BifrostTarget, ServeMode, WyrdServerConfig};
 use crate::grpc::{
     GrpcRouterConfig, build_app_grpc, build_peer_grpc, drive_health_status, publish_initial_health,
-    serve_grpc_with_listener,
+    serve_grpc_with_listener, serve_peer_grpc_with_listener,
 };
 use crate::state::{AppState, BifrostShutdownReport};
 use crate::verification::{RuntimeLimits, VerificationRuntime};
@@ -554,13 +554,23 @@ impl BoundServer {
         {
             let shutdown = shutdown.clone();
             set.spawn(worker_task(
-                TaskId::Worker("scribe_age_scanner"),
+                TaskId::Worker("scribe_lifecycle_scanner"),
                 async move {
+                    // Seal age and staging dwell are wall-clock bounds, so this
+                    // tick drives both whether or not new writes arrive. A
+                    // publication in flight finishes before the supervised
+                    // drain hands off to Scribe's own shutdown.
                     let mut ticks = tokio::time::interval(Duration::from_secs(1));
+                    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
                             _ = shutdown.cancelled() => break,
-                            _ = ticks.tick() => scribe.check_age(std::time::Instant::now()),
+                            _ = ticks.tick() => {
+                                scribe.check_age(std::time::Instant::now());
+                                if let Err(error) = scribe.publish_due().await {
+                                    tracing::warn!(%error, "Scribe due publication failed; next tick retries");
+                                }
+                            }
                         }
                     }
                 },
@@ -665,7 +675,18 @@ impl BoundServer {
             let bifrost = Arc::clone(&self.state.bifrost);
             peer_plane.mark_serving();
             set.spawn(fallible_task(TaskId::BifrostPeer, async move {
-                let serving = serve_grpc_with_listener(router, listener, token);
+                // Only a listener serving Scribe fragments fails accepted IO on
+                // shutdown: a fragment its reader stopped draining would
+                // otherwise hold its source past the drain. Oracle-only
+                // listeners keep tonic's graceful drain for admitted work.
+                let serves_scribe = bifrost.scribe().is_some();
+                let serving = async move {
+                    if serves_scribe {
+                        serve_peer_grpc_with_listener(router, listener, token).await
+                    } else {
+                        serve_grpc_with_listener(router, listener, token).await
+                    }
+                };
                 tokio::pin!(serving);
                 // Peer-mode roles were reserved unready at boot; they join
                 // membership only once this task has polled the listener into

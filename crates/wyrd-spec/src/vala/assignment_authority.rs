@@ -190,9 +190,14 @@ pub enum AssignmentDigestError {
     },
 }
 
-/// Domain separator for the v5 assignment-authority digest.
+/// Domain separator for the v6 assignment-authority digest.
 ///
-/// v5 appends the required
+/// v6 drops the Scribe cut's batch-count and retained-byte limits: the cut is
+/// the writer epoch and the two partitions. Every other rule is unchanged from
+/// v5, and the domain differs so a v5 signature can never validate against v6
+/// bytes.
+///
+/// v5 appended the required
 /// [`crate::vala::api::FollowerReaderCut`] to every assignment, so a signed
 /// fragment names the exact protected snapshot the follower may read. The
 /// domain differs from v4 so a v4 signature — which carried no cut — can never
@@ -205,7 +210,7 @@ pub enum AssignmentDigestError {
 /// the declared event-time bounds. Every other count, length, option,
 /// predicate, projection, cut, and numeric rule is unchanged from v3, and the
 /// domain differs so a v3 signature can never validate against v4 bytes.
-const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v5\0";
+const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v6\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
@@ -336,6 +341,15 @@ fn push_time_partition(buffer: &mut Vec<u8>, partition: crate::vala::api::TimePa
     buffer.extend_from_slice(&partition.start_unix_micros().to_be_bytes());
 }
 
+/// Appends one Scribe provider cut as `writer_epoch:u64` big-endian followed
+/// by its start and end partitions.
+///
+/// The cut names which memory partitions a follower may read on which writer
+/// incarnation, so it is digested whole; it carries no size limit.
+///
+/// # Errors
+///
+/// Never fails; the `Result` is the shape `push_option` requires.
 fn push_scribe_cut(
     buffer: &mut Vec<u8>,
     cut: &crate::vala::api::ScribeProviderCut,
@@ -343,9 +357,6 @@ fn push_scribe_cut(
     buffer.extend_from_slice(&cut.writer_epoch.to_be_bytes());
     push_time_partition(buffer, cut.start_partition);
     push_time_partition(buffer, cut.end_partition);
-    let batch_count = cut.maximum_batch_count;
-    buffer.extend_from_slice(&batch_count.to_be_bytes());
-    buffer.extend_from_slice(&cut.maximum_retained_bytes.to_be_bytes());
     Ok(())
 }
 
@@ -586,8 +597,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
-            maximum_batch_count: 16,
-            maximum_retained_bytes: 1_048_576,
         }
     }
 
@@ -599,18 +608,19 @@ mod tests {
             .expect("fixture start is canonical")
     }
 
-    /// Normative v5 vector: one assignment for tenant
+    /// Normative v6 vector: one assignment for tenant
     /// `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`, fingerprint
     /// `00..1f`, one typed hot descriptor, three required columns carried once
     /// on the assignment, a single `Eq(service_name, "api")` predicate, and the
-    /// normative Scribe cut and reader cut must encode to exactly 472 bytes and
+    /// normative Scribe cut and reader cut must encode to exactly 460 bytes and
     /// hash to the fixed digest below. Asserting both the byte length and the
     /// hash prevents a compensating pair of layout mistakes from passing.
     ///
     /// The 112-byte growth over v4's 360 is exactly the reader cut: 16 table
     /// uuid + 8 snapshot + 8 snapshot timestamp + 8 retained head + 4 ancestry
     /// count + 24 for its three entries + 4 digest version + 32 digest + 8
-    /// epoch fence.
+    /// epoch fence. v6 is 12 bytes shorter than v5's 472: the Scribe cut no
+    /// longer carries its `u32` batch count and `u64` retained-byte limit.
     #[test]
     fn normative_vector_encodes_to_fixed_length_and_digest() {
         let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
@@ -642,14 +652,14 @@ mod tests {
         let bytes = encode_assignment_authority_bytes(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             bytes.len(),
-            472,
-            "normative vector must encode to exactly 472 bytes"
+            460,
+            "normative vector must encode to exactly 460 bytes"
         );
 
         let digest = assignment_authority_digest(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             digest,
-            "df6be129b4cd43adc133c3adca78a4ea91bdd71716cc2f365f43e28534ea40e6"
+            "6e6cc4d337dc9706ae4ac3fca2cbef3db2023be2ef683e903e7c3acd4c3f6d38"
         );
     }
 

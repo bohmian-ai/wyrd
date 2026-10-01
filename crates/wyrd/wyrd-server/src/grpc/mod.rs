@@ -415,7 +415,11 @@ pub fn build_peer_grpc(
     // capability is absent fails closed instead.
     let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(
         GrpcTransportAdmissionService::new_peer(
-            crate::oracle::OraclePeerGrpc::new(Arc::clone(&state.bifrost)).into_server(),
+            crate::oracle::OraclePeerGrpc::new(
+                Arc::clone(&state.bifrost),
+                state.shutdown_token.clone(),
+            )
+            .into_server(),
             transport.clone(),
         ),
     );

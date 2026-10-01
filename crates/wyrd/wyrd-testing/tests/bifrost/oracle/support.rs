@@ -19,7 +19,8 @@ use std::time::Duration;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
-use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties;
+use vala_bifrost_redux::parquet::footer::tenant_key_value;
+use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use vala_bifrost_redux::schema::with_managed_columns;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -121,19 +122,25 @@ pub(crate) async fn client_from_bootstrap(
 ///
 /// # Errors
 ///
-/// Returns the client configuration error.
+/// Returns a message when the pod serves no public listener, or the client
+/// configuration error.
 pub(crate) fn public_client(
-    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    node: &wyrd_testing::WyrdTestServer,
     api_key: &secrecy::SecretString,
 ) -> Result<WyrdClient, JourneyError> {
     Ok(WyrdClient::with_config(ClientConfig {
         grpc: GrpcConfig {
-            endpoint: format!("http://{}", node.grpc_addr()),
+            endpoint: node
+                .grpc_url()
+                .ok_or("the pod serves no public gRPC listener")?,
             connect_retries: 0,
             ..GrpcConfig::default()
         },
         http: HttpConfig {
-            base_url: format!("http://{}", node.http_addr()),
+            base_url: node
+                .base_url()
+                .ok_or("the pod serves no public HTTP listener")?
+                .to_owned(),
             ..HttpConfig::default()
         },
         credential: Some(api_key.clone()),
@@ -227,9 +234,11 @@ pub(crate) async fn writer_from_bootstrap(
     .await?)
 }
 
-/// Persist one foreign-tenant physical row beneath the production provider union.
+/// Persist one foreign-tenant physical file beneath the production provider union.
 ///
-/// The row is well formed in every respect except its tenancy, including the
+/// The file sits under `owner`'s prefix and file list but its footer records
+/// `foreign` as its tenant, the way a misrouted write would. It is well formed
+/// in every respect except that footer tenant, including the
 /// durable SHA-256 the Scribe file-list writer always publishes. That matters:
 /// the Oracle refuses a hot row whose checksum is not an identity before it
 /// signs a descriptor, so a checksumless row would fail closed for the wrong
@@ -268,11 +277,14 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_timezone("UTC")),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_001_i64]).with_timezone("UTC")),
             Arc::new(batch_ids.finish()),
-            Arc::new(StringArray::from(vec![foreign.to_string()])),
         ],
     )?;
     let mut parquet = Vec::new();
-    let properties = bifrost_writer_properties(batch.num_rows(), &[]);
+    let properties = bifrost_writer_properties_with_metadata(
+        batch.num_rows(),
+        vec![tenant_key_value(foreign)],
+        &[],
+    );
     let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
     writer.write(&batch)?;
     writer.close()?;
@@ -657,19 +669,19 @@ pub(crate) const BASELINE_POLLS: usize = 50;
 ///
 /// # Errors
 ///
-/// Returns the control-protocol error, or a description of what the pod still
+/// Returns the ownership read failure, or a description of what the pod still
 /// retained when the bound expired.
 pub(crate) async fn await_baseline(
-    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    cluster: &crate::peer_cluster::PeerCluster,
     index: usize,
-    before: wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot,
+    before: crate::peer_cluster::OracleOwnershipSnapshot,
 ) -> Result<(), JourneyError> {
     for _ in 0..BASELINE_POLLS {
-        if cluster.nodes_mut()[index].ownership_snapshot()? == before {
+        if cluster.ownership_snapshot(index)? == before {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let after = cluster.nodes_mut()[index].ownership_snapshot()?;
+    let after = cluster.ownership_snapshot(index)?;
     Err(format!("pod {index} did not return to {before:?}, holds {after:?}").into())
 }

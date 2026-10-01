@@ -388,7 +388,15 @@ impl ScribeImpl {
             expected_schema_fingerprint,
             partition_granularity,
         } = self.resolve_logical_frame(frame).await?;
-        let receipt_micros = self.receipt_micros()?;
+        // The one receipt instant this frame is admitted under. Production
+        // reads the system clock; a test-support owner adds the offset
+        // installed by `shift_receipt_clock_for_test`.
+        let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()?;
+        #[cfg(any(test, feature = "test-support"))]
+        let receipt_micros = receipt_micros.saturating_add(
+            self.receipt_offset_micros_for_test
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
         let binding_facts =
             crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
                 .map_err(|_| ScribeError::InvalidFrame)?;
@@ -632,25 +640,6 @@ impl ScribeImpl {
             }
         }
         self.memory.ingress_limit_bytes()
-    }
-
-    /// Captures the one receipt instant a transport frame is admitted under.
-    ///
-    /// Production reads the system clock; a test-support owner adds the
-    /// offset installed by [`Self::shift_receipt_clock_for_test`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the system clock precedes the
-    /// UNIX epoch or exceeds Arrow's signed microsecond range.
-    fn receipt_micros(&self) -> Result<i64, ScribeError> {
-        let now = crate::scribe::execution_lanes::current_receipt_micros()?;
-        #[cfg(any(test, feature = "test-support"))]
-        let now = now.saturating_add(
-            self.receipt_offset_micros_for_test
-                .load(std::sync::atomic::Ordering::Acquire),
-        );
-        Ok(now)
     }
 
     /// Moves the receipt instant of every later transport frame `ahead`.

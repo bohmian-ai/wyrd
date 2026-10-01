@@ -22,17 +22,17 @@ use vala_bifrost_redux::oracle::analytical::{
 use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass};
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::bifrost::process_cluster::BifrostProcessCluster;
-use wyrd_testing::bifrost::process_cluster::{OracleOwnershipSnapshot, ProcessNodeTarget};
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 use wyrd_tonic::query_conversion::QueryStreamConverter;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
 
+use crate::peer_cluster::{OracleOwnershipSnapshot, PeerCluster};
 use crate::support::*;
 
 /// Rows written into the selection fixture table.
@@ -150,21 +150,17 @@ async fn await_retired(
 /// Returns the control-protocol error, or a description of what the pod held
 /// when the bound expired.
 async fn await_admitted(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
     index: usize,
     units: u32,
 ) -> Result<(), JourneyError> {
     for _ in 0..BASELINE_POLLS {
-        if cluster.nodes_mut()[index]
-            .ownership_snapshot()?
-            .root_active_queries
-            >= units
-        {
+        if cluster.ownership_snapshot(index)?.root_active_queries >= units {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let snapshot = cluster.nodes_mut()[index].ownership_snapshot()?;
+    let snapshot = cluster.ownership_snapshot(index)?;
     Err(format!("pod {index} never granted {units} slot units, holds {snapshot:?}").into())
 }
 
@@ -441,9 +437,6 @@ async fn hold_and_release(
     Ok(())
 }
 
-/// Path of the compiled child every simulated pod in this journey runs.
-const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
-
 /// Index of the pod public queries are addressed to.
 const COORDINATOR: usize = 0;
 
@@ -459,6 +452,65 @@ const PEER_SCRIBE: usize = 3;
 /// single held graph owns everything Analytical work can be granted while the
 /// remaining unit stays available to the Interactive floor.
 const ANALYTICAL_GRAPH_UNITS: u32 = 1;
+
+/// Remote-work evidence one distributed statement must advance.
+///
+/// Every follower's graph-lease activations are its own, so their per-follower
+/// delta attributes remote stages to each follower. The private-plane
+/// body-poll counter is process-wide in the in-process topology, so its delta
+/// proves only that some admitted peer request reached a body.
+struct RemoteWork {
+    /// Graph-lease activations per follower, in [`PEER_FOLLOWERS`] order.
+    leases: Vec<u64>,
+    /// Process-wide private-plane body polls.
+    polls: u64,
+}
+
+impl RemoteWork {
+    /// Records the evidence before a statement runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a follower is not running.
+    fn observe(cluster: &PeerCluster) -> Result<Self, JourneyError> {
+        Ok(Self {
+            leases: PEER_FOLLOWERS
+                .iter()
+                .map(|index| Ok(cluster.graph_leases(*index)?.0))
+                .collect::<Result<_, JourneyError>>()?,
+            polls: cluster.peer_body_polls(),
+        })
+    }
+
+    /// Requires every follower to have leased a graph and a peer body to have
+    /// been polled since [`Self::observe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming `case` and the follower or counter that did
+    /// not advance.
+    fn expect_advanced(&self, cluster: &PeerCluster, case: &str) -> Result<(), JourneyError> {
+        for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
+            let activated = cluster.graph_leases(index)?.0;
+            if activated <= self.leases[offset] {
+                return Err(format!(
+                    "{case}: follower {index} leased no graph: {activated} activations, was {}",
+                    self.leases[offset]
+                )
+                .into());
+            }
+        }
+        let polls = cluster.peer_body_polls();
+        if polls <= self.polls {
+            return Err(format!(
+                "{case}: no peer body was polled: {polls} polls, was {}",
+                self.polls
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
 
 /// What one public query settled to over the real public HTTP surface.
 struct PublicSettlement {
@@ -585,12 +637,12 @@ fn column<'batch, A: 'static>(
 /// transport failure or carries another code, when the build total moves by
 /// anything other than one, or when the phase records no cut.
 async fn expect_single_build_failure(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
     client: &WyrdClient,
     sql: &str,
     case: &str,
 ) -> Result<String, JourneyError> {
-    let before = cluster.nodes_mut()[COORDINATOR].physical_build_evidence()?;
+    let before = cluster.physical_build_evidence(COORDINATOR)?;
     let failure = match run_public(client, sql).await {
         Ok(settled) => {
             return Err(format!(
@@ -610,7 +662,7 @@ async fn expect_single_build_failure(
     if sdk_code(sdk) != "WYRD_VALA_500_QUERY_EXECUTION_FAILED" {
         return Err(format!("{case}: settled code {}: {sdk}", sdk_code(sdk)).into());
     }
-    let after = cluster.nodes_mut()[COORDINATOR].physical_build_evidence()?;
+    let after = cluster.physical_build_evidence(COORDINATOR)?;
     if after.total != before.total + 1 {
         return Err(format!(
             "{case}: entered the physical builder {} times, expected exactly one",
@@ -655,41 +707,37 @@ async fn single_planner_root_selects_path_and_capacity() {
 /// Panics if the deadline helper observes extended authority, late execution,
 /// incorrect rows, or physical-build/ownership evidence inconsistent with the query.
 async fn prove_single_planner_routing() -> Result<(), JourneyError> {
-    let mut cluster = wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
-        ],
-    )
+    let mut cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
     let api_key = cluster
         .provision_public_api_key("single-planner-caller")
         .await?;
     let table = format!("single_planner_{}", uuid::Uuid::now_v7().simple());
-    cluster.nodes_mut()[PEER_SCRIBE].register_table(&table)?;
-    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
+    cluster.register_table(PEER_SCRIBE, &table).await?;
+    cluster
+        .ingest_rows(PEER_SCRIBE, &table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
+        .await?;
     for index in [
         COORDINATOR,
         PEER_FOLLOWERS[0],
         PEER_FOLLOWERS[1],
         PEER_SCRIBE,
     ] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     let baseline: Vec<_> = oracle_indices(&cluster)
         .into_iter()
-        .map(|index| Ok((index, cluster.nodes_mut()[index].ownership_snapshot()?)))
+        .map(|index| Ok((index, cluster.ownership_snapshot(index)?)))
         .collect::<Result<_, JourneyError>>()?;
-    let polls_before: Vec<u64> = PEER_FOLLOWERS
-        .iter()
-        .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
-        .collect::<Result<_, JourneyError>>()?;
+    let remote_before = RemoteWork::observe(&cluster)?;
 
-    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
     let scan_sql = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
     let grouped_sql = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
@@ -722,28 +770,16 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     )?;
 
     // Real remote stages, not a leader-local rewrite of a distributed plan.
-    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
-        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
-        if polls <= polls_before[offset] {
-            return Err(format!(
-                "follower {index} admitted no peer body: {polls} polls, was {}",
-                polls_before[offset]
-            )
-            .into());
-        }
-    }
+    remote_before.expect_advanced(&cluster, "distributed root")?;
     for (index, before) in baseline.clone() {
-        await_baseline(&mut cluster, index, before).await?;
+        await_baseline(&cluster, index, before).await?;
     }
 
     // A same-table self-join reaches the one registered provider twice. Each
     // alias carries its own projection and predicate closure, so the two
     // physical occurrences must bind independently: a collision would let one
     // side read the other's closure and change the result.
-    let polls_before_join: Vec<u64> = PEER_FOLLOWERS
-        .iter()
-        .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
-        .collect::<Result<_, JourneyError>>()?;
+    let remote_before_join = RemoteWork::observe(&cluster)?;
     let self_join_sql = format!(
         "SELECT l.id AS left_id, r.id AS right_id \
          FROM vala.bifrost.{table} l \
@@ -767,28 +803,19 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         )
         .into());
     }
-    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
-        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
-        if polls <= polls_before_join[offset] {
-            return Err(format!(
-                "follower {index} admitted no self-join peer body: {polls} polls, was {}",
-                polls_before_join[offset]
-            )
-            .into());
-        }
-    }
+    remote_before_join.expect_advanced(&cluster, "same-table self-join")?;
     for (index, before) in baseline.clone() {
-        await_baseline(&mut cluster, index, before).await?;
+        await_baseline(&cluster, index, before).await?;
     }
 
     // One armed planning refusal settles the sole attempt: there is no second
     // build to fall back to, so the caller sees a failure rather than rows.
-    cluster.nodes_mut()[COORDINATOR].arm_analytical_plan_failure()?;
+    cluster.arm_analytical_plan_failure(COORDINATOR)?;
     let refusal_cut =
         expect_single_build_failure(&mut cluster, &client, &grouped_sql, "planning refusal")
             .await?;
     for (index, before) in baseline.clone() {
-        await_baseline(&mut cluster, index, before).await?;
+        await_baseline(&cluster, index, before).await?;
     }
 
     // A pinned object that no longer exists is terminal on the ordinary
@@ -805,10 +832,10 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         return Err(format!("both failure phases report one request-local cut {stale_cut}").into());
     }
     for (index, before) in baseline {
-        await_baseline(&mut cluster, index, before).await?;
+        await_baseline(&cluster, index, before).await?;
     }
 
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -822,18 +849,20 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
 /// Panics if the response widens ingress time, preparation executes after expiry,
 /// or physical-build, terminal, or returned-row evidence violates the query.
 async fn prove_preparation_deadline(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
     api_key: &secrecy::SecretString,
     sql: &str,
     endpoint: usize,
     expire: bool,
 ) -> Result<(), JourneyError> {
-    let client = public_client(&cluster.nodes()[endpoint], api_key)?;
+    let client = public_client(cluster.server(endpoint)?, api_key)?;
     let bearer = client.auth().bearer().await?;
-    let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(format!(
-        "http://{}",
-        cluster.nodes()[endpoint].grpc_addr()
-    ))?
+    let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(
+        cluster
+            .server(endpoint)?
+            .grpc_url()
+            .ok_or("the endpoint serves no public gRPC listener")?,
+    )?
     .connect()
     .await?;
     let mut grpc = BifrostQueryServiceClient::new(channel);
@@ -851,22 +880,19 @@ async fn prove_preparation_deadline(
     let candidates = oracle_indices(cluster);
     let baseline = candidates
         .iter()
-        .map(|index| {
-            Ok((
-                *index,
-                cluster.nodes_mut()[*index].ownership_snapshot()?,
-                cluster.nodes_mut()[*index].physical_build_evidence()?.total,
-            ))
-        })
+        .map(|index| Ok((*index, cluster.ownership_snapshot(*index)?)))
         .collect::<Result<Vec<_>, JourneyError>>()?;
+    // Physical builds are counted process-wide, so one total before the
+    // statement covers every candidate coordinator at once.
+    let builds_before = cluster.physical_build_evidence(COORDINATOR)?.total;
     for index in &candidates {
-        cluster.nodes_mut()[*index].arm_preparation_pause(&request_id)?;
+        cluster.arm_preparation_pause(*index, &request_id)?;
     }
     let response = tokio::spawn(async move { grpc.query(query).await });
     let accepted = tokio::time::timeout(std::time::Duration::from_secs(4), async {
         loop {
             for index in &candidates {
-                if let Some(deadline) = cluster.nodes_mut()[*index].preparation_pause_deadline()? {
+                if let Some(deadline) = cluster.preparation_pause_deadline(*index) {
                     return Ok::<_, JourneyError>(deadline);
                 }
             }
@@ -880,7 +906,7 @@ async fn prove_preparation_deadline(
         tokio::time::sleep(std::time::Duration::from_millis(remaining + 20)).await;
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), response).await??;
         for index in &candidates {
-            cluster.nodes_mut()[*index].release_preparation_pause()?;
+            cluster.release_preparation_pause(*index)?;
         }
         let error = outcome.expect_err("expired preparation cannot publish a response stream");
         let problem: serde_json::Value = serde_json::from_slice(
@@ -891,14 +917,14 @@ async fn prove_preparation_deadline(
                 .to_bytes()?,
         )?;
         assert_eq!(problem["code"], "WYRD_VALA_504_QUERY_TIMEOUT");
-        for (index, ownership, before) in baseline {
+        for (index, ownership) in baseline {
             await_baseline(cluster, index, ownership).await?;
-            assert_eq!(
-                cluster.nodes_mut()[index].physical_build_evidence()?.total,
-                before,
-                "expired pinning cannot build or publish a roster to execution"
-            );
         }
+        assert_eq!(
+            cluster.physical_build_evidence(COORDINATOR)?.total,
+            builds_before,
+            "expired pinning cannot build or publish a roster to execution"
+        );
         return Ok(());
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -907,7 +933,7 @@ async fn prove_preparation_deadline(
         "post-pin pause must retain preparation"
     );
     for index in &candidates {
-        cluster.nodes_mut()[*index].release_preparation_pause()?;
+        cluster.release_preparation_pause(*index)?;
     }
     let response = response.await??;
     let advertised: i64 = response
@@ -946,11 +972,10 @@ async fn prove_preparation_deadline(
     );
     assert_eq!(terminal.query_class, QueryClass::Analytical);
     assert_eq!(terminal.row_count, u64::try_from(FIXTURE_GROUPS)?);
-    let mut builds = 0;
-    for (index, ownership, before) in baseline {
+    for (index, ownership) in baseline {
         await_baseline(cluster, index, ownership).await?;
-        builds += cluster.nodes_mut()[index].physical_build_evidence()?.total - before;
     }
+    let builds = cluster.physical_build_evidence(COORDINATOR)?.total - builds_before;
     assert_eq!(builds, 1, "preparation must retain one physical build");
     assert_eq!(
         advertised, accepted,
@@ -963,7 +988,7 @@ async fn prove_preparation_deadline(
 ///
 /// Only row-bearing Parquet objects are eligible, so the caller deletes data
 /// while every Iceberg metadata and manifest file the snapshot depends on
-/// stays intact. The process fixture seals its rows to staged hot Parquet and
+/// stays intact. The peer fixture seals its rows to staged hot Parquet and
 /// runs no Forge compaction, so this is that hot object; the pinned cut names
 /// it exactly as it names a compacted one, and the stale-source branch under
 /// test does not distinguish the two.
@@ -972,7 +997,7 @@ async fn prove_preparation_deadline(
 ///
 /// Returns a description when the store cannot be walked or holds no pinned
 /// data object for `table`.
-fn pinned_parquet(cluster: &BifrostProcessCluster, table: &str) -> Result<String, JourneyError> {
+fn pinned_parquet(cluster: &PeerCluster, table: &str) -> Result<String, JourneyError> {
     let root = cluster.storage_root().to_path_buf();
     let mut seen: Vec<String> = Vec::new();
     let mut pending = vec![root.clone()];
@@ -1041,7 +1066,7 @@ async fn public_query_selects_both_paths_and_preserves_interactive_floor() {
         .expect("public analytical activation journey");
 }
 
-/// Drives both public paths against one live four-process topology.
+/// Drives both public paths against one live four-pod peer topology.
 ///
 /// # Errors
 ///
@@ -1054,23 +1079,19 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     // deriving it from the injected memory envelope is what makes the refusal
     // a statement about admitted capacity instead of about whatever the
     // envelope happened to divide into.
-    let mut cluster =
-        wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start_with_oracle_query_slot_limit(
-            NODE_BINARY,
-            &[
-                wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-                wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-                wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-                wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
-            ],
-            Some(2),
-        )
-        .await?;
+    let mut cluster = PeerCluster::start_with_slots(&[
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Oracle, Some(2)),
+        (BifrostTarget::Scribe, None),
+    ])
+    .await?;
 
-    let pids: std::collections::BTreeSet<u32> =
-        cluster.nodes().iter().map(|node| node.pid()).collect();
-    if pids.len() != cluster.nodes().len() {
-        return Err(format!("four pods must be four processes, saw pids {pids:?}").into());
+    let sockets: std::collections::BTreeSet<_> = (0..cluster.len())
+        .map(|index| cluster.peer_addr(index))
+        .collect::<Result<_, JourneyError>>()?;
+    if sockets.len() != cluster.len() {
+        return Err(format!("four pods must be four peer sockets, saw {sockets:?}").into());
     }
 
     // A public request carries no execution-path field: the path is server
@@ -1090,35 +1111,34 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
         .await?;
     let suffix = uuid::Uuid::now_v7().simple();
     let table = format!("public_activation_{suffix}");
-    cluster.nodes_mut()[PEER_SCRIBE].register_table(&table)?;
-    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
-    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.register_table(PEER_SCRIBE, &table).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
     // The UI table publishes one object, so its scan is a single-partition
     // leader-executable leaf and its root is normal. The Analytical table above
     // publishes two, which is what gives its grouped statement real remote work
     // to distribute.
     let ui_table = format!("public_activation_ui_{suffix}");
-    cluster.nodes_mut()[PEER_SCRIBE].register_table(&ui_table)?;
-    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&ui_table, 0, 12, 3)?;
+    cluster.register_table(PEER_SCRIBE, &ui_table).await?;
+    cluster
+        .ingest_rows(PEER_SCRIBE, &ui_table, 0, 12, 3)
+        .await?;
     for index in [
         COORDINATOR,
         PEER_FOLLOWERS[0],
         PEER_FOLLOWERS[1],
         PEER_SCRIBE,
     ] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     let baseline: Vec<_> = oracle_indices(&cluster)
         .into_iter()
-        .map(|index| Ok((index, cluster.nodes_mut()[index].ownership_snapshot()?)))
+        .map(|index| Ok((index, cluster.ownership_snapshot(index)?)))
         .collect::<Result<_, JourneyError>>()?;
-    let polls_before: Vec<u64> = PEER_FOLLOWERS
-        .iter()
-        .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
-        .collect::<Result<_, JourneyError>>()?;
+    let remote_before = RemoteWork::observe(&cluster)?;
 
-    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
     let analytical_sql = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
@@ -1129,13 +1149,13 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     // production queries while the UI query below asks for its own path. Two
     // graphs are exactly the class capacity configured above.
     let paused = PEER_FOLLOWERS[0];
-    cluster.nodes_mut()[paused].arm_execute_pause()?;
+    cluster.arm_execute_pause(paused)?;
     let held = {
-        let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+        let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
         let sql = analytical_sql.clone();
         tokio::spawn(async move { run_public(&client, &sql).await })
     };
-    cluster.nodes_mut()[paused].await_execute_paused()?;
+    cluster.await_execute_paused(paused).await?;
     // The pause proves the graph reached a follower; the leader's own granted
     // unit count is what proves it holds the whole Analytical envelope, which
     // is the condition the queued timeout below is a statement about.
@@ -1172,7 +1192,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
             );
         }
         Ok(settled) => {
-            let snapshot = cluster.nodes_mut()[COORDINATOR].ownership_snapshot()?;
+            let snapshot = cluster.ownership_snapshot(COORDINATOR)?;
             return Err(format!(
                 "an Analytical query settled {:?} while the class was fully held; leader holds {snapshot:?}",
                 settled.path
@@ -1181,7 +1201,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
         }
     }
 
-    cluster.nodes_mut()[paused].release_execute_pause()?;
+    cluster.release_execute_pause(paused)?;
     let analytical = held.await??;
     if analytical.path != QueryClass::Analytical {
         return Err(format!(
@@ -1231,35 +1251,18 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     }
 
     // Real peer-socket work, not a local rewrite of a distributed plan.
-    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
-        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
-        if polls <= polls_before[offset] {
-            return Err(format!(
-                "follower {index} admitted no peer body: {polls} polls, was {}",
-                polls_before[offset]
-            )
-            .into());
-        }
-    }
+    remote_before.expect_advanced(&cluster, "public activation")?;
 
     for (index, before) in baseline {
-        await_baseline(&mut cluster, index, before).await?;
+        await_baseline(&cluster, index, before).await?;
     }
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
-/// Returns every Oracle pod index in one process topology.
-fn oracle_indices(cluster: &BifrostProcessCluster) -> Vec<usize> {
-    cluster
-        .nodes()
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| {
-            node.target() == wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle
-        })
-        .map(|(index, _)| index)
-        .collect()
+/// Returns every Oracle pod index in one peer topology.
+fn oracle_indices(cluster: &PeerCluster) -> Vec<usize> {
+    cluster.indices_of(BifrostTarget::Oracle)
 }
 
 /// Fallback is a pre-selection decision only, and a selected Analytical query
@@ -1333,30 +1336,27 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
 ///
 /// Returns the first claim that broke.
 async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
-    let mut cluster = wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
-        ],
-    )
+    let mut cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
     let api_key = cluster
         .provision_public_api_key("selected-failure-caller")
         .await?;
     let table = format!("selected_failure_{}", uuid::Uuid::now_v7().simple());
-    cluster.nodes_mut()[PEER_SCRIBE].register_table(&table)?;
-    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
-    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.register_table(PEER_SCRIBE, &table).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
+    cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
     for index in [
         COORDINATOR,
         PEER_FOLLOWERS[0],
         PEER_FOLLOWERS[1],
         PEER_SCRIBE,
     ] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     let sql = format!(
@@ -1365,14 +1365,12 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     );
     let paused = PEER_FOLLOWERS[0];
     let survivor = PEER_FOLLOWERS[1];
-    let attempts_before = attempt_totals(&mut cluster)?;
-    let builds_before = cluster.nodes_mut()[COORDINATOR]
-        .physical_build_evidence()?
-        .total;
-    cluster.nodes_mut()[paused].arm_execute_pause()?;
-    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let attempts_before = attempt_totals(&cluster)?;
+    let builds_before = cluster.physical_build_evidence(COORDINATOR)?.total;
+    cluster.arm_execute_pause(paused)?;
+    let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
     let query = {
-        let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+        let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
         let sql = sql.clone();
         // Driven here rather than through `run_public` because the claim is
         // about the failure itself: the caller must receive one structured
@@ -1388,13 +1386,13 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
             Ok::<usize, BifrostClientError>(rows)
         })
     };
-    cluster.nodes_mut()[paused].await_execute_paused()?;
+    cluster.await_execute_paused(paused).await?;
 
     // Read while the query is still held at the follower: the cut the leader's
     // active entry retains is the one its single build ran against, so the
     // terminal failure below cannot be reporting a rebuilt or repinned
     // membership.
-    let held = cluster.nodes_mut()[COORDINATOR].physical_build_evidence()?;
+    let held = cluster.physical_build_evidence(COORDINATOR)?;
     let [active_cut] = held.active_cut_fingerprints.as_slice() else {
         return Err(format!(
             "the paused query must be the coordinator's sole active query, saw {:?}",
@@ -1410,7 +1408,7 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         .into());
     }
 
-    cluster.nodes_mut()[paused].kill()?;
+    cluster.kill(paused).await?;
 
     let failure = match query.await? {
         Ok(rows) => {
@@ -1426,9 +1424,7 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
 
     // One build for the whole attempt: the lost peer produced no successor
     // ordinal, so the coordinator never re-entered the shared physical builder.
-    let builds = cluster.nodes_mut()[COORDINATOR]
-        .physical_build_evidence()?
-        .total;
+    let builds = cluster.physical_build_evidence(COORDINATOR)?.total;
     if builds != builds_before + 1 {
         return Err(format!(
             "the lost peer entered the physical builder {} times, expected exactly one",
@@ -1440,10 +1436,10 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     // One attempt, terminally failed. A repin, a replan, or any local
     // successor would raise the total past one, and a cancellation or a
     // success would land the one attempt on another outcome entirely.
-    let attempts = attempt_totals(&mut cluster)?;
+    let attempts = attempt_totals(&cluster)?;
     let started = attempts.total - attempts_before.total;
     let succeeded = attempts.succeeded - attempts_before.succeeded;
-    if started != 1.0 || succeeded != 0.0 {
+    if started != 1 || succeeded != 0 {
         return Err(format!(
             "the lost peer settled {started} attempts of which {succeeded} succeeded, \
              not exactly one unsuccessful attempt"
@@ -1463,72 +1459,37 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     if live != 0 {
         return Err(format!("the survivor still holds {live} graph leases").into());
     }
-    let idle = wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot {
-        leader_attempts: 0,
-        leader_graphs: 0,
-        leader_cleanup_failures: 0,
-        follower_attempts: 0,
-        follower_graphs: 0,
-        follower_cleanup_failures: 0,
-        active_queries: 0,
-        queued_queries: 0,
-        reserved_memory_bytes: 0,
-        peer_running: 0,
-        root_active_queries: 0,
-        root_analytical_queries: 0,
-        root_query_memory_used_bytes: 0,
-        root_query_active: false,
-        scratch: wyrd_testing::bifrost::process_cluster::ScratchUsage {
-            entries: 0,
-            bytes: 0,
-        },
-        attempts_active: 0.0,
-        exchanges_active: 0.0,
-    };
-    await_baseline(&mut cluster, COORDINATOR, idle).await?;
+    await_baseline(&cluster, COORDINATOR, OracleOwnershipSnapshot::IDLE).await?;
 
-    // The pod this journey killed has no stdin left, so explicit shutdown
-    // reports it; asserting on that proves every other pod was still joined.
-    let killed = cluster.nodes()[paused].label().to_owned();
     drop(client);
-    match cluster.shutdown() {
-        Err(reported) if reported.to_string().contains(&killed) => Ok(()),
-        Err(reported) => Err(format!("shutdown reported {reported}, not {killed}").into()),
-        Ok(()) => Err(format!("shutdown did not report the killed pod {killed}").into()),
-    }
+    cluster.shutdown().await?;
+    Ok(())
 }
 
 /// Analytical attempt totals one coordinator has recorded.
 struct AttemptTotals {
-    /// Attempts settled on every outcome.
-    total: f64,
-    /// Attempts settled on the successful outcome alone.
-    succeeded: f64,
+    /// Attempts the coordinator admitted.
+    total: u64,
+    /// Attempts the coordinator settled on the successful outcome alone.
+    succeeded: u64,
 }
 
-/// Reads the coordinator's own Analytical attempt counters.
+/// Reads the coordinator's own Analytical attempt counts.
 ///
-/// The counter is the production family a build increments once per attempt,
-/// so a differenced pair of these reads is what makes "one build, and it did
-/// not succeed" an observation rather than an inference from the absence of
-/// rows. A lost peer settles its one attempt as cancelled rather than failed —
-/// the leader cancels the graph — so the successful outcome is the one the
-/// claim excludes.
+/// Every pod shares one process here, so the process-wide attempt counter
+/// family would also sum the followers' stage attempts; the coordinator's
+/// supervisor counts only its own. A differenced pair of these reads is what
+/// makes "one build, and it did not succeed" an observation rather than an
+/// inference from the absence of rows. A lost peer settles its one attempt as
+/// cancelled rather than failed — the leader cancels the graph — so the
+/// successful outcome is the one the claim excludes.
 ///
 /// # Errors
 ///
-/// Returns the control-protocol error unchanged.
-fn attempt_totals(cluster: &mut BifrostProcessCluster) -> Result<AttemptTotals, JourneyError> {
-    let family = "bifrost_oracle_analytical_attempts_total";
-    let total = cluster.nodes_mut()[COORDINATOR].metric_totals(&[family])?;
-    let succeeded = cluster.nodes_mut()[COORDINATOR].metric_totals_labeled(
-        &[family],
-        &std::collections::BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
-    )?;
-    Ok(AttemptTotals {
-        total: total.get(family).copied().unwrap_or_default(),
-        succeeded: succeeded.get(family).copied().unwrap_or_default(),
-    })
+/// Returns a message when the coordinator composes no Analytical handle.
+fn attempt_totals(cluster: &PeerCluster) -> Result<AttemptTotals, JourneyError> {
+    let (total, succeeded) = cluster.attempt_counts(COORDINATOR)?;
+    Ok(AttemptTotals { total, succeeded })
 }
 
 /// Waits, bounded, until one pod has released every graph lease it activated.
@@ -1542,17 +1503,17 @@ fn attempt_totals(cluster: &mut BifrostProcessCluster) -> Result<AttemptTotals, 
 /// Returns the control-protocol error, or a description of the lease the pod
 /// still held when the bound expired.
 async fn await_released_lease(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
     index: usize,
 ) -> Result<(u64, usize), JourneyError> {
     for _ in 0..BASELINE_POLLS {
-        let leases = cluster.nodes_mut()[index].graph_leases()?;
+        let leases = cluster.graph_leases(index)?;
         if leases.1 == 0 {
             return Ok(leases);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let (activated, live) = cluster.nodes_mut()[index].graph_leases()?;
+    let (activated, live) = cluster.graph_leases(index)?;
     Err(format!("pod {index} activated {activated} leases and still holds {live}").into())
 }
 
@@ -1563,7 +1524,7 @@ async fn await_released_lease(
 /// that reserved only its configured subset.
 const BOUNDED_REMOTES: [usize; 3] = [1, 2, 3];
 
-/// Scribe pod index in this journey's five-process topology.
+/// Scribe pod index in this journey's five-pod peer topology.
 const BOUNDED_SCRIBE: usize = 4;
 
 /// Remote Oracles one Analytical attempt may reserve.
@@ -1593,47 +1554,50 @@ async fn analytical_reserves_only_configured_workers() {
         .expect("bounded Analytical worker reservation journey");
 }
 
-/// Drives the bounded-selection journey over one live five-process topology.
+/// Drives the bounded-selection journey over one live five-pod peer topology.
 ///
 /// # Errors
 ///
 /// Returns the first selection, isolation, floor, or cleanup claim that broke.
 async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
+    let mut cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
     let api_key = cluster
         .provision_public_api_key("bounded-workers-caller")
         .await?;
     let suffix = uuid::Uuid::now_v7().simple();
     let table = format!("bounded_workers_{suffix}");
-    cluster.nodes_mut()[BOUNDED_SCRIBE].register_table(&table)?;
-    cluster.nodes_mut()[BOUNDED_SCRIBE].ingest_rows(&table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
-    cluster.nodes_mut()[BOUNDED_SCRIBE].ingest_rows(&table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
+    cluster.register_table(BOUNDED_SCRIBE, &table).await?;
+    cluster
+        .ingest_rows(BOUNDED_SCRIBE, &table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
+        .await?;
+    cluster
+        .ingest_rows(BOUNDED_SCRIBE, &table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
+        .await?;
     // The UI table publishes one object, so its scan stays a leader-executable
     // leaf and its root stays Interactive while the Analytical graph is held.
     let ui_table = format!("bounded_workers_ui_{suffix}");
-    cluster.nodes_mut()[BOUNDED_SCRIBE].register_table(&ui_table)?;
-    cluster.nodes_mut()[BOUNDED_SCRIBE].ingest_rows(&ui_table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
+    cluster.register_table(BOUNDED_SCRIBE, &ui_table).await?;
+    cluster
+        .ingest_rows(BOUNDED_SCRIBE, &ui_table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
+        .await?;
     for index in [COORDINATOR, 1, 2, 3, BOUNDED_SCRIBE] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     let mut baseline = Vec::new();
     for index in [COORDINATOR, 1, 2, 3] {
-        baseline.push((index, cluster.nodes_mut()[index].ownership_snapshot()?));
+        baseline.push((index, cluster.ownership_snapshot(index)?));
     }
     let mut activations_before = Vec::new();
     for index in BOUNDED_REMOTES {
-        activations_before.push(cluster.nodes_mut()[index].graph_leases()?.0);
+        activations_before.push(cluster.graph_leases(index)?.0);
     }
 
     let analytical_sql = format!(
@@ -1646,10 +1610,10 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     // held at their own execute seam and the third is left to prove it was
     // never addressed at all.
     for index in BOUNDED_REMOTES {
-        cluster.nodes_mut()[index].arm_execute_pause()?;
+        cluster.arm_execute_pause(index)?;
     }
     let attempt = {
-        let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+        let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
         let sql = analytical_sql.clone();
         tokio::spawn(async move { run_public(&client, &sql).await })
     };
@@ -1667,7 +1631,15 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
         .find(|(index, _)| *index == unselected)
         .map(|(_, snapshot)| *snapshot)
         .ok_or("the unselected pod has no baseline")?;
-    let held = cluster.nodes_mut()[unselected].ownership_snapshot()?;
+    // The attempt and exchange gauges are process-wide in-process, so they
+    // carry the selected pods' live attempt; every per-pod field must still
+    // equal the unselected pod's baseline exactly.
+    let held = cluster.ownership_snapshot(unselected)?;
+    let idle = OracleOwnershipSnapshot {
+        attempts_active: held.attempts_active,
+        exchanges_active: held.exchanges_active,
+        ..idle
+    };
     if held != idle {
         return Err(format!(
             "unselected pod {unselected} holds {held:?} while a bounded attempt runs"
@@ -1678,12 +1650,12 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     // A refusal the query never asks for cannot be a refusal the query
     // suffers: the unselected pod is armed to refuse the next distributed plan
     // it is asked to build, and the live attempt below still settles.
-    cluster.nodes_mut()[unselected].arm_analytical_plan_failure()?;
+    cluster.arm_analytical_plan_failure(unselected)?;
 
     // Served while the Analytical graph holds its envelope on every selected
     // pod: the combined leader-plus-follower Analytical units never reach into
     // the units Interactive work is owed.
-    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
     let ui = run_public(&client, &ui_sql).await?;
     if ui.path != QueryClass::Interactive {
         return Err(format!(
@@ -1697,7 +1669,7 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     }
 
     for index in BOUNDED_REMOTES {
-        cluster.nodes_mut()[index].release_execute_pause()?;
+        cluster.release_execute_pause(index)?;
     }
     let settled = attempt.await??;
     if settled.path != QueryClass::Analytical {
@@ -1731,7 +1703,7 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     prove_cancelled_query_returns_owners(&mut cluster, &analytical_sql, &baseline).await?;
 
     drop(client);
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -1747,14 +1719,12 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
 ///
 /// Returns the control-protocol error, or the observed lease distribution when
 /// the attempt never settles on exactly its configured subset.
-async fn await_selected_remotes(
-    cluster: &mut BifrostProcessCluster,
-) -> Result<Vec<usize>, JourneyError> {
+async fn await_selected_remotes(cluster: &mut PeerCluster) -> Result<Vec<usize>, JourneyError> {
     let mut live = Vec::new();
     for _ in 0..BASELINE_POLLS {
         live.clear();
         for index in BOUNDED_REMOTES {
-            if cluster.nodes_mut()[index].graph_leases()?.1 > 0 {
+            if cluster.graph_leases(index)?.1 > 0 {
                 live.push(index);
             }
         }
@@ -1780,13 +1750,13 @@ async fn await_selected_remotes(
 /// Returns the control-protocol error, an unexpectedly successful
 /// cancellation, or the first pod that did not return to its baseline.
 async fn prove_cancelled_query_returns_owners(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
     sql: &str,
     baseline: &[(usize, OracleOwnershipSnapshot)],
 ) -> Result<(), JourneyError> {
-    cluster.nodes_mut()[COORDINATOR].start_sql(sql)?;
-    cluster.nodes_mut()[COORDINATOR].cancel_sql()?;
-    if let Ok(rows) = cluster.nodes_mut()[COORDINATOR].await_sql()? {
+    cluster.start_sql(COORDINATOR, sql)?;
+    cluster.cancel_sql(COORDINATOR)?;
+    if let Ok(rows) = cluster.await_sql(COORDINATOR).await? {
         return Err(format!("a cancelled logical query still returned {rows} rows").into());
     }
     for (index, before) in baseline {

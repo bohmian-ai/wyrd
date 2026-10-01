@@ -1255,15 +1255,19 @@ impl ScribeResources {
     /// owns no Oracle spill directory. The peer's response stream owns the
     /// runtime, so closing the leader's stream drops the work and its bytes.
     ///
+    /// Its session runs [`oracle_target_partitions`] for fully local input:
+    /// a Scribe follower reads only its own memtable and staged runs.
+    ///
     /// # Errors
     ///
-    /// Returns [`BifrostResourceError::Unavailable`] when `DataFusion` cannot
+    /// Returns [`BifrostResourceError::InvalidPlan`] when the pod plan has no
+    /// CPU, and [`BifrostResourceError::Unavailable`] when `DataFusion` cannot
     /// build the runtime.
     pub fn follower_execution(
         &self,
         ceiling_bytes: usize,
-        target_partitions: usize,
     ) -> Result<OracleExecution, BifrostResourceError> {
+        let target_partitions = oracle_target_partitions(self.governor.plan().effective_cpu, 1.0)?;
         let memory_pool = self.memory_root.query_view(
             MemoryHolder::Oracle,
             ceiling_bytes,
@@ -5773,11 +5777,18 @@ mod tests {
         assert!(advanced > observed);
     }
 
-    /// The Scribe follower execution is shaped only by the ceiling this node chose.
+    /// The Scribe follower execution is shaped only by this node's own plan.
     ///
-    /// A hot-tail fragment runs one partition at the engine's default batch
-    /// size under the ceiling the Scribe passes, never a value the leader
-    /// supplied, and it cannot spill: a Scribe owns no Oracle spill directory.
+    /// A hot-tail fragment runs the fully local Oracle partition count for
+    /// this pod's CPU, at the engine's default batch size, under the ceiling
+    /// the Scribe passes, never a value the leader supplied, and it cannot
+    /// spill: a Scribe owns no Oracle spill directory.
+    ///
+    /// # Panics
+    /// Panics when the composed runtime has no Scribe capability, the
+    /// follower execution or the local partition count cannot be derived, or
+    /// the execution's shape, partition count, batch size, or disabled spill
+    /// differs from the node-local plan.
     #[test]
     fn scribe_follower_execution_shape_contract() {
         let roles = BifrostRuntimeResources::composed_for_test(
@@ -5787,11 +5798,13 @@ mod tests {
         );
         let scribe = roles.scribe().expect("Scribe capability");
         let execution = scribe
-            .follower_execution(ORACLE_PARTITION_MEMORY_BYTES, 1)
+            .follower_execution(ORACLE_PARTITION_MEMORY_BYTES)
             .expect("Scribe follower execution");
+        let local = oracle_target_partitions(scribe.governor.plan().effective_cpu, 1.0)
+            .expect("local partition count");
 
-        assert_eq!(execution.shape(), OracleSessionShape::new(1));
-        assert_eq!(execution.target_partitions(), 1);
+        assert_eq!(execution.shape(), OracleSessionShape::new(local));
+        assert_eq!(execution.target_partitions(), local);
         let state = execution.session_state(datafusion::prelude::SessionConfig::new());
         assert_eq!(
             state.config().batch_size(),

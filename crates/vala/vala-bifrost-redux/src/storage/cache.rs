@@ -210,6 +210,13 @@ enum ObjectPin {
     /// immutable and every Bifrost writer names each one uniquely, so the
     /// manifest path and size alone name the bytes.
     Published,
+    /// A run a Scribe staged on its local volume. A registered run is fsynced
+    /// once and never rewritten, and a writer epoch never reuses a staged
+    /// path, so the epoch plus the path and size name the bytes.
+    Staged {
+        /// Writer epoch of the Scribe stream that staged the run.
+        writer_epoch: u64,
+    },
 }
 
 impl ObjectMetadataKey {
@@ -251,6 +258,34 @@ impl ObjectMetadataKey {
             pin: ObjectPin::Published,
             size_bytes,
         }
+    }
+
+    /// Builds one Scribe staged run's identity from its local path, the
+    /// staging stream's writer epoch, and the run's size on disk.
+    #[must_use]
+    pub fn staged(
+        tenant_id: DataTenantId,
+        table: String,
+        object: String,
+        writer_epoch: u64,
+        size_bytes: u64,
+    ) -> Self {
+        Self {
+            tenant_id,
+            table,
+            object,
+            pin: ObjectPin::Staged { writer_epoch },
+            size_bytes,
+        }
+    }
+
+    /// Returns the authenticated tenant owning the object.
+    ///
+    /// Every constructor takes it from the reader's authenticated binding, so
+    /// a scan compares each opened object's footer tenant with this value.
+    #[must_use]
+    pub const fn tenant_id(&self) -> DataTenantId {
+        self.tenant_id
     }
 
     /// Returns the object's exact size in bytes.

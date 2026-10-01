@@ -7,11 +7,13 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use datafusion::error::DataFusionError;
 use futures_util::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::dispatcher::{
-    AttemptEncoder, DispatchError, EligibleSourceLossCause, OraclePeerTransport,
-    PEER_PROTOCOL_VERSION, WorkerAttemptStream, WorkerExecution,
+    AttemptEncoder, DispatchError, EligibleSourceLossCause, LiveFrame, NativeOutputTally,
+    OraclePeerTransport, PEER_PROTOCOL_VERSION, WorkerAttemptStream,
 };
 use vala_bifrost_redux::oracle::follower::{
     AuthenticatedFollowerContext, FollowerResolutionError, PhysicalPlanFollowerError,
@@ -39,6 +41,13 @@ use crate::state::{Bifrost, Scribe};
 pub struct OraclePeerGrpc {
     /// One published Bifrost facade owning every selectable peer capability.
     bifrost: Arc<Bifrost>,
+    /// The server's shutdown token; cancelling it ends open fragment streams.
+    ///
+    /// Graceful serving waits for in-flight streams, and a paused or slow
+    /// reader would otherwise hold a stopping pod's fragment open until the
+    /// leader's deadline. Ending it as unavailable lets the leader fail or
+    /// degrade the read at once, as it would for a pod that died.
+    shutdown: CancellationToken,
 }
 
 /// One fault a test-tier journey injects into the next Scribe fragment.
@@ -98,9 +107,12 @@ fn start_scribe_attempt(
 
 impl OraclePeerGrpc {
     /// Creates the adapter around the retained worker runtime.
+    ///
+    /// `shutdown` is the server's shutdown token: once cancelled, every open
+    /// fragment stream this adapter serves ends as unavailable.
     #[must_use]
-    pub const fn new(bifrost: Arc<Bifrost>) -> Self {
-        Self { bifrost }
+    pub const fn new(bifrost: Arc<Bifrost>, shutdown: CancellationToken) -> Self {
+        Self { bifrost, shutdown }
     }
 
     /// Returns the generated tonic server wrapper.
@@ -202,9 +214,10 @@ impl OraclePeerGrpc {
 
 /// In-process executor for fragments that target this process's own Scribe.
 ///
-/// The private gRPC service and a process-local Oracle, which has no peer
-/// channel, both run Scribe fragments through it, so the fence, context, and
-/// claims checks exist once.
+/// The private gRPC service and this process's own Oracle both run Scribe
+/// fragments through it, so the fence, context, and claims checks exist once.
+/// It yields Arrow batches and an in-process completion; only the gRPC
+/// service encodes them into attempt frames for a remote leader.
 pub struct ScribeFragmentExecutor {
     /// Local Scribe owner whose fence, verifier, and resources serve fragments.
     scribe: Arc<Scribe>,
@@ -221,7 +234,10 @@ impl ScribeFragmentExecutor {
     ///
     /// Checks the target fence, verifies the typed peer context, validates
     /// its claims and assignment-authority digest against the request, then
-    /// charges a follower lease and streams a footer-terminated attempt.
+    /// charges a follower lease and returns the result schema with a stream
+    /// of the result batches, closed by one [`LiveFrame::Complete`] carrying
+    /// the authenticated plan fingerprint, the delivered row and native byte
+    /// totals, and the follower's scan evidence.
     ///
     /// # Errors
     /// Returns [`DispatchError::Terminal`] for a fence, context, claims, or
@@ -229,7 +245,7 @@ impl ScribeFragmentExecutor {
     pub async fn execute(
         &self,
         request: ExecuteFragmentRequest,
-    ) -> Result<WorkerExecution, DispatchError> {
+    ) -> Result<(SchemaRef, WorkerAttemptStream), DispatchError> {
         let scribe = &self.scribe;
         let local_role = scribe.scribe_registered_role();
         if request.target_fence.role != ClusterRole::Scribe
@@ -333,16 +349,13 @@ impl ScribeFragmentExecutor {
             tracing::error!(?error, "Scribe physical follower rejected the request");
             DispatchError::Terminal
         })?;
-        // The Scribe follower runs one partition, because a hot-tail fragment
-        // is a single sequential cut, under its pool ceiling. Bytes are
-        // charged only as it grows. It never spills: a Scribe node owns no
-        // governed Oracle spill directory.
+        // The Scribe follower runs the local partition count its own pod plan
+        // derives, under its pool ceiling. Bytes are charged only as it grows.
+        // It never spills: a Scribe node owns no governed Oracle spill
+        // directory.
         let follower = scribe
             .resources()
-            .follower_execution(
-                vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
-                1,
-            )
+            .follower_execution(vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES)
             .map_err(|error| {
                 tracing::error!(%error, "Scribe follower execution could not be built");
                 DispatchError::Terminal
@@ -359,17 +372,11 @@ impl ScribeFragmentExecutor {
         // Split now, finalize after drain: the scan counters are written during
         // execution, and the leader has no physical scan of its own to report.
         let (mut batches, scan_evidence) = execution.split();
-        let plan_fingerprint = request.plan_fingerprint;
+        let schema = batches.schema();
         let scribe_owner = Arc::clone(scribe);
-        let output = async_stream::stream! {
-            let mut encoder = AttemptEncoder::default();
-            match start_scribe_attempt(&mut encoder, batches.schema()) {
-                Ok(schema) => yield Ok(schema),
-                Err(_) => {
-                    yield Err(DispatchError::Terminal);
-                    return;
-                }
-            }
+        let plan_fingerprint = request.plan_fingerprint;
+        let output = async_stream::try_stream! {
+            let mut tally = NativeOutputTally::default();
             while let Some(batch) = batches.next().await {
                 let batch = batch.map_err(|error| {
                     // The classification below keeps only a closed outcome, so
@@ -380,32 +387,21 @@ impl ScribeFragmentExecutor {
                     tracing::warn!(?error, "Scribe follower execution stream failed");
                     scribe_stream_error(&error)
                 })?;
-                let (schema, batch) = encoder.encode(&batch).map_err(|_| DispatchError::Terminal)?;
-                if let Some(schema) = schema {
-                    yield Ok(schema);
-                }
-                yield Ok(batch);
+                tally.record(&batch)?;
+                yield LiveFrame::Batch(batch);
                 #[cfg(feature = "test-support")]
                 if fault == Some(ScribeFragmentFault::UnavailableAfterFirstBatch) {
-                    yield Err(DispatchError::Unavailable);
-                    return;
+                    Err(DispatchError::Unavailable)?;
                 }
             }
             #[cfg(feature = "test-support")]
             if fault == Some(ScribeFragmentFault::OmitFooter) {
                 return;
             }
-            let footer = encoder
-                .finish_physical(&plan_fingerprint, scan_evidence.finalize())
-                .map_err(|_| DispatchError::Terminal);
-            if footer.is_ok() {
-                scribe_owner.record_fragment_footer();
-            }
-            yield footer;
+            scribe_owner.record_fragment_footer();
+            yield tally.complete(plan_fingerprint, scan_evidence.finalize());
         };
-        Ok(WorkerExecution {
-            stream: Box::pin(output),
-        })
+        Ok((schema, Box::pin(output)))
     }
 }
 
@@ -446,7 +442,7 @@ impl OraclePeerTransport for ScribeFragmentExecutor {
     ) -> Result<WorkerAttemptStream, DispatchError> {
         ScribeFragmentExecutor::execute(self, request)
             .await
-            .map(|execution| execution.stream)
+            .map(|(_, stream)| stream)
     }
 }
 
@@ -538,7 +534,11 @@ impl OraclePeerService for OraclePeerGrpc {
     /// Executes one verified Scribe fragment and streams a footer-terminated attempt.
     ///
     /// Only Scribe owns fragment work: Oracle peers exchange Analytical stages,
-    /// so an Oracle-target fragment is refused before any decode.
+    /// so an Oracle-target fragment is refused before any decode. The
+    /// executor's batches are encoded here, and only here, into Arrow IPC
+    /// attempt frames: the schema first, each batch in order, then the footer
+    /// built from the in-process completion. Server shutdown ends an open
+    /// stream with an unavailable status instead of waiting for its reader.
     ///
     /// # Errors
     /// Returns a conversion, security, or execution status, and a
@@ -549,7 +549,8 @@ impl OraclePeerService for OraclePeerGrpc {
     ) -> Result<Response<Self::ExecuteFragmentStream>, Status> {
         let request =
             ExecuteFragmentRequest::try_from(request.into_inner()).map_err(conversion_status)?;
-        let WorkerExecution { mut stream } = match request.target_fence.role {
+        let plan_fingerprint = request.plan_fingerprint.clone();
+        let (schema, mut stream) = match request.target_fence.role {
             // Oracle peers exchange Analytical stages, never fragments.
             ClusterRole::Oracle => {
                 tracing::warn!("Oracle-target fragment refused: Oracle peers run no fragments");
@@ -568,9 +569,36 @@ impl OraclePeerService for OraclePeerGrpc {
             },
         }
         .map_err(dispatch_status)?;
-        let output = async_stream::stream! {
-            while let Some(frame) = stream.next().await {
-                yield frame.map(Into::into).map_err(dispatch_status);
+        let shutdown = self.shutdown.clone();
+        let output = async_stream::try_stream! {
+            let mut encoder = AttemptEncoder::default();
+            yield start_scribe_attempt(&mut encoder, schema).map_err(dispatch_status)?.into();
+            loop {
+                let next = tokio::select! {
+                    () = shutdown.cancelled() => None,
+                    frame = stream.next() => Some(frame),
+                };
+                let frame = next.ok_or_else(|| dispatch_status(DispatchError::Unavailable))?;
+                let Some(frame) = frame else { break };
+                match frame.map_err(dispatch_status)? {
+                    LiveFrame::Batch(batch) => {
+                        let (schema, batch) = encoder
+                            .encode(&batch)
+                            .map_err(|_| dispatch_status(DispatchError::Terminal))?;
+                        if let Some(schema) = schema {
+                            yield schema.into();
+                        }
+                        yield batch.into();
+                    }
+                    LiveFrame::Complete(completion) => {
+                        yield encoder
+                            .finish_physical(&plan_fingerprint, completion.scan_stats)
+                            .map_err(|_| dispatch_status(DispatchError::Terminal))?
+                            .into();
+                        return;
+                    }
+                    LiveFrame::Wire(_) => Err(dispatch_status(DispatchError::Terminal))?,
+                }
             }
         };
         Ok(Response::new(Box::pin(output)))

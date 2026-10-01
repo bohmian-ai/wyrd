@@ -78,7 +78,7 @@ Both paths:
 3. acquire path-specific slots from one atomic capacity check and a query-owned
    memory/spill grant;
 4. bind the optimized plan to the pinned snapshot and post-pruning statistics;
-5. preserve the plan-root tenant predicate and `TenantTripwireExec`;
+5. prove every opened file's footer tenant against the authenticated binding;
 6. stream bounded Arrow batches with one explicit terminal result.
 
 Distributed stages bind tenant, snapshot digest, fragment digest, and fence

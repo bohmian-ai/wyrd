@@ -106,13 +106,13 @@ pub enum DispatchError {
     /// Ticket or fragment contract failed terminally.
     #[error("peer security or fragment contract rejected")]
     Terminal,
-    /// The tenant tripwire refused a physically scanned foreign-tenant row.
+    /// A peer refused a scanned file whose footer tenant was missing or foreign.
     ///
     /// Kept distinct from [`DispatchError::Terminal`] so the leader reports
     /// the tenant-isolation reason rather than a generic peer-security or
     /// retryable-worker outcome. It is never retried on another candidate:
     /// the refusal is a property of the data, not of the worker.
-    #[error("peer fragment refused a foreign-tenant row")]
+    #[error("peer fragment refused a foreign-tenant file")]
     TenantInvariant,
 }
 
@@ -439,6 +439,22 @@ impl ReservationRegistry {
         matches
     }
 
+    /// Drops every pending reservation, returning each envelope's capacity.
+    ///
+    /// Shutdown calls this after new work is refused: a pending reservation
+    /// has no graph yet, and the leader that took it can no longer activate a
+    /// graph on a node that is going away, so holding it until expiry would
+    /// only report capacity still charged for work that will never run.
+    /// Returns how many reservations were dropped.
+    pub fn drain_pending(&self) -> usize {
+        let Ok(mut entries) = self.entries.lock() else {
+            return 0;
+        };
+        let drained = entries.len();
+        entries.clear();
+        drained
+    }
+
     /// Opens one rollback-capable activation of a reservation into its graph.
     ///
     /// This is the only path from a reservation to a graph envelope, and it is
@@ -566,15 +582,83 @@ fn reservation_matches(entry: &PendingReservation, request: &ReleaseNodeSlotsReq
         && entry.leader_fencing_token == request.leader_fencing_token
 }
 
-/// Incremental dispatch stream shared by local and tonic transports.
-pub type WorkerAttemptStream =
-    Pin<Box<dyn Stream<Item = Result<WorkerAttemptFrame, DispatchError>> + Send>>;
-
-/// Worker execution whose stream owns its running reservation until drop.
-pub struct WorkerExecution {
-    /// Incremental footer-terminated frames with cancellation-bound ownership.
-    pub stream: WorkerAttemptStream,
+/// One item of a Scribe fragment's output as the leader receives it.
+///
+/// A remote Scribe sends encoded attempt frames; a Scribe in the leader's own
+/// process hands over its Arrow batches and completion directly, so nothing
+/// is encoded, decoded, or hashed on that path.
+pub enum LiveFrame {
+    /// One attempt frame from a remote peer.
+    Wire(WorkerAttemptFrame),
+    /// One in-process result batch.
+    Batch(RecordBatch),
+    /// Successful in-process completion; nothing may follow it.
+    Complete(NativeCompletion),
 }
+
+/// Output evidence closing one in-process Scribe fragment.
+///
+/// It is the native counterpart of a remote [`WorkerFooter`]: the leader
+/// reconciles the totals against what it received before accepting success,
+/// without any encoding or hashing on either side. Bytes follow the native
+/// convention, the sum of each batch's [`RecordBatch::get_array_memory_size`];
+/// it is transfer accounting, not a memory charge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCompletion {
+    /// Authenticated plan fingerprint of the fragment that produced the output.
+    pub plan_fingerprint: String,
+    /// Rows the producer delivered.
+    pub rows: u64,
+    /// Native Arrow bytes the producer delivered.
+    pub bytes: u64,
+    /// Follower's finalized scan evidence.
+    pub scan_stats: WorkerScanStats,
+}
+
+/// Producer-side running totals for one in-process fragment's output.
+///
+/// The Scribe executor records every batch it hands over and closes the
+/// fragment with [`NativeOutputTally::complete`], so the completion carries
+/// exactly what was delivered.
+#[derive(Debug, Default)]
+pub struct NativeOutputTally {
+    /// Rows delivered so far.
+    rows: u64,
+    /// Native Arrow bytes delivered so far.
+    bytes: u64,
+}
+
+impl NativeOutputTally {
+    /// Adds one delivered batch's rows and native bytes.
+    ///
+    /// # Errors
+    /// Returns [`DispatchError::Terminal`] when either total would overflow.
+    pub fn record(&mut self, batch: &RecordBatch) -> Result<(), DispatchError> {
+        let add = |total: u64, amount: usize| {
+            u64::try_from(amount)
+                .ok()
+                .and_then(|amount| total.checked_add(amount))
+                .ok_or(DispatchError::Terminal)
+        };
+        self.rows = add(self.rows, batch.num_rows())?;
+        self.bytes = add(self.bytes, batch.get_array_memory_size())?;
+        Ok(())
+    }
+
+    /// Closes the fragment with its delivered totals and scan evidence.
+    #[must_use]
+    pub fn complete(self, plan_fingerprint: String, scan_stats: WorkerScanStats) -> LiveFrame {
+        LiveFrame::Complete(NativeCompletion {
+            plan_fingerprint,
+            rows: self.rows,
+            bytes: self.bytes,
+            scan_stats,
+        })
+    }
+}
+
+/// Incremental dispatch stream shared by local and tonic transports.
+pub type WorkerAttemptStream = Pin<Box<dyn Stream<Item = Result<LiveFrame, DispatchError>> + Send>>;
 
 /// Worker-side owner of this node's Analytical graph reservations.
 ///
@@ -1415,7 +1499,7 @@ impl TonicOraclePeerTransport {
                 yield frame.map_err(|status| {
                     tracing::warn!(code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
                     stream_status_error(&status)
-                }).and_then(|frame| frame.try_into().map_err(|error| {
+                }).and_then(|frame| frame.try_into().map(LiveFrame::Wire).map_err(|error| {
                     tracing::warn!(?error, "Oracle leader could not decode a worker frame");
                     DispatchError::Terminal
                 }));
@@ -1478,8 +1562,8 @@ pub struct OraclePeerTransportDirectory {
     local_node_id: NodeId,
     /// Closed remote route separating live production resolution from injection.
     remote: RemoteOraclePeerTransport,
-    /// In-process Scribe fragment executor for a process-local node, whose
-    /// own Scribe is otherwise unreachable without a peer channel.
+    /// In-process executor for this node's own Scribe; its fragments never
+    /// cross a peer channel, so their batches stay in memory.
     local_scribe: Option<Arc<dyn OraclePeerTransport>>,
 }
 
@@ -1497,9 +1581,10 @@ enum RemoteOraclePeerTransport {
 impl OraclePeerTransportDirectory {
     /// Creates the production directory over the tonic transport.
     ///
-    /// `remote` is absent for a process-local node, which serves no peer plane;
-    /// its own Scribe fragments then run through `local_scribe`, and any
-    /// non-local candidate fails terminally rather than being dialed.
+    /// This node's own Scribe fragments always run through `local_scribe`.
+    /// `remote` is absent for a process-local node, which serves no peer
+    /// plane; any non-local candidate then fails terminally rather than being
+    /// dialed.
     #[must_use]
     pub fn new(
         local_node_id: NodeId,
@@ -1638,7 +1723,8 @@ impl OraclePeerTransportDirectory {
         }
     }
 
-    /// Opens one fragment on a Scribe, remote or in this process.
+    /// Opens one fragment on a Scribe, in this process when the candidate is
+    /// this node's own Scribe and remotely otherwise.
     ///
     /// # Errors
     ///
@@ -1649,19 +1735,17 @@ impl OraclePeerTransportDirectory {
         candidate: &DispatchCandidate,
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerAttemptStream, DispatchError> {
+        if let Some(scribe) = &self.local_scribe
+            && self.is_local(candidate.node_id)
+            && candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe
+        {
+            return scribe.execute(candidate.node_id, request).await;
+        }
         match &self.remote {
             RemoteOraclePeerTransport::Production(remote) => {
                 remote.execute_candidate(candidate, request).await
             }
-            RemoteOraclePeerTransport::Unavailable => match &self.local_scribe {
-                Some(scribe)
-                    if self.is_local(candidate.node_id)
-                        && candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe =>
-                {
-                    scribe.execute(candidate.node_id, request).await
-                }
-                _ => Err(DispatchError::Terminal),
-            },
+            RemoteOraclePeerTransport::Unavailable => Err(DispatchError::Terminal),
             #[cfg(test)]
             RemoteOraclePeerTransport::Injected(remote) => {
                 remote.execute(candidate.node_id, request).await
@@ -1694,8 +1778,8 @@ fn status_error(status: &Status) -> DispatchError {
 fn execution_status_error(status: &Status) -> DispatchError {
     match status.code() {
         wyrd_tonic::tonic::Code::NotFound => DispatchError::FileNotFound,
-        // The private peer protocol reserves `Aborted` for the tenant
-        // tripwire so a foreign-tenant refusal on a remote worker reaches the
+        // The private peer protocol reserves `Aborted` for the footer tenant
+        // proof so a foreign-tenant refusal on a remote worker reaches the
         // leader as a tenant-isolation outcome instead of a generic
         // security or retryable failure.
         wyrd_tonic::tonic::Code::Aborted => DispatchError::TenantInvariant,
@@ -1722,8 +1806,13 @@ fn live_execution_status_error(status: &Status) -> DispatchError {
 }
 
 /// Classifies errors after a stream was delivered as partition-local decoder partials.
+///
+/// `Aborted` stays the footer tenant refusal here too: the proof runs when the
+/// stream is first polled, after the schema frame, so a refusal can end an
+/// already-open stream and must not degrade into an availability loss.
 fn stream_status_error(status: &Status) -> DispatchError {
     match status.code() {
+        wyrd_tonic::tonic::Code::Aborted => DispatchError::TenantInvariant,
         wyrd_tonic::tonic::Code::Unauthenticated
         | wyrd_tonic::tonic::Code::PermissionDenied
         | wyrd_tonic::tonic::Code::InvalidArgument => DispatchError::Terminal,
@@ -1984,10 +2073,7 @@ mod tests {
                 // authority digest requires this shape even in fixtures that
                 // never exercise object storage.
                 schema_fingerprint: "0".repeat(64),
-                required_columns: vec![
-                    "value".to_owned(),
-                    wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
-                ],
+                required_columns: vec!["value".to_owned()],
                 predicates: Vec::new(),
                 reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
                     uuid::Uuid::nil(),
@@ -2428,6 +2514,28 @@ mod tests {
         assert!(matches!(
             live_execution_status_error(&Status::aborted("foreign tenant")),
             DispatchError::TenantInvariant
+        ));
+    }
+
+    /// A status that ends an already-open worker stream keeps the tenant class.
+    ///
+    /// The footer tenant proof runs when the stream is first polled, after the
+    /// schema frame, so its refusal arrives here rather than at open. Folding
+    /// `Aborted` into availability would let a live read degrade past a
+    /// tenant refusal and skip the leader's refusal audit.
+    #[test]
+    fn open_stream_status_preserves_tenant_refusal() {
+        assert!(matches!(
+            stream_status_error(&Status::aborted("foreign tenant")),
+            DispatchError::TenantInvariant
+        ));
+        assert!(matches!(
+            stream_status_error(&Status::unavailable("scribe outage")),
+            DispatchError::Unavailable
+        ));
+        assert!(matches!(
+            stream_status_error(&Status::permission_denied("ticket")),
+            DispatchError::Terminal
         ));
     }
 

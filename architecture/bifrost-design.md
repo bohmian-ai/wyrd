@@ -44,8 +44,11 @@ non-null columns:
 - `wyrd_event_time`: validated caller event time or server receipt time;
 - `wyrd_ingested_at`: server-stamped ingestion time;
 - `wyrd_batch_id`: immutable UUIDv7 identity of one accepted logical batch;
-- `wyrd_request_id`: server-minted or validated request correlation;
-- `data_tenant_id`: authenticated tenant-isolation identity.
+- `wyrd_request_id`: server-minted or validated request correlation.
+
+The tenant is not a row column. It is a property of the physical table, of
+each Parquet file, and of each in-memory Scribe bucket, all bound from the
+authenticated principal.
 
 Nullable `run_id` and `card_uid` provide optional Card/Run correlation.
 Required, non-null `principal_id` identifies the authenticated publisher. None
@@ -81,10 +84,17 @@ order, and payload digest; any mismatch is a stable batch-identity conflict.
 
 One authenticated tenant and logical `TableRef` bind exactly one physical
 Iceberg table, namespace, and object-store prefix. Callers never choose another
-tenant's physical identity. Every physical file retains `data_tenant_id`.
-Postgres RLS, object prefixes, Scribe ownership, Oracle source binding, and the
-plan-root `TenantTripwireExec` enforce the same tenant. A mismatched row fails
-closed with `WYRD_VALA_500_TENANT_TRIPWIRE`.
+tenant's physical identity. Every staged and published Parquet file records
+its tenant once, in the `wyrd.bifrost.tenant` footer key-value, taken from the
+authenticated binding that wrote it; Forge rewrites carry the same value
+forward. In-memory Scribe rows are bound by their seal key's tenant. Postgres
+RLS, object prefixes, Scribe ownership, Oracle source binding, and the footer
+proof enforce the same tenant. Oracle compares a file's footer tenant with the
+authenticated binding once when it opens the file, before decoding any row; a
+missing, duplicated, or foreign footer tenant, or an encrypted file whose
+footer the reader cannot prove, fails the query closed with
+`WYRD_VALA_500_QUERY_TENANT_INVARIANT` and one leader security audit event.
+There is no per-row tenant column and no per-row tenant check.
 
 Built-in and user-defined tables share this physical model. "Built-in" names
 definition ownership, not a weaker tenant scope or a separate storage mode. A
@@ -299,8 +309,10 @@ Oracle never opens another node's local path and does not use WAL as its normal
 query source. Scribe executes authenticated local DataFusion scan fragments
 over active, immutable, or staged rows and streams Arrow batches through the
 existing peer protocol. Projection, signed predicate, physical partition,
-retained bytes, batch count, deadline, and cancellation are enforced. Open
-fragment streams own their source references until completion or drop; no
+writer epoch, deadline, and cancellation are enforced. A live snapshot is
+shallow references to rows the Scribe already holds, so it carries no batch or
+byte limit; the query's execution memory pool governs what execution retains.
+Open fragment streams own their source references until completion or drop; no
 independent tail timeout can end an otherwise active query.
 
 Startup replays WAL using the recorded shard ID, validates staged files and
@@ -309,8 +321,9 @@ operation IDs against `file_list` before opening admission. Unknown versions,
 checksum mismatch, contradictory lineage, or ambiguous authority fail closed.
 
 Shutdown closes admission and mailboxes, rotates nonempty generations, stages
-immutable ownership, publishes valid residue, and drains admitted work within
-the server deadline. Unsettled work retains exact replay evidence. Shutdown
+immutable ownership, and drains admitted work within the server deadline. It
+publishes nothing: staged members below their object target stay staged, and
+the next process on that staging volume restores and publishes them. Unsettled work retains exact replay evidence. Shutdown
 never deletes WAL or staged files merely to meet a deadline.
 
 ## Query: Oracle

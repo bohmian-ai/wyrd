@@ -7,7 +7,7 @@ use arrow::datatypes::{Field, Schema};
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
-use iceberg::{Catalog as _, TableCreation};
+use iceberg::{Catalog as _, Error as IcebergError, TableCreation};
 use iceberg_catalog_sql::SqlCatalog;
 use sha2::{Digest as _, Sha256};
 use vala_sql::queries::file_list::HotFileCatalog;
@@ -32,10 +32,10 @@ use crate::catalog::wire::{
 };
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
-use crate::provider::ReduxTableProvider;
 use crate::schema::{SchemaFingerprint, with_managed_columns};
 use crate::storage::BifrostStorage;
 use crate::tables::{BuiltinTableDefinition, builtin_table};
+use iceberg_datafusion::IcebergStaticTableProvider;
 
 /// Hashes an ordered metadata identity projection for immutable cut auditing.
 fn digest_strings(values: impl IntoIterator<Item = String>) -> String {
@@ -159,7 +159,7 @@ impl PinnedIcebergFile {
     ///
     /// Decoding never fails the pin. Every defect normalizes into
     /// [`EventTimeStatistics::Unusable`] so the file is retained and executed
-    /// through the residual predicate and tenant tripwire.
+    /// through the residual predicate and footer tenant proof.
     #[must_use]
     fn from_manifest_entry(
         file_path: String,
@@ -1440,9 +1440,9 @@ impl BifrostCatalog {
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
-        let provider = ReduxTableProvider::try_new(iceberg_table, tenant)
+        let provider = IcebergStaticTableProvider::try_new_from_table(iceberg_table)
             .await
-            .map_err(BifrostCatalogError::DataFusion)?;
+            .map_err(provider_error)?;
         Ok(datafusion::datasource::TableProvider::schema(&provider))
     }
 
@@ -1526,8 +1526,8 @@ impl BifrostCatalog {
     /// Build an execution provider for one authenticated tenant's table.
     ///
     /// The control-plane lookup and physical Iceberg binding both use the
-    /// authenticated tenant. The returned provider adds an execution-time
-    /// tenant predicate as a second fail-closed boundary.
+    /// authenticated tenant. Its data-file footers are tenant-proved by the
+    /// Oracle scan that reads them, never by a row predicate.
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the control-plane row
     /// is absent for this tenant, [`BifrostCatalogError::InvalidBinding`] when
@@ -1540,7 +1540,7 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
         permit: &crate::oracle::reader_pins::ReaderIoPermit,
-    ) -> Result<ReduxTableProvider, BifrostCatalogError> {
+    ) -> Result<IcebergStaticTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));
@@ -1555,9 +1555,9 @@ impl BifrostCatalog {
             loaded.metadata_location().map(ToOwned::to_owned),
             permit,
         )?;
-        ReduxTableProvider::try_new(iceberg_table, tenant)
+        IcebergStaticTableProvider::try_new_from_table(iceberg_table)
             .await
-            .map_err(BifrostCatalogError::DataFusion)
+            .map_err(provider_error)
     }
 
     /// Resolves one registered tenant table pinned to an exact published
@@ -1580,7 +1580,7 @@ impl BifrostCatalog {
         tenant: DataTenantId,
         snapshot_id: i64,
         permit: &crate::oracle::reader_pins::ReaderIoPermit,
-    ) -> Result<ReduxTableProvider, BifrostCatalogError> {
+    ) -> Result<IcebergStaticTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));
@@ -1595,9 +1595,9 @@ impl BifrostCatalog {
             loaded.metadata_location().map(ToOwned::to_owned),
             permit,
         )?;
-        ReduxTableProvider::try_new_pinned(iceberg_table, tenant, snapshot_id)
+        IcebergStaticTableProvider::try_new_from_table_snapshot(iceberg_table, snapshot_id)
             .await
-            .map_err(BifrostCatalogError::DataFusion)
+            .map_err(provider_error)
     }
 
     async fn ensure_namespace(
@@ -1796,12 +1796,19 @@ fn assert_compaction_target(
     }
 }
 
+/// Maps an Iceberg scan-provider construction failure into the catalog error
+/// its callers document.
+fn provider_error(error: IcebergError) -> BifrostCatalogError {
+    BifrostCatalogError::DataFusion(datafusion::error::DataFusionError::External(Box::new(
+        error,
+    )))
+}
+
 #[cfg(test)]
 mod schema_shape_tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use wyrd_spec::DataTenantId;
 
-    use super::{BifrostCatalog, ReduxTableProvider, TableRef, schema_shape_matches};
+    use super::schema_shape_matches;
 
     /// UTC and Iceberg's equivalent offset spelling have the same physical shape.
     #[test]
@@ -1856,38 +1863,6 @@ mod schema_shape_tests {
 
         assert!(!schema_shape_matches(&declared, &reordered));
         assert!(!schema_shape_matches(&reordered, &declared));
-    }
-
-    /// Table providers are constructed directly from one pinned Iceberg table
-    /// and its authenticated tenant, with no hot-batch source to union in.
-    ///
-    /// Both constructors are checked as values against an exact argument shape,
-    /// so reintroducing a hot-batch parameter, or restoring a wrapper that
-    /// forwards an empty batch vector, fails to compile here rather than
-    /// silently returning a union plan at execution time.
-    #[test]
-    fn table_providers_are_constructed_from_one_tenant_qualified_table() {
-        /// Accepts only a constructor taking exactly a table and its tenant.
-        fn accepts_direct_provider_constructor<T, F>(_constructor: F)
-        where
-            F: Fn(iceberg::table::Table, DataTenantId) -> T,
-        {
-        }
-
-        /// Accepts only a catalog lookup taking exactly a table reference and tenant.
-        fn accepts_direct_catalog_provider<T, F>(_provider: F)
-        where
-            F: Fn(
-                &'static BifrostCatalog,
-                &'static TableRef,
-                DataTenantId,
-                &'static crate::oracle::reader_pins::ReaderIoPermit,
-            ) -> T,
-        {
-        }
-
-        accepts_direct_provider_constructor(ReduxTableProvider::try_new);
-        accepts_direct_catalog_provider(BifrostCatalog::provider);
     }
 }
 

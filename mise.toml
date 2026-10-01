@@ -54,8 +54,11 @@ description = "Workspace Clippy with -D warnings (default features, all targets)
 run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
 
 [tasks.lints]
-description = "Whole-plan workspace Clippy with -D warnings (all features, all targets)"
-run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warnings"
+description = "Whole-plan workspace Clippy with -D warnings (all features, all targets), then the shipped wyrd-server binary alone at its release features, which workspace feature unification otherwise hides"
+run = [
+  "cargo clippy --locked --workspace --all-features --all-targets -- -D warnings",
+  "cargo clippy --locked -p wyrd-server --bin wyrd-server -- -D warnings",
+]
 
 [tasks."lint:wyrd-sdk-python"]
 hide = true
@@ -485,8 +488,8 @@ description = "wyrd-testing `oracle` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all"
 
 [tasks."bench:bifrost:query-capacity"]
-description = "Opt-in benchmark: local Bifrost processes in 4-CPU/8-GiB systemd user cgroups; a 10M-row public-ingest events fixture, selective and small-aggregate concurrency sweeps, medium and table aggregates, broad window, full scan, reads during writes, a full Oracle queue, and a remote-live window through the public client. WYRD_BENCH_HEAVY_SCAN=1 runs the 100M-row scan qualification instead. Fails on any row that is not PASS. Linux with a delegating systemd user manager; part of no gate or verify lane."
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && cargo build --locked --release -p wyrd-testing --bin bifrost_peer_test_node && cargo run --locked --release -p wyrd-testing --bin bifrost_query_capacity'"
+description = "Opt-in benchmark: one release wyrd-server started through the local-development journey (migrate, serve, setup) in a 4-CPU/8-GiB systemd user scope, driven through the public Rust client: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --heavy` writes 100M rows and runs the broad window and full scan. Fails on any FAIL row. Linux with a delegating systemd user manager; part of no gate or verify lane."
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo build --locked --release -p wyrd-server && cargo run --locked --release -p wyrd-testing --bin bifrost_query_capacity -- \"$@\"' _"
 
 [tasks."test:bifrost:journey:otlp"]
 description = "Tier-1 journeys: OTLP trace, log, metric, mixed-batch and negative protocol surfaces"

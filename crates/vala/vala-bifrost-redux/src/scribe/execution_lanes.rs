@@ -32,8 +32,8 @@ use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
+    WYRD_REQUEST_ID,
 };
 
 #[cfg(test)]
@@ -386,7 +386,7 @@ impl ScribeIngressCpuPool {
 /// registered-schema fingerprint.
 ///
 /// All other managed columns (`wyrd_ingested_at`, `wyrd_batch_id`,
-/// `wyrd_request_id`, `data_tenant_id`, principal, and card columns) remain
+/// `wyrd_request_id`, principal, and card columns) remain
 /// unconditionally server-owned and are rejected when supplied.
 ///
 /// # Errors
@@ -535,12 +535,7 @@ fn decode_rows(
         // one is a refusal rather than an override.
         if matches!(
             field.name().as_str(),
-            CARD_UID
-                | PRINCIPAL_ID
-                | DATA_TENANT_ID
-                | WYRD_BATCH_ID
-                | WYRD_INGESTED_AT
-                | WYRD_REQUEST_ID
+            CARD_UID | PRINCIPAL_ID | WYRD_BATCH_ID | WYRD_INGESTED_AT | WYRD_REQUEST_ID
         ) {
             return Err(ScribeError::InvalidFrame);
         }
@@ -672,7 +667,7 @@ fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
         .filter(|field| {
             !matches!(
                 field.name().as_str(),
-                CARD_REF | CARD_UID | PRINCIPAL_ID | "run_id" | "data_tenant_id"
+                CARD_REF | CARD_UID | PRINCIPAL_ID | "run_id"
             ) && !field.name().starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())
@@ -1092,7 +1087,6 @@ fn server_owned_columns() -> Vec<&'static str> {
         WYRD_EVENT_TIME,
         WYRD_INGESTED_AT,
         WYRD_BATCH_ID,
-        DATA_TENANT_ID,
         RUN_ID,
     ]
 }
@@ -1269,7 +1263,6 @@ fn append_managed_columns(
             false,
         ),
         Field::new(WYRD_BATCH_ID, DataType::FixedSizeBinary(16), false),
-        Field::new(DATA_TENANT_ID, DataType::Utf8, false),
     ]);
     let timestamp_array = Arc::new(
         TimestampMicrosecondArray::from(vec![receipt_micros; row_count]).with_timezone("UTC"),
@@ -1287,13 +1280,6 @@ fn append_managed_columns(
             })?;
     }
     columns.push(Arc::new(batch_id_builder.finish()));
-    columns.push(Arc::new(StringArray::from(vec![
-        context
-            .principal
-            .tenant_id
-            .to_string();
-        row_count
-    ])));
     Ok(())
 }
 
@@ -2243,8 +2229,8 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{
-        CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-        WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
+        WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2998,7 +2984,7 @@ mod tests {
             None,
         )
         .expect("schema is valid");
-        assert!(decoded.schema().index_of(DATA_TENANT_ID).is_ok());
+        assert!(decoded.schema().index_of("data_tenant_id").is_err());
         assert!(decoded.schema().index_of(PRINCIPAL_ID).is_ok());
         assert!(decoded.schema().index_of(WYRD_BATCH_ID).is_ok());
         assert!(decoded.schema().index_of(WYRD_EVENT_TIME).is_ok());
@@ -3785,12 +3771,7 @@ mod tests {
     #[test]
     fn native_other_reserved_columns_still_rejected() {
         let (principal, card) = scoped_service_principal();
-        for reserved in [
-            WYRD_INGESTED_AT,
-            WYRD_BATCH_ID,
-            WYRD_REQUEST_ID,
-            DATA_TENANT_ID,
-        ] {
+        for reserved in [WYRD_INGESTED_AT, WYRD_BATCH_ID, WYRD_REQUEST_ID] {
             let rows = batch(
                 vec![
                     Field::new(reserved, DataType::Utf8, false),

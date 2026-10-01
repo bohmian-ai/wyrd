@@ -1,0 +1,256 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UpdateOperatorConnectionRequest",
+  "description": "`PATCH /v1/operator-connections/{connection_id}` body.\n\nOmitted fields are preserved; a supplied secret replaces the encrypted secret atomically. The provider tag must equal the stored provider, and the name is not patchable.",
+  "oneOf": [
+    {
+      "description": "Update a Slack connection.",
+      "type": "object",
+      "required": [
+        "provider"
+      ],
+      "properties": {
+        "bot_token": {
+          "description": "Replacement bot token.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretBearer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "slack"
+          ]
+        },
+        "status": {
+          "description": "New status.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OperatorConnectionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "workspace_id": {
+          "description": "Replacement workspace ID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Update a PagerDuty connection.",
+      "type": "object",
+      "required": [
+        "provider"
+      ],
+      "properties": {
+        "integration_key": {
+          "description": "Replacement Global Integration key.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretBearer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "pager_duty"
+          ]
+        },
+        "status": {
+          "description": "New status.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OperatorConnectionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Update an HTTP connection.",
+      "type": "object",
+      "required": [
+        "provider"
+      ],
+      "properties": {
+        "auth": {
+          "description": "Replacement credential; may change its scheme and header name.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/HttpConnectionAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "origin": {
+          "description": "Replacement origin.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "http"
+          ]
+        },
+        "status": {
+          "description": "New status.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OperatorConnectionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "definitions": {
+    "HttpConnectionAuth": {
+      "description": "Write-only HTTP credential of a create or update.",
+      "oneOf": [
+        {
+          "description": "`Authorization: Bearer <token>`.",
+          "type": "object",
+          "required": [
+            "scheme",
+            "token"
+          ],
+          "properties": {
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "bearer"
+              ]
+            },
+            "token": {
+              "description": "The bearer token.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SecretBearer"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`Authorization: Basic` from a username and password.",
+          "type": "object",
+          "required": [
+            "password",
+            "scheme",
+            "username"
+          ],
+          "properties": {
+            "password": {
+              "description": "The password.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SecretBearer"
+                }
+              ]
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "basic"
+              ]
+            },
+            "username": {
+              "description": "The username; treated as secret.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SecretBearer"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A custom header carrying `value`.",
+          "type": "object",
+          "required": [
+            "name",
+            "scheme",
+            "value"
+          ],
+          "properties": {
+            "name": {
+              "description": "Header name; case-insensitive, never a server-owned header.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "header"
+              ]
+            },
+            "value": {
+              "description": "The header value.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/SecretBearer"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OperatorConnectionStatus": {
+      "description": "Whether a connection may be used by Operators.",
+      "oneOf": [
+        {
+          "description": "Registration and delivery may use it.",
+          "type": "string",
+          "enum": [
+            "active"
+          ]
+        },
+        {
+          "description": "Retained for lineage; registration and delivery refuse it.",
+          "type": "string",
+          "enum": [
+            "disabled"
+          ]
+        }
+      ]
+    },
+    "SecretBearer": {
+      "description": "Opaque secret. Redacted in logs and audit payloads.",
+      "writeOnly": true,
+      "type": "string",
+      "format": "password"
+    }
+  }
+}

@@ -74,6 +74,7 @@ tempfile = { workspace = true }
 sqlx = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
@@ -133,6 +134,10 @@ name = "pg_router_smoke"
 
 [[test]]
 name = "pg_verification_runtime"
+required-features = ["test-support"]
+
+[[test]]
+name = "pg_operator_delivery"
 required-features = ["test-support"]
 
 [[test]]

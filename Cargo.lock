@@ -11762,6 +11762,7 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "zeroize",
 ]
 
 [[package]]

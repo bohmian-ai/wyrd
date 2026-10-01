@@ -1152,7 +1152,7 @@ table on `(data_tenant_id, result_id)`.
   canonical tenant/connection/provider/name/version context, and a wrapped key
   bound to an externally held tenant-scoped key-encryption key and key version.
   Root or key-encryption material MUST remain outside Postgres in the deployment
-  secret/KMS boundary. Rotation replaces the encrypted secret on the same
+  key source defined below. Rotation replaces the encrypted secret on the same
   connection identity; key rotation MUST support rewrapping or re-encryption
   without exposing plaintext through a public surface. Decrypted bytes exist
   only for the bounded delivery attempt in a redacted secret type and are not

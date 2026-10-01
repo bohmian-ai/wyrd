@@ -1,5 +1,5 @@
 //! The supervised verification runtime: scheduler, Verifier runner, Drift
-//! baseline fitter, and the Operator-worker slot.
+//! baseline fitter, and Operator delivery worker.
 //!
 //! [`VerificationRuntime`] is the one owner `BoundServer::run` spawns. It
 //! composes up to four capability tasks, restarts any that exits or panics
@@ -9,12 +9,14 @@
 //! runtime holds no process-local registry, so any process may crash and
 //! another reclaims its leases.
 
+mod claims;
 pub mod drift;
 pub mod engines;
 pub mod eval;
 pub mod fitter;
 pub mod health;
 pub mod observations;
+pub mod operators;
 pub mod permits;
 pub mod publisher;
 pub mod results;
@@ -36,6 +38,7 @@ use crate::state::AppState;
 use self::drift::DriftEngine;
 use self::fitter::BaselineFitter;
 use self::health::{RuntimeCapability, VerificationHealth};
+use self::operators::{OperatorDelivery, OperatorWorker, ProviderEndpoints};
 use self::permits::VerifierPermits;
 #[cfg(feature = "test-support")]
 use self::publisher::PublicationFault;
@@ -73,13 +76,33 @@ pub struct RuntimeLimits {
     /// How long after its creation an Eval run waits for its trace before it
     /// settles `timed_out`.
     pub trace_deadline: Duration,
+    /// Delivery attempts one Operator dispatch may make.
+    pub operator_attempts: i32,
+    /// Wall-clock budget of one Operator dispatch from its creation.
+    pub operator_deadline: Duration,
+    /// How long one Operator claim holds a dispatch; exceeds the attempt
+    /// timeout so a live attempt settles before reclaim.
+    pub operator_lease: Duration,
+    /// Ceiling of one Operator delivery attempt.
+    pub operator_attempt_timeout: Duration,
+    /// Server backoff after the first and every later failed Operator
+    /// attempt.
+    pub operator_backoff: [Duration; 2],
+    /// Wait between Operator key-rewrap passes; rewrap runs beside, never
+    /// inside, the delivery claim loop.
+    pub rewrap_interval: Duration,
+    /// Elapsed-time ceiling of one cross-tenant rewrap pass.
+    pub rewrap_pass_budget: Duration,
+    /// Elapsed-time ceiling of one tenant's rewrap transaction.
+    pub rewrap_tenant_budget: Duration,
 }
 
 impl Default for RuntimeLimits {
     /// Production bounds: 16 global and 4 per-tenant executions, a ten-minute
-    /// lease over a five-minute execution and one-minute publication, and a
-    /// thirty-second drain; Eval traces are polled every five seconds for up
-    /// to five minutes.
+    /// lease over a five-minute execution and one-minute publication, a
+    /// thirty-second drain, Eval traces polled every five seconds for up to
+    /// five minutes, and a five-minute rewrap interval whose passes stop after
+    /// two minutes and thirty seconds per tenant.
     fn default() -> Self {
         Self {
             global_permits: 16,
@@ -92,6 +115,14 @@ impl Default for RuntimeLimits {
             restart_backoff: Duration::from_secs(1),
             trace_poll: Duration::from_secs(5),
             trace_deadline: Duration::from_secs(300),
+            operator_attempts: 3,
+            operator_deadline: Duration::from_secs(300),
+            operator_lease: Duration::from_secs(45),
+            operator_attempt_timeout: Duration::from_secs(30),
+            operator_backoff: [Duration::from_secs(30), Duration::from_secs(120)],
+            rewrap_interval: Duration::from_secs(300),
+            rewrap_pass_budget: Duration::from_secs(120),
+            rewrap_tenant_budget: Duration::from_secs(30),
         }
     }
 }
@@ -106,6 +137,13 @@ impl RuntimeLimits {
             .drain_grace
             .min(server_drain.saturating_sub(Duration::from_secs(1)));
         self
+    }
+
+    /// Server backoff after failed Operator attempt number `attempt`
+    /// (1-based): the first entry after attempt one, the second afterwards.
+    #[must_use]
+    pub fn operator_backoff(&self, attempt: i32) -> Duration {
+        self.operator_backoff[usize::from(attempt > 1)]
     }
 }
 
@@ -143,6 +181,8 @@ enum Capability {
     Runner(Arc<VerifierRunner>),
     /// The Drift baseline fitter.
     Fitter(Arc<BaselineFitter>),
+    /// The Operator delivery worker.
+    OperatorWorker(Arc<OperatorWorker>),
 }
 
 impl Capability {
@@ -152,6 +192,7 @@ impl Capability {
             Self::Scheduler(_) => RuntimeCapability::Scheduler,
             Self::Runner(_) => RuntimeCapability::Runner,
             Self::Fitter(_) => RuntimeCapability::Fitter,
+            Self::OperatorWorker(_) => RuntimeCapability::OperatorWorker,
         }
     }
 
@@ -162,6 +203,7 @@ impl Capability {
             Self::Scheduler(scheduler) => tasks.spawn(Arc::clone(scheduler).run(stop)),
             Self::Runner(runner) => tasks.spawn(Arc::clone(runner).run(stop)),
             Self::Fitter(fitter) => tasks.spawn(Arc::clone(fitter).run(stop)),
+            Self::OperatorWorker(worker) => tasks.spawn(Arc::clone(worker).run(stop)),
         };
         handle.id()
     }
@@ -186,6 +228,7 @@ impl VerificationRuntime {
             limits: RuntimeLimits::default(),
             providers: None,
             ingest_endpoint: None,
+            endpoints: ProviderEndpoints::default(),
             #[cfg(feature = "test-support")]
             publication_fault: None,
             #[cfg(feature = "test-support")]
@@ -269,6 +312,8 @@ pub struct VerificationRuntimeBuilder<'a> {
     providers: Option<Arc<skald_runtime::ProviderRegistry>>,
     /// Scribe-bearing gRPC endpoint results are published through.
     ingest_endpoint: Option<String>,
+    /// Slack and PagerDuty endpoints Operators deliver to.
+    endpoints: ProviderEndpoints,
     /// Test-only publication faults.
     #[cfg(feature = "test-support")]
     publication_fault: Option<PublicationFault>,
@@ -324,6 +369,14 @@ impl VerificationRuntimeBuilder<'_> {
             }
             self.ingest_endpoint = Some(format!("http://{addr}"));
         }
+        self
+    }
+
+    /// Deliver fixed-provider Operators to `endpoints` (mock providers).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn provider_endpoints(mut self, endpoints: ProviderEndpoints) -> Self {
+        self.endpoints = endpoints;
         self
     }
 
@@ -397,9 +450,25 @@ impl VerificationRuntimeBuilder<'_> {
             Some(crash) => fitter.with_crash(crash.clone()),
             None => fitter,
         };
+        let worker = OperatorWorker::new(
+            postgres.clone(),
+            operator.clone(),
+            Arc::clone(&self.state.operator_keys),
+            OperatorDelivery::new(
+                self.state.deployment_profile.screened_http(),
+                self.endpoints,
+            ),
+            self.limits,
+        );
+        #[cfg(feature = "test-support")]
+        let worker = match &self.crash {
+            Some(crash) => worker.with_crash(crash.clone()),
+            None => worker,
+        };
         let mut capabilities = vec![
             Capability::Scheduler(Arc::new(scheduler)),
             Capability::Fitter(Arc::new(fitter)),
+            Capability::OperatorWorker(Arc::new(worker)),
         ];
         match (self.state.auth.tenant_issuer(), self.ingest_endpoint) {
             (Some(issuer), Some(endpoint)) => {

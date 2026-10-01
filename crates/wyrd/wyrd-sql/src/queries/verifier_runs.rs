@@ -23,6 +23,7 @@ use sqlx::Error as SqlxError;
 use sqlx::types::{Json, Uuid};
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, VerifierCounts};
 use wyrd_spec::ids::{
     BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
 };
@@ -222,12 +223,36 @@ const COMPLETE_RUN_SQL: &str = r#"
 "#;
 
 /// Insert one Operator dispatch; the (tenant, run, Operator) key absorbs retries.
+///
+/// The failure context is frozen here from the settled run and its exact
+/// Verifier and subject Cards plus the runner's bounded summary (`$5`) and
+/// the Verifier implementation's counts (`$6`), so every delivery attempt
+/// renders the same payload.
 const INSERT_DISPATCH_SQL: &str = r#"
     INSERT INTO wyrd.operator_dispatches (
         dispatch_id, data_tenant_id, run_id, operator_uid, operator_digest,
-        next_attempt_at, created_at, updated_at
-    ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4,
-              statement_timestamp(), statement_timestamp(), statement_timestamp())
+        failure_context, next_attempt_at, created_at, updated_at
+    )
+    SELECT $1, r.data_tenant_id, r.run_id, $3, $4,
+           jsonb_build_object(
+               'dispatch_id', $1::uuid,
+               'run_id', r.run_id,
+               'result_id', r.result_id,
+               'binding_id', r.binding_id,
+               'verifier_uid', r.verifier_uid,
+               'verifier_ref', v.space || '/' || v.name || '@' || v.version,
+               'subject_uid', r.subject_card_uid,
+               'subject_ref', s.space || '/' || s.name || '@' || s.version,
+               'verdict', 'failed',
+               'completed_at', r.settled_at,
+               'summary', $5::text,
+               'verifier', $6::jsonb
+           ),
+           statement_timestamp(), statement_timestamp(), statement_timestamp()
+      FROM wyrd.verifier_runs r
+      JOIN wyrd.cards v ON v.card_uid = r.verifier_uid
+      JOIN wyrd.cards s ON s.card_uid = r.subject_card_uid
+     WHERE r.run_id = $2
     ON CONFLICT DO NOTHING
 "#;
 
@@ -600,8 +625,10 @@ pub struct ScheduleTick {
 
 /// Opaque fencing token of one claim.
 ///
-/// Only [`VerifierRunQueue::claim`] mints one, so a settlement can only be
-/// attempted by a worker that actually claimed the run.
+/// Only [`VerifierRunQueue::claim`] and
+/// [`OperatorDispatchQueue::claim`](crate::queries::operator_dispatches::OperatorDispatchQueue::claim)
+/// mint one, so a settlement can only be attempted by a worker that actually
+/// claimed the run or dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseToken(pub(crate) Uuid);
 
@@ -654,18 +681,19 @@ pub struct ClaimedRun {
 pub enum Settlement {
     /// The transition was applied (or idempotently re-applied).
     Applied,
-    /// The lease token no longer holds the run; nothing changed.
+    /// The lease token no longer holds the run or dispatch; nothing changed.
     StaleLease,
 }
 
-/// Outcome of reporting a retryable engine failure.
+/// Outcome of reporting a retryable run or dispatch failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryOutcome {
-    /// The same run and input will be attempted again at this time.
+    /// The same work will be attempted again at this database time.
     Scheduled(DateTime<Utc>),
-    /// The attempt budget is exhausted; the run is now `errored`.
+    /// The attempt budget (or a dispatch's deadline) is spent; a run is now
+    /// `errored`, a dispatch `failed`.
     Exhausted,
-    /// The lease token no longer holds the run; nothing changed.
+    /// The lease token no longer holds the work; nothing changed.
     StaleLease,
 }
 
@@ -1168,8 +1196,11 @@ impl VerifierRunQueue {
     /// inserts one `pending` dispatch per distinct frozen Operator, due at
     /// PostgreSQL's statement time; the (tenant, run, Operator) key makes a
     /// settlement retry insert
-    /// nothing new. Passed and inconclusive verdicts and direct runs create no
-    /// dispatch. The verdict itself is not stored: Bifrost owns it.
+    /// nothing new. Each dispatch freezes the bounded failure context built
+    /// from the settled run, its exact Cards, `summary`, which is clipped
+    /// to [`MAX_SUMMARY_CHARS`], and the same result's `counts`. Passed and inconclusive verdicts and direct
+    /// runs create no dispatch. The verdict itself is not stored: Bifrost owns
+    /// it.
     ///
     /// # Errors
     /// Returns the database error when a statement fails, or a decode error
@@ -1181,6 +1212,8 @@ impl VerifierRunQueue {
         lease: RunLease,
         result_id: VerificationResultId,
         verdict: VerificationVerdict,
+        summary: &str,
+        counts: VerifierCounts,
     ) -> Result<Settlement, SqlxError> {
         let settled: Option<(Option<Uuid>, Json<Vec<FrozenTarget>>)> =
             sqlx::query_as(COMPLETE_RUN_SQL)
@@ -1193,6 +1226,7 @@ impl VerifierRunQueue {
             return Ok(Settlement::StaleLease);
         };
         if verdict == VerificationVerdict::Failed && binding_id.is_some() {
+            let summary: String = summary.chars().take(MAX_SUMMARY_CHARS).collect();
             for operator in &operators {
                 let (uid, digest) = match operator {
                     FrozenTarget::Uid(uid) => (Some(uid.as_uuid()), None),
@@ -1203,6 +1237,8 @@ impl VerifierRunQueue {
                     .bind(lease.run_id.as_uuid())
                     .bind(uid)
                     .bind(digest)
+                    .bind(&summary)
+                    .bind(Json(counts))
                     .execute(&mut **conn.transaction())
                     .await?;
             }
@@ -1776,7 +1812,8 @@ impl DispatchRow {
     }
 }
 
-/// Map a fenced update's row count to its settlement outcome.
+/// Map a fenced update's row count to its settlement outcome; shared by the
+/// run and Operator dispatch queues.
 pub(crate) fn settlement(rows_affected: u64) -> Settlement {
     if rows_affected == 0 {
         Settlement::StaleLease

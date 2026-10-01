@@ -10,22 +10,25 @@
 //!
 //! The production catalog exposes three read-only Bifrost tools for table
 //! discovery, schema/layout description, and bounded terminal-safe queries,
-//! the Card read and Verification status tools, and per-caller write tools for
-//! credential revocation and manual Verifier runs, plus the seventeen tenant
-//! gateway administration tools.
+//! the Card read, Verification status, and Operator connection read tools,
+//! per-caller write tools for credential revocation, manual Verifier runs,
+//! and Operator connection management, plus the seventeen tenant gateway
+//! administration tools.
 //! A test-support context probe is available only through explicit fixture opt-in.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ErrorCode, ErrorData, InitializeResult,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
+    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
+use serde::Serialize;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
@@ -34,6 +37,7 @@ use crate::state::AppState;
 
 mod bifrost;
 mod gateway;
+mod operators;
 mod principals;
 #[cfg(feature = "test-support")]
 pub mod probe;
@@ -134,7 +138,8 @@ impl WyrdMcpHandler {
     ///
     /// Ordinary startup — production and an ordinary `WyrdTestServer` alike —
     /// advertises the three read-only Bifrost tools, the read-only principal
-    /// credential listing, and the gateway tools, whose replacement and delete
+    /// credential listing, the Card, Verification, and Operator connection read
+    /// tools, and the gateway tools, whose replacement and delete
     /// operations require explicit gateway write or delete scopes at dispatch.
     /// Principal write tools are per caller and the test-support probe is
     /// opt-in, so neither belongs here.
@@ -142,6 +147,7 @@ impl WyrdMcpHandler {
         let mut catalog = bifrost::descriptors();
         catalog.extend(principals::descriptors_unscoped());
         catalog.extend(verification::descriptors_unscoped());
+        catalog.extend(operators::descriptors_unscoped());
         catalog.extend(gateway::descriptors());
         catalog
     }
@@ -180,6 +186,7 @@ impl ServerHandler for WyrdMcpHandler {
             .into_iter()
             .chain(principals::write_descriptors())
             .chain(verification::write_descriptors())
+            .chain(operators::write_descriptors())
             .chain(self.probe_descriptors())
             .find(|tool| tool.name == name)
     }
@@ -204,6 +211,9 @@ impl ServerHandler for WyrdMcpHandler {
             }
             if verification::may_start_runs(&caller) {
                 catalog.extend(verification::write_descriptors());
+            }
+            if operators::may_manage(&caller) {
+                catalog.extend(operators::write_descriptors());
             }
         }
         catalog.extend(self.probe_descriptors());
@@ -294,6 +304,17 @@ impl ServerHandler for WyrdMcpHandler {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.gateway_tool(name, caller, request.arguments).await
             }
+            name @ (operators::LIST
+            | operators::GET
+            | operators::CREATE
+            | operators::UPDATE
+            | operators::DISABLE) => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                // Authorized and audited by the operation, like revocation.
+                self.mcp_operator_connections(name, caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
             unknown => {
                 return Err(ErrorData::new(
                     ErrorCode::INVALID_PARAMS,
@@ -342,6 +363,18 @@ fn missing_context(extension: &'static str) -> WyrdError {
         message: format!("MCP request is missing the {extension} extension"),
         details: serde_json::json!({ "extension": extension }),
     }
+}
+
+/// Project one typed tool answer as a structured tool result.
+///
+/// # Errors
+/// Returns an internal error when the answer cannot be serialized.
+fn structured<T: Serialize>(value: &T) -> Result<CallToolResult, WyrdError> {
+    Ok(CallToolResult::structured(
+        serde_json::to_value(value).map_err(|error| {
+            crate::http::error::internal_failure("tool answer could not be projected", &error)
+        })?,
+    ))
 }
 
 /// Project a public Wyrd error onto the MCP protocol error shape.

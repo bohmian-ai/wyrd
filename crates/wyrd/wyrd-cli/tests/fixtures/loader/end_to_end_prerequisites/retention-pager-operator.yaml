@@ -8,5 +8,7 @@ spec:
   kind: notify
   channel:
     kind: pager_duty
+    connection: ops-pagerduty
+    route: retention
     severity: warning
     summary: retention guardrail failed

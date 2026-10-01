@@ -406,6 +406,9 @@ pub struct WyrdTestServerBuilder {
     sealing_keyring: Option<Arc<SealingKeyring>>,
     /// Deployment public origin the human-connection callback URL derives from.
     public_origin: Option<Url>,
+    /// SHA-256 of the raw BFF service key; `Some` mounts the private
+    /// browser-session channel.
+    bff_service_key_hash: Option<wyrd_spec::auth::Sha256Hex>,
     forge_interval: Duration,
     /// Executor slots composed into the production Forge worker.
     wal_sync_delay: Duration,
@@ -575,6 +578,7 @@ impl Default for WyrdTestServerBuilder {
             workload_binding_configs: Vec::new(),
             sealing_keyring: None,
             public_origin: None,
+            bff_service_key_hash: None,
             forge_interval: Duration::from_secs(60),
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
@@ -4007,6 +4011,15 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Provision the deployment BFF service key, mounting the private
+    /// `/internal/bff/v1/*` browser-session channel exactly as
+    /// `WYRD_BFF_SERVICE_KEY_SHA256` does in production.
+    #[must_use]
+    pub fn with_bff_service_key(mut self, raw_key: &str) -> Self {
+        self.bff_service_key_hash = Some(wyrd_spec::auth::Sha256Hex::digest(raw_key.as_bytes()));
+        self
+    }
+
     /// Boot workload bindings from `[[workload_bindings]]` config DTOs.
     ///
     /// At [`Self::start_in_process`] these run through the production
@@ -4381,6 +4394,21 @@ impl WyrdTestServerBuilder {
             DeploymentProfile::Development.screened_http(),
             self.public_origin.as_ref(),
         );
+        let bff =
+            self.bff_service_key_hash
+                .map(|hash| wyrd_server::components::auth::bff::BffChannel {
+                    sessions: wyrd_auth::browser_sessions::BrowserSessions::new(
+                        runtime_wyrd.clone(),
+                        Some(Arc::clone(&sealing_key)),
+                        wyrd_auth::issuance::TenantTokenIssuer::new(
+                            Arc::clone(&issuing_key),
+                            exchange_settings.clone(),
+                        ),
+                        Arc::clone(&verifier),
+                        human_connections.clone(),
+                    ),
+                    key_hashes: vec![hash],
+                });
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
         let resource_roles = self
             .bifrost_roles
@@ -4579,6 +4607,7 @@ impl WyrdTestServerBuilder {
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
                 human_connections: Some(human_connections),
+                bff,
             })
             .with_gateway(test_gateway_config(
                 fixture.data_tenant_id(),

@@ -116,6 +116,12 @@ pub fn build_router(state: AppState) -> Router {
     ProblemMediaAddon.modify(&mut document);
     let document = Arc::new(document);
 
+    // The private BFF session channel exists only when the deployment
+    // provisions a BFF service key; it is never an OpenAPI operation.
+    let routed = match state.auth.bff {
+        Some(_) => routed.merge(crate::components::auth::bff::bff_router(&state)),
+        None => routed,
+    };
     let protected = apply_protected_edge(routed.merge(mcp_route), &state);
 
     Router::new()

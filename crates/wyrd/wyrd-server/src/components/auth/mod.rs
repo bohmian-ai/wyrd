@@ -1,5 +1,7 @@
 //! Authentication HTTP adapters and server-local auth state.
 
+/// The private BFF browser-session channel.
+pub mod bff;
 /// The [`Caller`] extractor: token-derived tenant, principal, and delegation chain.
 pub mod caller_extractor;
 pub mod platform_extractor;

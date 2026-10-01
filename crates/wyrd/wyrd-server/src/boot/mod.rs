@@ -36,7 +36,9 @@ use vala_bifrost_redux::scribe::{
     ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
     ScribePersistenceConfig, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
+use wyrd_auth::browser_sessions::BrowserSessions;
 use wyrd_auth::connections::HumanConnections;
+use wyrd_auth::issuance::TenantTokenIssuer;
 use wyrd_auth::sealing::SealedSecretRewrap;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::{SealingKeyring, SecretKey};
@@ -55,6 +57,7 @@ use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
+use crate::components::auth::bff::BffChannel;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
@@ -1575,20 +1578,38 @@ async fn install_auth(
         config.deployment_profile.screened_http(),
     )?;
 
+    let human_connections = HumanConnections::new(
+        postgres.wyrd().clone(),
+        sealing_key.clone(),
+        config.deployment_profile.screened_http(),
+        config.auth.public_origin.as_ref(),
+    );
+    let token_exchange_settings = wyrd_auth::issuance::TokenExchangeSettings::default();
+    // The BFF channel exists only when the deployment provisions its key.
+    let bff = (!config.auth.bff_service_key_hashes.is_empty()).then(|| BffChannel {
+        sessions: BrowserSessions::new(
+            postgres.wyrd().clone(),
+            sealing_key.clone(),
+            TenantTokenIssuer::new(
+                Arc::clone(&handles.issuing_key),
+                token_exchange_settings.clone(),
+            ),
+            Arc::clone(&handles.token_verifier),
+            human_connections.clone(),
+        ),
+        key_hashes: config.auth.bff_service_key_hashes.clone(),
+    });
+
     Ok(ServerAuth {
         issuing_key: Some(handles.issuing_key),
         token_verifier: Some(handles.token_verifier),
         external_verifier: Some(handles.external_verifier),
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
-        human_connections: Some(HumanConnections::new(
-            postgres.wyrd().clone(),
-            sealing_key.clone(),
-            config.deployment_profile.screened_http(),
-            config.auth.public_origin.as_ref(),
-        )),
+        human_connections: Some(human_connections),
+        bff,
         sealing_key: sealing_key.clone(),
-        token_exchange_settings: wyrd_auth::issuance::TokenExchangeSettings::default(),
+        token_exchange_settings,
     })
 }
 

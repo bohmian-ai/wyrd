@@ -23,7 +23,7 @@ use wyrd_gateway::{
     CredentialAssignment, CredentialResolver, ManagedSecretKeys, TenantKeyring, VaultBackend,
     read_secret_file,
 };
-use wyrd_spec::auth::IssuerTokenPolicy;
+use wyrd_spec::auth::{IssuerTokenPolicy, Sha256Hex};
 use wyrd_spec::gateway::{ExternalSecretReference, ProviderCredentialSourceView};
 use wyrd_spec::ids::{CredentialBindingName, SecretBackendName};
 use wyrd_spec::security::SecretRef;
@@ -2173,6 +2173,17 @@ pub struct AuthConfig {
     /// every non-OIDC path keeps working.
     #[serde(default)]
     pub public_origin: Option<url::Url>,
+    /// SHA-256 hashes of the deployment BFF service key the production UI
+    /// presents on the private browser-session channel.
+    ///
+    /// Env-injected only. Loaded from `WYRD_BFF_SERVICE_KEY_SHA256`: one or,
+    /// during a rotation overlap, two comma-separated lowercase-hex SHA-256
+    /// digests of the raw key. Empty leaves `/internal/bff/v1/*` unmounted, so
+    /// a deployment without the production UI exposes no session channel. The
+    /// key authorizes only browser-session operations, never tenant API
+    /// authority.
+    #[serde(skip)]
+    pub bff_service_key_hashes: Vec<Sha256Hex>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -3095,6 +3106,9 @@ impl WyrdServerConfig {
         if !retained.is_empty() {
             self.auth.sealing_retained_keys = retained;
         }
+        if let Some(hashes) = env_opt("WYRD_BFF_SERVICE_KEY_SHA256")? {
+            self.auth.bff_service_key_hashes = parse_bff_service_key_hashes(&hashes)?;
+        }
         if let Some(origin) = env_opt("WYRD_PUBLIC_ORIGIN")? {
             self.auth.public_origin =
                 Some(
@@ -3490,6 +3504,30 @@ impl WyrdServerConfig {
 
 /// Read an environment variable, returning `None` if unset and
 /// `Err(EmptyEnvVar)` if set but empty.
+/// Parse `WYRD_BFF_SERVICE_KEY_SHA256`: one or two comma-separated
+/// lowercase-hex SHA-256 digests, the second accepted only for a bounded
+/// rotation overlap.
+///
+/// # Errors
+/// Returns [`ConfigError::BadEnvVar`] for an empty entry, a value that is not a
+/// SHA-256 digest, or more than two entries.
+fn parse_bff_service_key_hashes(value: &str) -> Result<Vec<Sha256Hex>, ConfigError> {
+    let bad = |message: String| ConfigError::BadEnvVar {
+        key: "WYRD_BFF_SERVICE_KEY_SHA256".to_string(),
+        message,
+    };
+    let hashes = value
+        .split(',')
+        .map(|entry| Sha256Hex::new(entry.trim()).map_err(|error| bad(error.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    if hashes.len() > 2 {
+        return Err(bad(
+            "at most two key hashes (current and rotating) are accepted".to_string(),
+        ));
+    }
+    Ok(hashes)
+}
+
 fn env_opt(key: &str) -> Result<Option<String>, ConfigError> {
     match env::var(key) {
         Ok(v) if v.is_empty() => Err(ConfigError::EmptyEnvVar {
@@ -3687,6 +3725,33 @@ mod tests {
 
     /// Serialize env-var tests so concurrent test threads cannot interfere.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The BFF service-key hash list accepts one key or a two-key rotation
+    /// overlap and refuses malformed digests and a third key.
+    #[test]
+    fn bff_service_key_hashes_accept_at_most_two_digests() {
+        let one = "a".repeat(64);
+        let two = format!("{one}, {}", "b".repeat(64));
+        assert_eq!(
+            parse_bff_service_key_hashes(&one).expect("one key").len(),
+            1
+        );
+        assert_eq!(
+            parse_bff_service_key_hashes(&two).expect("two keys").len(),
+            2
+        );
+        for bad in [
+            format!("{two},{}", "c".repeat(64)),
+            "A".repeat(64),
+            "abc".to_owned(),
+            format!("{one},"),
+        ] {
+            assert!(
+                parse_bff_service_key_hashes(&bad).is_err(),
+                "{bad} is refused"
+            );
+        }
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

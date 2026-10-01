@@ -210,3 +210,69 @@ session is `401`; the BFF then clears the cookie. Browser cookies:
 `wyrd_session_<tenantKey>` (`Secure`, `HttpOnly`, `SameSite=Lax`, host-only,
 path `/`, max-age = absolute expiry); the cookie name is only a lookup hint and
 the server-returned `tenant_key` must equal the path tenant.
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 OIDC-off UI with an existing Wyrd credential, no IdP or mock flag | `BrowserSessions::exchange_api_key` (`crates/wyrd/wyrd-auth/src/browser_sessions.rs`); `sessions/api-key` (`crates/wyrd/wyrd-server/src/components/auth/bff.rs`); `t/[tenantKey]/login` `apiKey` action | `OIDC-off credential UI` via `WYRD_IDENTITY_TARGET=ui` lane: production `node build` BFFs, no `WYRD_UI_LOCAL_AUTH`; reader and admin keys sign in, wrong-tenant and unusable keys refused with one `401` | PASS |
+| AC-002 real provider, shown callback, UI sign-in, mapped role, authorized and denied call | `ServerSessions.begin/complete`, `login/complete/+server.ts`, server `/auth/callback` → `{public_origin}/login/complete`; settings actions call `/v1/identity/oidc/*` as the session principal | `production SSO crosses replicas`: Keycloak HTML login for alice (`wyrd-admins`→admin) and bob (`wyrd-viewers`→reader); alice deactivates (allowed), bob's deactivate `403` | PASS |
+| AC-003 tenant separation in browser sessions | per-tenant `wyrd_session_<tenantKey>` cookie; server-returned `tenant_key` must equal path tenant, else no session (cookie cleared) | cross-tenant cookie → redirect to that tenant's login, cookie cleared; SSO session cannot act on the OIDC-off tenant (`401`); SSO tenant refuses API-key sign-in | PASS |
+| AC-004 (browser part) no provider secret or Wyrd token in page data or redirect URLs | session id and tokens stay server-side; BFF uses `sessions/authority` only for `X-Wyrd-Access-Token` on its own `/v1` calls | `expectNoSecrets`: tenant home, `__data.json`, settings on both replicas, and every BFF `Location`/non-session `Set-Cookie` contain neither the session id, a JWT, nor the API key | PASS |
+| AC-006 (UI part) owner manages connection from settings | settings page `stage/test/activate/deactivate/remove` actions | OIDC-off admin stages a Keycloak candidate through the UI (`200`, candidate rendered) | PASS |
+| AC-007 BFF across two replicas; missing/wrong flow binding, unauthorized BFF caller, second redemption; old-connection session cannot renew | `BrowserSessions::current/renew` under `FOR UPDATE`; refused renewal revokes; `require_bff_key` before any store read; one-use completion redemption | begin at replica 0, complete at replica 1, concurrent renewal on both; missing, forged, mismatched, and replayed flow → `/?login=failed` with no session cookie; no/wrong `x-wyrd-bff-key` → `401`; forged and logged-out cookies → login + cleared; after deactivation alice's and bob's sessions stop renewing | PASS |
+| AC-009 (UI part) generated contracts agree | `CallbackQuery` ignores provider response parameters (RFC 6749 §4.1.2); schemas regenerated | `mise run codegen:check` | PASS |
+| Unit: `production session rejects cross-tenant and missing CSRF` | `ServerSessions.read/checkAction` | `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/server/auth/session.test.ts -t 'production session rejects cross-tenant and missing CSRF'` | PASS |
+| Unit: `production session expires and logs out` | `ServerSessions.checkAction/read/logout` | same command with `-t 'production session expires and logs out'` | PASS |
+
+Verification run in this session (all exit 0):
+`mise exec -- env WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='production SSO crosses replicas' mise run test:identity:journey`;
+the same with `'OIDC-off credential UI'`; unfiltered `mise run test:identity:journey`
+(UI host: 2 Vitest journeys; `identity_e2e`: 28 passed);
+`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test` (175 passed);
+`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check`;
+`mise run fmt`; `mise run lints`; `mise run codegen:check`; `mise run test:wyrd` (2338 passed);
+`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/cards/core/CardsInventory.test.ts -t 'server wildcard grants satisfy cards:read'`;
+`mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=auth::oidc::tests::callback_query_ignores_provider_parameters)'`;
+`git diff --check`.
+
+Notes:
+
+- Safe browser data: the browser holds only the opaque HttpOnly session
+  cookie and the short-lived flow cookie (`HttpOnly`, `Secure`,
+  `SameSite=Lax`, `Path=/`, host-only, asserted on the wire). Page data carries
+  tenant key/name, principal id, expiry, and the CSRF token only.
+- CSRF: every mutating action requires POST, `Origin` equal to the public
+  origin, an unexpired session, and the session CSRF token (constant-time).
+  Missing, wrong, and cross-origin submissions are `403` on either replica.
+- Replica: session state lives in `wyrd.auth_browser_sessions`; two BFF
+  processes share nothing but the server. Logout at one replica ends the
+  session at the other.
+- OIDC-off: a tenant without an active connection offers API-key sign-in;
+  the key stays server-side, sealed in the session record, and every
+  unusable or other-tenant key gets one indistinguishable `401`.
+- Tenant switch: switching re-reads the target tenant's own session through
+  the server; without one the browser is sent to that tenant's sign-in.
+- Defects found by the journey and fixed at their owner: the callback query
+  refused Keycloak's `session_state` (every real browser login failed with
+  `400`); the BFF sent `Authorization` instead of `X-Wyrd-Access-Token`;
+  UI permission gates ignored the server's `wildcard` grant; the session
+  read could panic on an unlabeled `AnyOf` grant; a cross-tenant cookie
+  stayed stuck because SvelteKit discards cookie changes on a hook error;
+  API-key refusals leaked `401` vs `403`; the tenant-key input pattern
+  rendered `{0,62}` as a Svelte expression.
+- Removed assertion: `callback_query_rejects_unknown_fields` pinned
+  non-compliant behavior that broke real provider callbacks; replaced by
+  `callback_query_ignores_provider_parameters`, which still requires `code`
+  and `state`.
+- Non-goals unchanged: no browser-held Wyrd tokens, no UI role mapping, no
+  local password authority; SCIM/SAML untouched.
+- `test:wyrd` diagnosis: one earlier run aborted six
+  `pg_card_registration_route` tests (SIGABRT) when Postgres terminated their
+  connections ("terminating connection due to administrator command") and the
+  pool could not reconnect for ~20 s. The binary passed 28/28 alone under the
+  same wrapper, and the full lane then passed 2338/2338 with the Postgres log
+  captured. Card registration and test fixtures are outside this diff, and the
+  failed run's server log was lost with its container, so the terminator is
+  not identified. If it recurs, capture `docker logs` of the
+  `wyrd-test-*-postgres` container.

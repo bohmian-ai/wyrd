@@ -340,7 +340,7 @@ impl Case {
     pub fn target(self, fixture: Fixture) -> Target {
         match self {
             Self::Selective => Target {
-                p50_ms: Some(2.0),
+                p50_ms: Some(7.0),
                 p95_ms: Some(5.0),
                 p99_ms: Some(10.0),
                 min_qps: Some(1_000.0),

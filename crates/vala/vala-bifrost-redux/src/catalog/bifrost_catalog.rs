@@ -309,6 +309,14 @@ pub struct BifrostCatalog {
     /// each immutable manifest once per node instead of once per consumer per
     /// query. Seeded lazily because iceberg only builds a cache with a table.
     manifest_cache: Arc<std::sync::OnceLock<Arc<ObjectCache>>>,
+    /// Registered UIDs this node has already read, by tenant and table name.
+    ///
+    /// A registration row is immutable once written: its UID is minted once,
+    /// `(tenant, fqn)` is unique, and no production path updates or deletes
+    /// it. Only found rows are cached, so a table registered later is still
+    /// seen on its first lookup. Grows with registered tables, never with
+    /// queries.
+    table_uids: Arc<std::sync::RwLock<HashMap<(DataTenantId, String), TableUid>>>,
 }
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
@@ -403,7 +411,8 @@ impl BifrostCatalog {
     /// Resolves only the identity of the cut a reader is about to protect.
     ///
     /// This is deliberately the whole of what may happen before protection: a
-    /// registration lookup, one authoritative metadata-pointer read, one read of
+    /// registration lookup (served from [`BifrostCatalog::table_uid`]'s cache
+    /// after the table's first query), one authoritative metadata-pointer read, one read of
     /// the immutable metadata document it names, and the facts derived from
     /// that document. Reading that document is the allowed
     /// identity step because there is no other way to name the snapshot that
@@ -424,14 +433,10 @@ impl BifrostCatalog {
     ) -> Result<PreparedReaderIdentity, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
         TEST_PREPARED_IDENTITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let fqn = table.fqn();
         let started = std::time::Instant::now();
-        let row = self.lookup_table_row(&fqn, tenant).await;
+        let table_uid = self.table_uid(table, tenant).await;
         crate::oracle::QueryPhase::TableLookup.record(started);
-        let Some(row) = row? else {
-            return Err(BifrostCatalogError::TableNotFound(fqn));
-        };
-        let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
+        let table_uid = table_uid?;
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let identifier = binding.table_ident();
@@ -938,6 +943,7 @@ impl BifrostCatalog {
             storage,
             storage_properties,
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
+            table_uids: Arc::default(),
         })
     }
 
@@ -1371,24 +1377,44 @@ impl BifrostCatalog {
 
     /// Return the registered UID of one tenant/logical table.
     ///
-    /// This is a single control-row lookup: nothing is provisioned and no
-    /// Iceberg metadata is loaded, so Gate can name a write destination's
-    /// object scope cheaply on every frame.
+    /// Answers from the node's registration cache when this table was found
+    /// before, and otherwise from one control-row lookup whose result it then
+    /// caches. Nothing is provisioned and no Iceberg metadata is loaded, so
+    /// Gate can name a write destination's object scope on every frame and
+    /// Oracle can resolve every query's tables without a Postgres round trip.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant does not
     /// own the registration, or a metadata or SQL error otherwise.
+    ///
+    /// # Panics
+    /// Panics only if a thread panicked while holding the cache lock.
     pub async fn table_uid(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
     ) -> Result<TableUid, BifrostCatalogError> {
-        let fqn = table.fqn();
+        let key = (tenant, table.fqn());
+        let cached = self
+            .table_uids
+            .read()
+            .expect("the registration cache lock is never poisoned")
+            .get(&key)
+            .copied();
+        if let Some(table_uid) = cached {
+            return Ok(table_uid);
+        }
+        let fqn = &key.1;
         let row = self
-            .lookup_table_row(&fqn, tenant)
+            .lookup_table_row(fqn, tenant)
             .await?
             .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
-        TableUid::from_row(&row.table_uid, &fqn)
+        let table_uid = TableUid::from_row(&row.table_uid, fqn)?;
+        self.table_uids
+            .write()
+            .expect("the registration cache lock is never poisoned")
+            .insert(key, table_uid);
+        Ok(table_uid)
     }
 
     /// Return the registered user-schema fingerprint for one tenant/logical table.
@@ -2271,6 +2297,62 @@ mod production_pin_tests {
                 denied.to_string().contains("permission denied"),
                 "the request role is refused by privilege, not by absence: {denied}"
             );
+        });
+    }
+
+    /// The registration cache keeps found UIDs and never remembers a miss.
+    ///
+    /// A table looked up before it exists must still be found on the first
+    /// lookup after it registers, and every later lookup must return the UID
+    /// registration minted.
+    ///
+    /// # Panics
+    /// Panics when the fixture or registration fails, when the unregistered
+    /// lookup succeeds, or when a later lookup misses or returns another UID.
+    #[test]
+    fn registration_cache_keeps_found_uids_only() {
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                local_storage_owner(warehouse.path()),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+            let tenant = fixture.data_tenant_id();
+            let table = TableRef::new(BifrostNamespace::Datasets, "registered_later");
+            assert!(matches!(
+                catalog.table_uid(&table, tenant).await,
+                Err(crate::catalog::BifrostCatalogError::TableNotFound(_))
+            ));
+            let registered = catalog
+                .register_dataset(
+                    tenant,
+                    table.clone(),
+                    vec![arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("dataset registers");
+            for _ in 0..2 {
+                assert_eq!(
+                    catalog
+                        .table_uid(&table, tenant)
+                        .await
+                        .expect("the registered table resolves"),
+                    registered
+                );
+            }
         });
     }
 

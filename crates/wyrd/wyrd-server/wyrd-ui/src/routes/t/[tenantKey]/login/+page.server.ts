@@ -51,10 +51,10 @@ export const actions: Actions = {
     } catch (cause) {
       if (!isHttpError(cause)) throw cause;
       const value = safeProblem(cause);
-      // One indistinguishable refusal for every unusable credential.
-      return fail(value.status, {
-        problem: value.status === 401 || value.status === 403 ? problem('unauthenticated') : value
-      });
+      // One indistinguishable refusal, status included, for every unusable credential.
+      const refusal =
+        value.status === 401 || value.status === 403 ? problem('unauthenticated') : value;
+      return fail(refusal.status, { problem: refusal });
     }
     redirect(303, destination);
   }

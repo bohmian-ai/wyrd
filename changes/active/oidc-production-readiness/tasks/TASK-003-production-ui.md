@@ -181,3 +181,32 @@ Stop if UI correctness requires browser-held Wyrd tokens, UI-owned role mapping,
 ## Authority Links
 
 [Approved spec](../spec.md); [AGENTS.md](../../../../AGENTS.md); [Wyrd doctrine](../../../../architecture/wyrd-doctrine.mdx); [security posture](../../../../architecture/wyrd-security-posture.md).
+
+## Implementation Notes (local, reversible decisions)
+
+Private BFF session channel. The server mounts `POST /internal/bff/v1/*` only
+when BFF service-key hashes are configured (`WYRD_BFF_SERVICE_KEY_SHA256`,
+comma-separated lowercase hex SHA-256 of the raw key; at most two during
+rotation). Every call carries `x-wyrd-bff-key: <raw key>`; a missing or wrong
+key is `401` before any store read. The deployment gateway never routes
+`/internal/` publicly. Bodies are JSON; errors are Wyrd problem JSON.
+
+| Route | Body | Success |
+|---|---|---|
+| `login/options` | `{tenant_route_key}` | `200 {sso: bool}` |
+| `sessions/complete` | `{flow_id, csrf_token}` | `201 {session_id, tenant_key, expires_at}` |
+| `sessions/api-key` | `{tenant_route_key, api_key, csrf_token}` | `201 {session_id, tenant_key, expires_at}` |
+| `sessions/read` | `{session_id}` | `200 {tenant_key, tenant_name, principal_id, roles, permissions, expires_at, csrf_token}` |
+| `sessions/authority` | `{session_id}` | `200 {access_token, access_expires_at}` |
+| `sessions/logout` | `{session_id}` | `204` (idempotent) |
+
+`flow_id` is the raw HttpOnly flow-cookie value (64 lowercase hex chars);
+the BFF begins login with `browser_flow_hash = hex(sha256(utf8(flow_id)))`
+and the server recomputes it. `session_id` is the raw server-generated
+256-bit id (64 lowercase hex); the server stores only its SHA-256.
+Timestamps are RFC 3339. An unknown, expired, revoked, or non-renewable
+session is `401`; the BFF then clears the cookie. Browser cookies:
+`wyrd_flow` (path `/`, 5 min) and one session cookie per tenant,
+`wyrd_session_<tenantKey>` (`Secure`, `HttpOnly`, `SameSite=Lax`, host-only,
+path `/`, max-age = absolute expiry); the cookie name is only a lookup hint and
+the server-returned `tenant_key` must equal the path tenant.

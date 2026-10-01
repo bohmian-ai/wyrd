@@ -3699,12 +3699,14 @@ mod tests {
     /// plaintext gRPC to the server, and peer mTLS uses `WYRD_PEER_TLS_DIR`.
     #[test]
     fn production_peer_target_needs_no_public_grpc_certificate() {
+        let directory = tempfile::tempdir().expect("key temp directory");
         for role in [BifrostTarget::All, BifrostTarget::Oracle] {
             let mut config = WyrdServerConfig {
                 deployment_profile: DeploymentProfile::Production,
                 role,
                 ..WyrdServerConfig::default()
             };
+            config.verification.operator_keys = production_operator_keys(directory.path());
             config.bifrost.peer.address = Some("wyrd-core-0.wyrd-core:50052".to_owned());
             config.bifrost.peer.tls_dir = Some(PathBuf::from("/etc/wyrd/peer"));
 
@@ -4465,6 +4467,7 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
+        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path;
         assert!(config.validate().is_err());
     }
@@ -4483,6 +4486,7 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
+        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path;
         assert!(config.validate().is_err());
     }
@@ -5451,6 +5455,7 @@ minimum_slots = 2
                 deployment_profile: DeploymentProfile::Production,
                 ..WyrdServerConfig::default()
             };
+            config.verification.operator_keys = production_operator_keys(directory.path());
             config.bifrost.oracle.calibration_profile = profile;
             config.validate()
         };

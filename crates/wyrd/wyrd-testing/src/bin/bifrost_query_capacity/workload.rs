@@ -199,8 +199,12 @@ pub struct Target {
     pub p95_ms: Option<f64>,
     /// Client p99 ceiling, milliseconds.
     pub p99_ms: Option<f64>,
-    /// Successful queries-per-second floor.
+    /// Successful queries-per-second floor at the same concurrency as the
+    /// latency ceilings.
     pub min_qps: Option<f64>,
+    /// Successful queries-per-second floor at a sweep's busiest point, with
+    /// the latency ceilings judged at one client instead.
+    pub peak_qps: Option<f64>,
     /// Physical scan bytes-per-second floor.
     pub min_scan_bytes_per_second: Option<f64>,
 }
@@ -343,7 +347,7 @@ impl Case {
                 p50_ms: Some(7.0),
                 p95_ms: Some(10.0),
                 p99_ms: Some(10.0),
-                min_qps: Some(1_000.0),
+                peak_qps: Some(600.0),
                 ..Target::default()
             },
             Self::SmallAggregate => Target {

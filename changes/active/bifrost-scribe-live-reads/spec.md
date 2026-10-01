@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 22
+revision: 23
 status: approved
 ---
 
@@ -168,8 +168,8 @@ throughput result. These are engineering targets for this machine, not
 universal OLAP standards.
 
 On the 4-CPU/8-GiB node, selective reads must reach client p50 <7 ms, p95
-<10 ms, and p99 <10 ms while sustaining more than 1,000 successful reads per
-second at the same stated concurrency. Small filtered aggregates must sustain
+<10 ms, and p99 <10 ms at one client, and sustain at least 600 successful
+reads per second at the busiest point of the concurrency sweep. Small filtered aggregates must sustain
 at least 100 successful queries per second with p95 <100 ms. Medium queries must
 sustain at least 20 per second with p95 <300 ms at the same concurrency; the
 roughly 10-million-row case also has p95 <300 ms at one client. The large
@@ -597,7 +597,7 @@ REQ-015's removal of the tenant column and its footer tenant record.
 
 ## Open material decisions
 
-None. Revision 22 was explicitly approved by the user on 2026-10-01.
+None. Revisions 22 and 23 were explicitly approved by the user on 2026-10-01.
 Revision 20 was explicitly approved by the user on 2026-09-30.
 Revision 17's single execution path and one-unit slot charge were
 explicitly approved by the user on 2026-09-30. Revision 16's per-query memory limit, 4 GiB pod floor, and governed
@@ -737,6 +737,11 @@ on 2026-09-28.
   sharing, not interference; each class is judged against its absolute target
   while writing. Approved by the user on 2026-10-01 ("Go with your
   recommendations").
+- Revision 23 (2026-10-01): Selective latency is judged at one client and
+  its rate floor, lowered from 1,000 to 600 qps, at the sweep's busiest point.
+  One client reaches p50 6.9 ms at 143 qps; 4 CPUs saturate near 660 qps, so
+  no single concurrency can hold both. Approved by the user on 2026-10-01
+  ("A - continue and close out the remaining work").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

@@ -139,7 +139,8 @@ impl Report {
     }
 
     /// Adds a concurrency sweep of `case`: one `-` row per point, then a
-    /// summary that passes when some point meets the whole target.
+    /// summary judged by [`peak_summary`] when the target has a peak rate,
+    /// else by [`concurrency_summary`].
     pub fn sweep(&mut self, case: Case, points: &[Measured]) {
         let target = case.target(self.fixture);
         for point in points {
@@ -151,11 +152,10 @@ impl Report {
             }
             self.add(row);
         }
-        let meeting: Vec<String> = points
-            .iter()
-            .filter(|point| missed(&target, point).is_none() && point.error_count() == 0)
-            .map(|point| point.clients.to_string())
-            .collect();
+        let summary = match target.peak_qps {
+            Some(floor) => peak_summary(&target, points, floor),
+            None => concurrency_summary(&target, points),
+        };
         self.add(Row {
             step: format!("{} target", case.name()),
             clients: "-".to_owned(),
@@ -163,16 +163,12 @@ impl Report {
             latency: "-".to_owned(),
             errors: "-".to_owned(),
             usage: None,
-            verdict: if meeting.is_empty() {
-                Verdict::Fail
-            } else {
+            verdict: if summary.is_ok() {
                 Verdict::Pass
-            },
-            reason: if meeting.is_empty() {
-                "no concurrency meets the target".to_owned()
             } else {
-                format!("met at {} clients", meeting.join(", "))
+                Verdict::Fail
             },
+            reason: summary.unwrap_or_else(|missed| missed),
         });
     }
 
@@ -352,6 +348,56 @@ fn usage(usage: &Usage) -> Option<(f64, u64, f64, f64)> {
     })
 }
 
+/// Judges a sweep whose whole target must hold at one concurrency: `Ok`
+/// names every error-free point meeting it, `Err` says none did.
+fn concurrency_summary(
+    target: &Target,
+    points: &[Measured],
+) -> std::result::Result<String, String> {
+    let meeting: Vec<String> = points
+        .iter()
+        .filter(|point| missed(target, point).is_none() && point.error_count() == 0)
+        .map(|point| point.clients.to_string())
+        .collect();
+    if meeting.is_empty() {
+        Err("no concurrency meets the target".to_owned())
+    } else {
+        Ok(format!("met at {} clients", meeting.join(", ")))
+    }
+}
+
+/// Judges a sweep whose latency ceilings hold at one client and whose rate
+/// must reach `floor` at its busiest error-free point.
+///
+/// # Errors
+///
+/// Returns the first miss: no error-free one-client point, a latency
+/// ceiling missed there, or a peak rate below `floor`.
+fn peak_summary(
+    target: &Target,
+    points: &[Measured],
+    floor: f64,
+) -> std::result::Result<String, String> {
+    let clean = || points.iter().filter(|point| point.error_count() == 0);
+    let single = clean()
+        .find(|point| point.clients == 1)
+        .ok_or_else(|| "no error-free point at 1 client".to_owned())?;
+    if let Some(miss) = missed(target, single) {
+        return Err(format!("1 client: {miss}"));
+    }
+    let peak = clean()
+        .max_by(|a, b| a.rate().total_cmp(&b.rate()))
+        .ok_or_else(|| "no error-free point".to_owned())?;
+    if peak.rate() < floor {
+        return Err(format!("peak {:.1} qps < {floor}", peak.rate()));
+    }
+    Ok(format!(
+        "latency met at 1 client; peak {:.1} qps at {} clients",
+        peak.rate(),
+        peak.clients
+    ))
+}
+
 /// Successful queries per second, formatted.
 fn qps(measured: &Measured) -> String {
     format!("{:.1} qps", measured.rate())
@@ -409,8 +455,9 @@ mod tests {
         }
     }
 
-    /// A sweep passes when one point meets the whole target, and an error
-    /// fails a row whatever its latency.
+    /// A selective sweep passes on one-client latency plus its busiest
+    /// point's rate, a small-aggregate sweep when one point meets the whole
+    /// target, and an error fails a row whatever its latency.
     ///
     /// # Panics
     ///
@@ -420,16 +467,32 @@ mod tests {
         let mut report = Report::new(Fixture::standard());
         report.sweep(
             Case::Selective,
-            &[point(1, 1, 500), point(8, 1, 2_000), point(64, 20, 3_000)],
+            &[point(1, 5, 150), point(8, 12, 650), point(64, 90, 640)],
         );
         assert_eq!(report.rows[3].verdict, Verdict::Pass);
-        assert_eq!(report.rows[3].reason, "met at 8 clients");
+        assert_eq!(
+            report.rows[3].reason,
+            "latency met at 1 client; peak 650.0 qps at 8 clients"
+        );
+        report.sweep(Case::Selective, &[point(1, 8, 150), point(8, 12, 650)]);
+        assert_eq!(report.rows[6].reason, "1 client: p50 8.0 ms >= 7 ms");
+        report.sweep(Case::Selective, &[point(1, 5, 150), point(8, 12, 500)]);
+        assert_eq!(report.rows[9].reason, "peak 500.0 qps < 600");
+        report.sweep(
+            Case::SmallAggregate,
+            &[point(1, 10, 90), point(4, 15, 270), point(64, 180, 370)],
+        );
+        assert_eq!(report.rows[13].reason, "met at 4 clients");
+        report.rows.retain(|row| row.verdict != Verdict::Fail);
         assert!(report.passed());
 
         let mut failing = point(1, 100, 10);
         failing.errors.insert("wrong-result".to_owned(), 1);
         report.query(Case::TableAggregate, &failing);
-        assert_eq!(report.rows[4].verdict, Verdict::Fail);
+        assert_eq!(
+            report.rows.last().map(|row| row.verdict),
+            Some(Verdict::Fail)
+        );
         assert!(!report.passed());
     }
 }

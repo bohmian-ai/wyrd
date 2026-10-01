@@ -33,10 +33,10 @@ const METRICS_URL: &str = "http://127.0.0.1:8081/metrics";
 const TENANT: &str = "bench";
 
 /// CPUs of quota in the pod envelope.
-const CPUS: u64 = 4;
+pub const CPUS: u64 = 8;
 
 /// Memory limit of the pod envelope, with no swap.
-const MEMORY_BYTES: u64 = 8 << 30;
+pub const MEMORY_BYTES: u64 = 16 << 30;
 
 /// How long the server may take to report ready on `/readyz`.
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -70,7 +70,7 @@ impl LocalServer {
     /// Returns an error when `WYRD_TEST_DATABASE_ADMIN_URL` is unset (the
     /// benchmark is not running under the Postgres wrapper), `migrate` or
     /// `setup` fails, the server exits or never becomes ready, or its cgroup
-    /// does not enforce the 4-CPU/8-GiB envelope.
+    /// does not enforce the [`CPUS`]/[`MEMORY_BYTES`] envelope.
     pub async fn start(binary: &Path) -> Result<Self> {
         let owner_url = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")
             .map_err(|_| "WYRD_TEST_DATABASE_ADMIN_URL is unset; run through mise")?;

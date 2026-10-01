@@ -347,17 +347,17 @@ impl Case {
                 p50_ms: Some(7.0),
                 p95_ms: Some(10.0),
                 p99_ms: Some(10.0),
-                peak_qps: Some(600.0),
+                peak_qps: Some(1_200.0),
                 ..Target::default()
             },
             Self::SmallAggregate => Target {
                 p95_ms: Some(100.0),
-                min_qps: Some(100.0),
+                min_qps: Some(200.0),
                 ..Target::default()
             },
             Self::MillionAggregate => Target {
                 p95_ms: Some(300.0),
-                min_qps: Some(20.0),
+                min_qps: Some(40.0),
                 ..Target::default()
             },
             Self::TableAggregate => Target {
@@ -370,7 +370,7 @@ impl Case {
             },
             Self::FullScan if fixture.is_heavy() => Target {
                 p99_ms: Some(2_000.0),
-                min_scan_bytes_per_second: Some(500_000_000.0),
+                min_scan_bytes_per_second: Some(1_000_000_000.0),
                 ..Target::default()
             },
             Self::BroadWindow | Self::FullScan => Target::default(),

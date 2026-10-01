@@ -488,7 +488,7 @@ description = "wyrd-testing `oracle` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all"
 
 [tasks."bench:bifrost:query-capacity"]
-description = "Opt-in benchmark: one release wyrd-server started through the local-development journey (migrate, serve, setup) in a 4-CPU/8-GiB systemd user scope, driven through the public Rust client: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --heavy` writes 100M rows and runs the broad window and full scan. Fails on any FAIL row. Linux with a delegating systemd user manager; part of no gate or verify lane."
+description = "Opt-in benchmark: one release wyrd-server started through the local-development journey (migrate, serve, setup) in an 8-CPU/16-GiB systemd user scope, driven through the public Rust client: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --heavy` writes 100M rows and runs the broad window and full scan. Fails on any FAIL row. Linux with a delegating systemd user manager; part of no gate or verify lane."
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo build --locked --release -p wyrd-server && cargo run --locked --release -p wyrd-testing --bin bifrost_query_capacity -- \"$@\"' _"
 
 [tasks."test:bifrost:journey:otlp"]

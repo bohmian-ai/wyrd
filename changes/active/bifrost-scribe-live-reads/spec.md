@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 23
+revision: 24
 status: approved
 ---
 
@@ -134,7 +134,7 @@ PublishedOnly are updated to exercise the one query behavior.
 ### REQ-008 — Measured read capacity on one modest node
 
 The one query service must be measured and improved through the public client
-on one locally launched Bifrost node limited by Linux to 4 CPUs and 8 GiB,
+on one locally launched Bifrost node limited by Linux to 8 CPUs and 16 GiB,
 using local NVMe, where the node is one real `wyrd-server` release-binary
 process started through the local-development journey (`migrate`, serve,
 `setup`) with only the storage URL the journey leaves to the operator; every
@@ -167,26 +167,26 @@ audit. An invalid workload must be reported as invalid rather than assigned a
 throughput result. These are engineering targets for this machine, not
 universal OLAP standards.
 
-On the 4-CPU/8-GiB node, selective reads must reach client p50 <7 ms, p95
-<10 ms, and p99 <10 ms at one client, and sustain at least 600 successful
+On the 8-CPU/16-GiB node, selective reads must reach client p50 <7 ms, p95
+<10 ms, and p99 <10 ms at one client, and sustain at least 1,200 successful
 reads per second at the busiest point of the concurrency sweep. Small filtered aggregates must sustain
-at least 100 successful queries per second with p95 <100 ms. Medium queries must
-sustain at least 20 per second with p95 <300 ms at the same concurrency; the
+at least 200 successful queries per second with p95 <100 ms. Medium queries must
+sustain at least 40 per second with p95 <300 ms at the same concurrency; the
 roughly 10-million-row case also has p95 <300 ms at one client. The large
 time-window aggregate and a roughly 100-million-row heavy scan must each
 complete in <2 seconds; the heavy scan
-must reach at least 500 MB/second in measured physical scan throughput at
+must reach at least 1,000 MB/second in measured physical scan throughput at
 one client. Higher concurrency points identify saturation; they need not
 meet the single-client heavy-scan latency target. Sustained batched ingest
-must durably acknowledge at least 100,000 rows per
+must durably acknowledge at least 200,000 rows per
 second and report p95 batch latency, written bytes per second, CPU, and memory.
 
-Under simultaneous sustained ingest of at least 100,000 acknowledged rows
-per second, the representative read mix must sustain at least 100 successful
+Under simultaneous sustained ingest of at least 200,000 acknowledged rows
+per second, the representative read mix must sustain at least 200 successful
 analytical queries per second. Small-query p95 remains <100 ms and medium-query
 p95 <300 ms. Reads and writes share the node's CPU, so each class is
 judged against its own absolute target while writing, and its read-only p95
-is reported beside it rather than imposing a relative-rise limit. Peak node memory stays below 7 GiB with no
+is reported beside it rather than imposing a relative-rise limit. Peak node memory stays below 15 GiB with no
 OOM event. A 5,000/second selective rate is reported as a stretch result;
 it does not replace these required targets. CPU utilization is reported, not
 assigned an invented passing floor.
@@ -529,7 +529,7 @@ REQ-015's removal of the tenant column and its footer tenant record.
   report rules in REQ-008.
   Every required workload has a valid measured result or an explicit failure;
   no invalid run can satisfy a performance target.
-- **AC-010:** On the specified 4-CPU/8-GiB node, the measured required
+- **AC-010:** On the specified 8-CPU/16-GiB node, the measured required
   workloads meet the numeric targets in REQ-008. A missed target, a refused
   acknowledged read-back, or an unproven CPU or snapshot diagnosis prevents
   completion and is reported with its owning boundary and raw evidence.
@@ -541,7 +541,7 @@ REQ-015's removal of the tenant column and its footer tenant record.
   limit. Execution uses the remaining total time. The 1,000th waiting query
   fits; the next receives queue-full overload. Cancellation and
   timeout free their places. HTTP and gRPC do not shed an otherwise queueable
-  authenticated query before Oracle. A 4-CPU/8-GiB real-server run with
+  authenticated query before Oracle. An 8-CPU/16-GiB real-server run with
   the full queue remains under the stated memory ceiling without OOM.
 - **AC-012:** An 8-GiB process limit with default configuration yields at
   least 1 GiB of non-Bifrost server headroom and a 7-GiB shared Bifrost
@@ -597,7 +597,7 @@ REQ-015's removal of the tenant column and its footer tenant record.
 
 ## Open material decisions
 
-None. Revisions 22 and 23 were explicitly approved by the user on 2026-10-01.
+None. Revisions 22 through 24 were explicitly approved by the user on 2026-10-01.
 Revision 20 was explicitly approved by the user on 2026-09-30.
 Revision 17's single execution path and one-unit slot charge were
 explicitly approved by the user on 2026-09-30. Revision 16's per-query memory limit, 4 GiB pod floor, and governed
@@ -742,6 +742,12 @@ on 2026-09-28.
   One client reaches p50 6.9 ms at 143 qps; 4 CPUs saturate near 660 qps, so
   no single concurrency can hold both. Approved by the user on 2026-10-01
   ("A - continue and close out the remaining work").
+- Revision 24 (2026-10-01): The benchmark node doubles to 8 CPUs and 16 GiB,
+  replacing 4/8. Throughput floors double (selective 1,200 qps peak, small
+  aggregate 200, medium 40, heavy scan 1,000 MB/s, ingest 200,000 rows/s);
+  latency targets are unchanged; the memory ceiling is the limit less the
+  1-GiB default headroom (15 GiB). Approved by the user on 2026-10-01
+  ("Run 8/16 and replace 4/8. Scale benchmarks accordingly").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

@@ -9,13 +9,15 @@ use std::path::Path;
 
 use crate::Result;
 use crate::run::{Measured, Overload, QUEUE_FULL, QUEUE_PLACES, Usage};
+use crate::server::{CPUS, MEMORY_BYTES};
 use crate::workload::{Case, Fixture, Target};
 
-/// Peak server memory every step must stay below: 7 GiB of the 8-GiB pod.
-const MEMORY_CEILING_BYTES: u64 = 7 << 30;
+/// Peak server memory every step must stay below: the pod limit less the
+/// server's 1-GiB default headroom.
+const MEMORY_CEILING_BYTES: u64 = MEMORY_BYTES - (1 << 30);
 
 /// Durable acknowledged rows per second every write step must reach.
-const MIN_WRITE_ROWS_PER_SECOND: f64 = 100_000.0;
+const MIN_WRITE_ROWS_PER_SECOND: f64 = 200_000.0;
 
 /// The report table's header.
 const HEADER: &str = "| step | clients | rate | p50/p95/p99 ms | errors | server CPU | peak memory | seals | driver CPU | verdict | reason |\n|---|---|---|---|---|---|---|---|---|---|---|";
@@ -259,8 +261,9 @@ impl Report {
     /// The report's title line.
     fn title(fixture: Fixture) -> String {
         format!(
-            "# Bifrost query capacity: {} rows, 4 CPU / 8 GiB",
-            fixture.rows
+            "# Bifrost query capacity: {} rows, {CPUS} CPU / {} GiB",
+            fixture.rows,
+            MEMORY_BYTES >> 30
         )
     }
 
@@ -295,7 +298,7 @@ impl Report {
         } else if usage_.oom_kills > 0 {
             Some(format!("{} OOM kills", usage_.oom_kills))
         } else if usage_.peak_memory_bytes >= MEMORY_CEILING_BYTES {
-            Some("peak memory >= 7 GiB".to_owned())
+            Some(format!("peak memory >= {} GiB", MEMORY_CEILING_BYTES >> 30))
         } else {
             missed
         };
@@ -467,17 +470,17 @@ mod tests {
         let mut report = Report::new(Fixture::standard());
         report.sweep(
             Case::Selective,
-            &[point(1, 5, 150), point(8, 12, 650), point(64, 90, 640)],
+            &[point(1, 5, 150), point(16, 12, 1_300), point(64, 90, 1_280)],
         );
         assert_eq!(report.rows[3].verdict, Verdict::Pass);
         assert_eq!(
             report.rows[3].reason,
-            "latency met at 1 client; peak 650.0 qps at 8 clients"
+            "latency met at 1 client; peak 1300.0 qps at 16 clients"
         );
-        report.sweep(Case::Selective, &[point(1, 8, 150), point(8, 12, 650)]);
+        report.sweep(Case::Selective, &[point(1, 8, 150), point(16, 12, 1_300)]);
         assert_eq!(report.rows[6].reason, "1 client: p50 8.0 ms >= 7 ms");
-        report.sweep(Case::Selective, &[point(1, 5, 150), point(8, 12, 500)]);
-        assert_eq!(report.rows[9].reason, "peak 500.0 qps < 600");
+        report.sweep(Case::Selective, &[point(1, 5, 150), point(16, 12, 1_000)]);
+        assert_eq!(report.rows[9].reason, "peak 1000.0 qps < 1200");
         report.sweep(
             Case::SmallAggregate,
             &[point(1, 10, 90), point(4, 15, 270), point(64, 180, 370)],

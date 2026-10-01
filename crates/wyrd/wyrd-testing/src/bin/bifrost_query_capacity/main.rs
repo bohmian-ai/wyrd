@@ -39,9 +39,9 @@ const SWEEP: [usize; 6] = [1, 4, 8, 16, 32, 64];
 
 /// Read clients beside the writer in the reads-while-writing steps.
 ///
-/// Reads and writes share the node's 4 CPUs, so the step runs few enough
-/// readers to leave the writer room; at 8 the reads alone saturate the node.
-const LOADED_CLIENTS: usize = 2;
+/// Reads and writes share the node's CPUs, so the step runs few enough
+/// readers to leave the writer room; at 16 the reads alone saturate the node.
+const LOADED_CLIENTS: usize = 4;
 
 /// The journey: start the server, write, check answers, measure, stop.
 ///

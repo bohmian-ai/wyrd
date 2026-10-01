@@ -2,13 +2,16 @@
 // raw-query grep allowlist: storage tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use crate::error::SqlError;
-use sqlx::PgPool;
+use crate::operator_pool::OperatorPool;
 
 /// Delete expired idempotency rows across tenants.
 ///
 /// # Errors
 /// Returns [`SqlError`] when Postgres rejects the cleanup query.
-pub async fn reap_idempotency_keys(admin_pool: &PgPool, batch_size: i64) -> Result<u64, SqlError> {
+pub async fn reap_idempotency_keys(
+    operator: &OperatorPool,
+    batch_size: i64,
+) -> Result<u64, SqlError> {
     let result = sqlx::query(
         r#"
         WITH expired AS (
@@ -25,7 +28,7 @@ pub async fn reap_idempotency_keys(admin_pool: &PgPool, batch_size: i64) -> Resu
         "#,
     )
     .bind(batch_size)
-    .execute(admin_pool)
+    .execute(operator.pool())
     .await
     .map_err(SqlError::from)?;
 

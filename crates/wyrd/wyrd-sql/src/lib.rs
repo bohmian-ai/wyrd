@@ -375,7 +375,8 @@ mod tests {
         let resolver =
             fs::read_to_string(crate_dir.join("src/queries/platform/tenant_resolver.rs"))
                 .expect("tenant resolver module is readable");
-        assert!(resolver.contains("resolve_by_slug_for_app"));
+        assert!(resolver.contains("pub(crate) async fn resolve_by_slug"));
+        assert!(resolver.contains("&OperatorPool"));
         assert!(resolver.contains("&TenantSlug"));
         assert!(resolver.contains("platform.resolve_tenant_by_slug($1)"));
         assert!(resolver.contains("raw-query grep"));
@@ -682,7 +683,7 @@ mod tests {
         let admin_checked = without_line_comments(&admin_body);
 
         assert!(
-            admin_checked.contains("&PgPool"),
+            admin_checked.contains("&OperatorPool") && !admin_checked.contains("PgPool"),
             "storage admin queries must make their cross-tenant pool boundary explicit"
         );
         assert!(

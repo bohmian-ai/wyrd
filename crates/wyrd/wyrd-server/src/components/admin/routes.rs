@@ -34,6 +34,7 @@ use wyrd_auth_oidc::{
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
     IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
+    refuse_human_trusted_issuer,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_sql::queries::auth::{
@@ -258,7 +259,8 @@ struct BindingFilter {
 ///
 /// # Errors
 ///
-/// Returns a `400` for a missing secret or blocked issuer, the RBAC denial,
+/// Returns a `400` for a Human issuer (`HUMAN_CONNECTION_REQUIRED`, before any
+/// authorization or IO), a missing secret, or a blocked issuer, the RBAC denial,
 /// `AuditUnavailable` when the decision cannot be recorded, a `503` when
 /// discovery, the sealing key, or the store is unavailable, and a `409` for a
 /// duplicate issuer.
@@ -270,7 +272,9 @@ struct BindingFilter {
         (status = 200, description = "Issuer registered; the client secret is never returned",
          body = TrustedIssuerView),
         (status = 400, description = "The issuer URL is malformed, resolves to a blocked address, \
-          or a required field is missing (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)",
+          or a required field is missing (WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD); or the \
+          issuer is `principal_kind = human`, which is configured through the tenant OIDC \
+          connection API instead (WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED)",
          body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -294,6 +298,7 @@ async fn create_trusted_issuer(
     caller: Caller,
     Json(request): Json<CreateTrustedIssuerRequest>,
 ) -> Result<Json<TrustedIssuerView>, WyrdErrorResponse> {
+    refuse_human_trusted_issuer(request.principal_kind).map_err(WyrdErrorResponse::from)?;
     let client_auth = request_client_auth(&request)?;
     let decision = audit::authorize_service_accounts_write(
         &state,
@@ -1010,8 +1015,9 @@ mod pg_tests {
     const SECRET: &str = "super-secret";
     const SEEDED_ISSUER: &str = "https://idp.example.com/realms/wyrd";
 
-    fn sealing_key() -> SecretKey {
-        SecretKey::from_bytes([7_u8; 32])
+    /// Deterministic single-key sealing keyring shared by the admin route tests.
+    fn sealing_key() -> wyrd_crypt::SealingKeyring {
+        wyrd_crypt::SealingKeyring::new(SecretKey::from_bytes([7_u8; 32]))
     }
 
     async fn test_state(fixture: &PgFixture) -> AppState {
@@ -1097,7 +1103,7 @@ mod pg_tests {
             },
             group_role_map: HashMap::new(),
             default_roles: vec!["viewer".to_owned()],
-            principal_kind: IssuerTokenPolicy::Human,
+            principal_kind: IssuerTokenPolicy::Workload,
             jwks_ttl_secs: None,
         }
     }
@@ -1138,6 +1144,33 @@ mod pg_tests {
             .await
             .expect("issuer upsert");
         conn.commit().await.expect("issuer seed commits");
+    }
+
+    /// A Human issuer is refused with `HUMAN_CONNECTION_REQUIRED` before
+    /// authorization, discovery, or any write: human trust lives only in the
+    /// tenant connection API.
+    #[tokio::test]
+    async fn create_refuses_human_issuer_before_io() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture).await;
+        let mut request = create_issuer_request(
+            IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"),
+            None,
+        );
+        request.principal_kind = IssuerTokenPolicy::Human;
+
+        let error = create_trusted_issuer(State(state), writer(tenant), Json(request))
+            .await
+            .expect_err("a Human issuer must be refused");
+
+        assert!(matches!(error.0, WyrdError::HumanConnectionRequired { .. }));
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let row = trusted_issuer_by_url(&mut conn, SEEDED_ISSUER)
+            .await
+            .expect("query succeeds");
+        conn.commit().await.expect("commit");
+        assert!(row.is_none(), "a refused Human issuer must not be stored");
     }
 
     #[tokio::test]
@@ -1255,7 +1288,7 @@ mod pg_tests {
 
         // The sealing key round-trips: the resolver decrypts back to the original.
         let resolver = PgIssuerResolver::new(
-            Arc::new(fixture.app_pool().clone()),
+            fixture.wyrd_postgres().clone(),
             Some(Arc::new(sealing_key())),
         );
         let resolved = resolver

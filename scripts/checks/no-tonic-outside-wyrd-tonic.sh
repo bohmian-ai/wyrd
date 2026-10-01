@@ -8,38 +8,41 @@
 # are a one-line workspace edit rather than a multi-crate update.
 #
 # WHAT IT CHECKS:
-#   1. tonic/prost dep declarations appear only in wyrd-tonic and Cargo.toml
+#   1. tonic/prost dep declarations appear only in wyrd-tonic, the workspace
+#      root, and the generated workspace-hack manifest
 #   2. No renamed-dep workaround (package = "tonic") bypasses the rule
 #   3. Source imports use wyrd-tonic re-exports, not tonic:: directly
 #   4. Workspace pin entries for all four tonic-family crates are present
 #   5. wyrd-server depends on wyrd-tonic with the "server" feature
 set -e
 
+source "$(dirname "${BASH_SOURCE[0]}")/forbid.sh"
+
 # 1. Manifest declarations must only appear in wyrd-tonic and workspace root
-! rg -n --no-heading \
+forbid \
     -e '^[[:space:]]*(tonic|tonic-health|tonic-reflection|tonic-types|tonic-build|tonic-prost|tonic-prost-build|prost)[[:space:]]*=' \
     --glob '!crates/wyrd/wyrd-tonic/Cargo.toml' \
-    --glob '!Cargo.toml' \
-    crates/ python/
+    --glob '!crates/shared/workspace-hack/Cargo.toml' \
+    crates/
 
 # 1a. Renamed-dep evasion (package = "tonic")
-! rg -n --no-heading \
+forbid \
     -e 'package[[:space:]]*=[[:space:]]*"(tonic|tonic-health|tonic-reflection|tonic-types|tonic-build|tonic-prost|tonic-prost-build|prost)"' \
     --glob '!crates/wyrd/wyrd-tonic/Cargo.toml' \
-    --glob '!Cargo.toml' \
-    crates/ python/
+    --glob '!crates/shared/workspace-hack/Cargo.toml' \
+    crates/
 
 # 2. Source-code imports must not bypass wyrd-tonic re-exports
-! rg -n --no-heading \
+forbid \
     -e '^[[:space:]]*(pub(\([^)]+\))?[[:space:]]+)?use[[:space:]]+(tonic|tonic_health|tonic_reflection|prost)::' \
     --glob '!crates/wyrd/wyrd-tonic/src/**' \
-    crates/ python/
+    crates/
 
 # 2a. extern crate form
-! rg -n --no-heading \
+forbid \
     -e '^[[:space:]]*extern[[:space:]]+crate[[:space:]]+(tonic|tonic_health|tonic_reflection|prost)\b' \
     --glob '!crates/wyrd/wyrd-tonic/src/**' \
-    crates/ python/
+    crates/
 
 # 3. Workspace pin sanity
 rg -q -e '^[[:space:]]*tonic[[:space:]]*=' Cargo.toml

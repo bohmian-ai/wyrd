@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use uuid::Uuid;
 use wyrd_auth_issue::IssueError;
 use wyrd_spec::DataTenantId;
@@ -15,7 +14,7 @@ use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::vala::ScopeHash;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
-use wyrd_sql::TenantConn;
+use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::audit::{
     CARD_SCOPE_MINT_OPERATION, append_auth_audit, auth_event, auth_failure_code,
@@ -207,9 +206,11 @@ pub async fn write_scope_mint_success_audit(
 ///
 /// Only errors that name a scope root are recorded; the refused grant has no
 /// authenticated principal yet, so the event is attributed to
-/// [`PLATFORM_AUDIT_PRINCIPAL`]. Staging failures are logged, never returned.
+/// [`PLATFORM_AUDIT_PRINCIPAL`]. The event stages through
+/// [`record_auth_audit_best_effort`] on a tenant transaction from `postgres`.
+/// Staging failures are logged, never returned.
 pub async fn audit_scope_mint_failure_best_effort(
-    pool: &PgPool,
+    postgres: &WyrdPostgres,
     tenant_id: DataTenantId,
     request_id: &str,
     mint_kind: CardScopeMintKind,
@@ -234,7 +235,7 @@ pub async fn audit_scope_mint_failure_best_effort(
             failure_code: Some(auth_failure_code(error)),
         },
     );
-    record_auth_audit_best_effort(pool, tenant_id, &event).await;
+    record_auth_audit_best_effort(postgres, tenant_id, &event).await;
 }
 
 /// Principal kind of the card-bound principal that owns `root`.

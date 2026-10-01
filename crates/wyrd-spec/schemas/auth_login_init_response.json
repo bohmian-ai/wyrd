@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "LoginInitResponse",
-  "description": "`GET /auth/login` response.",
+  "description": "Platform-administrator login initiation response.\n\nThe platform plane posts the provider's `code` and `state` back itself, so it receives the state here. Tenant human login never does: its [`BeginLoginResponse`] carries only the authorization URL.",
   "type": "object",
   "required": [
     "authorization_url",

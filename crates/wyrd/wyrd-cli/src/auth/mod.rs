@@ -1,7 +1,5 @@
 /// `wyrd auth issue-key`: mint an API key bound to a Card.
 pub mod issue_key;
-/// `wyrd auth login`: interactive OIDC login exchanged for Wyrd tokens.
-pub mod login;
 /// `wyrd auth refresh`: rotate a Wyrd refresh token.
 pub mod refresh;
 /// `wyrd auth trusted-issuer`: administer the tenant's trusted OIDC issuers.
@@ -20,8 +18,6 @@ use crate::error::WyrdCliError;
 pub enum AuthCommand {
     /// Issue an API key bound to a card ref (POST /auth/issue-key).
     IssueKey(issue_key::IssueKeyArgs),
-    /// Initiate an OIDC login flow and exchange the callback code for a Wyrd access token.
-    Login(login::LoginArgs),
     /// Rotate a Wyrd refresh token and print the new access and refresh tokens.
     Refresh(refresh::RefreshArgs),
     /// Manage trusted OIDC issuers (add, list, rm).
@@ -40,7 +36,6 @@ pub enum AuthCommand {
 pub async fn dispatch(command: AuthCommand) -> Result<ExitCode, WyrdCliError> {
     match command {
         AuthCommand::IssueKey(args) => issue_key::dispatch(args).await,
-        AuthCommand::Login(args) => login::dispatch(args).await,
         AuthCommand::Refresh(args) => refresh::dispatch(args).await,
         AuthCommand::TrustedIssuer(cmd) => trusted_issuer::dispatch(cmd).await,
         AuthCommand::WorkloadBinding(cmd) => workload_binding::dispatch(cmd).await,

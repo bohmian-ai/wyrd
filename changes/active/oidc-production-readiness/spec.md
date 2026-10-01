@@ -1,7 +1,7 @@
 ---
 id: SPEC-oidc-production-readiness
-revision: 2
-status: draft
+revision: 5
+status: approved
 ---
 
 # Production OIDC for self-hosted and hosted Wyrd
@@ -71,11 +71,20 @@ authentication.
   `private_key_jwt` is refused until it is implemented end to end.
 - **REQ-005**: A provider secret is accepted only at an authorized server
   boundary, encrypted at rest, and absent from read responses, browser data,
-  logs, traces, errors, audit, and generated artifacts. A deployment sealing
-  secret is required only while provider secrets are stored. Operators can
-  rotate it without making existing connections permanently unusable; the
-  rotation procedure is documented and tested. No per-tenant OIDC secret is
-  injected into every serving replica as an environment variable.
+  logs, traces, errors, audit, and generated artifacts. Recoverable Wyrd
+  login and browser-session credentials, including a pending access/refresh
+  token pair or an operator bootstrap API key, are likewise encrypted at rest
+  and never returned to an unauthorized client. One deployment sealing
+  keyring, held separately from the encrypted data and shared by serving
+  replicas, protects these values. It is required whenever provider secrets
+  are stored or human login or browser sessions persist recoverable
+  credentials, including when the provider uses no client secret; otherwise
+  it is optional. Missing key material refuses activation or use of the
+  affected human login or session flow without disabling independent machine
+  authentication. Operators can rotate the keyring without making existing
+  connections or sessions permanently unusable; the rotation procedure is
+  documented and tested. No per-tenant OIDC secret is injected into every
+  serving replica as an environment variable.
 
 ### Browser login and session
 
@@ -93,18 +102,25 @@ authentication.
   bounded provider network calls. An unavailable, unsafe, untrusted, inactive,
   or mismatched provider fails closed without trying another tenant or the
   platform connection.
-- **REQ-008**: Successful callback resolves or creates only a user in the
-  bound tenant. Wyrd maps verified provider groups to roles valid in that
-  tenant and issues tenant-bound Wyrd credentials. No provider claim directly
-  names Wyrd permissions; unknown or ambiguous privileged mappings cannot
-  grant authority. A user with no applicable grant receives no privileged
-  default.
+- **REQ-008**: Activating a tenant's human connection authorizes successful
+  authentication by that exact provider to establish membership in that
+  tenant. A successful callback resolves or creates a tenant-bound `User`
+  principal for the verified `(issuer, subject)` and issues tenant-bound Wyrd
+  credentials. Wyrd maps verified provider groups only to roles valid in that
+  tenant. `User` is a principal kind, not a role; a user with no applicable
+  role mapping receives no privileged grant. No provider claim directly names
+  Wyrd permissions, and unknown or ambiguous privileged mappings cannot grant
+  authority.
 - **REQ-009**: The production BFF completes login and maintains a session
   usable across serving replicas. The browser gets a Secure, HttpOnly,
   SameSite cookie and safe session metadata, never a Wyrd bearer or refresh
   token in page data, URL, JavaScript storage, or a JSON callback page. BFF
-  actions enforce CSRF, expiry, tenant binding, and Wyrd permissions. Logout
-  ends the Wyrd browser session; it does not claim to end every IdP session.
+  completion redeems a short-lived, one-time pending credential only when
+  bound to the initiating browser flow and authorized server-side BFF caller;
+  missing, expired, replayed, or mismatched claims return no credential or
+  session. BFF actions enforce CSRF, expiry, tenant binding, and Wyrd
+  permissions. Logout ends the Wyrd browser session; it does not claim to end
+  every IdP session.
 - **REQ-010**: With OIDC absent, a self-hosted operator can sign in to the UI
   through an existing authorized Wyrd credential. This uses Wyrd's existing
   exchange and session authority; no new local password store is introduced.
@@ -116,14 +132,22 @@ authentication.
 - **REQ-011**: `wyrd auth login` for a human opens the system browser and
   completes the tenant's SSO flow without pasting a callback URL or printing
   access or refresh tokens. The CLI obtains the Wyrd user credential through
-  a short-lived, one-time handoff bound to the initiated login; neither the
-  provider authorization code nor a Wyrd token is put in a redirect URL.
-  A second IdP application registration is not required solely for CLI use.
+  a short-lived, one-time handoff bound to the initiated login and a
+  CLI-held secret; an absent, wrong, expired, or replayed claim returns no
+  credential. Neither the provider authorization code nor a Wyrd token is
+  put in a redirect URL. A second IdP application registration is not
+  required solely for CLI use.
 - **REQ-012**: The CLI stores the renewable Wyrd user credential in a
   user-protected credential store with tenant and server identity. Rust,
   Python, and TypeScript clients resolve it through the shared client and
-  renew access tokens automatically. Explicit credentials still override
-  ambient user credentials. A user can log out or revoke the saved session.
+  renew short-lived Wyrd access tokens automatically without contacting the
+  IdP on routine API calls. An explicitly supplied credential overrides the
+  saved user credential. With multiple saved logins, a client uses only the
+  login selected for its intended server and tenant; ambiguous selection
+  fails rather than choosing another tenant. Concurrent local clients sharing
+  a saved login must not replay a rotated refresh token or overwrite newer
+  renewal state. If renewal cannot be completed safely, access fails and the
+  user can log in again. A user can log out or revoke the saved session.
 - **REQ-013**: A deployed Service or Agent uses its own scoped Wyrd API key by
   default. Where the deployment chooses workload federation, Wyrd accepts a
   verified, audience-bound platform assertion only through the existing
@@ -137,10 +161,12 @@ authentication.
 - **REQ-014**: A tenant owner can replace one human provider with another by
   configuring and successfully testing the replacement before activation.
   Activation is one tenant-scoped transition: new logins use only the
-  replacement. Existing people must be invited or explicitly link their new
-  provider identity through an authorized transition; matching email
-  addresses alone never links identities or grants tenant membership. The
-  owner must have a tested route back in before the prior connection retires.
+  replacement. A person authenticated by the replacement may receive a new
+  tenant `User` principal under REQ-008, but that identity does not inherit
+  the prior principal's roles, ownership, or history. Linking it to a prior
+  identity requires an explicit authorized transition; matching email
+  addresses alone never links identities. The owner must have a tested route
+  back in before the prior connection retires.
 - **REQ-015**: A person who belongs to more than one tenant authenticates
   separately under each tenant's configured provider when required. A Wyrd
   account or provider assertion in one tenant never grants access to another.
@@ -154,8 +180,10 @@ authentication.
   mappings affect the next Wyrd token issuance. Already issued tenant access
   tokens retain their bounded snapshot authority for no more than the existing
   five-minute lifetime unless their principal or tenant is independently
-  blocked by an existing stronger guard. Documentation and UI must not promise
-  instantaneous revocation of such tokens.
+  blocked by an existing stronger guard. A BFF session established through the
+  old connection cannot renew its Wyrd authority; once its current access
+  token expires, it requires login through the active connection. Documentation
+  and UI must not promise instantaneous revocation of such tokens or sessions.
 - **REQ-017**: Security-significant connection mutations, login outcomes,
   and role changes produce redacted canonical audit evidence under their
   owning authority. A required audit failure cannot silently establish a
@@ -163,8 +191,9 @@ authentication.
 - **REQ-018**: Self-hosted and hosted documentation state who operates Wyrd
   and the IdP, the exact callback and configuration inputs, the one-active-
   connection rule, role mapping, secret rotation, login failures, operator
-  recovery, and the separate human and workload paths. Product surfaces
-  must not advertise production SSO while only mock UI authentication works.
+  recovery, local CLI login and SDK credential selection, and the separate
+  human and workload paths. Product surfaces must not advertise production
+  SSO while only mock UI authentication works.
 
 ## Invariants and non-goals
 
@@ -172,8 +201,10 @@ authentication.
   provider tokens cannot select effective tenant identity or a connection
   after login starts. Only verified, server-bound state can do so.
 - **INV-002**: The stable external user identity is `(issuer, subject)` within
-  its tenant. Email and email domain are display or invitation data, never
-  automatic account linking or membership authority.
+  its tenant. Tenant membership through OIDC comes only from successful
+  authentication by that tenant's active configured provider. Email and email
+  domain are display or invitation data, never automatic account linking or
+  membership authority.
 - **INV-003**: Platform administrators, tenant users, and workloads remain
   distinct principal types and authorization planes. An IdP group cannot
   create a platform administrator or bypass tenant RBAC.
@@ -206,8 +237,17 @@ outside this change.
 4. Hosted signup is owned entirely by a separate commercial distribution.
    The open-source server supplies its existing tenant and identity contracts
    without a stub, mock, placeholder, or edition gate for that product.
-5. Provider switching never links users by email; an explicit authorized
-   identity transition or invitation is required.
+5. Provider switching never links users by email. A replacement-provider
+   login may create a separate `User`; linking it to a prior identity requires
+   an explicit authorized transition.
+6. A local interactive login gives all first-class SDKs renewable Wyrd user
+   authority for one server and tenant. The browser session and provider
+   tokens are not SDK credentials; deployed workloads use their own identity.
+7. A completed OIDC callback hands Wyrd credentials to its initiating browser
+   or CLI through one server-owned, encrypted, expiring, single-use handoff.
+   The deployment keyring protects recoverable provider and Wyrd session
+   credentials in both self-hosted and hosted deployments; the number of
+   tenants does not select a different secret-storage or login path.
 
 ## Acceptance criteria and evidence
 
@@ -223,20 +263,29 @@ outside this change.
   issuer cross-tenant refusal.
 - **AC-004**: Rust, Python, and TypeScript client journeys use a credential
   established by the interactive CLI path without manual token paste, renew
-  it, and reject an expired or revoked credential. The browser receives no
-  provider secret or Wyrd token in page data or redirect URLs.
+  it without a repeat IdP visit, and reject an expired or revoked credential.
+  Journeys prove explicit credential precedence, unambiguous selection among
+  saved logins for different tenants on one server, and safe renewal when
+  concurrent local clients share one login. The browser receives no provider
+  secret or Wyrd token in page data or redirect URLs.
 - **AC-005**: Machine journeys prove an API-key Service or Agent continues
   operating with human SSO enabled and that an opted-in workload assertion
   maps only to its exact bound principal; rotated assertions renew, while a
   wrong issuer, subject, audience, or tenant fails closed.
 - **AC-006**: A provider-switch journey proves an owner can test and activate
-  a replacement, preserve an authorized route back in, and cannot gain
-  another identity's membership through an email match.
+  a replacement, preserve an authorized route back in, and provision a new
+  `User` through the replacement without inheriting the prior principal's
+  authority or linking identities through an email match.
 - **AC-007**: Fault and security evidence covers IdP outage, unsafe discovery
   and JWKS URL, invalid token and nonce, replayed or expired state, wrong
   callback origin, inactive connection, unsupported client auth, audit
-  failure, mapping changes, provider key and secret rotation, and BFF session
-  behavior across two serving replicas.
+  failure, mapping changes, provider key and secret rotation, absent or
+  rotated sealing keys, and BFF session behavior across two serving replicas.
+  A missing or wrong browser-flow binding, unauthorized BFF caller, missing or
+  wrong CLI handoff secret, expired handoff, or second redemption yields no
+  Wyrd credential or browser session. An unmapped but valid provider subject
+  receives a tenant `User` without privileged grants, and an old-connection
+  BFF session cannot renew after replacement or removal.
 - **AC-008**: Provider qualification uses controlled Okta, Keycloak, and
   Entra ID accounts over externally trusted TLS for each combination publicly
   claimed as supported. Redacted results identify the immutable Wyrd artifact,
@@ -254,6 +303,20 @@ revision and human approval.
 
 ## Revision history
 
+- **Revision 5 — 2026-09-26 — approved**: Approved the existing encrypted,
+  short-lived, one-time browser/CLI credential handoff. Clarified that the
+  deployment sealing keyring also protects recoverable login and browser
+  session credentials, including secretless-provider and OIDC-off browser
+  sessions; required initiator-bound, single-use redemption and key-failure
+  evidence. This supersedes revision 4's provider-secrets-only key condition.
+- **Revision 4 — 2026-09-25 — approved**: Clarified the CLI-to-SDK local user
+  credential flow, explicit precedence, tenant selection, and safe concurrent
+  renewal of a shared saved login.
+- **Revision 3 — 2026-09-25 — draft**: Made successful login through the
+  tenant's active provider sufficient for tenant `User` provisioning without
+  a privileged default. Clarified that provider replacement never transfers
+  an old identity's authority and that old-connection BFF sessions stop at
+  their current access token's expiry.
 - **Revision 2 — 2026-09-24 — draft**: Removed hosted signup and automatic
   tenant creation from this open-source change. The commercial
   distribution owns that separate work; no open-source stub is required.
@@ -282,3 +345,6 @@ revision and human approval.
   [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html), and
   [RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html): protocol and
   browser/native-client security guidance.
+- [OWASP Cryptographic Storage](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html)
+  and [Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html):
+  protection and management of stored credentials and deployment keys.

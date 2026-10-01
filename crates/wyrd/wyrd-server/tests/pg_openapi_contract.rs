@@ -161,6 +161,154 @@ async fn the_served_document_describes_the_composed_surface() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// The tenant human-connection administration surface is served with its typed
+/// contract and no secret-bearing or unsupported shape.
+///
+/// Each of the six operations publishes its route-specific refusals as
+/// problem+json; the redacted view and list shapes expose no secret field; the
+/// input schema offers exactly the three supported client-authentication
+/// methods (never `PrivateKeyJwt`); the candidate PUT publishes that input as
+/// its request body; and activation requires the recovery key.
+#[tokio::test]
+async fn identity_connection_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let operations: [(&str, &str, &[&str]); 6] = [
+        ("/v1/identity/oidc/connections", "get", &["403", "503"]),
+        (
+            "/v1/identity/oidc/candidate",
+            "put",
+            &["400", "403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/candidate/test",
+            "post",
+            &["400", "403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/candidate/activate",
+            "post",
+            &["403", "409", "503"],
+        ),
+        (
+            "/v1/identity/oidc/active/deactivate",
+            "post",
+            &["403", "404", "503"],
+        ),
+        (
+            "/v1/identity/oidc/connections/{id}",
+            "delete",
+            &["403", "404", "503"],
+        ),
+    ];
+    for (path, method, statuses) in operations {
+        let operation = &document["paths"][path][method];
+        assert!(operation.is_object(), "missing {method} {path}");
+        assert!(
+            operation.get("security").is_none(),
+            "{method} {path} must require the Wyrd access token"
+        );
+        for status in statuses {
+            assert_eq!(
+                operation["responses"][*status]["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+                "#/components/schemas/WyrdProblem",
+                "{method} {path} must publish {status} as problem+json"
+            );
+        }
+    }
+
+    assert_eq!(
+        document["paths"]["/v1/identity/oidc/candidate"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/ConnectionInput",
+        "the candidate PUT publishes its typed body although it reads raw bytes"
+    );
+
+    let schemas = &document["components"]["schemas"];
+    let view_fields = schemas["HumanConnectionView"]["properties"]
+        .as_object()
+        .expect("HumanConnectionView publishes its properties");
+    assert!(
+        view_fields.keys().all(|field| !field.contains("secret")),
+        "the redacted view must not carry a secret field: {:?}",
+        view_fields.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        schemas["HumanClientAuth"]["enum"],
+        serde_json::json!(["SecretBasic", "SecretPost", "Public"]),
+        "only supported client authentication methods are offered"
+    );
+    let activate = &schemas["ConnectionActivate"]["required"];
+    assert!(
+        activate
+            .as_array()
+            .is_some_and(|required| required.contains(&"recovery_api_key".into())),
+        "activation requires the recovery key: {activate}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Tenant human login publishes its header-free contract.
+///
+/// Login begins only with an anonymous `POST /auth/login` whose typed body
+/// carries the tenant route key and binding and whose response is the
+/// authorization URL alone; the retired `GET` form is not served. The common
+/// callback publishes the browser's `303` to the completion page (with its
+/// `Location`) and the CLI's `text/html` page, never a token body, and the
+/// token grant no longer offers `authorization_code`.
+#[tokio::test]
+async fn tenant_login_operations_publish_their_contract() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let login = &document["paths"]["/auth/login"];
+
+    assert!(login.get("get").is_none(), "GET /auth/login is retired");
+    let begin = &login["post"];
+    assert_eq!(begin["security"], serde_json::json!([{}]));
+    assert_eq!(
+        begin["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/BeginLogin"
+    );
+    assert_eq!(
+        begin["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/BeginLoginResponse"
+    );
+    let response_fields = document["components"]["schemas"]["BeginLoginResponse"]["properties"]
+        .as_object()
+        .expect("BeginLoginResponse publishes its properties");
+    assert_eq!(
+        response_fields.keys().collect::<Vec<_>>(),
+        vec!["authorization_url"]
+    );
+
+    let callback = &document["paths"]["/auth/callback"]["get"]["responses"];
+    assert!(
+        callback["303"]["headers"]["Location"].is_object(),
+        "the browser completion redirect publishes its Location: {callback}"
+    );
+    assert!(
+        callback["200"]["content"]["text/html"].is_object(),
+        "the CLI completion page is HTML: {callback}"
+    );
+    assert!(
+        callback["200"]["content"]["application/json"].is_null(),
+        "the callback never returns a token body: {callback}"
+    );
+    assert!(
+        !document["components"]["schemas"]["TokenRequest"]
+            .to_string()
+            .contains("authorization_code"),
+        "the authorization-code grant is retired"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// The local backend's byte-transfer operations are public Wyrd operations and
 /// are published with their real contract.
 ///

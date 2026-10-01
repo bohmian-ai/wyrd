@@ -23,9 +23,8 @@ pub mod publication;
 
 use std::fmt::Display;
 
-use sqlx::PgPool;
-use vala_sql::TenantConn;
 use vala_sql::queries::audit_staging::append_audit;
+use vala_sql::{TenantConn, ValaPostgres};
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
@@ -88,7 +87,8 @@ fn delegation_detail(caller: &Caller) -> Option<AuditDetail> {
 
 /// Build an [`AuditEvent`] for a pre-authentication attempt, attributed to
 /// [`PLATFORM_AUDIT_PRINCIPAL`] (a reserved well-known service actor). Used
-/// when no `Caller` is available — e.g. `GET /auth/login` before OIDC resolve.
+/// when no `Caller` is available — e.g. an Oracle peer or tail request refused
+/// before a principal resolves.
 ///
 /// The outcome states whether the attempt was admitted or refused.
 #[must_use]
@@ -138,17 +138,19 @@ pub async fn append_on(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<
 
 /// Append one audit row in its own tenant-scoped transaction (standalone path).
 ///
+/// The transaction is acquired through [`ValaPostgres::tenant_conn`], so
+/// callers pass the scoped Vala owner rather than a raw pool, and the row is
+/// durable once this returns `Ok`.
+///
 /// # Errors
 /// Returns [`WyrdError::AuditUnavailable`] when acquiring the connection, the
 /// append, or the commit fails.
 pub async fn record_audit(
-    pool: &PgPool,
+    vala: &ValaPostgres,
     tenant: DataTenantId,
     event: &AuditEvent,
 ) -> Result<(), WyrdError> {
-    let mut conn = TenantConn::acquire(pool, tenant)
-        .await
-        .map_err(audit_unavailable)?;
+    let mut conn = vala.tenant_conn(tenant).await.map_err(audit_unavailable)?;
     append_audit(&mut conn, event)
         .await
         .map_err(audit_unavailable)?;
@@ -158,31 +160,22 @@ pub async fn record_audit(
 
 /// Appends one owned audit event in its own tenant-scoped transaction.
 ///
-/// This adapter keeps event and pool ownership inside transport futures that
-/// must remain `Send`; durability and fail-closed behavior match
-/// [`record_audit`].
+/// This adapter keeps event and Vala-handle ownership inside transport
+/// futures that must remain `Send`; durability and fail-closed behavior match
+/// [`record_audit`], which it runs on a spawned task.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError::AuditUnavailable`] when acquiring, appending, or
-/// committing fails.
+/// Returns [`WyrdError::AuditUnavailable`] when acquiring, appending,
+/// committing, or joining the spawned task fails.
 pub async fn record_audit_owned(
-    pool: PgPool,
+    vala: ValaPostgres,
     tenant: DataTenantId,
     event: AuditEvent,
 ) -> Result<(), WyrdError> {
-    tokio::spawn(async move {
-        let mut conn = TenantConn::acquire(&pool, tenant)
-            .await
-            .map_err(audit_unavailable)?;
-        append_audit(&mut conn, &event)
-            .await
-            .map_err(audit_unavailable)?;
-        conn.commit().await.map_err(audit_unavailable)?;
-        Ok(())
-    })
-    .await
-    .map_err(audit_unavailable)?
+    tokio::spawn(async move { record_audit(&vala, tenant, &event).await })
+        .await
+        .map_err(audit_unavailable)?
 }
 
 /// Evaluate one receiving permission and audit the verdict exactly once.
@@ -207,7 +200,7 @@ pub async fn authorize(
     resource: &str,
 ) -> Result<(), WyrdError> {
     let denial = authorize_recording_denial(state, caller, required, operation, resource).await?;
-    record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denial).await
+    record_audit(state.postgres.vala(), caller.data_tenant_id, &denial).await
 }
 
 /// Evaluate one receiving permission, audit a denial, and hand back the allowed row.
@@ -240,7 +233,7 @@ pub async fn authorize_recording_denial(
             &required.to_string(),
             AuditOutcome::Denied,
         );
-        record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &denied).await?;
+        record_audit(state.postgres.vala(), caller.data_tenant_id, &denied).await?;
         return Err(permission_deny_reason_to_wyrd(reason));
     }
     Ok(audit_event(

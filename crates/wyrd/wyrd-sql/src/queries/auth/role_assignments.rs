@@ -42,10 +42,14 @@ const REPLACE_USER_ROLES_SQL: &str = r#"
             DELETE FROM wyrd.auth_user_roles
              WHERE user_id = $1
                AND role_id NOT IN (SELECT id FROM wanted)
+            RETURNING 1
+        ), added AS (
+            INSERT INTO wyrd.auth_user_roles (data_tenant_id, user_id, role_id)
+            SELECT wyrd.current_tenant(), $1, id FROM wanted
+            ON CONFLICT (data_tenant_id, user_id, role_id) DO NOTHING
+            RETURNING 1
         )
-        INSERT INTO wyrd.auth_user_roles (data_tenant_id, user_id, role_id)
-        SELECT wyrd.current_tenant(), $1, id FROM wanted
-        ON CONFLICT (data_tenant_id, user_id, role_id) DO NOTHING
+        SELECT EXISTS (SELECT 1 FROM removed) OR EXISTS (SELECT 1 FROM added)
         "#;
 
 const GRANT_ROLE_TO_SERVICE_ACCOUNT_SQL: &str = r#"
@@ -124,19 +128,21 @@ pub async fn revoke_role_from_user(
 /// are removed in the same statement, which is how a provider-side revocation
 /// reaches Wyrd.
 ///
+/// Returns `true` when the statement granted or removed at least one role, so
+/// the caller can audit a real change and stay silent for an unchanged set.
+///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the statement.
 pub async fn replace_user_roles(
     conn: &mut TenantConn<'_>,
     user_id: Uuid,
     role_names: &[&str],
-) -> Result<(), SqlxError> {
-    sqlx::query(REPLACE_USER_ROLES_SQL)
+) -> Result<bool, SqlxError> {
+    sqlx::query_scalar::<_, bool>(REPLACE_USER_ROLES_SQL)
         .bind(user_id)
         .bind(role_names)
-        .execute(&mut **conn.transaction())
-        .await?;
-    Ok(())
+        .fetch_one(&mut **conn.transaction())
+        .await
 }
 
 /// List role names granted to a user, ordered by name.

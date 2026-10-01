@@ -7,8 +7,8 @@ use std::path::Path;
 use schemars::schema_for;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, GatewayAccess, IssuerUrl, LoginInitResponse, PrincipalKindTag,
-    RevokePrincipalRequest, TokenRequest, TokenResponse,
+    AbsoluteUrl, BeginLogin, BeginLoginResponse, CallbackQuery, GatewayAccess, IssuerUrl,
+    LoginInitResponse, PrincipalKindTag, RevokePrincipalRequest, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
@@ -200,6 +200,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<AbsoluteUrl>(out, golden, "auth_url")?;
     write::<IssuerUrl>(out, golden, "auth_issuer_url")?;
     write::<LoginInitResponse>(out, golden, "auth_login_init_response")?;
+    write::<BeginLogin>(out, golden, "auth_begin_login")?;
+    write::<BeginLoginResponse>(out, golden, "auth_begin_login_response")?;
     write::<CallbackQuery>(out, golden, "auth_callback_query")?;
     write::<PrincipalKindTag>(out, golden, "auth_principal_kind")?;
     write::<RevokePrincipalRequest>(out, golden, "auth_revoke_principal_request")?;

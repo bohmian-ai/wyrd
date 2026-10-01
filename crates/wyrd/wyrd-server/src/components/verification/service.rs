@@ -264,12 +264,8 @@ impl<'a> VerificationControl<'a> {
         {
             Ok(committed) => committed,
             Err(uncommitted) => {
-                audit::record_audit(
-                    self.state.postgres.vala_pool(),
-                    caller.data_tenant_id,
-                    &allowed,
-                )
-                .await?;
+                audit::record_audit(self.state.postgres.vala(), caller.data_tenant_id, &allowed)
+                    .await?;
                 Err(uncommitted)
             }
         }

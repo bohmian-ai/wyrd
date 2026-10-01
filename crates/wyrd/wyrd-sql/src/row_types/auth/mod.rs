@@ -1,6 +1,7 @@
 //! Row mirrors for tenant-scoped `wyrd.auth_*` tables.
 
 mod api_keys;
+mod human_connections;
 mod refresh_tokens;
 mod roles;
 mod trusted_issuers;
@@ -8,6 +9,7 @@ mod users;
 mod workload_bindings;
 
 pub use api_keys::ApiKeyRow;
+pub use human_connections::{HumanConnectionBinding, HumanConnectionRow};
 pub use refresh_tokens::RefreshTokenRow;
 pub use roles::RoleRow;
 pub use trusted_issuers::TrustedIssuerRow;

@@ -14,6 +14,11 @@ not the implementation summary or only the latest fix diff. After remediation,
 include the original task, prior verdict and findings, remediation task, and
 cumulative candidate.
 
+On a remediation round, use the latest fix diff to locate changed owners and
+check closure of prior findings, while retaining the complete cumulative
+acceptance audit. A previously closed finding stays closed only with source
+evidence. Do not rediscover the same defect one caller at a time.
+
 ## Establish the subject
 
 Require the repository root, unambiguous base and candidate commits, approved
@@ -109,6 +114,15 @@ change to a test, assertion, timeout, sleep, retry, `#[ignore]`, `#[allow]`, or
 skip made to clear a failure, without a recorded diagnosis and diagnostician
 report, is a `VIOLATION`.
 
+For each suspected defect, enumerate sibling callers and writers of the same
+authority before proposing a correction. If the candidate adds a second way
+to resolve the same identity, use the same SQL capability, lock the same
+authority, validate the same token profile, or observe the same test condition,
+report the shared cause and the existing owner to reuse. Distinguish a
+standard-required check from task drift: for OIDC ID tokens and JWT bearer
+assertions, compare the complete applicable OIDC Core, RFC 7523, and RFC 8725
+rules without duplicating signature/JWKS verification or inventing a profile.
+
 Build an explicit matrix:
 
 | Requirement, acceptance criterion, constraint, or non-goal | Implementation evidence | Verification evidence | Result |
@@ -151,6 +165,12 @@ tests, manifests, generated artifacts, and consumers to determine compliance.
 It audits all touched languages and layers; one surface cannot stand in for
 Rust, Python, TypeScript, server, contract, test, documentation, or tooling
 rules that independently apply.
+
+Inspect actual SQL capability types in production signatures and fields.
+`check:from-pools-allowlist` covers construction, not raw-pool propagation;
+a green check cannot excuse `PgPool` where `OperatorPool` or `TenantConn` is
+required. Include materially changed test helpers and rustdoc in the same
+standards pass, so documentation corrections do not become separate rounds.
 
 The `repo-rev` returns:
 
@@ -277,8 +297,9 @@ simplification when it weakens validation, error handling, security,
 accessibility, durability, or another explicit requirement. For each proposed
 finding the `ponytail-rev` must:
 
-1. trace the failing state from its producer to the observed consumer, inspect
-   sibling consumers, and read the full body and callers of each function the
+1. trace the failing state from its producer to the observed consumer,
+   including every caller, sibling consumer and writer of the same durable
+   authority, and existing helper; read the full body of each function the
    correction would change or move;
 2. prove the reported path is reachable and required by the approved task,
    rejecting dormant, test-only, speculative, or zero-caller surfaces unless
@@ -304,6 +325,9 @@ prior `FIND-*` IDs during remediation and assign the next unused number only to
 new findings. Each correction selects the smallest safe approach, names the
 existing owner or mechanism to reuse, and preserves adjacent behavior. When
 discovery proposed no findings, return an explicitly validated empty ledger.
+Group findings with one cause into one correction boundary and list all
+affected paths. Treat human-directed additions as separate from independently
+validated reviewer findings; never assign them a `FIND-*` ID retroactively.
 
 The orchestrator may include only independently confirmed or revised findings.
 A rejected finding is omitted, not softened into optional advice. If validation
@@ -355,6 +379,12 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
 5. constraints, preserved behavior, and explicit non-goals;
 6. acceptance criteria mapped to every finding; and
 7. focused proof that directly exercises the gap plus broader verification.
+
+Batch bounded documentation corrections with the same remediation task. Keep
+the rustdoc gate intact, but do not create a style-only round while a shared
+security, tenancy, or concurrency cause remains open. If approved spec text
+conflicts with the required correction, return `SPEC_REVISION_REQUIRED` and
+name the conflict instead of prescribing an unapproved behavior change.
 
 Do not write an outcome checklist or merely restate the acceptance matrix. The
 diagnosis and recommendation are the substance of the remediation task;

@@ -20,9 +20,9 @@
 use std::sync::Arc;
 
 use secrecy::{ExposeSecret, SecretString};
-use wyrd_auth_oidc::{ClientAuth, IssuerVerification, ScreenedHttp};
+use wyrd_auth_oidc::{ClientAuth, IssuerVerification, OidcProvider, ScreenedHttp};
 use wyrd_auth_verify::{ExternalClaims, ExternalVerifier};
-use wyrd_crypt::SecretKey;
+use wyrd_crypt::SealingKeyring;
 use wyrd_spec::auth::LoginInitResponse;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::platform::identity::{
@@ -32,7 +32,10 @@ use wyrd_sql::queries::platform::identity::{
 use wyrd_sql::{OperatorPool, SqlError};
 
 use crate::error::auth_error_to_wyrd;
-use crate::login::{auth_nonce, auth_state_key, build_authorization_url, pkce_verifier};
+use crate::login::{
+    auth_nonce, auth_state_key, browser_authorization_endpoint, build_authorization_url,
+    pkce_verifier,
+};
 use crate::pg_resolvers::{PgIssuerResolver, platform_connection_from_row};
 use crate::platform_sessions::{PlatformSessionError, PlatformSessions};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
@@ -60,6 +63,11 @@ pub enum PlatformLoginError {
     /// The provider could not be reached or its response was unusable.
     #[error("identity provider unavailable")]
     ProviderUnavailable(Box<WyrdError>),
+    /// The discovered authorization endpoint uses a scheme this deployment
+    /// refuses to send a browser to. Carries the same redacted discovery
+    /// refusal tenant login returns, so both planes answer it identically.
+    #[error("authorization endpoint refused")]
+    EndpointRefused(Box<WyrdError>),
     /// The token was rejected, or it verified to a subject this deployment does
     /// not recognize. Deliberately one variant: a caller learns whether it got
     /// in, never whether a given subject is registered.
@@ -82,7 +90,7 @@ pub struct PlatformLogin {
     /// Cross-tenant boundary the connection and identity stores live behind.
     pool: OperatorPool,
     /// Process sealing key the stored client secret is opened with.
-    sealing_key: Option<Arc<SecretKey>>,
+    sealing_key: Option<Arc<SealingKeyring>>,
     /// The deployment's single external-token verification implementation.
     verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
     /// Mints the platform session an accepted identity receives.
@@ -105,7 +113,7 @@ impl PlatformLogin {
     #[must_use]
     pub fn new(
         pool: OperatorPool,
-        sealing_key: Option<Arc<SecretKey>>,
+        sealing_key: Option<Arc<SealingKeyring>>,
         verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
         sessions: Arc<PlatformSessions>,
         http: ScreenedHttp,
@@ -142,21 +150,43 @@ impl PlatformLogin {
     /// # Errors
     /// Returns [`PlatformLoginError::NotConfigured`] when federated login is not
     /// configured, [`PlatformLoginError::ProviderUnavailable`] when discovery
-    /// fails, and [`PlatformLoginError::Store`] when the state cannot be
-    /// persisted.
+    /// fails, [`PlatformLoginError::EndpointRefused`] when the discovered
+    /// authorization endpoint's scheme is refused, and
+    /// [`PlatformLoginError::Store`] when the state cannot be persisted.
     #[tracing::instrument(level = "info", skip(self), err)]
     pub async fn begin(
         &self,
         redirect_uri: String,
     ) -> Result<LoginInitResponse, PlatformLoginError> {
         let connection = self.connection().await?;
-        let authorization_endpoint = crate::login::discover_authorization_endpoint(
-            &connection.verification.issuer,
-            self.http,
-        )
-        .await
-        .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;
+        let provider =
+            crate::callback::discover_provider(&connection.verification.issuer, self.http)
+                .await
+                .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error.into())))?;
+        self.authorize(&connection, provider, redirect_uri).await
+    }
 
+    /// Screen the discovered authorization endpoint, persist the login state,
+    /// and return the browser destination.
+    ///
+    /// The endpoint passes the same scheme rule tenant login applies before any
+    /// state exists, so production never sends state, nonce, or PKCE challenge
+    /// over cleartext while a permissive deployment keeps its local `http`
+    /// provider. Nothing is persisted when the endpoint is refused.
+    ///
+    /// # Errors
+    /// Returns [`PlatformLoginError::EndpointRefused`] when the policy refuses
+    /// the endpoint's scheme, [`PlatformLoginError::Store`] when the state
+    /// cannot be persisted, and [`PlatformLoginError::ProviderUnavailable`]
+    /// when the authorization URL is invalid.
+    async fn authorize(
+        &self,
+        connection: &PlatformConnection,
+        provider: OidcProvider,
+        redirect_uri: String,
+    ) -> Result<LoginInitResponse, PlatformLoginError> {
+        let authorization_endpoint = browser_authorization_endpoint(provider, self.http)
+            .map_err(|error| PlatformLoginError::EndpointRefused(Box::new(error)))?;
         let state = auth_state_key();
         let code_verifier = pkce_verifier();
         let nonce = auth_nonce();
@@ -230,7 +260,7 @@ impl PlatformLogin {
         let provider =
             crate::callback::discover_provider(&connection.verification.issuer, self.http)
                 .await
-                .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error)))?;
+                .map_err(|error| PlatformLoginError::ProviderUnavailable(Box::new(error.into())))?;
         let id_token = crate::callback::exchange_code_for_id_token(
             &provider,
             &connection.client_id,
@@ -245,7 +275,7 @@ impl PlatformLogin {
 
         let claims = self
             .verifier
-            .verify_external_against(&connection.verification, &id_token)
+            .verify_id_token_against(&connection.verification, &id_token)
             .await
             .map_err(|error| {
                 tracing::warn!(error = %auth_error_to_wyrd(error), "platform ID token rejected");
@@ -306,7 +336,7 @@ pub struct PlatformConnection {
 /// rather than silently degrading to an unauthenticated client.
 fn decode_connection(
     row: PlatformOidcConnectionRow,
-    sealing_key: Option<&SecretKey>,
+    sealing_key: Option<&SealingKeyring>,
 ) -> Result<PlatformConnection, PlatformLoginError> {
     platform_connection_from_row(row, sealing_key).map_err(|error| {
         tracing::warn!(error = %error, "platform OIDC connection could not be decoded");
@@ -346,5 +376,190 @@ fn verify_nonce(expected: &str, claims: &ExternalClaims) -> Result<(), PlatformL
         Ok(())
     } else {
         Err(PlatformLoginError::NotAccepted)
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    //! Durable proof that platform login screens the discovered authorization
+    //! endpoint with the tenant-login scheme rule before persisting any state.
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use secrecy::SecretString;
+    use serde_json::json;
+    use url::Url;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wyrd_auth_issue::IssuingKey;
+    use wyrd_auth_oidc::{
+        AddressPolicy, ClaimMapping, ClaimPath, ClientAuth, IssuerVerification, JwksCache,
+        OidcProvider, ScreenedHttp,
+    };
+    use wyrd_auth_verify::{ExternalVerifier, Kid, WyrdAuthVerifySettings};
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::auth::{IssuerTokenPolicy, IssuerUrl};
+    use wyrd_spec::error::WyrdError;
+
+    use super::{PlatformConnection, PlatformLogin, PlatformLoginError};
+    use crate::pg_resolvers::PgIssuerResolver;
+    use crate::platform_sessions::PlatformSessions;
+
+    /// A throwaway Ed25519 key the session minter is built with; these tests
+    /// never mint a session.
+    const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+
+    /// Build platform login over `fixture` with the deployment's `policy`.
+    ///
+    /// # Panics
+    /// Panics when the test signing key does not load.
+    fn platform_login(fixture: &PgFixture, policy: AddressPolicy) -> PlatformLogin {
+        let key = IssuingKey::from_ed_pem(
+            SecretString::from(PRIVATE_KEY_PEM),
+            Kid::new("k1").expect("kid is valid"),
+            "wyrd",
+        )
+        .expect("test private key loads");
+        let verifier = ExternalVerifier::new(
+            Arc::new(JwksCache::new(
+                ScreenedHttp::new(policy),
+                Duration::from_mins(5),
+                Duration::from_secs(5),
+            )),
+            Arc::new(PgIssuerResolver::new(fixture.wyrd_postgres().clone(), None)),
+            WyrdAuthVerifySettings::default(),
+        );
+        PlatformLogin::new(
+            fixture.operator_pool().clone(),
+            None,
+            Arc::new(verifier),
+            Arc::new(PlatformSessions::new(
+                fixture.operator_pool().clone(),
+                Arc::new(key),
+            )),
+            ScreenedHttp::new(policy),
+        )
+    }
+
+    /// Discover a loopback provider that publishes `authorization_endpoint`,
+    /// returning the mock and the platform connection that trusts it.
+    ///
+    /// # Panics
+    /// Panics when the mock provider cannot be discovered.
+    async fn provider_publishing(
+        authorization_endpoint: &str,
+    ) -> (MockServer, OidcProvider, PlatformConnection) {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": issuer,
+                "authorization_endpoint": authorization_endpoint,
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })))
+            .mount(&server)
+            .await;
+        let issuer_url = Url::parse(&issuer).expect("mock issuer parses");
+        let client = ScreenedHttp::allowing_internal()
+            .client_for(&issuer_url)
+            .await
+            .expect("screened client");
+        let provider = OidcProvider::discover(issuer_url, client)
+            .await
+            .expect("mock provider is discovered");
+        let connection = PlatformConnection {
+            verification: IssuerVerification {
+                issuer: IssuerUrl::new(issuer.clone()).expect("mock issuer is valid"),
+                jwks_uri: Url::parse(&format!("{issuer}/jwks")).expect("jwks uri parses"),
+                expected_audience: "wyrd-platform".to_owned(),
+                claim_mapping: ClaimMapping {
+                    subject: ClaimPath::new("sub"),
+                    email: None,
+                    groups: None,
+                },
+                principal_kind: IssuerTokenPolicy::Human,
+            },
+            client_id: "wyrd-platform".to_owned(),
+            client_auth: ClientAuth::Public,
+        };
+        (server, provider, connection)
+    }
+
+    /// Count the platform login states persisted in `fixture`.
+    ///
+    /// # Panics
+    /// Panics when the superuser read fails.
+    async fn login_states(fixture: &PgFixture) -> i64 {
+        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query_scalar("SELECT count(*) FROM platform.login_state")
+            .fetch_one(&admin)
+            .await
+            .expect("login states read")
+    }
+
+    /// Production refuses a discovered cleartext authorization endpoint with
+    /// tenant login's redacted discovery refusal and persists no state.
+    ///
+    /// # Panics
+    /// Panics when the endpoint is accepted, refused with another error, or
+    /// any login state is persisted.
+    #[tokio::test]
+    async fn production_platform_login_refuses_a_cleartext_authorization_endpoint() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let (_server, provider, connection) =
+            provider_publishing("http://idp.example/authorize").await;
+
+        let error = platform_login(&fixture, AddressPolicy::BlockInternal)
+            .authorize(
+                &connection,
+                provider,
+                "https://wyrd.example/callback".to_owned(),
+            )
+            .await
+            .expect_err("a cleartext browser destination is refused");
+
+        assert!(
+            matches!(
+                &error,
+                PlatformLoginError::EndpointRefused(inner)
+                    if matches!(**inner, WyrdError::DiscoveryUnavailable { .. })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(login_states(&fixture).await, 0, "no login state persists");
+    }
+
+    /// Production accepts an `https` authorization endpoint and persists the
+    /// one login state the callback will consume.
+    ///
+    /// # Panics
+    /// Panics when the endpoint is refused or the state is not persisted.
+    #[tokio::test]
+    async fn production_platform_login_accepts_an_https_authorization_endpoint() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let (_server, provider, connection) =
+            provider_publishing("https://idp.example/authorize").await;
+
+        let init = platform_login(&fixture, AddressPolicy::BlockInternal)
+            .authorize(
+                &connection,
+                provider,
+                "https://wyrd.example/callback".to_owned(),
+            )
+            .await
+            .expect("an https browser destination is accepted");
+
+        assert!(
+            init.authorization_url
+                .as_str()
+                .starts_with("https://idp.example/authorize?"),
+            "{}",
+            init.authorization_url.as_str()
+        );
+        assert_eq!(login_states(&fixture).await, 1, "one login state persists");
     }
 }

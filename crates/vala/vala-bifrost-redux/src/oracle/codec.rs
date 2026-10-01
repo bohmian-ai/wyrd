@@ -14,8 +14,8 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
-use prost::Message;
 use sha2::{Digest as _, Sha256};
+use wyrd_tonic::prost::Message;
 
 /// Version of the private Oracle physical extension envelope.
 pub const ORACLE_PHYSICAL_CODEC_VERSION: u32 = 1;
@@ -56,6 +56,7 @@ pub fn encode_follower_subtree(plan: Arc<dyn ExecutionPlan>) -> Result<(Vec<u8>,
 
 /// Versioned extension envelope stored in a `DataFusion` extension node.
 #[derive(Clone, PartialEq, Message)]
+#[prost(prost_path = "::wyrd_tonic::prost")]
 struct OracleExtensionEnvelope {
     /// Private codec version.
     #[prost(uint32, tag = "1")]
@@ -70,6 +71,7 @@ struct OracleExtensionEnvelope {
 
 /// Identity payload for one remote scan placeholder.
 #[derive(Clone, PartialEq, Message)]
+#[prost(prost_path = "::wyrd_tonic::prost")]
 pub(crate) struct RemoteScanPayload {
     /// Stable request-local scan identifier.
     #[prost(string, tag = "1")]

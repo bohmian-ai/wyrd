@@ -43,6 +43,7 @@ services:
       KC_LOG_LEVEL: WARN
     volumes:
       - ./tests/fixtures/identity/keycloak-realm.json:/opt/keycloak/data/import/keycloak-realm.json:ro
+      - ./tests/fixtures/identity/keycloak-realm-2.json:/opt/keycloak/data/import/keycloak-realm-2.json:ro
     # Published on the loopback address only. A wildcard publication binds
     # 0.0.0.0:8080, which occupies port 8080 on every 127.x.y.z address and so
     # steals the canonical public HTTP port out from under the Bifrost process

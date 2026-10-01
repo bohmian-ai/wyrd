@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::datatypes::SchemaRef;
 use chrono::{DateTime, Utc};
@@ -29,8 +29,8 @@ use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{
-    ClaimCause, ScribeAssemblyKey, StagingAssembler, StagingAssemblerConfig, StagingClaim,
-    StagingClaimId,
+    ClaimCause, ScribeAssemblyKey, StagingAssembler, StagingAssemblerConfig, StagingBacklog,
+    StagingClaim, StagingClaimId,
 };
 use crate::scribe::claim_assembly::{
     AssembleClaimRequest, AssembledClaim, ClaimAssembler, ClaimRuns,
@@ -153,18 +153,22 @@ impl ScribeStagingRuntime {
         self
     }
 
-    /// Publishes the staged-backlog gauges from the assembler's ownership.
+    /// Locks the assembler that owns the ready index and outstanding claims.
     ///
-    /// Called after every transition that changes ownership — durable
-    /// registration, claim take, settlement, and completed restoration — so the
-    /// gauges always describe the members this runtime actually holds.
+    /// Every ownership transition — durable registration, claim take,
+    /// settlement, and restoration — publishes the staged-backlog gauges from
+    /// the guard it mutated through, before releasing it. Publishing under the
+    /// same lock orders the gauge writes with the transitions, so a stale
+    /// snapshot can never overwrite a later one and the gauges always end at
+    /// the members this runtime actually holds.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the ready index is poisoned.
-    fn publish_backlog(&self) -> Result<(), ScribeError> {
-        self.backlog()?.publish();
-        Ok(())
+    fn lock_assembly(&self) -> Result<MutexGuard<'_, StagingAssembler>, ScribeError> {
+        self.assembly
+            .lock()
+            .map_err(|_| poisoned("staged ready index"))
     }
 
     /// Returns the staged backlog the assembler currently owns.
@@ -172,12 +176,8 @@ impl ScribeStagingRuntime {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the ready index is poisoned.
-    pub fn backlog(&self) -> Result<crate::scribe::assembly::StagingBacklog, ScribeError> {
-        Ok(self
-            .assembly
-            .lock()
-            .map_err(|_| poisoned("staged ready index"))?
-            .backlog())
+    pub fn backlog(&self) -> Result<StagingBacklog, ScribeError> {
+        Ok(self.lock_assembly()?.backlog())
     }
 
     /// Encodes one frozen bucket into durable, preflighted local runs.
@@ -237,14 +237,15 @@ impl ScribeStagingRuntime {
         let bytes = staged.staged_bytes();
         let wal = staged.wal();
         let ready = self.stager.publish_ready(staged, ready_at).await?;
-        self.assembly
-            .lock()
-            .map_err(|_| poisoned("staged ready index"))?
-            .register_ready(&key, ready)
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("register the staged member as ready: {error}"),
-            })?;
-        self.publish_backlog()?;
+        {
+            let mut assembly = self.lock_assembly()?;
+            assembly
+                .register_ready(&key, ready)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("register the staged member as ready: {error}"),
+                })?;
+            assembly.backlog().publish();
+        }
         self.advance_authority(
             &key,
             member,
@@ -307,16 +308,14 @@ impl ScribeStagingRuntime {
     /// a key is due while every claim slot is held. A full budget with nothing
     /// due is not an error; it returns `Ok(None)` like any other idle poll.
     pub fn take_claim(&self, now: DateTime<Utc>) -> Result<Option<StagingClaim>, ScribeError> {
-        let claim = self
-            .assembly
-            .lock()
-            .map_err(|_| poisoned("staged ready index"))?
+        let mut assembly = self.lock_assembly()?;
+        let claim = assembly
             .next_claim(now)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("take the next due staging claim: {error}"),
             })?;
         if claim.is_some() {
-            self.publish_backlog()?;
+            assembly.backlog().publish();
         }
         Ok(claim)
     }
@@ -398,16 +397,14 @@ impl ScribeStagingRuntime {
         key: &ScribeAssemblyKey,
         cause: ClaimCause,
     ) -> Result<Option<StagingClaim>, ScribeError> {
-        let claim = self
-            .assembly
-            .lock()
-            .map_err(|_| poisoned("staged ready index"))?
+        let mut assembly = self.lock_assembly()?;
+        let claim = assembly
             .claim_residue(key, cause)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("take the residue claim for a staged key: {error}"),
             })?;
         if claim.is_some() {
-            self.publish_backlog()?;
+            assembly.backlog().publish();
         }
         Ok(claim)
     }
@@ -478,9 +475,7 @@ impl ScribeStagingRuntime {
             if !members_to_restore.is_empty() {
                 let context = self.restore_context(pool, &key, &members).await?;
                 restored += members_to_restore.len();
-                self.assembly
-                    .lock()
-                    .map_err(|_| poisoned("staged ready index"))?
+                self.lock_assembly()?
                     .restore(&key, members_to_restore)
                     .map_err(|error| ScribeError::Internal {
                         detail: format!("restore a recovered staged key: {error}"),
@@ -491,7 +486,7 @@ impl ScribeStagingRuntime {
                     .insert(key.clone(), context);
             }
         }
-        self.publish_backlog()?;
+        self.lock_assembly()?.backlog().publish();
         Ok(restored)
     }
 
@@ -781,14 +776,14 @@ impl ScribeStagingRuntime {
     /// Returns [`ScribeError::Internal`] when the ready index is unavailable
     /// or the claim is unknown.
     fn settle(&self, claim: StagingClaimId) -> Result<(), ScribeError> {
-        self.assembly
-            .lock()
-            .map_err(|_| poisoned("staged ready index"))?
+        let mut assembly = self.lock_assembly()?;
+        assembly
             .settle_claim(claim)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("settle a published staging claim: {error}"),
             })?;
-        self.publish_backlog()
+        assembly.backlog().publish();
+        Ok(())
     }
 
     /// Returns the encoding context recorded when the key first staged a member.
@@ -1342,6 +1337,104 @@ mod tests {
             "the claim is outstanding until it settles"
         );
         assert_eq!(claim.members().len(), 1);
+    }
+
+    /// Concurrent registration, claim, and settlement leave the published
+    /// staged gauges equal to the assembler's final ownership.
+    ///
+    /// Persistence workers share one runtime, so registrations, claim takes,
+    /// and settlements race. Four workers each stage members under fresh
+    /// tenants and take and settle whatever claim is due, all reporting into
+    /// one recorder. Once every member has been claimed and settled, the four
+    /// scraped gauges must equal `backlog()` — zero members, bytes, oldest
+    /// time, and claims — rather than whichever detached snapshot published
+    /// last.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staging, claiming, or settlement fails, or when the gauges
+    /// disagree with the runtime's final backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_transitions_publish_the_final_backlog() {
+        const WORKERS: usize = 4;
+        const ROUNDS: usize = 8;
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xc0c0));
+        let stage = Arc::new(ScribeHotStage::new(stage_root));
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            publisher(stage, &wal_root, node_id),
+            StagingAssemblerConfig::new(
+                512 * 1024 * 1024,
+                std::time::Duration::from_mins(5),
+                WORKERS,
+            )
+            .expect("assembler controls"),
+        );
+        let ready_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let handle = tokio::runtime::Handle::current();
+        let settle_due = |runtime: &ScribeStagingRuntime| -> usize {
+            let mut settled = 0;
+            while let Some(claim) = runtime
+                .take_claim(chrono::Utc::now())
+                .expect("a due claim is taken")
+            {
+                settled += claim.members().len();
+                runtime.settle(claim.id()).expect("the claim settles");
+            }
+            settled
+        };
+
+        let settled = std::thread::scope(|scope| {
+            let workers = (0..WORKERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _metrics = metrics::set_default_local_recorder(&recorder);
+                        let mut settled = 0;
+                        for _ in 0..ROUNDS {
+                            handle.block_on(stage_durable_members(
+                                &runtime,
+                                DataTenantId::new_v7(),
+                                node_id,
+                                1..=1,
+                                ready_at,
+                            ));
+                            settled += settle_due(&runtime);
+                        }
+                        settled
+                    })
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("worker completes"))
+                .sum::<usize>()
+        });
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let settled = settled + settle_due(&runtime);
+        assert_eq!(settled, WORKERS * ROUNDS, "every staged member settled");
+
+        let backlog = runtime.backlog().expect("final backlog");
+        assert_eq!(backlog, StagingBacklog::default());
+        let gauges = recorder.snapshot().gauges;
+        for family in [
+            "bifrost_scribe_staging_live_members",
+            "bifrost_scribe_staging_live_bytes",
+            "bifrost_scribe_staging_oldest_member_timestamp_seconds",
+            "bifrost_scribe_staging_outstanding_claims",
+        ] {
+            assert_eq!(
+                gauges.get(family).copied(),
+                Some(0.0),
+                "{family} ends at the runtime's final backlog"
+            );
+        }
     }
 
     /// Stages one member per shard of one partition through `runtime` and

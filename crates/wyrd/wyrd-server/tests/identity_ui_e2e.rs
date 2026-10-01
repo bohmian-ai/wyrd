@@ -7,7 +7,9 @@
 //! issuer), and a provider-replacement tenant (Active first realm, replaced by
 //! the second realm through the settings page), starts two production
 //! BFF processes (`node build`) against that same server and Postgres with the
-//! same public origin, and runs the Vitest HTTP journey
+//! same public origin — the first over loopback HTTP, the second only through
+//! a Node TLS terminator whose certificate the repository's test CA issues and
+//! the replica trusts — and runs the Vitest HTTP journey
 //! `src/lib/server/auth/production-auth.integration.test.ts` against them. The
 //! journey drives both replicas over HTTP like a browser behind a load
 //! balancer; no Vitest mock stands in for the BFF or the server.
@@ -22,6 +24,7 @@ use std::time::Duration;
 
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
+use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
 use wyrd_testing::{WyrdTestServer, WyrdTestServerBuilder};
 
 /// Keycloak realm issuer the lane's compose service serves.
@@ -51,16 +54,17 @@ const SWITCH_PEER_TENANT: &str = "ui-switch-peer";
 /// through settings.
 const REPLACEMENT_TENANT: &str = "ui-replace";
 
-/// A BFF process killed when the journey ends, however it ends.
+/// A journey child process (a BFF replica or the TLS terminator) killed when
+/// the journey ends, however it ends.
 struct Bff {
-    /// The running `node build` process.
+    /// The running `node` process.
     child: Child,
-    /// `http://127.0.0.1:{port}` the process listens on.
+    /// The origin the process listens on.
     url: String,
 }
 
 impl Drop for Bff {
-    /// Kill and reap the process so no BFF outlives the journey.
+    /// Kill and reap the process so no child outlives the journey.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -84,18 +88,30 @@ fn ui_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wyrd-ui")
 }
 
-/// Start one production BFF replica and wait until it answers.
+/// Start one production BFF replica against `server_url` and wait until it
+/// answers. `extra_ca` is the PEM file Node adds to its trust store, so a
+/// replica given the TLS terminator's `https:` origin verifies it through the
+/// ordinary native `fetch` path.
 ///
 /// # Panics
 /// Panics when the build output is missing or the process never answers.
-async fn start_bff(origin: &str, server_url: &str, service_key: &str) -> Bff {
+async fn start_bff(
+    origin: &str,
+    server_url: &str,
+    service_key: &str,
+    extra_ca: Option<&std::path::Path>,
+) -> Bff {
     let ui = ui_dir();
     assert!(
         ui.join("build/index.js").is_file(),
         "build the UI first: pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build"
     );
     let port = free_port();
-    let child = Command::new("node")
+    let mut node = Command::new("node");
+    if let Some(ca) = extra_ca {
+        node.env("NODE_EXTRA_CA_CERTS", ca);
+    }
+    let child = node
         .arg("build")
         .current_dir(&ui)
         .env("HOST", "127.0.0.1")
@@ -119,6 +135,65 @@ async fn start_bff(origin: &str, server_url: &str, service_key: &str) -> Bff {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("BFF on port {port} never answered");
+}
+
+/// Node TLS terminator: accepts TLS with `TLS_KEY`/`TLS_CERT` on `TLS_PORT`
+/// (dual-stack, so `localhost` resolves either way) and pipes each connection
+/// to the loopback server on `UPSTREAM_PORT`.
+const TLS_TERMINATOR_JS: &str = "\
+const tls = require('node:tls'), net = require('node:net'), fs = require('node:fs');\
+const env = process.env;\
+tls.createServer({ key: fs.readFileSync(env.TLS_KEY), cert: fs.readFileSync(env.TLS_CERT) }, (client) => {\
+  const upstream = net.connect(Number(env.UPSTREAM_PORT), '127.0.0.1');\
+  client.on('error', () => upstream.destroy());\
+  upstream.on('error', () => client.destroy());\
+  client.pipe(upstream).pipe(client);\
+}).listen(Number(env.TLS_PORT));";
+
+/// Front the bound server with a TLS terminator whose `localhost` leaf is
+/// issued by the repository's test certificate authority, and return it with
+/// the CA file a BFF must trust.
+///
+/// The private BFF channel must be `https:` off loopback; this gives one
+/// replica a real trusted TLS hop to the same server.
+///
+/// # Panics
+/// Panics when the material cannot be minted or written, or the terminator
+/// never accepts connections.
+async fn start_tls_terminator(server_url: &str, material: &std::path::Path) -> (Bff, PathBuf) {
+    let upstream = reqwest::Url::parse(server_url)
+        .expect("server URL parses")
+        .port()
+        .expect("bound server URL names its port");
+    let tls = BifrostPeerCa::generate("localhost")
+        .expect("test CA generates")
+        .materialize(material, "ui-server")
+        .expect("TLS material writes");
+    let port = free_port();
+    let child = Command::new("node")
+        .args(["-e", TLS_TERMINATOR_JS])
+        .env("TLS_KEY", &tls.private_key_path)
+        .env("TLS_CERT", &tls.certificate_path)
+        .env("TLS_PORT", port.to_string())
+        .env("UPSTREAM_PORT", upstream.to_string())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("node starts the TLS terminator");
+    let terminator = Bff {
+        child,
+        url: format!("https://localhost:{port}"),
+    };
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return (terminator, tls.ca_path);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("TLS terminator on port {port} never accepted");
 }
 
 /// Call one authenticated JSON route on the bound server.
@@ -247,8 +322,9 @@ async fn sso_tenant(srv: &WyrdTestServer, server: &str, slug: &str, connection: 
 ///
 /// Access tokens live 30 seconds, inside the one-minute renewal margin, so
 /// every session read renews through the ordinary issuance path: both
-/// replicas contend for the same row lock, and a deactivated connection or a
-/// revoked key ends the session at its next use.
+/// replicas contend for the same row lock. A deactivated connection stops
+/// renewal at once, but each session keeps its issued token until that
+/// token's stored expiry and ends at its first use afterwards.
 ///
 /// # Panics
 /// Panics when any setup step fails or the Vitest journey does not pass.
@@ -299,8 +375,13 @@ async fn production_ui_bff_journey() {
     let replacement_owner_key =
         sso_tenant(&srv, &server, REPLACEMENT_TENANT, keycloak_connection()).await;
 
-    let first = start_bff(&origin, &server, &service_key).await;
-    let second = start_bff(&origin, &server, &service_key).await;
+    // Replica 0 keeps the loopback HTTP topology; replica 1 reaches the same
+    // server only through a trusted TLS origin, so every journey step it
+    // serves crosses a real TLS hop.
+    let material = std::env::temp_dir().join(format!("wyrd-ui-tls-{}", uuid::Uuid::new_v4()));
+    let (terminator, ca) = start_tls_terminator(&server, &material).await;
+    let first = start_bff(&origin, &server, &service_key, None).await;
+    let second = start_bff(&origin, &terminator.url, &service_key, Some(&ca)).await;
     let fixture = json!({
         "origin": origin,
         "server": server,
@@ -342,7 +423,8 @@ async fn production_ui_bff_journey() {
         .await
         .expect("vitest task joins")
         .expect("vitest runs");
-    drop((first, second));
+    drop((first, second, terminator));
+    let _ = std::fs::remove_dir_all(&material);
     srv.shutdown().await.expect("server shuts down");
     assert!(
         status.success(),

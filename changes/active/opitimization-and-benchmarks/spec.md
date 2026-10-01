@@ -1,6 +1,6 @@
 ---
 id: SPEC-opitimization-and-benchmarks
-revision: 7
+revision: 8
 status: draft
 ---
 
@@ -96,9 +96,13 @@ answer file chosen by decision D-3. A mismatch fails the run, with one
 exception: queries whose ClickBench text has no deterministic order or
 tie-break are compared as sets, and the harness lists every such query.
 
-**REQ-003 — Real production server, default settings.** The harness drives one
-release `wyrd-server` binary through its normal operator journey (migrate,
-serve, setup). It uses the public Rust client over the public ingest and query
+**REQ-003 — Real production server, default settings.** The harness starts one
+release `wyrd-server` binary as its own operating-system process, with its own
+Postgres, and drives it through its normal operator journey (migrate, serve,
+setup). The benchmark client is a separate process that reaches the server
+only over the network, client to server. No in-process server, test server
+(`WyrdTestServer` or similar), embedded engine, test-only harness binary, or
+direct call into server crates is allowed anywhere in either benchmark. It uses the public Rust client over the public ingest and query
 surfaces: `wyrd_client::Bifrost`, `POST /v1/query` or the gRPC query service,
 and HTTP or gRPC ingest. The run uses no test-only feature, no hidden
 environment variable, and no configuration a default deployment lacks. The
@@ -168,6 +172,7 @@ missed or a result is wrong. It is reproducible from a clean checkout on a
 Linux host that meets REQ-004.
 
 **REQ-010 — Internal capacity benchmark removed.** This change deletes the
+benchmark outright rather than rewriting it. It deletes the
 `bench:bifrost:query-capacity` mise task, the
 `crates/wyrd/wyrd-testing/src/bin/bifrost_query_capacity` binary, and any code
 or tests used only by them. ClickBench and the observability benchmark are the
@@ -467,6 +472,11 @@ default.
   deleted rather than kept (REQ-010), and AC-7 is withdrawn; its ID is not
   reused. ClickBench and the observability benchmark are the only evidence
   classes. Draft; awaiting owner decisions D-1 and D-3 to D-13.
+- Revision 8 (2026-10-01): Owner decision. Both benchmarks start the real
+  release `wyrd-server` as its own process and reach it only through a client
+  over the network; no in-process or test server is allowed (REQ-003). The
+  capacity benchmark is deleted, not rewritten (REQ-010). Draft; awaiting
+  owner decisions D-1 and D-3 to D-13.
 
 ## Authority and context
 

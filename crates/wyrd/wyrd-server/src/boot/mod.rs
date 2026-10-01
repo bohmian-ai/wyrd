@@ -1520,7 +1520,8 @@ fn attach_config_fields(
 ///
 /// # Errors
 /// Returns [`ServerBootError::SealingKey`] when no sealing key is configured
-/// and any provider or live browser-session ciphertext is stored, or the
+/// and any provider or browser-session ciphertext is stored (expired but
+/// unpurged sessions included), or the
 /// store cannot be read to prove there is none.
 pub async fn rewrap_sealed_secrets(
     operator: Option<OperatorPool>,
@@ -2922,5 +2923,108 @@ mod sealing_boot_pg_tests {
         rewrap_sealed_secrets(Some(operator), None)
             .await
             .expect("a revoked session holds no ciphertext, so keyless boot proceeds");
+    }
+
+    /// Absolute expiry makes a browser session unreachable but does not delete
+    /// its row, so an expired, non-revoked session still stores ciphertext
+    /// until the tenant's next session insertion purges it. The canonical
+    /// rewrap pass must count and reseal those envelopes, and a keyless
+    /// deployment must refuse to boot until they are wiped.
+    ///
+    /// The session is stored with K1 envelopes for each sealed column of an
+    /// API-key session (access token, API key, CSRF token), then backdated past
+    /// its absolute expiry. A K2-write/K1-retained pass must reseal all three,
+    /// keyless boot must refuse while they remain, and wiping them through
+    /// revocation must let keyless boot proceed.
+    ///
+    /// # Panics
+    /// Panics when the session cannot be stored, backdated, or revoked, when
+    /// the rewrap pass fails or reports other counts, or when either boot
+    /// outcome differs.
+    #[tokio::test]
+    async fn keyless_boot_refuses_while_an_expired_browser_session_envelope_remains() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let operator = fixture.operator_pool().clone();
+        let k1 = SealingKeyring::new(SecretKey::from_bytes([1_u8; 32]));
+        let seal = |plaintext: &[u8]| k1.seal(plaintext).expect("K1 seals");
+        let id_hash = Sha256Hex::digest(b"keyless-boot-expired-browser-session");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        insert_browser_session(
+            &mut conn,
+            &id_hash,
+            &BrowserSessionWrite {
+                principal_id: uuid::Uuid::new_v4(),
+                connection_id: None,
+                mode: BrowserSessionMode::ApiKeyExchange,
+                access_token_sealed: seal(b"access"),
+                access_expires_at: Utc::now(),
+                refresh_token_sealed: None,
+                refresh_expires_at: None,
+                api_key_sealed: Some(seal(b"api-key")),
+                csrf_hash: Sha256Hex::digest(b"csrf"),
+                csrf_token_sealed: seal(b"csrf"),
+                lifetime: Duration::from_hours(8),
+            },
+        )
+        .await
+        .expect("session stores")
+        .expect("session id is new");
+        conn.commit().await.expect("session commits");
+        let superuser = fixture
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        let backdated = sqlx::query(
+            "UPDATE wyrd.auth_browser_sessions \
+             SET absolute_expires_at = statement_timestamp() - interval '1 hour' \
+             WHERE id_hash = $1",
+        )
+        .bind(id_hash.as_bytes().as_slice())
+        .execute(&superuser)
+        .await
+        .expect("session is backdated past its absolute expiry");
+        assert_eq!(backdated.rows_affected(), 1);
+
+        let rotated = Arc::new(
+            SealingKeyring::new(SecretKey::from_bytes([2_u8; 32]))
+                .with_retained(SecretKey::from_bytes([1_u8; 32])),
+        );
+        let report = SealedSecretRewrap::new(operator.clone(), Some(Arc::clone(&rotated)))
+            .run()
+            .await
+            .expect("rewrap pass runs");
+        assert_eq!(
+            (report.rewrapped, report.current, report.remaining),
+            (3, 0, 0),
+            "every expired-session envelope is resealed under K2"
+        );
+        let report = SealedSecretRewrap::new(operator.clone(), Some(rotated))
+            .run()
+            .await
+            .expect("verification pass runs");
+        assert_eq!(
+            (report.rewrapped, report.current, report.remaining),
+            (0, 3, 0),
+            "the verification pass sees every expired-session envelope current"
+        );
+
+        let refused = rewrap_sealed_secrets(Some(operator.clone()), None)
+            .await
+            .expect_err("a keyless deployment with an expired session envelope refuses to boot");
+        assert!(
+            matches!(refused, ServerBootError::SealingKey(_)),
+            "{refused:?}"
+        );
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        assert!(
+            revoke_browser_session(&mut conn, &id_hash)
+                .await
+                .expect("expired session revokes")
+        );
+        conn.commit().await.expect("revocation commits");
+        rewrap_sealed_secrets(Some(operator), None)
+            .await
+            .expect("wiped envelopes leave no ciphertext, so keyless boot proceeds");
     }
 }

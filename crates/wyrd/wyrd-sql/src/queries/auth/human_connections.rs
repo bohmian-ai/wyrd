@@ -381,9 +381,13 @@ pub async fn remove_human_connection(
 /// List every sealed value of one [`SealedSecretTable`] column across all
 /// tenants, for sealing-key rewrap.
 ///
-/// Browser-session columns list only live (unrevoked, not absolutely
-/// expired) sessions: a revoked row holds no ciphertext, and an expired row
-/// is unreachable and purged.
+/// Every column lists every stored (non-null) envelope, regardless of the
+/// row's lifecycle. For browser sessions that includes rows past their
+/// absolute expiry: expiry makes a session unreachable but writes nothing, and
+/// its ciphertext stays stored until the tenant's next session insertion
+/// purges the row, so it must still be counted and resealed. Revoked rows need
+/// no filter because revocation wipes every sealed value and the table
+/// constraint keeps them null.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails.
@@ -464,7 +468,9 @@ impl SealedSecretTable {
         }
     }
 
-    /// The operator statement listing every sealed value in this column.
+    /// The operator statement listing every stored (non-null) sealed value in
+    /// this column, with no liveness or expiry filter, so the rewrap report
+    /// and keyless boot decision cover all ciphertext the table holds.
     fn select_sql(self) -> &'static str {
         match self {
             Self::HumanConnections => {
@@ -479,29 +485,25 @@ impl SealedSecretTable {
                 "SELECT data_tenant_id, encode(id_hash, 'hex') AS row_key,
                         access_token_sealed AS client_secret_enc
                    FROM wyrd.auth_browser_sessions
-                  WHERE access_token_sealed IS NOT NULL AND revoked_at IS NULL
-                    AND absolute_expires_at > statement_timestamp()"
+                  WHERE access_token_sealed IS NOT NULL"
             }
             Self::BrowserSessionRefresh => {
                 "SELECT data_tenant_id, encode(id_hash, 'hex') AS row_key,
                         refresh_token_sealed AS client_secret_enc
                    FROM wyrd.auth_browser_sessions
-                  WHERE refresh_token_sealed IS NOT NULL AND revoked_at IS NULL
-                    AND absolute_expires_at > statement_timestamp()"
+                  WHERE refresh_token_sealed IS NOT NULL"
             }
             Self::BrowserSessionApiKey => {
                 "SELECT data_tenant_id, encode(id_hash, 'hex') AS row_key,
                         api_key_sealed AS client_secret_enc
                    FROM wyrd.auth_browser_sessions
-                  WHERE api_key_sealed IS NOT NULL AND revoked_at IS NULL
-                    AND absolute_expires_at > statement_timestamp()"
+                  WHERE api_key_sealed IS NOT NULL"
             }
             Self::BrowserSessionCsrf => {
                 "SELECT data_tenant_id, encode(id_hash, 'hex') AS row_key,
                         csrf_token_sealed AS client_secret_enc
                    FROM wyrd.auth_browser_sessions
-                  WHERE csrf_token_sealed IS NOT NULL AND revoked_at IS NULL
-                    AND absolute_expires_at > statement_timestamp()"
+                  WHERE csrf_token_sealed IS NOT NULL"
             }
         }
     }

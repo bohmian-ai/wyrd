@@ -1,10 +1,11 @@
 //! Sealing-key rotation: rewrap every long-lived sealed secret under the write key.
 //!
 //! The pass covers tenant human-connection and workload-issuer client secrets,
-//! the platform connection secret, and every sealed column (access token,
-//! refresh token or bootstrap API key, CSRF token) of live production UI
-//! browser sessions, so `remaining == 0` speaks for provider and browser-session
-//! stores alike.
+//! the platform connection secret, and every stored sealed column (access
+//! token, refresh token or bootstrap API key, CSRF token) of production UI
+//! browser sessions — including sessions past their absolute expiry whose rows
+//! have not yet been purged — so `remaining == 0` speaks for every ciphertext
+//! the provider and browser-session stores hold.
 //!
 //! Rotation procedure (operator runbook in `docs/`): configure the new key K2
 //! as the write key, keep the old key K1 in the retained set, and roll every
@@ -82,7 +83,8 @@ impl SealedSecretRewrap {
     /// write key.
     ///
     /// Walks human connections, workload trusted issuers, each sealed column of
-    /// live browser sessions, and the platform connection. A ciphertext no held
+    /// every stored browser session (expired but unpurged rows included), and
+    /// the platform connection. A ciphertext no held
     /// key opens, or one whose swap loses to a concurrent write, is counted in
     /// `remaining`; the former is logged with its table and tenant, never its
     /// bytes.

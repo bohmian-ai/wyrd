@@ -21,6 +21,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use wyrd_auth::browser_sessions::{BrowserSessions, CreatedBrowserSession};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_spec::request_id::RequestId;
@@ -165,6 +166,9 @@ struct CreatedResponse {
 }
 
 impl From<CreatedBrowserSession> for CreatedResponse {
+    /// Project a newly created session onto the internal channel reply,
+    /// exposing the raw session id this one time so the BFF can set its
+    /// opaque cookie; only the id's hash is stored server-side.
     fn from(created: CreatedBrowserSession) -> Self {
         Self {
             session_id: created.session_id.expose_secret().to_owned(),
@@ -227,6 +231,9 @@ struct SessionRequest {
 /// `sessions/read` reply: safe metadata plus the CSRF token the BFF renders.
 #[derive(Serialize)]
 struct ReadResponse {
+    /// The session's authoritative tenant id; server-only BFF session state,
+    /// never rendered into browser metadata or page data.
+    tenant_id: DataTenantId,
     /// Route key of the session's tenant.
     tenant_key: String,
     /// Display name of the session's tenant.
@@ -261,6 +268,7 @@ async fn read(
         )
         .await?;
     Ok(Json(ReadResponse {
+        tenant_id: view.tenant_id,
         tenant_key: view.tenant_key.to_string(),
         tenant_name: view.tenant_name,
         principal_id: view.principal_id,

@@ -3502,8 +3502,6 @@ impl WyrdServerConfig {
 // Internal helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Read an environment variable, returning `None` if unset and
-/// `Err(EmptyEnvVar)` if set but empty.
 /// Parse `WYRD_BFF_SERVICE_KEY_SHA256`: one or two comma-separated
 /// lowercase-hex SHA-256 digests, the second accepted only for a bounded
 /// rotation overlap.
@@ -3528,6 +3526,12 @@ fn parse_bff_service_key_hashes(value: &str) -> Result<Vec<Sha256Hex>, ConfigErr
     Ok(hashes)
 }
 
+/// Read an environment variable, returning `None` if unset and
+/// `Err(EmptyEnvVar)` if set but empty.
+///
+/// # Errors
+/// Returns [`ConfigError::EmptyEnvVar`] for a set but empty value and
+/// [`ConfigError::BadEnvVar`] for a value that is not valid UTF-8.
 fn env_opt(key: &str) -> Result<Option<String>, ConfigError> {
     match env::var(key) {
         Ok(v) if v.is_empty() => Err(ConfigError::EmptyEnvVar {

@@ -1359,8 +1359,9 @@ mod pg_tests {
     /// unknown route tenant, a key of another tenant at either route, an
     /// unknown prefix, a wrong secret, an expired key, a revoked key, and the
     /// valid key — must advance the process-wide verification count by
-    /// exactly one; every refusal renders the one API-key problem, and only
-    /// the valid key creates a session.
+    /// exactly one; every refusal renders the one API-key problem, only the
+    /// valid key creates a session, and that session's projection carries the
+    /// authoritative tenant id.
     ///
     /// # Panics
     /// Panics when the fixture cannot start, a seed fails, or any assertion
@@ -1452,6 +1453,14 @@ mod pg_tests {
             "the valid browser sign-in did not perform exactly one verification"
         );
         assert_eq!(created.tenant_key, route);
+        let view = sessions
+            .read(&created.session_id, "req-browser-read")
+            .await
+            .expect("the new session reads");
+        assert_eq!(
+            view.tenant_id, tenant,
+            "the session projection carries the authoritative tenant id"
+        );
 
         let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.auth_browser_sessions")
             .fetch_one(

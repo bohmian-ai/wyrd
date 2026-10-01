@@ -69,6 +69,8 @@ pub struct CreatedBrowserSession {
 /// The safe projection of a live session the BFF renders pages from.
 #[derive(Debug)]
 pub struct BrowserSessionView {
+    /// The session's tenant, as the session row itself names it.
+    pub tenant_id: DataTenantId,
     /// Route key of the session's tenant.
     pub tenant_key: TenantSlug,
     /// Display name of the session's tenant.
@@ -130,6 +132,11 @@ pub struct BrowserSessions {
 }
 
 impl std::fmt::Debug for BrowserSessions {
+    /// Render only the type name: the owner holds the sealing keyring and the
+    /// issuing key, so no field is ever printed into logs or traces.
+    ///
+    /// # Errors
+    /// Returns the formatter's error when writing fails.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrowserSessions").finish_non_exhaustive()
     }
@@ -333,6 +340,7 @@ impl BrowserSessions {
         current.conn.commit().await.map_err(store_error)?;
         let (tenant_key, tenant_name) = self.tenant_entry(tenant).await?;
         Ok(BrowserSessionView {
+            tenant_id: tenant,
             tenant_key,
             tenant_name,
             principal_id: verified.principal.id.as_uuid(),

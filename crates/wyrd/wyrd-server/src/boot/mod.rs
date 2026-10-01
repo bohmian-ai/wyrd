@@ -1503,8 +1503,8 @@ fn attach_config_fields(
         )))
 }
 
-/// Reseal every stored provider secret under the current sealing write key, or
-/// prove a keyless deployment stores none.
+/// Reseal every stored provider and browser-session secret under the current
+/// sealing write key, or prove a keyless deployment stores none.
 ///
 /// This is the rewrap step of sealing-key rotation: with the new key configured
 /// as the write key and the old one retained, every boot converges stored
@@ -1520,8 +1520,8 @@ fn attach_config_fields(
 ///
 /// # Errors
 /// Returns [`ServerBootError::SealingKey`] when no sealing key is configured
-/// and any provider ciphertext is stored, or the store cannot be read to
-/// prove there is none.
+/// and any provider or live browser-session ciphertext is stored, or the
+/// store cannot be read to prove there is none.
 pub async fn rewrap_sealed_secrets(
     operator: Option<OperatorPool>,
     keyring: Option<Arc<SealingKeyring>>,
@@ -1532,17 +1532,18 @@ pub async fn rewrap_sealed_secrets(
     let keyless = keyring.is_none();
     match SealedSecretRewrap::new(operator, keyring).run().await {
         Ok(report) if keyless && report.remaining > 0 => Err(ServerBootError::SealingKey(format!(
-            "{} stored provider client secret(s) exist but no sealing key is configured; \
-                 configure the key they were sealed under",
+            "{} stored sealed secret(s) (provider client secrets or browser-session \
+                 credentials) exist but no sealing key is configured; configure the key \
+                 they were sealed under",
             report.remaining
         ))),
         Ok(_) => Ok(()),
         Err(error) if keyless => Err(ServerBootError::SealingKey(format!(
-            "stored provider client secrets could not be checked with no sealing key \
+            "stored sealed secrets could not be checked with no sealing key \
              configured: {error}"
         ))),
         Err(error) => {
-            tracing::error!(error = %error, "sealed provider secret rewrap failed; retrying next boot");
+            tracing::error!(error = %error, "sealed secret rewrap failed; retrying next boot");
             Ok(())
         }
     }
@@ -2815,7 +2816,14 @@ pub(crate) mod pg_tests {
 
 #[cfg(test)]
 mod sealing_boot_pg_tests {
+    use std::time::Duration;
+
+    use chrono::Utc;
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
+    use wyrd_spec::auth::Sha256Hex;
+    use wyrd_sql::queries::auth::{
+        BrowserSessionMode, BrowserSessionWrite, insert_browser_session, revoke_browser_session,
+    };
 
     use super::*;
 
@@ -2859,5 +2867,60 @@ mod sealing_boot_pg_tests {
             matches!(refused, ServerBootError::SealingKey(_)),
             "{refused:?}"
         );
+    }
+
+    /// A keyless deployment refuses to boot while a live browser session still
+    /// holds sealed credentials, and boots once that session is revoked, since
+    /// revocation wipes every sealed value of the row.
+    ///
+    /// # Panics
+    /// Panics when the session cannot be stored or revoked, or either boot
+    /// outcome differs.
+    #[tokio::test]
+    async fn keyless_boot_refuses_while_a_browser_session_envelope_remains() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let operator = fixture.operator_pool().clone();
+        let id_hash = Sha256Hex::digest(b"keyless-boot-browser-session");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        insert_browser_session(
+            &mut conn,
+            &id_hash,
+            &BrowserSessionWrite {
+                principal_id: uuid::Uuid::new_v4(),
+                connection_id: None,
+                mode: BrowserSessionMode::ApiKeyExchange,
+                access_token_sealed: vec![1, 2],
+                access_expires_at: Utc::now(),
+                refresh_token_sealed: None,
+                refresh_expires_at: None,
+                api_key_sealed: Some(vec![3, 4]),
+                csrf_hash: Sha256Hex::digest(b"csrf"),
+                csrf_token_sealed: vec![5, 6],
+                lifetime: Duration::from_hours(8),
+            },
+        )
+        .await
+        .expect("session stores")
+        .expect("session id is new");
+        conn.commit().await.expect("session commits");
+
+        let refused = rewrap_sealed_secrets(Some(operator.clone()), None)
+            .await
+            .expect_err("a keyless deployment with a live session envelope refuses to boot");
+        assert!(
+            matches!(refused, ServerBootError::SealingKey(_)),
+            "{refused:?}"
+        );
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        assert!(
+            revoke_browser_session(&mut conn, &id_hash)
+                .await
+                .expect("session revokes")
+        );
+        conn.commit().await.expect("revocation commits");
+        rewrap_sealed_secrets(Some(operator), None)
+            .await
+            .expect("a revoked session holds no ciphertext, so keyless boot proceeds");
     }
 }

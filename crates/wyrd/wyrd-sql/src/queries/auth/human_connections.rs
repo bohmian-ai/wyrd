@@ -11,7 +11,9 @@
 //! run on the BYPASSRLS [`OperatorPool`] because sealing-key rotation is a
 //! deployment operation over every tenant's ciphertext, and each update is a
 //! compare-and-swap on the exact bytes read so a concurrent rotation cannot be
-//! overwritten.
+//! overwritten. Besides this table's client secrets they cover the workload
+//! issuer secrets and every sealed column of live browser sessions, so one
+//! inventory answers for every long-lived tenant ciphertext.
 // raw-query grep allowlist: auth tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::time::Duration;
@@ -159,9 +161,10 @@ pub struct HumanConnectionWrite {
 pub struct SealedSecretRow {
     /// Owning tenant, used only for operator diagnostics.
     pub data_tenant_id: Uuid,
-    /// Row key: the connection id or the trusted issuer URL, as text.
+    /// Row key as text: the connection id, the trusted issuer URL, or the
+    /// lowercase-hex browser-session id hash.
     pub row_key: String,
-    /// The sealed bytes exactly as stored.
+    /// The sealed bytes of the table's sealed column exactly as stored.
     pub client_secret_enc: Vec<u8>,
 }
 
@@ -375,8 +378,12 @@ pub async fn remove_human_connection(
         .map_err(SqlError::from)
 }
 
-/// List every sealed secret in the tenant human-connection and workload-issuer
-/// stores across all tenants, for sealing-key rewrap.
+/// List every sealed value of one [`SealedSecretTable`] column across all
+/// tenants, for sealing-key rewrap.
+///
+/// Browser-session columns list only live (unrevoked, not absolutely
+/// expired) sessions: a revoked row holds no ciphertext, and an expired row
+/// is unreachable and purged.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails.
@@ -416,18 +423,33 @@ pub async fn swap_sealed_tenant_secret(
         .map_err(SqlError::from)
 }
 
-/// A tenant table whose `client_secret_enc` column holds keyring envelopes.
+/// A tenant table column that holds keyring envelopes, as rewrap walks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealedSecretTable {
-    /// `wyrd.auth_human_connections`, keyed by connection id.
+    /// `wyrd.auth_human_connections.client_secret_enc`, keyed by connection id.
     HumanConnections,
-    /// `wyrd.auth_trusted_issuers`, keyed by issuer URL.
+    /// `wyrd.auth_trusted_issuers.client_secret_enc`, keyed by issuer URL.
     TrustedIssuers,
+    /// `wyrd.auth_browser_sessions.access_token_sealed`, keyed by id hash.
+    BrowserSessionAccess,
+    /// `wyrd.auth_browser_sessions.refresh_token_sealed` (SSO sessions).
+    BrowserSessionRefresh,
+    /// `wyrd.auth_browser_sessions.api_key_sealed` (API-key sessions).
+    BrowserSessionApiKey,
+    /// `wyrd.auth_browser_sessions.csrf_token_sealed`.
+    BrowserSessionCsrf,
 }
 
 impl SealedSecretTable {
-    /// Every table rewrap walks, in a stable order.
-    pub const ALL: [Self; 2] = [Self::HumanConnections, Self::TrustedIssuers];
+    /// Every column rewrap walks, in a stable order.
+    pub const ALL: [Self; 6] = [
+        Self::HumanConnections,
+        Self::TrustedIssuers,
+        Self::BrowserSessionAccess,
+        Self::BrowserSessionRefresh,
+        Self::BrowserSessionApiKey,
+        Self::BrowserSessionCsrf,
+    ];
 
     /// Stable label for operator logs.
     #[must_use]
@@ -435,10 +457,14 @@ impl SealedSecretTable {
         match self {
             Self::HumanConnections => "wyrd.auth_human_connections",
             Self::TrustedIssuers => "wyrd.auth_trusted_issuers",
+            Self::BrowserSessionAccess => "wyrd.auth_browser_sessions.access_token_sealed",
+            Self::BrowserSessionRefresh => "wyrd.auth_browser_sessions.refresh_token_sealed",
+            Self::BrowserSessionApiKey => "wyrd.auth_browser_sessions.api_key_sealed",
+            Self::BrowserSessionCsrf => "wyrd.auth_browser_sessions.csrf_token_sealed",
         }
     }
 
-    /// The operator statement listing every sealed secret in this table.
+    /// The operator statement listing every sealed value in this column.
     fn select_sql(self) -> &'static str {
         match self {
             Self::HumanConnections => {
@@ -449,10 +475,39 @@ impl SealedSecretTable {
                 "SELECT data_tenant_id, issuer_url AS row_key, client_secret_enc
                    FROM wyrd.auth_trusted_issuers WHERE client_secret_enc IS NOT NULL"
             }
+            Self::BrowserSessionAccess => {
+                "SELECT data_tenant_id, encode(id_hash, 'hex') AS row_key,
+                        access_token_sealed AS client_secret_enc
+                   FROM wyrd.auth_browser_sessions
+                  WHERE access_token_sealed IS NOT NULL AND revoked_at IS NULL
+                    AND absolute_expires_at > statement_timestamp()"
+            }
+            Self::BrowserSessionRefresh => {
+                "SELECT data_tenant_id, encode(id_hash, 'hex') AS row_key,
+                        refresh_token_sealed AS client_secret_enc
+                   FROM wyrd.auth_browser_sessions
+                  WHERE refresh_token_sealed IS NOT NULL AND revoked_at IS NULL
+                    AND absolute_expires_at > statement_timestamp()"
+            }
+            Self::BrowserSessionApiKey => {
+                "SELECT data_tenant_id, encode(id_hash, 'hex') AS row_key,
+                        api_key_sealed AS client_secret_enc
+                   FROM wyrd.auth_browser_sessions
+                  WHERE api_key_sealed IS NOT NULL AND revoked_at IS NULL
+                    AND absolute_expires_at > statement_timestamp()"
+            }
+            Self::BrowserSessionCsrf => {
+                "SELECT data_tenant_id, encode(id_hash, 'hex') AS row_key,
+                        csrf_token_sealed AS client_secret_enc
+                   FROM wyrd.auth_browser_sessions
+                  WHERE csrf_token_sealed IS NOT NULL AND revoked_at IS NULL
+                    AND absolute_expires_at > statement_timestamp()"
+            }
         }
     }
 
-    /// The operator compare-and-swap statement replacing one sealed secret.
+    /// The operator compare-and-swap statement replacing one sealed value; it
+    /// matches only while the column still holds exactly the bytes read.
     fn swap_sql(self) -> &'static str {
         match self {
             Self::HumanConnections => {
@@ -463,6 +518,26 @@ impl SealedSecretTable {
             Self::TrustedIssuers => {
                 "UPDATE wyrd.auth_trusted_issuers SET client_secret_enc = $4
                   WHERE data_tenant_id = $1 AND issuer_url = $2 AND client_secret_enc = $3"
+            }
+            Self::BrowserSessionAccess => {
+                "UPDATE wyrd.auth_browser_sessions SET access_token_sealed = $4
+                  WHERE data_tenant_id = $1 AND id_hash = decode($2, 'hex')
+                    AND access_token_sealed = $3"
+            }
+            Self::BrowserSessionRefresh => {
+                "UPDATE wyrd.auth_browser_sessions SET refresh_token_sealed = $4
+                  WHERE data_tenant_id = $1 AND id_hash = decode($2, 'hex')
+                    AND refresh_token_sealed = $3"
+            }
+            Self::BrowserSessionApiKey => {
+                "UPDATE wyrd.auth_browser_sessions SET api_key_sealed = $4
+                  WHERE data_tenant_id = $1 AND id_hash = decode($2, 'hex')
+                    AND api_key_sealed = $3"
+            }
+            Self::BrowserSessionCsrf => {
+                "UPDATE wyrd.auth_browser_sessions SET csrf_token_sealed = $4
+                  WHERE data_tenant_id = $1 AND id_hash = decode($2, 'hex')
+                    AND csrf_token_sealed = $3"
             }
         }
     }

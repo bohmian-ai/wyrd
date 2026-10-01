@@ -1,4 +1,10 @@
-//! Sealing-key rotation: rewrap every stored provider secret under the write key.
+//! Sealing-key rotation: rewrap every long-lived sealed secret under the write key.
+//!
+//! The pass covers tenant human-connection and workload-issuer client secrets,
+//! the platform connection secret, and every sealed column (access token,
+//! refresh token or bootstrap API key, CSRF token) of live production UI
+//! browser sessions, so `remaining == 0` speaks for provider and browser-session
+//! stores alike.
 //!
 //! Rotation procedure (operator runbook in `docs/`): configure the new key K2
 //! as the write key, keep the old key K1 in the retained set, and roll every
@@ -18,9 +24,11 @@
 //! the verification pass's start is enough; rewrapping it would only extend
 //! a secret that is about to expire.
 //!
-//! The pass is idempotent and safe across replicas: each row is replaced by a
-//! compare-and-swap on the exact bytes read, so a concurrent reconfiguration or
-//! a second replica's rewrap is never overwritten. It is an engine-internal
+//! The pass is idempotent and safe across replicas: each column value is
+//! replaced by a compare-and-swap on the exact bytes read, so a concurrent
+//! reconfiguration, browser-session renewal or logout, or a second replica's
+//! rewrap is never overwritten; the value it lost to counts as `remaining`
+//! and the next pass reseals it. It is an engine-internal
 //! transition that evaluates no principal permission, so it logs counts (never
 //! keys or plaintext) and writes no audit.
 //!
@@ -70,11 +78,14 @@ impl SealedSecretRewrap {
         Self { operator, keyring }
     }
 
-    /// Reseal every tenant and platform provider secret not under the write key.
+    /// Reseal every tenant, platform, and browser-session secret not under the
+    /// write key.
     ///
-    /// Walks human connections, workload trusted issuers, and the platform
-    /// connection. A ciphertext no held key opens is counted in `remaining`
-    /// and logged with its table and tenant, never its bytes.
+    /// Walks human connections, workload trusted issuers, each sealed column of
+    /// live browser sessions, and the platform connection. A ciphertext no held
+    /// key opens, or one whose swap loses to a concurrent write, is counted in
+    /// `remaining`; the former is logged with its table and tenant, never its
+    /// bytes.
     ///
     /// # Errors
     /// Returns [`SqlError`] when a read or swap statement fails; rows already
@@ -113,7 +124,7 @@ impl SealedSecretRewrap {
             rewrapped = report.rewrapped,
             current = report.current,
             remaining = report.remaining,
-            "sealed provider secret rewrap finished"
+            "sealed secret rewrap finished"
         );
         Ok(report)
     }

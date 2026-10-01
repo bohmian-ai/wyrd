@@ -388,6 +388,8 @@ export declare class NativeGateway {
    * failures are returned in the result.
    */
   capturePolicy(): Promise<NativeLifecycleResult>
+}
+
 /** Tenant-scoped Operator connection handle over the shared `wyrd_client` handle. */
 export declare class NativeOperatorConnections {
   /**
@@ -707,6 +709,8 @@ export declare function connectCards(serverUrl?: string | undefined | null, cred
  * be built.
  */
 export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeGateway
+
+/**
  * Builds one Operator connection handle without performing IO.
  *
  * Omitted arguments resolve through the same shared client configuration

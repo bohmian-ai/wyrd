@@ -492,7 +492,9 @@ fn total_equality_deletes(plans: &[CompactionPlan]) -> usize {
 mod tests {
     use super::super::policy::ForgeTablePolicy;
     use super::governed_context_for;
-    use crate::resources::{BifrostRole, BifrostRuntimeResources};
+    use crate::resources::{
+        BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory, ScribeMemoryRequest,
+    };
     use datafusion::execution::memory_pool::MemoryConsumer;
     use iceberg_compaction_core::config::{CompactionPlanningConfig, DEFAULT_MAX_SELECTION_PLANS};
     use iceberg_compaction_core::managed::{CandidateIdentity, IdentityAwareSelector};
@@ -613,10 +615,12 @@ mod tests {
 
     /// The attempt's pool charges the shared root and releases on cancel.
     ///
-    /// The rewrite runtime's pool is a view of the one Bifrost governor: its
-    /// growth appears as Forge-attributed governed memory, it is refused at
-    /// the shared cap, and cancelling the attempt and dropping its context
-    /// returns every byte. The disk manager spills into the leased root.
+    /// The rewrite runtime's pool is a view of the one Bifrost governor shared
+    /// with Scribe and Oracle: its growth appears as Forge-attributed governed
+    /// memory beside a held Scribe charge, it is refused at the shared cap,
+    /// cancellation alone frees nothing the reservation still holds, and
+    /// dropping the reservation and context returns every Forge byte. A spill
+    /// file lands in the leased root and is removed when the context drops.
     ///
     /// # Panics
     ///
@@ -629,9 +633,18 @@ mod tests {
         let roles = BifrostRuntimeResources::composed_for_test(
             64 * MIB,
             512 * MIB as u64,
-            [BifrostRole::Forge],
+            [BifrostRole::Forge, BifrostRole::Scribe, BifrostRole::Oracle],
         );
         let forge = roles.forge().expect("Forge capability");
+        let scribe_charge = roles
+            .scribe()
+            .expect("Scribe capability")
+            .try_acquire_memory(ScribeMemoryRequest {
+                bytes: 8 * MIB,
+                category: ScribeMemoryCategory::Raw,
+                shard: Some(0),
+            })
+            .expect("Scribe charges the shared root");
         let spill = tempfile::tempdir().expect("spill root");
         let cancel = CancellationToken::new();
         let context = governed_context_for(
@@ -648,24 +661,59 @@ mod tests {
             !spill_dirs.is_empty() && spill_dirs.iter().all(|dir| dir.starts_with(spill.path())),
             "spills land beneath the leased forge-spill root, saw {spill_dirs:?}"
         );
+        let spill_file = runtime
+            .disk_manager
+            .create_tmp_file("forge-rewrite-spill")
+            .expect("the disk manager creates a spill file");
+        assert!(
+            spill_file
+                .path()
+                .is_some_and(|path| path.starts_with(spill.path())),
+            "a spill file lands beneath the leased forge-spill root"
+        );
         let reservation = MemoryConsumer::new("forge-rewrite").register(&runtime.memory_pool);
         reservation
             .try_grow(48 * MIB)
             .expect("growth under the cap");
         let charged = roles.snapshot().expect("charged snapshot");
         assert_eq!(charged.forge_memory_used_bytes, 48 * MIB);
-        assert_eq!(charged.governed_memory_used_bytes, 48 * MIB);
+        assert_eq!(charged.governed_memory_used_bytes, 56 * MIB);
         assert!(
-            reservation.try_grow(32 * MIB).is_err(),
+            reservation.try_grow(16 * MIB).is_err(),
             "the shared cap, not a Forge budget, refuses growth"
         );
         cancel.cancel();
         assert!(context.is_cancelled());
+        assert_eq!(
+            roles
+                .snapshot()
+                .expect("cancelled snapshot")
+                .forge_memory_used_bytes,
+            48 * MIB,
+            "cancellation alone releases nothing the reservation still holds"
+        );
         drop(reservation);
+        drop(spill_file);
+        drop(runtime);
         drop(context);
         let released = roles.snapshot().expect("released snapshot");
         assert_eq!(released.forge_memory_used_bytes, 0);
-        assert_eq!(released.governed_memory_used_bytes, 0);
+        assert_eq!(released.governed_memory_used_bytes, 8 * MIB);
+        assert_eq!(
+            std::fs::read_dir(spill.path())
+                .expect("the spill root is readable")
+                .count(),
+            0,
+            "dropping the context removes every spill file and directory"
+        );
+        drop(scribe_charge);
+        assert_eq!(
+            roles
+                .snapshot()
+                .expect("idle snapshot")
+                .governed_memory_used_bytes,
+            0
+        );
         assert!(roles.health().reason().is_none());
     }
 }

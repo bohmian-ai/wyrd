@@ -46,15 +46,18 @@ const INSERT_BROWSER_SESSION_SQL: &str = r#"
 ///
 /// Only an unrevoked row before its absolute expiry matches. `access_fresh`
 /// reports whether the stored access token outlives `PostgreSQL`'s clock by
-/// more than the bound margin in seconds. A concurrent caller blocks on the
-/// row lock and, once the holder commits, re-reads the holder's rotated or
-/// revoked row.
+/// more than the bound margin in seconds, and `access_expired` whether
+/// `PostgreSQL`'s clock has reached that expiry, both from the one statement
+/// instant. A token neither fresh nor expired is still valid inside the
+/// renewal margin. A concurrent caller blocks on the row lock and, once the
+/// holder commits, re-reads the holder's rotated or revoked row.
 const LOCK_BROWSER_SESSION_SQL: &str = r#"
     SELECT principal_id, connection_id, mode, access_token_sealed,
            refresh_token_sealed, api_key_sealed, access_expires_at,
            absolute_expires_at, csrf_token_sealed,
            access_expires_at > statement_timestamp() + ($2 * interval '1 second')
-               AS access_fresh
+               AS access_fresh,
+           access_expires_at <= statement_timestamp() AS access_expired
       FROM wyrd.auth_browser_sessions
      WHERE id_hash = $1
        AND revoked_at IS NULL
@@ -175,6 +178,10 @@ pub struct LockedBrowserSession {
     pub csrf_token_sealed: Vec<u8>,
     /// Whether the access token outlives the requested margin.
     pub access_fresh: bool,
+    /// Whether `PostgreSQL`'s clock has reached the access token's expiry at
+    /// lock time; a token that is neither fresh nor expired is still usable
+    /// inside the renewal margin.
+    pub access_expired: bool,
 }
 
 /// Raw locked row as [`LOCK_BROWSER_SESSION_SQL`] returns it.
@@ -200,6 +207,8 @@ struct LockedRow {
     csrf_token_sealed: Option<Vec<u8>>,
     /// Freshness against the bound margin.
     access_fresh: bool,
+    /// Whether the access token had expired at the statement instant.
+    access_expired: bool,
 }
 
 /// Create a session keyed by `id_hash` after purging this tenant's sessions
@@ -240,7 +249,8 @@ pub async fn insert_browser_session(
 
 /// Lock this tenant's live session keyed by `id_hash` until the caller's
 /// transaction ends, reporting whether its access token outlives
-/// `fresh_margin`.
+/// `fresh_margin` and whether it has already expired, both against
+/// `PostgreSQL`'s clock.
 ///
 /// Returns `None` for an unknown, revoked, absolutely expired, or other
 /// tenant's session.
@@ -272,6 +282,7 @@ pub async fn lock_browser_session(
             absolute_expires_at: row.absolute_expires_at,
             csrf_token_sealed: row.csrf_token_sealed.ok_or_else(corrupt)?,
             access_fresh: row.access_fresh,
+            access_expired: row.access_expired,
         })
     })
     .transpose()

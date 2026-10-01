@@ -382,15 +382,31 @@ test('production SSO crosses replicas', async () => {
   expect(refusedKey.status).toBe(401);
   expect(apiKeyAtSso.cookies.has(sessionCookie(sso))).toBe(false);
 
-  // The admin may deactivate; every session on that connection then stops renewing.
+  // The admin may deactivate; every session on that connection then stops renewing but keeps
+  // its already-issued access token until that token's own expiry. Alice's token was just
+  // renewed by the deactivating request, so her next page still renders.
   const deactivated = await alice.go(1, `${settings}?/deactivate`, { form: { csrf } });
   expect(deactivated.status).not.toBe(403);
   expect(deactivated.status).toBeLessThan(500);
+  const stillIssued = await alice.go(0, `/t/${sso}`);
+  expect(stillIssued.status).toBe(200);
+  expect(alice.cookies.has(sessionCookie(sso))).toBe(true);
+  // Once each issued token expires (30-second journey lifetime), the first use ends the session.
   for (const browser of [alice, bob]) {
-    expect((await browser.go(0, `/t/${sso}`)).headers.get('location')).toBe(`/t/${sso}/login`);
+    const deadline = Date.now() + 45_000;
+    let location: string | null = null;
+    while (location === null && Date.now() < deadline) {
+      const page = await browser.go(0, `/t/${sso}`);
+      location = page.headers.get('location');
+      if (location === null) {
+        expect(page.status).toBe(200);
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+    }
+    expect(location).toBe(`/t/${sso}/login`);
     expect(browser.cookies.has(sessionCookie(sso))).toBe(false);
   }
-}, journeyTimeout);
+}, journeyTimeout + 60_000);
 
 test('OIDC-off credential UI', async () => {
   const tenant = journey.apiKeyTenant;

@@ -436,11 +436,18 @@ impl BrowserSessions {
     /// usable, renewing it under the row lock when it is stale.
     ///
     /// A concurrent replica blocks on the row lock and then sees the winner's
-    /// rotated credential as fresh, so one renewal serves both. A renewal the
-    /// issuance path refuses — a revoked or reused refresh token, a
-    /// deactivated or replaced connection, a revoked API key, a suspended
-    /// principal — revokes the session in the same transaction and commits;
-    /// no other credential is tried.
+    /// rotated credential as fresh, so one renewal serves both.
+    ///
+    /// A renewal the issuance path refuses — a revoked or reused refresh
+    /// token, a deactivated or replaced connection, a revoked API key, a
+    /// suspended principal — is decided by the stored token's expiry under
+    /// `PostgreSQL`'s clock. While that token is still valid inside the
+    /// renewal margin, the transaction holding the refused attempt is rolled
+    /// back (no tentative refresh, key-use, or revocation write commits), the
+    /// row is locked again, and the already-issued token is served unchanged
+    /// until its stored expiry. Once it has expired, the refusal revokes the
+    /// session in the same transaction and commits; no other credential is
+    /// tried. The relock happens at most once per call.
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] for an unknown, revoked, expired, or
@@ -458,64 +465,76 @@ impl BrowserSessions {
             .await
             .map_err(store_error)?
             .ok_or_else(session_ended)?;
-        let mut conn = self.begin(tenant).await?;
-        let row = lock_browser_session(&mut conn, &id_hash, RENEW_MARGIN)
+        let mut renewal_refused = false;
+        loop {
+            let mut conn = self.begin(tenant).await?;
+            let row = lock_browser_session(&mut conn, &id_hash, RENEW_MARGIN)
+                .await
+                .map_err(store_error)?
+                .ok_or_else(session_ended)?;
+            let keyring = self.require_keyring()?;
+            if row.access_fresh || (renewal_refused && !row.access_expired) {
+                let access_token = open_text(keyring, &row.access_token_sealed)?;
+                let access_expires_at = row.access_expires_at;
+                return Ok((
+                    tenant,
+                    CurrentSession {
+                        conn,
+                        row,
+                        access_token,
+                        access_expires_at,
+                    },
+                ));
+            }
+            let renewed = match self.renew(&mut conn, keyring, &row, request_id).await {
+                Ok(renewed) => renewed,
+                Err(Renewal::Refused) if !row.access_expired && !renewal_refused => {
+                    conn.rollback().await.map_err(store_error)?;
+                    renewal_refused = true;
+                    tracing::info!(
+                        tenant_id = %tenant,
+                        "browser session early renewal refused; serving the issued token until expiry"
+                    );
+                    continue;
+                }
+                Err(Renewal::Refused) => {
+                    revoke_browser_session(&mut conn, &id_hash)
+                        .await
+                        .map_err(store_error)?;
+                    conn.commit().await.map_err(store_error)?;
+                    tracing::info!(tenant_id = %tenant, "browser session renewal refused; session ended");
+                    return Err(session_ended());
+                }
+                Err(Renewal::Failed(error)) => return Err(error),
+            };
+            let refresh = match &renewed.refresh_token {
+                Some(token) => Some((
+                    seal(keyring, token.expose_secret())?,
+                    refresh_expiry(token.expose_secret())?,
+                )),
+                None => None,
+            };
+            rotate_browser_session(
+                &mut conn,
+                &id_hash,
+                &seal(keyring, renewed.access_token.expose_secret())?,
+                renewed.expires_at,
+                refresh
+                    .as_ref()
+                    .map(|(sealed, expires_at)| (sealed.as_slice(), *expires_at)),
+            )
             .await
-            .map_err(store_error)?
-            .ok_or_else(session_ended)?;
-        let keyring = self.require_keyring()?;
-        if row.access_fresh {
-            let access_token = open_text(keyring, &row.access_token_sealed)?;
-            let access_expires_at = row.access_expires_at;
+            .map_err(store_error)?;
             return Ok((
                 tenant,
                 CurrentSession {
                     conn,
                     row,
-                    access_token,
-                    access_expires_at,
+                    access_token: renewed.access_token,
+                    access_expires_at: renewed.expires_at,
                 },
             ));
         }
-        let renewed = match self.renew(&mut conn, keyring, &row, request_id).await {
-            Ok(renewed) => renewed,
-            Err(Renewal::Refused) => {
-                revoke_browser_session(&mut conn, &id_hash)
-                    .await
-                    .map_err(store_error)?;
-                conn.commit().await.map_err(store_error)?;
-                tracing::info!(tenant_id = %tenant, "browser session renewal refused; session ended");
-                return Err(session_ended());
-            }
-            Err(Renewal::Failed(error)) => return Err(error),
-        };
-        let refresh = match &renewed.refresh_token {
-            Some(token) => Some((
-                seal(keyring, token.expose_secret())?,
-                refresh_expiry(token.expose_secret())?,
-            )),
-            None => None,
-        };
-        rotate_browser_session(
-            &mut conn,
-            &id_hash,
-            &seal(keyring, renewed.access_token.expose_secret())?,
-            renewed.expires_at,
-            refresh
-                .as_ref()
-                .map(|(sealed, expires_at)| (sealed.as_slice(), *expires_at)),
-        )
-        .await
-        .map_err(store_error)?;
-        Ok((
-            tenant,
-            CurrentSession {
-                conn,
-                row,
-                access_token: renewed.access_token,
-                access_expires_at: renewed.expires_at,
-            },
-        ))
     }
 
     /// Mint a successor access token for a locked session through the
@@ -784,5 +803,159 @@ mod tests {
             assert!(session_hash(&SecretString::from(bad)).is_err());
         }
         assert_ne!(random_hex_256(), id);
+    }
+}
+
+/// Postgres-backed browser-session lifecycle behavior.
+#[cfg(test)]
+mod pg_tests {
+    use chrono::{DateTime, Utc};
+    use secrecy::{ExposeSecret, SecretString};
+    use uuid::Uuid;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::ids::TenantSlug;
+    use wyrd_sql::queries::auth::revoke_api_key;
+
+    use crate::exchange_api_key::pg_tests::{
+        browser_sessions, insert_live_api_key, insert_test_service_account, insert_test_user,
+        test_service_card_ref,
+    };
+
+    /// The stored lifecycle columns a refused early renewal must leave as
+    /// they were: sealed access token, its expiry, revocation, and the
+    /// backing API key's last use.
+    type StoredState = (
+        Option<Vec<u8>>,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+        Option<DateTime<Utc>>,
+    );
+
+    /// Read the one stored session's lifecycle columns and its API key's
+    /// last use as the superuser, outside tenant RLS.
+    ///
+    /// # Panics
+    /// Panics when the superuser pool cannot open or the read fails.
+    async fn stored_state(fixture: &PgFixture, api_key_id: Uuid) -> StoredState {
+        sqlx::query_as(
+            "SELECT s.access_token_sealed, s.access_expires_at, s.revoked_at, k.last_used_at
+               FROM wyrd.auth_browser_sessions s, wyrd.auth_api_keys k
+              WHERE k.id = $1",
+        )
+        .bind(api_key_id)
+        .fetch_one(
+            &fixture
+                .superuser_pool()
+                .await
+                .expect("superuser pool opens"),
+        )
+        .await
+        .expect("stored session state reads")
+    }
+
+    /// Move the one stored session's access-token expiry to `offset` from
+    /// `PostgreSQL`'s clock.
+    ///
+    /// # Panics
+    /// Panics when the superuser pool cannot open or the update fails.
+    async fn set_access_expiry(fixture: &PgFixture, offset: &str) {
+        let updated = sqlx::query(
+            "UPDATE wyrd.auth_browser_sessions \
+             SET access_expires_at = statement_timestamp() + $1::interval",
+        )
+        .bind(offset)
+        .execute(
+            &fixture
+                .superuser_pool()
+                .await
+                .expect("superuser pool opens"),
+        )
+        .await
+        .expect("access expiry updates");
+        assert_eq!(updated.rows_affected(), 1);
+    }
+
+    /// A refused proactive renewal keeps the issued token until its stored
+    /// expiry and ends the session only on the first use after it.
+    ///
+    /// An API-key session is signed in, then its API key is revoked so
+    /// renewal is disallowed. With the stored token inside the renewal margin
+    /// but unexpired, `authority` must return that same token and leave the
+    /// sealed token, its expiry, the session's revocation, and the key's last
+    /// use exactly as stored. Once the token's expiry has passed, the next use must refuse
+    /// with the session-ended error and revoke the row.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot start, a seed or update fails, or any
+    /// assertion fails.
+    #[tokio::test]
+    async fn proactive_renewal_refusal_preserves_authority_until_expiry() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let route = TenantSlug::new(fixture.tenant_slug().to_owned()).expect("fixture slug");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user_id = insert_test_user(&mut conn, tenant).await;
+        let sa_id =
+            insert_test_service_account(&mut conn, tenant, user_id, &test_service_card_ref()).await;
+        let (api_key_id, api_key) = insert_live_api_key(&mut conn, tenant, sa_id, user_id).await;
+        conn.commit().await.expect("seed commits");
+
+        let sessions = browser_sessions(&fixture);
+        let created = sessions
+            .exchange_api_key(
+                &route,
+                &api_key,
+                &SecretString::from("ab".repeat(32)),
+                "req-sign-in",
+            )
+            .await
+            .expect("the live key signs in");
+        let issued = sessions
+            .authority(&created.session_id, "req-fresh")
+            .await
+            .expect("a fresh session yields its token");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        assert!(
+            revoke_api_key(&mut conn, api_key_id)
+                .await
+                .expect("api key revokes")
+        );
+        conn.commit().await.expect("key revocation commits");
+        set_access_expiry(&fixture, "30 seconds").await;
+        let before = stored_state(&fixture, api_key_id).await;
+
+        let early = sessions
+            .authority(&created.session_id, "req-early")
+            .await
+            .expect("a refused early renewal still serves the unexpired token");
+        assert_eq!(
+            early.access_token.expose_secret(),
+            issued.access_token.expose_secret(),
+            "the already-issued token is served, not a successor"
+        );
+        assert_eq!(early.access_expires_at, before.1);
+        sessions
+            .read(&created.session_id, "req-early-read")
+            .await
+            .expect("the session still reads before its token expires");
+        assert_eq!(
+            stored_state(&fixture, api_key_id).await,
+            before,
+            "no renewal, key-use, or revocation write commits before expiry"
+        );
+
+        set_access_expiry(&fixture, "-1 second").await;
+        let ended = sessions
+            .authority(&created.session_id, "req-expired")
+            .await
+            .expect_err("the first use after expiry is refused");
+        assert!(matches!(ended, WyrdError::InvalidToken { .. }), "{ended:?}");
+        let (sealed, _, revoked_at, _) = stored_state(&fixture, api_key_id).await;
+        assert!(
+            sealed.is_none() && revoked_at.is_some(),
+            "the refused post-expiry renewal revokes the session"
+        );
     }
 }

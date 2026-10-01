@@ -538,7 +538,7 @@ impl From<DelegateError> for WyrdError {
 }
 
 #[cfg(test)]
-mod pg_tests {
+pub(crate) mod pg_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -586,7 +586,7 @@ mod pg_tests {
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
 
     /// The default static Service Card reference, named `test-service`.
-    fn test_service_card_ref() -> CardRef {
+    pub(crate) fn test_service_card_ref() -> CardRef {
         named_service_card_ref("test-service")
     }
 
@@ -690,7 +690,15 @@ mod pg_tests {
         )
     }
 
-    async fn insert_test_user(conn: &mut TenantConn<'_>, tenant_id: DataTenantId) -> Uuid {
+    /// Seed one active password user in `tenant_id` and return its id, as the
+    /// creator other seeded rows name.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    pub(crate) async fn insert_test_user(
+        conn: &mut TenantConn<'_>,
+        tenant_id: DataTenantId,
+    ) -> Uuid {
         let user_id = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO wyrd.auth_users (id, data_tenant_id, email, auth_type, status)
@@ -705,7 +713,12 @@ mod pg_tests {
         user_id
     }
 
-    async fn insert_test_service_account(
+    /// Seed `card_ref`'s backing Card and one active service account bound to
+    /// it, returning the account id an API key can be issued to.
+    ///
+    /// # Panics
+    /// Panics when the Card or account insert fails.
+    pub(crate) async fn insert_test_service_account(
         conn: &mut TenantConn<'_>,
         tenant_id: DataTenantId,
         created_by: Uuid,
@@ -865,7 +878,7 @@ mod pg_tests {
     ///
     /// The row id is what a grant record must name, so the attribution tests
     /// need it rather than a fresh UUID.
-    async fn insert_live_api_key(
+    pub(crate) async fn insert_live_api_key(
         conn: &mut TenantConn<'_>,
         tenant: DataTenantId,
         principal_id: Uuid,
@@ -1333,7 +1346,7 @@ mod pg_tests {
     ///
     /// # Panics
     /// Panics when the static test public key or key id fails to load.
-    fn browser_sessions(fixture: &PgFixture) -> BrowserSessions {
+    pub(crate) fn browser_sessions(fixture: &PgFixture) -> BrowserSessions {
         let keyring = Arc::new(SealingKeyring::new(SecretKey::from_bytes([7_u8; 32])));
         BrowserSessions::new(
             fixture.wyrd_postgres().clone(),

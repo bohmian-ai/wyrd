@@ -7,7 +7,8 @@ use crate::auth::auth_not_configured;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Complete a login from the provider callback's `code` and `state`.
+/// Complete a login from the provider callback's `code`, `state`, and
+/// optional RFC 9207 `iss`.
 ///
 /// Builds the authorization-code exchange from the server's auth
 /// configuration and runs it. The tenant is recovered from the state alone;
@@ -21,6 +22,7 @@ pub async fn exchange_authorization_code(
     state: &AppState,
     code: SecretString,
     state_key: &str,
+    response_issuer: Option<&str>,
     request_id: &str,
 ) -> Result<LoginInitiation, WyrdErrorResponse> {
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
@@ -37,7 +39,7 @@ pub async fn exchange_authorization_code(
             .ok_or_else(auth_not_configured)?,
     };
     service
-        .execute(code, state_key, request_id)
+        .execute(code, state_key, response_issuer, request_id)
         .await
         .map_err(WyrdErrorResponse::from)
 }
@@ -183,6 +185,7 @@ mod pg_tests {
             &state,
             SecretString::from("code".to_owned()),
             "missing-state",
+            None,
             "req-missing-state",
         )
         .await
@@ -215,6 +218,7 @@ mod pg_tests {
             &state,
             SecretString::from("code".to_owned()),
             raw,
+            None,
             "req-consumed",
         )
         .await

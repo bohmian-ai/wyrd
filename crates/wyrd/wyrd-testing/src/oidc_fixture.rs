@@ -23,14 +23,17 @@ pub struct KeycloakAdmin {
     pub realm: String,
 }
 
-/// Result of a driven human login: the `code` and `state` query parameters
-/// delivered to the redirect URI.
+/// Result of a driven human login: the `code`, `state`, and optional RFC 9207
+/// `iss` query parameters delivered to the redirect URI.
 #[derive(Debug, Clone)]
 pub struct LoginResult {
     /// Authorization code returned by the IdP.
     pub code: String,
     /// State value echoed back from the authorization request.
     pub state: String,
+    /// RFC 9207 authorization-response issuer, when the IdP sent one; a
+    /// callback that binds the response issuer must forward it.
+    pub iss: Option<String>,
 }
 
 /// Connected OIDC provider fixture.
@@ -102,7 +105,8 @@ impl OidcIssuerFixture {
     /// 2. GETs it (without following redirects) to reach the Keycloak login page.
     /// 3. Parses the HTML form `action` URL.
     /// 4. POSTs the user credentials.
-    /// 5. Follows the 302 to `redirect_uri` and captures `code` and `state`.
+    /// 5. Follows the 302 to `redirect_uri` and captures `code`, `state`, and
+    ///    the RFC 9207 `iss` when present.
     ///
     /// Only works with Keycloak; panics if called against a non-Keycloak issuer.
     ///
@@ -211,10 +215,15 @@ impl OidcIssuerFixture {
             .find(|(k, _)| k == "state")
             .map(|(_, v)| v.into_owned())
             .expect("callback URL contains 'state' param");
+        let iss = callback_url
+            .query_pairs()
+            .find(|(k, _)| k == "iss")
+            .map(|(_, v)| v.into_owned());
 
         LoginResult {
             code,
             state: returned_state,
+            iss,
         }
     }
 

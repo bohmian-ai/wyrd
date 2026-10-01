@@ -286,7 +286,9 @@ terminal.</p></body></html>";
 ///
 /// Anonymous by construction: the caller is mid-login and has no Wyrd session
 /// yet. The opaque `state` generated at initiation is the only input that
-/// selects the tenant and connection; no header is consulted. On success the
+/// selects the tenant and connection; no header is consulted. The RFC 9207
+/// `iss` parameter, when sent, is forwarded so the exchange can bind the
+/// response to the login's issuer before any token request. On success the
 /// session is stored sealed for one-use redemption by the login's initiator,
 /// and the response carries neither a token nor the provider code: a browser
 /// login is redirected (`303`) to the fixed `{public_origin}/login/complete`
@@ -300,7 +302,10 @@ terminal.</p></body></html>";
     path = "/auth/callback",
     params(
         ("code" = String, Query, description = "Authorization code from the identity provider"),
-        ("state" = String, Query, description = "Opaque login state Wyrd generated at initiation")
+        ("state" = String, Query, description = "Opaque login state Wyrd generated at initiation"),
+        ("iss" = Option<String>, Query, description = "RFC 9207 authorization-response issuer; \
+          when present it must equal the login's issuer, and it is required when the \
+          provider's discovery advertises `authorization_response_iss_parameter_supported`")
     ),
     responses(
         (status = 200, description = "A CLI-initiated login completed; the browser shows a static \
@@ -312,8 +317,9 @@ terminal.</p></body></html>";
           (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match \
           (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no sealing key or public origin \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
-        (status = 401, description = "The code or ID token is not usable, or the login's \
-          connection changed (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 401, description = "The code or ID token is not usable, the response `iss` \
+          does not match the login's issuer or is missing while the provider advertises it, or \
+          the login's connection changed (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
         (status = 503, description = "The identity provider, auth backend, or audit path is \
           unavailable (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
           WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
@@ -341,6 +347,7 @@ async fn callback(
         &state,
         query.code.into_secret_string(),
         &query.state,
+        query.iss.as_deref(),
         req_id,
     )
     .await?;

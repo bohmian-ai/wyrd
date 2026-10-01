@@ -1236,6 +1236,9 @@ struct ProviderReturn {
     code: String,
     /// The state the provider echoed; it names the login-state row.
     state: String,
+    /// The RFC 9207 issuer the provider returned, forwarded to the callback
+    /// exactly as a browser following the redirect would.
+    iss: Option<String>,
     /// The browser flow binding the login was begun with.
     flow: Sha256Hex,
 }
@@ -1335,6 +1338,7 @@ async fn authorization_code_bound(
     ProviderReturn {
         code: login.code,
         state: login.state,
+        iss: login.iss,
         flow,
     }
 }
@@ -1375,8 +1379,9 @@ impl CallbackReply {
     }
 }
 
-/// Present `code` and `state` to `GET /auth/callback` with `host` as the
-/// request `Host`, and read the raw reply.
+/// Present `code`, `state`, and the RFC 9207 `iss` (when `Some`) to
+/// `GET /auth/callback` with `host` as the request `Host`, and read the raw
+/// reply.
 ///
 /// # Panics
 /// Panics when the request cannot be built or the router fails.
@@ -1384,16 +1389,34 @@ async fn callback_reply(
     srv: &WyrdTestServer,
     code: &str,
     state: &str,
+    iss: Option<&str>,
     host: &str,
 ) -> CallbackReply {
-    let code_encoded: String = url::form_urlencoded::byte_serialize(code.as_bytes()).collect();
-    let state_encoded: String = url::form_urlencoded::byte_serialize(state.as_bytes()).collect();
+    callback_reply_with(srv, &[("code", code), ("state", state)], iss, host).await
+}
+
+/// Present `params` plus the RFC 9207 `iss` (when `Some`) as the query of
+/// `GET /auth/callback` with `host` as the request `Host`, and read the raw
+/// reply; lets a journey add provider parameters Wyrd must tolerate.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn callback_reply_with(
+    srv: &WyrdTestServer,
+    params: &[(&str, &str)],
+    iss: Option<&str>,
+    host: &str,
+) -> CallbackReply {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.extend_pairs(params);
+    if let Some(iss) = iss {
+        query.append_pair("iss", iss);
+    }
+    let query = query.finish();
     let response = auth_call(srv, || {
         Request::builder()
             .method(Method::GET)
-            .uri(format!(
-                "/auth/callback?code={code_encoded}&state={state_encoded}"
-            ))
+            .uri(format!("/auth/callback?{query}"))
             .header(header::HOST, host)
             .body(Body::empty())
             .expect("callback request builds")
@@ -1415,10 +1438,15 @@ async fn callback_reply(
     }
 }
 
-/// Present `code` and `state` to the callback and return the status and
-/// problem body, for journeys asserting a refusal.
-async fn finish_callback(srv: &WyrdTestServer, code: &str, state: &str) -> (StatusCode, Value) {
-    let reply = callback_reply(srv, code, state, "test-tenant-1.wyrd.test").await;
+/// Present `code`, `state`, and the optional RFC 9207 `iss` to the callback
+/// and return the status and problem body, for journeys asserting a refusal.
+async fn finish_callback(
+    srv: &WyrdTestServer,
+    code: &str,
+    state: &str,
+    iss: Option<&str>,
+) -> (StatusCode, Value) {
+    let reply = callback_reply(srv, code, state, iss, "test-tenant-1.wyrd.test").await;
     (reply.status, reply.problem())
 }
 
@@ -1481,7 +1509,14 @@ async fn complete_login(
     tenant: DataTenantId,
     provider: &ProviderReturn,
 ) -> Value {
-    let reply = callback_reply(srv, &provider.code, &provider.state, "attacker.example.net").await;
+    let reply = callback_reply(
+        srv,
+        &provider.code,
+        &provider.state,
+        provider.iss.as_deref(),
+        "attacker.example.net",
+    )
+    .await;
     assert_browser_completion(&reply, &provider.code);
     let session = redeem(srv, tenant, &provider.flow)
         .await
@@ -3016,6 +3051,7 @@ async fn browser_session_sealing_rotation_journey() {
         &srv,
         &provider.code,
         &provider.state,
+        provider.iss.as_deref(),
         "attacker.example.net",
     )
     .await;
@@ -3439,7 +3475,12 @@ async fn tenant_connection_session_cutoff_journey() {
         hold.commit().await.expect("hold releases");
     };
     let ((status, body), ()) = tokio::join!(
-        finish_callback(&replica_a, &provider.code, &provider.state),
+        finish_callback(
+            &replica_a,
+            &provider.code,
+            &provider.state,
+            provider.iss.as_deref(),
+        ),
         release
     );
     assert_refused(
@@ -3634,17 +3675,34 @@ async fn mount_mock_provider_advertising(
     token_response: wiremock::ResponseTemplate,
     algorithms: &[&str],
 ) {
+    let discovery = mock_discovery(&server.uri(), algorithms);
+    mount_mock_provider_discovering(server, token_response, discovery).await;
+}
+
+/// The mock provider's discovery document at `issuer`, advertising
+/// `algorithms` and no RFC 9207 issuer-parameter support.
+fn mock_discovery(issuer: &str, algorithms: &[&str]) -> Value {
+    serde_json::json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/authorize"),
+        "token_endpoint": format!("{issuer}/token"),
+        "jwks_uri": format!("{issuer}/jwks"),
+        "id_token_signing_alg_values_supported": algorithms,
+    })
+}
+
+/// Reset `server`, then serve `discovery`, the mock JWKS, and
+/// `token_response` from the token endpoint; clearing recorded requests lets
+/// a journey count the token calls of exactly one callback.
+async fn mount_mock_provider_discovering(
+    server: &wiremock::MockServer,
+    token_response: wiremock::ResponseTemplate,
+    discovery: Value,
+) {
     server.reset().await;
-    let issuer = server.uri();
     Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "issuer": issuer,
-            "authorization_endpoint": format!("{issuer}/authorize"),
-            "token_endpoint": format!("{issuer}/token"),
-            "jwks_uri": format!("{issuer}/jwks"),
-            "id_token_signing_alg_values_supported": algorithms,
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
         .mount(server)
         .await;
     Mock::given(method("GET"))
@@ -3786,15 +3844,26 @@ async fn tenant_callback_refusal_journey() {
 
     // 1. Wrong, unknown, replayed, and expired state.
     let provider = sign_in().await;
-    let (status, body) =
-        finish_callback(&srv, &provider.code, &format!("{}x", provider.state)).await;
+    let (status, body) = finish_callback(
+        &srv,
+        &provider.code,
+        &format!("{}x", provider.state),
+        provider.iss.as_deref(),
+    )
+    .await;
     assert_refused(
         status,
         &body,
         StatusCode::BAD_REQUEST,
         "WYRD_AUTH_400_INVALID_STATE",
     );
-    let (status, body) = finish_callback(&srv, &provider.code, "never-issued").await;
+    let (status, body) = finish_callback(
+        &srv,
+        &provider.code,
+        "never-issued",
+        provider.iss.as_deref(),
+    )
+    .await;
     assert_refused(
         status,
         &body,
@@ -3803,7 +3872,13 @@ async fn tenant_callback_refusal_journey() {
     );
     let session = complete_login(&srv, tenant_a, &provider).await;
     let alice = principal_id_of(session["access_token"].as_str().expect("access token"));
-    let (status, body) = finish_callback(&srv, &provider.code, &provider.state).await;
+    let (status, body) = finish_callback(
+        &srv,
+        &provider.code,
+        &provider.state,
+        provider.iss.as_deref(),
+    )
+    .await;
     assert_refused(
         status,
         &body,
@@ -3819,7 +3894,13 @@ async fn tenant_callback_refusal_journey() {
     .execute(&superuser)
     .await
     .expect("state expires");
-    let (status, body) = finish_callback(&srv, &expiring.code, &expiring.state).await;
+    let (status, body) = finish_callback(
+        &srv,
+        &expiring.code,
+        &expiring.state,
+        expiring.iss.as_deref(),
+    )
+    .await;
     assert_refused(
         status,
         &body,
@@ -3910,7 +3991,14 @@ async fn tenant_callback_refusal_journey() {
         "alice-password",
     )
     .await;
-    let reply = callback_reply(&srv, &in_b.code, &in_b.state, "test-tenant-1.wyrd.test").await;
+    let reply = callback_reply(
+        &srv,
+        &in_b.code,
+        &in_b.state,
+        in_b.iss.as_deref(),
+        "test-tenant-1.wyrd.test",
+    )
+    .await;
     assert_browser_completion(&reply, &in_b.code);
     assert!(
         redeem(&srv, tenant_a, &in_b.flow).await.is_err(),
@@ -4045,7 +4133,7 @@ async fn tenant_callback_refusal_journey() {
         mount_mock_provider(&mock, id_token_reply("unused")).await;
         let (flow, state, nonce) = begin_mock_login(&srv, "test-tenant-3").await;
         mount_mock_provider(&mock, reply_for(&nonce)).await;
-        let (status, body) = finish_callback(&srv, "mock-code", &state).await;
+        let (status, body) = finish_callback(&srv, "mock-code", &state, None).await;
         assert_eq!(status, *expected, "{label}: {body}");
         assert_eq!(response_code(&body), *code, "{label}: {body}");
         assert!(
@@ -4075,7 +4163,7 @@ async fn tenant_callback_refusal_journey() {
             None => sign_id_token(header, &claims(&nonce), MOCK_SIGNING_KEY),
         };
         mount_mock_provider_advertising(&mock, id_token_reply(&id_token), advertised).await;
-        let (status, body) = finish_callback(&srv, "mock-code", &state).await;
+        let (status, body) = finish_callback(&srv, "mock-code", &state, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{label}: {body}");
         assert_eq!(
             response_code(&body),
@@ -4114,7 +4202,7 @@ async fn tenant_callback_refusal_journey() {
         id_token_reply(&sign_id_token(&eddsa, &with_azp, MOCK_SIGNING_KEY)),
     )
     .await;
-    let reply = callback_reply(&srv, "mock-code", &state, "test-tenant-1.wyrd.test").await;
+    let reply = callback_reply(&srv, "mock-code", &state, None, "test-tenant-1.wyrd.test").await;
     assert_browser_completion(&reply, "mock-code");
     redeem(&srv, tenant_c, &flow)
         .await
@@ -4145,7 +4233,8 @@ async fn tenant_callback_refusal_journey() {
     .execute(&superuser)
     .await
     .expect("failure trigger installs");
-    let (status, body) = finish_callback(&srv, &failing.code, &failing.state).await;
+    let (status, body) =
+        finish_callback(&srv, &failing.code, &failing.state, failing.iss.as_deref()).await;
     sqlx::query("DROP TRIGGER test_fail_login_audit ON vala.audit_staging")
         .execute(&superuser)
         .await
@@ -4163,6 +4252,222 @@ async fn tenant_callback_refusal_journey() {
         before,
         "the failed login inserted no refresh row"
     );
+
+    srv.shutdown().await.expect("server shuts down");
+}
+
+/// Serve a mock provider that passes every candidate probe under
+/// `discovery`: the mock JWKS, a `prompt=none` redirect to the common
+/// callback echoing the probe's state, and `invalid_grant` for the probe's
+/// invalid code.
+async fn mount_probe_passing_provider(server: &wiremock::MockServer, discovery: Value) {
+    mount_mock_provider_discovering(
+        server,
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({ "error": "invalid_grant" })),
+        discovery,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/authorize"))
+        .respond_with(|request: &wiremock::Request| {
+            let state = request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
+            let mut location: Url = format!("{PUBLIC_ORIGIN}/auth/callback")
+                .parse()
+                .expect("callback parses");
+            location
+                .query_pairs_mut()
+                .append_pair("state", &state)
+                .append_pair("error", "login_required");
+            ResponseTemplate::new(302).insert_header("location", location.as_str())
+        })
+        .mount(server)
+        .await;
+}
+
+/// Token-endpoint requests `server` recorded since its last reset.
+///
+/// # Panics
+/// Panics when the mock does not record requests.
+async fn token_calls(server: &wiremock::MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("the mock records requests")
+        .iter()
+        .filter(|request| request.method == Method::POST && request.url.path() == "/token")
+        .count()
+}
+
+/// The common callback binds every authorization response to the issuer its
+/// login state recorded (RFC 9207), provider-agnostically:
+///   1. a provider whose discovery does not advertise
+///      `authorization_response_iss_parameter_supported` is tested and
+///      activated through the served connection API;
+///   2. against it, a response without `iss`, with the login's exact `iss`,
+///      and with an unrelated `session_state` parameter each complete;
+///   3. a response whose `iss` names another issuer — including a
+///      trailing-slash variant of the login's issuer — is refused
+///      `401 INVALID_TOKEN` and audited as a denied exchange, with no
+///      token-endpoint request and no completion;
+///   4. once the provider advertises support, a response without `iss` is
+///      refused the same way, and one with the exact `iss` completes.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "runs in the identity journey lane"]
+async fn tenant_callback_issuer_binding_journey() {
+    let srv = human_server_builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = srv.data_tenant_id();
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let mock = wiremock::MockServer::start().await;
+    let issuer = mock.uri();
+    let silent = mock_discovery(&issuer, &["EdDSA"]);
+    let mut advertising = silent.clone();
+    advertising["authorization_response_iss_parameter_supported"] = Value::Bool(true);
+
+    // 1. A provider that does not advertise issuer support is tested and
+    //    activated.
+    mount_probe_passing_provider(&mock, silent.clone()).await;
+    let admin = tenant_admin(&srv, tenant, "issuer-binding-admin").await;
+    activate_connection(
+        &srv,
+        &admin,
+        serde_json::json!({
+            "issuer": issuer,
+            "client_id": MOCK_CLIENT_ID,
+            "client_auth": "Public",
+            "claim_mapping": { "subject": "sub" },
+        }),
+    )
+    .await;
+
+    let mut eddsa = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+    eddsa.kid = Some("mock-1".to_owned());
+    let id_token_for = |nonce: &str| {
+        let now = chrono::Utc::now();
+        id_token_reply(&sign_id_token(
+            &eddsa,
+            &serde_json::json!({
+                "sub": "issuer-binding-user",
+                "iss": issuer,
+                "aud": MOCK_CLIENT_ID,
+                "exp": (now + ChronoDuration::hours(1)).timestamp(),
+                "iat": now.timestamp(),
+                "nonce": nonce,
+            }),
+            MOCK_SIGNING_KEY,
+        ))
+    };
+    let denied = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.audit_staging \
+              WHERE data_tenant_id = $1 AND operation = 'auth.token.exchange' \
+                AND outcome = 'denied'",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(&superuser)
+        .await
+        .expect("denied exchanges read")
+    };
+    let wrong_slash = format!("{issuer}/");
+    // (label, discovery, extra params, iss, completes)
+    let cases: Vec<(&str, &Value, &[(&str, &str)], Option<&str>, bool)> = vec![
+        ("unadvertised, no iss", &silent, &[], None, true),
+        ("unadvertised, exact iss", &silent, &[], Some(&issuer), true),
+        (
+            "unadvertised, unrelated session_state",
+            &silent,
+            &[("session_state", "provider-session")],
+            Some(&issuer),
+            true,
+        ),
+        (
+            "unadvertised, foreign iss",
+            &silent,
+            &[],
+            Some("https://evil.example.com"),
+            false,
+        ),
+        (
+            "unadvertised, trailing-slash iss",
+            &silent,
+            &[],
+            Some(&wrong_slash),
+            false,
+        ),
+        ("advertised, no iss", &advertising, &[], None, false),
+        (
+            "advertised, foreign iss",
+            &advertising,
+            &[],
+            Some("https://evil.example.com"),
+            false,
+        ),
+        (
+            "advertised, exact iss",
+            &advertising,
+            &[],
+            Some(&issuer),
+            true,
+        ),
+    ];
+    for (label, discovery, extra, iss, completes) in cases {
+        mount_mock_provider_discovering(&mock, id_token_reply("unused"), discovery.clone()).await;
+        let (flow, state, nonce) = begin_mock_login(&srv, FIXTURE_TENANT_SLUG).await;
+        mount_mock_provider_discovering(&mock, id_token_for(&nonce), discovery.clone()).await;
+        let denied_before = denied().await;
+        let mut params = vec![("code", "mock-code"), ("state", state.as_str())];
+        params.extend_from_slice(extra);
+        let reply = callback_reply_with(&srv, &params, iss, "test-tenant-1.wyrd.test").await;
+        if completes {
+            assert_browser_completion(&reply, "mock-code");
+            assert_eq!(token_calls(&mock).await, 1, "{label}: one code exchange");
+            redeem(&srv, tenant, &flow)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: the completion redeems: {error}"));
+        } else {
+            assert_refused(
+                reply.status,
+                &reply.problem(),
+                StatusCode::UNAUTHORIZED,
+                "WYRD_AUTH_401_INVALID_TOKEN",
+            );
+            assert_eq!(
+                token_calls(&mock).await,
+                0,
+                "{label}: the code never reaches a token endpoint"
+            );
+            assert_eq!(
+                denied().await,
+                denied_before + 1,
+                "{label}: refusal audited"
+            );
+            assert!(
+                redeem(&srv, tenant, &flow).await.is_err(),
+                "{label}: no completion is stored"
+            );
+            let (status, body) = finish_callback(&srv, "mock-code", &state, iss).await;
+            assert_refused(
+                status,
+                &body,
+                StatusCode::BAD_REQUEST,
+                "WYRD_AUTH_400_INVALID_STATE",
+            );
+        }
+    }
 
     srv.shutdown().await.expect("server shuts down");
 }

@@ -207,7 +207,10 @@ impl PyRun {
         let _ = slf.py().import("wyrd.otel").and_then(|otel| {
             otel.call_method1(
                 "_enter_run",
-                (run.inner.card_ref().to_string(), run.inner.run_id().as_str()),
+                (
+                    run.inner.card_ref().to_string(),
+                    run.inner.run_id().as_str(),
+                ),
             )
         });
         slf

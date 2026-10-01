@@ -542,7 +542,11 @@ async fn scoped_run_emits_drift_eval_and_generic_rows() {
     let model = run.for_card("model").expect("model view resolves");
     let agent = run.for_card("agent").expect("agent view resolves");
     assert_eq!(model.run_id().as_str(), run_id, "one invocation, two views");
-    assert_eq!(run.card_ref(), state.root_ref(), "no Card argument targets the root");
+    assert_eq!(
+        run.card_ref(),
+        state.root_ref(),
+        "no Card argument targets the root"
+    );
     let agent_run = state
         .run_for_card("agent")
         .expect("the single-Card form resolves");

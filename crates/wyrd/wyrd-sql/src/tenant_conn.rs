@@ -120,11 +120,8 @@ async fn begin_bound(
 #[cfg(test)]
 mod tests {
     use super::{
-        BIND_CURRENT_TENANT_SQL, CURRENT_TENANT_GUC, TenantConn, begin_bound, begin_tenant_sql,
-        tenant_binding_value,
+        BIND_CURRENT_TENANT_SQL, CURRENT_TENANT_GUC, begin_tenant_sql, tenant_binding_value,
     };
-    use crate::SqlError;
-    use sqlx::postgres::PgPoolOptions;
     use wyrd_spec::DataTenantId;
 
     #[test]
@@ -159,18 +156,26 @@ mod tests {
             format!("SELECT set_config('app.current_tenant', '{data_tenant_id}', true); BEGIN")
         );
     }
+}
+
+/// Postgres-backed tenant transaction tests, skipped by the fast lanes.
+#[cfg(test)]
+mod pg_tests {
+    use super::{TenantConn, begin_bound};
+    use crate::SqlError;
+    use sqlx::postgres::PgPoolOptions;
+    use wyrd_spec::DataTenantId;
 
     /// A failed begin-and-bind leaves no transaction behind: on a one-connection
     /// pool, the same connection then opens a tenant transaction whose binding
     /// is visible inside it and gone after commit.
     ///
-    /// Skipped when `WYRD_DATABASE_URL` is unset so the fast lane stays
-    /// credential-free; `mise run test:sql` supplies it.
+    /// # Panics
+    /// Panics when `WYRD_DATABASE_URL` is unset (`mise run test:sql` sets it)
+    /// or when any step of the transaction round trip fails.
     #[tokio::test]
     async fn failed_bind_rolls_back_and_the_connection_stays_usable() {
-        let Ok(url) = std::env::var("WYRD_DATABASE_URL") else {
-            return;
-        };
+        let url = std::env::var("WYRD_DATABASE_URL").expect("test:sql sets WYRD_DATABASE_URL");
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&url)

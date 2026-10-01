@@ -826,12 +826,10 @@ struct ResourceState {
     oracle_query_memory_used_bytes: usize,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
-    memory_epoch: u64,
     /// Advances only when Oracle slot units return to the ledger.
     ///
-    /// Oracle admission refuses on slots alone, so its waiters
-    /// follow this epoch rather than `memory_epoch`, which also moves on every
-    /// query-memory grow and shrink and would wake the whole queue per batch.
+    /// Oracle admission refuses on slots alone, so its waiters follow this
+    /// epoch and are not woken by query-memory grows and shrinks.
     oracle_capacity_epoch: u64,
     poisoned: bool,
 }
@@ -1490,28 +1488,6 @@ impl ScribeResources {
         .map_err(scribe_resource_error)
     }
 
-    /// Captures the current root capacity epoch before an admission attempt.
-    #[must_use]
-    pub fn memory_epoch(&self) -> u64 {
-        self.governor.memory_epoch()
-    }
-
-    /// Waits until release, resize, or poison advances the root capacity epoch.
-    ///
-    /// Waiting never grants bytes. The caller must retry root admission after
-    /// every successful wake.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostResourceError::Poisoned`] when root accounting becomes
-    /// untrustworthy before or during the wait.
-    pub async fn wait_for_memory_change(
-        &self,
-        observed_epoch: u64,
-    ) -> Result<u64, BifrostResourceError> {
-        self.governor.wait_for_memory_change(observed_epoch).await
-    }
-
     /// Captures the authoritative root Scribe projection.
     pub fn snapshot(&self) -> Result<ResourceSnapshot, BifrostResourceError> {
         self.governor.snapshot()
@@ -1967,8 +1943,6 @@ struct ResourceGovernorInner {
     oracle_class_split: OnceLock<OracleClassSplit>,
     sources: ResolvedResourceSources,
     state: Mutex<ResourceState>,
-    /// Lost-wakeup-safe notification paired with `ResourceState::memory_epoch`.
-    memory_changed: Notify,
     /// Lost-wakeup-safe notification paired with `ResourceState::oracle_capacity_epoch`.
     oracle_capacity_changed: Notify,
     /// Cgroup that bounds this process's memory, read by the live
@@ -2133,7 +2107,6 @@ impl BifrostResourceGovernor {
                 },
                 oracle_class_split: OnceLock::new(),
                 state: Mutex::new(ResourceState::default()),
-                memory_changed: Notify::new(),
                 oracle_capacity_changed: Notify::new(),
                 memory_cgroup: MemoryCgroup::detect(),
                 cgroup_current: Mutex::new(None),
@@ -2287,7 +2260,6 @@ impl BifrostResourceGovernor {
             self.inner
                 .health
                 .poison(BifrostResourcePoisonReason::Accounting);
-            self.inner.memory_changed.notify_waiters();
             self.notify_oracle_capacity();
             return Err(BifrostResourceError::Poisoned {
                 detail: "Scribe root attribution does not reconcile to live ownership".to_owned(),
@@ -2388,33 +2360,6 @@ impl BifrostResourceGovernor {
             shard: request.shard,
             released: false,
         })
-    }
-
-    /// Returns the current capacity-change epoch from the authoritative lock.
-    fn memory_epoch(&self) -> u64 {
-        self.inner
-            .state
-            .lock()
-            .map_or(u64::MAX, |state| state.memory_epoch)
-    }
-
-    /// Waits for a strictly newer epoch without granting capacity.
-    ///
-    /// # Errors
-    ///
-    /// Returns a poison error when the root becomes untrustworthy.
-    async fn wait_for_memory_change(
-        &self,
-        observed_epoch: u64,
-    ) -> Result<u64, BifrostResourceError> {
-        loop {
-            let notified = self.inner.memory_changed.notified();
-            let current_epoch = { self.lock_state()?.memory_epoch };
-            if current_epoch > observed_epoch {
-                return Ok(current_epoch);
-            }
-            notified.await;
-        }
     }
 
     /// Returns the Oracle slot-and-scratch epoch from the authoritative lock.
@@ -2642,9 +2587,7 @@ impl BifrostResourceGovernor {
         Ok(())
     }
 
-    /// Returns `bytes` held by `holder` and advances the memory epoch.
-    ///
-    /// The caller wakes memory waiters after dropping the lock.
+    /// Returns `bytes` held by `holder`.
     ///
     /// # Errors
     ///
@@ -2660,7 +2603,6 @@ impl BifrostResourceGovernor {
             return Err(self.poison_locked(state, "shared memory release underflow"));
         };
         state.held_bytes[holder as usize] = next;
-        state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition(holder.label(), "released", next);
         Ok(())
     }
@@ -2779,8 +2721,6 @@ impl BifrostResourceGovernor {
             state.oracle_query_memory_used_bytes -= charge.governed_bytes;
             record_oracle_memory(&state);
         }
-        drop(state);
-        self.inner.memory_changed.notify_waiters();
         Ok(())
     }
 
@@ -2796,7 +2736,7 @@ impl BifrostResourceGovernor {
         self.charge_locked(&mut state, MemoryHolder::Transport, bytes)
     }
 
-    /// Returns exact transport-body bytes and wakes memory waiters.
+    /// Returns exact transport-body bytes to the shared cap.
     ///
     /// # Errors
     ///
@@ -2805,8 +2745,6 @@ impl BifrostResourceGovernor {
     pub(crate) fn release_transport(&self, bytes: usize) -> Result<(), BifrostResourceError> {
         let mut state = self.lock_state()?;
         self.release_locked(&mut state, MemoryHolder::Transport, bytes)?;
-        drop(state);
-        self.inner.memory_changed.notify_waiters();
         Ok(())
     }
 
@@ -2843,11 +2781,9 @@ impl BifrostResourceGovernor {
         // originating imbalance has been lost before.
         tracing::error!(detail, "Bifrost resource accounting failed to reconcile");
         state.poisoned = true;
-        state.memory_epoch = state.memory_epoch.wrapping_add(1);
         self.inner
             .health
             .poison(BifrostResourcePoisonReason::Accounting);
-        self.inner.memory_changed.notify_waiters();
         self.notify_oracle_capacity();
         BifrostResourceError::Poisoned {
             detail: detail.to_owned(),
@@ -2864,8 +2800,6 @@ impl BifrostResourceGovernor {
         self.inner.health.poison(reason);
         if let Ok(mut state) = self.inner.state.lock() {
             state.poisoned = true;
-            state.memory_epoch = state.memory_epoch.wrapping_add(1);
-            self.inner.memory_changed.notify_waiters();
             self.notify_oracle_capacity();
             tracing::error!(detail, "Bifrost resource accounting poisoned");
         } else {
@@ -2980,9 +2914,6 @@ impl ScribeMemoryLease {
             self.shrink_locked(&mut state, self.bytes - bytes)?;
         }
         self.bytes = bytes;
-        state.memory_epoch = state.memory_epoch.wrapping_add(1);
-        drop(state);
-        self.root.inner.memory_changed.notify_waiters();
         Ok(())
     }
 
@@ -3307,8 +3238,6 @@ impl ScribeMemoryLease {
             }
         }
         self.released = true;
-        drop(state);
-        self.root.inner.memory_changed.notify_waiters();
         Ok(())
     }
 }
@@ -3762,8 +3691,6 @@ impl OracleMemoryLease {
             .release_locked(&mut state, MemoryHolder::Oracle, self.bytes)?;
         record_oracle_capacity(&state, &plan, self.governor.oracle_class_split());
         self.released = true;
-        drop(state);
-        self.governor.inner.memory_changed.notify_waiters();
         Ok(())
     }
 }
@@ -3918,7 +3845,6 @@ impl OracleQueryResources {
             QueryClass::Interactive => state.oracle_interactive_queries -= 1,
             QueryClass::Analytical => state.oracle_analytical_queries -= 1,
         }
-        state.memory_epoch = state.memory_epoch.wrapping_add(1);
         BifrostResourceGovernor::advance_oracle_capacity(&mut state);
         record_memory_transition("oracle", "released", state.held(MemoryHolder::Oracle));
         record_oracle_capacity(
@@ -3933,7 +3859,6 @@ impl OracleQueryResources {
         // so it must not run under the state lock above; and the wake below is
         // what reconsiders queued work, so the charge must already be free.
         drop(self.admission_charge.take());
-        self.governor.inner.memory_changed.notify_waiters();
         self.governor.notify_oracle_capacity();
         Ok(())
     }
@@ -5878,40 +5803,6 @@ mod tests {
                 .scribe_memory_used_bytes,
             0
         );
-    }
-
-    /// Epoch waiting observes a release that occurs before waiter registration.
-    #[tokio::test]
-    async fn accepted_replay_capacity_wait_is_bounded_and_cancellation_safe() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            768 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Scribe, BifrostRole::Oracle],
-        );
-        let scribe = roles.scribe().expect("Scribe capability");
-        let owner = scribe
-            .try_acquire_memory(ScribeMemoryRequest {
-                bytes: 1,
-                category: crate::scribe::memory::MemoryCategory::Raw,
-                shard: Some(0),
-            })
-            .expect("root admission");
-        let observed = scribe.memory_epoch();
-        let cancelled = {
-            let scribe = scribe.clone();
-            tokio::spawn(async move { scribe.wait_for_memory_change(observed).await })
-        };
-        cancelled.abort();
-        assert!(
-            cancelled.await.is_err(),
-            "cancelled replay waiter owns no lease"
-        );
-        drop(owner);
-        let advanced = scribe
-            .wait_for_memory_change(observed)
-            .await
-            .expect("release advances the epoch");
-        assert!(advanced > observed);
     }
 
     /// The Scribe follower execution is shaped only by this node's own plan.

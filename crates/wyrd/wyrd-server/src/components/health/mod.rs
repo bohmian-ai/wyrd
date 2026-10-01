@@ -84,8 +84,9 @@ pub struct ReadinessSnapshot {
     pub verification: Option<ProbeOutcome>,
     /// Whether a Scribe WAL fault is role-local rather than target-fatal.
     ///
-    /// True when this target serves another role (Oracle, Forge, or
-    /// verification) that stays available while Scribe is withdrawn. Startup
+    /// True when this target also serves Oracle or Forge, which stay available
+    /// while Scribe is withdrawn. The verification runtime does not count: it
+    /// is composed on every API target, including a Scribe-only one. Startup
     /// recovery still gates every target, so replay finishes before ready.
     #[serde(skip)]
     pub scribe_fault_is_role_local: bool,
@@ -193,8 +194,7 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
         forge_worker: probe_forge_worker(state),
         verification: probe_verification(state),
         scribe_fault_is_role_local: state.bifrost.oracle().is_some()
-            || state.bifrost.forge().is_some()
-            || state.verification.is_composed(),
+            || state.bifrost.forge().is_some(),
     }
 }
 
@@ -738,5 +738,29 @@ mod pg_tests {
 
         let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
         assert!(result.is_ok(), "readiness_loop did not exit after cancel");
+    }
+
+    /// A Scribe-only target stays unready on a WAL fault even though the
+    /// verification runtime is composed on it: only Oracle or Forge make the
+    /// fault role-local.
+    #[tokio::test]
+    async fn scribe_only_wal_fault_is_unready_with_verification_composed() {
+        use crate::verification::health::RuntimeCapability;
+
+        let state = crate::test_support::test_app_state(
+            crate::test_support::test_server_postgres().await,
+            crate::test_support::test_storage().await,
+            crate::test_support::test_catalog().await,
+        );
+        state.verification.require(RuntimeCapability::Scheduler);
+
+        let mut snapshot = compute_snapshot(&state, Duration::from_millis(100)).await;
+        assert!(!snapshot.scribe_fault_is_role_local);
+        snapshot.scribe = ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::ScribeWalFaulted,
+            elapsed_ms: 0,
+        };
+        assert!(!snapshot.all_ok());
     }
 }

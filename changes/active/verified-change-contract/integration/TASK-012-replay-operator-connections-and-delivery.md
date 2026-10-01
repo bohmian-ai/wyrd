@@ -288,6 +288,16 @@ Integrated candidate: the commit that records this evidence.
     - follower activation (single-use envelope; rollback never restores a closed grant).
     `PENDING_TTL`, `ReleaseSlots`, and retained-release expiry are deleted. `STAGE_PROTOCOL_VERSION` 1→2 refuses mixed peers.
   - **Proof:** held grants appear in `OracleRuntimeInspection` and the ownership snapshot. `peer_network::security::peer_context_refusals` now includes the abandoned-grant journey (admit, drop, follower back to baseline including spill directories within 5 s against a 30 s deadline). The capacity journey passes.
+- **Merge of `main` (Forge takeover race):**
+  - **Symptom:** the gate on the merge went red in one test, `forge::compaction_admission::multi_plan_success_counts_all_committed_volume_once`. Its final pass never settled: task `ae3c` stayed `running` and operation `b066` stayed `prepared` past the 60 s `ADMISSION_BOUND`. The test passes alone.
+  - **Evidence:**
+    - In the gate trace, the takeover worker released an attempt for table-wide takeover and was then stopped. In the passing trace, the stop instead hit the new attempt before its commit (`Forge scheduler was shut down`).
+    - `worker.rs` `release_unresolved_attempt` leaves the task `Running` until its claim lapses.
+    - `forge_tasks.rs` reclaims only once `claim_expires_at < statement_timestamp()`, and `lease_ttl` defaults to 15 min.
+  - **Cause:** the takeover phase waited only for the sibling's `recovered` phase before `stop_worker()`. That raced the same attempt's own new rewrite. When the stop landed after that rewrite was submitted, the task was released for a takeover the final pass never runs.
+  - **Fix site:** the test only. It now holds the takeover at `hold_after_next_rewrite_settlement_for_test` (after reconciliation, before planning), then cancels and releases, matching the existing landed-replacement test. No production change. The other phase-then-stop callers were checked and need no change (the page-bounded takeover asserts only captured operations; `consumed_by_recovered_compaction` schedules nothing new).
+  - **Diagnosis:** a separate read-only diagnostician gave the same cause.
+  - **Verification:** focused test 2/2; `mise run test:vala` 1172/1172.
 - **Generated docs drift:** the schema inventory and `llms-full.txt` were
   regenerated for Operator connections and Gateway (`f2cb96efd`).
 

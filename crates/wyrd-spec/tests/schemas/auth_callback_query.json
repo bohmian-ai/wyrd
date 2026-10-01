@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CallbackQuery",
-  "description": "`GET /auth/callback` query: the provider's redirect back to the common callback. It carries no tenant selector.\n\nOther provider response parameters (Keycloak's `session_state`, RFC 9207 `iss`) are ignored, as RFC 6749 §4.1.2 requires of the client; only `code` and `state` are read.",
+  "description": "`GET /auth/callback` query: the provider's redirect back to the common callback. It carries no tenant selector.\n\n`code` and `state` are required. The RFC 9207 `iss` response parameter is retained when present so the callback can bind the response to the issuer the login state recorded before any token-endpoint request. Other provider response parameters (Keycloak's `session_state`) are ignored, as RFC 6749 §4.1.2 requires of the client.",
   "type": "object",
   "required": [
     "code",
@@ -14,6 +14,13 @@
         {
           "$ref": "#/definitions/SecretBearer"
         }
+      ]
+    },
+    "iss": {
+      "description": "RFC 9207 authorization-response issuer identifier, when the provider sends one. It must equal the login's recorded issuer exactly.",
+      "type": [
+        "string",
+        "null"
       ]
     },
     "state": {

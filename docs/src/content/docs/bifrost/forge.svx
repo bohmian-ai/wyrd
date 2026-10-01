@@ -291,7 +291,7 @@ must be read with `max`, never summed.
 | `bifrost_forge_pending_tasks` | gauge | `task_type` | After a complete fenced planning pass | All five types always exported; zero means an empty queue | Coordinator-owned |
 | `bifrost_forge_oldest_pending_task_timestamp_seconds` | gauge | `task_type` | After a complete fenced planning pass | All five types always exported; zero means nothing is pending | Coordinator-owned |
 | `bifrost_forge_active_tasks` | gauge | `task_type` | Incremented on a successful claim, decremented when the attempt's guard drops | All five types always exported; a non-zero steady state is a leak | Process-local |
-| `bifrost_forge_task_attempts_total` | counter | `task_type`, `result` | Once the settled durable state is read back | Absent until an attempt of that pair settles | Process-local |
+| `bifrost_forge_task_attempts_total` | counter | `task_type`, `result` | From the result the worker's settlement transaction committed; the durable row is read back only when that outcome is unknown to the worker (slot-fatal error, a release that matched no row, or a claim retained after an effect) | Absent until an attempt of that pair settles | Process-local |
 | `bifrost_forge_task_duration_seconds` | histogram | `task_type`, `result` | With the attempt counter; measures claim through durable result | Absent until an attempt of that pair settles; excludes queue time | Process-local |
 | `bifrost_forge_task_failures_total` | counter | `task_type`, `reason` | After the retry, refusal, or terminal-failure transaction commits | Absent until such a failure settles | Process-local |
 | `bifrost_forge_input_files_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect consumes files | Process-local |

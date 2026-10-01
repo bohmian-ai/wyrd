@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 kind: implementation
-status: ready
+status: approved
 spec: SPEC-oidc-production-readiness
 spec_revision: 4
 requirements: [REQ-006, REQ-007, REQ-008, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, INV-001, INV-002, INV-003, INV-004, AC-002, AC-003, AC-005, AC-006, AC-007]

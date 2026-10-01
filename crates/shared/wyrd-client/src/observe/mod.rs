@@ -49,7 +49,9 @@ pub struct Run {
     state: WyrdState,
     /// The invocation identity every observation of every view correlates to.
     run_id: RunId,
-    /// The exact Card this view observes; the root Service until `for_card`.
+    /// The exact Card this view observes: the root Service for
+    /// `WyrdState::run`, the initially selected Card for
+    /// `WyrdState::run_for_card`, or the selected sibling for `for_card`.
     subject: CardRef,
 }
 

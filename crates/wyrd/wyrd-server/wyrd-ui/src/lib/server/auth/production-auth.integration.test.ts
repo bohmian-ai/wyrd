@@ -25,6 +25,8 @@ const keycloakIssuer =
   process.env.WYRD_KEYCLOAK_ISSUER ?? 'http://localhost:18080/realms/wyrd-test';
 const jwt = /eyJ[\w-]+\.[\w-]+\./;
 const sessionCookie = (tenant: string) => `wyrd_session_${tenant}`;
+/** Each journey drives many real logins, key verifications, and renewals. */
+const journeyTimeout = 60_000;
 
 /**
  * One browser behind a load balancer: a host-only cookie jar for the public
@@ -305,7 +307,7 @@ test('production SSO crosses replicas', async () => {
     expect((await browser.go(0, `/t/${sso}`)).headers.get('location')).toBe(`/t/${sso}/login`);
     expect(browser.cookies.has(sessionCookie(sso))).toBe(false);
   }
-});
+}, journeyTimeout);
 
 test('OIDC-off credential UI', async () => {
   const tenant = journey.apiKeyTenant;
@@ -370,4 +372,4 @@ test('OIDC-off credential UI', async () => {
   const stagedPage = await (await browser.go(1, settings)).text();
   expect(stagedPage).toContain('wyrd-human');
   expect(stagedPage).not.toContain(journey.offAdminKey);
-});
+}, journeyTimeout);

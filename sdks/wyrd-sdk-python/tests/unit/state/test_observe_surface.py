@@ -6,8 +6,8 @@ belongs to the gated journey lanes, not here.
 """
 
 import asyncio
-import contextvars
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,7 @@ from uuid import UUID
 
 import pytest
 import wyrd
+import wyrd.otel
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -398,31 +399,130 @@ def test_missing_opentelemetry_is_a_no_op(tmp_path: Path, monkeypatch: pytest.Mo
     assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
 
 
-def test_enrichment_and_detach_failures_never_escape(
+def _drift_reaches_the_ordinary_boundary(run: Run) -> None:
+    """Emit one explicit Drift observation and assert its ordinary offline error."""
+    with pytest.raises(wyrd.WyrdError) as raised:
+        run.observe.drift({"latency_ms": 1.0})
+    assert _code(raised.value) == "WYRD_SDK_400_BIFROST_NOT_STARTED"
+
+
+def _broken(*_args: object, **_kwargs: object) -> None:
+    """Stand in for an OpenTelemetry call that fails."""
+    raise RuntimeError("telemetry broke")
+
+
+def test_registration_and_attach_failures_never_block_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An API-only provider or a failing attach leaves explicit emits untouched."""
+    run = _state(tmp_path).run(card="model")
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: object())
+    with run as entered:
+        _drift_reaches_the_ordinary_boundary(entered)
+
+    monkeypatch.setattr(otel_context, "attach", _broken)
+    with run as entered:
+        _drift_reaches_the_ordinary_boundary(entered)
+
+
+def test_enrichment_failure_never_blocks_observations(
     tmp_path: Path,
     spans: tuple[TracerProvider, InMemorySpanExporter],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failing context lookup or detach is contained; user errors propagate."""
+    """A failing span-start lookup is contained; user errors propagate."""
     provider, exporter = spans
     run = _state(tmp_path).run()
-
-    def broken(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("telemetry broke")
-
-    def scope() -> None:
-        with run:
-            monkeypatch.setattr(otel_context, "get_value", broken)
-            provider.get_tracer("framework").start_span("unenriched").end()
-            monkeypatch.setattr(otel_context, "detach", broken)
-
-    # A failed detach leaves its scope attached; a copied context keeps that
-    # leak out of the tests that follow on this thread.
-    contextvars.copy_context().run(scope)
-    monkeypatch.setattr(otel_context, "get_value", ORIGINAL_GET_VALUE)
-    monkeypatch.setattr(otel_context, "detach", ORIGINAL_DETACH)
+    with run as entered:
+        monkeypatch.setattr(otel_context, "get_value", _broken)
+        provider.get_tracer("framework").start_span("unenriched").end()
+        _drift_reaches_the_ordinary_boundary(entered)
+        monkeypatch.setattr(otel_context, "get_value", ORIGINAL_GET_VALUE)
     assert _correlation(exporter) == {"unenriched": None}
 
     with pytest.raises(ValueError, match="user failure"), run:
         raise ValueError("user failure")
     assert run.__exit__(None, None, None) is False
+
+
+def test_detach_failure_restores_the_prior_correlation(
+    tmp_path: Path,
+    spans: tuple[TracerProvider, InMemorySpanExporter],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising or silently swallowed detach still restores the preceding pair."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run()
+    model = run.for_card("model")
+    with run:
+        with model as entered:
+            # OTel's public ``detach`` logs and swallows a failed reset.
+            monkeypatch.setattr(otel_context, "detach", lambda _token: None)
+            _drift_reaches_the_ordinary_boundary(entered)
+        tracer.start_span("outer").end()
+        monkeypatch.setattr(otel_context, "detach", _broken)
+    monkeypatch.setattr(otel_context, "detach", ORIGINAL_DETACH)
+    tracer.start_span("after").end()
+    assert _correlation(exporter) == {"outer": (run.card_ref, run.run_id), "after": None}
+
+
+def test_concurrent_first_entries_share_one_scope_key(
+    tmp_path: Path,
+    spans: tuple[TracerProvider, InMemorySpanExporter],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two threads entering their first scopes at once attach under one key."""
+    provider, exporter = spans
+    tracer = provider.get_tracer("framework")
+    run = _state(tmp_path).run()
+    views = {"model": run.for_card("model"), "backup": run.for_card("backup")}
+    lock = _ContentionLock()
+    created: list[object] = []
+    creating = threading.Event()
+    original_create_key = otel_context.create_key
+
+    def create_key(name: str) -> object:
+        # Hold the first creation open until another entry contends for the
+        # lock; without serialization the second entry mints its own key.
+        created.append(name)
+        creating.set()
+        if len(created) == 1:
+            lock.contended.wait(timeout=5)
+        return original_create_key(name)
+
+    monkeypatch.setattr(wyrd.otel, "_scope_key", None)
+    monkeypatch.setattr(wyrd.otel, "_registered_lock", lock)
+    monkeypatch.setattr(otel_context, "create_key", create_key)
+
+    def scoped(alias: str) -> None:
+        with views[alias]:
+            tracer.start_span(alias).end()
+
+    first = threading.Thread(target=scoped, args=("model",))
+    second = threading.Thread(target=scoped, args=("backup",))
+    first.start()
+    assert creating.wait(timeout=5)
+    second.start()
+    first.join()
+    second.join()
+    assert len(created) == 1
+    assert _correlation(exporter) == {
+        alias: (view.card_ref, run.run_id) for alias, view in views.items()
+    }
+
+
+class _ContentionLock:
+    """A lock recording when a second caller had to wait for it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.contended = threading.Event()
+
+    def __enter__(self) -> None:
+        if not self._lock.acquire(blocking=False):
+            self.contended.set()
+            self._lock.acquire()
+
+    def __exit__(self, *_exc: object) -> None:
+        self._lock.release()

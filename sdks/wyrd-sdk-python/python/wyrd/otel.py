@@ -186,10 +186,11 @@ class OtelObserver(Observer):
 _CARD_REF = "wyrd.card_ref"
 _RUN_ID = "wyrd.run_id"
 
-# One execution-local stack of OTel context tokens (``None`` when an entry
+# One execution-local stack of ``(token, prior)`` entries (``None`` when an entry
 # attached nothing), so nested and concurrent scopes of one immutable Run each
-# detach exactly the token their own entry installed.
-_scope_tokens: ContextVar[tuple[object | None, ...]] = ContextVar(
+# detach exactly the token their own entry installed and restore the
+# correlation that preceded it.
+_scope_tokens: ContextVar[tuple[tuple[object, Any] | None, ...]] = ContextVar(
     "wyrd_run_scope_tokens", default=()
 )
 _scope_key: Any = None
@@ -201,9 +202,13 @@ def _key() -> Any:
     """Return the private OTel context key holding ``(card_ref, run_id)``."""
     global _scope_key
     if _scope_key is None:
-        from opentelemetry.context import create_key
+        # ``create_key`` mints a distinct key per call; one lock-held creation
+        # keeps concurrent first entries attaching under the key spans read.
+        with _registered_lock:
+            if _scope_key is None:
+                from opentelemetry.context import create_key
 
-        _scope_key = create_key("wyrd.run_scope")
+                _scope_key = create_key("wyrd.run_scope")
     return _scope_key
 
 
@@ -276,32 +281,46 @@ def _enter_run(card_ref: str, run_id: str) -> None:
 
     Always pushes exactly one stack entry so ``_exit_run`` stays paired.
     """
-    token = None
+    entry = None
     try:
         from opentelemetry import context, trace
 
         install_run_correlation()
-        token = context.attach(context.set_value(_key(), (card_ref, run_id)))
+        prior = context.get_value(_key())
+        entry = (context.attach(context.set_value(_key(), (card_ref, run_id))), prior)
         span = trace.get_current_span()
         if span.is_recording():
             span.set_attribute(_CARD_REF, card_ref)
             span.set_attribute(_RUN_ID, run_id)
     except Exception:  # telemetry must never fail the app
         pass
-    _scope_tokens.set((*_scope_tokens.get(), token))
+    _scope_tokens.set((*_scope_tokens.get(), entry))
 
 
 def _exit_run() -> None:
-    """Detach the innermost scope token of this execution context. Never raises."""
+    """Restore the correlation preceding the innermost scope. Never raises.
+
+    Detaches the entry's exact token; when OTel raises or silently swallows the
+    reset, the recorded prior correlation is re-attached instead so no later
+    span in this execution context carries the exited scope's pair.
+    """
     tokens = _scope_tokens.get()
     if not tokens:
         return
     _scope_tokens.set(tokens[:-1])
     if tokens[-1] is None:
         return
+    token, prior = tokens[-1]
     try:
         from opentelemetry import context
-
-        context.detach(tokens[-1])
+    except Exception:  # telemetry must never fail the app
+        return
+    try:
+        context.detach(token)
+    except Exception:  # telemetry must never fail the app
+        pass
+    try:
+        if context.get_value(_key()) != prior:
+            context.attach(context.set_value(_key(), prior))
     except Exception:  # telemetry must never fail the app
         pass

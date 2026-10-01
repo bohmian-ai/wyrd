@@ -1,6 +1,6 @@
 ---
 id: SPEC-opitimization-and-benchmarks
-revision: 6
+revision: 7
 status: draft
 ---
 
@@ -32,10 +32,8 @@ change measures it in both roles. It does three things:
    targets in this specification. Bifrost does not have to beat ClickHouse. It
    has to come within the stated ratios.
 
-ClickBench deliberately leaves out concurrency, writes during reads, tail
-latency, and memory limits. The existing internal capacity benchmark
-(`bifrost_query_capacity`) covers those and stays as a third, required
-evidence class.
+These two benchmarks replace the internal capacity benchmark
+(`bifrost_query_capacity`), which this change deletes (REQ-010).
 
 The audience is operators and platform teams choosing a store for verification
 evidence, and Wyrd maintainers, who get a repeatable external yardstick for
@@ -52,7 +50,7 @@ change.
 
 ## Current baseline
 
-Measured with `mise run bench:bifrost:query-capacity`
+Last measured, before its removal, with `mise run bench:bifrost:query-capacity`
 (`crates/wyrd/wyrd-testing/src/bin/bifrost_query_capacity`) on an 8-CPU/16-GiB
 node, in TASK-004 of `changes/active/bifrost-scribe-live-reads`:
 
@@ -115,8 +113,7 @@ authorization, admission, and read audit.
 the owner's local host, with Bifrost (server plus its Postgres catalog)
 confined to a 16-CPU/32-GiB systemd scope, matching the CPU and memory of
 ClickBench's c6a.4xlarge reference. The host (Ryzen 9 9950X, 32 threads,
-91 GiB) fits that scope. The internal capacity benchmark keeps its own
-8-CPU/16-GiB envelope (REQ-010, AC-7). Every result carries an environment description: CPU
+91 GiB) fits that scope. Every result carries an environment description: CPU
 model and the CPUs the scope allows, enforced memory limit, storage device and
 filesystem, kernel, `wyrd-server` version and commit, dataset version, and
 the ClickBench commit. Published Bifrost numbers are always stated against
@@ -170,19 +167,17 @@ the dataset and the pinned ClickBench results. It exits nonzero when an AC targe
 missed or a result is wrong. It is reproducible from a clean checkout on a
 Linux host that meets REQ-004.
 
-**REQ-010 — Internal capacity benchmark kept.** The existing
-`bench:bifrost:query-capacity` benchmark keeps running as the third evidence
-class. It covers what ClickBench and the observability benchmark leave out:
-selective reads, concurrent clients, reads while writing, tail latency under
-load, overload and queueing, and behavior at the memory limit. AC-7 sets new
-targets for it. Its fixture, envelope, and cases may change
-only through a revision of this specification.
+**REQ-010 — Internal capacity benchmark removed.** This change deletes the
+`bench:bifrost:query-capacity` mise task, the
+`crates/wyrd/wyrd-testing/src/bin/bifrost_query_capacity` binary, and any code
+or tests used only by them. ClickBench and the observability benchmark are the
+only performance benchmarks.
 
 ### Optimization
 
 **REQ-011 — Optimize reads and writes to the targets.** The change optimizes
 the Oracle read path and the Gate/Scribe/Forge write and publication path
-until AC-1 through AC-12 pass. The specification fixes the targets and the
+until AC-1 to AC-6 and AC-8 to AC-12 pass. The specification fixes the targets and the
 proof, not the mechanisms. Each optimization task reports its before and after
 numbers on the benchmark that motivated it.
 
@@ -281,8 +276,7 @@ human-readable report.
 These hold whatever the architecture documents say:
 
 - **INV-1 — Correct results.** No optimization changes a query result. Every
-  existing Bifrost correctness, journey, and capacity answer check still
-  passes.
+  existing Bifrost correctness and journey check still passes.
 - **INV-2 — Tenant isolation.** Authentication, authorization (including
   object-scoped query permission), and per-file tenant proof stay enforced on
   every read and write. No cache or shared structure lets one tenant's data,
@@ -321,9 +315,9 @@ These hold whatever the architecture documents say:
   client surfaces (REQ-003, REQ-012).
 - Load time includes publication. Data size counts the published table
   (REQ-007, REQ-008).
-- The benchmark has three evidence classes, and each is required: ClickBench,
-  the observability benchmark, and the internal capacity benchmark (REQ-010,
-  REQ-013 to REQ-017).
+- The benchmark has two evidence classes, and both are required: ClickBench
+  and the observability benchmark (REQ-013 to REQ-017). The internal capacity
+  benchmark is deleted (REQ-010).
 - Per-core ingest counts server CPU only (REQ-014).
 
 ## Acceptance criteria
@@ -342,7 +336,6 @@ confirmation (D-1).
 | AC-4 | Worst single-query hot ratio | ≤ 10× |
 | AC-5 | Load-time ratio (REQ-007) | ≤ 2.0× |
 | AC-6 | Data-size ratio (REQ-008) | ≤ 1.5× |
-| AC-7 | Internal capacity benchmark at 8 CPU/16 GiB: selective p50 at 1 client, ingest rows/s, and every existing row | p50 ≤ 2 ms, ingest ≥ 1.0M rows/s, no regression of other rows |
 | AC-8 | Observability ingest rows/s per core, per signal (REQ-014) | logs ≥ 150k, spans ≥ 100k, metric points ≥ 300k |
 | AC-9 | Observability ingest MB/s per core, per signal (REQ-014) | ≥ 50 MB/s per core |
 | AC-10 | Compression ratio, per signal (REQ-015) | logs ≥ 10×, traces ≥ 8×, metrics ≥ 10× |
@@ -357,7 +350,6 @@ confirmation (D-1).
 - per-optimization before and after numbers (REQ-011);
 - the observability result files and report from one complete run on the
   declared host;
-- the capacity-benchmark report;
 - the existing Bifrost journey and correctness lanes passing (INV-1 to INV-5).
 
 
@@ -366,7 +358,8 @@ confirmation (D-1).
 The owner decides each of these before approval. Each has a recommended
 default.
 
-1. **D-1 — Target ratios.** Confirm or change the AC-2 to AC-12 targets.
+1. **D-1 — Target ratios.** Confirm or change the AC-2 to AC-6 and AC-8 to
+   AC-12 targets.
    Recommended: the values in the table. A 2× hot geomean puts Bifrost among
    the leading Parquet-based engines on ClickBench. The cold target is looser because
    Iceberg and object-store metadata cost the most on a cold start. The AC-8 to
@@ -470,6 +463,10 @@ default.
   benchmark run in a 16-CPU/32-GiB envelope, matching ClickBench's reference
   CPU count and memory; the internal capacity benchmark stays at
   8-CPU/16-GiB. Draft; awaiting owner decisions D-1 and D-3 to D-13.
+- Revision 7 (2026-10-01): Owner decision. The internal capacity benchmark is
+  deleted rather than kept (REQ-010), and AC-7 is withdrawn; its ID is not
+  reused. ClickBench and the observability benchmark are the only evidence
+  classes. Draft; awaiting owner decisions D-1 and D-3 to D-13.
 
 ## Authority and context
 

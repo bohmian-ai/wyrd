@@ -1210,6 +1210,10 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
     "GoogleBatchEmbedRequest": {
       "additionalProperties": false,
       "properties": {
@@ -1847,31 +1851,19 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "type": "object"
     },
     "HttpAuth": {
-      "description": "Server-side authentication sources for an HTTP action.",
+      "description": "Credential authority of an HTTP action, bound to a tenant `http` connection.\n\nThe scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "No authentication.",
+          "description": "`Authorization: Bearer` from the connection's token.",
           "properties": {
-            "scheme": {
-              "enum": [
-                "none"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
               ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "scheme"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Bearer token loaded from an environment variable.",
-          "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -1881,18 +1873,22 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "`user:password` loaded from an environment variable.",
+          "description": "`Authorization: Basic` from the connection's username and password.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -1902,21 +1898,25 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "Custom header value loaded from an environment variable.",
+          "description": "A custom header carrying the connection's value.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "name": {
-              "description": "Header name.",
+              "description": "Header name, compared case-insensitively with the connection's.",
               "type": "string"
             },
             "scheme": {
@@ -1927,7 +1927,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "name",
             "scheme"
           ],
@@ -2106,10 +2106,18 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "PagerDuty event payload.",
+          "description": "PagerDuty Events API v2 trigger through a tenant Global Integration key.",
           "properties": {
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `pager_duty` connection."
+            },
             "dedup_key": {
-              "description": "Optional de-duplication key.",
+              "description": "Optional de-duplication key template; the dispatch ID when omitted.",
               "type": [
                 "string",
                 "null"
@@ -2121,17 +2129,27 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
               ],
               "type": "string"
             },
-            "severity": {
-              "description": "PagerDuty severity.",
+            "route": {
+              "description": "Route sent as `payload.custom_details.wyrd_route` for PagerDuty Service Routes.",
               "type": "string"
             },
+            "severity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PagerDutySeverity"
+                }
+              ],
+              "description": "PagerDuty event severity."
+            },
             "summary": {
-              "description": "Human-readable event summary.",
+              "description": "Event summary template.",
               "type": "string"
             }
           },
           "required": [
+            "connection",
             "kind",
+            "route",
             "severity",
             "summary"
           ],
@@ -2139,8 +2157,20 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         },
         {
           "additionalProperties": false,
-          "description": "Slack message payload.",
+          "description": "Slack `chat.postMessage` through a tenant workspace bot token.",
           "properties": {
+            "channel_id": {
+              "description": "Slack conversation ID the app may post in.",
+              "type": "string"
+            },
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `slack` connection."
+            },
             "kind": {
               "enum": [
                 "slack"
@@ -2148,11 +2178,13 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
               "type": "string"
             },
             "text": {
-              "description": "Message text.",
+              "description": "Message text template.",
               "type": "string"
             }
           },
           "required": [
+            "channel_id",
+            "connection",
             "kind",
             "text"
           ],
@@ -4423,13 +4455,13 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
                   "type": "null"
                 }
               ],
-              "description": "Optional server-side authentication binding."
+              "description": "Credential authority; omitted for an unauthenticated request."
             },
             "body": {
-              "description": "Optional structured JSON body."
+              "description": "Optional structured JSON body; string values are templates."
             },
             "expect_status": {
-              "description": "Optional expected response status.",
+              "description": "Optional expected response status; any 2xx is accepted when omitted.",
               "format": "uint16",
               "minimum": 0.0,
               "type": [
@@ -4441,7 +4473,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
               "additionalProperties": {
                 "type": "string"
               },
-              "description": "Optional request headers.",
+              "description": "Optional request headers; values are templates.",
               "type": "object"
             },
             "kind": {
@@ -4459,7 +4491,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
               "description": "HTTP method."
             },
             "timeout_seconds": {
-              "description": "Optional request timeout.",
+              "description": "Optional request timeout, clipped to [`MAX_ATTEMPT_SECONDS`].",
               "format": "uint32",
               "minimum": 0.0,
               "type": [
@@ -4468,7 +4500,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
               ]
             },
             "url": {
-              "description": "URL template.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
               "type": "string"
             }
           },
@@ -4501,6 +4533,39 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         }
       },
       "type": "object"
+    },
+    "PagerDutySeverity": {
+      "description": "PagerDuty Events API v2 severities.",
+      "oneOf": [
+        {
+          "description": "critical.",
+          "enum": [
+            "critical"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "error.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "warning.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "info.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "Prompt": {
       "description": "Authored native prompt request plus render metadata.",
@@ -9185,32 +9250,24 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
     "HttpAuth": {
-      "description": "Server-side authentication sources for an HTTP action.",
+      "description": "Credential authority of an HTTP action, bound to a tenant `http` connection.\n\nThe scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "No authentication.",
+          "description": "`Authorization: Bearer` from the connection's token.",
           "properties": {
-            "scheme": {
-              "enum": [
-                "none"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
               ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "scheme"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Bearer token loaded from an environment variable.",
-          "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -9220,18 +9277,22 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "`user:password` loaded from an environment variable.",
+          "description": "`Authorization: Basic` from the connection's username and password.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -9241,21 +9302,25 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "Custom header value loaded from an environment variable.",
+          "description": "A custom header carrying the connection's value.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "name": {
-              "description": "Header name.",
+              "description": "Header name, compared case-insensitively with the connection's.",
               "type": "string"
             },
             "scheme": {
@@ -9266,7 +9331,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "name",
             "scheme"
           ],
@@ -9319,10 +9384,18 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "PagerDuty event payload.",
+          "description": "PagerDuty Events API v2 trigger through a tenant Global Integration key.",
           "properties": {
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `pager_duty` connection."
+            },
             "dedup_key": {
-              "description": "Optional de-duplication key.",
+              "description": "Optional de-duplication key template; the dispatch ID when omitted.",
               "type": [
                 "string",
                 "null"
@@ -9334,17 +9407,27 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
               ],
               "type": "string"
             },
-            "severity": {
-              "description": "PagerDuty severity.",
+            "route": {
+              "description": "Route sent as `payload.custom_details.wyrd_route` for PagerDuty Service Routes.",
               "type": "string"
             },
+            "severity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PagerDutySeverity"
+                }
+              ],
+              "description": "PagerDuty event severity."
+            },
             "summary": {
-              "description": "Human-readable event summary.",
+              "description": "Event summary template.",
               "type": "string"
             }
           },
           "required": [
+            "connection",
             "kind",
+            "route",
             "severity",
             "summary"
           ],
@@ -9352,8 +9435,20 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
         },
         {
           "additionalProperties": false,
-          "description": "Slack message payload.",
+          "description": "Slack `chat.postMessage` through a tenant workspace bot token.",
           "properties": {
+            "channel_id": {
+              "description": "Slack conversation ID the app may post in.",
+              "type": "string"
+            },
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `slack` connection."
+            },
             "kind": {
               "enum": [
                 "slack"
@@ -9361,11 +9456,13 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
               "type": "string"
             },
             "text": {
-              "description": "Message text.",
+              "description": "Message text template.",
               "type": "string"
             }
           },
           "required": [
+            "channel_id",
+            "connection",
             "kind",
             "text"
           ],
@@ -9397,6 +9494,39 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
         }
       },
       "type": "object"
+    },
+    "PagerDutySeverity": {
+      "description": "PagerDuty Events API v2 severities.",
+      "oneOf": [
+        {
+          "description": "critical.",
+          "enum": [
+            "critical"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "error.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "warning.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "info.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "Ref": {
       "anyOf": [
@@ -9506,13 +9636,13 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
               "type": "null"
             }
           ],
-          "description": "Optional server-side authentication binding."
+          "description": "Credential authority; omitted for an unauthenticated request."
         },
         "body": {
-          "description": "Optional structured JSON body."
+          "description": "Optional structured JSON body; string values are templates."
         },
         "expect_status": {
-          "description": "Optional expected response status.",
+          "description": "Optional expected response status; any 2xx is accepted when omitted.",
           "format": "uint16",
           "minimum": 0.0,
           "type": [
@@ -9524,7 +9654,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
           "additionalProperties": {
             "type": "string"
           },
-          "description": "Optional request headers.",
+          "description": "Optional request headers; values are templates.",
           "type": "object"
         },
         "kind": {
@@ -9542,7 +9672,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
           "description": "HTTP method."
         },
         "timeout_seconds": {
-          "description": "Optional request timeout.",
+          "description": "Optional request timeout, clipped to [`MAX_ATTEMPT_SECONDS`].",
           "format": "uint32",
           "minimum": 0.0,
           "type": [
@@ -9551,7 +9681,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
           ]
         },
         "url": {
-          "description": "URL template.",
+          "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
           "type": "string"
         }
       },
@@ -13989,6 +14119,10 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
       ],
       "type": "object"
     },
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
     "CredentialRef": {
       "description": "Reference to a credential or secret managed outside public Card specs.",
       "properties": {
@@ -14008,31 +14142,19 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
       "type": "object"
     },
     "HttpAuth": {
-      "description": "Server-side authentication sources for an HTTP action.",
+      "description": "Credential authority of an HTTP action, bound to a tenant `http` connection.\n\nThe scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "No authentication.",
+          "description": "`Authorization: Bearer` from the connection's token.",
           "properties": {
-            "scheme": {
-              "enum": [
-                "none"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
               ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "scheme"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Bearer token loaded from an environment variable.",
-          "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -14042,18 +14164,22 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "`user:password` loaded from an environment variable.",
+          "description": "`Authorization: Basic` from the connection's username and password.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -14063,21 +14189,25 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "Custom header value loaded from an environment variable.",
+          "description": "A custom header carrying the connection's value.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "name": {
-              "description": "Header name.",
+              "description": "Header name, compared case-insensitively with the connection's.",
               "type": "string"
             },
             "scheme": {
@@ -14088,7 +14218,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "name",
             "scheme"
           ],
@@ -14332,10 +14462,18 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "PagerDuty event payload.",
+          "description": "PagerDuty Events API v2 trigger through a tenant Global Integration key.",
           "properties": {
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `pager_duty` connection."
+            },
             "dedup_key": {
-              "description": "Optional de-duplication key.",
+              "description": "Optional de-duplication key template; the dispatch ID when omitted.",
               "type": [
                 "string",
                 "null"
@@ -14347,17 +14485,27 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
               ],
               "type": "string"
             },
-            "severity": {
-              "description": "PagerDuty severity.",
+            "route": {
+              "description": "Route sent as `payload.custom_details.wyrd_route` for PagerDuty Service Routes.",
               "type": "string"
             },
+            "severity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PagerDutySeverity"
+                }
+              ],
+              "description": "PagerDuty event severity."
+            },
             "summary": {
-              "description": "Human-readable event summary.",
+              "description": "Event summary template.",
               "type": "string"
             }
           },
           "required": [
+            "connection",
             "kind",
+            "route",
             "severity",
             "summary"
           ],
@@ -14365,8 +14513,20 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         },
         {
           "additionalProperties": false,
-          "description": "Slack message payload.",
+          "description": "Slack `chat.postMessage` through a tenant workspace bot token.",
           "properties": {
+            "channel_id": {
+              "description": "Slack conversation ID the app may post in.",
+              "type": "string"
+            },
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `slack` connection."
+            },
             "kind": {
               "enum": [
                 "slack"
@@ -14374,11 +14534,13 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
               "type": "string"
             },
             "text": {
-              "description": "Message text.",
+              "description": "Message text template.",
               "type": "string"
             }
           },
           "required": [
+            "channel_id",
+            "connection",
             "kind",
             "text"
           ],
@@ -14477,13 +14639,13 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
                   "type": "null"
                 }
               ],
-              "description": "Optional server-side authentication binding."
+              "description": "Credential authority; omitted for an unauthenticated request."
             },
             "body": {
-              "description": "Optional structured JSON body."
+              "description": "Optional structured JSON body; string values are templates."
             },
             "expect_status": {
-              "description": "Optional expected response status.",
+              "description": "Optional expected response status; any 2xx is accepted when omitted.",
               "format": "uint16",
               "minimum": 0.0,
               "type": [
@@ -14495,7 +14657,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
               "additionalProperties": {
                 "type": "string"
               },
-              "description": "Optional request headers.",
+              "description": "Optional request headers; values are templates.",
               "type": "object"
             },
             "kind": {
@@ -14513,7 +14675,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
               "description": "HTTP method."
             },
             "timeout_seconds": {
-              "description": "Optional request timeout.",
+              "description": "Optional request timeout, clipped to [`MAX_ATTEMPT_SECONDS`].",
               "format": "uint32",
               "minimum": 0.0,
               "type": [
@@ -14522,7 +14684,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
               ]
             },
             "url": {
-              "description": "URL template.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
               "type": "string"
             }
           },
@@ -14555,6 +14717,39 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         }
       },
       "type": "object"
+    },
+    "PagerDutySeverity": {
+      "description": "PagerDuty Events API v2 severities.",
+      "oneOf": [
+        {
+          "description": "critical.",
+          "enum": [
+            "critical"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "error.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "warning.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "info.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "Ref": {
       "anyOf": [
@@ -16194,6 +16389,10 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
         }
       ]
     },
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
     "DivergenceMetric": {
       "description": "Probability-divergence metric used by [`ComparisonOperator::DivergenceLessThan`].",
       "oneOf": [
@@ -17787,31 +17986,19 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
       "type": "object"
     },
     "HttpAuth": {
-      "description": "Server-side authentication sources for an HTTP action.",
+      "description": "Credential authority of an HTTP action, bound to a tenant `http` connection.\n\nThe scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "No authentication.",
+          "description": "`Authorization: Bearer` from the connection's token.",
           "properties": {
-            "scheme": {
-              "enum": [
-                "none"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
               ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "scheme"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Bearer token loaded from an environment variable.",
-          "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -17821,18 +18008,22 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "`user:password` loaded from an environment variable.",
+          "description": "`Authorization: Basic` from the connection's username and password.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -17842,21 +18033,25 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "Custom header value loaded from an environment variable.",
+          "description": "A custom header carrying the connection's value.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "name": {
-              "description": "Header name.",
+              "description": "Header name, compared case-insensitively with the connection's.",
               "type": "string"
             },
             "scheme": {
@@ -17867,7 +18062,7 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "name",
             "scheme"
           ],
@@ -18141,10 +18336,18 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "PagerDuty event payload.",
+          "description": "PagerDuty Events API v2 trigger through a tenant Global Integration key.",
           "properties": {
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `pager_duty` connection."
+            },
             "dedup_key": {
-              "description": "Optional de-duplication key.",
+              "description": "Optional de-duplication key template; the dispatch ID when omitted.",
               "type": [
                 "string",
                 "null"
@@ -18156,17 +18359,27 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
               ],
               "type": "string"
             },
-            "severity": {
-              "description": "PagerDuty severity.",
+            "route": {
+              "description": "Route sent as `payload.custom_details.wyrd_route` for PagerDuty Service Routes.",
               "type": "string"
             },
+            "severity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PagerDutySeverity"
+                }
+              ],
+              "description": "PagerDuty event severity."
+            },
             "summary": {
-              "description": "Human-readable event summary.",
+              "description": "Event summary template.",
               "type": "string"
             }
           },
           "required": [
+            "connection",
             "kind",
+            "route",
             "severity",
             "summary"
           ],
@@ -18174,8 +18387,20 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
         },
         {
           "additionalProperties": false,
-          "description": "Slack message payload.",
+          "description": "Slack `chat.postMessage` through a tenant workspace bot token.",
           "properties": {
+            "channel_id": {
+              "description": "Slack conversation ID the app may post in.",
+              "type": "string"
+            },
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `slack` connection."
+            },
             "kind": {
               "enum": [
                 "slack"
@@ -18183,11 +18408,13 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
               "type": "string"
             },
             "text": {
-              "description": "Message text.",
+              "description": "Message text template.",
               "type": "string"
             }
           },
           "required": [
+            "channel_id",
+            "connection",
             "kind",
             "text"
           ],
@@ -20458,13 +20685,13 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
                   "type": "null"
                 }
               ],
-              "description": "Optional server-side authentication binding."
+              "description": "Credential authority; omitted for an unauthenticated request."
             },
             "body": {
-              "description": "Optional structured JSON body."
+              "description": "Optional structured JSON body; string values are templates."
             },
             "expect_status": {
-              "description": "Optional expected response status.",
+              "description": "Optional expected response status; any 2xx is accepted when omitted.",
               "format": "uint16",
               "minimum": 0.0,
               "type": [
@@ -20476,7 +20703,7 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
               "additionalProperties": {
                 "type": "string"
               },
-              "description": "Optional request headers.",
+              "description": "Optional request headers; values are templates.",
               "type": "object"
             },
             "kind": {
@@ -20494,7 +20721,7 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
               "description": "HTTP method."
             },
             "timeout_seconds": {
-              "description": "Optional request timeout.",
+              "description": "Optional request timeout, clipped to [`MAX_ATTEMPT_SECONDS`].",
               "format": "uint32",
               "minimum": 0.0,
               "type": [
@@ -20503,7 +20730,7 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
               ]
             },
             "url": {
-              "description": "URL template.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
               "type": "string"
             }
           },
@@ -20536,6 +20763,39 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
         }
       },
       "type": "object"
+    },
+    "PagerDutySeverity": {
+      "description": "PagerDuty Events API v2 severities.",
+      "oneOf": [
+        {
+          "description": "critical.",
+          "enum": [
+            "critical"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "error.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "warning.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "info.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "ParameterizedComparisonOperator": {
       "oneOf": [
@@ -22822,6 +23082,10 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
     "GoogleBatchEmbedRequest": {
       "additionalProperties": false,
       "properties": {
@@ -23497,31 +23761,19 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "type": "object"
     },
     "HttpAuth": {
-      "description": "Server-side authentication sources for an HTTP action.",
+      "description": "Credential authority of an HTTP action, bound to a tenant `http` connection.\n\nThe scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.",
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "No authentication.",
+          "description": "`Authorization: Bearer` from the connection's token.",
           "properties": {
-            "scheme": {
-              "enum": [
-                "none"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
               ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "scheme"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Bearer token loaded from an environment variable.",
-          "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -23531,18 +23783,22 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "`user:password` loaded from an environment variable.",
+          "description": "`Authorization: Basic` from the connection's username and password.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "scheme": {
               "enum": [
@@ -23552,21 +23808,25 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "scheme"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "Custom header value loaded from an environment variable.",
+          "description": "A custom header carrying the connection's value.",
           "properties": {
-            "env": {
-              "description": "Environment variable name.",
-              "type": "string"
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `http` connection."
             },
             "name": {
-              "description": "Header name.",
+              "description": "Header name, compared case-insensitively with the connection's.",
               "type": "string"
             },
             "scheme": {
@@ -23577,7 +23837,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
             }
           },
           "required": [
-            "env",
+            "connection",
             "name",
             "scheme"
           ],
@@ -23905,10 +24165,18 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "PagerDuty event payload.",
+          "description": "PagerDuty Events API v2 trigger through a tenant Global Integration key.",
           "properties": {
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `pager_duty` connection."
+            },
             "dedup_key": {
-              "description": "Optional de-duplication key.",
+              "description": "Optional de-duplication key template; the dispatch ID when omitted.",
               "type": [
                 "string",
                 "null"
@@ -23920,17 +24188,27 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
               ],
               "type": "string"
             },
-            "severity": {
-              "description": "PagerDuty severity.",
+            "route": {
+              "description": "Route sent as `payload.custom_details.wyrd_route` for PagerDuty Service Routes.",
               "type": "string"
             },
+            "severity": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/PagerDutySeverity"
+                }
+              ],
+              "description": "PagerDuty event severity."
+            },
             "summary": {
-              "description": "Human-readable event summary.",
+              "description": "Event summary template.",
               "type": "string"
             }
           },
           "required": [
+            "connection",
             "kind",
+            "route",
             "severity",
             "summary"
           ],
@@ -23938,8 +24216,20 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         },
         {
           "additionalProperties": false,
-          "description": "Slack message payload.",
+          "description": "Slack `chat.postMessage` through a tenant workspace bot token.",
           "properties": {
+            "channel_id": {
+              "description": "Slack conversation ID the app may post in.",
+              "type": "string"
+            },
+            "connection": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ConnectionName"
+                }
+              ],
+              "description": "Name of the tenant's `slack` connection."
+            },
             "kind": {
               "enum": [
                 "slack"
@@ -23947,11 +24237,13 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
               "type": "string"
             },
             "text": {
-              "description": "Message text.",
+              "description": "Message text template.",
               "type": "string"
             }
           },
           "required": [
+            "channel_id",
+            "connection",
             "kind",
             "text"
           ],
@@ -26242,13 +26534,13 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
                   "type": "null"
                 }
               ],
-              "description": "Optional server-side authentication binding."
+              "description": "Credential authority; omitted for an unauthenticated request."
             },
             "body": {
-              "description": "Optional structured JSON body."
+              "description": "Optional structured JSON body; string values are templates."
             },
             "expect_status": {
-              "description": "Optional expected response status.",
+              "description": "Optional expected response status; any 2xx is accepted when omitted.",
               "format": "uint16",
               "minimum": 0.0,
               "type": [
@@ -26260,7 +26552,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
               "additionalProperties": {
                 "type": "string"
               },
-              "description": "Optional request headers.",
+              "description": "Optional request headers; values are templates.",
               "type": "object"
             },
             "kind": {
@@ -26278,7 +26570,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
               "description": "HTTP method."
             },
             "timeout_seconds": {
-              "description": "Optional request timeout.",
+              "description": "Optional request timeout, clipped to [`MAX_ATTEMPT_SECONDS`].",
               "format": "uint32",
               "minimum": 0.0,
               "type": [
@@ -26287,7 +26579,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
               ]
             },
             "url": {
-              "description": "URL template.",
+              "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
               "type": "string"
             }
           },
@@ -26320,6 +26612,39 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         }
       },
       "type": "object"
+    },
+    "PagerDutySeverity": {
+      "description": "PagerDuty Events API v2 severities.",
+      "oneOf": [
+        {
+          "description": "critical.",
+          "enum": [
+            "critical"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "error.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "warning.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "info.",
+          "enum": [
+            "info"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "ParameterValue": {
       "description": "Typed parameter value for experiments, runs, workflows, and tools.",

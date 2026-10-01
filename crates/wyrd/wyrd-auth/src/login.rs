@@ -176,7 +176,8 @@ impl HumanConnections {
             .map_err(store_error)?;
         let sealed = redeem_login_completion(&mut conn, &initiation)
             .await
-            .map_err(store_error)?;
+            .map_err(store_error)?
+            .map(|redeemed| redeemed.sealed);
         conn.commit().await.map_err(store_error)?;
         let sealed = sealed.ok_or_else(|| WyrdError::InvalidState {
             message: "no completed login is waiting for this binding".to_owned(),

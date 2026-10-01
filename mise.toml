@@ -578,7 +578,7 @@ description = """Stand up real OIDC providers (Keycloak + Dex), seed test users 
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
 Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
-env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:18080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:identity:journey:inner'"
 [tasks."test:identity:journey:inner"]
@@ -587,7 +587,7 @@ description = """Stand up real OIDC providers (Keycloak + Dex), seed test users 
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
 Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
-env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:18080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 run = """
 set -e
 
@@ -607,7 +607,7 @@ docker compose up -d keycloak dex --wait
 uv run python - <<'PYEOF'
 import json, urllib.request, urllib.parse, time, sys
 
-BASE = "http://localhost:18080"
+BASE = "http://localhost:8180"
 REALM = "wyrd-test"
 
 def get_admin_token():

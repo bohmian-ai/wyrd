@@ -34,7 +34,7 @@ use wyrd_testing::{
 
 fn keycloak_issuer() -> String {
     env::var("WYRD_KEYCLOAK_ISSUER")
-        .unwrap_or_else(|_| "http://localhost:18080/realms/wyrd-test".to_owned())
+        .unwrap_or_else(|_| "http://localhost:8180/realms/wyrd-test".to_owned())
 }
 
 fn dex_issuer() -> String {
@@ -48,7 +48,7 @@ fn dex_issuer() -> String {
 /// the credential is written once here rather than at each call site.
 fn keycloak_admin() -> KeycloakAdmin {
     KeycloakAdmin {
-        base_url: "http://localhost:18080".to_owned(),
+        base_url: "http://localhost:8180".to_owned(),
         username: "admin".to_owned(),
         password: "admin".to_owned(),
         realm: "wyrd-test".to_owned(),
@@ -1830,7 +1830,7 @@ async fn conformance_login_rejects_bare_localhost_host() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/auth/login?issuer=http%3A%2F%2Flocalhost%3A18080%2Frealms%2Fwyrd-test")
+                .uri("/auth/login?issuer=http%3A%2F%2Flocalhost%3A8180%2Frealms%2Fwyrd-test")
                 .header(header::HOST, "localhost")
                 .header(header::ACCEPT, "application/json")
                 .body(Body::empty())

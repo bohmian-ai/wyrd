@@ -13,7 +13,7 @@ use wyrd_spec::auth::IssuerUrl;
 /// Keycloak-specific admin context needed for privileged operations.
 #[derive(Debug, Clone)]
 pub struct KeycloakAdmin {
-    /// Base URL of the Keycloak server (e.g. `http://localhost:18080`).
+    /// Base URL of the Keycloak server (e.g. `http://localhost:8180`).
     pub base_url: String,
     /// Admin username.
     pub username: String,

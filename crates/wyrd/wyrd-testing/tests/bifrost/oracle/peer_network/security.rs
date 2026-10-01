@@ -11,8 +11,8 @@ use vala_bifrost_redux::oracle::codec::{
 };
 use vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION;
 use vala_bifrost_redux::oracle::peer::{
-    PeerTicketClaims, ReservationBinding, ReservationOperationV1,
-    assignment_authority_digest_for, reservation_body_digest,
+    PeerTicketClaims, ReservationBinding, ReservationOperationV1, assignment_authority_digest_for,
+    reservation_body_digest,
 };
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::{
@@ -20,8 +20,8 @@ use wyrd_spec::vala::api::{
     OracleRoleFence, PeerContext, PersistedFileAssignment, ReservationId, ScribeProviderCut,
     TenantTableBinding,
 };
-use wyrd_tonic::tonic;
 use wyrd_tonic::prost::Message as _;
+use wyrd_tonic::tonic;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 

@@ -69,6 +69,10 @@ pub struct TelemetryGuard {
 pub struct CapturedSpan {
     /// W3C trace identifier from the production span context.
     pub trace_id: String,
+    /// This span's own identifier, which its children name as their parent.
+    pub span_id: String,
+    /// Identifier of the enclosing span; the invalid all-zero id for a root.
+    pub parent_span_id: String,
     /// Exact instrumentation span name.
     pub name: String,
     /// Scrubbed span attributes keyed by their production field names.
@@ -133,6 +137,8 @@ impl TestTraceCapture {
                     .skip(checkpoint)
                     .map(|span| CapturedSpan {
                         trace_id: span.span_context.trace_id().to_string(),
+                        span_id: span.span_context.span_id().to_string(),
+                        parent_span_id: span.parent_span_id.to_string(),
                         name: span.name.to_string(),
                         attributes: span
                             .attributes

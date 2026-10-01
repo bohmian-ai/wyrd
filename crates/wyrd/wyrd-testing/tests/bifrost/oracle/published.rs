@@ -23,6 +23,7 @@ use vala_bifrost_redux::storage::{
 use wyrd_client::WyrdClient;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{BifrostClusterSpec, ScribeCacheMode, WyrdTestCluster};
 
 use crate::support::*;
@@ -112,6 +113,12 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         vec![2],
         "the neighbouring tenant reads only its row"
     );
+
+    // 1b. Query stream telemetry. The same owner query is held open after its
+    //     first batch, so request opening and stream completion are observed
+    //     as the two separate production facts they are.
+    prove_query_stream_telemetry(&cluster, server, owner.client(), &fqn, owner_tenant, &table)
+        .await?;
 
     // 2. Hot cache single-flight and reuse. A second object is published, and
     //    the first read of it is held at the owner's deterministic barrier so a
@@ -255,13 +262,28 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         "an excluded object's footer is never opened"
     );
     let delta = cluster.telemetry().delta_since(&checkpoint)?;
-    for source in ["hot", "iceberg"] {
-        let excluded = pruning_exclusions(&delta, source);
-        assert!(
-            excluded > 0.0,
-            "the {source} source must record a pre-footer exclusion, saw {excluded}"
-        );
-    }
+    // Only the hot path decides exclusion from file bounds; the Iceberg
+    // snapshot prunes inside its own scan planning, and no second walk of the
+    // pinned file list runs to manufacture a per-source series.
+    let excluded = metric_value(
+        &delta,
+        "bifrost_oracle_file_pruning_total",
+        BifrostMetricKind::Counter,
+        &[("outcome", "excluded")],
+    );
+    assert!(
+        excluded >= 1.0 && excluded <= f64::from(u32::try_from(hot)?),
+        "every hot object is excluded before its footer, and only hot objects \
+         are counted, saw {excluded} for {hot} hot objects"
+    );
+    assert!(
+        delta
+            .metrics
+            .iter()
+            .filter(|sample| sample.family == "bifrost_oracle_file_pruning_total")
+            .all(|sample| !sample.labels.contains_key("source")),
+        "pruning carries no telemetry-only source label"
+    );
 
     // 7 (cluster owner). Final reconciliation for the pod that served every
     //    phase above: the owner closes, every start has a terminal, and nothing
@@ -566,21 +588,269 @@ async fn wait_for_waiter(storage: &Arc<BifrostStorage>) -> Result<(), JourneyErr
     Err("no concurrent caller joined the in-flight decode".into())
 }
 
-/// Sums one source's pre-footer exclusions in a production metric delta.
-fn pruning_exclusions(
-    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
-    source: &str,
-) -> f64 {
-    delta
-        .metrics
+/// Families retired as zero-only, duplicate, or telemetry-only work.
+///
+/// A sample of any of these in a real query window means a deleted emitter
+/// came back: the production HPA and query report read
+/// `oracle_query_duration_seconds`, and the rest never described real work.
+const RETIRED_QUERY_FAMILIES: [&str; 6] = [
+    "bifrost_query_duration_seconds",
+    "oracle_tenant_budget_pressure",
+    "oracle_query_spill_bytes_total",
+    "oracle_query_spill_files_total",
+    "oracle_query_logical_bytes_selected_total",
+    "bifrost_oracle_analytical_exchanges_active",
+];
+
+/// Proves the Gate request, Gate stream, and Oracle query facts of one query.
+///
+/// The query is parked after its first batch frame, so the window taken while
+/// it is parked shows the request opened successfully and no stream terminal
+/// exists yet. The window taken after the client reads the terminal shows
+/// exactly one successful stream and one Oracle execution, nested inside the
+/// server-edge interval, which is itself inside the client's own clock. The
+/// trace must be one causal story: the dispatch span is a child of the stream
+/// span, and the Oracle stream span shares its trace and ends inside it.
+///
+/// # Errors
+/// Returns a client, park, Postgres, or telemetry error.
+///
+/// # Panics
+/// Panics when an emitted fact disagrees with the stream the client observed.
+async fn prove_query_stream_telemetry(
+    cluster: &WyrdTestCluster,
+    server: &WyrdTestServer,
+    client: &WyrdClient,
+    fqn: &str,
+    tenant: wyrd_spec::DataTenantId,
+    table: &str,
+) -> Result<(), JourneyError> {
+    let telemetry = cluster.telemetry();
+    let opened_window = telemetry.checkpoint()?;
+    let final_window = telemetry.checkpoint()?;
+    let park = server.park_next_query_after_rows()?;
+    let client_clock = std::time::Instant::now();
+    let mut stream = wyrd_client::Bifrost::query_only(client)
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id FROM {fqn} ORDER BY id"),
+            deadline_ms: None,
+        })
+        .await?;
+    tokio::time::timeout(Duration::from_secs(30), park.wait_entered())
+        .await
+        .map_err(|_| "the query never parked after its first batch")?;
+
+    let opened = telemetry.delta_since(&opened_window)?;
+    assert_eq!(
+        metric_value(
+            &opened,
+            "bifrost_gate_requests_total",
+            BifrostMetricKind::Counter,
+            &[("operation", "query"), ("outcome", "success")],
+        ),
+        1.0,
+        "an opened stream is one successful Gate query request"
+    );
+    assert_eq!(
+        metric_value(
+            &opened,
+            "bifrost_gate_query_streams_total",
+            BifrostMetricKind::Counter,
+            &[],
+        ),
+        0.0,
+        "an open, unconsumed stream has no terminal outcome yet"
+    );
+    assert_eq!(
+        metric_value(
+            &opened,
+            "bifrost_gate_query_stream_duration_seconds",
+            BifrostMetricKind::HistogramCount,
+            &[],
+        ),
+        0.0,
+        "an open stream has no server-edge duration yet"
+    );
+    let active: f64 = opened
+        .gauge_final
         .iter()
         .filter(|sample| {
-            sample.family == "bifrost_oracle_file_pruning_total"
-                && sample.labels.get("source").map(String::as_str) == Some(source)
-                && sample.labels.get("outcome").map(String::as_str) == Some("excluded")
+            sample.family == "oracle_queries_active"
+                && sample.labels.get("class").map(String::as_str) == Some("interactive")
         })
         .map(|sample| sample.value)
-        .sum()
+        .sum();
+    assert_eq!(
+        active, 1.0,
+        "the parked admitted query is the one active query"
+    );
+    assert!(
+        !opened.spans.iter().any(|span| {
+            span.name == "bifrost.gate.query.stream" || span.name == "bifrost.oracle.stream"
+        }),
+        "no query operation span closes while its stream is still open"
+    );
+
+    park.resume();
+    let mut ids = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("the leading projected column is not Int64")?;
+        ids.extend(column.iter().flatten());
+    }
+    stream.terminal().ok_or("query terminal missing")?;
+    let client_elapsed = client_clock.elapsed().as_secs_f64();
+    drop(stream);
+    assert_eq!(
+        ids,
+        vec![1],
+        "the parked query returns the owner's exact row"
+    );
+    wait_for_spans(
+        telemetry,
+        &final_window,
+        &["bifrost.gate.query.stream", "bifrost.oracle.stream"],
+    )
+    .await?;
+
+    let finished = telemetry.delta_since(&final_window)?;
+    for outcome in ["success", "degraded", "rejected", "failed", "cancelled"] {
+        let expected = if outcome == "success" { 1.0 } else { 0.0 };
+        assert_eq!(
+            metric_value(
+                &finished,
+                "bifrost_gate_query_streams_total",
+                BifrostMetricKind::Counter,
+                &[("outcome", outcome)],
+            ),
+            expected,
+            "one consumed stream is exactly one {outcome} terminal when expected"
+        );
+    }
+    let gate_count = metric_value(
+        &finished,
+        "bifrost_gate_query_stream_duration_seconds",
+        BifrostMetricKind::HistogramCount,
+        &[("outcome", "success")],
+    );
+    let gate_seconds = metric_value(
+        &finished,
+        "bifrost_gate_query_stream_duration_seconds",
+        BifrostMetricKind::HistogramSum,
+        &[("outcome", "success")],
+    );
+    let oracle_count = metric_value(
+        &finished,
+        "oracle_query_duration_seconds",
+        BifrostMetricKind::HistogramCount,
+        &[("class", "interactive"), ("outcome", "success")],
+    );
+    let oracle_seconds = metric_value(
+        &finished,
+        "oracle_query_duration_seconds",
+        BifrostMetricKind::HistogramSum,
+        &[("class", "interactive"), ("outcome", "success")],
+    );
+    assert_eq!(
+        gate_count, 1.0,
+        "one server-edge stream duration observation"
+    );
+    assert_eq!(
+        oracle_count, 1.0,
+        "one Oracle execution duration observation"
+    );
+    assert!(
+        oracle_seconds <= gate_seconds && gate_seconds <= client_elapsed,
+        "Oracle work ({oracle_seconds}s) starts after the Gate stream ({gate_seconds}s), \
+         which the client clock ({client_elapsed}s) contains"
+    );
+
+    let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
+    let files = metric_value(
+        &finished,
+        "oracle_query_files_scanned_total",
+        BifrostMetricKind::Counter,
+        &[("class", "interactive")],
+    );
+    let bytes = metric_value(
+        &finished,
+        "oracle_query_bytes_scanned_total",
+        BifrostMetricKind::Counter,
+        &[("class", "interactive")],
+    );
+    assert_eq!(
+        files,
+        f64::from(u32::try_from(compacted + hot)?),
+        "scanned files are the published objects the plan actually read"
+    );
+    assert!(bytes > 0.0, "a read of a published object scans its bytes");
+
+    for family in RETIRED_QUERY_FAMILIES {
+        assert!(
+            !finished
+                .metrics
+                .iter()
+                .chain(&finished.gauge_final)
+                .any(|sample| sample.family == family && sample.value != 0.0),
+            "retired family {family} must not be emitted"
+        );
+    }
+    assert!(
+        !finished.metrics.iter().any(|sample| {
+            sample.family == "oracle_query_phase_seconds"
+                && sample.labels.get("phase").is_some_and(|phase| {
+                    [
+                        "first_row",
+                        "terminal",
+                        "table_lookup",
+                        "manifest_scan",
+                        "hot_cut",
+                    ]
+                    .contains(&phase.as_str())
+                })
+        }),
+        "duplicate and per-substep phases are not emitted"
+    );
+
+    let span = |name: &str| {
+        finished
+            .spans
+            .iter()
+            .filter(|span| span.name == name)
+            .collect::<Vec<_>>()
+    };
+    let gate_streams = span("bifrost.gate.query.stream");
+    let [gate_stream] = gate_streams.as_slice() else {
+        panic!("one query has one Gate stream span, saw {gate_streams:?}");
+    };
+    assert_eq!(
+        gate_stream.attributes.get("outcome").map(String::as_str),
+        Some("success")
+    );
+    let dispatches = span("bifrost.gate.query");
+    assert!(
+        dispatches
+            .iter()
+            .any(|dispatch| dispatch.parent_span_id == gate_stream.span_id),
+        "dispatch is causal child work of the client-facing stream"
+    );
+    let oracle_streams = span("bifrost.oracle.stream");
+    let [oracle_stream] = oracle_streams.as_slice() else {
+        panic!("one query has one Oracle stream span, saw {oracle_streams:?}");
+    };
+    assert_eq!(oracle_stream.trace_id, gate_stream.trace_id);
+    assert_eq!(
+        oracle_stream.attributes.get("outcome").map(String::as_str),
+        Some("success")
+    );
+    assert!(
+        oracle_stream.duration_nanos <= gate_stream.duration_nanos,
+        "Oracle stream work ends inside the Gate stream lifetime"
+    );
+    Ok(())
 }
 
 /// Reads one table's `id` column, optionally floored on event time.

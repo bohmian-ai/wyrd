@@ -3,6 +3,45 @@
 use std::time::Instant;
 use wyrd_spec::vala::api::QueryClass;
 
+/// Carries the spawning task's span into every task `DataFusion` spawns.
+///
+/// `DataFusion` runs partitions, repartitioning, and coalescing on its own
+/// spawned tasks, which start with no span. Without this, work a query plan
+/// does on those tasks, such as a remote peer fragment, would be a separate
+/// trace root rather than child work of the query that caused it.
+struct QuerySpanJoinSetTracer;
+
+impl datafusion::common::runtime::JoinSetTracer for QuerySpanJoinSetTracer {
+    /// Instruments a spawned future with the span current at spawn time.
+    fn trace_future(
+        &self,
+        future: futures_util::future::BoxFuture<'static, Box<dyn std::any::Any + Send>>,
+    ) -> futures_util::future::BoxFuture<'static, Box<dyn std::any::Any + Send>> {
+        use tracing::Instrument as _;
+        Box::pin(future.instrument(tracing::Span::current()))
+    }
+
+    /// Runs a spawned blocking closure inside the span current at spawn time.
+    fn trace_block(
+        &self,
+        block: Box<dyn FnOnce() -> Box<dyn std::any::Any + Send> + Send>,
+    ) -> Box<dyn FnOnce() -> Box<dyn std::any::Any + Send> + Send> {
+        let span = tracing::Span::current();
+        Box::new(move || span.in_scope(block))
+    }
+}
+
+/// Installs [`QuerySpanJoinSetTracer`] as `DataFusion`'s process tracer.
+///
+/// The tracer is process-global and can be set once; every Oracle owner in
+/// the process calls this, and a later call finding it already set is the
+/// expected outcome rather than a failure, because the installed tracer is
+/// this same stateless one.
+pub(crate) fn install_query_span_propagation() {
+    static TRACER: QuerySpanJoinSetTracer = QuerySpanJoinSetTracer;
+    let _already_installed = datafusion::common::runtime::set_join_set_tracer(&TRACER);
+}
+
 /// Returns the closed metric label every Oracle metric family uses for a class.
 pub(crate) const fn query_class_label(class: QueryClass) -> &'static str {
     match class {
@@ -34,23 +73,18 @@ impl OracleAdmissionOutcome {
     }
 }
 
-/// Closed local admission rejection reason.
+/// Closed local admission reason.
+///
+/// Only reasons an admission branch actually reaches are listed; a label value
+/// no code path can emit would be a permanently zero series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OracleAdmissionReason {
-    /// Class-local active capacity was exhausted.
+    /// Class-local active capacity granted the query, or the class has none.
     ClassCapacity,
-    /// Tenant-local budget was exhausted.
-    TenantBudget,
     /// Queue bound was reached.
     QueueFull,
     /// Queue deadline elapsed.
     QueueDeadline,
-    /// Memory budget was exhausted.
-    Memory,
-    /// Spill budget was exhausted.
-    Spill,
-    /// Audit WAL could not accept the decision.
-    AuditUnavailable,
     /// No live local Oracle membership may accept new work.
     Membership,
     /// Oracle shutdown closed admission.
@@ -58,28 +92,36 @@ pub(crate) enum OracleAdmissionReason {
 }
 
 impl OracleAdmissionReason {
-    /// Every wire value used by contract tests and dashboards.
-    pub(crate) const ALL: [Self; 9] = [
+    /// Every wire value, projected by the benchmark label-domain contract.
+    #[cfg(feature = "bench-support")]
+    pub(crate) const ALL: [Self; 5] = [
         Self::ClassCapacity,
-        Self::TenantBudget,
         Self::QueueFull,
         Self::QueueDeadline,
-        Self::Memory,
-        Self::Spill,
-        Self::AuditUnavailable,
         Self::Membership,
         Self::Shutdown,
     ];
+
+    /// Every `(outcome, reason)` pair an admission branch can emit.
+    ///
+    /// Oracle pre-registers exactly these series at zero, so an impossible
+    /// combination such as an admitted query refused for a full queue never
+    /// appears on a dashboard.
+    pub(crate) const DECISIONS: [(OracleAdmissionOutcome, Self); 6] = [
+        (OracleAdmissionOutcome::Admitted, Self::ClassCapacity),
+        (OracleAdmissionOutcome::Rejected, Self::ClassCapacity),
+        (OracleAdmissionOutcome::Rejected, Self::QueueFull),
+        (OracleAdmissionOutcome::Rejected, Self::QueueDeadline),
+        (OracleAdmissionOutcome::Rejected, Self::Membership),
+        (OracleAdmissionOutcome::Rejected, Self::Shutdown),
+    ];
+
     /// Return the canonical label value.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ClassCapacity => "class_capacity",
-            Self::TenantBudget => "tenant_budget",
             Self::QueueFull => "queue_full",
             Self::QueueDeadline => "queue_deadline",
-            Self::Memory => "memory",
-            Self::Spill => "spill",
-            Self::AuditUnavailable => "audit_unavailable",
             Self::Membership => "membership",
             Self::Shutdown => "shutdown",
         }
@@ -91,29 +133,19 @@ impl OracleAdmissionReason {
 pub(crate) enum OracleCancellationReason {
     /// Client dropped the response stream.
     ClientDrop,
-    /// Query deadline elapsed.
-    Deadline,
     /// Oracle shutdown cancelled the stream.
     Shutdown,
-    /// Peer execution failed.
-    PeerFailure,
 }
 
 impl OracleCancellationReason {
     /// Every wire value used by contract tests and dashboards.
-    pub(crate) const ALL: [Self; 4] = [
-        Self::ClientDrop,
-        Self::Deadline,
-        Self::Shutdown,
-        Self::PeerFailure,
-    ];
+    pub(crate) const ALL: [Self; 2] = [Self::ClientDrop, Self::Shutdown];
+
     /// Return the canonical label value.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ClientDrop => "client_drop",
-            Self::Deadline => "deadline",
             Self::Shutdown => "shutdown",
-            Self::PeerFailure => "peer_failure",
         }
     }
 }
@@ -311,7 +343,6 @@ pub(crate) fn register_analytical_series() {
         .increment(0);
     }
     metrics::gauge!("bifrost_oracle_analytical_attempts_active").set(0.0);
-    metrics::gauge!("bifrost_oracle_analytical_exchanges_active").set(0.0);
     metrics::counter!("bifrost_oracle_analytical_exchange_batches_total").increment(0);
     metrics::counter!("bifrost_oracle_analytical_exchange_bytes_total").increment(0);
     metrics::counter!("bifrost_oracle_analytical_output_sort_spills_total").increment(0);
@@ -397,13 +428,6 @@ impl AnalyticalAttemptTelemetry {
             attempt,
             outcome = tracing::field::Empty
         );
-        tracing::debug!(
-            parent: &span,
-            public_query_id,
-            datafusion_query_id,
-            attempt,
-            "Oracle analytical attempt started"
-        );
         Self {
             started_at: Instant::now(),
             finished: false,
@@ -432,12 +456,6 @@ impl AnalyticalAttemptTelemetry {
         )
         .record(elapsed.as_secs_f64());
         self.span.record("outcome", outcome.as_str());
-        tracing::info!(
-            parent: &self.span,
-            outcome = outcome.as_str(),
-            duration_ms = elapsed.as_millis(),
-            "Oracle analytical attempt settled"
-        );
     }
 }
 

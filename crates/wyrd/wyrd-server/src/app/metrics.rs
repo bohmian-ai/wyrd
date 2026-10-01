@@ -32,8 +32,6 @@ pub const HTTP_REQUESTS_TOTAL: &str = "wyrd_http_requests_total";
 /// Histogram of HTTP request latency in seconds, labelled like [`HTTP_REQUESTS_TOTAL`].
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "wyrd_http_request_duration_seconds";
 
-/// Production-facing query duration metric.
-pub const BIFROST_QUERY_DURATION_SECONDS: &str = "bifrost_query_duration_seconds";
 /// Production-facing Forge task duration metric.
 pub const BIFROST_FORGE_TASK_DURATION_SECONDS: &str = "bifrost_forge_task_duration_seconds";
 /// Gate request latency observed at the public write/query boundary.
@@ -81,7 +79,6 @@ pub const VERIFICATION_CAPABILITY_RESTARTS_TOTAL: &str =
 
 /// Every production Bifrost duration family whose p99 is consumed by qualification.
 const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
-    BIFROST_QUERY_DURATION_SECONDS,
     BIFROST_GATE_REQUEST_DURATION_SECONDS,
     BIFROST_GATE_QUERY_STREAM_DURATION_SECONDS,
     BIFROST_SCRIBE_ACK_SECONDS,

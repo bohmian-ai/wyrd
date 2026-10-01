@@ -249,7 +249,7 @@ pub fn initialize_gate_metrics() {
             .increment(0);
         }
     }
-    for outcome in ["success", "rejected", "failed", "cancelled"] {
+    for outcome in ["success", "degraded", "rejected", "failed", "cancelled"] {
         metrics::counter!("bifrost_gate_query_streams_total", "outcome" => outcome).increment(0);
     }
     metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
@@ -710,16 +710,17 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// stream lifecycle is attached to the returned stream after dispatch, so
     /// local and forwarded execution are accounted identically.
     ///
+    /// The lifecycle's `bifrost.gate.query.stream` span is the query's top
+    /// operation: dispatch runs in its `bifrost.gate.query` child, and the
+    /// returned stream is polled inside it until the terminal frame or client
+    /// drop, so Oracle planning, remote fragments, and terminal cleanup all
+    /// belong to one trace.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::OracleRoleUnavailable`] before any accounting
     /// when this Gate is closed or has no query dispatcher, otherwise returns
     /// the dispatcher's stable query errors.
-    #[tracing::instrument(
-        name = "bifrost.gate.role_dispatch",
-        skip_all,
-        fields(required_role = "oracle", operation = "query_sql")
-    )]
     pub async fn query_sql(
         &self,
         context: AuthorizedQueryContext,
@@ -749,6 +750,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         let result = dispatch
             .dispatch_sql(context, request)
             .instrument(tracing::info_span!(
+                parent: lifecycle.span(),
                 "bifrost.gate.query",
                 operation = "query"
             ))

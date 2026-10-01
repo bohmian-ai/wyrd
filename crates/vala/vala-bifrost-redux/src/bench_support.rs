@@ -21,11 +21,11 @@ pub struct OracleTelemetryLabelDomains {
     /// Admission outcome values emitted by production Oracle metrics.
     pub outcomes: [&'static str; 2],
     /// Admission reason values emitted by production Oracle metrics.
-    pub reasons: [&'static str; 9],
+    pub reasons: [&'static str; 5],
     /// Query terminal outcomes emitted by the Oracle stream owner.
     pub terminal_outcomes: [&'static str; 3],
     /// Query cancellation reasons emitted by the Oracle stream owner.
-    pub cancellation_reasons: [&'static str; 4],
+    pub cancellation_reasons: [&'static str; 2],
     /// Fragment terminal outcomes emitted by the Oracle dispatcher.
     pub fragment_outcomes: [&'static str; 2],
 }
@@ -55,10 +55,6 @@ pub const fn oracle_telemetry_label_domains() -> OracleTelemetryLabelDomains {
             reasons[2].as_str(),
             reasons[3].as_str(),
             reasons[4].as_str(),
-            reasons[5].as_str(),
-            reasons[6].as_str(),
-            reasons[7].as_str(),
-            reasons[8].as_str(),
         ],
         terminal_outcomes: [
             query_terminal_outcome_label(QueryTerminalOutcome::Success),
@@ -68,8 +64,6 @@ pub const fn oracle_telemetry_label_domains() -> OracleTelemetryLabelDomains {
         cancellation_reasons: [
             cancellation_reasons[0].as_str(),
             cancellation_reasons[1].as_str(),
-            cancellation_reasons[2].as_str(),
-            cancellation_reasons[3].as_str(),
         ],
         fragment_outcomes: [fragment_outcomes[0].as_str(), fragment_outcomes[1].as_str()],
     }

@@ -694,8 +694,7 @@ impl PeerCluster {
                 .ok_or_else(|| format!("pod {index} composes no spill root"))?,
         )?;
         let attempts = "bifrost_oracle_analytical_attempts_active";
-        let exchanges = "bifrost_oracle_analytical_exchanges_active";
-        let gauges = self.metric_totals(&[attempts, exchanges])?;
+        let gauges = self.metric_totals(&[attempts])?;
         Ok(OracleOwnershipSnapshot {
             leader_attempts: live.leader.attempts,
             leader_graphs: live.leader.graphs,
@@ -714,7 +713,6 @@ impl PeerCluster {
             root_query_active: root.oracle_query_active,
             scratch,
             attempts_active: gauges[attempts],
-            exchanges_active: gauges[exchanges],
         })
     }
 
@@ -758,6 +756,14 @@ impl PeerCluster {
             }
         }
         Ok(totals)
+    }
+
+    /// Returns the process-wide production telemetry capture every pod shares.
+    ///
+    /// One recorder and tracer serve the whole topology, so a delta from it is
+    /// the topology's total; trace identity, not a pod label, separates work.
+    pub(crate) fn telemetry(&self) -> &wyrd_testing::bifrost::BifrostTelemetryCapture {
+        self.cluster.telemetry()
     }
 
     /// Reads the process-wide count of private-plane request bodies polled.
@@ -1238,8 +1244,6 @@ pub(crate) struct OracleOwnershipSnapshot {
     pub(crate) scratch: ScratchUsage,
     /// Process-wide `bifrost_oracle_analytical_attempts_active` gauge.
     pub(crate) attempts_active: f64,
-    /// Process-wide `bifrost_oracle_analytical_exchanges_active` gauge.
-    pub(crate) exchanges_active: f64,
 }
 
 impl OracleOwnershipSnapshot {
@@ -1264,7 +1268,6 @@ impl OracleOwnershipSnapshot {
             bytes: 0,
         },
         attempts_active: 0.0,
-        exchanges_active: 0.0,
     };
 }
 

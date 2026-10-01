@@ -61,8 +61,6 @@ pub(crate) enum TelemetryUnit {
     Bytes,
     /// Seconds.
     Seconds,
-    /// Dimensionless budget-pressure ratio.
-    Ratio,
 }
 
 /// Closed requirement policy for the current representative workload.
@@ -169,12 +167,8 @@ const ORACLE_ADMISSION_LABELS: &[TelemetryLabelValues] = &[
         key: "reason",
         values: &[
             "class_capacity",
-            "tenant_budget",
             "queue_full",
             "queue_deadline",
-            "memory",
-            "spill",
-            "audit_unavailable",
             "membership",
             "shutdown",
         ],
@@ -192,7 +186,7 @@ const ORACLE_TERMINAL_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
 #[cfg(test)]
 const ORACLE_CANCELLATION_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
     key: "reason",
-    values: &["client_drop", "deadline", "shutdown", "peer_failure"],
+    values: &["client_drop", "shutdown"],
 }];
 
 /// Closed fragment terminal labels emitted by the Oracle dispatcher.
@@ -554,19 +548,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         }],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("oracle.tenant_pressure_peak"),
-        selected_label_values: &[],
-        family: "oracle_tenant_budget_pressure",
-        kind: BifrostMetricKind::Gauge,
-        unit: TelemetryUnit::Ratio,
-        aggregation: TelemetryAggregation::Peak,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "class",
-            values: &["interactive", "analytical"],
-        }],
-    },
-    TelemetryBinding {
         id: TelemetryBindingId("scribe.wal_bytes"),
         selected_label_values: &[],
         family: "bifrost_scribe_wal_append_bytes_total",
@@ -656,19 +637,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         }],
     },
     TelemetryBinding {
-        id: TelemetryBindingId("oracle.logical_bytes"),
-        selected_label_values: &[],
-        family: "oracle_query_logical_bytes_selected_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Bytes,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "class",
-            values: &["interactive", "analytical"],
-        }],
-    },
-    TelemetryBinding {
         id: TelemetryBindingId("oracle.physical_bytes"),
         selected_label_values: &[],
         family: "oracle_query_bytes_scanned_total",
@@ -719,51 +687,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
             key: "class",
             values: &["interactive", "analytical"],
         }],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.spill_bytes"),
-        selected_label_values: &[],
-        family: "oracle_query_spill_bytes_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Bytes,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "class",
-            values: &["interactive", "analytical"],
-        }],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.spill_files"),
-        selected_label_values: &[],
-        family: "oracle_query_spill_files_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "class",
-            values: &["interactive", "analytical"],
-        }],
-    },
-    TelemetryBinding {
-        id: TelemetryBindingId("oracle.spill_queries"),
-        selected_label_values: &[],
-        family: "oracle_query_spill_queries_total",
-        kind: BifrostMetricKind::Counter,
-        unit: TelemetryUnit::Count,
-        aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
-        allowed_label_values: &[
-            TelemetryLabelValues {
-                key: "class",
-                values: &["interactive", "analytical"],
-            },
-            TelemetryLabelValues {
-                key: "outcome",
-                values: &["success", "error", "cancelled"],
-            },
-        ],
     },
     TelemetryBinding {
         id: TelemetryBindingId("postgres.acquire"),
@@ -1444,6 +1367,17 @@ impl BifrostTelemetryCapture {
         }
 
         report
+    }
+
+    /// Return the spans finished since `checkpoint` without consuming it.
+    ///
+    /// A streamed operation's span closes when the server drops the response
+    /// stream, which can be shortly after the client has read the terminal
+    /// frame. A journey polls this bounded read until the span it needs has
+    /// closed, then takes its single consuming delta.
+    #[must_use]
+    pub fn spans_since(&self, checkpoint: &BifrostTelemetryCheckpoint) -> Vec<CapturedSpan> {
+        self.traces.finished_since(checkpoint.spans)
     }
 
     /// Return the names of all finished spans in the shared production capture.
@@ -2314,9 +2248,6 @@ fn validate_binding_unit(binding: &TelemetryBinding) -> Result<(), BifrostTeleme
                 || (binding.family.contains("_bytes_") && binding.family.ends_with("_total"))
         }
         TelemetryUnit::Seconds => binding.family.ends_with("_seconds"),
-        TelemetryUnit::Ratio => {
-            !binding.family.ends_with("_seconds") && !binding.family.ends_with("_bytes_total")
-        }
     };
     if valid {
         Ok(())
@@ -2381,8 +2312,8 @@ impl BifrostQueryTelemetryReport {
         Ok(Self {
             query_latency_p99_us: histogram_quantile_for_label(
                 delta,
-                "bifrost_query_duration_seconds",
-                "result",
+                "oracle_query_duration_seconds",
+                "outcome",
                 "success",
                 0.99,
             )? * 1_000_000.0,
@@ -2390,19 +2321,25 @@ impl BifrostQueryTelemetryReport {
     }
 }
 
-/// Reject unexpected labels or categorical values on the server query histogram.
+/// Reject unexpected labels or categorical values on the Oracle query histogram.
 fn validate_query_label_contract(
     delta: &BifrostTelemetryDelta,
 ) -> Result<(), BifrostTelemetryReportError> {
     for sample in delta
         .metrics
         .iter()
-        .filter(|sample| sample.family == "bifrost_query_duration_seconds")
+        .filter(|sample| sample.family == "oracle_query_duration_seconds")
     {
         validate_sample_labels(
             sample,
-            &["result", "le"],
-            &[("result", &["success", "rejected", "failed"])],
+            &["class", "outcome", "le"],
+            &[
+                ("class", &["interactive", "analytical"]),
+                (
+                    "outcome",
+                    &["success", "degraded", "failed", "cancelled", "client_drop"],
+                ),
+            ],
         )?;
     }
     Ok(())
@@ -2811,6 +2748,8 @@ mod tests {
     fn captured_span(name: &str, attributes: &[(&str, &str)]) -> CapturedSpan {
         CapturedSpan {
             trace_id: "00000000000000000000000000000001".to_owned(),
+            span_id: "0000000000000001".to_owned(),
+            parent_span_id: "0000000000000000".to_owned(),
             name: name.to_owned(),
             attributes: attributes
                 .iter()
@@ -3224,8 +3163,7 @@ mod tests {
 
             let mut wrong_unit = *binding;
             wrong_unit.unit = match binding.unit {
-                TelemetryUnit::Count => TelemetryUnit::Seconds,
-                TelemetryUnit::Bytes | TelemetryUnit::Ratio => TelemetryUnit::Seconds,
+                TelemetryUnit::Count | TelemetryUnit::Bytes => TelemetryUnit::Seconds,
                 TelemetryUnit::Seconds => TelemetryUnit::Count,
             };
             assert!(matches!(
@@ -3474,7 +3412,7 @@ mod tests {
         use BifrostMetricKind::{Counter, Gauge, HistogramBucket};
         use TelemetryAggregation::{Delta, Final, P99, Peak};
         use TelemetryRequirement::{Always, Role};
-        use TelemetryUnit::{Bytes, Count, Ratio, Seconds};
+        use TelemetryUnit::{Bytes, Count, Seconds};
         vec![
             EmitterContractFixture {
                 id: "gate.requests.success",
@@ -3762,12 +3700,8 @@ mod tests {
                         "reason",
                         &[
                             "class_capacity",
-                            "tenant_budget",
                             "queue_full",
                             "queue_deadline",
-                            "memory",
-                            "spill",
-                            "audit_unavailable",
                             "membership",
                             "shutdown",
                         ],
@@ -3789,18 +3723,6 @@ mod tests {
                 aggregation: P99,
                 requirement: Role("oracle"),
                 destination: "oracle admission queue",
-            },
-            EmitterContractFixture {
-                id: "oracle.tenant_pressure_peak",
-                selectors: &[],
-                family: "oracle_tenant_budget_pressure",
-                kind: Gauge,
-                keys: &["class"],
-                domains: &[("class", &["interactive", "analytical"])],
-                unit: Ratio,
-                aggregation: Peak,
-                requirement: Role("oracle"),
-                destination: "oracle tenant pressure",
             },
             EmitterContractFixture {
                 id: "scribe.wal_bytes",
@@ -3957,18 +3879,6 @@ mod tests {
                 destination: "phase.oracle_stream_bytes",
             },
             EmitterContractFixture {
-                id: "oracle.logical_bytes",
-                selectors: &[],
-                family: "oracle_query_logical_bytes_selected_total",
-                kind: Counter,
-                keys: &["class"],
-                domains: &[("class", &["interactive", "analytical"])],
-                unit: Bytes,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "oracle logical bytes",
-            },
-            EmitterContractFixture {
                 id: "oracle.physical_bytes",
                 selectors: &[],
                 family: "oracle_query_bytes_scanned_total",
@@ -4015,45 +3925,6 @@ mod tests {
                 aggregation: Peak,
                 requirement: Role("oracle"),
                 destination: "oracle queued peak",
-            },
-            EmitterContractFixture {
-                id: "oracle.spill_bytes",
-                selectors: &[],
-                family: "oracle_query_spill_bytes_total",
-                kind: Counter,
-                keys: &["class"],
-                domains: &[("class", &["interactive", "analytical"])],
-                unit: Bytes,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "oracle spill bytes",
-            },
-            EmitterContractFixture {
-                id: "oracle.spill_files",
-                selectors: &[],
-                family: "oracle_query_spill_files_total",
-                kind: Counter,
-                keys: &["class"],
-                domains: &[("class", &["interactive", "analytical"])],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "oracle spill files",
-            },
-            EmitterContractFixture {
-                id: "oracle.spill_queries",
-                selectors: &[],
-                family: "oracle_query_spill_queries_total",
-                kind: Counter,
-                keys: &["class", "outcome"],
-                domains: &[
-                    ("class", &["interactive", "analytical"]),
-                    ("outcome", &["success", "error", "cancelled"]),
-                ],
-                unit: Count,
-                aggregation: Delta,
-                requirement: Role("oracle"),
-                destination: "oracle spill queries",
             },
             EmitterContractFixture {
                 id: "postgres.acquire",

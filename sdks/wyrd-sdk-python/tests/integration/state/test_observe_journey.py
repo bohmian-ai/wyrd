@@ -28,6 +28,7 @@ from uuid import uuid4
 import pytest
 import wyrd
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.proto.common.v1.common_pb2 import KeyValueList
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel
@@ -401,6 +402,14 @@ def emit_framework_scope(
     return agent_run, (f"{ids.trace_id:032x}", f"{ids.span_id:016x}")
 
 
+def asserted_card_ref(attributes: bytes) -> str:
+    """Read the ``wyrd.card_ref`` a span asserted from its persisted attribute payload."""
+    values = {
+        item.key: item.value.string_value for item in KeyValueList.FromString(attributes).values
+    }
+    return values["wyrd.card_ref"]
+
+
 def assert_scope_joins(
     server: WyrdTestServer,
     credential: str,
@@ -414,16 +423,18 @@ def assert_scope_joins(
     run_id = agent_run.run_id
     spans = (
         query.sql(
-            "SELECT name, card_ref, run_id, card_uid, principal_id "
+            "SELECT name, attributes, run_id, card_uid, principal_id "
             f"FROM vala.traces.spans WHERE run_id = '{run_id}' ORDER BY name"
         )
         .to_arrow()
         .to_pylist()
     )
     assert [row["name"] for row in spans] == ["agent.invoke", "agent.tool"]
-    assert {(row["card_ref"], row["run_id"], row["card_uid"]) for row in spans} == {
-        (agent_run.card_ref, run_id, agent_uid)
-    }
+    # The asserted CardRef is not a column: Scribe resolves it to `card_uid`
+    # and the lossless attribute payload keeps exactly what the client sent.
+    assert {
+        (asserted_card_ref(row["attributes"]), row["run_id"], row["card_uid"]) for row in spans
+    } == {(agent_run.card_ref, run_id, agent_uid)}
     publishers = {row["principal_id"] for row in spans}
     assert len(publishers) == 1 and None not in publishers, "one authenticated publisher"
     (publisher,) = publishers

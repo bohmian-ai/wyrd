@@ -2251,9 +2251,11 @@ async fn three_concurrent_snapshots_are_not_refused() {
 /// Holds the catalog table lock while a burst of public queries reaches
 /// snapshot preparation, then releases it and requires every query to finish.
 ///
-/// The lock is test-owned database state: `ACCESS EXCLUSIVE` makes each
-/// query's catalog identity lookup wait in Postgres exactly as a busy
-/// connection pool or slow catalog would. The burst is only released once
+/// The lock is test-owned database state: `ACCESS EXCLUSIVE` on the Iceberg
+/// catalog table makes each query's uncached metadata-pointer read wait in
+/// Postgres exactly as a busy connection pool or slow catalog would. The
+/// registration lookup is served from the node's cache after the setup write,
+/// so it cannot be the blocked read. The burst is only released once
 /// every query is provably blocked on that lock, or once any query has already
 /// ended — an early end is the immediate refusal this journey forbids.
 ///
@@ -2275,7 +2277,7 @@ async fn prove_concurrent_snapshots_wait() -> Result<(), JourneyError> {
 
     let superuser = cluster.pg_fixture().superuser_pool().await?;
     let mut lock = superuser.begin().await?;
-    sqlx::query("LOCK TABLE vala.bifrost_tables IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE iceberg_catalog.iceberg_tables IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *lock)
         .await?;
     let burst: Vec<JoinHandle<Result<u64, String>>> = (0..SNAPSHOT_BURST)
@@ -2293,7 +2295,7 @@ async fn prove_concurrent_snapshots_wait() -> Result<(), JourneyError> {
     for _ in 0..SNAPSHOT_LOCK_POLLS {
         blocked = sqlx::query_scalar(
             "SELECT count(*) FROM pg_locks \
-             WHERE relation = 'vala.bifrost_tables'::regclass AND NOT granted",
+             WHERE relation = 'iceberg_catalog.iceberg_tables'::regclass AND NOT granted",
         )
         .fetch_one(&superuser)
         .await?;

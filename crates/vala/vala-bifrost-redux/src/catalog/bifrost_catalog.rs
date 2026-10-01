@@ -410,7 +410,8 @@ impl BifrostCatalog {
     ///
     /// This is deliberately the whole of what may happen before protection: a
     /// registration lookup (served from [`BifrostCatalog::table_uid`]'s cache
-    /// after the table's first query), one authoritative metadata-pointer read, one read of
+    /// after the node's first write or query of the table), one authoritative
+    /// metadata-pointer read, one read of
     /// the immutable metadata document it names, and the facts derived from
     /// that document. Reading that document is the allowed
     /// identity step because there is no other way to name the snapshot that

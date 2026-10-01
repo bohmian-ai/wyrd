@@ -76,6 +76,28 @@ const PUBLICATION_FAMILIES: [&str; 8] = [
     "bifrost_scribe_seal_failed_total",
 ];
 
+/// Prints every captured span of one trace with its parentage and outcome.
+fn print_trace(delta: &BifrostTelemetryDelta, trace_id: &str, story: &str) {
+    for span in delta.spans.iter().filter(|span| span.trace_id == trace_id) {
+        let levels: Vec<_> = span
+            .events
+            .iter()
+            .filter_map(|event| event.attributes.get("level"))
+            .collect();
+        eprintln!(
+            "evidence trace story={story} trace={} span={} parent={} name={} duration_nanos={} \
+             outcome={:?} batch_id={:?} event_levels={levels:?}",
+            span.trace_id,
+            span.span_id,
+            span.parent_span_id,
+            span.name,
+            span.duration_nanos,
+            attribute(span, "outcome"),
+            attribute(span, "batch_id"),
+        );
+    }
+}
+
 /// Prints every Bifrost and Oracle family the production exposition holds.
 ///
 /// One line per family with its series count, so the run's output is an
@@ -504,6 +526,7 @@ async fn scribe_hot_path_telemetry_reconciles() {
         traced, sent,
         "the write traces carry each request's batch id"
     );
+    print_trace(&written, &writes[0].trace_id, "write_success");
     assert!(
         spans_named(&written, "bifrost.scribe.wal.append").is_empty(),
         "per-append WAL spans are DEBUG detail, not routine operation traces"
@@ -724,6 +747,9 @@ async fn scribe_hot_path_telemetry_reconciles() {
         .filter(|span| attribute(span, "outcome") == Some("failed"))
         .collect();
     assert!(!failed_writes.is_empty(), "the failed write is traced");
+    for span in &failed_writes {
+        print_trace(&failed, &span.trace_id, "write_failure");
+    }
     for span in failed_writes {
         // The whole trace, not only the root: a failure re-logged by a child
         // span would repeat the reason under the same correlation identity.

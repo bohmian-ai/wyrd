@@ -812,6 +812,22 @@ async fn assert_public_rows(
     digest
 }
 
+/// Forge families the journey and recovery windows print as evidence.
+const FORGE_FAMILIES: [&str; 12] = [
+    "bifrost_forge_pending_tasks",
+    "bifrost_forge_oldest_pending_task_timestamp_seconds",
+    "bifrost_forge_active_tasks",
+    "bifrost_forge_tasks_created_total",
+    "bifrost_forge_task_attempts_total",
+    "bifrost_forge_task_failures_total",
+    "bifrost_forge_input_files_total",
+    "bifrost_forge_input_bytes_total",
+    "bifrost_forge_output_files_total",
+    "bifrost_forge_output_bytes_total",
+    "bifrost_forge_compaction_debt_files",
+    "bifrost_forge_compaction_debt_bytes",
+];
+
 /// Durable rewrite facts one recovered operation must be able to prove.
 ///
 /// Every field is read out of Postgres or the Iceberg manifests before this
@@ -1881,6 +1897,41 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let journey_window = telemetry
         .delta_since(&checkpoint)
         .expect("production telemetry delta");
+    eprintln!(
+        "evidence forge phase=journey durable_unsettled_tasks={} samples: {}",
+        pending_tasks(&cluster).await,
+        journey_window.evidence(&FORGE_FAMILIES)
+    );
+    for span in recovery_window
+        .spans
+        .iter()
+        .filter(|span| span.name.starts_with("bifrost.forge."))
+    {
+        eprintln!(
+            "evidence forge_trace trace={} span={} parent={} name={} duration_nanos={} \
+             result={:?} task_type={:?} event_levels={:?}",
+            span.trace_id,
+            span.span_id,
+            span.parent_span_id,
+            span.name,
+            span.duration_nanos,
+            attribute(span, "result"),
+            attribute(span, "task_type"),
+            span.events
+                .iter()
+                .filter_map(|event| event.attributes.get("level"))
+                .collect::<Vec<_>>()
+        );
+    }
+    eprintln!(
+        "evidence forge phase=recovery landed_task={landed_task} attempt={landed_attempt} \
+         removed_files={} added_files={} removed_bytes={} added_bytes={} samples: {}",
+        landed.removed_data.len(),
+        landed.added_data.len(),
+        landed.removed_bytes,
+        landed.added_bytes,
+        recovery_window.evidence(&FORGE_FAMILIES)
+    );
     assert_recovery_telemetry(
         &journey_window,
         &recovery_window,

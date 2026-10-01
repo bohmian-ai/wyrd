@@ -2452,6 +2452,12 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
             .sum()
     };
     let admitted = server.oracle_runtime_inspection()?.active_queries;
+    eprintln!(
+        "evidence query_queue phase=held owner_queued={queued} owner_admitted={admitted} \
+         scraped oracle_queries_queued={} oracle_queries_active={}",
+        gauge("oracle_queries_queued"),
+        gauge("oracle_queries_active")
+    );
     assert_eq!(
         gauge("oracle_queries_queued"),
         2.0,
@@ -2489,6 +2495,12 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     // Both waiters were granted from the queue: each records one queue wait
     // at least as long as the hold that kept it waiting, and one admission.
     let granted = cluster.telemetry().delta_since(&queue_window)?;
+    eprintln!(
+        "evidence query_queue phase=granted http_rows={http_rows} grpc_rows={grpc_rows} \
+         held_seconds={} samples: {}",
+        QUEUED_HOLD.as_secs_f64(),
+        granted.evidence(&QUEUE_FAMILIES)
+    );
     assert_eq!(
         metric_value(
             &granted,
@@ -2574,6 +2586,11 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     // Six expiries, three statements over two transports, each one refusal
     // for the queue deadline and nothing left waiting.
     let expired = cluster.telemetry().delta_since(&expiry_window)?;
+    eprintln!(
+        "evidence query_queue phase=expired typed_timeouts=6 owner_queued={} samples: {}",
+        server.oracle_runtime_inspection()?.queued_queries,
+        expired.evidence(&QUEUE_FAMILIES)
+    );
     assert_eq!(
         metric_value(
             &expired,
@@ -2599,6 +2616,16 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Admission and execution families the saturated-wait windows print as evidence.
+const QUEUE_FAMILIES: [&str; 6] = [
+    "oracle_queries_queued",
+    "oracle_queries_active",
+    "oracle_admission_total",
+    "oracle_admission_queue_duration_seconds",
+    "oracle_query_duration_seconds",
+    "bifrost_gate_query_streams_total",
+];
 
 /// Queue places the overflow journey boots its Oracle pods with.
 ///

@@ -566,6 +566,21 @@ async fn wait_for_waiter(storage: &Arc<BifrostStorage>) -> Result<(), JourneyErr
     Err("no concurrent caller joined the in-flight decode".into())
 }
 
+/// Gate and Oracle families the query-stream windows print as evidence.
+const QUERY_STREAM_FAMILIES: [&str; 11] = [
+    "bifrost_gate_requests_total",
+    "bifrost_gate_query_streams_total",
+    "bifrost_gate_query_stream_duration_seconds",
+    "bifrost_gate_active_streams",
+    "oracle_queries_active",
+    "oracle_queries_queued",
+    "oracle_admission_total",
+    "oracle_query_duration_seconds",
+    "oracle_query_files_scanned_total",
+    "oracle_query_bytes_scanned_total",
+    "oracle_query_rows_total",
+];
+
 /// Families retired as zero-only, duplicate, or telemetry-only work.
 ///
 /// A sample of any of these in a real query window means a deleted emitter
@@ -619,6 +634,10 @@ async fn prove_query_stream_telemetry(
         .map_err(|_| "the query never parked after its first batch")?;
 
     let opened = telemetry.delta_since(&opened_window)?;
+    eprintln!(
+        "evidence query_opened client_rows_read=0 parked=true samples: {}",
+        opened.evidence(&QUERY_STREAM_FAMILIES)
+    );
     assert_eq!(
         metric_value(
             &opened,
@@ -765,6 +784,13 @@ async fn prove_query_stream_telemetry(
         "scanned files are the published objects the plan actually read"
     );
     assert!(bytes > 0.0, "a read of a published object scans its bytes");
+    eprintln!(
+        "evidence query_finished client_rows={} client_elapsed_seconds={client_elapsed} \
+         published_objects={} samples: {}",
+        ids.len(),
+        compacted + hot,
+        finished.evidence(&QUERY_STREAM_FAMILIES)
+    );
 
     for family in RETIRED_QUERY_FAMILIES {
         assert!(
@@ -828,6 +854,21 @@ async fn prove_query_stream_telemetry(
         oracle_stream.duration_nanos <= gate_stream.duration_nanos,
         "Oracle stream work ends inside the Gate stream lifetime"
     );
+    for span in finished
+        .spans
+        .iter()
+        .filter(|span| span.trace_id == gate_stream.trace_id)
+    {
+        eprintln!(
+            "evidence query_trace trace={} span={} parent={} name={} duration_nanos={} outcome={:?}",
+            span.trace_id,
+            span.span_id,
+            span.parent_span_id,
+            span.name,
+            span.duration_nanos,
+            span.attributes.get("outcome")
+        );
+    }
     Ok(())
 }
 

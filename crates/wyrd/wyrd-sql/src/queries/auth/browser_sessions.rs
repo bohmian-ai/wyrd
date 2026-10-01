@@ -27,10 +27,9 @@ const PURGE_EXPIRED_BROWSER_SESSIONS_SQL: &str = r#"
 
 /// Create one live session owned by the RLS tenant.
 ///
-/// The absolute expiry is either the bound producer instant (`$13`, an SSO
-/// session's refresh-token expiry) or `PostgreSQL`'s clock plus the bound
-/// lifetime in seconds (`$14`, an API-key session's fixed limit). The id hash
-/// is the primary key, so a reused id inserts nothing.
+/// The absolute expiry is `PostgreSQL`'s clock plus the bound fixed lifetime
+/// in seconds (`$13`); the refresh-token expiry (`$10`) is stored separately
+/// as issued. The id hash is the primary key, so a reused id inserts nothing.
 const INSERT_BROWSER_SESSION_SQL: &str = r#"
     INSERT INTO wyrd.auth_browser_sessions (
         id_hash, data_tenant_id, principal_id, connection_id, mode,
@@ -38,7 +37,7 @@ const INSERT_BROWSER_SESSION_SQL: &str = r#"
         access_expires_at, refresh_expires_at, csrf_hash, csrf_token_sealed,
         absolute_expires_at
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-              COALESCE($13, statement_timestamp() + ($14 * interval '1 second')))
+              statement_timestamp() + ($13 * interval '1 second'))
     ON CONFLICT DO NOTHING
     RETURNING absolute_expires_at
 "#;
@@ -123,16 +122,6 @@ impl BrowserSessionMode {
     }
 }
 
-/// When a new session stops being usable regardless of renewal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionLifetime {
-    /// A producer-owned instant: an SSO session ends with its login's refresh
-    /// token.
-    Until(DateTime<Utc>),
-    /// A fixed limit from `PostgreSQL`'s clock at creation.
-    For(Duration),
-}
-
 /// One new session as [`insert_browser_session`] writes it.
 ///
 /// Every credential is already a keyring envelope; nothing here is plaintext.
@@ -158,8 +147,9 @@ pub struct BrowserSessionWrite {
     pub csrf_hash: Sha256Hex,
     /// Sealed session CSRF token.
     pub csrf_token_sealed: Vec<u8>,
-    /// When the session ends regardless of renewal.
-    pub lifetime: SessionLifetime,
+    /// Fixed lifetime from `PostgreSQL`'s clock at creation after which the
+    /// session ends regardless of renewal.
+    pub lifetime: Duration,
 }
 
 /// A live session locked by [`lock_browser_session`].
@@ -230,10 +220,6 @@ pub async fn insert_browser_session(
     sqlx::query(PURGE_EXPIRED_BROWSER_SESSIONS_SQL)
         .execute(&mut **conn.transaction())
         .await?;
-    let (until, lifetime_secs) = match row.lifetime {
-        SessionLifetime::Until(instant) => (Some(instant), None),
-        SessionLifetime::For(lifetime) => (None, Some(lifetime.as_secs_f64())),
-    };
     sqlx::query_scalar::<_, DateTime<Utc>>(INSERT_BROWSER_SESSION_SQL)
         .bind(id_hash.as_bytes().as_slice())
         .bind(tenant)
@@ -247,8 +233,7 @@ pub async fn insert_browser_session(
         .bind(row.refresh_expires_at)
         .bind(row.csrf_hash.as_bytes().as_slice())
         .bind(&row.csrf_token_sealed)
-        .bind(until)
-        .bind(lifetime_secs)
+        .bind(row.lifetime.as_secs_f64())
         .fetch_optional(&mut **conn.transaction())
         .await
 }

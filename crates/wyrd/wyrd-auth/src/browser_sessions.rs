@@ -29,17 +29,17 @@ use wyrd_spec::auth::{LoginInitiation, Sha256Hex, TokenResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{
-    BrowserSessionMode, BrowserSessionWrite, LockedBrowserSession, SessionLifetime,
-    insert_browser_session, lock_browser_session, redeem_login_completion, refresh_by_hash,
-    revoke_browser_session, revoke_refresh, rotate_browser_session,
+    BrowserSessionMode, BrowserSessionWrite, LockedBrowserSession, insert_browser_session,
+    lock_browser_session, redeem_login_completion, refresh_by_hash, revoke_browser_session,
+    revoke_refresh, rotate_browser_session,
 };
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::connections::HumanConnections;
+use crate::credential_verify::verify_presented;
 use crate::error::{auth_error_to_wyrd, store_error};
 use crate::exchange_api_key::{ExchangeApiKey, api_key_invalid, token_hash};
 use crate::issuance::{ExchangedToken, TenantTokenIssuer};
-use crate::issue_api_key::WyrdApiKey;
 use crate::refresh::{RefreshError, RefreshTokens, claims_from_refresh_jwt};
 
 /// Absolute lifetime of a tenant SSO browser session; refresh rotation keeps
@@ -238,26 +238,31 @@ impl BrowserSessions {
             api_key_sealed: None,
             csrf_hash: Sha256Hex::digest(csrf.as_bytes()),
             csrf_token_sealed: seal(keyring, &csrf)?,
-            lifetime: SessionLifetime::For(SSO_SESSION_LIFETIME),
+            lifetime: SSO_SESSION_LIFETIME,
         };
         self.insert(conn, tenant_key, &write).await
     }
 
     /// Exchange an existing tenant API key for an OIDC-off browser session.
     ///
-    /// The key's own embedded tenant must be the tenant `tenant_key` names;
-    /// otherwise, and for every other unusable key, the one indistinguishable
-    /// API-key refusal is returned. The key is verified and exchanged through
-    /// the ordinary audited API-key exchange, then stored sealed so each later
+    /// The route tenant `tenant_key` names is resolved first and the presented
+    /// key is handed, unparsed, to the ordinary audited API-key exchange on
+    /// that tenant's connection; the shared verifier there decides malformed,
+    /// other-tenant, unknown, revoked, and wrong-secret keys at the cost of
+    /// exactly one verification. An unknown route tenant has no connection, so
+    /// it pays that one verification against the fixed dummy instead. Every
+    /// refusal is the one indistinguishable API-key refusal, and only a
+    /// successful exchange stores a session: the key is sealed so each later
     /// renewal re-exchanges it under the session lock. No refresh token
     /// exists; the session ends after eight hours or when the key stops
     /// exchanging.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] without a keyring or for a malformed
-    /// CSRF token, [`WyrdError::ApiKeyInvalid`] for an unusable key or one of
-    /// another tenant, and [`WyrdError::AuthVerifyUnavailable`] when the store
-    /// fails.
+    /// CSRF token, [`WyrdError::ApiKeyInvalid`] for an unknown route tenant, an
+    /// unusable key, or one of another tenant, [`WyrdError::Internal`] when
+    /// the dummy verification task fails, and
+    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails.
     pub async fn exchange_api_key(
         &self,
         tenant_key: &TenantSlug,
@@ -267,18 +272,18 @@ impl BrowserSessions {
     ) -> Result<CreatedBrowserSession, WyrdError> {
         let keyring = self.require_keyring()?;
         let csrf = lower_hex_256(csrf_token, "csrf_token")?;
-        let key_tenant = WyrdApiKey::parse(api_key.expose_secret())
-            .map_err(|_| api_key_invalid())?
-            .tenant_id;
-        let tenant = self
+        let Some(tenant) = self
             .postgres
             .resolve_tenant_slug(tenant_key)
             .await
-            .map_err(store_error)?;
-        if tenant != Some(key_tenant) {
+            .map_err(store_error)?
+        else {
+            verify_presented(api_key, None)
+                .await
+                .map_err(|_| unusable("api key verification failed"))?;
             return Err(api_key_invalid());
-        }
-        let mut conn = self.begin(key_tenant).await?;
+        };
+        let mut conn = self.begin(tenant).await?;
         let exchanged = ExchangeApiKey {
             issuer: self.issuer.clone(),
         }
@@ -288,7 +293,7 @@ impl BrowserSessions {
             tracing::info!(error = %error, "browser api key sign-in refused");
             api_key_invalid()
         })?;
-        let principal_id = self.principal_of(key_tenant, exchanged.access_token.expose_secret())?;
+        let principal_id = self.principal_of(tenant, exchanged.access_token.expose_secret())?;
         let write = BrowserSessionWrite {
             principal_id,
             connection_id: None,
@@ -300,7 +305,7 @@ impl BrowserSessions {
             api_key_sealed: Some(seal(keyring, api_key.expose_secret())?),
             csrf_hash: Sha256Hex::digest(csrf.as_bytes()),
             csrf_token_sealed: seal(keyring, &csrf)?,
-            lifetime: SessionLifetime::For(API_KEY_SESSION_LIFETIME),
+            lifetime: API_KEY_SESSION_LIFETIME,
         };
         self.insert(conn, tenant_key.clone(), &write).await
     }

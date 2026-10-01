@@ -25,8 +25,8 @@ pub use api_keys::{
     ApiKeyMetadataRow, credential_belongs_to, list_api_key_metadata, revoke_api_key,
 };
 pub use browser_sessions::{
-    BrowserSessionMode, BrowserSessionWrite, LockedBrowserSession, SessionLifetime,
-    insert_browser_session, lock_browser_session, revoke_browser_session, rotate_browser_session,
+    BrowserSessionMode, BrowserSessionWrite, LockedBrowserSession, insert_browser_session,
+    lock_browser_session, revoke_browser_session, rotate_browser_session,
 };
 pub use human_connections::{
     HumanConnectionWrite, SealedSecretRow, SealedSecretTable, deactivate_active_human_connection,

@@ -448,9 +448,12 @@ impl HumanConnections {
     /// Allowed or Denied decision on `identity_connections:write`, appended
     /// before promotion or the committed refusal.
     ///
-    /// A keyless deployment is refused first, before any lock or decision:
-    /// the activated connection could not complete a human login, secretless
-    /// providers included, because completions are sealed by the keyring.
+    /// A keyless deployment is refused right after the lock and decision are
+    /// taken, before any candidate or recovery-key read: the activated
+    /// connection could not complete a human login, secretless providers
+    /// included, because completions are sealed by the keyring. The refusal
+    /// commits the caller's appended decision, so the evaluated permission
+    /// is audited.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] with reason `sealing_key_missing`
@@ -466,9 +469,11 @@ impl HumanConnections {
         request: ConnectionActivate,
         decision: &AuditEvent,
     ) -> Result<HumanConnectionView, WyrdError> {
-        self.require_keyring()?;
-        let recovery_key = request.recovery_api_key.into_secret_string();
         let mut conn = self.begin_locked(tenant, decision).await?;
+        if let Err(refusal) = self.require_keyring() {
+            return commit_refusal(conn, refusal).await;
+        }
+        let recovery_key = request.recovery_api_key.into_secret_string();
         let candidate =
             human_connection_in_state(&mut conn, HumanConnectionState::Candidate.as_str())
                 .await
@@ -1314,10 +1319,13 @@ mod probe_tests {
 
     /// A keyless deployment cannot activate even a secretless (public-client)
     /// candidate: the refusal names the missing sealing key and happens
-    /// before any candidate or recovery key is consulted.
+    /// before any candidate or recovery key is consulted. The caller's
+    /// evaluated decision still commits as exactly one canonical staged row
+    /// that carries no recovery-key material, and no connection is promoted.
     ///
     /// # Panics
-    /// Panics when the fixture cannot start or activation is not refused.
+    /// Panics when the fixture cannot start, activation is not refused, or
+    /// the staged audit and connection state disagree with that contract.
     #[tokio::test]
     async fn activation_without_a_sealing_key_is_refused_for_a_secretless_provider() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -1335,9 +1343,10 @@ mod probe_tests {
             None,
             super::AuditOutcome::Allowed,
         );
+        let recovery_secret = "wyrd_recovery_never_staged";
         let request = wyrd_spec::auth::ConnectionActivate {
             expected_revision: 1,
-            recovery_api_key: wyrd_spec::auth::SecretBearer::new("not-checked".to_owned()),
+            recovery_api_key: wyrd_spec::auth::SecretBearer::new(recovery_secret.to_owned()),
         };
 
         let outcome = connections
@@ -1349,5 +1358,28 @@ mod probe_tests {
             }
             other => panic!("expected sealing_key_missing, got {other:?}"),
         }
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let staged: Vec<String> = sqlx::query_scalar(
+            "SELECT row_to_json(s)::text FROM vala.audit_staging s
+              WHERE data_tenant_id = $1 AND operation = $2 AND outcome = 'allowed'",
+        )
+        .bind(fixture.data_tenant_id().as_uuid())
+        .bind("identity.oidc.candidate.activate")
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("staged decisions read");
+        assert_eq!(staged.len(), 1, "the allowed decision commits once");
+        assert!(
+            !staged[0].contains(recovery_secret),
+            "the staged decision carries no recovery key"
+        );
+        let active = super::human_connection_in_state(
+            &mut conn,
+            wyrd_spec::auth::HumanConnectionState::Active.as_str(),
+        )
+        .await
+        .expect("active connection reads");
+        assert!(active.is_none(), "no connection is promoted");
     }
 }

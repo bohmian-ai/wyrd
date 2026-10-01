@@ -1,13 +1,14 @@
 //! Postgres-backed trusted-issuer and workload-binding resolvers.
 //!
 //! These are the production implementations of [`IssuerConfigResolver`] and
-//! [`WorkloadBindingResolver`]. They live in `wyrd-server` (not the SQL-free
-//! `wyrd-auth-oidc` crate) because they hold the [`PgPool`] and the process-wide
-//! sealing key, and call commit 03's tenant-scoped read-path query functions.
+//! [`WorkloadBindingResolver`]. They live in `wyrd-auth` (not the SQL-free
+//! `wyrd-auth-oidc` crate) because they hold the [`WyrdPostgres`] handle and,
+//! for issuers, the optional process-wide sealing keyring.
 //!
-//! Issuer trust is tenant-scoped (F02): every read goes through a
-//! [`TenantConn`](wyrd_sql::TenantConn), so Postgres RLS is the load-bearing isolation boundary. A
-//! resolve for tenant A can never surface tenant B's issuers or bindings.
+//! Issuer trust and workload bindings are tenant-scoped: every read acquires a
+//! [`TenantConn`](wyrd_sql::TenantConn) through [`WyrdPostgres`], so Postgres
+//! RLS is the load-bearing isolation boundary. A resolve for tenant A can
+//! never surface tenant B's issuers or bindings.
 //!
 //! The `client_secret_enc` BYTEA column stores `nonce ‖ ciphertext` (AES-256-GCM
 //! via `wyrd-crypt`). It is decrypted on read with the sealing key. A row that

@@ -5,6 +5,11 @@
 //! row alone decides the tenant, connection revision, issuer, client,
 //! redirect, PKCE verifier, nonce, and initiation binding. No request header
 //! takes part. A present `iss` must name that recorded issuer.
+//!
+//! A candidate connection test's state takes the same path against its bound
+//! candidate instead of the Active connection: the code is redeemed and the ID
+//! token verified exactly as a login, and then only that candidate revision is
+//! marked tested. A test issues no session, credential, or User.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -85,13 +90,20 @@ impl AuthorizationCodeExchange {
     /// and PKCE verifier; and [`Self::finish_id_token_exchange`] verifies the
     /// token and issues and seals the session. Returns how the login was
     /// initiated, which decides the callback's response: a browser login is
-    /// redirected to the BFF completion route, a CLI login gets a static page.
+    /// redirected to the BFF completion route, a CLI login and a candidate
+    /// connection test get a static page.
+    ///
+    /// A connection test's state is bound to a candidate revision, not the
+    /// Active connection: the provider is discovered from the recorded issuer
+    /// first, and that exact candidate — with the freshly discovered JWKS URI
+    /// it has not stored yet — is the trust the code and ID token are checked
+    /// against ([`HumanConnections::tested_candidate`]).
     ///
     /// # Errors
     /// Returns [`WyrdError::InvalidState`] when the state is unknown, expired,
     /// or replayed; [`WyrdError::Validation`] when no sealing keyring is
     /// configured; [`WyrdError::InvalidToken`] when the bound connection is no
-    /// longer Active, the response issuer is mismatched or required and
+    /// longer Active (or, for a test, the bound candidate changed), the response issuer is mismatched or required and
     /// missing, or the provider refuses the code;
     /// [`WyrdError::DiscoveryUnavailable`] or
     /// [`WyrdError::AuthVerifyUnavailable`] when the provider or store is
@@ -151,9 +163,29 @@ impl AuthorizationCodeExchange {
         conn.commit().await.map_err(store_error)?;
         let login_state = login_state
             .ok_or_else(|| invalid_state("login state is missing, expired, or already consumed"))?;
-        let trusted = self.bound_connection(tenant_id, &login_state).await?;
         let http = self.connections.http();
-        let provider = discover_provider(&trusted.issuer, http).await?;
+        let (trusted, provider) = if let LoginInitiation::ConnectionTest(_) = login_state.initiation
+        {
+            let issuer = IssuerUrl::new(login_state.issuer.as_str()).map_err(|error| {
+                WyrdError::Internal {
+                    message: format!("recorded login issuer does not decode: {error}"),
+                    details: serde_json::json!({}),
+                }
+            })?;
+            let provider = discover_provider(&issuer, http).await?;
+            let trusted = self
+                .connections
+                .tested_candidate(tenant_id, &login_state, &provider.metadata.jwks_uri)
+                .await?
+                .ok_or_else(|| {
+                    invalid_token("the login connection changed while the login was in progress")
+                })?;
+            (trusted, provider)
+        } else {
+            let trusted = self.bound_connection(tenant_id, &login_state).await?;
+            let provider = discover_provider(&trusted.issuer, http).await?;
+            (trusted, provider)
+        };
         verify_response_issuer(
             response_issuer,
             &login_state.issuer,
@@ -206,6 +238,13 @@ impl AuthorizationCodeExchange {
     /// consumed state row with a fresh redemption expiry. The session never
     /// leaves this method except sealed. Returns how the login was initiated.
     ///
+    /// A connection test stops after the token checks: instead of the Active
+    /// connection re-check and any user or session work,
+    /// [`HumanConnections::stamp_test_sign_in`] re-checks the tester's
+    /// authority and marks only the bound candidate revision tested with
+    /// `trusted`'s JWKS URI. The consumed test state is left for expiry
+    /// purge; it never carries a completion.
+    ///
     /// # Errors
     /// Returns [`WyrdError::InvalidToken`] when the token's algorithm was not
     /// advertised, the token fails verification or authorized-party checks,
@@ -213,8 +252,9 @@ impl AuthorizationCodeExchange {
     /// [`WyrdError::InvalidNonce`] on a missing or mismatched nonce,
     /// [`WyrdError::InvalidState`] when the state row is no longer consumed
     /// and awaiting completion, [`WyrdError::Validation`] when no sealing
-    /// keyring is configured, and the store, issuance, audit, and sealing
-    /// errors; nothing commits unless every step succeeds, so a failed audit
+    /// keyring is configured, the errors of
+    /// [`HumanConnections::stamp_test_sign_in`] for a connection test, and the
+    /// store, issuance, audit, and sealing errors; nothing commits unless every step succeeds, so a failed audit
     /// append — role sync or token exchange — leaves no role change, session,
     /// refresh row, or completion.
     pub async fn finish_id_token_exchange(
@@ -236,6 +276,18 @@ impl AuthorizationCodeExchange {
             .map_err(auth_error_to_wyrd)?;
         verify_nonce(&login_state.nonce, &verified.raw_claims)?;
         verify_authorized_party(&trusted.client_id, &verified.raw_claims)?;
+        if let LoginInitiation::ConnectionTest(tester) = login_state.initiation {
+            self.connections
+                .stamp_test_sign_in(
+                    tenant_id,
+                    login_state.connection,
+                    tester,
+                    &trusted.jwks_uri,
+                    request_id,
+                )
+                .await?;
+            return Ok(login_state.initiation);
+        }
         self.bound_connection(tenant_id, login_state).await?;
 
         let mut conn = self
@@ -465,10 +517,9 @@ pub(crate) async fn exchange_code_for_id_token(
 /// Build one authorization-code token request with the client's configured
 /// authentication.
 ///
-/// Shared by the login callback's real exchange and candidate testing's
-/// invalid-code probe, so the probe proves exactly the request a login sends:
-/// the same grant form, PKCE verifier, redirect URI, and `client_secret_basic`
-/// or `client_secret_post` placement. Nothing is sent here.
+/// Sends the same grant form, PKCE verifier, redirect URI, and
+/// `client_secret_basic` or `client_secret_post` placement for every login
+/// and candidate test sign-in. Nothing is sent here.
 ///
 /// # Errors
 /// Returns [`WyrdError::Internal`] for `private_key_jwt`, which human

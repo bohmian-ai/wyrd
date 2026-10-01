@@ -20,7 +20,7 @@ use wyrd_auth::connections::HumanConnections;
 use wyrd_runtime::Permission;
 use wyrd_spec::auth::{
     ConnectionActivate, ConnectionInput, ConnectionTestRequest, ConnectionTestResponse,
-    HumanConnectionView, HumanConnectionsResponse,
+    ConnectionTester, HumanConnectionView, HumanConnectionsResponse,
 };
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::AuditEvent;
@@ -195,29 +195,34 @@ async fn put_candidate(
         .map_err(WyrdErrorResponse::from)
 }
 
-/// `POST /v1/identity/oidc/candidate/test` — prove the candidate at
-/// `expected_revision` against its provider and stamp it activatable for
-/// fifteen minutes.
+/// `POST /v1/identity/oidc/candidate/test` — check the candidate at
+/// `expected_revision` against its provider and begin a real test sign-in.
 ///
 /// The allowed decision is committed before the screened provider IO starts.
-/// After every check passes, `identity_connections:write` is evaluated again
-/// as `identity.oidc.candidate.tested`; that decision and the stamp commit
-/// together, and a denial there stamps nothing.
+/// Discovery must name the candidate's exact issuer and its JWKS must hold a
+/// usable key; the response then carries the provider authorization URL of one
+/// authorization-code login (PKCE, state, nonce) bound to this candidate
+/// revision and this caller. Completing that sign-in at the provider returns
+/// through the common `/auth/callback`, which redeems the code and verifies the
+/// ID token exactly as a login, re-checks the caller's
+/// `identity_connections:write` as `identity.oidc.candidate.tested`, and marks
+/// only this revision tested for fifteen minutes. The test issues no session,
+/// credential, or User.
 ///
 /// # Errors
-/// Returns `400` when no public origin is configured, `403` without
-/// `identity_connections:write` at either evaluation, `409` for a stale revision
+/// Returns `400` when no public origin or sealing key is configured, `403`
+/// without `identity_connections:write`, `409` for a stale revision
 /// (`CONNECTION_CONFLICT`) or a failed check (`CONNECTION_NOT_TESTED`), and
 /// `503` when the provider is refused by address screening or unavailable, the
-/// store is unavailable, or a decision cannot be audited.
+/// store is unavailable, or the decision cannot be audited.
 #[utoipa::path(
     post,
     path = "/identity/oidc/candidate/test",
     request_body = ConnectionTestRequest,
     responses(
-        (status = 200, description = "The candidate passed every check and is activatable \
-          until tested_until", body = ConnectionTestResponse),
-        (status = 400, description = "No public origin is configured \
+        (status = 200, description = "The provider checks passed; complete the sign-in at \
+          authorization_url to mark this candidate revision tested", body = ConnectionTestResponse),
+        (status = 400, description = "No public origin or sealing key is configured \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -225,12 +230,13 @@ async fn put_candidate(
         (status = 403, description = "Caller lacks identity_connections:write \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "No candidate at expected_revision \
-          (WYRD_AUTH_409_CONNECTION_CONFLICT), or a check failed; details.reason names it \
-          (WYRD_AUTH_409_CONNECTION_NOT_TESTED)", body = WyrdProblem),
+          (WYRD_AUTH_409_CONNECTION_CONFLICT), or a check failed; details.reason is \
+          issuer_mismatch or jwks_unusable (WYRD_AUTH_409_CONNECTION_NOT_TESTED)",
+         body = WyrdProblem),
         (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
          body = WyrdProblem),
         (status = 503, description = "The provider is refused by address screening or \
-          unavailable, the store is unavailable, or a decision could not be audited \
+          unavailable, the store is unavailable, or the decision could not be audited \
           (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)",
          body = WyrdProblem)
@@ -247,19 +253,14 @@ async fn test_candidate(
     audit::record_audit(state.postgres.vala(), caller.data_tenant_id, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let owner = connections(&state)?;
-    let tested = owner
-        .probe_candidate(caller.data_tenant_id, request.expected_revision)
+    let tester = ConnectionTester {
+        principal_id: caller.principal.id,
+        principal_kind: caller.principal.kind.tag(),
+    };
+    connections(&state)?
+        .begin_test(caller.data_tenant_id, request.expected_revision, tester)
         .await
-        .map_err(WyrdErrorResponse::from)?;
-    // The probe ran for seconds without a lock; the caller's authority is
-    // evaluated again at the stamp so a grant withdrawn meanwhile stamps
-    // nothing.
-    let stamp = decide(&state, &caller, "identity.oidc.candidate.tested").await?;
-    owner
-        .stamp_candidate(caller.data_tenant_id, tested, &stamp)
-        .await
-        .map(|candidate| Json(ConnectionTestResponse { candidate }))
+        .map(Json)
         .map_err(WyrdErrorResponse::from)
 }
 
@@ -402,16 +403,18 @@ mod pg_tests {
 
     use url::Url;
     use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
     use wyrd_auth_oidc::ScreenedHttp;
+    use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
         PermissionCheck, PermissionDenyReason, PermissionSet, PermissionVerdict, Principal,
         PrincipalId, PrincipalKind, RoleRef,
     };
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::{LoginInitiation, PrincipalKindTag, Sha256Hex};
     use wyrd_spec::request_id::RequestId;
-    use wyrd_sql::queries::auth::human_connection_in_state;
+    use wyrd_sql::queries::auth::{consume_login_state, human_connection_in_state};
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use super::*;
@@ -422,12 +425,11 @@ mod pg_tests {
     /// Public x coordinate of the Ed25519 key the mock provider publishes.
     const ED_X: &str = "WhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ-DZ8Vw";
 
-    /// Deployment origin whose `/auth/callback` the mock provider redirects to.
+    /// Deployment origin whose `/auth/callback` a test sign-in returns to.
     const PUBLIC_ORIGIN: &str = "https://wyrd.test";
 
     /// A permission check that allows its first `allowed` evaluations and
-    /// denies every later one, so a test can withdraw authority between the
-    /// pre-network decision and the stamp decision of one request.
+    /// denies every later one.
     #[derive(Debug)]
     struct AllowFirst {
         /// Evaluations still allowed; each check consumes one.
@@ -457,9 +459,8 @@ mod pg_tests {
         }
     }
 
-    /// Start a mock provider that passes every candidate probe: discovery,
-    /// a usable JWKS, a `prompt=none` redirect to the callback echoing the
-    /// probe's state, and `invalid_grant` for the probe's invalid code.
+    /// Start a mock provider that passes the checks a test begins with:
+    /// discovery naming its own issuer and a usable JWKS.
     async fn passing_provider() -> MockServer {
         let server = MockServer::start().await;
         let issuer = server.uri();
@@ -481,38 +482,11 @@ mod pg_tests {
             })))
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/authorize"))
-            .respond_with(|request: &Request| {
-                let state = request
-                    .url
-                    .query_pairs()
-                    .find(|(key, _)| key == "state")
-                    .map(|(_, value)| value.into_owned())
-                    .unwrap_or_default();
-                let mut location =
-                    Url::parse(&format!("{PUBLIC_ORIGIN}/auth/callback")).expect("callback parses");
-                location
-                    .query_pairs_mut()
-                    .append_pair("state", &state)
-                    .append_pair("error", "login_required");
-                ResponseTemplate::new(302).insert_header("location", location.as_str())
-            })
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(400)
-                    .set_body_json(serde_json::json!({ "error": "invalid_grant" })),
-            )
-            .mount(&server)
-            .await;
         server
     }
 
-    /// Build handler state whose connection owner may reach loopback
-    /// providers and whose permission check is `check`.
+    /// Build handler state whose connection owner holds a sealing keyring,
+    /// may reach loopback providers, and whose permission check is `check`.
     async fn test_state(fixture: &PgFixture, check: Arc<AllowFirst>) -> AppState {
         let postgres = Arc::new(ServerPostgres::from_parts(
             fixture.wyrd_postgres().clone(),
@@ -533,7 +507,9 @@ mod pg_tests {
         .with_auth(ServerAuth {
             human_connections: Some(HumanConnections::new(
                 fixture.wyrd_postgres().clone(),
-                None,
+                Some(Arc::new(SealingKeyring::new(SecretKey::from_bytes(
+                    [7_u8; 32],
+                )))),
                 ScreenedHttp::allowing_internal(),
                 Some(&origin),
             )),
@@ -627,13 +603,17 @@ mod pg_tests {
         (row.tested_revision, row.tested_until.is_some())
     }
 
-    /// A successful test evaluates permission twice — before provider IO and
-    /// again for the stamp — and records both as allowed decisions.
+    /// Beginning a test records one allowed decision and returns an
+    /// authorization URL for the candidate's client and the deployment
+    /// callback carrying state, nonce, and an S256 PKCE challenge. Its state
+    /// is stored bound to this caller and the exact candidate revision, while
+    /// the candidate itself stays untested until the sign-in completes.
     ///
     /// # Panics
-    /// Panics when the test is refused or either decision is missing.
+    /// Panics when the test is refused, the URL or stored state differs, or
+    /// the candidate is stamped.
     #[tokio::test]
-    async fn a_successful_test_records_two_evaluated_decisions() {
+    async fn beginning_a_test_binds_one_sign_in_to_the_caller_and_revision() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let provider = passing_provider().await;
@@ -644,7 +624,7 @@ mod pg_tests {
         let state = test_state(&fixture, Arc::clone(&check)).await;
         stage_candidate(&state, tenant, &provider).await;
 
-        let Json(tested) = test_candidate(
+        let Json(begun) = test_candidate(
             State(state),
             caller(tenant),
             Json(ConnectionTestRequest {
@@ -652,112 +632,41 @@ mod pg_tests {
             }),
         )
         .await
-        .expect("the candidate passes its test");
+        .expect("the candidate passes its provider checks");
 
-        assert_eq!(tested.candidate.revision, 1);
-        assert_eq!(check.evaluations.load(Ordering::SeqCst), 2);
+        let url = Url::parse(begun.authorization_url.as_str()).expect("authorization url parses");
+        assert_eq!(url.path(), "/authorize");
+        let query: std::collections::HashMap<String, String> =
+            url.query_pairs().into_owned().collect();
+        assert_eq!(query["client_id"], "wyrd-human");
+        assert_eq!(
+            query["redirect_uri"],
+            format!("{PUBLIC_ORIGIN}/auth/callback")
+        );
+        assert_eq!(query["response_type"], "code");
+        assert_eq!(query["code_challenge_method"], "S256");
+        assert!(!query["nonce"].is_empty());
+        let state_hash = Sha256Hex::digest(query["state"].as_bytes());
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let pending = consume_login_state(&mut conn, &state_hash)
+            .await
+            .expect("login state reads")
+            .expect("the test state is pending");
+        conn.commit().await.expect("commit");
+        assert_eq!(pending.connection.connection_revision, 1);
+        assert_eq!(pending.issuer, provider.uri());
+        assert_eq!(
+            pending.initiation,
+            LoginInitiation::ConnectionTest(ConnectionTester {
+                principal_id: PrincipalId::new(Uuid::nil()),
+                principal_kind: PrincipalKindTag::User,
+            })
+        );
+        assert_eq!(check.evaluations.load(Ordering::SeqCst), 1);
         assert_eq!(
             decisions(&fixture, "identity.oidc.candidate.test").await,
             vec![("allowed".to_owned(), 1)]
         );
-        assert_eq!(
-            decisions(&fixture, "identity.oidc.candidate.tested").await,
-            vec![("allowed".to_owned(), 1)]
-        );
-        assert_eq!(stamp(&fixture).await, (Some(1), true));
-    }
-
-    /// Authority withdrawn while the provider is probed denies the stamp
-    /// decision: the refusal is audited and the candidate stays untested.
-    ///
-    /// # Panics
-    /// Panics when the stamp decision is allowed or the candidate is stamped.
-    #[tokio::test]
-    async fn a_denied_stamp_decision_leaves_the_candidate_untested() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let provider = passing_provider().await;
-        let check = Arc::new(AllowFirst {
-            allowed: AtomicUsize::new(1),
-            evaluations: AtomicUsize::new(0),
-        });
-        let state = test_state(&fixture, Arc::clone(&check)).await;
-        stage_candidate(&state, tenant, &provider).await;
-
-        let refused = test_candidate(
-            State(state),
-            caller(tenant),
-            Json(ConnectionTestRequest {
-                expected_revision: 1,
-            }),
-        )
-        .await
-        .expect_err("the stamp decision is denied");
-
-        assert_eq!(refused.0.status(), StatusCode::FORBIDDEN.as_u16());
-        assert_eq!(check.evaluations.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            decisions(&fixture, "identity.oidc.candidate.tested").await,
-            vec![("denied".to_owned(), 1)]
-        );
-        assert_eq!(stamp(&fixture).await, (None, false));
-    }
-
-    /// A stamp decision that cannot be recorded fails closed: the stamp shares
-    /// its transaction, so the candidate stays untested.
-    ///
-    /// # Panics
-    /// Panics when the trigger cannot be installed, the test succeeds, or the
-    /// candidate is stamped.
-    #[tokio::test]
-    async fn a_failed_stamp_audit_leaves_the_candidate_untested() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let provider = passing_provider().await;
-        let check = Arc::new(AllowFirst {
-            allowed: AtomicUsize::new(usize::MAX),
-            evaluations: AtomicUsize::new(0),
-        });
-        let state = test_state(&fixture, check).await;
-        stage_candidate(&state, tenant, &provider).await;
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
-        sqlx::query(
-            r#"CREATE OR REPLACE FUNCTION vala.test_fail_candidate_stamp_audit()
-               RETURNS trigger LANGUAGE plpgsql AS $$
-               BEGIN
-                 IF NEW.operation = 'identity.oidc.candidate.tested' THEN
-                   RAISE EXCEPTION 'injected candidate stamp audit failure';
-                 END IF;
-                 RETURN NEW;
-               END;
-               $$;"#,
-        )
-        .execute(&superuser)
-        .await
-        .expect("failure function installs");
-        sqlx::query(
-            r#"CREATE TRIGGER test_fail_candidate_stamp_audit
-               BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_candidate_stamp_audit()"#,
-        )
-        .execute(&superuser)
-        .await
-        .expect("failure trigger installs");
-
-        let refused = test_candidate(
-            State(state),
-            caller(tenant),
-            Json(ConnectionTestRequest {
-                expected_revision: 1,
-            }),
-        )
-        .await
-        .expect_err("an unrecordable stamp decision refuses the test");
-
-        assert!(refused.0.status() >= 500, "fails closed: {:?}", refused.0);
         assert_eq!(stamp(&fixture).await, (None, false));
     }
 

@@ -12,7 +12,7 @@ use sha2::Digest as _;
 use utoipa::openapi::schema::{ObjectBuilder, Schema as OpenApiSchema, Type};
 use uuid::Uuid;
 
-use crate::auth::SecretBearer;
+use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer};
 use crate::error::WyrdError;
 use crate::ids::TenantSlug;
 
@@ -357,13 +357,29 @@ pub struct BeginLogin {
 }
 
 /// How a tenant human login was initiated: the single binding its completed
-/// session is redeemed by.
+/// session is redeemed by, or the candidate test it proves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginInitiation {
     /// A browser login bound to the BFF's flow id hash.
     Browser(Sha256Hex),
     /// A CLI login bound to its handoff id.
     Cli(Uuid),
+    /// A candidate connection test begun by this principal. Its sign-in marks
+    /// the bound candidate revision tested and issues nothing, so it has no
+    /// completion to redeem.
+    ConnectionTest(ConnectionTester),
+}
+
+/// The authorized caller a candidate connection test was begun by.
+///
+/// Recorded on the test's login state so the callback can re-check that
+/// principal's authority before it marks the candidate tested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionTester {
+    /// The principal that began the test.
+    pub principal_id: PrincipalId,
+    /// That principal's kind, which names where its roles are stored.
+    pub principal_kind: PrincipalKindTag,
 }
 
 impl BeginLogin {

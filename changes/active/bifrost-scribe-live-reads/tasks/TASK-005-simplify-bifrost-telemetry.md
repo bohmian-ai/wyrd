@@ -408,15 +408,15 @@ Status: `IMPLEMENTED`. Commits on `vcc/task-004`: `6ec15730c` (Scribe),
 | 1. Write, local/remote query, and Forge traces read in order; one terminal outcome; failure reason once | `bifrost.gate.write` root; `bifrost.gate.query.stream` → `bifrost.gate.query` → `bifrost.oracle.query` → `bifrost.oracle.stream`/`bifrost.oracle.peer.fragment{role,outcome}` (`oracle/query_stream.rs`, `oracle/dispatcher.rs`, DataFusion `JoinSetTracer` in `oracle/telemetry.rs`); catalog commits nest under `bifrost.forge.task.execute`; `IngestError::report_internal_at_edge` replaces the mapping-time log | `telemetry::scribe_hot_path_telemetry_reconciles` (one WARN/ERROR per failed write *trace*), `published::…` phase 1b, `peer_network::analytical::remote_live_scribe_drop_releases_query`, `live_rewrite::forge_promoted_files_rewrite_and_remain_exact_across_recovery` 3b/3d | PASS |
 | 2. Metrics report owner facts; shadow, zero-only, duplicate families removed; Forge 17-family catalog and HPA metric kept; Degraded ≠ Success; waiting ≠ active; replay not new rows; restored staging in backlog | Scribe mirrors/registry removed, `memtable_rows_inserted_total` at insertion, staging gauges from `StagingAssembler`, `lane_queued` waiting-only; Oracle zero-only families and phase duplicates removed, `degraded` outcome, active gauge after admission; storage ledger removed (`storage/telemetry.rs` stateless); Forge `metrics.rs` unchanged | Scenario 1 three commands; `write_read::scribe_undialable_private_peer_degrades_live_coverage` (degraded=1, success=0); `capacity::saturated_query_waits_on_http_and_grpc` (queued=2 vs active from Oracle runtime); `forge::metrics::tests::forge_telemetry_is_closed_bounded_and_balanced` | PASS |
 | 3. No telemetry ledger, pruning walk, or telemetry-only settlement read decides or delays work | `MetadataCacheSnapshot`, Scribe ingress mirror, `FilePruningSource` per-file loop deleted; Forge `record_task_execution_telemetry` takes the committed `ForgeTaskResult` | Storage unit lane (20/20), `forge::` lib lane (86), Forge journey | PASS |
-| 4. Existing write, query, Forge journeys keep results | No ACK, WAL, Iceberg, admission, terminal, tenant, settlement, or SDK contract change | All Scenario 1–4 commands plus `write_read::scribe_write_flush_read_user_journey`; benchmark not run (caller-owned) | PASS |
+| 4. Existing write, query, Forge journeys keep results | No ACK, WAL, Iceberg, admission, terminal, tenant, settlement, or SDK contract change | All Scenario 1–4 commands plus `write_read::scribe_write_flush_read_user_journey`; R1: `mise run gate` (whole Scribe, Oracle, Forge journey lanes) and `bench:bifrost:query-capacity`, see R1 verification | PASS |
 | 5. Every dashboard row has a real family/trace owner and focused assertion; request opening precedes stream terminal; no high-cardinality labels | Dashboard table below; labels are bounded enums only | `published::…` phase 1b asserts request success at open with zero stream terminals, then one terminal | PASS |
 
 Commands run (all PASS, final tree): the exact commands in Scenarios 1–4;
 `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib` over
 `storage::`, `forge::`, `scribe::staging_runtime::`, `gate::`, `oracle::`;
 `wyrd-server --lib otlp`; `wyrd-testing --lib`; `mise run fmt`;
-`mise run lints`; `mise run docs:check`; `git diff --check`. Benchmarks,
-`mise run gate`, and whole journey lanes were not run.
+`mise run lints`; `mise run docs:check`; `git diff --check`. Benchmark,
+`mise run gate`, and whole journey lanes: see R1 verification below.
 
 Material notes:
 
@@ -495,3 +495,130 @@ trace=89dcbb03 └ bifrost.forge.catalog.commit ×3 (156/1610/1637ms) result=fai
 trace=c54985ba bifrost.forge.task.execute 157ms result=succeeded events=[]
                INFO log for the run: only "Forge worker started" / "Forge worker stopped"
 ```
+
+### R1 dashboard evidence (production samples, TASK-005-R1)
+
+Every value below was printed by a focused journey from the installed
+production recorder (`BifrostTelemetryCapture` renders the same
+`PrometheusHandle` the `/metrics` route serves) and is asserted against the
+independent fact in the same row. Counters and histograms are window deltas;
+`peak` is the highest gauge value sampled during the window; `final` is the
+gauge when the window closed. Raw `evidence …` lines (journeys run with `--no-capture`) are preserved
+under `review/task-005-review-20261001/r1-outputs/`.
+
+| Question | Family {labels} or trace, unit, boundary | Before → after (production sample) | Independent fact | Focused test |
+| --- | --- | --- | --- | --- |
+| Are writes arriving and getting durable responses? | `bifrost_gate_requests_total{operation="write",outcome}` (attempts), `bifrost_gate_request_duration_seconds` (server-edge seconds), `bifrost_gate_frames_total{status}`, `bifrost_gate_frame_bytes_total`; `bifrost_scribe_ack_seconds` (ACK attempts incl. replays); `bifrost_scribe_wal_append_total{outcome}`, `_append_bytes_total`, `_fsync_total{outcome}` | Write window: requests{success} +4, duration count +4 (sum 0.0677 s), frames{accepted} +4, frame bytes +2336, ACK count +4 (sum 0.0504 s), WAL append{success} +8, append bytes +15332, fsync{success} +8. Retry window: requests{success} +1, ACK count +1, rows_inserted +0, WAL +0. WAL-fault window: requests{failed} +1, frames{rejected} +1, append{success} +1, fsync{failed} +1, ACK +0 | 4 client ACKs for 64 rows; same-batch retry ACKed; faulted write returned an error to the client | `telemetry::scribe_hot_path_telemetry_reconciles` PASS |
+| Is new data entering a shard and moving out of memory? | `bifrost_scribe_memtable_rows_inserted_total` (rows newly inserted, this process); `bifrost_scribe_active_memtable_bytes`, `_immutable_memtable_bytes`, `_immutable_generation_count` (age-tick sampled); `bifrost_scribe_lane_queued{lane}` (waiting), `_lane_active{lane}` (running) | Write: rows_inserted +64. Retry: +0. Abrupt-restart resend of an ACKed batch: +0. Freeze: active bytes peak 25120 → final 0; immutable bytes final 25120, generations final 1; lane queued/active peak 0, final 0 | `memtable_stats().writable_rows` = 64 after writes, 0 after freeze; readback returns the 64 rows | `telemetry::scribe_hot_path_telemetry_reconciles`, `telemetry::staged_backlog_survives_abrupt_restart` PASS |
+| Is staging or publication falling behind? | `bifrost_scribe_staging_live_members`, `_live_bytes`, `_oldest_member_timestamp_seconds` (Unix s), `_outstanding_claims` (assembler ownership, pod aggregate); `bifrost_scribe_staging_claims_published_total`, `bifrost_scribe_publication_files_total`, `_bytes_total` (committed output) | Restart journey, held below target/dwell: [members, bytes, oldest, claims] = [1, 3464, 1790876177, 0] before kill → [1, 3464, 1790876177, 0] on the replacement before publication → [0, 0, 0, 0] after publication. Hot path publish window: staging peak [1, 3732, 1790876898, 0] → final [0, 0, 0, 0]; claims_published +1, files +1, bytes +3949 | Owner `StagingBacklog` equal at each scrape (same oldest persisted `ready_at` 17:36:17Z across restart); replacement serves all 48 rows before publication; committed `vala.file_list`: 1 file, 3949 bytes, 64 rows (hot path) and 48 rows (restart) | `telemetry::staged_backlog_survives_abrupt_restart`, `telemetry::scribe_hot_path_telemetry_reconciles`, `scribe::staging_runtime::pg_tests::restored_stage_republishes_backlog` (fresh recorder: absent → 4 members, durable bytes, persisted oldest, 1 claim), `scribe::staging_runtime::tests::concurrent_transitions_publish_the_final_backlog` PASS |
+| Is Forge keeping up? | `bifrost_forge_pending_tasks{task_type}`, `_oldest_pending_task_timestamp_seconds{task_type}` (per planning pass), `_active_tasks{task_type}`, `_tasks_created_total`, `_task_attempts_total{task_type,result}` (committed result), `_input/_output_files_total`, `_bytes_total`, `_compaction_debt_files/_bytes`; trace `bifrost.forge.task.execute{result}` | Journey window: created scribe_promotion +4, small_files +1, orphan_cleanup +5; attempts{succeeded} the same; promotion in/out 5 files, 18175 bytes; small_files in 1 file 3615 B → out 1 file 5196 B; pending peak small_files 1, orphan_cleanup 2; debt 3 files / 10845 B. Recovery window: attempts{small_files,succeeded} +1, input 1/3615, output 1/5196, active peak 1 | Landed Iceberg snapshot of task `01a0f88f-e2c8…`: removed 1 file 3615 B, added 1 file 5196 B; durable unsettled `vala.forge_tasks` = 0 at end | `live_rewrite::forge_promoted_files_rewrite_and_remain_exact_across_recovery` PASS |
+| Are clients getting answers promptly? | `bifrost_gate_query_streams_total{outcome}` (stream terminal), `bifrost_gate_query_stream_duration_seconds{outcome}` (server-edge lifetime), `bifrost_gate_requests_total{operation="query"}` (stream opened), `bifrost_gate_active_streams`; trace `bifrost.gate.query.stream` | Parked after first batch: requests{query,success} +1, streams_total +0, stream duration count +0, active streams final 1. After terminal: streams{success} +1, stream duration 0.0290 s, Oracle duration 0.0177 s | Client read 1 row and its terminal; client clock 0.0311 s ⊇ Gate 0.0290 s ⊇ Oracle 0.0177 s | `published::published_cache_pruning_and_shutdown_are_production_governed` PASS |
+| Where is query work waiting or failing? | `oracle_queries_queued{class}` (waiting), `oracle_queries_active{class}` (admitted), `oracle_admission_total{class,outcome,reason}`, `oracle_admission_queue_duration_seconds{class}`, `oracle_query_duration_seconds{class,outcome}` (HPA), `oracle_query_files/bytes_scanned_total`, `oracle_query_rows_total`; trace `bifrost.oracle.peer.fragment{role,outcome}` | Held queue: scraped queued 2, active 4. Granted: admission{admitted} +2, queue-wait count 2 / sum 0.527 s (≥ 2 × 0.25 s hold), duration{success} +2. Expired: admission{rejected,queue_deadline} interactive +4, analytical +2; duration{failed} +6; queued final 0. Published query: files scanned +1, bytes +59, rows +1 | Owner `oracle_runtime_inspection`: queued 2, admitted 4 while held, then queued 0; 24 rows over HTTP and gRPC each; 6 typed `QUERY_TIMEOUT` refusals; 1 published object | `capacity::saturated_query_waits_on_http_and_grpc`, `published::…` PASS; remote failure trace under `peer_network::analytical::remote_live_scribe_drop_releases_query` |
+
+Trace parentage captured in these runs (full ids):
+
+```text
+query  trace=2451aa9005c98d06a28f39b1db4e3235
+  ff5c7b9956ef8acf bifrost.gate.query.stream  29.2ms outcome=success   parent=root
+  f9f9523acb0c1338 └ bifrost.gate.query        13.5ms                    parent=ff5c7b99…
+  a7468bcbf2dadcc3   └ bifrost.oracle.query     7.9ms                    parent=f9f9523a…
+  000588b018c025ee     └ bifrost.oracle.stream 17.9ms outcome=success   parent=a7468bcb…
+  7ee0a4f3332a333b       └ bifrost.oracle.source 2.5ms outcome=success parent=000588b0…
+forge  trace=80dc9285c65d2a381c26b08fdbb9cf46 (released, uncertain commit)
+  fc563754112b3ff3 bifrost.forge.task.execute 1702ms result=<none> events=[WARN]
+  f14020baa9f6ff68 └ bifrost.forge.catalog.commit 1614ms result=failed
+  7d2914ee3eabf268 └ bifrost.forge.catalog.commit 1635ms result=failed
+forge  trace=0b4520e73cf8656c1dc3b47d90cb08c4 (recovery)
+  2b1bc7eb41c31087 bifrost.forge.task.execute 171ms result=succeeded events=[]
+write  trace=9b1d86f5e48b003d99eb890a00dc7ac1 (success)
+  6f694da8ab9f14e4 bifrost.gate.write    26.4ms outcome=success     parent=root
+  271d463246fdfe00 └ dispatch_native_frame 25.7ms batch_id=01a0f894-d1c2-…
+write  trace=7b0dacc6c0d25485b8b3250e6102b07f (WAL fault)
+  de7b731c81659915 bifrost.gate.write    13.3ms outcome=failed events=[WARN] parent=root
+  dfd823cf5996d1be └ dispatch_native_frame 12.5ms batch_id=01a0f894-d584-…
+```
+
+Timing and accounting gaps, stated rather than reconciled:
+
+- Gate stream duration starts at the server edge when the stream opens;
+  Oracle duration starts later at admission and ends inside it; the SDK's
+  client clock adds transport and decode. Measured 0.0311 ≥ 0.0290 ≥ 0.0177 s.
+- Request and ACK counters are attempts: a same-batch retry adds one request
+  and one ACK but no inserted row. Process counters restart at zero, so they
+  are not durable lifetime totals; `vala.file_list` and `vala.forge_tasks` are.
+- Memtable bytes and Forge pending/age gauges are sampled state. The memtable
+  gauges move on the Scribe age tick, so the freeze sample waits for that
+  tick. The Forge pending gauges move after each complete fenced planning
+  pass (`forge.svx`), so the journey's final pending 1 + 2 was the last
+  pass's view while durable unsettled tasks were already 0.
+- The short persistence jobs in the hot path never showed waiting or running
+  work in the sampler (lane peaks 0). The held-queue proof is the Oracle
+  queue (2 waiting, 4 active) and the held stage backlog above.
+- The recorder survives the in-process restart, so the unchanged restored
+  value proves exposition, not re-emission; the fresh-recorder restore test
+  proves the replacement emits it.
+
+Production family inventory (hot-path journey exposition; series count
+excludes histogram buckets): 105 families. Bifrost and Oracle families:
+`bifrost_cluster_roles_live`(2), `bifrost_forge_*` active_tasks(5),
+compaction_debt_bytes(1), compaction_debt_files(1),
+oldest_pending_task_timestamp_seconds(5),
+oldest_planning_demand_timestamp_seconds(1), pending_tasks(5),
+planning_demands(1); `bifrost_gate_*` active_requests(2), active_streams(1),
+frame_bytes_total(1), frames_total(2), query_stream_duration_seconds(2),
+query_streams_total(5), rejections_total(18), request_duration_seconds(6),
+requests_total(8); `bifrost_oracle_analytical_*` attempts_active(1),
+attempts_total(3), exchange_batches_total(1), exchange_bytes_total(1),
+output_sort_spilled_bytes_total(1), output_sort_spilled_rows_total(1),
+output_sort_spills_total(1), stage_authority_total(10),
+stage_operations_total(2); `bifrost_oracle_files_pruned_total`(1),
+`bifrost_oracle_local_bytes`(2), `bifrost_oracle_local_slot_units`(2);
+`bifrost_parquet_upload_bytes`(1), `_outcomes_total`(1);
+`bifrost_resource_*` acquisitions_total(6), current_bytes(3),
+memory_bytes(7), planned_bytes(3), scratch_bytes(1); `bifrost_role_ready`(5);
+`bifrost_scribe_*` ack_seconds(2), active_memtable_bytes(1),
+immutable_generation_count(1), immutable_memtable_bytes(1),
+ingress_active(1), lane_active(3), lane_job_seconds(6), lane_jobs_total(4),
+lane_queued(3), memtable_rows_inserted_total(1),
+persistence_encoded_bytes_total(1), persistence_jobs_total(1),
+persistence_publication_seconds(2), persistence_queue_depth(1),
+publication_bytes_total(1), publication_files_total(1),
+queue_wait_seconds(2), rejections_total(6), retired_bytes_total(1),
+retirements_total(1), staging_claims_published_total(1),
+staging_live_bytes(1), staging_live_members(1),
+staging_oldest_member_timestamp_seconds(1), staging_outstanding_claims(1),
+wal_append_bytes_total(1), wal_append_seconds(2), wal_append_total(1),
+wal_fault_total(1), wal_fsync_seconds(4), wal_fsync_total(2);
+`bifrost_storage_*` active_requests(1), metadata_cache_effects_total(2),
+metadata_cache_inflight_loads(1), metadata_cache_loads_total(1),
+metadata_cache_resident_bytes(1), metadata_cache_resident_entries(1),
+request_terminals_total(3), requests_total(3); `oracle_*`
+admission_queue_duration_seconds(2), admission_total(12),
+queries_active(2), queries_queued(2), query_bytes_returned_total(2),
+query_bytes_scanned_total(2), query_cancellations_total(2),
+query_duration_seconds(2), query_files_scanned_total(2),
+query_partitions_scanned_total(2), query_phase_seconds(10),
+query_row_groups_pruned_total(2), query_row_groups_scanned_total(2),
+query_rows_total(2), query_time_to_first_batch_seconds(2). The remaining 16
+are server, pool, and storage-adapter families (`wyrd_http_*`,
+`wyrd_postgres_pool_*`, `vala_postgres_pool_*`, `wyrd_storage_*`). No family
+carries a tenant, table, batch, shard, task, or query identity label.
+
+Removed families (present as emitters at base `05d7d7413`, absent from
+source emitters and from the exposition above): `bifrost_gate_events_total`,
+`bifrost_gate_rows_total`, `bifrost_scribe_frames_total`,
+`bifrost_scribe_rows_total`, `bifrost_scribe_ingress_watermark_bytes`,
+`bifrost_scribe_persistence_compression_ratio`,
+`bifrost_scribe_persistence_queue_bytes`,
+`bifrost_scribe_seal_stage_seconds`, `bifrost_scribe_staging_effects_total`,
+`bifrost_query_duration_seconds`, `bifrost_oracle_analytical_exchanges_active`,
+`oracle_query_logical_bytes_selected_total`, `oracle_query_spill_bytes_total`,
+`oracle_query_spill_files_total`, `oracle_query_spill_queries_total`,
+`oracle_tenant_budget_pressure`,
+`bifrost_storage_metadata_cache_transition_anomalies_total`,
+`bifrost_storage_metadata_cache_waiters`. Added:
+`bifrost_scribe_memtable_rows_inserted_total`,
+`bifrost_scribe_publication_files_total`,
+`bifrost_scribe_publication_bytes_total`,
+`bifrost_scribe_staging_live_bytes`,
+`bifrost_scribe_staging_oldest_member_timestamp_seconds`.

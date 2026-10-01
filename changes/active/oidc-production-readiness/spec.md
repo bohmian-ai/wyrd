@@ -1,7 +1,7 @@
 ---
 id: SPEC-oidc-production-readiness
-revision: 6
-status: draft
+revision: 7
+status: approved
 ---
 
 # Enterprise identity integration for self-hosted and hosted Wyrd
@@ -62,6 +62,14 @@ authentication.
   tenant settings; neither surface can administer another tenant. Hosted
   changes take effect without restarting Wyrd replicas. Self-hosted boot
   seeding may use the same durable contract but is not a second trust model.
+  Testing a candidate connection completes one real interactive sign-in
+  through that exact provider, client, and callback, verified exactly as a
+  production login, after discovery and signing-key checks. A test sign-in
+  only marks that candidate revision tested; it issues no session, Wyrd
+  credential, or `User`. Wyrd never infers connection health from
+  side-effect probes such as non-interactive `prompt=none` redirects or
+  fabricated authorization codes, so any provider that can complete a
+  standard login can be tested and activated.
 - **REQ-004**: Setup shows the exact public callback URL the customer must
   register for its Wyrd Web application. Required customer inputs are the
   issuer URL, client ID, a client secret only if the selected supported Web
@@ -322,10 +330,13 @@ The initial SCIM delivery excludes using SCIM as an authentication mechanism.
   operating with human SSO enabled and that an opted-in workload assertion
   maps only to its exact bound principal; rotated assertions renew, while a
   wrong issuer, subject, audience, or tenant fails closed.
-- **AC-006**: A provider-switch journey proves an owner can test and activate
-  a replacement, preserve an authorized route back in, and provision a new
-  `User` through the replacement without inheriting the prior principal's
-  authority or linking identities through an email match.
+- **AC-006**: A provider-switch journey proves an owner can test, by
+  completing a real sign-in, and activate a replacement, including a provider
+  that does not honor `prompt=none`; a test sign-in creates no session,
+  credential, or `User`. The journey also proves the owner can preserve an
+  authorized route back in, and provision a new `User` through the
+  replacement without inheriting the prior principal's authority or linking
+  identities through an email match.
 - **AC-007**: Fault and security evidence covers IdP outage, unsafe discovery
   and JWKS URL, invalid token and nonce, replayed or expired state, wrong
   callback origin, inactive connection, unsupported client auth, audit
@@ -368,6 +379,14 @@ TASK-001–005 until this draft is approved; TASK-006/007 are proposed only.
 
 ## Revision history
 
+- **Revision 7 — 2026-10-01 — approved**: Approved by Steven Forrester.
+  Connection testing completes one real interactive sign-in and never infers
+  provider health from side-effect probes (`prompt=none` redirect or
+  fabricated-code token-endpoint probes). Evidence: Dex v2.38–v2.45 ignores
+  `prompt` (dexidp/dex#4560) and classic Amazon Cognito hosted UI ignores
+  `prompt=none`, so the probe locked out providers that complete standard
+  logins; `invalid_grant` ordering is not mandated by RFC 6749 §5.2. Also
+  approves revision 6's SCIM and SAML additions unchanged.
 - **Revision 6 — 2026-10-01 — draft**: Proposed two additional enterprise
   integration tasks: SCIM provisioning and SAML SSO, both sharing existing
   Wyrd identity and security authorities. Keeps revision 5 tasks intact

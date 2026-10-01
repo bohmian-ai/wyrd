@@ -3,7 +3,7 @@ id: TASK-003
 kind: implementation
 status: ready
 spec: SPEC-oidc-production-readiness
-spec_revision: 5
+spec_revision: 7
 requirements: [REQ-003, REQ-005, REQ-006, REQ-009, REQ-010, REQ-015, REQ-016, REQ-018, INV-001, INV-003, INV-005, AC-001, AC-002, AC-003, AC-006, AC-007, AC-009]
 depends_on: [TASK-002]
 ---

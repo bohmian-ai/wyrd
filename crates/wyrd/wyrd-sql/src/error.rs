@@ -423,6 +423,14 @@ mod tests {
                 500,
                 "Stored tenant identifier is invalid",
             ),
+            (
+                SqlError::SchemaNotReady {
+                    detail: "migration 7 is not applied".to_owned(),
+                },
+                "WYRD_SQL_503_SCHEMA_NOT_READY",
+                503,
+                "Database schema is not ready for serving",
+            ),
         ];
 
         for (error, code, status, title) in cases {

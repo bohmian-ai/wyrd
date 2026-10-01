@@ -180,3 +180,24 @@ git diff --check
 
 Route this remediation directly to `$wyrd-implement` and review the complete
 original base-to-remediated-candidate range afterward.
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. `FIND-TASK-009-4` one key under concurrent first entry | `python/wyrd/otel.py` `_key` double-checked creation under the existing `_registered_lock` | `test_concurrent_first_entries_share_one_scope_key` (fails on the unfixed module: two keys) | PASS |
+| 2. `FIND-TASK-009-3` detach failure restores prior pair | `_enter_run` records `(token, prior)`; `_exit_run` detaches then re-attaches `prior` when the key still differs (covers raising and swallowed reset) | `test_detach_failure_restores_the_prior_correlation` (swallowed inner reset restores outer pair; raising outer detach leaves no pair; fails on the unfixed module) | PASS |
+| 3. `FIND-TASK-009-1` failures never block explicit observations | tests only | `test_registration_and_attach_failures_never_block_observations`, `test_enrichment_failure_never_blocks_observations`, detach test; each reaches `WYRD_SDK_400_BIFROST_NOT_STARTED`; user exception and `test_run_card_refuses_an_unknown_alias` unchanged | PASS |
+| 4. `FIND-TASK-009-2` `Run::subject` rustdoc | `crates/shared/wyrd-client/src/observe/mod.rs` field doc only | `mise run fmt`, `mise run lints` | PASS |
+| 5. Healthy paths stay green | unchanged | focused file 33 passed; persisted journey passed; `py:test:unit`, `py:test:integration` | PASS |
+
+Commands (all exit 0): `mise run py:setup`; focused
+`uv run python -m pytest -q tests/unit/state/test_observe_surface.py`; the persisted
+journey under `scripts/postgres/with-test-postgres.sh` (the listed
+`mise run py:setup:testing` task does not exist — `py:setup` already builds with
+`--features testing`); `test:shared`, `py:test:unit`, `py:test:integration`,
+`py:typecheck`, `codegen:check`, `check:pyo3-scope`, `fmt`, `py:format`, `lints`,
+`py:lints`, `git diff --check`.
+
+Non-goals remained excluded: no new lock, dependency, harness, retry/warning, or
+public API change; no unrelated files changed.

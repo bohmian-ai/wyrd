@@ -7,7 +7,8 @@ import datetime
 import os
 import pathlib
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol, TypeAlias, overload
+from types import TracebackType
+from typing import Any, Literal, Protocol, TypeAlias, overload
 
 from wyrd.observer import Observer
 from wyrd.otel import OtelObserver

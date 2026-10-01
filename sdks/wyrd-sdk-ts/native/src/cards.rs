@@ -296,15 +296,18 @@ impl NativeWyrdState {
         NativeLifecycleResult::outcome(Box::pin(state.start_bifrost_with(&client, table)).await)
     }
 
-    /// Opens one invocation over this state, targeting the root Service Card.
+    /// Opens one invocation over this state, targeting `card` or the root Service.
     ///
     /// Local only: no network IO, no server-side Run resource, and no Verifier
-    /// execution.
+    /// execution. A `card` alias resolves in the hydrated graph before the run
+    /// mints its `run_id`; an unknown alias is returned as the outcome's
+    /// `WYRD_SDK_404_UNKNOWN_ALIAS` error and nothing is opened.
     #[napi]
-    pub fn run(&self) -> NativeRunOpen {
-        NativeRunOpen::outcome(match &self.state {
-            Ok(state) => Ok(state.run()),
-            Err(error) => Err(error.clone()),
+    pub fn run(&self, card: Option<String>) -> NativeRunOpen {
+        NativeRunOpen::outcome(match (&self.state, card) {
+            (Ok(state), Some(alias)) => state.run_for_card(&alias),
+            (Ok(state), None) => Ok(state.run()),
+            (Err(error), _) => Err(error.clone()),
         })
     }
 

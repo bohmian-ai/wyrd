@@ -6,6 +6,11 @@ caller-registered generic table, drains at graceful shutdown, and reads every
 row back by the exact subject Card UID and the one invocation id. Startup is
 first refused once per fixed table whose describe the server fails, and the
 server's staged describe decisions prove repeated writes reuse cached schemas.
+
+A second, single-Card run is entered with ``with state.run(card="agent")``:
+framework-style spans created inside it export through the stock OTLP/HTTP
+exporter to the authenticated ``/v1/traces`` endpoint, and the persisted span,
+custom, and Eval rows join on their Run and trace identity.
 """
 
 from __future__ import annotations
@@ -16,18 +21,22 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 import wyrd
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from pydantic import BaseModel
 from wyrd.bifrost import Bifrost, TableConfig
 from wyrd.cards import CardRef, Cards
 from wyrd.eval import MediaRef
 from wyrd.model import ModelInterface
 from wyrd.observe import Run
+from wyrd.otel import install_run_correlation
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
@@ -340,6 +349,120 @@ def assert_eval_refusals(agent: Run) -> None:
     assert bad_media.value.code == "WYRD_SPEC_400_VALIDATION"
 
 
+def access_token(server: WyrdTestServer, credential: str) -> str:
+    """Exchange an API key for a Wyrd access token through the public token route."""
+    request = urllib.request.Request(
+        f"{server.base_url}/auth/token",
+        data=json.dumps({"grant_type": "wyrd_api_key", "api_key": credential}).encode(),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request) as response:
+        return json.loads(response.read())["access_token"]
+
+
+def otlp_provider(server: WyrdTestServer, credential: str) -> TracerProvider:
+    """A stock OpenTelemetry SDK provider exporting OTLP/HTTP to ``/v1/traces``.
+
+    The provider is private, as an agent framework's often is, so the journey
+    registers Wyrd's correlation processor through the explicit hook.
+    """
+    provider = TracerProvider()
+    provider.add_span_processor(
+        BatchSpanProcessor(
+            OTLPSpanExporter(
+                endpoint=f"{server.base_url}/v1/traces",
+                headers={"x-wyrd-access-token": f"Bearer {access_token(server, credential)}"},
+            )
+        )
+    )
+    assert install_run_correlation(provider) is True
+    return provider
+
+
+def emit_framework_scope(
+    state: WyrdState, provider: TracerProvider, dataset: str
+) -> tuple[Run, tuple[str, str]]:
+    """Run framework-style code inside ``with state.run(card="agent")``.
+
+    The spans carry no Wyrd attributes of their own; the scope supplies them.
+    The custom row and the Eval observation pass no trace identity: the Eval
+    row takes the active tool span's ids. Returns the run and those ids.
+    """
+    tracer = provider.get_tracer("framework")
+    with state.run(card="agent") as agent_run:
+        with (
+            tracer.start_as_current_span("agent.invoke"),
+            tracer.start_as_current_span("agent.tool") as tool,
+        ):
+            ids = tool.get_span_context()
+            agent_run.observe.record(dataset, {"value": 44})
+            agent_run.observe.eval({"answer": "scoped"})
+    return agent_run, (f"{ids.trace_id:032x}", f"{ids.span_id:016x}")
+
+
+def assert_scope_joins(
+    server: WyrdTestServer,
+    credential: str,
+    agent_run: Run,
+    agent_uid: str,
+    dataset: str,
+    tool: tuple[str, str],
+) -> None:
+    """Prove the persisted span, custom, and Eval rows join on the Run scope."""
+    query = Bifrost(server_url=server.base_url, credential=credential)
+    run_id = agent_run.run_id
+    spans = (
+        query.sql(
+            "SELECT name, card_ref, run_id, card_uid, principal_id "
+            f"FROM vala.traces.spans WHERE run_id = '{run_id}' ORDER BY name"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert [row["name"] for row in spans] == ["agent.invoke", "agent.tool"]
+    assert {(row["card_ref"], row["run_id"], row["card_uid"]) for row in spans} == {
+        (agent_run.card_ref, run_id, agent_uid)
+    }
+    publishers = {row["principal_id"] for row in spans}
+    assert len(publishers) == 1 and None not in publishers, "one authenticated publisher"
+    (publisher,) = publishers
+
+    custom = (
+        query.sql(
+            "SELECT d.value, d.card_uid, d.principal_id, s.name "
+            f"FROM {dataset} d JOIN vala.traces.spans s ON d.run_id = s.run_id "
+            f"WHERE d.run_id = '{run_id}' ORDER BY s.name"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert custom == [
+        {"value": 44, "card_uid": agent_uid, "principal_id": publisher, "name": name}
+        for name in ("agent.invoke", "agent.tool")
+    ]
+
+    evals = (
+        query.sql(
+            "SELECT e.context, e.trace_id, e.span_id, e.run_id, e.card_uid, s.name "
+            "FROM vala.eval.observations e JOIN vala.traces.spans s "
+            "ON e.trace_id = s.trace_id AND e.span_id = s.span_id "
+            f"WHERE e.run_id = '{run_id}'"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert len(evals) == 1
+    (joined,) = evals
+    assert json.loads(joined["context"]) == {"answer": "scoped"}
+    assert (joined["trace_id"].hex(), joined["span_id"].hex()) == tool
+    assert (joined["run_id"], joined["card_uid"], joined["name"]) == (
+        run_id,
+        agent_uid,
+        "agent.tool",
+    )
+
+
 @pytest.mark.integration
 def test_scoped_run_emits_drift_eval_and_generic_rows(tmp_path: Path) -> None:
     """One invocation emits Drift, Eval, and generic rows correlated to their subjects."""
@@ -413,8 +536,17 @@ def run_journey(tmp_path: Path, server: WyrdTestServer) -> None:
         "Drift and Eval emits perform no per-observation schema IO"
     )
 
+    provider = otlp_provider(server, credential)
+    agent_run, tool = emit_framework_scope(state, provider, dataset)
+    assert agent_run.run_id != run.run_id
+    # Leaving the scope is not a durability barrier: flush spans, drain the
+    # writer, then wait for publication before reading anything back.
+    assert provider.force_flush()
+
     state.shutdown()
     state.shutdown()
     server.flush_bifrost()
 
     assert_read_back(server, admin, run.run_id, model_uid, agent_uid, (dataset, dataset_b), active)
+    assert_scope_joins(server, admin, agent_run, agent_uid, dataset, tool)
+    provider.shutdown()

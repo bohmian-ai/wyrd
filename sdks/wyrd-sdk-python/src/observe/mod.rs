@@ -192,6 +192,47 @@ impl PyRun {
         ))
     }
 
+    /// Enter this view's ambient OpenTelemetry span correlation.
+    ///
+    /// Delegates to `wyrd.otel`, which attaches this view's exact CardRef and
+    /// `run_id` to Python's execution-local OpenTelemetry context, stamps an
+    /// already-active recording span, and ensures the global provider has the
+    /// Wyrd span processor. The token lives in that module's execution-local
+    /// stack, never on this immutable view, so one run may be entered by nested
+    /// or concurrent scopes. Telemetry is optional: any failure, including a
+    /// missing `opentelemetry` package, is swallowed and the run is returned.
+    /// Entering never flushes, starts a span, or calls the server.
+    fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        let run = slf.get();
+        let _ = slf.py().import("wyrd.otel").and_then(|otel| {
+            otel.call_method1(
+                "_enter_run",
+                (run.inner.card_ref().to_string(), run.inner.run_id().as_str()),
+            )
+        });
+        slf
+    }
+
+    /// Restore the correlation that was ambient before the matching entry.
+    ///
+    /// Detaches the token pushed by this execution context's innermost entry.
+    /// Detach failure is swallowed, and the method always returns `False` so an
+    /// exception raised inside the block propagates unchanged. Exiting is not a
+    /// flush, shutdown, or durability acknowledgement.
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        let _ = py
+            .import("wyrd.otel")
+            .and_then(|otel| otel.call_method0("_exit_run"));
+        false
+    }
+
     /// The emit surface for this view.
     #[getter]
     fn observe(&self) -> PyObserveHandle {

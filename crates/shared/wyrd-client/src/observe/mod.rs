@@ -54,9 +54,12 @@ pub struct Run {
 }
 
 impl Run {
-    /// Open a run over `state`, targeting its root Service Card.
-    pub(crate) fn new(state: WyrdState) -> Self {
-        let subject = state.root_ref().clone();
+    /// Open a run over `state` whose first view observes `subject`.
+    ///
+    /// Mints the invocation's UUIDv7 `run_id`; every later [`Run::for_card`]
+    /// view shares it. The caller has already resolved `subject` from the
+    /// state's hydrated graph, so opening never fails and performs no IO.
+    pub(crate) fn new(state: WyrdState, subject: CardRef) -> Self {
         Self {
             state,
             run_id: RunId::new(),

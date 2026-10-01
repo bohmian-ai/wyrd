@@ -21,6 +21,7 @@ use vala_bifrost_redux::storage::{
     StorageOperationBarrier, StorageRequestOutcome,
 };
 use wyrd_client::WyrdClient;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::telemetry::{BifrostMetricKind, BifrostTelemetryDelta};
@@ -599,7 +600,7 @@ async fn prove_query_stream_telemetry(
     server: &WyrdTestServer,
     client: &WyrdClient,
     fqn: &str,
-    tenant: wyrd_spec::DataTenantId,
+    tenant: DataTenantId,
     table: &str,
 ) -> Result<(), JourneyError> {
     let telemetry = cluster.telemetry();

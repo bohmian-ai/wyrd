@@ -54,6 +54,8 @@ use crate::catalog::BifrostCatalog;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use crate::maintenance::StagingFilePublisher;
 use crate::scribe::admission::{AdmissionConfig, AdmissionController};
+#[cfg(any(test, feature = "test-support"))]
+use crate::scribe::assembly::StagingBacklog;
 pub use crate::scribe::execution_lanes::{
     ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
@@ -2221,13 +2223,12 @@ impl ScribeImpl {
     /// Returns [`ScribeError::Internal`] when the staging assembler lock is
     /// poisoned.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn staging_backlog_for_test(
-        &self,
-    ) -> Result<crate::scribe::assembly::StagingBacklog, ScribeError> {
-        self.persistence.as_ref().map_or(
-            Ok(crate::scribe::assembly::StagingBacklog::default()),
-            |persistence| persistence.staging_backlog_for_test(),
-        )
+    pub fn staging_backlog_for_test(&self) -> Result<StagingBacklog, ScribeError> {
+        self.persistence
+            .as_ref()
+            .map_or(Ok(StagingBacklog::default()), |persistence| {
+                persistence.staging_backlog_for_test()
+            })
     }
 
     /// Install a one-shot test barrier at the public write seam.

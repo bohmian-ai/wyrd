@@ -2743,6 +2743,10 @@ pub(crate) fn histogram_quantile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use BifrostMetricKind::{Counter, Gauge, HistogramBucket};
+    use TelemetryAggregation::{Delta, Final, P99, Peak};
+    use TelemetryRequirement::{Always, Role};
+    use TelemetryUnit::{Bytes, Count, Seconds};
 
     /// Construct one normalized captured production span for mapper tests.
     fn captured_span(name: &str, attributes: &[(&str, &str)]) -> CapturedSpan {
@@ -3409,10 +3413,6 @@ mod tests {
 
     /// Enumerate accepted-T16 emitter contracts without reading the binding ledger.
     fn emitter_contracts() -> Vec<EmitterContractFixture> {
-        use BifrostMetricKind::{Counter, Gauge, HistogramBucket};
-        use TelemetryAggregation::{Delta, Final, P99, Peak};
-        use TelemetryRequirement::{Always, Role};
-        use TelemetryUnit::{Bytes, Count, Seconds};
         vec![
             EmitterContractFixture {
                 id: "gate.requests.success",

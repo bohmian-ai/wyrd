@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
+use vala_bifrost_redux::storage::{StorageInspection, StorageLifecycle};
 use wyrd_spec::DataTenantId;
 
 pub use vala_bifrost_redux::scribe::promotion::ScribePublishedHotFileV1;
@@ -724,8 +725,7 @@ impl ScribeStorageDrainObservationV1 {
     /// A composition with no metadata cache reports every cache count as zero,
     /// which is exactly what it holds.
     #[must_use]
-    pub fn from_inspection(inspection: &vala_bifrost_redux::storage::StorageInspection) -> Self {
-        use vala_bifrost_redux::storage::StorageLifecycle;
+    pub fn from_inspection(inspection: &StorageInspection) -> Self {
         let cache = inspection.metadata_cache;
         Self {
             lifecycle: match inspection.lifecycle {

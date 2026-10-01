@@ -1,6 +1,7 @@
 //! Closed-label peer, fragment, slot, and security telemetry.
 
 use std::time::Instant;
+use tracing::Instrument as _;
 use wyrd_spec::vala::api::QueryClass;
 
 /// Carries the spawning task's span into every task `DataFusion` spawns.
@@ -17,7 +18,6 @@ impl datafusion::common::runtime::JoinSetTracer for QuerySpanJoinSetTracer {
         &self,
         future: futures_util::future::BoxFuture<'static, Box<dyn std::any::Any + Send>>,
     ) -> futures_util::future::BoxFuture<'static, Box<dyn std::any::Any + Send>> {
-        use tracing::Instrument as _;
         Box::pin(future.instrument(tracing::Span::current()))
     }
 

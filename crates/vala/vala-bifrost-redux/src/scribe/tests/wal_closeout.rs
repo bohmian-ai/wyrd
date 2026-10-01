@@ -9,7 +9,7 @@ use crate::contracts::{
 };
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::admission::EventTimeWindow;
-use crate::scribe::memory::MemoryCategory;
+use crate::scribe::memory::{MEMORY_CATEGORY_COUNT, MemoryCategory};
 use crate::scribe::replay::replay_wal_directory;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::NodeId;
@@ -288,8 +288,7 @@ fn assert_ingress_owners_settled(scribe: &crate::scribe::ScribeImpl) {
 }
 
 /// Sum the pre-insertion ingress memory categories of one inspection.
-fn ingress_bytes(memory: &[usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT]) -> usize {
-    use crate::scribe::memory::MemoryCategory;
+fn ingress_bytes(memory: &[usize; MEMORY_CATEGORY_COUNT]) -> usize {
     [
         MemoryCategory::Raw,
         MemoryCategory::Decode,

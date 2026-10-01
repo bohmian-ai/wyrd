@@ -20,6 +20,8 @@ use crate::parquet::object_uploader::{
     BifrostParquetUploader, BifrostUploadRole, ParquetObjectIdentity, VerifiedParquetObject,
 };
 use crate::resources::ScribeResources;
+#[cfg(any(test, feature = "test-support"))]
+use crate::scribe::assembly::StagingBacklog;
 use crate::scribe::execution_lanes::{
     ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult, ScribeWalIoOp,
     ScribeWalIoPool, ScribeWalIoResult,
@@ -1002,16 +1004,11 @@ impl PersistenceRuntime {
     /// Returns [`ScribeError::Internal`] when the staging assembler lock is
     /// poisoned.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn staging_backlog_for_test(
-        &self,
-    ) -> Result<crate::scribe::assembly::StagingBacklog, ScribeError> {
+    pub fn staging_backlog_for_test(&self) -> Result<StagingBacklog, ScribeError> {
         self.worker
             .as_ref()
             .and_then(|worker| worker.staging.as_ref())
-            .map_or(
-                Ok(crate::scribe::assembly::StagingBacklog::default()),
-                |staging| staging.backlog(),
-            )
+            .map_or(Ok(StagingBacklog::default()), |staging| staging.backlog())
     }
 
     /// Aborts every retained persistence worker without touching the async join registry.

@@ -14,8 +14,10 @@ use std::task::{Context, Poll};
 use axum::body::Body;
 use axum::http::Request;
 use axum::response::{IntoResponse, Response};
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Collected, LengthLimitError, Limited};
 use tower::{Layer, Service};
+use vala_bifrost_redux::resources::BifrostResourceError;
 use wyrd_spec::error::WyrdError;
 
 use crate::http::error::WyrdErrorResponse;
@@ -132,8 +134,8 @@ where
             }
 
             // A declared length is charged before a byte is buffered; an
-            // undeclared body is charged its exact collected length below.
-            let mut transport_lease = match (&admission, declared_bytes) {
+            // undeclared body is charged frame by frame as it is buffered.
+            let transport_lease = match (&admission, declared_bytes) {
                 (Some(admission), Some(bytes)) => match admission.try_acquire(bytes) {
                     Ok(lease) => Some(lease),
                     Err(error) => return Ok(transport_occupied(&error)),
@@ -145,10 +147,31 @@ where
             // Using http_body_util::Limited directly lets us distinguish
             // length-limit failures from stream/IO failures by error type.
             let (parts, body) = request.into_parts();
-            let limited = Limited::new(body, max_bytes + 1);
-            match limited.collect().await {
-                Ok(collected) => {
-                    let bytes = collected.to_bytes();
+            let mut limited = Limited::new(body, max_bytes + 1);
+            let mut frame_leases = Vec::new();
+            let collected = match (&admission, declared_bytes) {
+                (Some(admission), None) => {
+                    let mut buffered = Vec::new();
+                    loop {
+                        match limited.frame().await {
+                            None => break Ok(Bytes::from(buffered)),
+                            Some(Err(error)) => break Err(error),
+                            Some(Ok(frame)) => {
+                                if let Some(data) = frame.data_ref() {
+                                    match admission.try_acquire(data.len()) {
+                                        Ok(lease) => frame_leases.push(lease),
+                                        Err(error) => return Ok(transport_occupied(&error)),
+                                    }
+                                    buffered.extend_from_slice(data);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => limited.collect().await.map(Collected::to_bytes),
+            };
+            match collected {
+                Ok(bytes) => {
                     if bytes.len() > max_bytes {
                         let error = WyrdError::PayloadTooLarge {
                             message: format!("request body exceeds the {max_bytes}-byte limit"),
@@ -158,17 +181,9 @@ where
                         };
                         return Ok(WyrdErrorResponse::from(error).into_response());
                     }
-                    if let Some(admission) =
-                        admission.as_ref().filter(|_| transport_lease.is_none())
-                    {
-                        match admission.try_acquire(bytes.len()) {
-                            Ok(lease) => transport_lease = Some(lease),
-                            Err(error) => return Ok(transport_occupied(&error)),
-                        }
-                    }
                     let request = Request::from_parts(parts, Body::from(bytes));
                     let response = inner.call(request).await.map_err(Into::into);
-                    drop(transport_lease);
+                    drop((transport_lease, frame_leases));
                     response
                 }
                 Err(error) if error.is::<LengthLimitError>() => {
@@ -197,7 +212,7 @@ where
 }
 
 /// Maps a refused transport charge to the typed occupied-capacity response.
-fn transport_occupied(error: &vala_bifrost_redux::resources::BifrostResourceError) -> Response {
+fn transport_occupied(error: &BifrostResourceError) -> Response {
     let error = WyrdError::ServiceUnavailable {
         message: "request body capacity is occupied".to_owned(),
         details: serde_json::json!({ "reason": error.to_string() }),
@@ -250,8 +265,8 @@ mod tests {
         assert_eq!(admission.used_bytes(), 0);
     }
 
-    /// An HTTP/2-style body without a length is charged its exact collected
-    /// bytes, and a full shared cap refuses it before the handler runs.
+    /// An HTTP/2-style body without a length is charged as it is buffered,
+    /// and a full shared cap refuses it before the handler runs.
     ///
     /// # Panics
     ///
@@ -293,6 +308,85 @@ mod tests {
             2 * BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
         drop((first, second));
+    }
+
+    /// An undeclared-length Scribe body holds a governed charge for every
+    /// buffered frame while it is still arriving, a nearly full root refuses
+    /// it before buffering past the remaining capacity, and dropping the
+    /// in-flight request returns every byte.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the charge, refusal, or release differs from that.
+    #[tokio::test]
+    async fn undeclared_body_is_charged_while_collected_and_released_on_drop() {
+        let admission = BifrostTransportAdmission::for_tests();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&invoked);
+        let service = ServiceBuilder::new()
+            .layer(wyrd_body_limit(
+                1024,
+                Some(BIFROST_INGEST_REQUEST_LIMIT_BYTES),
+                Some(admission.clone()),
+            ))
+            .service(service_fn(move |_request: Request<Body>| {
+                observed.store(true, Ordering::Release);
+                async { Ok::<_, Infallible>(Response::new(Body::empty())) }
+            }));
+        let streamed = |rx| {
+            Request::builder()
+                .version(axum::http::Version::HTTP_2)
+                .uri("/v1/traces")
+                .body(Body::from_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                ))
+                .expect("HTTP/2 request")
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(1);
+        let in_flight = tokio::spawn(service.clone().oneshot(streamed(rx)));
+        tx.send(Ok(Bytes::from(vec![0_u8; 100])))
+            .await
+            .expect("body chunk");
+        while admission.used_bytes() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(admission.used_bytes(), 100, "the buffered chunk is charged");
+        in_flight.abort();
+        assert!(in_flight.await.is_err(), "the request was dropped mid-body");
+        assert_eq!(
+            admission.used_bytes(),
+            0,
+            "a dropped request returns its charge"
+        );
+
+        let headroom = 10;
+        let occupants = (
+            admission
+                .try_acquire(BIFROST_INGEST_REQUEST_LIMIT_BYTES)
+                .expect("first occupant"),
+            admission
+                .try_acquire(
+                    admission.limit_bytes() - BIFROST_INGEST_REQUEST_LIMIT_BYTES - headroom,
+                )
+                .expect("second occupant fills all but the headroom"),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(1);
+        tx.send(Ok(Bytes::from(vec![0_u8; 100])))
+            .await
+            .expect("body chunk");
+        drop(tx);
+        let response = service
+            .oneshot(streamed(rx))
+            .await
+            .expect("infallible service");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!invoked.load(Ordering::Acquire), "the handler never ran");
+        assert_eq!(admission.used_bytes(), admission.limit_bytes() - headroom);
+        drop(occupants);
     }
 
     /// Only the three mounted Scribe HTTP routes receive the selected encoded

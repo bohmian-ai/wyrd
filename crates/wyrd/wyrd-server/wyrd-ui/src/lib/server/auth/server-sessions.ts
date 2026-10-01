@@ -285,7 +285,9 @@ export class ServerSessions {
    * session the server still honours for this browser. Session-cookie names
    * are only lookup hints: each distinct hinted tenant is resolved through
    * `read`, which clears unknown, expired, and mismatched cookies, and only the
-   * server-returned key and name are rendered.
+   * server-returned key and name are rendered. Hints come from the request,
+   * so they are resolved one at a time: at most one private verification is
+   * in flight however many cookies a request carries.
    */
   async metadata(session: ServerSession, cookies: Cookies): Promise<SessionMetadata> {
     const hints = new Set(
@@ -295,7 +297,8 @@ export class ServerSessions {
         .map(({ name }) => name.slice(sessionPrefix.length))
         .filter((key) => key !== session.tenantKey && tenantKeyPattern.test(key))
     );
-    const others = await Promise.all([...hints].map((key) => this.read(key, cookies)));
+    const others: (ServerSession | null)[] = [];
+    for (const key of hints) others.push(await this.read(key, cookies));
     return {
       subject: { id: session.principalId, name: session.principalId },
       expiresAt: session.expiresAt,

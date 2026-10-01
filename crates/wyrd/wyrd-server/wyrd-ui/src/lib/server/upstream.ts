@@ -8,11 +8,13 @@ const loopback = (hostname: string) =>
  * Internal Wyrd server origin; the application image points it at the
  * co-located Rust listener. This one origin carries the BFF service key and
  * session credentials, so it must be `https:`; plaintext `http:` is allowed
- * only for `localhost` and literal loopback addresses. Throws on any other
- * value, before a caller can send a request.
+ * only for `localhost` and literal loopback addresses. Only an absent value
+ * takes the loopback default; an explicit empty value is refused like any
+ * other invalid one. Throws on any other value, before a caller can send a
+ * request.
  */
 export function serverUrl(): string {
-  const configured = env.WYRD_SERVER_URL || 'http://127.0.0.1:8080';
+  const configured = env.WYRD_SERVER_URL ?? 'http://127.0.0.1:8080';
   let url: URL;
   try {
     url = new URL(configured);

@@ -262,6 +262,47 @@ test('production chooser clears forged, expired, duplicate and mismatched hints'
   expect(seen.sort()).toEqual([forged, expired, mismatched, research].sort());
 });
 
+test('production chooser bounds server verification', async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const hinted = ['one', 'two', 'three', 'four', 'five'];
+  const ids = Object.fromEntries(hinted.map((key, i) => [String(i).repeat(64), key]));
+  const fetcher = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
+    const { session_id } = JSON.parse(String(init!.body)) as { session_id: string };
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    inFlight--;
+    const key = ids[session_id];
+    return key ? read(key, undefined, key.toUpperCase()) : new Response(null, { status: 401 });
+  }) as unknown as typeof fetch;
+  const sessions = new ServerSessions(fetcher);
+  const cookies = jar({
+    wyrd_session_acme: sessionId,
+    ...Object.fromEntries(Object.entries(ids).map(([id, key]) => [`wyrd_session_${key}`, id])),
+    wyrd_session_forged: 'd'.repeat(64)
+  });
+  const current = {
+    tenantKey: 'acme',
+    tenantId,
+    tenantName: 'Acme',
+    principalId: 'p',
+    roles: [],
+    permissions: [],
+    expiresAt: Date.now() + 60_000,
+    csrf
+  };
+
+  const metadata = await sessions.metadata(current, cookies);
+  expect(peak).toBe(1);
+  expect(fetcher).toHaveBeenCalledTimes(hinted.length + 1);
+  expect(metadata.tenants).toEqual([
+    { key: 'acme', name: 'Acme' },
+    ...hinted.map((key) => ({ key, name: key.toUpperCase() }))
+  ]);
+  expect(cookies.values.has('wyrd_session_forged')).toBe(false);
+});
+
 test('production tenant context carries the server tenant id outside page metadata', async () => {
   const sessions = new ServerSessions(vi.fn(async () => read('acme')) as unknown as typeof fetch);
   const cookies = jar({ wyrd_session_acme: sessionId });

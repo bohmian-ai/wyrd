@@ -39,7 +39,7 @@ test('loopback http server origin is accepted', () => {
       env.WYRD_SERVER_URL = origin;
       expect(serverUrl()).toBe(origin);
     }
-    env.WYRD_SERVER_URL = '';
+    delete env.WYRD_SERVER_URL;
     expect(serverUrl()).toBe('http://127.0.0.1:8080');
   } finally {
     env.WYRD_SERVER_URL = 'https://wyrd.internal:8443';
@@ -62,6 +62,18 @@ test('non-loopback http server origin is refused before fetch', async () => {
       expect(await serverReady(fetcher)).toBe(false);
       expect(seen).toEqual([]);
     }
+  } finally {
+    env.WYRD_SERVER_URL = 'https://wyrd.internal:8443';
+  }
+});
+
+test('empty upstream value is refused before fetch', async () => {
+  try {
+    env.WYRD_SERVER_URL = '';
+    expect(() => serverUrl()).toThrow('WYRD_SERVER_URL is not a valid URL');
+    const { seen, fetcher } = recording();
+    expect(await serverReady(fetcher)).toBe(false);
+    expect(seen).toEqual([]);
   } finally {
     env.WYRD_SERVER_URL = 'https://wyrd.internal:8443';
   }

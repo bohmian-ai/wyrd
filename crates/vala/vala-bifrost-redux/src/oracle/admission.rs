@@ -834,7 +834,7 @@ impl OracleAdmission {
             OracleAdmissionReason::ClassCapacity,
         );
         let mut waiter_telemetry = waiter_telemetry;
-        waiter_telemetry.finish("class", "acquired");
+        waiter_telemetry.finish();
         self.build_admitted_guard(tenant, resources, cancellation, attempt_id)
     }
 

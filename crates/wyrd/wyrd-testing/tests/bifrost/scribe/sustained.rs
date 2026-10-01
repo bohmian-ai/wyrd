@@ -185,9 +185,9 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
     );
     assert!(
         server
-            .scribe_staging_totals_for_test()
-            .expect("the pod's staged and claim totals are inspectable")
-            .live_members()
+            .scribe_staging_backlog_for_test()
+            .expect("the pod's staged backlog is inspectable")
+            .live_members
             > 0,
         "the freeze must make at least one member durable"
     );
@@ -355,23 +355,21 @@ fn batch_values(tenant_ordinal: usize, batch: usize) -> Vec<i64> {
     (base..base + ROWS_PER_BATCH).collect()
 }
 
-/// Asserts the drained pod's ownership and retained telemetry reconcile.
+/// Asserts the drained pod's ownership settled.
 ///
 /// Every published object has replaced the members that produced it, so a
-/// settled pod must own no writable bucket and have closed every claim it opened. These are the totals
-/// of the one retained observation owner checked against the inspected
-/// ownership beside them.
+/// settled pod must own no writable bucket and have closed every claim it
+/// opened, read from the staging and shard owners.
 ///
 /// # Panics
 ///
 /// Panics when the totals are not inspectable or any of them does not settle.
 fn assert_terminal_reconciliation(server: &WyrdTestServer) {
     let staging = server
-        .scribe_staging_totals_for_test()
-        .expect("the pod's staged and claim totals are inspectable");
+        .scribe_staging_backlog_for_test()
+        .expect("the pod's staged backlog is inspectable");
     assert_eq!(
-        staging.outstanding_claims(),
-        0,
+        staging.outstanding_claims, 0,
         "a drained pod has no publication in flight"
     );
     let snapshot = server

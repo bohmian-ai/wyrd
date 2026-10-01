@@ -1089,7 +1089,7 @@ mod tests {
         decoder
             .accept(tally.complete(fingerprint.clone(), staged(1024)))
             .expect("in-process completion validates");
-        let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&live, 0);
+        let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&live);
         stats.finalize();
         assert_eq!(
             (stats.physical_bytes_scanned, stats.files_scanned),
@@ -1103,7 +1103,7 @@ mod tests {
         decoder
             .accept(NativeOutputTally::default().complete(fingerprint, WorkerScanStats::default()))
             .expect("empty completion validates");
-        let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&memtable, 0);
+        let mut stats = crate::oracle::exec::OracleQueryScanStats::from_plan(&memtable);
         stats.finalize();
         assert_eq!(
             stats.physical_bytes_scanned, None,

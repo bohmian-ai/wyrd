@@ -563,12 +563,16 @@ Snapshot preparation has no admission gate of its own. Table lookup, reader
 guard, and hot-cut work wait on the bounded runtime PostgreSQL pool; the
 metadata pointer read and revalidation wait on the Iceberg SQL catalog's own
 bounded pool, which pings a reused connection only after it has sat idle. All
-wait within the leader deadline, and each substep is timed on
-`oracle_query_phase_seconds`.
+wait within the leader deadline. `oracle_query_phase_seconds` times the
+leader's sequential, non-overlapping steps — `snapshot_pin` (covering every
+preparation substep above), `scribe_listing`, `provider_setup`,
+`physical_planning`, and `admission` — so they may be read as additive; total
+Oracle time is `oracle_query_duration_seconds`, not a phase.
 Remote peer work reuses one authenticated channel per ready peer incarnation and
 endpoint; a changed fence or endpoint connects anew and never inherits the
 prior peer's channel. Connect, fragment open, first remote frame, and terminal
-are timed as separate phases.
+are timed as separate `peer_*` phases; they are per-fragment latencies that can
+overlap one another and the leader steps, so they are never summed with them.
 
 An Analytical leader selects at most `max_workers_per_query` remote workers from
 the pinned eligible cut, rotating the starting position by the attempt identity
@@ -886,6 +890,64 @@ fallback reason, and stage role. Tenant, table, SQL, object path,
 query ID, task ID, snapshot digest, and other high-cardinality values are
 scrubbed trace fields, never metric labels. Physical size, latency, throughput,
 and SLA claims require measured evidence from the production path.
+
+### Measurement meanings
+
+Request counters count attempts, including idempotent client retries. Process
+counters restart at zero with the process and are not exact durable accounting
+across a restart; durable batch, file, and task rows answer that question.
+
+- **Gate.** `bifrost_gate_requests_total{operation,outcome}` and
+  `bifrost_gate_request_duration_seconds` measure request opening: a query
+  request succeeds when its stream opens, not when it completes.
+  `bifrost_gate_query_streams_total{outcome}` and
+  `bifrost_gate_query_stream_duration_seconds{outcome}` record the
+  client-facing stream's one terminal — `success`, `degraded`, `failed`,
+  `rejected`, or `cancelled` — at the server edge. Neither includes client
+  network or SDK time.
+- **Scribe.** `bifrost_scribe_ack_seconds` measures each ACK attempt.
+  `bifrost_scribe_memtable_rows_inserted_total` counts rows the shard inserted
+  into the live memtable in this process; an idempotent same-process retry adds
+  zero, and replay after restart counts again in the new process. Receipt
+  `accepted_rows` is a client contract, not a newly-stored-row measure.
+  `bifrost_scribe_staging_live_members`, `_live_bytes`,
+  `_oldest_member_timestamp_seconds`, and `_outstanding_claims` are published
+  from the staging assembler's own state, so members restored after restart
+  appear in backlog. `bifrost_scribe_lane_queued{lane}` is waiting jobs only;
+  `bifrost_scribe_lane_active{lane}` is running jobs.
+  `bifrost_scribe_publication_files_total` and `_bytes_total` count committed
+  publication output after its catalog transaction commits.
+- **Oracle.** `oracle_query_duration_seconds{class,outcome}` starts after Gate
+  dispatch and measures Oracle execution through its terminal; the production
+  HPA and query reports read it. Outcomes are `success`, `degraded`, `failed`,
+  `cancelled`, and `client_drop`; a Degraded terminal is never counted as
+  success. `oracle_queries_queued` is waiting work and `oracle_queries_active`
+  is admitted work only. `oracle_admission_total{class,outcome,reason}`
+  pre-registers only the decisions an admission branch can make, and
+  `oracle_admission_queue_duration_seconds` records each waiter once. Scan
+  counters report the executed plan's files, bytes, partitions, and row
+  groups. `bifrost_oracle_file_pruning_total{outcome}` counts hot-object
+  exclusions decided from declared bounds; Iceberg pruning happens inside its
+  own scan planning and is not re-walked for telemetry.
+- **Storage.** `bifrost_storage_metadata_cache_effects_total{effect,reason}`
+  counts cache decisions (hit, miss, join, bypass, evict) — logical lookups,
+  not backend I/O. `bifrost_storage_metadata_cache_loads_total{outcome}`,
+  `bifrost_storage_metadata_load_seconds`, and
+  `bifrost_storage_metadata_wait_seconds` measure footer decodes and the time
+  callers waited on them. `bifrost_storage_requests_total{operation}`,
+  `bifrost_storage_request_terminals_total{operation,outcome}`,
+  `bifrost_storage_request_seconds`, and
+  `bifrost_storage_request_retries_total` measure governed backend requests; a
+  cache hit adds none. Resident entries/bytes and in-flight loads are set from
+  the cache's own state, and `bifrost_storage_active_requests` moves at request
+  admission and settlement. No telemetry copy of cache or request state exists.
+- **Traces.** A query is one trace: `bifrost.gate.query.stream` spans the
+  client-facing stream through terminal or drop, with `bifrost.gate.query`
+  dispatch as its child; `bifrost.oracle.stream` spans Oracle execution through
+  terminal cleanup, and `bifrost.oracle.peer.fragment{role,outcome}` spans each
+  remote fragment. Work `DataFusion` spawns inherits the query span, so remote
+  fragments are child work of the query that dispatched them. Each operation
+  span records exactly one `outcome`.
 
 ## Public surface
 

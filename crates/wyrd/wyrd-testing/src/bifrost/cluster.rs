@@ -16,6 +16,7 @@ use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::storage::StorageInspection;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::app::metrics::install_recorder;
@@ -565,13 +566,13 @@ pub struct ClusterShutdownInspection {
     pub forge_active_attempts: u64,
     /// Supervised server tasks retained after every server owner is dropped.
     pub supervised_tasks: u64,
-    /// Each stopped node's terminal storage-owner snapshot, in stop order.
+    /// Each stopped node's terminal storage-owner state, in stop order.
     ///
     /// Kept per node rather than summed: the storage owner is a per-node
     /// resource, and adding two nodes' counts together would turn a per-node
     /// reconciliation into a cluster-wide one that no single owner ever has to
     /// satisfy.
-    pub storage: Vec<vala_bifrost_redux::storage::MetadataCacheSnapshot>,
+    pub storage: Vec<StorageInspection>,
 }
 
 /// One parsed production Prometheus series.

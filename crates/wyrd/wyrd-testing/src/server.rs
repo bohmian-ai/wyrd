@@ -43,6 +43,7 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::storage::StorageInspection;
 use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
 use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
 use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
@@ -249,12 +250,12 @@ pub struct ServerShutdownInspection {
     pub listeners_stopped: bool,
     /// Supervisor join handles still retained after shutdown.
     pub supervised_tasks: u64,
-    /// Final storage-owner reconciliation snapshot when this process had one.
+    /// Final storage-owner state, read from its owners, when this process had one.
     ///
     /// Captured after the bound production serve task joins and before the
     /// harness drops, so it is the state production teardown actually left
     /// rather than the state a test-invoked second shutdown produced.
-    pub storage: Option<vala_bifrost_redux::storage::MetadataCacheSnapshot>,
+    pub storage: Option<StorageInspection>,
 }
 
 /// Exact query-owned resources inspected by test-tier cancellation journeys.
@@ -949,7 +950,7 @@ impl WyrdTestServer {
             .state
             .bifrost
             .bifrost_storage()
-            .map(|storage| storage.telemetry_snapshot());
+            .map(|storage| storage.inspect());
         let inspection = ServerShutdownInspection {
             scribe,
             scribe_inflight,
@@ -2103,24 +2104,22 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
     }
 
-    /// Report the pod's closed staged-member and claim registry totals.
+    /// Report the pod's staged backlog from the Scribe staging owner.
     ///
-    /// Durability is a lifecycle transition, not a file: the only truthful
-    /// evidence that a member became durable, that a claim opened, or that a
-    /// published member's runs were retired is the production registry that
-    /// recorded it. A reconciliation case reads these totals and checks them
-    /// against the published objects and rows the same run can observe.
+    /// Live members are durable, unpublished members, ready or claimed; the
+    /// same snapshot is published as the `bifrost_scribe_staging_*` gauges.
     ///
     /// # Errors
     ///
-    /// Returns an error when this server owns no Scribe.
-    pub fn scribe_staging_totals_for_test(
+    /// Returns an error when this server owns no Scribe or the staging owner
+    /// cannot be read.
+    pub fn scribe_staging_backlog_for_test(
         &self,
-    ) -> Result<vala_bifrost_redux::scribe::telemetry::ScribeStagingSnapshot, WyrdTestServerError>
-    {
+    ) -> Result<vala_bifrost_redux::scribe::assembly::StagingBacklog, WyrdTestServerError> {
         self.bifrost_scribe()
-            .map(|scribe| scribe.staging_totals_for_test())
-            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
+            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
+            .staging_backlog_for_test()
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
     /// Trip the server-owned WAL breaker for a deterministic failure probe.

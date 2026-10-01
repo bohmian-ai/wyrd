@@ -101,6 +101,10 @@ fn begin_tenant_sql(data_tenant_id: DataTenantId) -> String {
 /// Opens a pooled transaction with `statement` as its begin statement.
 ///
 /// SQLx accepts the transaction only when Postgres reports it open afterwards.
+/// Its pool-acquire, connect, and TLS future is boxed here, once for every
+/// tenant transaction, because inlining that deep chain into callers' futures
+/// exceeds the compiler's layout depth limit on deep server paths such as Oracle
+/// query forwarding in release builds.
 ///
 /// # Errors
 /// Returns [`SqlError::TxFailed`] when Postgres rejects `statement`, and
@@ -109,7 +113,7 @@ async fn begin_bound(
     pool: &PgPool,
     statement: String,
 ) -> Result<Transaction<'static, Postgres>, SqlError> {
-    pool.begin_with(AssertSqlSafe(statement))
+    Box::pin(pool.begin_with(AssertSqlSafe(statement)))
         .await
         .map_err(|error| match error {
             sqlx::Error::Database(_) => SqlError::TxFailed(error),

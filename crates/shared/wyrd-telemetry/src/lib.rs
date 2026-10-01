@@ -69,6 +69,10 @@ pub struct TelemetryGuard {
 pub struct CapturedSpan {
     /// W3C trace identifier from the production span context.
     pub trace_id: String,
+    /// This span's own identifier, which its children name as their parent.
+    pub span_id: String,
+    /// Identifier of the enclosing span; the invalid all-zero id for a root.
+    pub parent_span_id: String,
     /// Exact instrumentation span name.
     pub name: String,
     /// Scrubbed span attributes keyed by their production field names.
@@ -77,6 +81,18 @@ pub struct CapturedSpan {
     pub duration_nanos: u64,
     /// Terminal OpenTelemetry status retained without collapsing unset and success.
     pub status: CapturedSpanStatus,
+    /// Events recorded inside this span, in emission order.
+    pub events: Vec<CapturedSpanEvent>,
+}
+
+/// One `tracing` event the production pipeline attached to a finished span.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedSpanEvent {
+    /// Event message as exported by the OpenTelemetry layer.
+    pub name: String,
+    /// Scrubbed event fields, including the exported `level`.
+    pub attributes: BTreeMap<String, String>,
 }
 
 /// Closed terminal status of one captured OpenTelemetry span.
@@ -121,6 +137,8 @@ impl TestTraceCapture {
                     .skip(checkpoint)
                     .map(|span| CapturedSpan {
                         trace_id: span.span_context.trace_id().to_string(),
+                        span_id: span.span_context.span_id().to_string(),
+                        parent_span_id: span.parent_span_id.to_string(),
                         name: span.name.to_string(),
                         attributes: span
                             .attributes
@@ -138,6 +156,23 @@ impl TestTraceCapture {
                             .map_or(0, |duration| {
                                 u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
                             }),
+                        events: span
+                            .events
+                            .iter()
+                            .map(|event| CapturedSpanEvent {
+                                name: event.name.to_string(),
+                                attributes: event
+                                    .attributes
+                                    .iter()
+                                    .map(|attribute| {
+                                        (
+                                            attribute.key.as_str().to_owned(),
+                                            attribute.value.to_string(),
+                                        )
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
                         status: match &span.status {
                             opentelemetry::trace::Status::Unset => CapturedSpanStatus::Unset,
                             opentelemetry::trace::Status::Ok => CapturedSpanStatus::Ok,

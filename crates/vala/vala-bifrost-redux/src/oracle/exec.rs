@@ -347,8 +347,6 @@ pub(crate) struct OracleQueryScanStats {
     pub(crate) row_groups_scanned: u64,
     /// Row groups excluded by closed-predicate statistics pruning.
     pub(crate) row_groups_pruned: u64,
-    /// Immutable-cut file sizes selected before physical execution.
-    pub(crate) logical_bytes_selected: u64,
     /// Shared file-source metric sets retained until terminal stream drain.
     physical_metrics: Vec<ExecutionPlanMetricsSet>,
     /// Shared dependency counters retained until terminal stream drain.
@@ -362,11 +360,8 @@ pub(crate) struct OracleQueryScanStats {
 impl OracleQueryScanStats {
     /// Walks one final physical plan and snapshots scan metrics and file counts.
     #[must_use]
-    pub(crate) fn from_plan(plan: &dyn ExecutionPlan, logical_bytes_selected: u64) -> Self {
-        let mut stats = Self {
-            logical_bytes_selected,
-            ..Self::default()
-        };
+    pub(crate) fn from_plan(plan: &dyn ExecutionPlan) -> Self {
+        let mut stats = Self::default();
         Self::visit(plan, &mut stats);
         stats
     }
@@ -504,7 +499,7 @@ pub(crate) const WYRD_ROW_GROUPS_PRUNED_METRIC: &str = "wyrd_row_groups_pruned";
 /// would have reported for the identical scan. Bytes are omitted rather than
 /// zeroed when the source never reported them, preserving absent-versus-zero.
 pub(crate) fn analytical_leaf_scan_metrics(plan: &dyn ExecutionPlan) -> MetricsSet {
-    let mut stats = OracleQueryScanStats::from_plan(plan, 0);
+    let mut stats = OracleQueryScanStats::from_plan(plan);
     stats.finalize();
     let mut published = MetricsSet::new();
     let mut publish = |name: &'static str, value: u64| {
@@ -1660,14 +1655,6 @@ pub(crate) struct OracleTableInputs {
     pub(crate) storage: Arc<crate::storage::BifrostStorage>,
     /// Leader-local hot files absent from the pinned Iceberg snapshot.
     pub(crate) hot_files: Vec<HotFileSource>,
-    /// Normalized `wyrd_event_time` bounds of every file the pinned Iceberg
-    /// snapshot holds, in manifest order.
-    ///
-    /// Carried so the leader can decide the published tier on the same axis and
-    /// the same bounds it decides the hot tier on. Iceberg's manifest planning
-    /// applies the identical bounds when it plans the scan, so this is the
-    /// leader's own statement of a decision the reader then enforces.
-    pub(crate) iceberg_event_times: Vec<crate::catalog::event_time::EventTimeStatistics>,
     /// Authenticated request context whose tenant every scanned footer must name.
     pub(crate) context: AuthorizedQueryContext,
     /// Canonical table name used in security diagnostics.
@@ -1685,9 +1672,6 @@ pub(crate) struct OracleTableProvider {
     iceberg: IcebergStaticTableProvider,
     /// Pinned hot files absent from the selected Iceberg manifest.
     hot_files: Vec<HotFileSource>,
-    /// Normalized event-time bounds of every pinned Iceberg file, in manifest
-    /// order.
-    iceberg_event_times: Vec<crate::catalog::event_time::EventTimeStatistics>,
     /// File reader inherited from the pinned Iceberg table.
     file_io: FileIO,
     /// The node's one storage owner, handed to every hot leaf this builds.
@@ -1807,7 +1791,6 @@ impl OracleTableProvider {
             table,
             storage,
             hot_files,
-            iceberg_event_times,
             context,
             table_name,
             remote,
@@ -1821,7 +1804,6 @@ impl OracleTableProvider {
         Ok(Self {
             iceberg,
             hot_files,
-            iceberg_event_times,
             file_io,
             storage,
             physical_schema,
@@ -1885,7 +1867,6 @@ impl OracleTableProvider {
             // own global limit above this provider remains authoritative. The
             // closure's physical indices are what keep unrequested columns out
             // of the Iceberg reader itself rather than merely out of the result.
-            self.record_iceberg_pruning(supported_predicates);
             let published = self
                 .iceberg
                 .scan(
@@ -1981,36 +1962,6 @@ impl OracleTableProvider {
         Ok(remotes)
     }
 
-    /// Records this query's pre-footer event-time decision for every pinned
-    /// Iceberg file.
-    ///
-    /// The published tier is read through Iceberg's own manifest planning,
-    /// which applies these same normalized bounds and never opens an excluded
-    /// file's footer. Deciding here as well is what makes that exclusion
-    /// observable: without it the emitted
-    /// `bifrost_oracle_file_pruning_total` counts reconcile against the cut's
-    /// hot files alone and report a pruned snapshot as unpruned. The decision
-    /// reads the bounds the pin already minted from the manifest entry, so it
-    /// cannot disagree with what the reader then does.
-    ///
-    /// An unconstrained query interval records nothing at all, matching the hot
-    /// tier: nothing was considered, so nothing is reported.
-    fn record_iceberg_pruning(
-        &self,
-        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-    ) {
-        let interval = crate::oracle::pruning::EventTimeQueryInterval::from_predicates(predicates);
-        if interval.is_unbounded() {
-            return;
-        }
-        for statistics in &self.iceberg_event_times {
-            let _ = interval.retains(
-                crate::oracle::pruning::FilePruningSource::Iceberg,
-                *statistics,
-            );
-        }
-    }
-
     /// Returns the staged hot files this query can still read a row from.
     ///
     /// Staged hot Parquet is the only persisted source a leader-local scan
@@ -2033,12 +1984,7 @@ impl OracleTableProvider {
         }
         self.hot_files
             .iter()
-            .filter(|file| {
-                interval.retains(
-                    crate::oracle::pruning::FilePruningSource::Hot,
-                    file.event_time,
-                )
-            })
+            .filter(|file| interval.retains(file.event_time))
             .cloned()
             .collect()
     }
@@ -4199,7 +4145,7 @@ mod tests {
             None,
         )
         .expect("memory source is valid");
-        let mut memory_only = OracleQueryScanStats::from_plan(source.as_ref(), 17);
+        let mut memory_only = OracleQueryScanStats::from_plan(source.as_ref());
         memory_only.finalize();
         assert_eq!(memory_only.physical_bytes_scanned, None);
 
@@ -5631,7 +5577,7 @@ mod tests {
     /// Drains a hot plan through the production `OracleQueryStream` terminal owner.
     async fn drain_hot_terminal(telemetry: &Arc<OracleTelemetry>, exec: HotParquetExec) {
         let schema = exec.schema();
-        let scan_stats = OracleQueryScanStats::from_plan(&exec, 0);
+        let scan_stats = OracleQueryScanStats::from_plan(&exec);
         let batches = exec
             .execute(
                 0,
@@ -5712,7 +5658,7 @@ mod tests {
             }),
         );
         let schema = pending.schema();
-        let scan_stats = OracleQueryScanStats::from_plan(&pending, 0);
+        let scan_stats = OracleQueryScanStats::from_plan(&pending);
         let batches = pending
             .execute(
                 0,
@@ -6970,7 +6916,6 @@ mod tests {
             table: pruning_fixture_table(),
             storage: fixture_storage(),
             hot_files,
-            iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
             remote: None,
@@ -7102,7 +7047,7 @@ mod tests {
             snapshot
                 .counters
                 .get(&format!(
-                    "bifrost_oracle_file_pruning_total{{outcome=\"{outcome}\",source=\"hot\"}}"
+                    "bifrost_oracle_file_pruning_total{{outcome=\"{outcome}\"}}"
                 ))
                 .copied()
                 .unwrap_or_default()
@@ -7260,7 +7205,6 @@ mod tests {
             table: projection_fixture_table(),
             storage: fixture_storage(),
             hot_files: Vec::new(),
-            iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
             remote,

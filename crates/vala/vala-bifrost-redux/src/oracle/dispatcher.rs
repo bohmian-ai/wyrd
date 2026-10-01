@@ -1513,6 +1513,14 @@ impl TonicOraclePeerTransport {
 
     /// Executes a fragment for one exact planned node/fence target.
     ///
+    /// The leader-side `bifrost.oracle.peer.fragment` span is created in the
+    /// calling query's context, so the remote fragment appears as child work of
+    /// the query that dispatched it. The span moves into the returned stream
+    /// and closes when the leader drops it: `outcome` is `success` after the
+    /// worker's last frame, `failed` on a rejected open or failed frame, and
+    /// stays empty when the query dropped the fragment first, which the parent
+    /// query span's own outcome then explains.
+    ///
     /// # Errors
     /// Returns stale-object for a changed lease, retryable for transport
     /// failure, or terminal for invalid transport and stream contracts.
@@ -1521,6 +1529,14 @@ impl TonicOraclePeerTransport {
         candidate: &DispatchCandidate,
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerAttemptStream, DispatchError> {
+        let span = tracing::info_span!(
+            "bifrost.oracle.peer.fragment",
+            role = match candidate.role {
+                wyrd_spec::vala::api::ClusterRole::Scribe => "scribe",
+                wyrd_spec::vala::api::ClusterRole::Oracle => "oracle",
+            },
+            outcome = tracing::field::Empty
+        );
         let mut client = self.client(candidate).await?;
         let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
         let opened = std::time::Instant::now();
@@ -1529,7 +1545,8 @@ impl TonicOraclePeerTransport {
             .await
             .inspect(|_| super::QueryPhase::PeerOpen.record(opened))
             .map_err(|status| {
-                tracing::warn!(code = ?status.code(), "Oracle peer execute rejected");
+                span.record("outcome", "failed");
+                tracing::warn!(parent: &span, code = ?status.code(), "Oracle peer execute rejected");
                 if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
                     live_execution_status_error(&status)
                 } else {
@@ -1544,14 +1561,19 @@ impl TonicOraclePeerTransport {
                 if std::mem::take(&mut first) {
                     super::QueryPhase::PeerFirstFrame.record(streaming);
                 }
-                yield frame.map_err(|status| {
-                    tracing::warn!(code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
+                let frame = frame.map_err(|status| {
+                    tracing::warn!(parent: &span, code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
                     stream_status_error(&status)
                 }).and_then(|frame| frame.try_into().map(LiveFrame::Wire).map_err(|error| {
-                    tracing::warn!(?error, "Oracle leader could not decode a worker frame");
+                    tracing::warn!(parent: &span, ?error, "Oracle leader could not decode a worker frame");
                     DispatchError::Terminal
                 }));
+                if frame.is_err() {
+                    span.record("outcome", "failed");
+                }
+                yield frame;
             }
+            span.record("outcome", "success");
             super::QueryPhase::PeerTerminal.record(streaming);
         };
         Ok(Box::pin(output))

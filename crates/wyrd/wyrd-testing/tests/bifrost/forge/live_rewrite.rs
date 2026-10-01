@@ -654,6 +654,22 @@ async fn rewrite_task_plan(
         .collect()
 }
 
+/// Reads the durable lifecycle state of one Forge task.
+///
+/// This is the committed authority an attempt's reported result is compared
+/// with, read independently of any production telemetry.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails or the task is absent.
+async fn durable_task_state(cluster: &WyrdTestCluster, task_id: Uuid) -> String {
+    sqlx::query_scalar::<_, String>("SELECT state FROM vala.forge_tasks WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_one(cluster.pg_fixture().operator_pool().pool())
+        .await
+        .expect("Forge task state inspection")
+}
+
 /// Reads the durable canonical plan hash of one small-files Forge task.
 ///
 /// Returned hex-encoded, which is exactly how publication renders it into the
@@ -796,6 +812,22 @@ async fn assert_public_rows(
     digest
 }
 
+/// Forge families the journey and recovery windows print as evidence.
+const FORGE_FAMILIES: [&str; 12] = [
+    "bifrost_forge_pending_tasks",
+    "bifrost_forge_oldest_pending_task_timestamp_seconds",
+    "bifrost_forge_active_tasks",
+    "bifrost_forge_tasks_created_total",
+    "bifrost_forge_task_attempts_total",
+    "bifrost_forge_task_failures_total",
+    "bifrost_forge_input_files_total",
+    "bifrost_forge_input_bytes_total",
+    "bifrost_forge_output_files_total",
+    "bifrost_forge_output_bytes_total",
+    "bifrost_forge_compaction_debt_files",
+    "bifrost_forge_compaction_debt_bytes",
+];
+
 /// Durable rewrite facts one recovered operation must be able to prove.
 ///
 /// Every field is read out of Postgres or the Iceberg manifests before this
@@ -804,6 +836,8 @@ async fn assert_public_rows(
 struct RecoveryTelemetry {
     /// Durable Forge task the landed snapshot named as its owner.
     task_id: Uuid,
+    /// Durable `vala.forge_tasks.state` of that task after recovery settled.
+    task_state: String,
     /// Attempt identity the uncertain publication committed under.
     attempt_id: Uuid,
     /// Plans the attempt admitted, each of which publishes independently and
@@ -872,12 +906,20 @@ fn attribute<'a>(span: &'a wyrd_telemetry::CapturedSpan, key: &str) -> Option<&'
 /// stay fixed-cardinality, so no sample may carry a tenant, table, task,
 /// attempt, operation, or object-path label.
 ///
+/// Attempt results are compared with what each settlement committed: the
+/// released attempt committed nothing and so reports no result, the task's
+/// last settled execution reports its durable state, every settled
+/// execution's span result is counted exactly once in
+/// `bifrost_forge_task_attempts_total`, and a successful execution trace
+/// carries no routine claim or settle event.
+///
 /// # Panics
 ///
 /// Panics when a required stage is missing, when a stage carries an identity
-/// other than the durable one, when the recovered volume does not reconcile to
-/// the manifest-derived volume, or when a Forge sample carries an unbounded
-/// label.
+/// other than the durable one, when an attempt result disagrees with durable
+/// state or with its counter, when a routine success event reappears, when the
+/// recovered volume does not reconcile to the manifest-derived volume, or when
+/// a Forge sample carries an unbounded label.
 fn assert_recovery_telemetry(
     journey: &BifrostTelemetryDelta,
     recovery: &BifrostTelemetryDelta,
@@ -980,6 +1022,102 @@ fn assert_recovery_telemetry(
         );
     }
 
+    // 3b. A result is what a settlement committed, never a Rust `Ok`. The
+    //     released attempt wrote nothing durable, so its trace names no
+    //     result; the task's last settled execution names its durable state.
+    for span in executions
+        .iter()
+        .filter(|span| attribute(span, "attempt_id") == Some(facts.attempt_id.to_string().as_str()))
+    {
+        assert_eq!(
+            attribute(span, "result"),
+            None,
+            "the released attempt committed nothing, so it reports no result: {span:?}"
+        );
+        for commit in &commits {
+            assert_eq!(
+                (commit.trace_id.as_str(), commit.parent_span_id.as_str()),
+                (span.trace_id.as_str(), span.span_id.as_str()),
+                "each catalog commit is a child of its attempt's task trace: {commit:?}"
+            );
+        }
+    }
+    let settled_result = executions
+        .iter()
+        .rev()
+        .find_map(|span| attribute(span, "result"));
+    assert_eq!(
+        (settled_result, facts.task_state.as_str()),
+        (Some("succeeded"), "succeeded"),
+        "the task's last settled execution reports the durable state it committed: {executions:?}"
+    );
+
+    // 3c. Each settled small-files execution is one trace and one counted
+    //     attempt under the same result, and settlement released every
+    //     claim-time active count. A registered zero cannot satisfy this: the
+    //     recovery window must hold at least the recovered success.
+    let recovered_executions = recovery
+        .spans
+        .iter()
+        .filter(|span| {
+            span.name == "bifrost.forge.task.execute"
+                && attribute(span, "strategy").is_some_and(|value| value.contains("small_files"))
+        })
+        .filter_map(|span| attribute(span, "result"))
+        .collect::<Vec<_>>();
+    assert!(
+        recovered_executions.contains(&"succeeded"),
+        "the recovery window settled a small-files execution: {recovered_executions:?}"
+    );
+    for result in [
+        "succeeded",
+        "retry",
+        "failed",
+        "cancelled",
+        "refused",
+        "uncertain",
+    ] {
+        let traced = recovered_executions
+            .iter()
+            .filter(|traced| **traced == result)
+            .count();
+        let counted = counter_delta(
+            recovery,
+            "bifrost_forge_task_attempts_total",
+            &[("task_type", "small_files"), ("result", result)],
+        );
+        assert!(
+            (counted - traced as f64).abs() < f64::EPSILON,
+            "small-files {result} attempts counted {counted} but traced {traced}"
+        );
+    }
+    for sample in recovery
+        .gauge_final
+        .iter()
+        .filter(|sample| sample.family == "bifrost_forge_active_tasks")
+    {
+        assert!(
+            sample.value.abs() < f64::EPSILON,
+            "settlement released every claimed attempt's active count: {sample:?}"
+        );
+    }
+
+    // 3d. A settled task tells its story once, in its own trace: the routine
+    //     claim and settle events are gone and nothing replaced them.
+    for span in &journey.spans {
+        for event in &span.events {
+            assert!(
+                ![
+                    "Forge task claimed",
+                    "Forge task settled",
+                    "Forge recovery claimed an unfinished cleanup cursor",
+                ]
+                .contains(&event.name.as_str()),
+                "a routine Forge success event was exported again: {span:?}"
+            );
+        }
+    }
+
     // 4. The terminal reconciliation counted itself as a recovery.
     let recovered = counter_delta(
         recovery,
@@ -1010,11 +1148,7 @@ fn assert_recovery_telemetry(
     // presence of their metric families: a registered family carrying only
     // zero-valued samples would satisfy a presence check while proving that
     // this journey never traversed either production owner.
-    let accepted = counter_delta(
-        journey,
-        "bifrost_scribe_rows_total",
-        &[("status", "accepted")],
-    );
+    let accepted = counter_delta(journey, "bifrost_scribe_memtable_rows_inserted_total", &[]);
     // The counter is process-wide and carries no table label, and this process
     // also publishes its own retained audit history through the same Scribe, so
     // the journey's rows are a floor rather than the whole count. Row-for-row
@@ -1022,7 +1156,7 @@ fn assert_recovery_telemetry(
     // which compare identities and a digest, not a volume.
     assert!(
         accepted >= facts.acknowledged_rows as f64,
-        "the production Scribe accepted at least the rows public ingest acknowledged: \
+        "the production Scribe inserted at least the rows public ingest acknowledged: \
          {accepted} vs {}",
         facts.acknowledged_rows
     );
@@ -1763,11 +1897,47 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let journey_window = telemetry
         .delta_since(&checkpoint)
         .expect("production telemetry delta");
+    eprintln!(
+        "evidence forge phase=journey durable_unsettled_tasks={} samples: {}",
+        pending_tasks(&cluster).await,
+        journey_window.evidence(&FORGE_FAMILIES)
+    );
+    for span in recovery_window
+        .spans
+        .iter()
+        .filter(|span| span.name.starts_with("bifrost.forge."))
+    {
+        eprintln!(
+            "evidence forge_trace trace={} span={} parent={} name={} duration_nanos={} \
+             result={:?} task_type={:?} event_levels={:?}",
+            span.trace_id,
+            span.span_id,
+            span.parent_span_id,
+            span.name,
+            span.duration_nanos,
+            attribute(span, "result"),
+            attribute(span, "task_type"),
+            span.events
+                .iter()
+                .filter_map(|event| event.attributes.get("level"))
+                .collect::<Vec<_>>()
+        );
+    }
+    eprintln!(
+        "evidence forge phase=recovery landed_task={landed_task} attempt={landed_attempt} \
+         removed_files={} added_files={} removed_bytes={} added_bytes={} samples: {}",
+        landed.removed_data.len(),
+        landed.added_data.len(),
+        landed.removed_bytes,
+        landed.added_bytes,
+        recovery_window.evidence(&FORGE_FAMILIES)
+    );
     assert_recovery_telemetry(
         &journey_window,
         &recovery_window,
         &RecoveryTelemetry {
             task_id: landed_task,
+            task_state: durable_task_state(&cluster, landed_task).await,
             attempt_id: landed_attempt,
             plans: attempt_plan_count(&observer, landed_attempt),
             input_files: landed.removed_data.len() as u64,

@@ -147,7 +147,7 @@ async fn multi_pod_concurrent_batches_are_owned_and_visible() {
         assert!(
             acknowledged[pod] > baseline[pod],
             "pod {pod} must durably acknowledge the batches sent to its own \
-             endpoint, but its acknowledgement total stayed at {}",
+             endpoint, but its retained memtable rows stayed at {}",
             acknowledged[pod]
         );
     }
@@ -503,29 +503,36 @@ async fn read_rows(client: &WyrdClient, table: &str) -> Vec<RowIdentity> {
 
 /// Returns each pod's currently owned ingress work in pod order.
 ///
-/// Accepted-but-unsettled attempts plus queued shard commands are live gauges,
-/// so an all-zero reading is a genuine idle pod rather than an absence of
-/// history.
+/// Admitted-but-unsettled requests from the admission owner plus queued shard
+/// commands are live state, so an all-zero reading is a genuine idle pod
+/// rather than an absence of history.
 fn in_flight_by_pod(cluster: &WyrdTestCluster) -> Vec<usize> {
     (0..PODS)
         .map(|index| {
-            let snapshot = pod(cluster, index)
+            let server = pod(cluster, index);
+            let scribe = server.bifrost_scribe().expect("pod owns a Scribe");
+            let snapshot = server
                 .scribe_inspection_snapshot()
                 .expect("pod Scribe ownership is inspectable");
-            snapshot.ingress_lifecycle.active_attempts + snapshot.queued_items
+            scribe.inflight_items_for_test() + snapshot.queued_items
         })
         .collect()
 }
 
-/// Returns each pod's durable acknowledgement total in pod order.
-fn acknowledged_by_pod(cluster: &WyrdTestCluster) -> Vec<u64> {
+/// Returns each pod's memtable-retained rows in pod order.
+///
+/// Before any flush, a pod's writable plus immutable rows only grow with the
+/// appends it inserted, so an increase proves the pod durably acknowledged
+/// and inserted work sent to its own endpoint.
+fn acknowledged_by_pod(cluster: &WyrdTestCluster) -> Vec<usize> {
     (0..PODS)
         .map(|index| {
-            pod(cluster, index)
-                .scribe_inspection_snapshot()
-                .expect("pod Scribe ownership is inspectable")
-                .ingress_lifecycle
-                .succeeded
+            let stats = pod(cluster, index)
+                .bifrost_scribe()
+                .expect("pod owns a Scribe")
+                .memtable_stats()
+                .expect("pod memtable is inspectable");
+            stats.writable_rows + stats.immutable_rows
         })
         .collect()
 }

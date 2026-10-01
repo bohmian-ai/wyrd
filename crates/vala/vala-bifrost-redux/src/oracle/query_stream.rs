@@ -3,6 +3,7 @@
 //! The stream retains local admission, cancellation, telemetry, and lazy
 //! physical batches until exactly one terminal outcome releases owned resources.
 
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::OnceLock;
@@ -10,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use tracing::Span;
 
 use super::telemetry::AnalyticalAttemptOutcome;
 
@@ -125,6 +127,12 @@ impl QueryStreamLifecycle {
         }
     }
 
+    /// Returns the client-facing query span; Gate parents dispatch under it.
+    #[must_use]
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+
     /// Record one terminal outcome; repeated calls are ignored.
     pub fn finish(&self, outcome: &'static str) {
         if !self.finished.swap(true, Ordering::AcqRel) {
@@ -167,21 +175,42 @@ impl OracleQueryStream {
     #[must_use]
     pub fn with_gate_lifecycle(mut self, lifecycle: Arc<QueryStreamLifecycle>) -> Self {
         let mut frames = self.frames;
-        self.frames = Box::pin(async_stream::stream! {
-            while let Some(frame) = frames.next().await {
-                if let Ok(QueryStreamFrame::Terminal(terminal)) = &frame {
-                    let outcome = match terminal.outcome {
-                        QueryTerminalOutcome::Success => "success",
-                        QueryTerminalOutcome::Degraded => "degraded",
-                        QueryTerminalOutcome::Failed => "failed",
-                    };
-                    lifecycle.finish(outcome);
+        let span = lifecycle.span.clone();
+        self.frames = polled_in_span(
+            Box::pin(async_stream::stream! {
+                while let Some(frame) = frames.next().await {
+                    if let Ok(QueryStreamFrame::Terminal(terminal)) = &frame {
+                        let outcome = match terminal.outcome {
+                            QueryTerminalOutcome::Success => "success",
+                            QueryTerminalOutcome::Degraded => "degraded",
+                            QueryTerminalOutcome::Failed => "failed",
+                        };
+                        lifecycle.finish(outcome);
+                    }
+                    yield frame;
                 }
-                yield frame;
-            }
-        });
+            }),
+            span,
+        );
         self
     }
+}
+
+/// Polls `frames` inside `span` for the stream's whole lifetime.
+///
+/// Every batch, nested child span such as a remote fragment or storage read,
+/// and the terminal cleanup the frame stream performs before its last frame
+/// therefore belongs to that one operation. The span closes only after the
+/// returned stream and every other holder drop it, which is after the
+/// terminal frame or client drop, never when the stream is constructed.
+fn polled_in_span(
+    mut frames: Pin<Box<OracleFrameStream>>,
+    span: Span,
+) -> Pin<Box<OracleFrameStream>> {
+    Box::pin(futures_util::stream::poll_fn(move |context| {
+        let _entered = span.enter();
+        frames.poll_next_unpin(context)
+    }))
 }
 
 /// Complete owned inputs for one terminal-aware query stream.
@@ -1392,10 +1421,10 @@ fn release_and_finish_terminal(
         let _release = release_admitted(admitted);
     }
     let terminal = candidate;
-    let outcome = if terminal.outcome == QueryTerminalOutcome::Failed {
-        failed_outcome
-    } else {
-        "success"
+    let outcome = match terminal.outcome {
+        QueryTerminalOutcome::Failed => failed_outcome,
+        QueryTerminalOutcome::Degraded => "degraded",
+        QueryTerminalOutcome::Success => "success",
     };
     finish_stream(query_telemetry, gate_lifecycle, outcome);
     terminal
@@ -1491,7 +1520,6 @@ impl OracleQueryStream {
     /// permit or reservation from its query owner. The caller supplies
     /// the encoded schema, leaving no fallible work after guard transfer.
     pub(super) fn new(input: QueryStreamInput) -> Self {
-        let _stream_span = tracing::info_span!("bifrost.oracle.stream").entered();
         let QueryStreamInput {
             query_class,
             schema_frame,
@@ -1520,6 +1548,7 @@ impl OracleQueryStream {
         let stream_telemetry_cancelled = Arc::clone(&telemetry_cancelled);
         query_telemetry.record_scan_stats(scan_stats);
         query_telemetry.start_stream();
+        let span = query_telemetry.span().clone();
         let frames = build_frames(FrameBuildInput {
             query_class,
             schema_frame,
@@ -1537,6 +1566,7 @@ impl OracleQueryStream {
             running_query,
             reader_protection,
         });
+        let frames = polled_in_span(frames, span);
         let stream = Self::assemble(
             schema_fingerprint,
             deadline_ms,

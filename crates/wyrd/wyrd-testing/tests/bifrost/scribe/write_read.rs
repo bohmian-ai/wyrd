@@ -10,10 +10,11 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, ScribeCacheMode, ScribeCheckpointNameV1, ScribeProductionEvidenceV1,
     ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeStorageDrainObservationV1,
-    WyrdTestCluster,
+    WyrdTestCluster, shared_process_telemetry_for_test,
 };
 
 use super::support::{
@@ -73,6 +74,15 @@ async fn scribe_write_flush_read_user_journey() {
     let cached: ScribeProductionWorkloadV1 =
         serde_json::from_slice(&bytes).expect("the same bytes deserialize for the second run");
 
+    // Cache decisions are production counters, so the disabled composition is
+    // judged over its own window: the boot reads, then the whole uncached run,
+    // closed before the cached cluster starts.
+    let (_telemetry_guard, telemetry) =
+        shared_process_telemetry_for_test().expect("process production telemetry");
+    let boot_window = telemetry.checkpoint().expect("boot telemetry window");
+    let uncached_window = telemetry
+        .checkpoint()
+        .expect("uncached run telemetry window");
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Disabled),
     )
@@ -87,17 +97,11 @@ async fn scribe_write_flush_read_user_journey() {
     // Forge has not yet promoted it, so it is the one read that must decide
     // hot metadata. The terminal owner is the restarted pod's, and whether its
     // reads still find hot objects races Forge promotion after boot.
-    let booted = ScribeStorageDrainObservationV1::from_snapshot(
-        &cluster
-            .server(0)
-            .expect("the mixed pod is running")
-            .state()
-            .bifrost_storage()
-            .expect("a composed pod owns Bifrost storage")
-            .telemetry_snapshot(),
-    );
+    let booted = cache_effects(&telemetry.delta_since(&boot_window).expect("boot delta"));
     assert!(
-        booted.cache_bypasses > 0 && booted.cache_bypasses_disabled > 0,
+        booted
+            .iter()
+            .any(|((effect, reason), _)| effect == "bypass" && reason == "disabled"),
         "a disabled composition must positively record a bypass with reason disabled, observed {booted:?}"
     );
 
@@ -109,6 +113,11 @@ async fn scribe_write_flush_read_user_journey() {
         .evidence
         .assert_matches(&workload, ScribeCacheMode::Disabled)
         .expect("the uncached run satisfies every normative field of the record");
+    let uncached_effects = cache_effects(
+        &telemetry
+            .delta_since(&uncached_window)
+            .expect("uncached run delta"),
+    );
 
     let cached_cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
@@ -130,19 +139,35 @@ async fn scribe_write_flush_read_user_journey() {
     let cached_storage = terminal_storage(&cached_run.evidence);
     assert_settled(&uncached_storage, "cache disabled");
     assert_settled(&cached_storage, "cache enabled");
-    assert_eq!(
-        uncached_storage.cache_bypasses, uncached_storage.cache_bypasses_disabled,
-        "every bypass a disabled composition records has reason disabled, observed {uncached_storage:?}"
+    assert!(
+        !uncached_effects.is_empty()
+            && uncached_effects
+                .iter()
+                .all(|((effect, reason), _)| effect == "bypass" && reason == "disabled"),
+        "a disabled composition records only bypasses with reason disabled — no hit, miss, \
+         or join — observed {uncached_effects:?}"
     );
-    assert_eq!(
-        (
-            uncached_storage.cache_hits,
-            uncached_storage.cache_misses,
-            uncached_storage.cache_joins
-        ),
-        (0, 0, 0),
-        "a disabled composition must record no hit, miss, or join, observed {uncached_storage:?}"
-    );
+}
+
+/// Returns the nonzero metadata-cache decisions one telemetry window recorded.
+///
+/// Keyed by `(effect, reason)`, the family's complete closed label set.
+fn cache_effects(
+    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
+) -> Vec<((String, String), f64)> {
+    delta
+        .metrics
+        .iter()
+        .filter(|sample| {
+            sample.family == "bifrost_storage_metadata_cache_effects_total"
+                && sample.kind == BifrostMetricKind::Counter
+                && sample.value > 0.0
+        })
+        .map(|sample| {
+            let label = |key: &str| sample.labels.get(key).cloned().unwrap_or_default();
+            ((label("effect"), label("reason")), sample.value)
+        })
+        .collect()
 }
 
 /// One complete GenAI span survives this pod's write/flush/read path, and is
@@ -341,19 +366,13 @@ fn terminal_storage(evidence: &ScribeProductionEvidenceV1) -> ScribeStorageDrain
 
 /// Asserts one run's storage owner closed and retained nothing.
 ///
+/// Every value is read from the owners themselves at teardown, so a nonzero
+/// count is work the owner still holds rather than a tally that drifted.
+///
 /// # Panics
-/// Panics when the owner is not closed, its starts and terminals disagree, any
-/// live count is nonzero, or any settlement was unmatched.
+/// Panics when the owner is not closed or any live count is nonzero.
 fn assert_settled(storage: &ScribeStorageDrainObservationV1, label: &str) {
     assert_eq!(storage.lifecycle, "closed", "{label}: {storage:?}");
-    assert_eq!(
-        storage.load_starts, storage.load_terminals,
-        "{label}: every started metadata load must publish a terminal"
-    );
-    assert_eq!(
-        storage.request_starts, storage.request_terminals,
-        "{label}: every admitted governed request must publish a terminal"
-    );
     assert_eq!(
         (
             storage.resident_entries,
@@ -361,9 +380,8 @@ fn assert_settled(storage: &ScribeStorageDrainObservationV1, label: &str) {
             storage.inflight_loads,
             storage.waiters,
             storage.active_requests,
-            storage.anomalies,
         ),
-        (0, 0, 0, 0, 0, 0),
+        (0, 0, 0, 0, 0),
         "{label}: a drained owner must retain nothing, observed {storage:?}"
     );
 }
@@ -542,7 +560,9 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
 /// membership address with a concrete closed loopback endpoint and refreshes
 /// the production registry snapshot. The known Scribe is unreachable before
 /// any row, so the query ends `Degraded` with `LiveTailUnavailable` and returns
-/// none of the unreachable live rows; it is never reported as complete.
+/// none of the unreachable live rows; it is never reported as complete. The
+/// production metric window records that terminal as one Degraded Gate
+/// stream and one Degraded Oracle execution, with no Success sample.
 ///
 /// # Panics
 ///
@@ -555,6 +575,8 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
     // Peer mode, because only a peer-enabled node advertises a dialable
     // private address and reaches even its own Scribe through that transport;
     // a process-local node calls its Scribe in process and has nothing to break.
+    let (_telemetry_guard, telemetry) =
+        shared_process_telemetry_for_test().expect("process production telemetry");
     let peer_root = tempfile::tempdir().expect("peer TLS root");
     let peer_tls = wyrd_testing::bifrost::peer_ca::BifrostPeerCa::generate(
         wyrd_server::config::PEER_SERVER_NAME,
@@ -639,6 +661,7 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
         .await
         .expect("Oracle observes the undialable membership");
 
+    let window = telemetry.checkpoint().expect("query telemetry window");
     let mut stream = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
@@ -665,6 +688,41 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
     assert_eq!(
         terminal.warnings,
         vec![wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable]
+    );
+    // Both owners record their terminal before the terminal frame is yielded,
+    // so the window already holds them: the Degraded result is its own
+    // outcome on the Gate stream and on the Oracle execution, never Success.
+    let delta = telemetry
+        .delta_since(&window)
+        .expect("query telemetry delta");
+    let outcomes = |family: &str, kind: BifrostMetricKind| -> Vec<(String, f64)> {
+        delta
+            .metrics
+            .iter()
+            .filter(|sample| sample.family == family && sample.kind == kind && sample.value != 0.0)
+            .map(|sample| {
+                (
+                    sample.labels.get("outcome").cloned().unwrap_or_default(),
+                    sample.value,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        outcomes(
+            "bifrost_gate_query_streams_total",
+            BifrostMetricKind::Counter
+        ),
+        vec![("degraded".to_owned(), 1.0)],
+        "the Gate stream terminal is exactly one Degraded outcome"
+    );
+    assert_eq!(
+        outcomes(
+            "oracle_query_duration_seconds",
+            BifrostMetricKind::HistogramCount
+        ),
+        vec![("degraded".to_owned(), 1.0)],
+        "the Oracle execution is exactly one Degraded observation"
     );
 
     server.shutdown().await.expect("the server drains cleanly");

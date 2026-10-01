@@ -64,17 +64,6 @@ fn projection_error(signal: &str, error: &TableError) -> IngestError {
         }
     }
 }
-fn record_gate_event(event: &'static str) {
-    metrics::counter!("bifrost_gate_events_total", "stage" => event).increment(1);
-}
-
-fn record_gate_rows(accepted: i64, rejected: i64) {
-    metrics::counter!("bifrost_gate_rows_total", "status" => "accepted")
-        .increment(u64::try_from(accepted).unwrap_or(0));
-    metrics::counter!("bifrost_gate_rows_total", "status" => "rejected")
-        .increment(u64::try_from(rejected).unwrap_or(0));
-}
-
 /// Record the bounded-cardinality Gate request families used by D24.
 fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: Duration) {
     metrics::counter!("bifrost_gate_requests_total", "operation" => operation, "outcome" => outcome)
@@ -260,7 +249,7 @@ pub fn initialize_gate_metrics() {
             .increment(0);
         }
     }
-    for outcome in ["success", "rejected", "failed", "cancelled"] {
+    for outcome in ["success", "degraded", "rejected", "failed", "cancelled"] {
         metrics::counter!("bifrost_gate_query_streams_total", "outcome" => outcome).increment(0);
     }
     metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
@@ -610,7 +599,6 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// Stop accepting new ingest requests.
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
-            record_gate_event("close");
             tracing::info!("bifrost gate closed");
         }
     }
@@ -676,7 +664,6 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// ingress-closed refusal when lifecycle shutdown already closed the Gate.
     fn authenticate(&self, metadata: &MetadataMap) -> Result<AuthContext, IngestError> {
         let started = std::time::Instant::now();
-        record_gate_event("auth_attempt");
         match self.auth.authenticate(metadata) {
             Ok(auth) => {
                 metrics::histogram!("bifrost_gate_resolution_seconds", "stage" => "auth")
@@ -685,7 +672,6 @@ impl<A: GateAudit + 'static> Gate<A> {
                 Ok(auth)
             }
             Err(error) => {
-                record_gate_event("auth_rejection");
                 metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
                 Err(error)
             }
@@ -724,16 +710,17 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// stream lifecycle is attached to the returned stream after dispatch, so
     /// local and forwarded execution are accounted identically.
     ///
+    /// The lifecycle's `bifrost.gate.query.stream` span is the query's top
+    /// operation: dispatch runs in its `bifrost.gate.query` child, and the
+    /// returned stream is polled inside it until the terminal frame or client
+    /// drop, so Oracle planning, remote fragments, and terminal cleanup all
+    /// belong to one trace.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::OracleRoleUnavailable`] before any accounting
     /// when this Gate is closed or has no query dispatcher, otherwise returns
     /// the dispatcher's stable query errors.
-    #[tracing::instrument(
-        name = "bifrost.gate.role_dispatch",
-        skip_all,
-        fields(required_role = "oracle", operation = "query_sql")
-    )]
     pub async fn query_sql(
         &self,
         context: AuthorizedQueryContext,
@@ -763,6 +750,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         let result = dispatch
             .dispatch_sql(context, request)
             .instrument(tracing::info_span!(
+                parent: lifecycle.span(),
                 "bifrost.gate.query",
                 operation = "query"
             ))
@@ -798,18 +786,12 @@ impl<A: GateAudit + 'static> Gate<A> {
         decoded: DecodedOtlp<ExportTraceServiceRequest>,
     ) -> Result<IngestOutcome, IngestError> {
         self.ensure_open()?;
-        record_gate_event("otlp_export");
-        if let Err(error) = self
-            .authorize_record_write(
-                auth,
-                &TableRef::new(BifrostNamespace::Traces, "spans"),
-                None,
-            )
-            .await
-        {
-            record_gate_event("otlp_rejection");
-            return Err(error);
-        }
+        self.authorize_record_write(
+            auth,
+            &TableRef::new(BifrostNamespace::Traces, "spans"),
+            None,
+        )
+        .await?;
         let (batch, outcome) = crate::tables::traces::project_resource_spans(
             &decoded.request.resource_spans,
             auth.principal.card_ref_scope(),
@@ -827,7 +809,6 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.owner,
         )
         .await?;
-        record_gate_rows(outcome.accepted_spans, outcome.rejected_spans);
         Ok(outcome)
     }
 
@@ -843,18 +824,12 @@ impl<A: GateAudit + 'static> Gate<A> {
         decoded: DecodedOtlp<ExportMetricsServiceRequest>,
     ) -> Result<MetricsOutcome, IngestError> {
         self.ensure_open()?;
-        record_gate_event("otlp_export");
-        if let Err(error) = self
-            .authorize_record_write(
-                auth,
-                &TableRef::new(BifrostNamespace::Metrics, "points"),
-                None,
-            )
-            .await
-        {
-            record_gate_event("otlp_rejection");
-            return Err(error);
-        }
+        self.authorize_record_write(
+            auth,
+            &TableRef::new(BifrostNamespace::Metrics, "points"),
+            None,
+        )
+        .await?;
         let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
             &decoded.request.resource_metrics,
             auth.principal.card_ref_scope(),
@@ -872,7 +847,6 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.owner,
         )
         .await?;
-        record_gate_rows(outcome.accepted_points, outcome.rejected_points);
         Ok(outcome)
     }
 
@@ -888,18 +862,12 @@ impl<A: GateAudit + 'static> Gate<A> {
         decoded: DecodedOtlp<ExportLogsServiceRequest>,
     ) -> Result<LogsOutcome, IngestError> {
         self.ensure_open()?;
-        record_gate_event("otlp_export");
-        if let Err(error) = self
-            .authorize_record_write(
-                auth,
-                &TableRef::new(BifrostNamespace::Logs, "records"),
-                None,
-            )
-            .await
-        {
-            record_gate_event("otlp_rejection");
-            return Err(error);
-        }
+        self.authorize_record_write(
+            auth,
+            &TableRef::new(BifrostNamespace::Logs, "records"),
+            None,
+        )
+        .await?;
         let (batch, outcome) = crate::tables::logs::project_resource_logs(
             &decoded.request.resource_logs,
             auth.principal.card_ref_scope(),
@@ -917,7 +885,6 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.owner,
         )
         .await?;
-        record_gate_rows(outcome.accepted_records, outcome.rejected_records);
         Ok(outcome)
     }
 
@@ -981,10 +948,7 @@ impl<A: GateAudit + 'static> Gate<A> {
                 payload,
             })
             .await
-            .map_err(|error| {
-                record_gate_event("scribe_failure");
-                IngestError::from_scribe(error)
-            })?;
+            .map_err(IngestError::from_scribe)?;
         Ok(())
     }
 
@@ -1002,7 +966,12 @@ impl<A: GateAudit + 'static> Gate<A> {
     /// to the caller, but does not revoke an already-dispatched durable append.
     #[tracing::instrument(
         skip_all,
-        fields(tenant = %auth.tenant, table = %frame.table, request_id = %auth.request_id)
+        fields(
+            tenant = %auth.tenant,
+            table = %frame.table,
+            request_id = %auth.request_id,
+            batch_id = tracing::field::Empty
+        )
     )]
     async fn dispatch_native_frame(
         &self,
@@ -1010,9 +979,11 @@ impl<A: GateAudit + 'static> Gate<A> {
         auth: &AuthContext,
         frame: InsertBatchRequest,
     ) -> Result<u64, IngestError> {
+        if let Ok(batch_id) = uuid::Uuid::from_slice(&frame.wyrd_batch_id) {
+            tracing::Span::current().record("batch_id", tracing::field::display(batch_id));
+        }
         self.ensure_open()?;
         let resolution_started = std::time::Instant::now();
-        record_gate_event("native_frame");
         metrics::counter!("bifrost_gate_frame_bytes_total")
             .increment(u64::try_from(frame.arrow_ipc.len()).unwrap_or(u64::MAX));
         if frame.arrow_ipc.len() > limits.max_frame_bytes {
@@ -1063,15 +1034,10 @@ impl<A: GateAudit + 'static> Gate<A> {
         // and ingress bytes while nothing observes its terminal. Awaiting inline
         // makes the admission guard drop with the cancelled request.
         let admission = scribe.ingest_frame(ingress).await.map_err(|error| {
-            record_gate_event("scribe_failure");
             metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
             IngestError::from_scribe(error)
         })?;
         metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
-        record_gate_rows(
-            i64::try_from(admission.rows_accepted).unwrap_or(i64::MAX),
-            0,
-        );
         metrics::histogram!("bifrost_gate_resolution_seconds")
             .record(resolution_started.elapsed().as_secs_f64());
         // Only the attempt that inserted the batch activates runs: a suppressed
@@ -1139,7 +1105,11 @@ pub fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError>
 
 #[wyrd_tonic::tonic::async_trait]
 impl<A: GateAudit + 'static> BifrostIngestService for Gate<A> {
-    #[tracing::instrument(name = "bifrost.gate.write", skip_all, fields(operation = "write"))]
+    #[tracing::instrument(
+        name = "bifrost.gate.write",
+        skip_all,
+        fields(operation = "write", outcome = tracing::field::Empty)
+    )]
     async fn insert_batch(
         &self,
         request: Request<InsertBatchRequest>,
@@ -1157,7 +1127,6 @@ impl<A: GateAudit + 'static> BifrostIngestService for Gate<A> {
             self.dispatch_native_frame(&self.limits, &auth, frame.clone())
                 .await
                 .inspect_err(|error| {
-                    record_gate_event("native_rejection");
                     record_write_rejection(error);
                 })
                 .map_err(Status::from)?;
@@ -1178,6 +1147,12 @@ impl<A: GateAudit + 'static> BifrostIngestService for Gate<A> {
         // before returning to the transport. Keeping the accounting here
         // avoids a second increment in the Gate→Scribe seam.
         let outcome = ingest_request_outcome(&result);
+        tracing::Span::current().record("outcome", outcome);
+        if let Err(status) = &result
+            && outcome == "failed"
+        {
+            tracing::warn!(code = ?status.code(), error = %status.message(), "Bifrost write failed");
+        }
         lifecycle.complete(outcome);
         result
     }

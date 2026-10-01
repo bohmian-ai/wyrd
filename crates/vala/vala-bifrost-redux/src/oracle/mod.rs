@@ -422,32 +422,19 @@ impl AttemptPhaseTimer {
 
 /// Closed set of Oracle query phases timed into `oracle_query_phase_seconds`.
 ///
-/// Pin, listing, provider setup, planning, and admission are each the
-/// duration of that phase alone. First row and terminal are measured from the
-/// end of physical planning, where the query's stream telemetry starts, so they
-/// include audit, source binding, and execution. Snapshot substeps and peer
-/// phases are recorded once per call inside the pin or fragment that owns
-/// them, so a query touching several tables or peers contributes several
-/// samples. Only the phase is a label; the request identity stays on the
-/// enclosing trace span.
+/// Each phase is one named performance boundary of the leader or one remote
+/// fragment, timed once per occurrence. The leader phases (`snapshot_pin`,
+/// `scribe_listing`, `provider_setup`, `physical_planning`, `admission`) run
+/// one after another and do not overlap. The peer phases describe one remote
+/// fragment each and run concurrently with other fragments; `peer_first_frame`
+/// and `peer_terminal` both start when the fragment opened, so they are
+/// latencies, not additive steps. Total query time is
+/// `oracle_query_duration_seconds`, never a sum of phases. Only the phase is a
+/// label; the request identity stays on the enclosing trace span.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum QueryPhase {
     /// Pinning the catalog snapshot and hot-file cut.
     SnapshotPin,
-    /// Looking up one table's registered identity row in Postgres.
-    TableLookup,
-    /// Reading one table's authoritative metadata pointer from the catalog.
-    MetadataPointer,
-    /// Reading one table's immutable Iceberg metadata document from storage.
-    MetadataLoad,
-    /// Acquiring the reader guard that protects the prepared tables.
-    ReaderGuard,
-    /// Re-reading one table's authoritative metadata pointer after protection.
-    Revalidation,
-    /// Listing one pinned Iceberg snapshot's data files.
-    ManifestScan,
-    /// Reading one table's sealed hot-file cut from Postgres.
-    HotCut,
     /// Establishing a new authenticated channel to one peer.
     PeerConnect,
     /// Opening one remote fragment until the peer accepts the stream.
@@ -464,10 +451,6 @@ pub(crate) enum QueryPhase {
     PhysicalPlanning,
     /// Acquiring query admission.
     Admission,
-    /// Producing the first client-visible batch.
-    FirstRow,
-    /// Reaching the query's terminal outcome.
-    Terminal,
 }
 
 impl QueryPhase {
@@ -475,13 +458,6 @@ impl QueryPhase {
     const fn as_str(self) -> &'static str {
         match self {
             Self::SnapshotPin => "snapshot_pin",
-            Self::TableLookup => "table_lookup",
-            Self::MetadataPointer => "metadata_pointer",
-            Self::MetadataLoad => "metadata_load",
-            Self::ReaderGuard => "reader_guard",
-            Self::Revalidation => "revalidation",
-            Self::ManifestScan => "manifest_scan",
-            Self::HotCut => "hot_cut",
             Self::PeerConnect => "peer_connect",
             Self::PeerOpen => "peer_open",
             Self::PeerFirstFrame => "peer_first_frame",
@@ -490,8 +466,6 @@ impl QueryPhase {
             Self::ProviderSetup => "provider_setup",
             Self::PhysicalPlanning => "physical_planning",
             Self::Admission => "admission",
-            Self::FirstRow => "first_row",
-            Self::Terminal => "terminal",
         }
     }
 
@@ -523,53 +497,31 @@ impl OracleTelemetry {
     /// Creates the process-local Oracle metric owner with zeroed gauges.
     #[must_use]
     fn new() -> Self {
-        let _ = (OracleAdmissionReason::ALL, OracleCancellationReason::ALL);
         for query_class in [QueryClass::Interactive, QueryClass::Analytical] {
             let class = query_class_label(query_class);
             metrics::gauge!("oracle_queries_active", "class" => query_class_label(query_class))
                 .set(0.0);
             metrics::gauge!("oracle_queries_queued", "class" => query_class_label(query_class))
                 .set(0.0);
-            metrics::gauge!(
-                "oracle_tenant_budget_pressure",
-                "class" => query_class_label(query_class)
-            )
-            .set(0.0);
             for family in [
                 "oracle_query_rows_total",
-                "oracle_query_logical_bytes_selected_total",
                 "oracle_query_bytes_scanned_total",
                 "oracle_query_bytes_returned_total",
                 "oracle_query_files_scanned_total",
                 "oracle_query_partitions_scanned_total",
                 "oracle_query_row_groups_scanned_total",
                 "oracle_query_row_groups_pruned_total",
-                "oracle_query_spill_bytes_total",
-                "oracle_query_spill_files_total",
             ] {
                 metrics::counter!(family, "class" => class).increment(0);
             }
-            for outcome in ["success", "error", "cancelled"] {
+            for (outcome, reason) in OracleAdmissionReason::DECISIONS {
                 metrics::counter!(
-                    "oracle_query_spill_queries_total",
+                    "oracle_admission_total",
                     "class" => class,
-                    "outcome" => outcome
+                    "outcome" => outcome.as_str(),
+                    "reason" => reason.as_str()
                 )
                 .increment(0);
-            }
-            for outcome in [
-                OracleAdmissionOutcome::Admitted,
-                OracleAdmissionOutcome::Rejected,
-            ] {
-                for reason in OracleAdmissionReason::ALL {
-                    metrics::counter!(
-                        "oracle_admission_total",
-                        "class" => class,
-                        "outcome" => outcome.as_str(),
-                        "reason" => reason.as_str()
-                    )
-                    .increment(0);
-                }
             }
         }
         for reason in OracleCancellationReason::ALL {
@@ -584,21 +536,29 @@ impl OracleTelemetry {
     ///
     /// Nothing on the telemetry owner is read: a query's counters live on the
     /// returned guard, so this is an associated constructor rather than a
-    /// method that pretends to consult shared state.
+    /// method that pretends to consult shared state. The query is not yet
+    /// admitted, so it does not count as active work until
+    /// [`QueryTelemetryGuard::admitted`] runs. The returned guard owns the
+    /// `bifrost.oracle.stream` span, which the response stream polls inside
+    /// and which closes only after terminal cleanup drops the guard.
     #[must_use]
     fn start_query(query_class: QueryClass) -> QueryTelemetryGuard {
-        metrics::gauge!(
-            "oracle_queries_active",
-            "class" => query_class_label(query_class)
-        )
-        .increment(1.0);
+        let span = tracing::info_span!(
+            "bifrost.oracle.stream",
+            query_class = query_class_label(query_class),
+            outcome = tracing::field::Empty
+        );
+        let source_span = tracing::info_span!(
+            parent: &span,
+            "bifrost.oracle.source",
+            outcome = tracing::field::Empty
+        );
         QueryTelemetryGuard {
             query_class,
             started_at: Instant::now(),
-            source_span: Some(tracing::info_span!(
-                "bifrost.oracle.source",
-                outcome = tracing::field::Empty
-            )),
+            span,
+            source_span: Some(source_span),
+            admitted: false,
             first_batch_recorded: false,
             stream_started: false,
             finalization: QueryTelemetryFinalization::Open,
@@ -670,8 +630,14 @@ struct QueryTelemetryGuard {
     query_class: QueryClass,
     /// Query start used by duration and first-batch histograms.
     started_at: Instant,
-    /// Production source span retained until the first physical batch or terminal result.
+    /// Query operation span covering admission, stream polling, and terminal
+    /// cleanup; it records the one terminal outcome.
+    span: tracing::Span,
+    /// Child span measuring source work up to the first physical batch, or to
+    /// the terminal result when no batch is produced.
     source_span: Option<tracing::Span>,
+    /// Whether admission succeeded, so this query counts as active work.
+    admitted: bool,
     /// Whether the first yielded batch was already observed.
     first_batch_recorded: bool,
     /// Whether a public stream was successfully constructed.
@@ -689,6 +655,29 @@ struct QueryTelemetryGuard {
 }
 
 impl QueryTelemetryGuard {
+    /// Counts this query as admitted active work exactly once.
+    ///
+    /// Called after admission succeeds, so a query still waiting in the
+    /// admission queue appears only on `oracle_queries_queued`. `Drop`
+    /// releases the active gauge only for a query that reached this point.
+    fn admitted(&mut self) {
+        if self.admitted {
+            return;
+        }
+        self.admitted = true;
+        metrics::gauge!(
+            "oracle_queries_active",
+            "class" => query_class_label(self.query_class)
+        )
+        .increment(1.0);
+    }
+
+    /// Returns the query operation span the response stream polls inside.
+    #[must_use]
+    fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
     /// Marks that stream construction completed and stream outcomes now apply.
     fn start_stream(&mut self) {
         self.stream_started = true;
@@ -701,7 +690,6 @@ impl QueryTelemetryGuard {
         }
         self.first_batch_recorded = true;
         self.finish_source_span("success");
-        QueryPhase::FirstRow.record(self.started_at);
         metrics::histogram!(
             "oracle_query_time_to_first_batch_seconds",
             "class" => query_class_label(self.query_class)
@@ -742,13 +730,8 @@ impl QueryTelemetryGuard {
         }
         self.finalization = QueryTelemetryFinalization::Closed;
         self.finish_source_span(outcome);
-        QueryPhase::Terminal.record(self.started_at);
+        self.span.record("outcome", outcome);
         self.scan_stats.finalize();
-        metrics::counter!(
-            "oracle_query_logical_bytes_selected_total",
-            "class" => query_class_label(self.query_class)
-        )
-        .increment(self.scan_stats.logical_bytes_selected);
         metrics::counter!(
             "oracle_query_files_scanned_total",
             "class" => query_class_label(self.query_class)
@@ -782,13 +765,6 @@ impl QueryTelemetryGuard {
             "outcome" => outcome
         )
         .record(self.started_at.elapsed().as_secs_f64());
-        let result = match outcome {
-            "success" => "success",
-            "rejected" => "rejected",
-            _ => "failed",
-        };
-        metrics::histogram!("bifrost_query_duration_seconds", "result" => result)
-            .record(self.started_at.elapsed().as_secs_f64());
         if self.stream_started {
             metrics::counter!("oracle_query_rows_total", "class" => query_class_label(self.query_class))
             .increment(self.emitted_rows);
@@ -813,8 +789,10 @@ impl Drop for QueryTelemetryGuard {
             };
             self.finish(outcome);
         }
-        metrics::gauge!("oracle_queries_active", "class" => query_class_label(self.query_class))
-            .decrement(1.0);
+        if self.admitted {
+            metrics::gauge!("oracle_queries_active", "class" => query_class_label(self.query_class))
+                .decrement(1.0);
+        }
     }
 }
 
@@ -829,8 +807,8 @@ struct AdmissionWaitTelemetryGuard {
 }
 
 impl AdmissionWaitTelemetryGuard {
-    /// Records the final durable scope and outcome for this waiter.
-    fn finish(&mut self, _scope: &'static str, _outcome: &'static str) {
+    /// Records this waiter's queue duration exactly once.
+    fn finish(&mut self) {
         if self.finished {
             return;
         }
@@ -844,7 +822,7 @@ impl Drop for AdmissionWaitTelemetryGuard {
     /// Closes the waiter gauge and records unexpected exits as failures.
     fn drop(&mut self) {
         if !self.finished {
-            self.finish("cluster", "failed");
+            self.finish();
         }
         metrics::gauge!("oracle_queries_queued", "class" => query_class_label(self.query_class))
             .decrement(1.0);
@@ -1085,8 +1063,6 @@ struct LiveDiscovery {
 struct RetainedExecutionInput<'a> {
     /// The single physical root and the config it was planned with.
     retained: RetainedPhysicalPlan,
-    /// Immutable selected-file bytes used for logical scan telemetry.
-    logical_bytes_selected: u64,
     /// Class derived from the retained root and admitted under.
     query_class: QueryClass,
     /// Authenticated request context.
@@ -1609,6 +1585,7 @@ impl Oracle {
         let operator_pool = config.operator_pool;
         let planner = OraclePlanner::new(config.config);
         let telemetry = Arc::new(OracleTelemetry::new());
+        telemetry::install_query_span_propagation();
         let cluster = Arc::clone(&config.cluster);
         let running_queries = Arc::new(RunningQueryRegistry::new());
         let admission = Arc::new(OracleAdmission::with_config(
@@ -2316,6 +2293,9 @@ impl Oracle {
                 &mut phases,
             )
             .await?;
+        if let Some(telemetry) = query_telemetry.as_mut() {
+            telemetry.admitted();
+        }
         let bound = match self.audit_and_bind(
             CutAuditInput {
                 context,
@@ -2344,7 +2324,6 @@ impl Oracle {
         let mut execution = match self
             .execute_retained_root(RetainedExecutionInput {
                 retained,
-                logical_bytes_selected: Self::logical_selected_bytes(&planned.cuts),
                 query_class,
                 context,
                 admitted: &mut admitted,
@@ -2393,7 +2372,6 @@ impl Oracle {
     ) -> Result<CutExecution, BifrostError> {
         let RetainedExecutionInput {
             retained,
-            logical_bytes_selected,
             query_class,
             context,
             admitted,
@@ -2415,8 +2393,7 @@ impl Oracle {
                 .ok_or(BifrostError::OracleRoleUnavailable)?,
             QueryClass::Interactive => {
                 let session = admitted.execution_session(config)?;
-                let scan_stats =
-                    OracleQueryScanStats::from_plan(root.as_ref(), logical_bytes_selected);
+                let scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
                 let schema = root.schema();
                 let batches = execute_stream(root, session.task_ctx())
                     .map_err(|error| map_datafusion_error(&error))?;
@@ -2454,7 +2431,7 @@ impl Oracle {
         if let Some(ownership) = admitted.analytical.as_ref() {
             ownership.publish_participants().await?;
         }
-        let mut scan_stats = OracleQueryScanStats::from_plan(root.as_ref(), logical_bytes_selected);
+        let mut scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
         let schema = root.schema();
         let batches = execute_stream(Arc::clone(&root), leader.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
@@ -3002,11 +2979,6 @@ impl Oracle {
                 table: cut.iceberg_table.clone(),
                 storage: Arc::clone(self.catalog.storage()),
                 hot_files,
-                iceberg_event_times: cut
-                    .iceberg_files
-                    .iter()
-                    .map(|file| file.event_time)
-                    .collect(),
                 context: context.clone(),
                 table_name,
                 remote,
@@ -3069,23 +3041,6 @@ impl Oracle {
             total
                 .saturating_add(cut.iceberg_files.len())
                 .saturating_add(cut.hot_files.len())
-        })
-    }
-
-    /// Sums immutable selected file sizes before execution starts.
-    fn logical_selected_bytes(cuts: &[PinnedSealedTable]) -> u64 {
-        cuts.iter().fold(0_u64, |total, cut| {
-            let iceberg = cut
-                .iceberg_files
-                .iter()
-                .map(|file| file.file_size)
-                .sum::<u64>();
-            let hot = cut
-                .hot_files
-                .iter()
-                .filter_map(|file| u64::try_from(file.file_size).ok())
-                .sum::<u64>();
-            total.saturating_add(iceberg).saturating_add(hot)
         })
     }
 
@@ -4366,14 +4321,7 @@ fn map_first_batch_failure(
     first
         .as_ref()
         .and_then(|result| result.as_ref().err())
-        .map(|error| {
-            // The stable public error deliberately discards engine detail, which
-            // leaves an execution failure with no attributable cause anywhere in
-            // the logs. Record the underlying engine error once, here, before the
-            // mapping erases it.
-            tracing::warn!(%error, "Oracle query failed on its first batch");
-            map_datafusion_error(error)
-        })
+        .map(map_datafusion_error)
 }
 
 /// Derives the identity-bound common-plan placeholder for one pinned Scribe stream.
@@ -5388,10 +5336,7 @@ mod tests {
             "oracle_queries_active{class=\"analytical\"}",
             "oracle_queries_queued{class=\"interactive\"}",
             "oracle_queries_queued{class=\"analytical\"}",
-            "oracle_tenant_budget_pressure{class=\"interactive\"}",
-            "oracle_tenant_budget_pressure{class=\"analytical\"}",
             "bifrost_oracle_analytical_attempts_active",
-            "bifrost_oracle_analytical_exchanges_active",
         ];
         let initial = recorder.snapshot();
         assert_eq!(initial.gauges.len(), expected.len());
@@ -5420,6 +5365,34 @@ mod tests {
         for series in expected {
             assert_eq!(snapshot.gauges.get(series), Some(&0.0), "{series}");
         }
+    }
+
+    /// The active gauge counts admitted work only.
+    ///
+    /// A query that is classified but never admitted leaves
+    /// `oracle_queries_active` untouched; an admitted query raises it once,
+    /// however often admission is reported, and its drop returns it to zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a pre-admission query is counted as active or an admitted
+    /// query does not settle the gauge.
+    #[test]
+    fn oracle_active_gauge_counts_only_admitted_queries() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let active = "oracle_queries_active{class=\"interactive\"}";
+        let waiting = OracleTelemetry::start_query(QueryClass::Interactive);
+        assert_eq!(recorder.snapshot().gauges.get(active), None);
+        drop(waiting);
+        assert_eq!(recorder.snapshot().gauges.get(active), None);
+
+        let mut admitted = OracleTelemetry::start_query(QueryClass::Interactive);
+        admitted.admitted();
+        admitted.admitted();
+        assert_eq!(recorder.snapshot().gauges.get(active), Some(&1.0));
+        drop(admitted);
+        assert_eq!(recorder.snapshot().gauges.get(active), Some(&0.0));
     }
 
     /// Stream payload counters retain exact rows and Arrow IPC bytes for every

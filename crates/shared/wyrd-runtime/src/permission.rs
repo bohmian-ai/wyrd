@@ -402,6 +402,26 @@ impl Permission {
         }
     }
 
+    /// Read the tenant's redacted Operator connections.
+    #[must_use]
+    pub const fn operators_read() -> Self {
+        Self {
+            resource: Resource::Operators,
+            action: Action::Read,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Create, update, rotate, and disable the tenant's Operator connections.
+    #[must_use]
+    pub const fn operators_write() -> Self {
+        Self {
+            resource: Resource::Operators,
+            action: Action::Write,
+            scope: PermissionScope::All,
+        }
+    }
+
     /// Invoke operators.
     #[must_use]
     pub const fn operator_invoke() -> Self {

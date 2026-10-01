@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 44
+revision: 45
 status: approved
 ---
 
@@ -1152,7 +1152,7 @@ table on `(data_tenant_id, result_id)`.
   canonical tenant/connection/provider/name/version context, and a wrapped key
   bound to an externally held tenant-scoped key-encryption key and key version.
   Root or key-encryption material MUST remain outside Postgres in the deployment
-  secret/KMS boundary. Rotation replaces the encrypted secret on the same
+  key source defined below. Rotation replaces the encrypted secret on the same
   connection identity; key rotation MUST support rewrapping or re-encryption
   without exposing plaintext through a public surface. Decrypted bytes exist
   only for the bounded delivery attempt in a redacted secret type and are not
@@ -1165,20 +1165,21 @@ table on `(data_tenant_id, result_id)`.
   under the exact tenant KEK version using the same authenticated primitive
   with a distinct domain tag.
 
-  The deployment key provider is the existing external-secret resolver and
-  its `SecretRef::Vault` boundary (the configured backend may be Vault, AWS
-  Secrets Manager, or Google Secret Manager). Server configuration MUST supply
-  one external key prefix and one active positive key version; the resolver
-  reads a 32-byte KEK from
-  `<prefix>/<data_tenant_id>/<key_version>`. Multi-tenant production MUST use
-  this external provider and MUST fail startup if it or the active key is
-  unavailable; environment-sourced KEKs are development-only, while a
-  restrictive file-mounted KEK MAY be used by an explicitly single-tenant
-  deployment. Postgres stores only the key version and wrapped DEK. KEK
-  rotation publishes a new external version before making it active; new
-  writes use it, existing rows are rewrapped in bounded tenant-scoped work,
-  and an old external version is retained until no row references it. Rewrap
-  exposes only the DEK inside the process and does not decrypt the credential.
+  The Wyrd server owns Operator key selection and reads the KEK from its
+  configured deployment key source. Multi-tenant production MUST use Vault KV
+  v2 over HTTPS, with a 32-byte tenant KEK at
+  `<prefix>/<data_tenant_id>/<key_version>`. Server configuration MUST supply
+  one active positive key version and, for Vault, the key prefix. Multi-tenant
+  production MUST fail startup if Vault or any active tenant's active key is
+  unavailable. Environment-sourced KEKs are development-only; a restrictive
+  file-mounted KEK MAY be used by an explicitly single-tenant deployment.
+  Operator credentials are supplied through write-only connection operations,
+  not through deployment key configuration. Postgres stores only the key
+  version and wrapped DEK. KEK rotation publishes a new key version before
+  making it active; new writes use it, existing rows are rewrapped in bounded
+  tenant-scoped work, and an old version is retained until no row references
+  it. Rewrap exposes only the DEK inside the process and does not decrypt the
+  credential.
 - **REQ-148**: Tenant administrators MUST manage Operator connections through
   typed server-owned operations: create; list/get redacted metadata; update
   nonsecret configuration, status, or the write-only secret; and disable. The
@@ -2094,6 +2095,14 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 45 Operator key source correction (2026-10-01):** Replaced the
+  nonexistent shared external-secret resolver requirement with server-owned
+  Operator key selection: Vault KV v2 for multi-tenant production, environment
+  keys for development, and restrictive files for explicitly single-tenant
+  deployments. Tenant administrators continue to submit write-only delivery
+  credentials to Wyrd's encrypted connection store. The user directed this
+  correction on 2026-10-01 and explicitly approved revision 45 on 2026-10-01.
 
 - **Revision 38 direct Drift input boundary (2026-09-24):** Approved by the
   user after the TASK-011 review. Direct PSI/SPC batches contain only selected

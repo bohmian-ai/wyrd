@@ -11,6 +11,8 @@ spec:
   kind: notify
   channel:
     kind: slack
-    text: |
-      [{{ severity }}] {{ trigger.name }} fired on {{ subject.name }}@{{ subject.version }}
-      → {{ observation.summary }}
+    # Names the tenant's `slack` connection; registration refuses the Card
+    # unless an active connection with this name exists.
+    connection: ops-slack
+    channel_id: C0123456789
+    text: "[{{verdict}}] {{verifier_ref}} failed on {{subject_ref}}: {{summary}}"

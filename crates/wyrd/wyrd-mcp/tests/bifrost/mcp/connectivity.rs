@@ -237,6 +237,8 @@ mod pg_tests {
                 "cards.get",
                 "verification.get_binding",
                 "verification.get_run",
+                "operator_connections.list",
+                "operator_connections.get",
                 "gateway.list_provider_credentials",
                 "gateway.list_provider_deployments",
                 "gateway.get_fallback_policy",
@@ -256,6 +258,9 @@ mod pg_tests {
                 "gateway.delete_governance_policy",
                 "principals.revoke_credential",
                 "verification.start_run",
+                "operator_connections.create",
+                "operator_connections.update",
+                "operator_connections.disable",
                 probe::TOOL_NAME,
             ],
             "an opted-in fixture advertises the context probe after the ordinary catalog"

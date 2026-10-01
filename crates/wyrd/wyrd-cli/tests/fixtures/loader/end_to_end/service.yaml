@@ -30,6 +30,8 @@ spec:
         - kind: notify
           channel:
             kind: slack
+            connection: ops-slack
+            channel_id: C0123456789
             text: retention guardrail failed for the churn response service
 
   # Every component uses the unified ref variant: `path` (sibling submission)

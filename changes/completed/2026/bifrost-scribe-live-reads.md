@@ -125,3 +125,13 @@ At that time:
 - `architecture/bifrost-design.md` — Fused/live-read, memory, and telemetry
   sections updated by this change.
 - `SPEC-verified-change-contract` revision 44, REQ-160/REQ-161 — peer protocol.
+
+## Post-completion amendment
+
+Revision 25 (approved by the user 2026-10-01) replaces pre-accept Oracle peer
+reservations with follower grants owned by the leader stream: `ReserveSlots`
+is a held stream that admits or refuses on accept, the grant ends with the
+stream or the query deadline, and there is no pending reservation, TTL, or
+`ReleaseSlots`. AC-013 and INV-008 read accordingly. Delivered by
+`SPEC-verified-change-contract` TASK-012 (`3322efcaf`, PR #106); the
+authoritative text is `architecture/bifrost-design.md`.

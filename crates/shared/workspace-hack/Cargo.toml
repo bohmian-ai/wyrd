@@ -257,6 +257,7 @@ secrecy = { version = "0.10", default-features = false, features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
+serde_derive = { version = "1" }
 serde_json = { version = "1", features = ["alloc", "float_roundtrip", "preserve_order", "raw_value"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10", features = ["oid"] }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }

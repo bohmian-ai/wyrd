@@ -959,6 +959,66 @@ async fn verification_contract_publishes_exactly_three_typed_operations() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// Operator connection management publishes exactly its five typed
+/// operations: the provider-tagged create and update bodies, the redacted
+/// view, and a UUID `connection_id` path parameter.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, or when an operation,
+/// schema reference, or path parameter differs.
+#[tokio::test]
+async fn operator_connection_contract_publishes_five_typed_operations() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let document = served_document(&server).await;
+    let paths = document["paths"].as_object().expect("paths object");
+    let operations: BTreeSet<(&str, &str)> = paths
+        .iter()
+        .filter(|(path, _)| path.starts_with("/v1/operator-connections"))
+        .flat_map(|(path, item)| {
+            item.as_object()
+                .expect("path item object")
+                .keys()
+                .filter(|key| ["get", "post", "put", "patch", "delete"].contains(&key.as_str()))
+                .map(move |method| (path.as_str(), method.as_str()))
+        })
+        .collect();
+    let item = "/v1/operator-connections/{connection_id}";
+    assert_eq!(
+        operations,
+        BTreeSet::from([
+            ("/v1/operator-connections", "get"),
+            ("/v1/operator-connections", "post"),
+            (item, "delete"),
+            (item, "get"),
+            (item, "patch"),
+        ])
+    );
+    let body_ref = |path: &str, method: &str| {
+        paths[path][method]["requestBody"]["content"]["application/json"]["schema"]["$ref"].clone()
+    };
+    assert_eq!(
+        body_ref("/v1/operator-connections", "post"),
+        "#/components/schemas/CreateOperatorConnectionRequest"
+    );
+    assert_eq!(
+        body_ref(item, "patch"),
+        "#/components/schemas/UpdateOperatorConnectionRequest"
+    );
+    assert_eq!(
+        paths["/v1/operator-connections"]["post"]["responses"]["201"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/OperatorConnectionView"
+    );
+    for method in ["get", "patch", "delete"] {
+        let schema = path_parameter_schema(&document, item, method, "connection_id");
+        assert_eq!(schema["format"], "uuid", "{method} connection_id: {schema}");
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}
+
 /// Issued and listed credential ids publish the same UUID contract the revoke
 /// path parameter and the MCP tools use, so no surface advertises free text.
 ///

@@ -11060,6 +11060,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_core",
+ "serde_derive",
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
@@ -11451,6 +11452,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-spec",
  "wyrd-tls",
+ "wyrd-vault",
  "zeroize",
 ]
 
@@ -11762,6 +11764,8 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-vault",
+ "zeroize",
 ]
 
 [[package]]
@@ -12019,6 +12023,21 @@ dependencies = [
  "workspace-hack",
  "wyrd-spec",
  "zstd",
+]
+
+[[package]]
+name = "wyrd-vault"
+version = "0.0.1"
+dependencies = [
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-tls",
 ]
 
 [[package]]

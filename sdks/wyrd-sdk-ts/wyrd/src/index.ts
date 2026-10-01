@@ -21,6 +21,7 @@ const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
 const {
   connectBifrost,
   connectCards,
+  connectOperatorConnections,
   connectVerification,
   connectGateway,
   connectWyrdClient,
@@ -30,6 +31,7 @@ const {
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
+type NativeOperatorConnections = import("../index.cjs").NativeOperatorConnections;
 type NativeVerification = import("../index.cjs").NativeVerification;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
@@ -1307,6 +1309,171 @@ export class Verification {
   async getRun(runId: string): Promise<VerificationRunStatus> {
     return lifecycleValue<VerificationRunStatus>(
       await this.#native.getRun(runId),
+    );
+  }
+}
+
+/** The provider an Operator connection authenticates to. */
+export type OperatorProvider = "slack" | "pager_duty" | "http";
+
+/** A connection's lifecycle state; Operators naming a disabled one fail closed. */
+export type OperatorConnectionStatus = "active" | "disabled";
+
+/** Write-only HTTP connection credential, tagged by `scheme`. */
+export type HttpConnectionAuth =
+  | { readonly scheme: "bearer"; readonly token: string }
+  | {
+      readonly scheme: "basic";
+      readonly username: string;
+      readonly password: string;
+    }
+  | {
+      readonly scheme: "header";
+      readonly name: string;
+      readonly value: string;
+    };
+
+/** Redacted HTTP auth metadata a view returns; the credential is never read back. */
+export type HttpAuthScheme =
+  | { readonly scheme: "bearer" }
+  | { readonly scheme: "basic" }
+  | { readonly scheme: "header"; readonly name: string };
+
+/** A connection create request: provider config plus its secret. */
+export type CreateOperatorConnectionRequest =
+  | {
+      readonly provider: "slack";
+      readonly name: string;
+      readonly workspace_id: string;
+      readonly bot_token: string;
+    }
+  | {
+      readonly provider: "pager_duty";
+      readonly name: string;
+      readonly integration_key: string;
+    }
+  | {
+      readonly provider: "http";
+      readonly name: string;
+      readonly origin: string;
+      readonly auth: HttpConnectionAuth;
+    };
+
+/**
+ * A connection update: the same provider, with any config, status, or secret
+ * field to replace; omitted fields are preserved.
+ */
+export type UpdateOperatorConnectionRequest =
+  | {
+      readonly provider: "slack";
+      readonly workspace_id?: string;
+      readonly bot_token?: string;
+      readonly status?: OperatorConnectionStatus;
+    }
+  | {
+      readonly provider: "pager_duty";
+      readonly integration_key?: string;
+      readonly status?: OperatorConnectionStatus;
+    }
+  | {
+      readonly provider: "http";
+      readonly origin?: string;
+      readonly auth?: HttpConnectionAuth;
+      readonly status?: OperatorConnectionStatus;
+    };
+
+/** Fields every connection view carries regardless of provider. */
+interface OperatorConnectionViewBase {
+  readonly connection_id: string;
+  readonly name: string;
+  readonly status: OperatorConnectionStatus;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+/**
+ * A connection's redacted metadata with provider config flattened alongside
+ * it; no view ever carries a secret.
+ */
+export type OperatorConnectionView = OperatorConnectionViewBase &
+  (
+    | { readonly provider: "slack"; readonly workspace_id: string }
+    | { readonly provider: "pager_duty" }
+    | {
+        readonly provider: "http";
+        readonly origin: string;
+        readonly auth: HttpAuthScheme;
+      }
+  );
+
+/**
+ * Tenant-scoped Operator connection client over the shared Rust handle.
+ *
+ * The server encrypts each secret, authorizes and audits each request, and
+ * returns only redacted metadata; failures throw a structured
+ * {@link WyrdError}. Rotating a secret never requires a Card revision.
+ */
+export class OperatorConnections {
+  readonly #native: NativeOperatorConnections;
+
+  private constructor(native: NativeOperatorConnections) {
+    this.#native = native;
+  }
+
+  /**
+   * Build an Operator connection client without performing IO.
+   *
+   * Omitted options resolve through the same chain as {@link Cards.connect}.
+   */
+  static connect(
+    options: { readonly serverUrl?: string; readonly credential?: string } = {},
+  ): OperatorConnections {
+    const connection = connectOperatorConnections(
+      options.serverUrl,
+      options.credential,
+    );
+    return new OperatorConnections(
+      nativeHandle(connection.connections, connection.error),
+    );
+  }
+
+  /** Create one connection; requires `operators:write`. */
+  async create(
+    request: CreateOperatorConnectionRequest,
+  ): Promise<OperatorConnectionView> {
+    return lifecycleValue<OperatorConnectionView>(
+      await this.#native.create(JSON.stringify(request)),
+    );
+  }
+
+  /** List the caller tenant's connections; requires `operators:read`. */
+  async list(): Promise<readonly OperatorConnectionView[]> {
+    return lifecycleValue<readonly OperatorConnectionView[]>(
+      await this.#native.list(),
+    );
+  }
+
+  /** Read one connection; requires `operators:read`. */
+  async get(connectionId: string): Promise<OperatorConnectionView> {
+    return lifecycleValue<OperatorConnectionView>(
+      await this.#native.get(connectionId),
+    );
+  }
+
+  /** Update config, re-enable, or rotate the secret; requires `operators:write`. */
+  async update(
+    connectionId: string,
+    request: UpdateOperatorConnectionRequest,
+  ): Promise<OperatorConnectionView> {
+    return lifecycleValue<OperatorConnectionView>(
+      await this.#native.update(connectionId, JSON.stringify(request)),
+    );
+  }
+
+  /** Disable one connection; requires `operators:write`. */
+  async disable(connectionId: string): Promise<OperatorConnectionView> {
+    return lifecycleValue<OperatorConnectionView>(
+      await this.#native.disable(connectionId),
     );
   }
 }

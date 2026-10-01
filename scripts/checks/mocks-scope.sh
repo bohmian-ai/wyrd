@@ -19,6 +19,11 @@
 # `wyrd-auth/src/callback.rs` is the same shape: a dev-dependency only.
 # Gateway's mock provider and Postgres proofs, plus the provider client tests,
 # are also compiled only under `#[cfg(test)]` with dev-only wiremock.
+# The shared `wyrd-vault` KV v2 reader carries the Vault tests that moved with
+# it out of Gateway, in the same `#[cfg(test)]` module over dev-only wiremock.
+# Operator key reads and delivery pin their Vault and provider behavior in
+# `#[cfg(test)]` modules, and the Operator Postgres journeys stand in for
+# providers, all over the server's dev-only wiremock.
 #
 # WHAT IT CHECKS: mockall, wiremock, and mockito references do not appear
 # outside wyrd-testing and the explicitly allowlisted test-only seams.
@@ -33,6 +38,8 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/skald/skald-providers/src/clients/openai.rs' \
   --glob '!crates/skald/skald-providers/src/clients/vertex.rs' \
   --glob '!crates/skald/skald-providers/src/clients/mod.rs' \
+  --glob '!crates/shared/wyrd-vault/Cargo.toml' \
+  --glob '!crates/shared/wyrd-vault/src/lib.rs' \
   --glob '!crates/wyrd/wyrd-gateway/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-gateway/src/vault.rs' \
   --glob '!crates/wyrd/wyrd-gateway/src/credential.rs' \
@@ -54,6 +61,10 @@ if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/wyrd/wyrd-server/src/components/admin/routes.rs' \
   --glob '!crates/wyrd/wyrd-server/src/boot/issuer.rs' \
   --glob '!crates/wyrd/wyrd-server/src/components/gateway/pg_invocation_tests.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/components/operators/keys.rs' \
+  --glob '!crates/wyrd/wyrd-server/src/verification/operators.rs' \
+  --glob '!crates/wyrd/wyrd-server/tests/pg_operator_delivery.rs' \
+  --glob '!crates/wyrd/wyrd-server/tests/pg_operator_connection_routes.rs' \
   --glob '!crates/wyrd/wyrd-auth/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-auth/src/callback.rs' \
   --glob '!crates/wyrd/wyrd-cli/src/auth/trusted_issuer.rs'; then

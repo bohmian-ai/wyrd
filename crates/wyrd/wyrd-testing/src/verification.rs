@@ -238,6 +238,25 @@ impl VerificationFixture {
         Ok(uid)
     }
 
+    /// Register one Operator Card named `name` with `spec` directly, skipping
+    /// registration's connection-authority check; runtime tests use it for
+    /// connection-less HTTP Operators.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when `spec` is not an Operator
+    /// spec or a write fails.
+    pub async fn operator(
+        &self,
+        name: &str,
+        spec: &Value,
+    ) -> Result<CardUid, VerificationFixtureError> {
+        let card = card("Operator", name, spec)?;
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let uid = self.insert(&mut conn, &card).await?;
+        conn.commit().await?;
+        Ok(uid)
+    }
+
     /// Project one scheduled binding of `verifier` owned by the Service
     /// `owner` and verifying `subject`, dispatching `operators` on failure.
     ///

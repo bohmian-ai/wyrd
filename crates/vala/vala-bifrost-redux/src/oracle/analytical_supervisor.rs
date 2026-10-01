@@ -793,23 +793,6 @@ impl AnalyticalSupervisor {
             .and_then(|held| held.clone())
     }
 
-    /// Clears one graph's retained cleanup once every release has resolved.
-    pub fn resolve_graph_cleanup(&self, graph: AnalyticalGraphKey) {
-        let Ok(mut graphs) = self.graphs.lock() else {
-            tracing::error!(
-                public_query_id = %graph.public_query_id,
-                "Oracle analytical graph registry is poisoned"
-            );
-            return;
-        };
-        if let Some(AnalyticalGraphEntry::Draining {
-            settlement_failure, ..
-        }) = graphs.get_mut(&graph)
-        {
-            *settlement_failure = None;
-        }
-    }
-
     /// Reports why one graph's cleanup failed, when it did.
     ///
     /// # Errors

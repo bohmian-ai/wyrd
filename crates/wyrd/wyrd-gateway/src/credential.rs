@@ -358,7 +358,7 @@ mod tests {
                 .map(|(name, address)| {
                     let backend = VaultBackend::new(
                         Url::parse(address).expect("address"),
-                        "kv".to_owned(),
+                        "kv",
                         file_ref(token),
                         None,
                         None,

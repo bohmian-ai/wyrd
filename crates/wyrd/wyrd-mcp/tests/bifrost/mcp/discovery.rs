@@ -21,8 +21,9 @@ mod pg_tests {
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
-    /// caller that also holds tenant principal administration and `evals:run`.
-    const ADVERTISED_TOOLS: [&str; 26] = [
+    /// caller that also holds tenant principal administration, `evals:run`, and
+    /// `operators:write`: every read tool, then that caller's write tools.
+    const ADVERTISED_TOOLS: [&str; 31] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
@@ -30,6 +31,8 @@ mod pg_tests {
         "cards.get",
         "verification.get_binding",
         "verification.get_run",
+        "operator_connections.list",
+        "operator_connections.get",
         "gateway.list_provider_credentials",
         "gateway.list_provider_deployments",
         "gateway.get_fallback_policy",
@@ -49,6 +52,9 @@ mod pg_tests {
         "gateway.delete_governance_policy",
         "principals.revoke_credential",
         "verification.start_run",
+        "operator_connections.create",
+        "operator_connections.update",
+        "operator_connections.disable",
     ];
 
     /// An agent sees exactly the advertised Bifrost, principal, and gateway
@@ -101,16 +107,25 @@ mod pg_tests {
             )
             .await?;
 
-        let names: Vec<String> = client
-            .list_all_tools()
-            .await?
-            .iter()
-            .map(|tool| tool.name.to_string())
-            .collect();
+        let tools = client.list_all_tools().await?;
+        let names: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
         assert_eq!(
             names, ADVERTISED_TOOLS,
             "an ordinary server advertises the Bifrost, principal, Card, verification, \
              and gateway tools, and no test probe"
+        );
+        let list_connections = tools
+            .iter()
+            .find(|tool| tool.name == "operator_connections.list")
+            .ok_or("the catalog advertises the Operator connection list tool")?;
+        assert_eq!(
+            list_connections.description.as_deref(),
+            Some(
+                "List this tenant's Operator provider connections as redacted metadata: ID, \
+                 provider, name, status, and nonsecret config. Secrets are never returned. \
+                 Requires operators:read."
+            ),
+            "the list descriptor promises only fields the redacted view returns"
         );
 
         let listed = structured(

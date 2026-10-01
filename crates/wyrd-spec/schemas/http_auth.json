@@ -1,35 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "HttpAuth",
-  "description": "Server-side authentication sources for an HTTP action.",
+  "description": "Credential authority of an HTTP action, bound to a tenant `http` connection.\n\nThe scheme and custom header name must equal the named connection's stored authority at registration and before every attempt.",
   "oneOf": [
     {
-      "description": "No authentication.",
+      "description": "`Authorization: Bearer` from the connection's token.",
       "type": "object",
       "required": [
+        "connection",
         "scheme"
       ],
       "properties": {
-        "scheme": {
-          "type": "string",
-          "enum": [
-            "none"
+        "connection": {
+          "description": "Name of the tenant's `http` connection.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectionName"
+            }
           ]
-        }
-      },
-      "additionalProperties": false
-    },
-    {
-      "description": "Bearer token loaded from an environment variable.",
-      "type": "object",
-      "required": [
-        "env",
-        "scheme"
-      ],
-      "properties": {
-        "env": {
-          "description": "Environment variable name.",
-          "type": "string"
         },
         "scheme": {
           "type": "string",
@@ -41,16 +29,20 @@
       "additionalProperties": false
     },
     {
-      "description": "`user:password` loaded from an environment variable.",
+      "description": "`Authorization: Basic` from the connection's username and password.",
       "type": "object",
       "required": [
-        "env",
+        "connection",
         "scheme"
       ],
       "properties": {
-        "env": {
-          "description": "Environment variable name.",
-          "type": "string"
+        "connection": {
+          "description": "Name of the tenant's `http` connection.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectionName"
+            }
+          ]
         },
         "scheme": {
           "type": "string",
@@ -62,20 +54,24 @@
       "additionalProperties": false
     },
     {
-      "description": "Custom header value loaded from an environment variable.",
+      "description": "A custom header carrying the connection's value.",
       "type": "object",
       "required": [
-        "env",
+        "connection",
         "name",
         "scheme"
       ],
       "properties": {
-        "env": {
-          "description": "Environment variable name.",
-          "type": "string"
+        "connection": {
+          "description": "Name of the tenant's `http` connection.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectionName"
+            }
+          ]
         },
         "name": {
-          "description": "Header name.",
+          "description": "Header name, compared case-insensitively with the connection's.",
           "type": "string"
         },
         "scheme": {
@@ -87,5 +83,11 @@
       },
       "additionalProperties": false
     }
-  ]
+  ],
+  "definitions": {
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    }
+  }
 }

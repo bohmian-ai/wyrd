@@ -4,7 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
+use std::fmt::{self, Debug, Formatter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1632,6 +1634,10 @@ pub struct VerificationConfig {
     /// runner until this is set.
     #[serde(default)]
     pub ingest_endpoint: Option<String>,
+    /// Where the key-encryption keys that protect Operator connection
+    /// credentials come from.
+    #[serde(default)]
+    pub operator_keys: OperatorKeysConfig,
 }
 
 /// Serde default for [`VerificationConfig::enabled`].
@@ -1645,7 +1651,260 @@ impl Default for VerificationConfig {
         Self {
             enabled: default_verification_enabled(),
             ingest_endpoint: None,
+            operator_keys: OperatorKeysConfig::default(),
         }
+    }
+}
+
+/// Source of the 32-byte key-encryption keys (KEKs) that wrap each Operator
+/// connection's data key.
+///
+/// Wyrd stores every Slack, PagerDuty, and HTTP credential itself, encrypted;
+/// this names only where the key that unlocks them lives. Keys are read at
+/// use, never cached, so a rotated file or Vault secret applies on the next
+/// read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorKeySource {
+    /// One deployment key per version from `WYRD_OPERATOR_KEK_V<version>`
+    /// (base64). The zero-dependency first-run and self-hosted source.
+    #[default]
+    Env,
+    /// One deployment key per version from the owner-only file
+    /// `<dir>/v<version>` (base64).
+    File,
+    /// One key per tenant and version from HashiCorp Vault KV v2 at
+    /// `<mount>/data/<prefix>/<data_tenant_id>/<version>`, field `key`
+    /// (base64). Required for multi-tenant production.
+    Vault,
+}
+
+/// HashiCorp Vault KV v2 location of per-tenant Operator KEKs.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultKeysConfig {
+    /// Vault base URL, such as `https://vault.internal:8200`.
+    pub addr: String,
+    /// KV v2 mount name.
+    #[serde(default = "default_vault_mount")]
+    pub mount: String,
+    /// Path prefix under the mount; the tenant and version are appended.
+    #[serde(default = "default_vault_prefix")]
+    pub prefix: String,
+    /// File holding the Vault token, re-read on every key read so an agent
+    /// may renew it in place. Mutually exclusive with
+    /// `WYRD_OPERATOR_KEK_VAULT_TOKEN`.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    /// Inline Vault token from `WYRD_OPERATOR_KEK_VAULT_TOKEN`; never read
+    /// from TOML.
+    #[serde(skip)]
+    pub token: Option<SecretString>,
+}
+
+impl Debug for VaultKeysConfig {
+    /// Redacting debug: the address, mount, prefix, and token file locate
+    /// secret material, so only the type name is printed.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VaultKeysConfig").finish_non_exhaustive()
+    }
+}
+
+/// Serde default for [`VaultKeysConfig::mount`].
+fn default_vault_mount() -> String {
+    "secret".to_owned()
+}
+
+/// Serde default for [`VaultKeysConfig::prefix`].
+fn default_vault_prefix() -> String {
+    "wyrd/operator-keys".to_owned()
+}
+
+/// Operator connection key configuration (`[verification.operator_keys]`).
+///
+/// Multi-tenant production (no `auth.tenant_slug`) must use
+/// [`OperatorKeySource::Vault`] over `https` and fails startup unless every
+/// active tenant's active key is readable. Elsewhere Wyrd runs without a
+/// readable active key; only creating or changing a connection credential
+/// refuses with `WYRD_OPERATOR_503_KEY_UNAVAILABLE`.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorKeysConfig {
+    /// Where keys are read from.
+    #[serde(default)]
+    pub source: OperatorKeySource,
+    /// Key version new and rotated credentials are wrapped under. Publish a
+    /// version's key before activating it; keep older versions readable
+    /// until rewrap leaves no row on them.
+    #[serde(default = "default_active_key_version")]
+    pub active_version: NonZeroU32,
+    /// Directory of `v<version>` key files for [`OperatorKeySource::File`].
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// Vault location for [`OperatorKeySource::Vault`].
+    #[serde(default)]
+    pub vault: Option<VaultKeysConfig>,
+}
+
+impl Debug for OperatorKeysConfig {
+    /// Redacting debug: prints the source kind, active version, and whether a
+    /// Vault section is present, never a directory or Vault selector.
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OperatorKeysConfig")
+            .field("source", &self.source)
+            .field("active_version", &self.active_version)
+            .field("vault", &self.vault.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Serde default for [`OperatorKeysConfig::active_version`].
+const fn default_active_key_version() -> NonZeroU32 {
+    NonZeroU32::MIN
+}
+
+impl Default for OperatorKeysConfig {
+    /// Environment-sourced key version 1.
+    fn default() -> Self {
+        Self {
+            source: OperatorKeySource::default(),
+            active_version: default_active_key_version(),
+            dir: None,
+            vault: None,
+        }
+    }
+}
+
+impl OperatorKeysConfig {
+    /// Check that the chosen source is fully configured and allowed here.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Invalid`] when `active_version` exceeds the
+    /// persisted `i32` key-version range, `file` has no `dir`, `vault` has no
+    /// usable address or token, both token forms are set, a production
+    /// deployment names a plaintext `http` Vault address, a multi-tenant
+    /// production deployment uses anything but Vault, or any production
+    /// deployment uses the development-only environment source.
+    fn validate(&self, production: bool, multi_tenant: bool) -> Result<(), ConfigError> {
+        let multi_tenant_production = production && multi_tenant;
+        let invalid = |message: &str| {
+            Err(ConfigError::Invalid {
+                message: format!("verification.operator_keys: {message}"),
+            })
+        };
+        if i32::try_from(self.active_version.get()).is_err() {
+            return invalid("active_version must not exceed 2147483647 (i32::MAX)");
+        }
+        if multi_tenant_production && self.source != OperatorKeySource::Vault {
+            return invalid(
+                "multi-tenant production requires source = \"vault\" \
+                 (WYRD_OPERATOR_KEK_SOURCE=vault) so each tenant has its own key",
+            );
+        }
+        if production && self.source == OperatorKeySource::Env {
+            return invalid(
+                "source = \"env\" is development-only; single-tenant production requires \
+                 source = \"file\" or \"vault\" (WYRD_OPERATOR_KEK_SOURCE)",
+            );
+        }
+        match self.source {
+            OperatorKeySource::Env => Ok(()),
+            OperatorKeySource::File if self.dir.is_none() => {
+                invalid("source = \"file\" requires dir (WYRD_OPERATOR_KEK_DIR)")
+            }
+            OperatorKeySource::File => Ok(()),
+            OperatorKeySource::Vault => {
+                let Some(vault) = &self.vault else {
+                    return invalid(
+                        "source = \"vault\" requires vault.addr (WYRD_OPERATOR_KEK_VAULT_ADDR)",
+                    );
+                };
+                match url::Url::parse(&vault.addr) {
+                    Ok(url) if url.scheme() == "https" => {}
+                    Ok(url) if url.scheme() == "http" && !production => {}
+                    Ok(url) if url.scheme() == "http" => {
+                        return invalid(
+                            "production requires an https vault.addr; plaintext http is \
+                             limited to non-production local fixtures",
+                        );
+                    }
+                    _ => return invalid("vault.addr must be an http(s) URL"),
+                }
+                match (&vault.token_file, &vault.token) {
+                    (Some(_), Some(_)) => invalid(
+                        "set only one of vault.token_file (WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE) \
+                         and WYRD_OPERATOR_KEK_VAULT_TOKEN",
+                    ),
+                    (None, None) => invalid(
+                        "source = \"vault\" requires a token (WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE \
+                         or WYRD_OPERATOR_KEK_VAULT_TOKEN)",
+                    ),
+                    _ => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Apply `WYRD_OPERATOR_KEK_*` environment overrides.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::BadEnvVar`] or [`ConfigError::EmptyEnvVar`] for
+    /// a malformed override.
+    fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_SOURCE")? {
+            self.source = match val.as_str() {
+                "env" => OperatorKeySource::Env,
+                "file" => OperatorKeySource::File,
+                "vault" => OperatorKeySource::Vault,
+                _ => {
+                    return Err(ConfigError::BadEnvVar {
+                        key: "WYRD_OPERATOR_KEK_SOURCE".to_owned(),
+                        message: format!("expected 'env', 'file', or 'vault', got {val:?}"),
+                    });
+                }
+            };
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_ACTIVE_VERSION")? {
+            self.active_version =
+                val.parse()
+                    .map_err(|e: std::num::ParseIntError| ConfigError::BadEnvVar {
+                        key: "WYRD_OPERATOR_KEK_ACTIVE_VERSION".to_owned(),
+                        message: e.to_string(),
+                    })?;
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_DIR")? {
+            self.dir = Some(PathBuf::from(val));
+        }
+        if let Some(addr) = env_opt("WYRD_OPERATOR_KEK_VAULT_ADDR")? {
+            match &mut self.vault {
+                Some(vault) => vault.addr = addr,
+                None => {
+                    self.vault = Some(VaultKeysConfig {
+                        addr,
+                        mount: default_vault_mount(),
+                        prefix: default_vault_prefix(),
+                        token_file: None,
+                        token: None,
+                    });
+                }
+            }
+        }
+        let Some(vault) = &mut self.vault else {
+            return Ok(());
+        };
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_MOUNT")? {
+            vault.mount = val;
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_PREFIX")? {
+            vault.prefix = val;
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE")? {
+            vault.token_file = Some(PathBuf::from(val));
+        }
+        if let Some(val) = env_opt("WYRD_OPERATOR_KEK_VAULT_TOKEN")? {
+            vault.token = Some(SecretString::from(val));
+        }
+        Ok(())
     }
 }
 
@@ -2272,7 +2531,7 @@ impl GatewayConfig {
                 };
                 let vault = VaultBackend::new(
                     backend.address.clone(),
-                    backend.mount.clone(),
+                    &backend.mount,
                     backend.token.clone(),
                     backend.namespace.clone(),
                     ca_cert.as_deref(),
@@ -2770,6 +3029,9 @@ impl WyrdServerConfig {
             self.verification.ingest_endpoint = Some(val);
         }
 
+        // verification.operator_keys (WYRD_OPERATOR_KEK_*)
+        self.verification.operator_keys.apply_env()?;
+
         // readiness.tick_ms
         if let Some(val) = env_opt("WYRD_READINESS_TICK_MS")? {
             self.readiness.tick_ms = val.parse::<u64>().map_err(|e| ConfigError::BadEnvVar {
@@ -2817,6 +3079,12 @@ impl WyrdServerConfig {
         self.gateway
             .validate(self.deployment_profile.is_production())?;
         let serves_api = self.role.serves_api();
+        if serves_api {
+            self.verification.operator_keys.validate(
+                self.deployment_profile.is_production(),
+                self.auth.tenant_slug.is_none(),
+            )?;
+        }
         if self.forge.per_tenant_active_cap == Some(0) {
             return Err(ConfigError::Invalid {
                 message: "forge.per_tenant_active_cap must be positive".to_owned(),
@@ -3431,12 +3699,14 @@ mod tests {
     /// plaintext gRPC to the server, and peer mTLS uses `WYRD_PEER_TLS_DIR`.
     #[test]
     fn production_peer_target_needs_no_public_grpc_certificate() {
+        let directory = tempfile::tempdir().expect("key temp directory");
         for role in [BifrostTarget::All, BifrostTarget::Oracle] {
             let mut config = WyrdServerConfig {
                 deployment_profile: DeploymentProfile::Production,
                 role,
                 ..WyrdServerConfig::default()
             };
+            config.verification.operator_keys = production_operator_keys(directory.path());
             config.bifrost.peer.address = Some("wyrd-core-0.wyrd-core:50052".to_owned());
             config.bifrost.peer.tls_dir = Some(PathBuf::from("/etc/wyrd/peer"));
 
@@ -3900,6 +4170,174 @@ minimum_slots = 2
         profile
     }
 
+    /// The Vault-sourced Operator keys multi-tenant production requires,
+    /// reading its token from a file under `directory`.
+    fn production_operator_keys(directory: &Path) -> OperatorKeysConfig {
+        OperatorKeysConfig {
+            source: OperatorKeySource::Vault,
+            vault: Some(VaultKeysConfig {
+                addr: "https://vault.internal:8200".to_owned(),
+                mount: default_vault_mount(),
+                prefix: default_vault_prefix(),
+                token_file: Some(directory.join("vault-token")),
+                token: None,
+            }),
+            ..OperatorKeysConfig::default()
+        }
+    }
+
+    /// The environment KEK is development-only: production refuses it even
+    /// when single-tenant, where the owner-only file and Vault stay accepted,
+    /// and multi-tenant production remains Vault-only. Validation reads no key.
+    #[test]
+    fn operator_key_source_follows_deployment() {
+        let directory = tempfile::tempdir().expect("key temp directory");
+        OperatorKeysConfig::default()
+            .validate(false, true)
+            .expect("development accepts the environment source");
+        let refused = OperatorKeysConfig::default()
+            .validate(true, false)
+            .expect_err("single-tenant production refuses the environment source")
+            .to_string();
+        assert!(refused.contains("development-only"), "{refused}");
+        let file = OperatorKeysConfig {
+            source: OperatorKeySource::File,
+            dir: Some(directory.path().join("absent-keys")),
+            ..OperatorKeysConfig::default()
+        };
+        file.validate(true, false)
+            .expect("single-tenant production accepts the file source");
+        let vault = production_operator_keys(directory.path());
+        vault
+            .validate(true, false)
+            .expect("single-tenant production accepts Vault");
+        vault
+            .validate(true, true)
+            .expect("multi-tenant production accepts https Vault");
+        let refused = file
+            .validate(true, true)
+            .expect_err("multi-tenant production refuses the file source")
+            .to_string();
+        assert!(refused.contains("vault"), "{refused}");
+    }
+
+    /// Production refuses a plaintext Vault address before any token or key
+    /// crosses it and accepts HTTPS; plaintext stays available only to a
+    /// non-production local fixture.
+    #[test]
+    fn production_vault_requires_https() {
+        let directory = tempfile::tempdir().expect("key temp directory");
+        let mut keys = production_operator_keys(directory.path());
+        keys.validate(true, true).expect("https Vault validates");
+        if let Some(vault) = &mut keys.vault {
+            vault.addr = "http://vault.internal:8200".to_owned();
+        }
+        for multi_tenant in [true, false] {
+            let refused = keys
+                .validate(true, multi_tenant)
+                .expect_err("production refuses plaintext Vault")
+                .to_string();
+            assert!(refused.contains("https"), "{refused}");
+        }
+        keys.validate(false, true)
+            .expect("a development fixture may use plaintext Vault");
+    }
+
+    /// The largest persisted key version is accepted exactly, and one past it
+    /// is refused at validation from both TOML and the environment, before
+    /// boot or any key provider is reached.
+    #[test]
+    fn operator_key_version_must_fit_i32() {
+        let at_max: OperatorKeysConfig =
+            toml::from_str("active_version = 2147483647").expect("i32::MAX parses");
+        at_max.validate(false, false).expect("i32::MAX validates");
+        assert_eq!(at_max.active_version.get(), 2_147_483_647);
+        let past_max: OperatorKeysConfig =
+            toml::from_str("active_version = 2147483648").expect("u32 parses");
+        let refused = past_max
+            .validate(false, false)
+            .expect_err("i32::MAX + 1 is refused")
+            .to_string();
+        assert!(refused.contains("active_version"), "{refused}");
+
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars(
+            [("WYRD_OPERATOR_KEK_ACTIVE_VERSION", Some("2147483648"))],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config.bifrost.oracle.allow_unapproved_profile = true;
+                config.apply_env_overrides().expect("the override parses");
+                assert!(matches!(
+                    config.validate(),
+                    Err(ConfigError::Invalid { ref message }) if message.contains("active_version")
+                ));
+            },
+        );
+    }
+
+    /// An oversized Operator key version is ignored by a dedicated Forge
+    /// worker, which owns no Operator keys, and refused before boot for an
+    /// API-bearing role.
+    #[test]
+    fn oversized_operator_key_version_follows_role_ownership() {
+        for (role, accepted) in [
+            (BifrostTarget::ForgeWorker, true),
+            (BifrostTarget::Server, false),
+        ] {
+            let mut config = WyrdServerConfig {
+                role,
+                ..WyrdServerConfig::default()
+            };
+            config.bifrost.oracle.allow_unapproved_profile = true;
+            config.verification.operator_keys.active_version =
+                NonZeroU32::new(2_147_483_648).expect("positive");
+            match config.validate() {
+                Ok(()) => assert!(accepted, "{role:?} accepted an oversized version"),
+                Err(ConfigError::Invalid { message }) => {
+                    assert!(!accepted, "{role:?} refused: {message}");
+                    assert!(message.contains("active_version"), "{message}");
+                }
+                Err(other) => panic!("{role:?} failed unexpectedly: {other}"),
+            }
+        }
+    }
+
+    /// Debug formatting of the key configuration, directly and through the
+    /// server configuration, prints only the source kind, active version, and
+    /// Vault presence, never a selector or token.
+    #[test]
+    fn operator_keys_debug_redacts_selectors() {
+        let keys = OperatorKeysConfig {
+            source: OperatorKeySource::Vault,
+            active_version: NonZeroU32::new(907_311).expect("positive"),
+            dir: Some(PathBuf::from("/sentinel-kek-dir")),
+            vault: Some(VaultKeysConfig {
+                addr: "https://sentinel-vault-addr:8200".to_owned(),
+                mount: "sentinel-mount".to_owned(),
+                prefix: "sentinel-prefix".to_owned(),
+                token_file: Some(PathBuf::from("/sentinel-token-file")),
+                token: Some(SecretString::from("sentinel-inline-token")),
+            }),
+        };
+        let mut config = WyrdServerConfig::default();
+        config.verification.operator_keys = keys.clone();
+        for debug in [format!("{keys:?}"), format!("{config:?}")] {
+            for sentinel in [
+                "sentinel-kek-dir",
+                "sentinel-vault-addr",
+                "sentinel-mount",
+                "sentinel-prefix",
+                "sentinel-token-file",
+                "sentinel-inline-token",
+            ] {
+                assert!(!debug.contains(sentinel), "{sentinel} leaked: {debug}");
+            }
+            assert!(debug.contains("source: Vault"), "{debug}");
+            assert!(debug.contains("active_version: 907311"), "{debug}");
+            assert!(debug.contains("vault: true"), "{debug}");
+        }
+    }
+
     /// Proves production accepts only a complete maintainer-approved profile.
     #[test]
     fn oracle_production_calibration_requires_approved_profile() {
@@ -3911,6 +4349,7 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
+        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path.clone();
         assert!(config.validate().is_err());
 
@@ -4028,6 +4467,7 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
+        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path;
         assert!(config.validate().is_err());
     }
@@ -4046,6 +4486,7 @@ minimum_slots = 2
             deployment_profile: DeploymentProfile::Production,
             ..WyrdServerConfig::default()
         };
+        config.verification.operator_keys = production_operator_keys(directory.path());
         config.bifrost.oracle.calibration_profile = path;
         assert!(config.validate().is_err());
     }
@@ -5014,6 +5455,7 @@ minimum_slots = 2
                 deployment_profile: DeploymentProfile::Production,
                 ..WyrdServerConfig::default()
             };
+            config.verification.operator_keys = production_operator_keys(directory.path());
             config.bifrost.oracle.calibration_profile = profile;
             config.validate()
         };

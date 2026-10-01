@@ -4,16 +4,26 @@
   "description": "Typed notification destinations.",
   "oneOf": [
     {
-      "description": "PagerDuty event payload.",
+      "description": "PagerDuty Events API v2 trigger through a tenant Global Integration key.",
       "type": "object",
       "required": [
+        "connection",
         "kind",
+        "route",
         "severity",
         "summary"
       ],
       "properties": {
+        "connection": {
+          "description": "Name of the tenant's `pager_duty` connection.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectionName"
+            }
+          ]
+        },
         "dedup_key": {
-          "description": "Optional de-duplication key.",
+          "description": "Optional de-duplication key template; the dispatch ID when omitted.",
           "type": [
             "string",
             "null"
@@ -25,25 +35,47 @@
             "pager_duty"
           ]
         },
-        "severity": {
-          "description": "PagerDuty severity.",
+        "route": {
+          "description": "Route sent as `payload.custom_details.wyrd_route` for PagerDuty Service Routes.",
           "type": "string"
         },
+        "severity": {
+          "description": "PagerDuty event severity.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PagerDutySeverity"
+            }
+          ]
+        },
         "summary": {
-          "description": "Human-readable event summary.",
+          "description": "Event summary template.",
           "type": "string"
         }
       },
       "additionalProperties": false
     },
     {
-      "description": "Slack message payload.",
+      "description": "Slack `chat.postMessage` through a tenant workspace bot token.",
       "type": "object",
       "required": [
+        "channel_id",
+        "connection",
         "kind",
         "text"
       ],
       "properties": {
+        "channel_id": {
+          "description": "Slack conversation ID the app may post in.",
+          "type": "string"
+        },
+        "connection": {
+          "description": "Name of the tenant's `slack` connection.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ConnectionName"
+            }
+          ]
+        },
         "kind": {
           "type": "string",
           "enum": [
@@ -51,11 +83,50 @@
           ]
         },
         "text": {
-          "description": "Message text.",
+          "description": "Message text template.",
           "type": "string"
         }
       },
       "additionalProperties": false
     }
-  ]
+  ],
+  "definitions": {
+    "ConnectionName": {
+      "description": "Immutable tenant-scoped Operator connection name, unique per provider.",
+      "type": "string"
+    },
+    "PagerDutySeverity": {
+      "description": "PagerDuty Events API v2 severities.",
+      "oneOf": [
+        {
+          "description": "critical.",
+          "type": "string",
+          "enum": [
+            "critical"
+          ]
+        },
+        {
+          "description": "error.",
+          "type": "string",
+          "enum": [
+            "error"
+          ]
+        },
+        {
+          "description": "warning.",
+          "type": "string",
+          "enum": [
+            "warning"
+          ]
+        },
+        {
+          "description": "info.",
+          "type": "string",
+          "enum": [
+            "info"
+          ]
+        }
+      ]
+    }
+  }
 }

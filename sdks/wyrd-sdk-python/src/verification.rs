@@ -7,37 +7,15 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use wyrd_client::bifrost::client_from_options;
 use wyrd_client::verification::{
     BindingId, StartVerificationRunRequest, Verification as NativeVerification, VerificationRunId,
 };
 use wyrd_spec::error::WyrdError;
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject, pyobject_to_json};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, pyobject_to_json};
 
-/// Decode one Python argument into a wire type, naming the argument on failure.
-///
-/// # Errors
-/// Returns `WYRD_SPEC_400_VALIDATION` with `details.field` set to `field` when
-/// `value` does not match the wire contract.
-fn decode<T: DeserializeOwned>(field: &str, value: Value) -> WyrdPyResult<T> {
-    serde_json::from_value(value).map_err(|error| {
-        WyrdPyError::from(WyrdError::Validation {
-            message: format!("{field} is invalid: {error}"),
-            details: serde_json::json!({ "field": field, "reason": error.to_string() }),
-        })
-    })
-}
-
-/// Project one wire response into plain Python values.
-///
-/// # Errors
-/// Returns a Python error when the response cannot be serialized or converted.
-fn to_python<T: Serialize>(py: Python<'_>, value: &T) -> WyrdPyResult<Py<PyAny>> {
-    Ok(json_to_pyobject(py, &serde_json::to_value(value)?)?)
-}
+use crate::operators::{decode, to_python};
 
 /// Python-facing Verification handle: binding status, manual runs, run status.
 ///

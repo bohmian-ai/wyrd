@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -65,7 +67,8 @@ use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
-    GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, ServeMode, WorkloadBindingEntry,
+    GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, OperatorKeySource, OperatorKeysConfig,
+    ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -181,6 +184,8 @@ pub struct WyrdTestServer {
 
 struct WyrdTestServerInner {
     fixture: Arc<PgFixture>,
+    /// Lifetime guard of the generated Operator key directory, when used.
+    operator_keys_dir: Option<TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
     _storage_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
@@ -275,6 +280,8 @@ pub struct OracleRuntimeInspection {
     pub reserved_memory_bytes: u64,
     /// Peer reservations executing worker streams.
     pub peer_running: u64,
+    /// Analytical graph grants a leader's admit stream still holds open.
+    pub held_grants: u64,
     /// Oracle audit outbox commits still in flight.
     pub audit_pending: u64,
     /// Active Oracle-owned process/query scratch directories.
@@ -486,6 +493,8 @@ pub struct WyrdTestServerBuilder {
     mcp_context_probe: bool,
     /// Keep the server's audit publisher from retiring staged audit rows.
     audit_publication_disabled: bool,
+    /// Operator connection key source; `None` generates a file key.
+    operator_keys: Option<OperatorKeysConfig>,
 }
 
 /// Test-only file paths for one replica's Bifrost peer identity and trust root.
@@ -604,12 +613,35 @@ impl Default for WyrdTestServerBuilder {
             serve_task_panic_for_test: false,
             mcp_context_probe: false,
             audit_publication_disabled: false,
+            operator_keys: None,
         }
     }
 }
 
 /// Result of a fixture-path principal bootstrap.
 pub use crate::principal::Bootstrap;
+
+/// Write key version 1 as an owner-only file in a fresh directory and return
+/// the file-sourced Operator key config over it.
+///
+/// # Errors
+/// Returns [`WyrdTestServerError::Start`] when the directory or file cannot
+/// be created.
+fn generated_operator_keys() -> Result<(OperatorKeysConfig, Option<TempDir>), WyrdTestServerError> {
+    let start = |error: std::io::Error| WyrdTestServerError::Start(error.to_string());
+    let dir = tempfile::tempdir().map_err(start)?;
+    let mut key = [0_u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
+    let path = dir.path().join("v1");
+    std::fs::write(&path, base64::engine::general_purpose::STANDARD.encode(key)).map_err(start)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(start)?;
+    let config = OperatorKeysConfig {
+        source: OperatorKeySource::File,
+        dir: Some(dir.path().to_path_buf()),
+        ..OperatorKeysConfig::default()
+    };
+    Ok((config, Some(dir)))
+}
 
 /// Test server errors.
 #[derive(Debug, Error)]
@@ -1329,6 +1361,7 @@ impl WyrdTestServer {
             queued_queries: admission.queued_queries,
             reserved_memory_bytes: admission.reserved_memory_bytes,
             peer_running: admission.peer_running,
+            held_grants: admission.held_grants,
             audit_pending: audit_pending as u64,
             spill_directories,
             spill_files,
@@ -3363,6 +3396,13 @@ impl WyrdTestServer {
         Some(self.inner.bifrost_data_root.wal())
     }
 
+    /// Directory of the generated owner-only Operator key files (`v1`, ...),
+    /// or `None` when the builder supplied its own key source.
+    #[must_use]
+    pub fn operator_keys_dir_for_test(&self) -> Option<&Path> {
+        self.inner.operator_keys_dir.as_ref().map(TempDir::path)
+    }
+
     async fn raw_call(
         &self,
         mut req: Request<Body>,
@@ -3724,6 +3764,18 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_mcp_context_probe_for_test(mut self) -> Self {
         self.mcp_context_probe = true;
+        self
+    }
+
+    /// Read Operator connection keys from `config` instead of the default
+    /// generated owner-only file key version 1.
+    ///
+    /// A multi-replica rotation journey points a second server at the first
+    /// server's [`WyrdTestServer::operator_keys_dir_for_test`] with a newer
+    /// active version.
+    #[must_use]
+    pub fn with_operator_keys_for_test(mut self, config: OperatorKeysConfig) -> Self {
+        self.operator_keys = Some(config);
         self
     }
 
@@ -4479,11 +4531,20 @@ impl WyrdTestServerBuilder {
         state.authz.permission_check = Arc::new(RbacCheck);
         let (forge_publisher, _forge_inbox) = staging_file_channel(16)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
+            Some(config) => (config, None),
+            None => generated_operator_keys()?,
+        };
+        state = state.with_operator_keys(
+            wyrd_server::components::operators::keys::OperatorKeys::new(operator_keys)
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
         let router = build_router(state.clone());
 
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
                 fixture,
+                operator_keys_dir,
                 _storage_root: storage_root,
                 _bifrost_data_dir: data_dir,
                 bifrost_data_root,

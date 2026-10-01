@@ -252,6 +252,12 @@ Run the smallest complete affected surface sequentially:
 5. `git diff --check`;
 6. final diff inspection.
 
+These focused commands support iteration. When the task selects `mise run gate`
+as its final aggregate, do not repeat its component `mise` lanes in the final
+verification checklist or run them again merely to duplicate the gate. Keep
+exact named-test commands required by the task and any proven lane outside the
+aggregate.
+
 Use repository `mise run` tasks for module-, crate-, family-, environment-, and
 aggregate-level coverage after inspecting their implementation and setup. Use
 `mise exec --` with `cargo nextest run` for a specifically named Rust test,

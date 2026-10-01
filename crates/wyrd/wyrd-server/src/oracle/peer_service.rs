@@ -31,9 +31,7 @@ use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_server::{
     OraclePeerService, OraclePeerServiceServer,
 };
-use wyrd_tonic::wyrd::v1::{
-    self as proto, ForwardQueryRequest, ReleaseNodeSlotsRequest, ReserveNodeSlotsRequest,
-};
+use wyrd_tonic::wyrd::v1::{self as proto, ForwardQueryRequest, ReserveNodeSlotsRequest};
 
 use crate::state::{Bifrost, Scribe};
 
@@ -407,7 +405,7 @@ impl ScribeFragmentExecutor {
 
 #[async_trait::async_trait]
 impl OraclePeerTransport for ScribeFragmentExecutor {
-    /// Scribe fragments are never reserved; the leader skips reservation.
+    /// Scribe fragments are never granted; only Analytical graphs hold grants.
     ///
     /// # Errors
     /// Always returns [`DispatchError::Terminal`].
@@ -415,20 +413,14 @@ impl OraclePeerTransport for ScribeFragmentExecutor {
         &self,
         _worker: wyrd_spec::vala::api::NodeId,
         _request: wyrd_spec::vala::api::ReserveNodeSlotsRequest,
-    ) -> Result<wyrd_spec::vala::api::ReserveNodeSlotsResponse, DispatchError> {
+    ) -> Result<
+        Result<
+            vala_bifrost_redux::oracle::dispatcher::ParticipantGrant,
+            wyrd_spec::vala::api::ReservationRejected,
+        >,
+        DispatchError,
+    > {
         Err(DispatchError::Terminal)
-    }
-
-    /// Nothing is reserved, so release is a no-op.
-    ///
-    /// # Errors
-    /// Never fails.
-    async fn release(
-        &self,
-        _worker: wyrd_spec::vala::api::NodeId,
-        _request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
-    ) -> Result<(), DispatchError> {
-        Ok(())
     }
 
     /// Executes the fragment in-process through [`Self::execute`].
@@ -453,15 +445,26 @@ impl OraclePeerService for OraclePeerGrpc {
         Pin<Box<dyn Stream<Item = Result<proto::WorkerAttemptFrame, Status>> + Send>>;
     /// Public-query frames proxied from the selected local Oracle.
     type ForwardQueryStream = crate::grpc::query::QueryGrpcStream;
+    /// One graph grant, held for exactly as long as this stream stays open.
+    type ReserveSlotsStream =
+        Pin<Box<dyn Stream<Item = Result<proto::ReserveNodeSlotsResponse, Status>> + Send>>;
 
-    /// Reserves one bounded pending slot after its context is checked.
+    /// Admits or refuses one graph grant, then holds it on the open stream.
+    ///
+    /// The first message is the verdict: `Pending` with the grant identity, or
+    /// `Rejected` with a retry hint, after which a refusal's stream ends. An
+    /// admitted grant is held by the stream itself, so it ends — releasing
+    /// its envelope and cancelling any graph built on it — the moment the
+    /// leader drops the stream, the query's absolute deadline passes, or this
+    /// server begins shutting down. Nothing else releases it.
     ///
     /// # Errors
-    /// Returns a context, conversion, or worker rejection status.
+    /// Returns a context, fence, or conversion status before any capacity is
+    /// charged.
     async fn reserve_slots(
         &self,
         request: Request<ReserveNodeSlotsRequest>,
-    ) -> Result<Response<proto::ReserveNodeSlotsResponse>, Status> {
+    ) -> Result<Response<Self::ReserveSlotsStream>, Status> {
         let mut wire = request.into_inner();
         let context = wire.context.take();
         let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(wire.clone())
@@ -496,39 +499,33 @@ impl OraclePeerService for OraclePeerGrpc {
             .oracle_peer_service()
             .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?
             .worker();
-        Ok(Response::new(worker.reserve(&request).into()))
-    }
-
-    /// Releases one matching reservation idempotently after its context is checked.
-    ///
-    /// # Errors
-    /// Returns a context or conversion status.
-    async fn release_slots(
-        &self,
-        request: Request<ReleaseNodeSlotsRequest>,
-    ) -> Result<Response<proto::ReleaseNodeSlotsResponse>, Status> {
-        let mut wire = request.into_inner();
-        let context = wire.context.take();
-        let request = wyrd_spec::vala::api::ReleaseNodeSlotsRequest::try_from(wire.clone())
-            .map_err(conversion_status)?;
-        // A release is state-changing, so it is authorized on exactly the same
-        // terms as a reserve: a replayed release must not cancel capacity the
-        // leader has since re-taken.
-        self.authorize_reservation(
-            ReservationOperationV1::ReleaseSlots,
-            &wire,
-            context,
-            request.leader_node_id,
-            request.leader_fencing_token,
-            request.query_id.as_uuid(),
-        )
-        .await?;
-        self.bifrost
-            .oracle_peer_service()
-            .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?
-            .worker()
-            .release(&request);
-        Ok(Response::new(proto::ReleaseNodeSlotsResponse {}))
+        let grant = match worker.reserve(&request) {
+            Ok(grant) => grant,
+            Err(rejected) => {
+                let verdict: proto::ReserveNodeSlotsResponse =
+                    wyrd_spec::vala::api::ReserveNodeSlotsResponse::Rejected(rejected).into();
+                return Ok(Response::new(Box::pin(futures_util::stream::once(
+                    async move { Ok(verdict) },
+                ))));
+            }
+        };
+        let verdict: proto::ReserveNodeSlotsResponse =
+            wyrd_spec::vala::api::ReserveNodeSlotsResponse::Pending(grant.reservation()).into();
+        // The deadline is the backstop for a leader that vanished without its
+        // connection closing; an ordinary leader ends the grant far sooner.
+        let remaining = (request.expires_at - chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default();
+        let shutdown = self.shutdown.clone();
+        let held = async_stream::stream! {
+            yield Ok(verdict);
+            tokio::select! {
+                () = shutdown.cancelled() => {}
+                () = tokio::time::sleep(remaining) => {}
+            }
+            drop(grant);
+        };
+        Ok(Response::new(Box::pin(held)))
     }
 
     /// Executes one verified Scribe fragment and streams a footer-terminated attempt.

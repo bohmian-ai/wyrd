@@ -705,20 +705,36 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
     promoted.fixture.expire_claims().await;
     supervisor.reclaim_expired_claims().await;
     promoted.fixture.clear_task_backoff().await;
+    let unresolved = operation_phases(&promoted.fixture)
+        .await
+        .into_iter()
+        .filter(|(_, phase)| phase == "prepared")
+        .map(|(id, _)| id)
+        .collect::<BTreeSet<_>>();
+    // The takeover attempt is held once its reconciliation settled the
+    // sibling and before it plans a rewrite of its own, so the stop below
+    // lands at a pre-effect checkpoint. Stopping it after a fresh commit was
+    // submitted would release that commit for a claim-expiry takeover the
+    // final pass never reaches.
+    supervisor
+        .observer()
+        .hold_after_next_rewrite_settlement_for_test();
     supervisor.restart_worker();
     supervisor.schedule_only().await;
     supervisor.start_worker();
-    await_operation_phase(
-        &promoted.fixture,
-        &operation_phases(&promoted.fixture)
-            .await
-            .into_iter()
-            .filter(|(_, phase)| phase == "prepared")
-            .map(|(id, _)| id)
-            .collect::<BTreeSet<_>>(),
-        &["recovered"],
+    tokio::time::timeout(
+        ADMISSION_BOUND,
+        supervisor
+            .observer()
+            .wait_for_held_rewrite_settlement_for_test(),
     )
-    .await;
+    .await
+    .expect("the takeover settles the unresolved sibling");
+    await_operation_phase(&promoted.fixture, &unresolved, &["recovered"]).await;
+    supervisor.worker_stop().cancel();
+    supervisor
+        .observer()
+        .release_held_rewrite_settlement_for_test();
     supervisor.stop_worker().await;
     let settled_total = small_files_volume(&telemetry, "bifrost_forge_input_files_total");
     assert_eq!(

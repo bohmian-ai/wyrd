@@ -357,6 +357,8 @@ pub struct OracleRuntimeInspection {
     pub reserved_memory_bytes: u64,
     /// Peer running reservations held by this Oracle.
     pub peer_running: u64,
+    /// Analytical graph grants held open by a leader's admit stream.
+    pub held_grants: u64,
 }
 
 /// Per-phase stopwatch for one SQL attempt after planning completes.
@@ -947,9 +949,9 @@ pub struct OracleBuildConfig {
     pub audit: Arc<dyn OracleAudit>,
     /// Reservation owner this node's Analytical graphs charge against.
     ///
-    /// One registry per node, shared with the peer worker that accepts
-    /// reservations, so a graph lease can only ever be activated from a
-    /// reservation this same node actually granted.
+    /// One registry per node, shared with the peer worker that holds each
+    /// leader's admit stream, so a graph lease can only ever be activated from
+    /// a grant this same node is still holding.
     pub reservations: Arc<dispatcher::ReservationRegistry>,
     /// Server-owned east-west stage authority for the Analytical path.
     ///
@@ -1218,7 +1220,7 @@ pub struct Oracle {
     /// Immutable membership registry retained for planning and worker selection.
     cluster: Arc<ClusterRegistry>,
     /// Reservation owner this node's Analytical graphs charge against; the
-    /// engine drains its pending entries at shutdown and reads it for
+    /// engine ends its held grants at shutdown and reads it for
     /// test-tier inspection.
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// One process-local lifecycle registry shared with private controls.
@@ -2767,11 +2769,14 @@ impl Oracle {
         self.admission.refresh(snapshot);
     }
 
-    /// Captures local admission and peer reservations without external IO.
+    /// Captures local admission and held peer grants without external IO.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn runtime_inspection(&self) -> OracleRuntimeInspection {
-        self.admission.runtime_inspection()
+        OracleRuntimeInspection {
+            held_grants: self.reservations.held_grants() as u64,
+            ..self.admission.runtime_inspection()
+        }
     }
 
     /// Captures every local readiness input without performing network or SQL IO.
@@ -2864,14 +2869,12 @@ impl Oracle {
                 "Oracle analytical follower ownership did not release during shutdown"
             );
         }
-        // Pending reservations hold capacity for graphs no leader can still
-        // activate here, so they are released rather than left to expire.
-        let drained = self.reservations.drain_pending();
-        if drained != 0 {
-            tracing::debug!(
-                drained,
-                "Oracle shutdown released pending peer reservations"
-            );
+        // Held grants keep capacity for leaders whose streams may still be
+        // open, but no graph can run here any more, so they end now rather
+        // than when each leader's stream happens to close.
+        let closed = self.reservations.close_all();
+        if closed != 0 {
+            tracing::debug!(closed, "Oracle shutdown ended held peer grants");
         }
         let report = self.admission.shutdown(deadline).await;
         if report.active_queries != 0 || report.queued_queries != 0 || report.peer_running != 0 {

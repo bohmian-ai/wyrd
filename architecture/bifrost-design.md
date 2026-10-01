@@ -367,7 +367,7 @@ peer context that binds:
 - public query, DataFusion query, stage, task, and attempt identities;
 - pinned snapshot and fragment digests;
 - leader and worker fences and audience;
-- reservation identity, request digest, and absolute deadline.
+- request digest and absolute deadline.
 
 The context is unsigned. Peer mTLS with the fixed `wyrd-peer` cluster identity
 is the only peer authentication and completes before the bounded first frame is
@@ -377,9 +377,18 @@ admission window rather than replay state. A compromised cluster member is out
 of scope. Claims and body digests are verified before lazy plan decode, task
 cache lookup, provider creation, or source IO. Every worker replaces its
 process runtime with the exact query-admitted `RuntimeEnv`, `MemoryPool`, spill
-share, cancellation token, and deadline. Query-owned leases remain alive until
-coordinator end-of-stream, cancellation, or cache invalidation and all
-structured tasks have joined.
+share, cancellation token, and deadline.
+
+A follower never outlives its leader. The leader's stream owns every grant a
+follower holds for its graph: slot unit, memory, scratch share, query runtime
+and spill directory, task cache entries, and structured tasks. A follower
+takes no capacity before it accepts that stream. It admits the graph when it
+accepts the leader's stream, beneath its own local capacity root, or refuses
+at once with retry timing when full. No pending reservation, reservation
+expiry, or reclaim-by-timeout exists. When the leader stream completes, fails,
+is cancelled, or is dropped, or the deadline passes, the follower cancels the
+graph immediately and releases every owner once its structured tasks have
+joined; nothing waits for a later request or timer to reclaim it.
 
 Exchange buffers draw from the same finite query-owned memory pool as the
 operators; they are not precharged into a predicted child allocation. Before
@@ -451,9 +460,9 @@ itself charged as resident query memory. Concurrency is governed by slot units,
 actual cooperative reservation by the shared memory root, and spill by the
 separately leased scratch share. Every query charges exactly one unit on each
 node it runs on, whatever its class: an Interactive query on its leader, and an
-Analytical query on its leader and on every participant that reserves its
-graph. The class decides only which capacity rules apply, never the charge, and
-a peer reservation therefore carries no demand of its own. A query-local memory ceiling
+Analytical query on its leader and on every participant whose leader stream it
+has accepted. The class decides only which capacity rules apply, never the
+charge, and a participant's charge therefore carries no demand of its own. A query-local memory ceiling
 is derived once at admission:
 
 ```text
@@ -568,8 +577,10 @@ overlap one another and the leader steps, so they are never summed with them.
 An Analytical leader selects at most `max_workers_per_query` remote workers from
 the pinned eligible cut, rotating the starting position by the attempt identity
 so selection is deterministic, stable across re-projection of the same roster,
-and spread across attempts. Only selected workers reserve resources, receive
-requests, or affect the result; an unselected replica is absent from the cut
+and spread across attempts. Only selected workers admit resources, receive
+requests, or affect the result; a selected worker that refuses its leader
+stream fails that attempt before rows, and only the leader may retry it within
+the same query deadline; an unselected replica is absent from the cut
 entirely. Memory governance protects
 stability; pruning, vectorization, layout, and IO efficiency determine latency.
 
@@ -1032,7 +1043,7 @@ Bifrost does not provide:
 
 `DataTenantId::SYSTEM_OWNER` is the durable platform tenant for security events
 that cannot safely be attributed to caller-controlled tenant data, including
-peer refusals made before the receiver's own query, reservation, or stage state
+peer refusals made before the receiver's own query or stage state
 binds a tenant. Its canonical row is UUID
 `00000000-0000-7000-8000-000000000000`, slug `wyrd-system`, display name
 `Wyrd System`, status `active`, and `deleted_at IS NULL`. Provisioning and boot

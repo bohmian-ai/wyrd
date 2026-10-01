@@ -744,7 +744,12 @@ fn print_list_text(response: &ListCardsResponse) {
     }
 }
 
-fn print_json<T: Serialize>(value: &T) -> Result<(), WyrdCliError> {
+/// Print one response as pretty JSON; shared by the card and Operator
+/// connection verbs.
+///
+/// # Errors
+/// Returns [`WyrdCliError::Output`] when the value cannot be serialized.
+pub(crate) fn print_json<T: Serialize>(value: &T) -> Result<(), WyrdCliError> {
     let output = serde_json::to_string_pretty(value).map_err(|error| WyrdCliError::Output {
         detail: error.to_string(),
     })?;

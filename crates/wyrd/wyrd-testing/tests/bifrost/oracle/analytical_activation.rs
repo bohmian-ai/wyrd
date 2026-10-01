@@ -1637,7 +1637,6 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     let held = cluster.ownership_snapshot(unselected)?;
     let idle = OracleOwnershipSnapshot {
         attempts_active: held.attempts_active,
-        exchanges_active: held.exchanges_active,
         ..idle
     };
     if held != idle {

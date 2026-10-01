@@ -381,7 +381,6 @@ impl ScribeImpl {
     async fn admit_transport_frame(
         &self,
         frame: &mut ScribeIngressFrame,
-        lifecycle: &mut crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     ) -> Result<RootAdmission, ScribeError> {
         validate_logical_transport_frame(frame, self.ingest_limits.otlp.request_bytes)?;
         let decode_owner = take_transport_decode_owner(&mut frame.payload);
@@ -403,7 +402,6 @@ impl ScribeImpl {
                 .map_err(|_| ScribeError::InvalidFrame)?;
         let material_plan = self.plan_transport_payload(frame)?;
         let held_bytes = material_plan.held_material_bytes();
-        lifecycle.planned(&material_plan);
         let mut memory = match decode_owner {
             Some(owner) => owner.complete(),
             None => self.memory.try_reserve_ingress(MemoryCategory::Raw, 0)?,
@@ -502,7 +500,6 @@ impl ScribeImpl {
         mut frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
-        let mut lifecycle = self.ingress_lifecycle.begin();
         let RootAdmission {
             expected_schema_fingerprint,
             partition_granularity,
@@ -511,22 +508,15 @@ impl ScribeImpl {
             mut memory,
             binding,
             reservation,
-        } = match self.admit_transport_frame(&mut frame, &mut lifecycle).await {
-            Ok(admission) => admission,
-            Err(error) => {
-                lifecycle.refuse();
-                return Err(error);
-            }
-        };
+        } = self.admit_transport_frame(&mut frame).await?;
         let tenant = frame.principal.tenant_id;
         let builtin_definition = Self::builtin_definition(&frame.table);
         let request_id = uuid::Uuid::parse_str(frame.request_id.as_str()).map_err(|error| {
-            lifecycle.refuse();
             ScribeError::Internal {
                 detail: format!("Scribe request identity is not a UUID: {error}"),
             }
         })?;
-        let rows = match self
+        let rows = self
             .prepare_admitted_rows(
                 frame.payload,
                 AdmittedRowContext {
@@ -544,18 +534,8 @@ impl ScribeImpl {
                     definition: builtin_definition,
                 },
             )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                lifecycle.refuse();
-                return Err(error);
-            }
-        };
-        if let Err(error) = Self::mark_memory_prepared(&mut memory) {
-            lifecycle.refuse();
-            return Err(error);
-        }
+            .await?;
+        Self::mark_memory_prepared(&mut memory)?;
 
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
         let admitted = AdmittedAppend {
@@ -570,7 +550,6 @@ impl ScribeImpl {
             partition_granularity,
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
-            lifecycle,
         };
         let planned_rows_accepted = u64::try_from(material_plan.rows).unwrap_or(u64::MAX);
         let mut prepared = self.preprocess(admitted).await?;
@@ -581,7 +560,8 @@ impl ScribeImpl {
         let completion = durable_rx.await.map_err(|_| ScribeError::Internal {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;
-        record_accepted_frame(planned_rows_accepted, append_started.elapsed());
+        metrics::histogram!("bifrost_scribe_ack_seconds")
+            .record(append_started.elapsed().as_secs_f64());
         Ok(FrameAdmission {
             batch_id: frame.batch_id,
             rows_accepted: planned_rows_accepted,
@@ -593,9 +573,8 @@ impl ScribeImpl {
     /// Charges the bytes one prepared append actually holds before WAL/ACK.
     ///
     /// Preprocessing materialized the memtable slices and their WAL records;
-    /// the admitted lease grows or shrinks to exactly that retained set, which
-    /// is the one root reservation the ingress lifecycle records. A refusal
-    /// drops the append and its owners before any WAL or ACK.
+    /// the admitted lease grows or shrinks to exactly that retained set. A
+    /// refusal drops the append and its owners before any WAL or ACK.
     ///
     /// # Errors
     ///
@@ -611,14 +590,7 @@ impl ScribeImpl {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "prepared append lost its memory lease".to_owned(),
             })?;
-        let result = self.resize_after_pressure_seal(memory, bytes, &table);
-        if let Some(lifecycle) = prepared.lifecycle.as_mut() {
-            match result {
-                Ok(()) => lifecycle.reserved(bytes),
-                Err(_) => lifecycle.refuse(),
-            }
-        }
-        result
+        self.resize_after_pressure_seal(memory, bytes, &table)
     }
 
     /// Returns the decoded-request ceiling for the current production or test owner.
@@ -754,17 +726,6 @@ fn scribe_catalog_error(error: crate::catalog::BifrostCatalogError) -> ScribeErr
             detail: other.to_string(),
         },
     }
-}
-
-/// Emits the accepted-frame counters and ACK latency histogram.
-///
-/// Extracted from `prepare_and_dispatch` to keep that function within the
-/// line-length limit; all metrics writes are stateless and have no natural
-/// owner struct, so a free function is appropriate here.
-fn record_accepted_frame(rows_accepted: u64, elapsed: std::time::Duration) {
-    metrics::counter!("bifrost_scribe_frames_total", "status" => "accepted").increment(1);
-    metrics::counter!("bifrost_scribe_rows_total", "status" => "accepted").increment(rows_accepted);
-    metrics::histogram!("bifrost_scribe_ack_seconds").record(elapsed.as_secs_f64());
 }
 
 #[cfg(test)]

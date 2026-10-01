@@ -257,7 +257,7 @@ impl Memtable {
         }
         self.next_seal_id.fetch_max(highest + 1, Ordering::Relaxed);
         let reserved = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(
+        tracing::debug!(
             operation = "scribe_generation_reserved",
             shard = self.shard_id,
             seal_key = %key,

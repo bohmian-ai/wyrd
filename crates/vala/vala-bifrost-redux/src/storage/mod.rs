@@ -20,17 +20,18 @@ use tokio_util::sync::CancellationToken;
 use wyrd_storage::handle::StorageHandle;
 
 use crate::resources::OracleMetadataResources;
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::storage::cache::MetadataCacheInspection;
 pub use crate::storage::cache::{ObjectMetadataKey, RetainedMetadata};
 pub use crate::storage::error::BifrostStorageError;
 pub(crate) use crate::storage::error::error_chain_contains_not_found;
 pub use crate::storage::policy::{BifrostStorageConfig, BifrostStoragePolicy};
 pub use crate::storage::telemetry::{
-    CacheEffect, CacheEffectReason, MetadataCacheSnapshot, MetadataLoadOutcome, StorageLifecycle,
-    StorageOperation, StorageRequestOutcome, TelemetryTransition,
+    CacheEffect, CacheEffectReason, MetadataLoadOutcome, StorageLifecycle, StorageOperation,
+    StorageRequestOutcome,
 };
 
 use crate::storage::cache::ParquetMetadataCache;
-use crate::storage::telemetry::BifrostStorageTelemetry;
 
 /// Fixed detail published when an admitted attempt panicked.
 ///
@@ -99,14 +100,12 @@ impl RequestSettlement {
 ///
 /// Held by [`BifrostStorage::run_read`] and [`BifrostStorage::run_once`] for
 /// the whole logical operation, not per attempt, so a retried read is one start
-/// and one terminal. Settlement is checked rather than clamped: a duplicate or
-/// missing settlement raises a bounded anomaly, because a live count silently
-/// reconciled to zero is exactly how a broken owner reports a clean drain.
-struct StorageRequestGuard<'telemetry> {
-    /// The owner's one telemetry sink.
-    telemetry: &'telemetry BifrostStorageTelemetry,
+/// and one terminal. The `settled` flag is what makes settlement idempotent:
+/// the explicit terminal and the drop path can never both lower the owner's
+/// live request count.
+struct StorageRequestGuard<'owner> {
     /// The owner's live request count, raised here and lowered on settlement.
-    settlement: &'telemetry RequestSettlement,
+    settlement: &'owner RequestSettlement,
     /// Which governed operation this request performs.
     operation: StorageOperation,
     /// When the logical request was admitted, for the terminal histogram.
@@ -115,21 +114,16 @@ struct StorageRequestGuard<'telemetry> {
     settled: bool,
 }
 
-impl<'telemetry> StorageRequestGuard<'telemetry> {
+impl<'owner> StorageRequestGuard<'owner> {
     /// Admits one logical request and raises the active-request count.
     ///
-    /// The owner's settlement count is raised alongside the published start, so
+    /// The owner's settlement count is raised before the start is published, so
     /// a teardown that begins between the two still observes this request as
     /// outstanding and waits for it.
-    fn admit(
-        telemetry: &'telemetry BifrostStorageTelemetry,
-        settlement: &'telemetry RequestSettlement,
-        operation: StorageOperation,
-    ) -> Self {
+    fn admit(settlement: &'owner RequestSettlement, operation: StorageOperation) -> Self {
         settlement.admit();
-        telemetry.record_request_start(operation);
+        telemetry::record_request_start(operation);
         Self {
-            telemetry,
             settlement,
             operation,
             started: Instant::now(),
@@ -137,19 +131,16 @@ impl<'telemetry> StorageRequestGuard<'telemetry> {
         }
     }
 
-    /// Publishes this request's one terminal outcome.
+    /// Publishes this request's one terminal outcome and lowers the live count.
     ///
-    /// A second call publishes nothing and records an anomaly instead, so two
-    /// paths cannot disagree about how one request ended.
+    /// A second call does nothing, so two paths cannot disagree about how one
+    /// request ended or lower the count twice.
     fn settle(&mut self, outcome: StorageRequestOutcome) {
         if self.settled {
-            self.telemetry
-                .record_transition_anomaly(TelemetryTransition::RequestTerminal);
             return;
         }
         self.settled = true;
-        self.telemetry
-            .record_request_terminal(self.operation, outcome, self.started.elapsed());
+        telemetry::record_request_terminal(self.operation, outcome, self.started.elapsed());
         self.settlement.settle();
     }
 }
@@ -162,8 +153,7 @@ impl Drop for StorageRequestGuard<'_> {
     /// the caller's query was cancelled, its stream abandoned, or its task
     /// aborted. That is cancellation, not a lost terminal, so it publishes a
     /// [`StorageRequestOutcome::Cancelled`] terminal: the active-request count
-    /// comes back down and the totals still reconcile, without claiming an
-    /// invariant was violated.
+    /// comes back down without claiming an invariant was violated.
     fn drop(&mut self) {
         if !self.settled {
             self.settle(StorageRequestOutcome::Cancelled);
@@ -210,6 +200,31 @@ impl AttemptFailure {
     }
 }
 
+/// One storage owner's live state, read from the owners that hold it.
+///
+/// Test-support only; returned by [`BifrostStorage::inspect`].
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageInspection {
+    /// Lifecycle derived from the owner token, request settlement, and cache.
+    pub lifecycle: StorageLifecycle,
+    /// Logical governed requests admitted and not yet settled.
+    pub active_requests: usize,
+    /// The metadata cache's live state, absent when the composition has none.
+    pub metadata_cache: Option<MetadataCacheInspection>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl StorageInspection {
+    /// Returns whether the owner is closed and holds and owes nothing.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.lifecycle == StorageLifecycle::Closed
+            && self.active_requests == 0
+            && self.metadata_cache.is_none_or(|cache| cache.is_quiescent())
+    }
+}
+
 /// The node's one storage owner for every Bifrost role co-located on it.
 ///
 /// Dedicated role pods each construct their own owner because they are separate
@@ -227,8 +242,6 @@ pub struct BifrostStorage {
     handle: Arc<StorageHandle>,
     /// Validated policy applied to every operation.
     policy: BifrostStoragePolicy,
-    /// The single production owner of cache and storage lifecycle signals.
-    telemetry: Arc<BifrostStorageTelemetry>,
     /// Decoded-metadata cache, present only for an Oracle-serving composition
     /// with a nonzero budget.
     metadata_cache: Option<Arc<ParquetMetadataCache>>,
@@ -269,13 +282,11 @@ impl BifrostStorage {
         policy: BifrostStoragePolicy,
         metadata_resources: Option<OracleMetadataResources>,
     ) -> Self {
-        let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let metadata_cache = metadata_resources
             .filter(|_| policy.metadata_cache_bytes() > 0)
             .map(|resources| {
                 Arc::new(ParquetMetadataCache::new(
                     policy.metadata_cache_bytes(),
-                    Arc::clone(&telemetry),
                     resources,
                 ))
             });
@@ -283,7 +294,6 @@ impl BifrostStorage {
         Self {
             handle,
             policy,
-            telemetry,
             metadata_cache,
             requests,
             owner: CancellationToken::new(),
@@ -416,8 +426,7 @@ impl BifrostStorage {
         // stops retrying a read, whichever comes first.
         let bound = deadline.min(Instant::now() + self.policy.max_retry_elapsed());
         let Some(cache) = self.metadata_cache.as_ref() else {
-            self.telemetry
-                .record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Disabled);
+            telemetry::record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Disabled);
             let load = self.governed_decode(reader, size, bound);
             return Self::bounded(load, bound, &cancel, &self.owner)
                 .await
@@ -738,7 +747,7 @@ impl BifrostStorage {
     where
         Fut: std::future::Future<Output = Result<T, opendal::Error>>,
     {
-        let mut guard = StorageRequestGuard::admit(&self.telemetry, &self.settlement, operation);
+        let mut guard = StorageRequestGuard::admit(&self.settlement, operation);
         let result = self.read_attempts(operation, attempt).await;
         guard.settle(match &result {
             Ok(_) => StorageRequestOutcome::Success,
@@ -792,7 +801,7 @@ impl BifrostStorage {
                 () = tokio::time::sleep(backoff) => {}
             }
             retries_performed = retries_performed.saturating_add(1);
-            self.telemetry.record_request_retry(operation);
+            telemetry::record_request_retry(operation);
         }
     }
 
@@ -816,7 +825,7 @@ impl BifrostStorage {
     where
         Fut: std::future::Future<Output = Result<T, opendal::Error>>,
     {
-        let mut guard = StorageRequestGuard::admit(&self.telemetry, &self.settlement, operation);
+        let mut guard = StorageRequestGuard::admit(&self.settlement, operation);
         let result = if self.owner.is_cancelled() {
             Err(BifrostStorageError::Closed)
         } else {
@@ -966,15 +975,37 @@ impl BifrostStorage {
         self.requests.available_permits()
     }
 
-    /// Returns the retained reconciliation snapshot.
+    /// Reads this owner's live state from the owners that hold it.
     ///
-    /// Test-support only: production observation is the emitted metrics and
-    /// events, and exposing the totals to production callers would invite a
-    /// second source of truth.
+    /// Test-support only. The lifecycle is derived rather than retained:
+    /// `Open` until the owner token is cancelled, then `Closed` once every
+    /// governed request has settled and the cache, when present, has finished
+    /// its own close; `Closing` in between. Active requests come from the
+    /// request settlement teardown waits on, and the cache fields from the
+    /// cache's own state lock, so a drained node is proven settled by the
+    /// owners rather than by a parallel tally.
+    ///
+    /// # Panics
+    /// Panics when the cache state lock is poisoned; see
+    /// [`ParquetMetadataCache::inspect`].
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
-    pub fn telemetry_snapshot(&self) -> MetadataCacheSnapshot {
-        self.telemetry.snapshot()
+    pub fn inspect(&self) -> StorageInspection {
+        let metadata_cache = self.metadata_cache.as_ref().map(|cache| cache.inspect());
+        let cache_closed =
+            metadata_cache.is_none_or(|cache| cache.lifecycle == StorageLifecycle::Closed);
+        let lifecycle = if !self.owner.is_cancelled() {
+            StorageLifecycle::Open
+        } else if cache_closed && self.settlement.is_idle() {
+            StorageLifecycle::Closed
+        } else {
+            StorageLifecycle::Closing
+        };
+        StorageInspection {
+            lifecycle,
+            active_requests: self.settlement.active.load(Ordering::SeqCst),
+            metadata_cache,
+        }
     }
 
     /// Closes admission and settles every loader and governed request by `deadline`.
@@ -991,16 +1022,11 @@ impl BifrostStorage {
     /// the cache is settled first because a retained loader's own object read
     /// is one of the governed requests the second wait then covers.
     ///
-    /// The lifecycle transitions are published here rather than by the cache so
-    /// a composition with no cache — a Scribe-only node, or an Oracle node
-    /// booted with an explicit zero budget — still reports `Closed` on a clean
-    /// teardown instead of remaining indistinguishable from a node that never
-    /// shut down. `Closed` is published only when both the cache and every
-    /// governed request have settled, so the transition can never claim a drain
+    /// Returns `true` only when both the cache and every governed request
+    /// settled within the deadline, so a clean close can never claim a drain
     /// that live object I/O contradicts.
     pub async fn close(&self, deadline: Instant) -> bool {
         self.owner.cancel();
-        self.telemetry.record_lifecycle(StorageLifecycle::Closing);
         let cache_settled = match self.metadata_cache.as_ref() {
             None => true,
             Some(cache) => cache.close(deadline).await,
@@ -1009,11 +1035,7 @@ impl BifrostStorage {
             tokio::time::timeout_at(deadline.into(), self.settlement.wait_for_idle())
                 .await
                 .is_ok();
-        let settled = cache_settled && requests_settled;
-        if settled {
-            self.telemetry.record_lifecycle(StorageLifecycle::Closed);
-        }
-        settled
+        cache_settled && requests_settled
     }
 
     /// Closes admission immediately, aborting every retained loader.
@@ -1030,12 +1052,10 @@ impl BifrostStorage {
     /// would just recreate the deadline `close` already owns.
     pub async fn abort(&self) {
         self.owner.cancel();
-        self.telemetry.record_lifecycle(StorageLifecycle::Closing);
         if let Some(cache) = self.metadata_cache.as_ref() {
             cache.abort().await;
         }
         self.settlement.wait_for_idle().await;
-        self.telemetry.record_lifecycle(StorageLifecycle::Closed);
     }
 }
 
@@ -1104,7 +1124,12 @@ mod governed_request_tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use wyrd_bench::BenchmarkRecorder;
+
     use super::*;
+    use crate::storage::telemetry::recorded::{
+        self, ACTIVE_REQUESTS, REQUEST_RETRIES, REQUEST_TERMINALS, REQUESTS,
+    };
 
     /// Marks its flag when dropped, proving a losing attempt future was released.
     struct DropSentinel(Arc<AtomicBool>);
@@ -1158,6 +1183,8 @@ mod governed_request_tests {
     /// state does not match.
     #[tokio::test]
     async fn iceberg_read_retry_is_bounded_by_owner_policy() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let root = tempfile::tempdir().expect("warehouse root");
         let storage = owner(
             root.path(),
@@ -1197,19 +1224,20 @@ mod governed_request_tests {
             dropped.load(Ordering::SeqCst),
             "the losing attempt future must be dropped when the bound wins"
         );
-        let snapshot = storage.telemetry_snapshot();
-        assert_eq!(snapshot.request_retries(), 2);
         assert_eq!(
-            snapshot.request_starts(),
+            recorded::counter(&recorder, REQUEST_RETRIES, &[("operation", "read")]),
+            2
+        );
+        assert_eq!(
+            recorded::counter(&recorder, REQUESTS, &[]),
             1,
             "a retried read is one request"
         );
         assert_eq!(
-            snapshot.request_terminal(StorageRequestOutcome::Deadline),
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "deadline")]),
             1
         );
-        assert_eq!(snapshot.active_requests(), 0);
-        assert_eq!(snapshot.anomalies(), 0);
+        assert_eq!(storage.inspect().active_requests, 0);
         assert_eq!(
             storage.available_request_permits(),
             storage.policy().max_concurrent_requests(),
@@ -1243,7 +1271,11 @@ mod governed_request_tests {
             "a request timeout that occurs first must not be reported as the elapsed bound"
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert_eq!(bounded.telemetry_snapshot().request_retries(), 0);
+        assert_eq!(
+            recorded::counter(&recorder, REQUEST_RETRIES, &[]),
+            2,
+            "a timed-out attempt with no retry budget adds no retry"
+        );
     }
 
     /// Every non-idempotent effect is admitted exactly once, whatever it returns.
@@ -1259,6 +1291,8 @@ mod governed_request_tests {
     /// declares itself retryable.
     #[tokio::test]
     async fn iceberg_mutations_are_attempted_once() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let root = tempfile::tempdir().expect("warehouse root");
         let storage = owner(
             root.path(),
@@ -1297,12 +1331,10 @@ mod governed_request_tests {
                 effect.as_str()
             );
         }
-        let snapshot = storage.telemetry_snapshot();
-        assert_eq!(snapshot.request_starts(), 6);
-        assert_eq!(snapshot.request_terminals(), 6);
-        assert_eq!(snapshot.request_retries(), 0);
-        assert_eq!(snapshot.active_requests(), 0);
-        assert_eq!(snapshot.anomalies(), 0);
+        assert_eq!(recorded::counter(&recorder, REQUESTS, &[]), 6);
+        assert_eq!(recorded::counter(&recorder, REQUEST_TERMINALS, &[]), 6);
+        assert_eq!(recorded::counter(&recorder, REQUEST_RETRIES, &[]), 0);
+        assert_eq!(storage.inspect().active_requests, 0);
     }
 
     /// Every attempt-level terminal settles its own request accounting.
@@ -1321,6 +1353,8 @@ mod governed_request_tests {
     /// reconcile after a case.
     #[tokio::test]
     async fn storage_request_telemetry_reconciles_attempt_terminals() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let root = tempfile::tempdir().expect("warehouse root");
 
         let storage = owner(root.path(), BifrostStorageConfig::default());
@@ -1328,7 +1362,7 @@ mod governed_request_tests {
             .run_read(StorageOperation::Exists, || async { Ok(true) })
             .await
             .expect("a successful read returns its value");
-        assert_reconciled(&storage, StorageRequestOutcome::Success, 1);
+        assert_reconciled(&recorder, &storage, StorageRequestOutcome::Success, 1);
 
         let attempts = Arc::new(AtomicUsize::new(0));
         storage
@@ -1344,8 +1378,8 @@ mod governed_request_tests {
             .await
             .expect("a retried read still succeeds");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(storage.telemetry_snapshot().request_retries(), 1);
-        assert_reconciled(&storage, StorageRequestOutcome::Success, 2);
+        assert_eq!(recorded::counter(&recorder, REQUEST_RETRIES, &[]), 1);
+        assert_reconciled(&recorder, &storage, StorageRequestOutcome::Success, 2);
 
         let error = storage
             .run_once(StorageOperation::Delete, async {
@@ -1357,7 +1391,7 @@ mod governed_request_tests {
             .await
             .expect_err("a missing object fails");
         assert!(matches!(error, BifrostStorageError::NotFound { .. }));
-        assert_reconciled(&storage, StorageRequestOutcome::NotFound, 1);
+        assert_reconciled(&recorder, &storage, StorageRequestOutcome::NotFound, 1);
 
         let panicking = storage
             .run_once(StorageOperation::Write, async {
@@ -1373,7 +1407,7 @@ mod governed_request_tests {
                 detail: PANICKED_ATTEMPT.to_owned(),
             }
         );
-        assert_reconciled(&storage, StorageRequestOutcome::Backend, 1);
+        assert_reconciled(&recorder, &storage, StorageRequestOutcome::Backend, 1);
     }
 
     /// Timeout, a permit wait that outlives its bound, and owner closure each
@@ -1390,6 +1424,8 @@ mod governed_request_tests {
     /// reconcile after a case.
     #[tokio::test]
     async fn storage_request_telemetry_reconciles_admission_terminals() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let timeout_root = tempfile::tempdir().expect("warehouse root");
         let timing = owner(
             timeout_root.path(),
@@ -1409,7 +1445,7 @@ mod governed_request_tests {
             .await
             .expect_err("a stalled attempt times out");
         assert!(matches!(error, BifrostStorageError::Timeout { .. }));
-        assert_reconciled(&timing, StorageRequestOutcome::Timeout, 1);
+        assert_reconciled(&recorder, &timing, StorageRequestOutcome::Timeout, 1);
 
         let held = Arc::clone(&timing.requests)
             .acquire_owned()
@@ -1420,13 +1456,12 @@ mod governed_request_tests {
             .await
             .expect_err("the node's one request slot stays spent past the wait's bound");
         assert_eq!(expired, BifrostStorageError::Deadline);
-        let expired_snapshot = timing.telemetry_snapshot();
         assert_eq!(
-            expired_snapshot.request_terminal(StorageRequestOutcome::Deadline),
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "deadline")]),
             1
         );
         assert_eq!(
-            expired_snapshot.active_requests(),
+            timing.inspect().active_requests,
             0,
             "the expired waiter settles and leaves nothing admitted"
         );
@@ -1435,7 +1470,6 @@ mod governed_request_tests {
             0,
             "the expired waiter took no permit"
         );
-        assert_eq!(expired_snapshot.anomalies(), 0);
         drop(held);
 
         let barrier = StorageOperationBarrier::new(StorageOperation::Exists);
@@ -1468,11 +1502,11 @@ mod governed_request_tests {
                 .expect_err("a closed owner admits nothing"),
             BifrostStorageError::Closed
         );
-        let snapshot = timing.telemetry_snapshot();
-        assert_eq!(snapshot.request_terminal(StorageRequestOutcome::Closed), 2);
-        assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
-        assert_eq!(snapshot.active_requests(), 0);
-        assert_eq!(snapshot.anomalies(), 0);
+        assert_eq!(
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "closed")]),
+            2
+        );
+        assert_reconciled_totals(&recorder, &timing);
     }
 
     /// An occupied storage permit delays a read instead of refusing it, and
@@ -1491,6 +1525,8 @@ mod governed_request_tests {
     /// permit returns, or leaves a permit or request outstanding.
     #[tokio::test]
     async fn occupied_storage_permit_waits_within_operation_deadline() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let root = tempfile::tempdir().expect("warehouse root");
         let storage = owner(
             root.path(),
@@ -1528,7 +1564,7 @@ mod governed_request_tests {
                 }
             }
         });
-        wait_until(&storage, |snapshot| snapshot.active_requests() == 2).await;
+        wait_until(|| storage.inspect().active_requests == 2).await;
         // Outlive the per-attempt timeout while queued: a timeout that began
         // before admission would now fail the queued read on its first poll
         // after the permit returns.
@@ -1544,8 +1580,8 @@ mod governed_request_tests {
                 .is_none(),
             "caller cancellation ends the queued wait"
         );
-        wait_until(&storage, |snapshot| {
-            snapshot.request_terminal(StorageRequestOutcome::Cancelled) == 1
+        wait_until(|| {
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "cancelled")]) == 1
         })
         .await;
 
@@ -1556,11 +1592,11 @@ mod governed_request_tests {
                 .expect("the queued read completes once the permit returns"),
             Bytes::from_static(b"rows")
         );
-        let snapshot = storage.telemetry_snapshot();
-        assert_eq!(snapshot.request_terminal(StorageRequestOutcome::Success), 1);
-        assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
-        assert_eq!(snapshot.active_requests(), 0);
-        assert_eq!(snapshot.anomalies(), 0);
+        assert_eq!(
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "success")]),
+            1
+        );
+        assert_reconciled_totals(&recorder, &storage);
         assert_eq!(
             storage.available_request_permits(),
             1,
@@ -1701,6 +1737,8 @@ mod governed_request_tests {
     /// `Closed`, or any settlement was unmatched.
     #[tokio::test]
     async fn abort_settles_every_governed_request_before_reporting_closed() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let root = tempfile::tempdir().expect("warehouse root");
         let storage = owner(root.path(), patient_config());
         let barrier = StorageOperationBarrier::new(StorageOperation::Exists);
@@ -1733,20 +1771,19 @@ mod governed_request_tests {
                     .await
             }
         });
-        wait_until(&storage, |snapshot| snapshot.active_requests() == 2).await;
+        wait_until(|| storage.inspect().active_requests == 2).await;
 
         storage.abort().await;
 
-        let snapshot = storage.telemetry_snapshot();
+        let inspection = storage.inspect();
         assert_eq!(
-            snapshot.active_requests(),
-            0,
+            inspection.active_requests, 0,
             "abort returned while governed requests were still admitted"
         );
-        assert_eq!(snapshot.request_starts(), 2);
-        assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
+        assert_eq!(recorded::counter(&recorder, REQUESTS, &[]), 2);
+        assert_reconciled_totals(&recorder, &storage);
         assert_eq!(
-            snapshot.request_terminal(StorageRequestOutcome::Closed),
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "closed")]),
             2,
             "a request the owner cancelled settles as closed"
         );
@@ -1759,8 +1796,7 @@ mod governed_request_tests {
             dropped.load(Ordering::SeqCst),
             "the losing backend future must be dropped before abort returns"
         );
-        assert_eq!(snapshot.lifecycle(), StorageLifecycle::Closed);
-        assert_eq!(snapshot.anomalies(), 0);
+        assert_eq!(inspection.lifecycle, StorageLifecycle::Closed);
 
         barrier.release();
         assert_eq!(
@@ -1779,10 +1815,12 @@ mod governed_request_tests {
         );
 
         storage.abort().await;
-        let repeated = storage.telemetry_snapshot();
-        assert_eq!(repeated.active_requests(), 0);
-        assert_eq!(repeated.request_starts(), repeated.request_terminals());
-        assert_eq!(repeated.anomalies(), 0);
+        assert_reconciled_totals(&recorder, &storage);
+        assert_eq!(
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[]),
+            2,
+            "a repeated abort publishes no second terminal"
+        );
     }
 
     /// A close waits for governed requests under the same absolute deadline it
@@ -1801,6 +1839,8 @@ mod governed_request_tests {
     /// with governed work still admitted, or leaves the totals unreconciled.
     #[tokio::test]
     async fn close_waits_for_governed_requests_within_its_absolute_deadline() {
+        let recorder = BenchmarkRecorder::default();
+        let _metrics = metrics::set_default_local_recorder(&recorder);
         let patient_root = tempfile::tempdir().expect("warehouse root");
         let patient = owner(patient_root.path(), patient_config());
         let patient_barrier = StorageOperationBarrier::new(StorageOperation::Exists);
@@ -1820,10 +1860,9 @@ mod governed_request_tests {
                 .await,
             "a deadline with room left must settle the cancelled request"
         );
-        let settled = patient.telemetry_snapshot();
-        assert_eq!(settled.active_requests(), 0);
-        assert_eq!(settled.lifecycle(), StorageLifecycle::Closed);
-        assert_eq!(settled.anomalies(), 0);
+        let settled = patient.inspect();
+        assert_eq!(settled.active_requests, 0);
+        assert_eq!(settled.lifecycle, StorageLifecycle::Closed);
         patient_barrier.release();
         assert_eq!(
             waited
@@ -1844,7 +1883,7 @@ mod governed_request_tests {
             "the first poll admits the request and parks it at the barrier"
         );
         assert!(expired_barrier.was_reached());
-        assert_eq!(expired.telemetry_snapshot().active_requests(), 1);
+        assert_eq!(expired.inspect().active_requests, 1);
 
         assert!(
             !expired
@@ -1852,27 +1891,25 @@ mod governed_request_tests {
                 .await,
             "a deadline that elapses with a request still admitted cannot report settled"
         );
-        let unsettled = expired.telemetry_snapshot();
+        let unsettled = expired.inspect();
         assert_eq!(
-            unsettled.lifecycle(),
+            unsettled.lifecycle,
             StorageLifecycle::Closing,
-            "a close that did not settle must not publish Closed"
+            "a close that did not settle must not report Closed"
         );
-        assert_eq!(unsettled.active_requests(), 1);
-        assert_eq!(unsettled.anomalies(), 0);
+        assert_eq!(unsettled.active_requests, 1);
 
         drop(outstanding);
         expired.abort().await;
-        let aborted = expired.telemetry_snapshot();
-        assert_eq!(aborted.active_requests(), 0);
+        let aborted = expired.inspect();
+        assert_eq!(aborted.active_requests, 0);
         assert_eq!(
-            aborted.request_terminal(StorageRequestOutcome::Cancelled),
+            recorded::counter(&recorder, REQUEST_TERMINALS, &[("outcome", "cancelled")]),
             1,
             "an abandoned caller settles its request as cancelled"
         );
-        assert_eq!(aborted.request_starts(), aborted.request_terminals());
-        assert_eq!(aborted.lifecycle(), StorageLifecycle::Closed);
-        assert_eq!(aborted.anomalies(), 0);
+        assert_reconciled_totals(&recorder, &expired);
+        assert_eq!(aborted.lifecycle, StorageLifecycle::Closed);
         expired_barrier.release();
     }
 
@@ -1890,41 +1927,63 @@ mod governed_request_tests {
         }
     }
 
-    /// Waits until the owner's retained totals satisfy `reached`.
+    /// Waits until `reached` holds, yielding to the test's own runtime.
     ///
     /// Bounded so a never-satisfied condition fails the test with its own
     /// message instead of hanging the lane.
     ///
     /// # Panics
     /// Panics when the condition is not reached within the bound.
-    async fn wait_until(
-        storage: &BifrostStorage,
-        reached: impl Fn(&MetadataCacheSnapshot) -> bool,
-    ) {
+    async fn wait_until(reached: impl Fn() -> bool) {
         tokio::time::timeout(Duration::from_secs(10), async {
-            while !reached(&storage.telemetry_snapshot()) {
+            while !reached() {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("the owner reached the expected retained totals");
+        .expect("the owner reached the expected state");
     }
 
-    /// Asserts one owner published the expected terminal and reconciles.
+    /// Asserts one owner published the expected terminal and settled.
     ///
     /// # Panics
-    /// Panics when the terminal count differs, starts and terminals disagree,
-    /// active work is nonzero, or any settlement was unmatched.
-    fn assert_reconciled(storage: &BifrostStorage, outcome: StorageRequestOutcome, expected: u64) {
-        let snapshot = storage.telemetry_snapshot();
+    /// Panics when the terminal count differs or the owner did not settle; see
+    /// [`assert_reconciled_totals`].
+    fn assert_reconciled(
+        recorder: &BenchmarkRecorder,
+        storage: &BifrostStorage,
+        outcome: StorageRequestOutcome,
+        expected: u64,
+    ) {
         assert_eq!(
-            snapshot.request_terminal(outcome),
+            recorded::counter(
+                recorder,
+                REQUEST_TERMINALS,
+                &[("outcome", outcome.as_str())]
+            ),
             expected,
             "{} terminals",
             outcome.as_str()
         );
-        assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
-        assert_eq!(snapshot.active_requests(), 0);
-        assert_eq!(snapshot.anomalies(), 0);
+        assert_reconciled_totals(recorder, storage);
+    }
+
+    /// Asserts every admitted request published one terminal and settled.
+    ///
+    /// The live count comes from the request settlement teardown waits on;
+    /// the active-request gauge must agree with it, and the retired shadow
+    /// families must never appear.
+    ///
+    /// # Panics
+    /// Panics when starts and terminals disagree, the owner or its gauge still
+    /// counts admitted work, or a retired family was emitted.
+    fn assert_reconciled_totals(recorder: &BenchmarkRecorder, storage: &BifrostStorage) {
+        assert_eq!(
+            recorded::counter(recorder, REQUESTS, &[]),
+            recorded::counter(recorder, REQUEST_TERMINALS, &[])
+        );
+        assert_eq!(storage.inspect().active_requests, 0);
+        assert!(recorded::gauge(recorder, ACTIVE_REQUESTS).abs() < f64::EPSILON);
+        assert!(!recorded::emitted(recorder, recorded::RETIRED_ANOMALIES));
     }
 }

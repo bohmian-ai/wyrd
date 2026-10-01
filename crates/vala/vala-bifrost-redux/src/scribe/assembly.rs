@@ -42,6 +42,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use num_traits::ToPrimitive;
 use sha2::{Digest as _, Sha256};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{NullOrderWire, SortDirectionWire};
@@ -705,6 +706,42 @@ pub enum RecoveredMember {
     },
 }
 
+/// Point-in-time staged backlog derived from [`StagingAssembler`] ownership.
+///
+/// Counts durable, unpublished members whether they are ready or held by an
+/// outstanding claim. Every field is a pod aggregate with no member identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StagingBacklog {
+    /// Durable members not yet published, ready or claimed.
+    pub live_members: usize,
+    /// Encoded staging bytes those members occupy.
+    pub live_bytes: u64,
+    /// Earliest persisted ready time among those members, if any.
+    pub oldest_ready_at: Option<DateTime<Utc>>,
+    /// Claims taken or restored that have not settled.
+    pub outstanding_claims: usize,
+}
+
+impl StagingBacklog {
+    /// Publishes the four staged-backlog gauges from this snapshot.
+    ///
+    /// Each gauge is a pod aggregate without labels. The oldest-member gauge
+    /// holds Unix seconds, or zero when nothing is staged, so a dashboard
+    /// derives age as `time() - timestamp` only while members are live.
+    pub fn publish(self) {
+        let to_f64 = |value: u64| value.to_f64().unwrap_or(f64::MAX);
+        metrics::gauge!("bifrost_scribe_staging_live_members")
+            .set(to_f64(self.live_members as u64));
+        metrics::gauge!("bifrost_scribe_staging_live_bytes").set(to_f64(self.live_bytes));
+        metrics::gauge!("bifrost_scribe_staging_oldest_member_timestamp_seconds").set(
+            self.oldest_ready_at
+                .map_or(0.0, |ready_at| ready_at.timestamp().to_f64().unwrap_or(0.0)),
+        );
+        metrics::gauge!("bifrost_scribe_staging_outstanding_claims")
+            .set(to_f64(self.outstanding_claims as u64));
+    }
+}
+
 /// Tenant-fair owner of the durable ready index and its assembly claims.
 ///
 /// Holds every member that is durable but not yet published, decides which
@@ -967,6 +1004,36 @@ impl StagingAssembler {
     #[must_use]
     pub fn outstanding_claims(&self) -> usize {
         self.outstanding.len()
+    }
+
+    /// Summarizes every durable, unpublished member this assembler owns.
+    ///
+    /// Ready members and members held by outstanding claims both count, so
+    /// taking a claim moves members between the two sets without changing the
+    /// backlog; only settlement removes them. The walk is linear in owned
+    /// members and reads only facts the assembler already holds, so it adds no
+    /// second ledger. Called after each ownership transition, never per scrape.
+    #[must_use]
+    pub fn backlog(&self) -> StagingBacklog {
+        let ready = self.ready.values().flat_map(|index| index.members.iter());
+        let claimed = self
+            .outstanding
+            .values()
+            .flat_map(|claim| claim.members.iter());
+        let mut backlog = StagingBacklog {
+            outstanding_claims: self.outstanding.len(),
+            ..StagingBacklog::default()
+        };
+        for member in ready.chain(claimed) {
+            backlog.live_members += 1;
+            backlog.live_bytes = backlog.live_bytes.saturating_add(member.encoded_bytes());
+            backlog.oldest_ready_at = Some(
+                backlog
+                    .oldest_ready_at
+                    .map_or(member.ready_at(), |oldest| oldest.min(member.ready_at())),
+            );
+        }
+        backlog
     }
 
     /// Returns the ready members currently held for one key, in claim order.

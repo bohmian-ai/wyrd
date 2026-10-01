@@ -432,23 +432,14 @@ impl BifrostCatalog {
     ) -> Result<PreparedReaderIdentity, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
         TEST_PREPARED_IDENTITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let started = std::time::Instant::now();
-        let table_uid = self.table_uid(table, tenant).await;
-        crate::oracle::QueryPhase::TableLookup.record(started);
-        let table_uid = table_uid?;
+        let table_uid = self.table_uid(table, tenant).await?;
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let identifier = binding.table_ident();
-        let started = std::time::Instant::now();
-        let metadata_location = self.metadata_pointer(&identifier).await;
-        crate::oracle::QueryPhase::MetadataPointer.record(started);
-        let metadata_location = metadata_location?;
-        let started = std::time::Instant::now();
+        let metadata_location = self.metadata_pointer(&identifier).await?;
         #[cfg(test)]
         TEST_METADATA_DOCUMENT_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let metadata = TableMetadata::read_from(&self.file_io, &metadata_location).await;
-        crate::oracle::QueryPhase::MetadataLoad.record(started);
-        let metadata = Arc::new(metadata?);
+        let metadata = Arc::new(TableMetadata::read_from(&self.file_io, &metadata_location).await?);
         let snapshot = metadata.current_snapshot();
         Ok(PreparedReaderIdentity {
             tenant,
@@ -760,11 +751,7 @@ impl BifrostCatalog {
         ),
         BifrostCatalogError,
     > {
-        let started = std::time::Instant::now();
-        let pinned = self.pin_iceberg_snapshot(&gated, binding).await;
-        crate::oracle::QueryPhase::ManifestScan.record(started);
-        let pinned = pinned?;
-        let started = std::time::Instant::now();
+        let pinned = self.pin_iceberg_snapshot(&gated, binding).await?;
         let cut = async {
             let hot_file_catalog =
                 HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
@@ -780,7 +767,6 @@ impl BifrostCatalog {
             Ok::<_, BifrostCatalogError>(cut)
         }
         .await;
-        crate::oracle::QueryPhase::HotCut.record(started);
         Ok((gated, pinned, cut?))
     }
 

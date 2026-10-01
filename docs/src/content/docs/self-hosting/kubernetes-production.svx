@@ -577,8 +577,10 @@ kubectl -n wyrd get gateway wyrd-edge    # ADDRESS is the public entry
 The Oracle tier scales on **successful reads its Oracles execute per second**.
 Each Oracle counts its completed reads in the histogram
 `oracle_query_duration_seconds`; its `_count` series with
-`outcome="success"` is that count. HTTP request counts and CPU are not the
-signal: they do not measure Oracle execution.
+`outcome="success"` is that count. A read that ends `degraded` (for example,
+with a live tail unavailable) has its own `outcome="degraded"` series and is
+not counted as success. HTTP request counts and CPU are not the signal: they
+do not measure Oracle execution.
 
 **Scrape each pod with its namespace and pod labels.** The adapter attributes
 a series to a pod only through those two labels. Add this job to your

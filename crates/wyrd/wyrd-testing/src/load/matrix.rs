@@ -55,19 +55,9 @@ const DEFAULT_SCENARIO_DEADLINE: Duration = Duration::from_secs(60);
 /// genuine shutdown hang distinguishable.
 const CLUSTER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 /// Exact bindings required to reconcile warmup writes.
-const WARMUP_BINDINGS: &[&str] = &[
-    "gate.requests.success",
-    "gate.bytes",
-    "gate.rows",
-    "scribe.rows",
-];
+const WARMUP_BINDINGS: &[&str] = &["gate.requests.success", "gate.bytes", "scribe.rows"];
 /// Exact bindings required to reconcile mixed measured traffic.
-const MEASURED_BINDINGS: &[&str] = &[
-    "gate.requests.success",
-    "gate.bytes",
-    "gate.rows",
-    "scribe.rows",
-];
+const MEASURED_BINDINGS: &[&str] = &["gate.requests.success", "gate.bytes", "scribe.rows"];
 /// Exact bindings required to reconcile final public reads.
 const FINAL_BINDINGS: &[&str] = &[
     "gate.requests.query_success",
@@ -1232,7 +1222,6 @@ fn reconcile_matrix_telemetry(
         .values()
         .map(|tenant| u64::from(tenant.retries))
         .sum::<u64>();
-    assert_phase_counter("warmup Gate rows", warmup.gate_rows, warmup_rows)?;
     assert_phase_counter("warmup Gate bytes", warmup.gate_bytes, warmup_bytes)?;
     assert_phase_counter("warmup Scribe rows", warmup.scribe_rows, warmup_rows)?;
     assert_phase_counter("warmup Oracle stream rows", warmup.oracle_stream_rows, 0)?;
@@ -1246,7 +1235,6 @@ fn reconcile_matrix_telemetry(
         warmup.gate_success,
         warmup_rows / u64::from(profile.rows_per_batch),
     )?;
-    assert_phase_counter("measured Gate rows", measured.gate_rows, measured_rows)?;
     assert_phase_counter("measured Gate bytes", measured.gate_bytes, measured_bytes)?;
     assert_phase_counter("measured Scribe rows", measured.scribe_rows, measured_rows)?;
     assert_phase_counter(

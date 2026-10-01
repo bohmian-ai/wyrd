@@ -10,6 +10,7 @@ use std::task::{Context, Poll};
 
 use tower::Service;
 use vala_bifrost_redux::contracts::DecodedOtlp;
+use vala_bifrost_redux::gate::IngestError;
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
 use wyrd_tonic::otlp::metrics_service::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
@@ -181,7 +182,7 @@ where
             let metadata = MetadataMap::from_headers(request.headers().clone());
             let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
-                Err(error) => return Ok(Status::from(error).into_http()),
+                Err(error) => return Ok(ingest_status(error).into_http()),
             };
             let method = TraceExportUnary {
                 gate: Arc::clone(&gate),
@@ -220,12 +221,21 @@ impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
                 .gate()
                 .ingest_decoded_resource_spans(&auth, request.into_inner())
                 .await
-                .map_err(Status::from)?;
+                .map_err(ingest_status)?;
             Ok(Response::new(ExportTraceServiceResponse {
                 partial_success: outcome.partial_success(),
             }))
         })
     }
+}
+
+/// Projects one ingest error onto its gRPC status at this OTLP edge.
+///
+/// Every OTLP gRPC refusal answers the caller through here, so an internal
+/// failure is reported exactly once before the canonical projection.
+fn ingest_status(error: IngestError) -> Status {
+    error.report_internal_at_edge();
+    Status::from(error)
 }
 
 /// Tonic codec whose decoder owns trace preflight and root-backed decode reservation.
@@ -316,15 +326,15 @@ impl Decoder for TraceRequestDecoder {
         }
         record_codec_activity("preflight");
         let plan = preflight_trace_protobuf(bytes, self.gate.gate().otlp_wire_limits())
-            .map_err(Status::from)?;
+            .map_err(ingest_status)?;
         record_codec_activity("reserve");
         let owner = self
             .gate
             .gate()
             .reserve_otlp_decode(plan.reservation_bytes())
-            .map_err(Status::from)?;
+            .map_err(ingest_status)?;
         record_codec_activity("decode");
-        let request = decode_trace_protobuf(bytes).map_err(Status::from)?;
+        let request = decode_trace_protobuf(bytes).map_err(ingest_status)?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
     }
@@ -385,7 +395,7 @@ where
             let metadata = MetadataMap::from_headers(request.headers().clone());
             let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
-                Err(error) => return Ok(Status::from(error).into_http()),
+                Err(error) => return Ok(ingest_status(error).into_http()),
             };
             let response = Grpc::new(MetricsOtlpCodec {
                 gate: Arc::clone(&gate),
@@ -427,7 +437,7 @@ impl UnaryService<DecodedOtlp<ExportMetricsServiceRequest>> for MetricsExportUna
                 .gate()
                 .ingest_decoded_resource_metrics(&auth, request.into_inner())
                 .await
-                .map_err(Status::from)?;
+                .map_err(ingest_status)?;
             Ok(Response::new(ExportMetricsServiceResponse {
                 partial_success: outcome.partial_success(),
             }))
@@ -487,15 +497,15 @@ impl Decoder for MetricsRequestDecoder {
         }
         record_codec_activity("preflight");
         let plan = preflight_metrics_protobuf(bytes, self.gate.gate().otlp_wire_limits())
-            .map_err(Status::from)?;
+            .map_err(ingest_status)?;
         record_codec_activity("reserve");
         let owner = self
             .gate
             .gate()
             .reserve_otlp_decode(plan.reservation_bytes())
-            .map_err(Status::from)?;
+            .map_err(ingest_status)?;
         record_codec_activity("decode");
-        let request = decode_metrics_protobuf(bytes, plan).map_err(Status::from)?;
+        let request = decode_metrics_protobuf(bytes, plan).map_err(ingest_status)?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
     }
@@ -556,7 +566,7 @@ where
             let metadata = MetadataMap::from_headers(request.headers().clone());
             let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
                 Ok(auth) => auth,
-                Err(error) => return Ok(Status::from(error).into_http()),
+                Err(error) => return Ok(ingest_status(error).into_http()),
             };
             let response = Grpc::new(LogsOtlpCodec {
                 gate: Arc::clone(&gate),
@@ -598,7 +608,7 @@ impl UnaryService<DecodedOtlp<ExportLogsServiceRequest>> for LogsExportUnary {
                 .gate()
                 .ingest_decoded_resource_logs(&auth, request.into_inner())
                 .await
-                .map_err(Status::from)?;
+                .map_err(ingest_status)?;
             Ok(Response::new(ExportLogsServiceResponse {
                 partial_success: outcome.partial_success(),
             }))
@@ -658,15 +668,15 @@ impl Decoder for LogsRequestDecoder {
         }
         record_codec_activity("preflight");
         let plan = preflight_logs_protobuf(bytes, self.gate.gate().otlp_wire_limits())
-            .map_err(Status::from)?;
+            .map_err(ingest_status)?;
         record_codec_activity("reserve");
         let owner = self
             .gate
             .gate()
             .reserve_otlp_decode(plan.reservation_bytes())
-            .map_err(Status::from)?;
+            .map_err(ingest_status)?;
         record_codec_activity("decode");
-        let request = decode_logs_protobuf(bytes).map_err(Status::from)?;
+        let request = decode_logs_protobuf(bytes).map_err(ingest_status)?;
         source.advance(plan.wire_bytes);
         Ok(Some(DecodedOtlp::new(request, plan.wire_bytes, owner)))
     }

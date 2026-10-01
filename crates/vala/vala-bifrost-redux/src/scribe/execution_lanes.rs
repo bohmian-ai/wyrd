@@ -95,23 +95,22 @@ fn record_lane_enqueued(lane: &'static str) {
     metrics::gauge!("bifrost_scribe_lane_queued", "lane" => lane).increment(1.0);
 }
 
-/// Count one queued job becoming an actively running job on a lane worker.
+/// Move one job from waiting to running when its lane worker starts it.
 ///
-/// Paired one-to-one with the `active` increment inside the Rayon closure. See
-/// [`record_lane_enqueued`] for why this is additive rather than a snapshot.
+/// `bifrost_scribe_lane_queued` counts only jobs waiting to start, so the
+/// start transition decrements it and increments `bifrost_scribe_lane_active`.
+/// See [`record_lane_enqueued`] for why both moves are additive.
 fn record_lane_started(lane: &'static str) {
+    metrics::gauge!("bifrost_scribe_lane_queued", "lane" => lane).decrement(1.0);
     metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane).increment(1.0);
 }
 
-/// Release one job from both lane gauges once its worker closure has finished.
+/// Release one running job from the active gauge once its worker finished.
 ///
-/// Paired one-to-one with the `depth`/`active` decrements in the Rayon closure,
-/// which run on every terminal including a caught panic. Because each of the
-/// three prior transitions moved the gauges by exactly one, a quiesced lane
-/// settles at exactly zero rather than at whichever snapshot happened to be
-/// written last.
+/// Runs on every terminal including a caught panic, after
+/// [`record_lane_started`] already removed the job from the waiting gauge, so
+/// a quiesced lane settles both gauges at exactly zero.
 fn record_lane_finished(lane: &'static str) {
-    metrics::gauge!("bifrost_scribe_lane_queued", "lane" => lane).decrement(1.0);
     metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane).decrement(1.0);
 }
 
@@ -1318,8 +1317,6 @@ pub(crate) enum ScribePersistenceCpuOp {
 pub(crate) struct HoldMemoryOp {
     /// Root-backed bytes that must remain charged through job completion.
     memory: crate::resources::ScribeMemoryLease,
-    /// Lifecycle owner that must remain active through job completion.
-    lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     /// Deterministic signal emitted after the detached job owns the lease.
     started: std::sync::mpsc::SyncSender<()>,
     /// Deterministic release gate controlled by the cancellation test.
@@ -1399,11 +1396,9 @@ fn execute_persistence_operation(
         ScribePersistenceCpuOp::HoldMemory(held) => {
             let HoldMemoryOp {
                 memory,
-                mut lifecycle,
                 started,
                 release,
             } = *held;
-            lifecycle.materialized(1024);
             started.send(()).map_err(|error| ScribeError::Internal {
                 detail: format!("stalled ownership test could not signal start: {error}"),
             })?;
@@ -1411,7 +1406,6 @@ fn execute_persistence_operation(
                 detail: format!("stalled ownership test release failed: {error}"),
             })?;
             drop(memory);
-            drop(lifecycle);
             Err(ScribeError::Internal {
                 detail: "stalled ownership test completed".to_owned(),
             })
@@ -1677,10 +1671,6 @@ pub(crate) enum ScribeWalIoOp {
         append: PreparedWalAppend,
         /// Root lease retained until the detached WAL write returns.
         memory: crate::resources::ScribeMemoryLease,
-        /// Lifecycle owner retained beside the root lease.
-        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
-        /// Exact current-material bytes transferred by a successful WAL append.
-        materialized_bytes: usize,
     },
     WritePrepared {
         wal: WalHandle,
@@ -1729,8 +1719,6 @@ pub(crate) enum ScribeWalIoResult {
         result: WalAppendResult,
         /// Root lease returned after detached WAL work completed.
         memory: crate::resources::ScribeMemoryLease,
-        /// Lifecycle owner returned beside the root lease.
-        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     },
     WalWritten {
         result: WalAppendResult,
@@ -1959,8 +1947,8 @@ impl ScribeWalIoPool {
 ///
 /// # Errors
 ///
-/// Returns the WAL append, synchronization, retirement, or lifecycle
-/// settlement error produced by the selected operation.
+/// Returns the WAL append, synchronization, or retirement error produced by
+/// the selected operation.
 fn execute_wal_io(
     operation: ScribeWalIoOp,
     delay: std::time::Duration,
@@ -1970,18 +1958,9 @@ fn execute_wal_io(
             wal,
             append,
             memory,
-            mut lifecycle,
-            materialized_bytes,
         } => {
-            let result = wal
-                .append_prepared(append)
-                .inspect_err(|_| lifecycle.refuse())?;
-            lifecycle.transferred_to_wal(materialized_bytes);
-            Ok(ScribeWalIoResult::IngressSliceWritten {
-                result,
-                memory,
-                lifecycle,
-            })
+            let result = wal.append_prepared(append)?;
+            Ok(ScribeWalIoResult::IngressSliceWritten { result, memory })
         }
         ScribeWalIoOp::WritePrepared { wal, append } => {
             let result = wal.append_prepared(append)?;
@@ -2455,9 +2434,6 @@ mod tests {
         let memory = scribe
             .try_reserve_ingress(ScribeMemoryCategory::Raw, 4096)
             .expect("root-backed test lease");
-        let lifecycle = Arc::new(crate::scribe::telemetry::ScribeIngressLifecycle::default());
-        let mut lifecycle_owner = lifecycle.begin();
-        lifecycle_owner.reserved(4096);
         let pool = ScribePersistenceCpuPool::new(1);
         let submitted = pool.clone();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -2467,7 +2443,6 @@ mod tests {
                 .submit(ScribePersistenceCpuOp::HoldMemory(Box::new(
                     super::HoldMemoryOp {
                         memory,
-                        lifecycle: lifecycle_owner,
                         started: started_tx,
                         release: release_rx,
                     },
@@ -2486,15 +2461,6 @@ mod tests {
                 .scribe_memory_used_bytes,
             4096
         );
-        let active = lifecycle.snapshot();
-        assert_eq!(active.active_attempts, 1);
-        assert_eq!(active.active_reservations, 1);
-        assert_eq!(active.active_reserved_bytes, 4096);
-        assert_eq!(active.materializations, 1);
-        assert_eq!(active.materialized_bytes, 1024);
-        assert_eq!(active.active_materializations, 1);
-        assert_eq!(active.active_materialized_bytes, 1024);
-        assert_eq!(active.releases, 0);
         release_tx.send(()).expect("release detached job");
         pool.drain().await;
         assert_eq!(
@@ -2504,15 +2470,6 @@ mod tests {
                 .scribe_memory_used_bytes,
             0
         );
-        let settled = lifecycle.snapshot();
-        assert_eq!(settled.active_attempts, 0);
-        assert_eq!(settled.active_reservations, 0);
-        assert_eq!(settled.active_reserved_bytes, 0);
-        assert_eq!(settled.active_materializations, 0);
-        assert_eq!(settled.active_materialized_bytes, 0);
-        assert_eq!(settled.releases, 1);
-        assert_eq!(settled.released_bytes, 4096);
-        assert_eq!(settled.cancelled, 1);
     }
 
     #[test]

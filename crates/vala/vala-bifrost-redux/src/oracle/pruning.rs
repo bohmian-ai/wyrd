@@ -56,37 +56,6 @@ impl FilePruningDecision {
     }
 }
 
-/// Closed persisted-source label for one file-pruning decision.
-///
-/// Both persisted tiers are reported. Oracle decides staged hot Parquet itself
-/// before constructing the leaf; a pinned Iceberg leaf hands its predicate to
-/// Iceberg's own manifest planning, and the leader states the same decision on
-/// the same normalized bounds so the exclusion is observable rather than
-/// silent. Keeping the label an enum is what bounds the
-/// `bifrost_oracle_file_pruning_total` series cardinality.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FilePruningSource {
-    /// Staged hot Parquet not yet published into the pinned snapshot.
-    Hot,
-    /// Data files the pinned Iceberg snapshot publishes.
-    Iceberg,
-}
-
-impl FilePruningSource {
-    /// Complete closed label domain, used by the emitted-inventory contract.
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 2] = [Self::Hot, Self::Iceberg];
-
-    /// Returns the emitted `source` label for this persisted source.
-    #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Hot => "hot",
-            Self::Iceberg => "iceberg",
-        }
-    }
-}
-
 /// The closed inclusive `wyrd_event_time` interval a query's supported
 /// predicates restrict one scan to.
 ///
@@ -203,25 +172,22 @@ impl EventTimeQueryInterval {
         FilePruningDecision::Include
     }
 
-    /// Decides one file, records its bounded outcome, and reports retention.
+    /// Decides one staged hot file, records its bounded outcome, and reports
+    /// retention.
     ///
-    /// Every considered physical file emits exactly one
-    /// `bifrost_oracle_file_pruning_total` observation, so the emitted counts
-    /// reconcile against the cut's file count and an exclusion is visible even
-    /// when the query returns the same rows it would have without pruning. Both
-    /// labels are closed enums, which is what bounds the series.
+    /// Every hot file the leader actually decides emits exactly one
+    /// `bifrost_oracle_file_pruning_total` observation, so an exclusion is
+    /// visible even when the query returns the same rows it would have without
+    /// pruning. Published Iceberg files are pruned inside Iceberg's own
+    /// manifest planning, which Oracle does not repeat merely to count it. The
+    /// outcome label is a closed enum, which is what bounds the series.
     ///
     /// Returns `true` when the file must still be assigned, opened, and read.
     #[must_use]
-    pub(crate) fn retains(
-        self,
-        source: FilePruningSource,
-        statistics: EventTimeStatistics,
-    ) -> bool {
+    pub(crate) fn retains(self, statistics: EventTimeStatistics) -> bool {
         let decision = self.decide(statistics);
         metrics::counter!(
             "bifrost_oracle_file_pruning_total",
-            "source" => source.as_str(),
             "outcome" => decision.outcome_label(),
         )
         .increment(1);
@@ -322,9 +288,5 @@ mod tests {
         }
         assert_eq!(FilePruningDecision::Include.outcome_label(), "included");
         assert_eq!(FilePruningDecision::Exclude.outcome_label(), "excluded");
-        assert_eq!(
-            FilePruningSource::ALL.map(FilePruningSource::as_str),
-            ["hot", "iceberg"]
-        );
     }
 }

@@ -25,6 +25,11 @@ struct RawProviderMetadata {
     token_endpoint: Option<String>,
     jwks_uri: String,
     id_token_signing_alg_values_supported: Vec<String>,
+    /// RFC 9207 `authorization_response_iss_parameter_supported` exactly as
+    /// the document states it. A document that omits the member decodes as
+    /// `false` (`serde(default)`), the RFC's meaning of absence, so only a
+    /// provider that explicitly advertises support makes the human-login
+    /// callback require `iss`. A non-boolean value fails decoding.
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
 }
@@ -50,6 +55,17 @@ pub struct ProviderMetadata {
     pub authorization_response_iss_parameter_supported: bool,
 }
 
+/// Convert the decoded discovery document into [`ProviderMetadata`].
+///
+/// [`OidcProvider::discover`] calls this after the issuer anti-spoofing check:
+/// the three endpoint strings are parsed as absolute URLs and every other
+/// member, including the RFC 9207 support flag, is carried over unchanged.
+/// `issuer_str` only labels a failure; it is not compared here.
+///
+/// # Errors
+/// Returns [`OidcError::Discovery`] naming the field when
+/// `authorization_endpoint`, a present `token_endpoint`, or `jwks_uri` is not
+/// a valid URL.
 fn parse_raw_metadata(
     raw: RawProviderMetadata,
     issuer_str: &str,

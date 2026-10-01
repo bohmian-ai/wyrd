@@ -1295,7 +1295,12 @@ impl ScribeResources {
             oracle_limit_bytes: plan.managed_memory_bytes,
             categories: state.scribe_category_bytes,
             cgroup_current_bytes: self.governor.cgroup_pressure().map(|(current, _)| current),
-            cgroup_limit_bytes: self.governor.inner.cgroup_limit_bytes,
+            cgroup_limit_bytes: self
+                .governor
+                .inner
+                .memory_cgroup
+                .as_ref()
+                .map(|cgroup| cgroup.limit_bytes),
             ingress_occupancy_bytes: state.held(MemoryHolder::Scribe),
             ingress_limit_bytes: self.ingress_limit_bytes(),
             ingress_high_water_bytes: 0,
@@ -1966,8 +1971,9 @@ struct ResourceGovernorInner {
     memory_changed: Notify,
     /// Lost-wakeup-safe notification paired with `ResourceState::oracle_capacity_epoch`.
     oracle_capacity_changed: Notify,
-    /// Cgroup hard limit used by the live external-pressure tripwire.
-    cgroup_limit_bytes: Option<usize>,
+    /// Cgroup that bounds this process's memory, read by the live
+    /// external-pressure tripwire.
+    memory_cgroup: Option<MemoryCgroup>,
     /// Live cgroup usage cached for at most one second under the root owner.
     cgroup_current: Mutex<Option<(Instant, Option<usize>)>>,
     /// Lock-free first-poison signal observed by application supervision.
@@ -2129,7 +2135,7 @@ impl BifrostResourceGovernor {
                 state: Mutex::new(ResourceState::default()),
                 memory_changed: Notify::new(),
                 oracle_capacity_changed: Notify::new(),
-                cgroup_limit_bytes: crate::scribe::memory::read_cgroup_limit(),
+                memory_cgroup: MemoryCgroup::detect(),
                 cgroup_current: Mutex::new(None),
                 health: BifrostResourceHealth::default(),
             }),
@@ -2181,13 +2187,17 @@ impl BifrostResourceGovernor {
         {
             value
         } else {
-            let value = crate::scribe::memory::read_cgroup_current();
+            let value = self
+                .inner
+                .memory_cgroup
+                .as_ref()
+                .and_then(MemoryCgroup::current_bytes);
             if let Ok(mut cache) = self.inner.cgroup_current.lock() {
                 *cache = Some((Instant::now(), value));
             }
             value
         }?;
-        Some((current, self.inner.cgroup_limit_bytes?))
+        Some((current, self.inner.memory_cgroup.as_ref()?.limit_bytes))
     }
 
     /// Captures exact live shared-cap ownership and its attribution.
@@ -4316,13 +4326,8 @@ fn detect_snapshot(
             ResourceSource::Override,
         ),
     };
-    let cgroup_memory = read_positive_usize("/sys/fs/cgroup/memory.max")
-        .map(|value| (value, ResourceSource::CgroupV2))
-        .or_else(|| {
-            read_positive_usize("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-                .map(|value| (value, ResourceSource::CgroupV1))
-        });
-    let (memory_limit_bytes, memory_source) = cgroup_memory
+    let (memory_limit_bytes, memory_source) = MemoryCgroup::detect()
+        .map(|cgroup| (cgroup.limit_bytes, cgroup.source))
         .filter(|(value, _)| *value < host_memory)
         .unwrap_or((host_memory, host_source));
     let available = std::thread::available_parallelism()
@@ -4384,7 +4389,88 @@ fn host_memory_limit() -> Result<(usize, ResourceSource), BifrostResourceError> 
     })
 }
 
-fn read_positive_usize(path: &str) -> Option<usize> {
+/// Mount point of the cgroup v2 unified hierarchy.
+const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
+
+/// Returns this process's cgroup v2 directory, then each ancestor up to `root`.
+///
+/// `self_cgroup` is `/proc/self/cgroup`, whose `0::<path>` line names the
+/// process's own group. Inside a cgroup namespace, such as a Kubernetes
+/// container, that path is `/` and the result is `root` alone. On a host, a
+/// systemd unit's `MemoryMax=` or `CPUQuota=` sits on the unit's own group or
+/// a parent slice, which only this walk reaches. Without a v2 line the result
+/// is `root` alone.
+fn cgroup_v2_dirs(root: &Path, self_cgroup: &str) -> Vec<PathBuf> {
+    let own = self_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map_or_else(
+            || root.to_path_buf(),
+            |path| root.join(path.trim().trim_start_matches('/')),
+        );
+    own.ancestors()
+        .take_while(|dir| dir.starts_with(root))
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+/// Returns the cgroup v2 directories that can bound this process, nearest first.
+fn own_cgroup_v2_dirs() -> Vec<PathBuf> {
+    cgroup_v2_dirs(
+        Path::new(CGROUP_V2_ROOT),
+        &fs::read_to_string("/proc/self/cgroup").unwrap_or_default(),
+    )
+}
+
+/// The cgroup that bounds this process's memory.
+///
+/// Boot sizes the managed memory plan from its limit, and the external-pressure
+/// tripwire compares the usage of the same group against that limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryCgroup {
+    /// Tightest hard limit over this process's group and its ancestors.
+    limit_bytes: usize,
+    /// File reporting the usage of the group that sets `limit_bytes`.
+    usage: PathBuf,
+    /// Controller version the limit came from.
+    source: ResourceSource,
+}
+
+impl MemoryCgroup {
+    /// Finds this process's memory bound, or `None` when no group sets one.
+    fn detect() -> Option<Self> {
+        Self::from_v2_dirs(&own_cgroup_v2_dirs()).or_else(|| {
+            Some(Self {
+                limit_bytes: read_positive_usize("/sys/fs/cgroup/memory/memory.limit_in_bytes")?,
+                usage: PathBuf::from("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+                source: ResourceSource::CgroupV1,
+            })
+        })
+    }
+
+    /// Picks the group in `dirs` with the smallest `memory.max`.
+    ///
+    /// A limit on any ancestor bounds every descendant, so the smallest one is
+    /// the limit this process actually runs under.
+    fn from_v2_dirs(dirs: &[PathBuf]) -> Option<Self> {
+        dirs.iter()
+            .filter_map(|dir| Some((read_positive_usize(dir.join("memory.max"))?, dir)))
+            .min_by_key(|(limit, _)| *limit)
+            .map(|(limit_bytes, dir)| Self {
+                limit_bytes,
+                usage: dir.join("memory.current"),
+                source: ResourceSource::CgroupV2,
+            })
+    }
+
+    /// Reads the bounding group's current usage, or `None` when it is unreadable.
+    fn current_bytes(&self) -> Option<usize> {
+        read_positive_usize(&self.usage)
+    }
+}
+
+/// Reads one positive integer control file, treating `max` and `0` as no bound.
+fn read_positive_usize(path: impl AsRef<Path>) -> Option<usize> {
     let value = fs::read_to_string(path).ok()?;
     let value = value.trim();
     if value == "max" {
@@ -4393,10 +4479,17 @@ fn read_positive_usize(path: &str) -> Option<usize> {
     value.parse::<usize>().ok().filter(|value| *value > 0)
 }
 
+/// Returns the CPU count this process may use under its cgroups, if any bound it.
+///
+/// The quota is the tightest `cpu.max` over this process's group and its
+/// ancestors; the cpuset is the nearest group's effective set, which already
+/// reflects every ancestor. Cgroup v1 is read at its mount root.
 fn detect_cgroup_cpu() -> Option<usize> {
-    let quota = fs::read_to_string("/sys/fs/cgroup/cpu.max")
-        .ok()
-        .and_then(|value| {
+    let dirs = own_cgroup_v2_dirs();
+    let quota = dirs
+        .iter()
+        .filter_map(|dir| {
+            let value = fs::read_to_string(dir.join("cpu.max")).ok()?;
             let mut fields = value.split_whitespace();
             let quota = fields.next()?;
             let period = fields.next()?.parse::<usize>().ok()?;
@@ -4406,13 +4499,15 @@ fn detect_cgroup_cpu() -> Option<usize> {
             let quota = quota.parse::<usize>().ok()?;
             Some((quota / period).max(1))
         })
+        .min()
         .or_else(|| {
             let quota = read_positive_usize("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")?;
             let period = read_positive_usize("/sys/fs/cgroup/cpu/cpu.cfs_period_us")?;
             Some((quota / period).max(1))
         });
-    let cpuset = fs::read_to_string("/sys/fs/cgroup/cpuset.cpus.effective")
-        .ok()
+    let cpuset = dirs
+        .iter()
+        .find_map(|dir| fs::read_to_string(dir.join("cpuset.cpus.effective")).ok())
         .or_else(|| fs::read_to_string("/sys/fs/cgroup/cpuset/cpuset.cpus").ok())
         .and_then(|value| parse_cpuset(value.trim()));
     match (quota, cpuset) {
@@ -5476,6 +5571,48 @@ mod tests {
         assert_eq!(runtime.sources().scratch, ResourceSource::Filesystem);
         assert_eq!(parse_cpuset("0-2,5"), Some(4));
         assert_eq!(parse_cpuset("4-2"), None);
+    }
+
+    /// A host process under a systemd unit is bounded by its own group's ancestors.
+    ///
+    /// The unit's scope leaves `memory.max` at `max` while its slice sets the
+    /// limit, and the cgroup root has no `memory.max` at all: detection must
+    /// walk from `/proc/self/cgroup` and take the slice's limit, reading usage
+    /// from that same slice. A namespaced container (`0::/`) is the root alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture hierarchy cannot be written.
+    #[test]
+    fn memory_cgroup_is_the_tightest_limit_above_the_process() {
+        let root = tempfile::tempdir().expect("cgroup fixture root");
+        let dirs = cgroup_v2_dirs(root.path(), "0::/bench.slice/run-1.scope\n");
+        assert_eq!(
+            dirs,
+            vec![
+                root.path().join("bench.slice/run-1.scope"),
+                root.path().join("bench.slice"),
+                root.path().to_path_buf(),
+            ]
+        );
+        assert_eq!(
+            cgroup_v2_dirs(root.path(), "0::/\n"),
+            vec![root.path().to_path_buf()]
+        );
+        assert_eq!(
+            cgroup_v2_dirs(root.path(), ""),
+            vec![root.path().to_path_buf()]
+        );
+
+        std::fs::create_dir_all(&dirs[0]).expect("scope directory");
+        std::fs::write(dirs[0].join("memory.max"), "max\n").expect("scope limit");
+        std::fs::write(dirs[1].join("memory.max"), "8589934592\n").expect("slice limit");
+        std::fs::write(dirs[1].join("memory.current"), "1048576\n").expect("slice usage");
+        let cgroup = MemoryCgroup::from_v2_dirs(&dirs).expect("the slice bounds the process");
+        assert_eq!(cgroup.limit_bytes, 8 * 1024 * MIB);
+        assert_eq!(cgroup.usage, dirs[1].join("memory.current"));
+        assert_eq!(cgroup.current_bytes(), Some(MIB));
+        assert_eq!(MemoryCgroup::from_v2_dirs(&dirs[..1]), None);
     }
 
     /// Absolute overrides can tighten but never inflate detected resources.

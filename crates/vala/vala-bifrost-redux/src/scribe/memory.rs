@@ -12,7 +12,6 @@ use crate::contracts::ScribeError;
 
 #[cfg(test)]
 thread_local! {
-    static CGROUP_CURRENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// One-shot terminal identity return failure used by replay settlement tests.
     static FAIL_REPLAY_IDENTITY_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -818,41 +817,6 @@ impl ScribeOwnership {
             .expect("active memory ledger lock invariant for inspection")
             .is_poisoned()
     }
-}
-
-pub(crate) fn read_cgroup_limit() -> Option<usize> {
-    [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .into_iter()
-    .find_map(read_memory_limit)
-}
-
-pub(crate) fn read_cgroup_current() -> Option<usize> {
-    #[cfg(test)]
-    CGROUP_CURRENT_READS.with(|count| count.set(count.get() + 1));
-    [
-        "/sys/fs/cgroup/memory.current",
-        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-    ]
-    .into_iter()
-    .find_map(|path| {
-        std::fs::read_to_string(path)
-            .ok()?
-            .trim()
-            .parse::<usize>()
-            .ok()
-    })
-}
-
-fn read_memory_limit(path: &str) -> Option<usize> {
-    let value = std::fs::read_to_string(path).ok()?;
-    let value = value.trim();
-    if value == "max" {
-        return None;
-    }
-    value.parse::<usize>().ok().filter(|value| *value > 0)
 }
 
 #[cfg(test)]

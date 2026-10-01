@@ -30,16 +30,20 @@ Keep the R1 closures for FIND-TASK-005-1, -2, and -3: owner-locked backlog gauge
 
 ## R2 implementation evidence
 
-Commits: `5b17af21f` (FIND-5), `be31c6f99` (FIND-6).
+User override (2026-10-01): FIND-TASK-005-4 is rejected; FIND-TASK-005-6 is
+rejected and the dashboard proposal stays in the candidate. Only
+FIND-TASK-005-5 is valid.
+
+Commits: `5b17af21f` (FIND-5). `be31c6f99` reverted the dashboard draft and was
+itself reverted per the override.
 
 | Finding | Implementation evidence | Verification evidence | Result |
 | --- | --- | --- | --- |
-| FIND-TASK-005-4 | None; the standard benchmark has not been rerun | Host not quiet at attempt (load average 12.5/26.9/22.0, other-worktree builds); run stopped by user before measurement | OPEN |
+| FIND-TASK-005-4 | Rejected by user; no benchmark rerun | N/A | REJECTED |
 | FIND-TASK-005-5 | Module-top `Span`/`Pin` (`oracle/query_stream.rs`), `BoxFuture`/`Any`/`Span` (`oracle/telemetry.rs`), `Span` (`scribe/persistence.rs`), `StorageInspection` (`wyrd-testing/src/server.rs`, `bifrost/cluster.rs`); bare names at each cited declaration | `mise run fmt`, `mise run lints` exit 0; `git diff --check` clean | PASS |
-| FIND-TASK-005-6 | `be31c6f99` reverts `1f1cbcf5f`; draft preserved on local branch `backlog/bifrost-operations-dashboard` | `git diff --name-only 05d7d7413 HEAD` contains no `bifrost-operations-dashboard` path; TASK-005 evidence table unchanged | PASS |
+| FIND-TASK-005-6 | Rejected by user; `changes/backlog/bifrost-operations-dashboard/spec.md` remains in the candidate | N/A | REJECTED |
 
-Limits: FIND-4 needs `mise run bench:bifrost:query-capacity` on a quiet
-8-CPU/16-GiB-equivalent host. No source change in R2 touches runtime behavior
-(imports only), so the Bifrost journey result from R1 stands for unchanged
-behavior. The SQL boxing fix (`49f3b601d`) remains; the release build and
-`test:sql` evidence is recorded in R1.
+Limits: R2 source changes are imports only, so the R1 Bifrost journey result
+stands for unchanged behavior. The SQL boxing fix (`49f3b601d`) remains, with
+its release build and `test:sql` evidence recorded in R1. `mise run gate`
+deferred by user.

@@ -22,7 +22,7 @@ def test_on_behalf_of_rejects_an_unknown_audience():
 
     client = WyrdClient(server_url="http://127.0.0.1:9", credential="wyrd_test_actor")
     with pytest.raises(WyrdError) as captured:
-        client.on_behalf_of("subject-token", audience="storage")
+        client.on_behalf_of("subject-token", audience="storage")  # ty: ignore[invalid-argument-type]
     assert captured.value.code == "WYRD_SPEC_400_VALIDATION"
 
 

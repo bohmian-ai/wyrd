@@ -182,8 +182,9 @@ export class ServerSessions {
 
   /**
    * Resolve this tenant's session through the server. Returns `null` (and
-   * clears the cookie) when there is none or the server no longer honours it;
-   * refuses a session the server binds to a different tenant.
+   * clears the cookie) when there is none, the server no longer honours it, or
+   * the server binds it to a different tenant: the cookie name is only a hint,
+   * so a session of another tenant is no session here.
    */
   async read(tenantKey: string, cookies: Cookies): Promise<ServerSession | null> {
     const name = this.cookieName(tenantKey);
@@ -198,7 +199,7 @@ export class ServerSessions {
     const read = (await response.json()) as Read;
     if (read.tenant_key !== tenantKey) {
       cookies.delete(name, { path: '/' });
-      reject('denied');
+      return null;
     }
     return {
       tenantKey: read.tenant_key,

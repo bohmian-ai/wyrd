@@ -120,7 +120,7 @@ test('production session rejects cross-tenant and missing CSRF', async () => {
   const cookies = jar({ wyrd_session_acme: sessionId });
 
   // The cookie name is only a hint: the server-returned tenant must equal the path tenant.
-  await expect(sessions.read('acme', cookies)).rejects.toMatchObject({ status: 403 });
+  expect(await sessions.read('acme', cookies)).toBeNull();
   expect(cookies.values.has('wyrd_session_acme')).toBe(false);
   expect(calls[0].url).toBe('http://127.0.0.1:8080/internal/bff/v1/sessions/read');
   expect(new Headers(calls[0].init.headers).get('x-wyrd-bff-key')).toBe('bff-key');

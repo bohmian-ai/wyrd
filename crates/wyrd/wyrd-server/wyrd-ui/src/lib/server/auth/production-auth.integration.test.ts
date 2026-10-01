@@ -236,7 +236,9 @@ test('production SSO crosses replicas', async () => {
   expect(forged.cookies.has(sessionCookie(sso))).toBe(false);
   const crossed = new Browser();
   crossed.cookies.set(sessionCookie(journey.apiKeyTenant), sessionId);
-  expect((await crossed.go(0, `/t/${journey.apiKeyTenant}/settings`)).status).toBe(403);
+  expect((await crossed.go(0, `/t/${journey.apiKeyTenant}/settings`)).headers.get('location')).toBe(
+    `/t/${journey.apiKeyTenant}/login`
+  );
   expect(crossed.cookies.has(sessionCookie(journey.apiKeyTenant))).toBe(false);
   expect(
     (await alice.go(0, `/t/${journey.apiKeyTenant}/settings?/deactivate`, { form: {} })).status

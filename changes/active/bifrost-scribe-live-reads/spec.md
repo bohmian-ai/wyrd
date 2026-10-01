@@ -168,7 +168,7 @@ throughput result. These are engineering targets for this machine, not
 universal OLAP standards.
 
 On the 4-CPU/8-GiB node, selective reads must reach client p50 <7 ms, p95
-<5 ms, and p99 <10 ms while sustaining more than 1,000 successful reads per
+<10 ms, and p99 <10 ms while sustaining more than 1,000 successful reads per
 second at the same stated concurrency. Small filtered aggregates must sustain
 at least 100 successful queries per second with p95 <100 ms. Medium queries must
 sustain at least 20 per second with p95 <300 ms at the same concurrency; the
@@ -727,10 +727,10 @@ on 2026-09-28.
   footer tenant check (REQ-015). The idle-publication gap is closed by one
   lifecycle tick (REQ-016). Approved by the user on 2026-09-30 ("I agree with
   all recommendations"; "approved. roll it in to all other recommendations").
-- Revision 21 (2026-09-30): Raises the selective-read p50 target from <2 ms
-  to <7 ms. Every query pays Postgres round trips for its reader cut, which
+- Revision 21 (2026-09-30): Raises the selective-read targets from p50 <2 ms
+  to <7 ms and p95 <5 ms to <10 ms. Every query pays Postgres round trips for its reader cut, which
   2 ms cannot absorb on this node. Approved by the user on 2026-09-30 ("raise
-  the bar to 5 ms"; then "bump p50 up to 7ms").
+  the bar to 5 ms"; then "bump p50 up to 7ms"; "p95 should be 10 ms").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

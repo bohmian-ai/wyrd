@@ -341,7 +341,7 @@ impl Case {
         match self {
             Self::Selective => Target {
                 p50_ms: Some(7.0),
-                p95_ms: Some(5.0),
+                p95_ms: Some(10.0),
                 p99_ms: Some(10.0),
                 min_qps: Some(1_000.0),
                 ..Target::default()

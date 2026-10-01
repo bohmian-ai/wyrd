@@ -37,6 +37,12 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 /// Concurrency points of the selective and small-aggregate sweeps.
 const SWEEP: [usize; 6] = [1, 4, 8, 16, 32, 64];
 
+/// Read clients beside the writer in the reads-while-writing steps.
+///
+/// Reads and writes share the node's 4 CPUs, so the step runs few enough
+/// readers to leave the writer room; at 8 the reads alone saturate the node.
+const LOADED_CLIENTS: usize = 2;
+
 /// The journey: start the server, write, check answers, measure, stop.
 ///
 /// Returns whether every row passed.
@@ -104,8 +110,8 @@ async fn benchmark(heavy: bool) -> Result<bool> {
     report.query(Case::FullScan, &bench.run(Case::FullScan, 1).await?);
 
     if !heavy {
-        for (case, clients) in [(Case::SmallAggregate, 8), (Case::MillionAggregate, 8)] {
-            let (alone, loaded, written) = bench.reads_while_writing(case, clients).await?;
+        for case in [Case::SmallAggregate, Case::MillionAggregate] {
+            let (alone, loaded, written) = bench.reads_while_writing(case, LOADED_CLIENTS).await?;
             report.loaded(case, &alone, &loaded);
             report.write(&format!("write during {}", case.name()), &written, 0, 0);
         }

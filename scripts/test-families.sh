@@ -57,6 +57,7 @@ FAMILY_SHARED=(
   wyrd-telemetry
   wyrd-test-contract-macros
   wyrd-tls
+  wyrd-vault
   wyrd-bench
   wyrd-utils
   wyrd-version

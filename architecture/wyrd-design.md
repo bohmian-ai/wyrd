@@ -1333,9 +1333,11 @@ active tenant's active 32-byte key is unavailable; environment keys are
 development-only, and owner-only key files may serve an explicitly
 single-tenant deployment. Without a readable key only connection
 create/update refuses; other surfaces keep working and delivery retries with
-`credential_store_unavailable`. A shared `SecretRef` resolver and AWS Secrets
-Manager or Google Secret Manager key sources are deferred. Rewrap onto a new active version runs beside
-delivery in bounded, cancellable tenant-scoped passes. Responses, errors,
+`credential_store_unavailable`. Vault reads use the shared screened and
+pinned `wyrd-vault` KV v2 reader that Gateway also uses for provider
+credentials; only the Operator owner interprets and validates the KEK, and no
+general secret resolver backs Operator keys. Rewrap onto a new active version
+runs beside delivery in bounded, cancellable tenant-scoped passes. Responses, errors,
 logs, and audit carry only redacted metadata, never key locations. Registration
 and every delivery attempt require an active connection whose provider — and,
 for HTTP, auth scheme, header name, and origin of every effective URL —

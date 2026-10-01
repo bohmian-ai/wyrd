@@ -61,6 +61,9 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 
 Run the narrowest complete capability lane covering what you changed. `mise run
 gate` is the nightly, release, and conservative fallback aggregate.
+When using `gate` for final verification, do not also run its component lanes
+as a checklist. Use focused tests while iterating; add a separate final lane
+only if `mise.toml` shows that required proof is outside `gate`.
 
 ### Bifrost
 
@@ -104,8 +107,10 @@ release packages; releases build every package.
 
 ### Checks and codegen
 
+For scoped verification (`gate` already includes its checks):
+
 ```bash
-mise run fmt lints                       # always
+mise run fmt lints                       # relevant Rust format and lint checks
 mise run codegen:check                   # contracts, schemas, stubs
 mise run check:client-tier | check:pyo3-scope | check:unwrap-audit
 ```

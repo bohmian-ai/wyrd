@@ -1099,12 +1099,77 @@ retries next sweep (`held_chain_head_fails_immediately_and_retries_unchanged`).
 - **Fix (owner approved one round trip, a rollback test and a doc update):**
   - `TenantConn` now sends `SELECT set_config('app.current_tenant', '<uuid>', true); BEGIN`. Postgres runs both as one implicit transaction that `BEGIN` makes explicit. If the bind fails, `BEGIN` never runs and Postgres rolls back by itself.
   - A Postgres rejection maps to `TxFailed`; pool and IO failures map to `Connect`.
-  - `check_tenant_isolation.py` names `tenant_conn.rs` as the single owner allowed raw transaction control.
+  - `check_tenant_isolation.py` is unchanged and passes: the new statement does not match its raw transaction-control pattern. An owner exemption added earlier was dead and is deleted.
   - `architecture/v1/00-foundations/sql-foundation.md` documents the statement and why its order matters.
 
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
 | Tenant begin and bind in one round trip | `tenant_conn.rs` `begin_tenant_sql`, `begin_bound` | `tenant_conn::tests::begin_tenant_sql_binds_then_begins` | PASS |
-| Failed bind leaves no hanging transaction | statement order | `tenant_conn::tests::failed_bind_rolls_back_and_the_connection_stays_usable` (PG); fails with 25P02 when the order is reversed | PASS |
+| Failed bind leaves no hanging transaction | statement order | `tenant_conn::pg_tests::failed_bind_rolls_back_and_the_connection_stays_usable` (PG lane only); fails with 25P02 when the order is reversed | PASS |
 | Binding is transaction-local | same test: visible inside, empty after commit | same | PASS |
-| Gate and docs | check script owner exemption; sql-foundation.md | `mise run check:tenant-isolation`, `mise run lints`, `mise run py:lints`, `mise run test:sql` (173/6/114/2 passed) | PASS |
+| Gate and docs | unmodified check; sql-foundation.md | `mise run check:tenant-isolation`, `mise run lints`, `mise run py:lints`, `mise run test:sql` (173/6/114/2 passed) | PASS |
+import sys
+p=sys.argv[1]; s=open(p).read()
+reps=[
+("  - `check_tenant_isolation.py` names `tenant_conn.rs` as the single owner allowed raw transaction control.\n",
+ "  - `check_tenant_isolation.py` is unchanged and passes: the new statement does not match its raw transaction-control pattern. An owner exemption added earlier was dead and is deleted.\n"),
+("| `tenant_conn::tests::failed_bind_rolls_back_and_the_connection_stays_usable` (PG); fails with 25P02",
+ "| `tenant_conn::pg_tests::failed_bind_rolls_back_and_the_connection_stays_usable` (PG lane only); fails with 25P02"),
+("| Gate and docs | check script owner exemption; sql-foundation.md |",
+ "| Gate and docs | unmodified check; sql-foundation.md |"),
+]
+for a,b in reps:
+    assert s.count(a)==1,a; s=s.replace(a,b)
+s=s.rstrip("\n")+"\n"+open("/dev/stdin").read()
+open(p,'w').write(s)
+
+## Replay ledger
+
+Source: TASK-006 commit `0e9c6e98c`. Destination: replay commit `4ae6a1992`
+plus the later TASK-004 commits on this branch. Every path in
+`git show --stat 4ae6a1992 -- crates sdks scripts mise.toml` falls in exactly
+one row. Spec IDs are from `changes/active/verified-change-contract/spec.md`.
+
+Status words: **replayed** (source behavior carried onto current Bifrost seams),
+**superseded** (source removed it and current Bifrost has the one owner),
+**carried closure** (not Eval or boot itself, but required by a replayed symbol).
+
+| Source behavior | Destination paths | Status | Owning seam / REQ |
+|---|---|---|---|
+| Eval verification runtime: run owner, Eval engine dispatch, observation enqueue | `wyrd-server/src/verification/{eval,engines,mod,observations,runner}.rs`, `wyrd-server/src/query/{scheduled,service}.rs`, `wyrd-server/src/bifrost/service.rs` | replayed | `VerifierRunner` / `ObservationEnqueue`; REQ-077, REQ-083, REQ-084, REQ-115, REQ-130 |
+| Eval scoring, judge, sampling, media and trace tasks | `vala/vala-eval/src/**`, `vala/vala-eval/tests/orchestrator_judge_skald.rs` | replayed | Vala evaluation engine; REQ-130, REQ-131 |
+| Eval observation table and post-ACK hook | `vala-bifrost-redux/src/tables/eval/{mod,observations}.rs`, `gate/mod.rs`, `scribe/{ingress,preprocess,shards,mod,execution_lanes}.rs` | replayed onto the current Scribe ACK | Gate `ObservationAck`; REQ-077, REQ-087 |
+| Verifier run queue for observations | `wyrd-sql/src/queries/verifier_runs.rs`, `wyrd-sql/migrations/20260601000032_verifier_run_observation_ordinal.sql`, `wyrd-sql/tests/pg_verifier_runs.rs`, `wyrd-server/tests/pg_verification_runtime.rs` | replayed | `VerifierRunQueue`; REQ-079, REQ-083 |
+| One boot graph, config, readiness | `wyrd-server/src/{boot/mod,app/server,config,main,lib,state,postgres,test_support}.rs`, `components/health/mod.rs`, `components/{mod,admin/routes,principals/routes}.rs`, `http/{error,router}.rs`, `wyrd-client/tests/startup_image_journey.rs` | replayed; source startup branches superseded | `compose_bifrost` / `ReadinessSnapshot`; REQ-159, REQ-165 |
+| DSN-only Postgres startup; embedded Postgres and migrator removed | `wyrd-sql/src/{dsn,error,lib,operator_pool,pool,postgres,schema_check}.rs`, deleted `wyrd-sql/src/postgres_boot.rs` and `postgres_boot/role_bootstrap.rs`, `wyrd-sql/{Cargo.toml,bootstrap/roles.sql,migrations/20260601000000_platform.sql}`, `wyrd-sql/tests/{pg_migration,pg_admin_principals}.rs`, `vala-sql/src/{lib,postgres}.rs`, `vala-sql/migrations/{20260601000000_vala_init,20260619000000_iceberg_catalog,20260910000025_oracle_reader_authority}.sql`, `vala-sql/tests/{pg_migration,pg_oracle_membership}.rs`, `wyrd-dev-fixtures/src/pg.rs`, `scripts/postgres/*`, `scripts/checks/from-pools-allowlist.sh`, `scripts/test-families.sh` | replayed; embedded Postgres superseded | `ResolvedDsns`; REQ-158, REQ-165 |
+| Peer plane: mTLS identity and typed, receiver-checked context; ticket keyring removed | `wyrd-server/src/oracle/{peer_authority,peer_service,forwarding,lifecycle_service,lifecycle_transport,tail_discovery,mod}.rs`, deleted `oracle/{peer_credentials,peer_keyring}.rs`, `grpc/{mod,scribe_tail}.rs`, deleted `grpc/peer_auth.rs`, `vala-bifrost-redux/src/oracle/{peer,dispatcher,analytical,analytical_transport,follower,mod,telemetry}.rs`, `scribe/tail_rpc.rs`, `cluster/mod.rs`, `contracts.rs`, `wyrd-tonic/{proto/wyrd.v1.proto,src/private_conversion.rs}`, `wyrd-spec/src/vala/api.rs`, `wyrd-tls/src/lib.rs` | replayed; signed tickets superseded | `OraclePeerGrpc` / `ScribeFragmentExecutor`; REQ-160, REQ-161, REQ-162, REQ-164 |
+| One shared durable object store in peer mode | `wyrd-storage/src/{error,factory/mod,handle,service,settings}.rs`, `wyrd-storage/tests/{handle_crud,pg_sweeper}.rs`, `vala-bifrost-redux/src/catalog/iceberg_sql.rs`, `vala-bifrost-redux/src/forge/{mod,planning_scheduler,worker}.rs`, `vala-bifrost-redux/tests/integration/forge/support.rs`, `vala-bifrost-redux/Cargo.toml` | replayed | `wyrd-storage` factory; REQ-163 |
+| Authz check route and `PolicyHook` removed | deleted `shared/wyrd-auth-check/**`, `components/authz/{check,mod,routes}.rs`, `components/auth/{policy_hook,audit_writer}.rs`, `components/auth/{mod,routes,state}.rs`, `wyrd-spec/src/error.rs` (`WYRD_AUTHZ_403_POLICY_DENIED`, `…REQUIRES_DELEGATED_TOKEN`), deleted `wyrd-server/tests/{auth_e2e,authz_check_e2e,pg_authz_check_route}.rs`, `wyrd-auth/{Cargo.toml,src/exchange_api_key.rs,src/issuance.rs}`, `sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts` | carried closure | REQ-166 |
+| Audit publisher drained by the one boot graph | `wyrd-server/src/audit/publication.rs`, `wyrd-testing/tests/bifrost/server/audit_publication.rs` | carried closure | `AuditPublisher`; boot shutdown order |
+| Client transport config without public certificate inputs; SDK URL getters | `wyrd-client/{Cargo.toml,schemas/*,tests/schemas/*}`, `wyrd-client/src/{bifrost/facade,cards/config,cards/hydrate/bundle,client,config,error,transport/config,transport/grpc,transport/http}.rs`, `wyrd-client/tests/{pg_auth_e2e_against_fixture,pg_bifrost_e2e,transport/config_enum,transport/grpc,transport/http}.rs`, `wyrd-cli/src/client.rs`, `wyrd-cli/tests/card_lifecycle.rs`, `sdks/wyrd-sdk-python/{src/client.rs,examples/transport_*.py,tests/examples/test_examples_smoke.py,tests/unit/client/test_client.py}`, `sdks/wyrd-sdk-ts/{native/src/client.rs,wyrd/index.d.cts,wyrd/index.d.ts,wyrd/src/index.ts,wyrd/tests/unit/wyrd-client.test.ts}` | replayed | `wyrd_client` config; REQ-165 |
+| Server route tests on the new boot | `wyrd-server/tests/{identity_e2e,pg_card_registration_route,pg_grpc_ingest_smoke,pg_merge_http_protected,pg_router_smoke,storage_e2e}.rs`, `wyrd-server/Cargo.toml` | replayed | boot graph; REQ-159 |
+| Test harness and journeys | `wyrd-testing/{Cargo.toml,src/lib.rs,src/principal.rs,src/server.rs,src/verification.rs}`, `wyrd-testing/src/bifrost/{cluster,forge_harness,mod,peer_ca,process_cluster,process_cluster/child}.rs`, deleted `wyrd-testing/src/bifrost/{deployment_contract,peer_keyring}.rs`, `wyrd-testing/tests/bifrost/oracle/{analytical_inactive,distributed}.rs`, `wyrd-testing/tests/bifrost/oracle/peer_network/{join,listener,mod,security,support,transport}.rs`, `wyrd-testing/tests/bifrost/server/{eval_verification,main,query}.rs` | replayed | journey lanes; REQ-101, REQ-161 |
+| UI upstream without a public base URL | `wyrd-server/wyrd-ui/src/lib/server/{upstream.ts,upstream.test.ts,routing/tenant.test.ts}`, `wyrd-ui/src/routes/+page.server.ts` | replayed | UI host; REQ-165 |
+| Build and lanes | `shared/workspace-hack/Cargo.toml`, `mise.toml` (`test:server:peer`, startup lanes), `scripts/server/{test-startup,test-kind-autoscale}.sh`, `scripts/check_tenant_isolation.py` | replayed; the tenant-isolation exemption added later was deleted (FIND-004-11) | verification lanes |
+
+## Review remediation evidence (task-004-review)
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1 operator journey DSN | `platform_admin_e2e.rs::operator_command` swaps both DSNs | both `platform_admin_e2e` tests | PASS |
+| 2 Scribe-only WAL fault is unready | `components/health/mod.rs` | `components::health::pg_tests::scribe_only_wal_fault_is_unready_with_verification_composed` | PASS |
+| 3 failed replay is role-local | `boot/mod.rs` replay branch; `state.rs` `Scribe::activate` | `owner_inspection::failed_wal_replay_is_role_local` | PASS |
+| 4 undeclared bodies charged per frame | `http/middleware/body_limit.rs` | `undeclared_body_is_charged_while_collected_and_released_on_drop` | PASS |
+| 5 stopped Eval enqueue logged | `verification/observations.rs::UnfinishedEnqueue` | `verification::observations::tests::dropped_enqueue_records_failure` | PASS |
+| 6 peer docs, schema, `MissingPeerIdentity` | design doc, rustdoc, regenerated schema | `mise run codegen:check` | PASS |
+| 7 wrong-tenant peer context | `peer_network/security.rs::a_foreign_tenant_context_reads_no_scribe_rows` | `peer_network::security::peer_context_refusals` (correct fragment executes; foreign tenant refused before execution) | PASS |
+| 8 cancellation during capacity wait | `oracle/analytical.rs` test; D10 selector note | `oracle::analytical::tests::cancellation_during_peer_capacity_wait_stops_retry` | PASS |
+| 9 Forge rewrite pool | `forge/managed/executor.rs` test | `forge::managed::executor::tests::rewrite_pool_charges_root_and_releases_on_cancel` | PASS |
+| 10 replay ledger | this section above | packet review | PASS |
+| 11 dead isolation exemption | `scripts/check_tenant_isolation.py`; D19 row | `mise run check:tenant-isolation` | PASS |
+| 12 tenant_conn PG test | `tenant_conn.rs` `mod pg_tests` | `tenant_conn::pg_tests::failed_bind_rolls_back_and_the_connection_stays_usable` | PASS |
+| 13 memory-wait API deleted | `resources.rs` | `mise run lints` | PASS |
+| 14 Python stub properties | `client.pyi` | `mise run py:typecheck` | PASS |
+| 15 owning structs | `OracleAuditWriter`, `ScribeWalFaultMonitor` | `mise run lints` | PASS |
+| 16 rustdoc | listed items | `mise run lints` | PASS |
+| 17 script task reference | `scripts/server/test-kind-autoscale.sh` | `rg TASK- scripts/server` is empty | PASS |

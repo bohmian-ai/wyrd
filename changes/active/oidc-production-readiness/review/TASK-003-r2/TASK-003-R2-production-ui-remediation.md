@@ -282,3 +282,32 @@ failure without weakening the gate.
 Route this task directly to `$wyrd-implement`. A later `$wyrd-task-review`
 must reassess the complete original base-to-remediated-candidate range against
 TASK-003, both remediation rounds, and the explicit human issuer direction.
+
+## Implementation Evidence
+
+Commits: `0a5ce5631`, `343854a4c`, `a79099831`, `fd82af7df`, `9154ea0dc`,
+`b9da9be55`, `edbc7ad25`, `8fc076dca`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| R2-AC-01 (FIND-4) | Canonical envelope inventory counts every stored, non-revoked envelope regardless of expiry (`a79099831`) | `boot::sealing_boot_pg_tests::keyless_boot_refuses_while_an_expired_browser_session_envelope_remains`; `browser_session_sealing_rotation_journey`. RED by reasoning: the previous inventory filtered on `expires_at > now`, so an expired row was never counted and keyless boot proceeded | PASS |
+| R2-AC-02 (FIND-5) | One BFF replica reaches the server through a trusted TLS origin (`9154ea0dc`) | UI journey `production SSO crosses replicas` | PASS |
+| R2-AC-03 (FIND-6) | Dex is the second provider; the mixed callback keeps every genuine parameter, including `iss`, and replaces only `state` (`edbc7ad25`, `8fc076dca`) | UI journey `production multi-provider tenant switch` | PASS |
+| R2-AC-04 (FIND-10) | A refused proactive renewal keeps the issued token until expiry and commits nothing (`fd82af7df`) | `browser_sessions::pg_tests::proactive_renewal_refusal_preserves_authority_until_expiry`. RED: with the guard disabled, the "early" expect failed; GREEN with the guard. UI journey `production provider replacement settings` polls until the retired session's token expires, then its first use is refused | PASS |
+| R2-AC-05 (FIND-11) | Rustdoc with `# Errors` on the raw discovery flag and parser (`0a5ce5631`) | `provider::tests::discover_projects_authorization_response_issuer_support` | PASS |
+| R2-AC-06 (FIND-12) | Chooser hints are verified sequentially (`343854a4c`) | Vitest `production chooser bounds server verification` | PASS |
+| R2-AC-07 (FIND-13) | An explicit empty upstream value is refused before fetch (`343854a4c`) | Vitest `empty upstream value is refused before fetch` | PASS |
+| HD-TASK-003-R2-1: real test sign-in | Probes removed; `HumanConnections::begin_test` checks discovery and JWKS, then binds one PKCE/state/nonce login to the revision and caller (`wyrd.auth_login_state` tester columns) and returns `authorization_url`; the callback verifies the code and ID token as a normal login, re-resolves the caller's authority, stamps only that revision tested, audits `identity.oidc.candidate.tested`, and issues no session, credential or User (`b9da9be55`) | `components::admin::identity::..::beginning_a_test_binds_one_sign_in_to_the_caller_and_revision`; `auth::callback::..::a_test_sign_in_marks_only_its_candidate_tested_and_issues_nothing`, `an_unauthorized_tester_leaves_the_candidate_untested`, `a_failed_tested_audit_leaves_the_candidate_untested` | PASS |
+| HD-1: Dex tested through a real sign-in, then activated | `identity_ui_e2e.rs` `activate_connection` drives `provider_sign_in` against Keycloak and Dex; the settings `?/test` action redirects to the provider (`edbc7ad25`, `8fc076dca`) | UI journeys `production multi-provider tenant switch` and `production provider replacement settings` | PASS |
+| HD-1: replay, expired and cross-tenant states refused; a wrong callback or secret fails | `identity_e2e.rs` | `tenant_connection_test_sign_in_journey` (cross-tenant, expired, success with nothing issued, replay, unregistered callback); `tenant_connection_rotation_journey` (a wrong secret gives a 401 callback and the candidate stays untested) | PASS |
+| HD-1: no provider-specific branch and no soft-pass status | `wyrd-auth/src/connections.rs` | Review of the diff; the issuer-binding journey now uses a real authorizing mock | PASS |
+| HD-1: schemas and docs | `ConnectionTestResponse` in wyrd-spec; `sso-and-oidc.svx` "Testing a candidate" | `mise run codegen:check`, `mise run docs:check` | PASS |
+
+Non-goals stayed excluded: there are no per-connection callback URLs, no new dependencies and no compatibility routes.
+
+Verification (all run with `CARGO_TARGET_DIR` set to the shared target):
+- UI: `pnpm test` (183 passed) and `pnpm check` (0 errors).
+- Mise lanes: `test:identity:journey`, `test:wyrd`, `test:sql`, `codegen:check`, `check:tenant-isolation`, `docs:check`, `fmt` and `lints`.
+- `git diff --check`.
+
+All exited 0.

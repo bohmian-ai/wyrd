@@ -182,6 +182,7 @@ pub struct WyrdTestServer {
 }
 
 struct WyrdTestServerInner {
+    fixture: Arc<PgFixture>,
     /// Lifetime guard of the generated Operator key directory, when used.
     operator_keys_dir: Option<TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
@@ -232,13 +233,6 @@ struct WyrdTestServerInner {
     /// released in the same struct drop order: an admitted plan runner must not
     /// be abandoned between writing its outputs and Preparing its operation.
     _compaction_runtime: wyrd_server::state::ForgeCompactionRuntime,
-    /// Postgres fixture whose database this server serves from.
-    ///
-    /// Declared after every server-owned field so struct drop order releases
-    /// the database last: dropping the fixture issues `DROP DATABASE ... WITH
-    /// (FORCE)`, which would otherwise terminate the backends of a still-live
-    /// Oracle and Scribe, whose lease loss then aborts the process.
-    fixture: Arc<PgFixture>,
 }
 
 /// Concrete lifecycle evidence returned after one test server stops.

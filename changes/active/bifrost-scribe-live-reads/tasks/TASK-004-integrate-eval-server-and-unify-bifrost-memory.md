@@ -199,7 +199,7 @@ mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=sc
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::ingress::tests::decode_to_memtable_transfers_one_charge)'
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=storage::governed_request_tests::occupied_storage_permit_waits_within_operation_deadline)'
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=storage::governed_request_tests::footer_decode_has_no_fixed_memory_slot)'
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::dispatcher::tests::leader_retries_only_preaccept_peer_capacity)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::analytical::tests::cancellation_during_peer_capacity_wait_stops_retry) | test(=oracle::analytical::tests::participant_cut_is_reserved_once_immediately_before_dispatch)'
 ```
 
 Run the two new real-server cases through the existing PostgreSQL wrapper,
@@ -758,7 +758,7 @@ not complete this task.
 | R13-A: one Scribe held-byte owner, no secondary ceiling | aacd0bd27 | `scribe::admission::tests::one_root_charge_has_no_secondary_memory_ceiling`, `scribe::ingress::tests::decode_to_memtable_transfers_one_charge` | PASS |
 | R13-B: ACKed rows survive stage pressure, retry, publish once, WAL retires, survive restart without duplicates; no future writer/footer/workspace admission | `parquet_writer::append_charged_batch`, `persistence::publish_claim` (one transfer chunk), `member_stager::encode_runs` (D5), `shards::flush_all` (D7) | `write_read::acknowledged_rows_survive_stage_pressure_and_restart`; `member_stager::tests::*`; `shards::tests::flush_all_resubmits_a_retained_generation` | PASS |
 | R13-C: storage permit waits within the operation deadline; no fixed footer slot | 65da92a03 | `storage::governed_request_tests::{occupied_storage_permit_waits_within_operation_deadline, footer_decode_has_no_fixed_memory_slot}` | PASS |
-| R13-D: only the leader retries pre-accept peer capacity; receiver never exceeds its running slots | 65da92a03, D6 | `oracle::dispatcher::tests::leader_retries_only_preaccept_peer_capacity`; `peer_network::analytical::two_leaders_retry_preaccept_capacity` | PASS |
+| R13-D: only the leader retries pre-accept peer capacity; receiver never exceeds its running slots | 65da92a03, D6 | `oracle::analytical::tests::participant_cut_is_reserved_once_immediately_before_dispatch`; `oracle::analytical::tests::cancellation_during_peer_capacity_wait_stops_retry`; `peer_network::analytical::two_leaders_retry_preaccept_capacity` | PASS |
 | Lint lanes | D8 | `mise run lints:default`, `mise run lints` | PASS |
 | Crate lib suite | — | `vala-bifrost-redux --lib --features test-support`: 848/848 | PASS |
 
@@ -854,6 +854,13 @@ This supersedes this task's row at line 99 that kept `try_acquire_worker` and
   the Interactive floor" now use 2 units (`RETRY_RECEIVER_SLOTS`,
   activation topology). Unit fixtures that saturated the Analytical class with
   one query use `analytical_slots: 1`.
+- **Selector:** deleting the fragment-worker path removed
+  `oracle::dispatcher::tests::leader_retries_only_preaccept_peer_capacity`.
+  R13-D is proven by
+  `oracle::analytical::tests::participant_cut_is_reserved_once_immediately_before_dispatch`
+  (retry within the deadline) and
+  `oracle::analytical::tests::cancellation_during_peer_capacity_wait_stops_retry`
+  (cancellation during the wait stops the retry).
 
 ### D11 — the query class is the execution path
 

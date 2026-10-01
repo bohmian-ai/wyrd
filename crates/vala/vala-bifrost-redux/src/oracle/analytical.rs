@@ -7115,6 +7115,84 @@ mod tests {
         assert_expiry_needs_both_clocks().await;
     }
 
+    /// Cancelling the graph while the leader waits a capacity hint stops the
+    /// retry: the refused round stays released and nothing is placed again.
+    ///
+    /// The first participant accepts and the second refuses with a one-second
+    /// hint. The graph is cancelled while the leader waits that hint, far
+    /// inside a ten-minute deadline.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the attempt does not end at once, when a second round is
+    /// reserved, when the round's acceptance is not returned exactly once, or
+    /// when a cut is published.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_peer_capacity_wait_stops_retry() {
+        let fixture = ReservationFixture::start_bounded(
+            1,
+            Utc::now() + chrono::Duration::seconds(60),
+            tokio::time::Instant::now() + Duration::from_mins(10),
+        );
+        fixture
+            .graph
+            .supervisor
+            .signal_reserve(fixture.graph.graph)
+            .expect("an active graph accepts one reserve request");
+        settle_lifecycle().await;
+        assert_eq!(
+            fixture.transport.reserves().len(),
+            2,
+            "the first round reserves both participants and the second refuses"
+        );
+        assert_eq!(
+            fixture.transport.releases().len(),
+            1,
+            "the refused round is released before the leader waits its hint"
+        );
+        fixture
+            .graph
+            .supervisor
+            .graph_cancellation(fixture.graph.graph)
+            .expect("the registered graph owns a cancellation child")
+            .expect("the registered graph owns a cancellation child")
+            .cancel();
+        let cancelled_at = tokio::time::Instant::now();
+        let refused = fixture
+            .signals
+            .publish_participants()
+            .await
+            .expect_err("a cancelled placement cannot publish a cut");
+        assert!(
+            matches!(refused, BifrostError::QueryAdmissionRejected),
+            "a cancelled wait takes the existing refusal path: {refused:?}"
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            cancelled_at,
+            "cancellation ends the wait at once, not at the hint"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        settle_lifecycle().await;
+        assert_eq!(
+            fixture.transport.reserves().len(),
+            2,
+            "no participant is reserved again after cancellation"
+        );
+        assert_eq!(
+            fixture.transport.releases(),
+            vec![(
+                fixture.remote[0].1.node_id,
+                Uuid::from_u128(200).to_string()
+            )],
+            "the round's one acceptance is returned exactly once"
+        );
+        assert!(
+            fixture.signals.participants().get().is_none(),
+            "a cancelled placement publishes no cut"
+        );
+    }
+
     /// Builds one frozen destination distinguishable by node identity.
     fn frozen_destination(endpoint: &str) -> super::super::dispatcher::DispatchCandidate {
         super::super::dispatcher::DispatchCandidate {

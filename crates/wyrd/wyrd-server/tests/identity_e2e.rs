@@ -42,7 +42,7 @@ use wyrd_testing::{
 
 fn keycloak_issuer() -> String {
     env::var("WYRD_KEYCLOAK_ISSUER")
-        .unwrap_or_else(|_| "http://localhost:8080/realms/wyrd-test".to_owned())
+        .unwrap_or_else(|_| "http://localhost:18080/realms/wyrd-test".to_owned())
 }
 
 fn dex_issuer() -> String {
@@ -56,7 +56,7 @@ fn dex_issuer() -> String {
 /// the credential is written once here rather than at each call site.
 fn keycloak_admin() -> KeycloakAdmin {
     KeycloakAdmin {
-        base_url: "http://localhost:8080".to_owned(),
+        base_url: "http://localhost:18080".to_owned(),
         username: "admin".to_owned(),
         password: "admin".to_owned(),
         realm: "wyrd-test".to_owned(),

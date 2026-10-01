@@ -120,8 +120,6 @@ pub struct PinnedSealedTable {
     pub iceberg_files: Vec<PinnedIcebergFile>,
     /// Ordered tenant hot rows absent from the exact pinned snapshot manifest.
     pub hot_files: Vec<vala_sql::row_types::file_list::HotFileRow>,
-    /// Complete validated sealed manifest retained for live-tail watermarks.
-    pub sealed_manifest: Vec<vala_sql::row_types::file_list::HotFileRow>,
     /// Stable digest of the ordered, post-subtraction hot manifest.
     pub hot_manifest_digest: String,
     /// Bounded sealed-byte estimate used by Oracle classification.
@@ -587,8 +585,7 @@ impl BifrostCatalog {
             return Err(BifrostCatalogError::AmbiguousPublication);
         }
         let hot_files = cut.hot_files;
-        let sealed_manifest = cut.sealed_manifest;
-        for row in &sealed_manifest {
+        for row in &hot_files {
             let valid_identity = row.data_tenant_id == tenant.as_uuid()
                 && row.namespace == binding.logical_namespace
                 && row.table_name == binding.table_name
@@ -604,13 +601,12 @@ impl BifrostCatalog {
                 ));
             }
         }
-        let hot_file_count = sealed_manifest.len();
         metrics::counter!(
             "bifrost_oracle_files_pruned_total",
             "source" => "hot_sealed",
             "reason" => "snapshot_overlap"
         )
-        .increment(hot_file_count.saturating_sub(hot_files.len()) as u64);
+        .increment(cut.represented as u64);
         for row in &hot_files {
             estimated_bytes = estimated_bytes
                 .checked_add(u64::try_from(row.file_size).map_err(|_| {
@@ -645,7 +641,6 @@ impl BifrostCatalog {
             iceberg_file_paths,
             iceberg_files: iceberg_files.into_values().collect(),
             hot_files,
-            sealed_manifest,
             hot_manifest_digest,
             estimated_bytes,
         })

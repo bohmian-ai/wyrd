@@ -39,13 +39,13 @@ impl VaultBackend {
     /// client cannot be built.
     pub fn new(
         address: Url,
-        mount: String,
+        mount: &str,
         token: SecretRef,
         namespace: Option<String>,
         ca_cert: Option<&[u8]>,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            reader: VaultKv2::new(address, &mount, namespace, ca_cert)?,
+            reader: VaultKv2::new(address, mount, namespace, ca_cert)?,
             token,
         })
     }
@@ -100,7 +100,7 @@ mod tests {
     fn backend(address: &str, token: &tempfile::NamedTempFile) -> VaultBackend {
         VaultBackend::new(
             Url::parse(address).expect("address"),
-            "kv/team".to_owned(),
+            "kv/team",
             SecretRef::File {
                 path: token.path().to_string_lossy().into_owned(),
             },
@@ -182,7 +182,7 @@ mod tests {
         }
         let unreadable = VaultBackend::new(
             Url::parse(&server.uri()).expect("address"),
-            "kv".to_owned(),
+            "kv",
             SecretRef::Env {
                 name: "WYRD_GATEWAY_VAULT_TEST_UNSET_TOKEN".to_owned(),
             },

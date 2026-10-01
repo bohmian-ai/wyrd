@@ -2531,7 +2531,7 @@ impl GatewayConfig {
                 };
                 let vault = VaultBackend::new(
                     backend.address.clone(),
-                    backend.mount.clone(),
+                    &backend.mount,
                     backend.token.clone(),
                     backend.namespace.clone(),
                     ca_cert.as_deref(),

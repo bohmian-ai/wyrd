@@ -1,4 +1,4 @@
-//! The one HashiCorp Vault KV v2 reader Wyrd uses.
+//! The one Vault KV v2 reader Wyrd uses.
 //!
 //! The gateway reads provider credentials and the server reads Operator
 //! key-encryption keys through [`VaultKv2`]. Each caller keeps its own

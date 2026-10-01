@@ -248,3 +248,115 @@ async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJour
     );
     Ok(())
 }
+
+/// Every `.wal` segment under `root` with its bytes, sorted by path.
+///
+/// # Errors
+///
+/// Returns the directory-walk or read error.
+fn wal_segments(
+    root: &std::path::Path,
+) -> Result<Vec<(std::path::PathBuf, Vec<u8>)>, super::query::ServerJourneyError> {
+    let mut segments = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "wal") {
+                let bytes = std::fs::read(&path)?;
+                segments.push((path, bytes));
+            }
+        }
+    }
+    segments.sort();
+    Ok(segments)
+}
+
+/// A WAL that fails restart replay leaves only Scribe unready.
+///
+/// A WAL sync fault keeps the segments on disk; corrupting the final CRC byte
+/// of each segment that holds records makes the next boot's replay fail. The
+/// restarted combined target must still boot and report `/readyz` 200 with
+/// Scribe named unready, keep answering published Oracle reads, refuse writes
+/// without an ACK, and leave every WAL byte as it found it for operator
+/// repair.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJourneyError> {
+    let data_root = tempfile::tempdir()?;
+    let server = combined_target(data_root.path()).start_bound().await?;
+    super::query::await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+    let table = format!("wal_replay_{}", uuid::Uuid::now_v7().simple());
+    server
+        .create_bifrost_table_for_test(vala_bifrost_redux::catalog::CreateTableRequest {
+            table: vala_bifrost_redux::catalog::TableRef::new(
+                vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+                &table,
+            ),
+            user_fields: vec![arrow::datatypes::Field::new(
+                "value",
+                arrow::datatypes::DataType::Int64,
+                false,
+            )],
+            tenant: server.data_tenant_id(),
+            physical_layout: None,
+            audit: None,
+        })
+        .await?;
+    let fqn = format!("vala.bifrost.{table}");
+    server.seed_bifrost_rows(&fqn, &[1, 2, 3]).await?;
+    server.trip_bifrost_wal_sync_fault_for_test()?;
+    assert!(
+        server.seed_bifrost_rows(&fqn, &[4]).await.is_err(),
+        "a write whose WAL sync failed must not be acknowledged"
+    );
+    let wal_root = server
+        .scribe_wal_root_for_test()
+        .ok_or("the combined target composes a WAL")?
+        .to_path_buf();
+
+    let mut corrupted = 0;
+    for (path, mut bytes) in wal_segments(&wal_root)? {
+        if bytes.len() > 64 {
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xff;
+            std::fs::write(&path, &bytes)?;
+            corrupted += 1;
+        }
+    }
+    assert!(
+        corrupted > 0,
+        "the faulted Scribe kept segments with records"
+    );
+    let before = wal_segments(&wal_root)?;
+
+    let server = server
+        .restart_bound(combined_target(data_root.path()))
+        .await?;
+    super::query::await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+    let (status, body) = readyz(&server).await?;
+    assert_eq!(status, 200, "the other roles keep the target ready: {body}");
+    assert_eq!(
+        body["checks"]["scribe"]["reason"], "scribe_wal_faulted",
+        "{body}"
+    );
+    assert_eq!(body["checks"]["oracle"]["reason"], "ok", "{body}");
+    assert_eq!(published_values(&server, &table).await?, vec![1, 2, 3]);
+    assert!(
+        server.seed_bifrost_rows(&fqn, &[5]).await.is_err(),
+        "a Scribe whose replay failed admits no write"
+    );
+    assert_eq!(
+        wal_segments(&wal_root)?,
+        before,
+        "a failed replay leaves every WAL byte for operator repair"
+    );
+    server.shutdown().await?;
+    Ok(())
+}

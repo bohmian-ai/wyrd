@@ -932,7 +932,10 @@ impl Scribe {
             Arc::clone(&tail_service),
             Arc::clone(&catalog),
         )));
-        let advertise_ready = Arc::new(AtomicBool::new(activated));
+        // A WAL that faulted during boot replay never advertises ready.
+        let advertise_ready = Arc::new(AtomicBool::new(
+            activated && !ingest.wal_fault().is_cancelled(),
+        ));
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
             Arc::clone(&advertise_ready),
@@ -1071,13 +1074,19 @@ impl Scribe {
     /// Boot leaves a peer-mode Scribe reserved but unready so no replica dials
     /// its tail before the socket serves. This advertises readiness to the
     /// heartbeat, marks the exact fence ready, and republishes membership. On
-    /// failure it withdraws the advertisement and marks the fence unready.
+    /// failure it withdraws the advertisement and marks the fence unready. A
+    /// Scribe whose WAL faulted, including a failed boot replay, is left
+    /// unready and activation succeeds without touching the fence, so the
+    /// other peer roles still activate.
     ///
     /// # Errors
     ///
     /// Returns [`ServerBootError::Scribe`] when the role is no
     /// longer serving or the fence cannot be activated or published.
     pub async fn activate(&self) -> Result<(), ServerBootError> {
+        if self.wal_faulted() {
+            return Ok(());
+        }
         if !self.lifecycle.is_serving() {
             return Err(ServerBootError::Scribe(
                 "Scribe stopped serving before peer activation".to_owned(),

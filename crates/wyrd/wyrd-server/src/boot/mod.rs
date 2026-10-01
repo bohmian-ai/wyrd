@@ -842,14 +842,21 @@ pub async fn compose_bifrost(
             geometry,
             staging_file_publisher: Some(staging_file_publisher),
         }));
-        if let Err(error) = scribe.replay_wal_async().await {
-            if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
-                tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after recovery failure");
+        // A failed replay is role-local: faulting the WAL leaves Scribe
+        // unready, its fence reserved but never activated, and its WAL and
+        // staged files untouched for operator repair, while the other roles
+        // keep serving.
+        let replayed = match scribe.replay_wal_async().await {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "Scribe WAL recovery failed; Scribe stays unready for operator repair"
+                );
+                scribe.wal_fault().cancel();
+                false
             }
-            return Err(ServerBootError::Scribe(format!(
-                "WAL recovery failed before role activation: {error}"
-            )));
-        }
+        };
         if let Err(error) = scribe.tail_service() {
             if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
                 tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after tail failure");
@@ -860,7 +867,7 @@ pub async fn compose_bifrost(
         }
         // A peer-mode Scribe stays reserved but unready until its private
         // listener serves; the serving owner activates it then.
-        if peer_tls.is_none() {
+        if replayed && peer_tls.is_none() {
             if let Err(error) = cluster_registry.activate(&scribe_role).await {
                 if let Err(cleanup_error) =
                     cluster_registry.shutdown_role(scribe_role.clone()).await

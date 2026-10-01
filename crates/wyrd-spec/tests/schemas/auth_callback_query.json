@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CallbackQuery",
-  "description": "`GET /auth/callback` query: the provider's redirect back to the common callback. It carries no tenant selector.",
+  "description": "`GET /auth/callback` query: the provider's redirect back to the common callback. It carries no tenant selector.\n\nOther provider response parameters (Keycloak's `session_state`, RFC 9207 `iss`) are ignored, as RFC 6749 §4.1.2 requires of the client; only `code` and `state` are read.",
   "type": "object",
   "required": [
     "code",
@@ -23,7 +23,6 @@
       "minLength": 1
     }
   },
-  "additionalProperties": false,
   "definitions": {
     "SecretBearer": {
       "description": "Opaque secret. Redacted in logs and audit payloads.",

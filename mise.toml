@@ -681,20 +681,52 @@ create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="
 print("Keycloak users seeded")
 PYEOF
 
-# WYRD_IDENTITY_TARGET selects the suite (only `server` exists);
-# WYRD_IDENTITY_FILTER selects one exact test and must select exactly one.
-# Unfiltered runs every identity journey, and first proves each named tenant
-# connection journey still selects exactly one test so a rename cannot
-# silently drop it.
-target="${WYRD_IDENTITY_TARGET:-server}"
-if [ "$target" != server ]; then
-  echo "unsupported WYRD_IDENTITY_TARGET=$target (supported: server)" >&2
-  exit 2
+# WYRD_IDENTITY_TARGET selects the suite: `server` (Rust identity_e2e) or
+# `ui` (the production BFF journey: identity_ui_e2e starts the real server and
+# two `node build` BFF replicas sharing its Postgres and public origin, then
+# runs the Vitest HTTP journey against them). WYRD_IDENTITY_FILTER selects one
+# exact test of that suite and must select exactly one. Unfiltered runs both
+# suites, and first proves each named journey still selects exactly one test so
+# a rename cannot silently drop it.
+target="${WYRD_IDENTITY_TARGET:-}"
+case "$target" in
+  ""|server|ui) ;;
+  *) echo "unsupported WYRD_IDENTITY_TARGET=$target (supported: server, ui)" >&2; exit 2 ;;
+esac
+if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ -z "$target" ]; then
+  target=server
 fi
+ui_dir=crates/wyrd/wyrd-server/wyrd-ui
+ui_journey=src/lib/server/auth/production-auth.integration.test.ts
 selected_count() {
   cargo nextest list --locked -p wyrd-server --test identity_e2e --run-ignored=all --message-format oneline -E "$1" | grep -c . || true
 }
-if [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
+ui_selected_count() {
+  (cd "$ui_dir" && WYRD_UI_INTEGRATION=1 pnpm exec vitest list "$ui_journey" -t "$1" | grep -cF "$1") || true
+}
+run_ui() {
+  pnpm --dir "$ui_dir" install --frozen-lockfile
+  pnpm --dir "$ui_dir" build
+  for required in "production SSO crosses replicas" "OIDC-off credential UI"; do
+    count="$(ui_selected_count "$required")"
+    if [ "$count" != 1 ]; then
+      echo "UI identity journey '$required' selects $count tests; expected exactly 1" >&2
+      exit 1
+    fi
+  done
+  if [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
+    count="$(ui_selected_count "$WYRD_IDENTITY_FILTER")"
+    if [ "$count" != 1 ]; then
+      echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count UI tests; expected exactly 1" >&2
+      exit 1
+    fi
+    export WYRD_UI_FILTER="$WYRD_IDENTITY_FILTER"
+  fi
+  cargo nextest run --locked -p wyrd-server --test identity_ui_e2e --run-ignored=all --no-capture -E 'test(=production_ui_bff_journey)'
+}
+if [ "$target" = ui ]; then
+  run_ui
+elif [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
   expr="test(=${WYRD_IDENTITY_FILTER})"
   count="$(selected_count "$expr")"
   if [ "$count" != 1 ]; then
@@ -710,6 +742,9 @@ else
       exit 1
     fi
   done
+  if [ "$target" != server ]; then
+    run_ui
+  fi
   cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
 fi
 """

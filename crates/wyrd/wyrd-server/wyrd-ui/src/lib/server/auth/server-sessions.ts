@@ -61,7 +61,7 @@ const sha256 = (value: string) => createHash('sha256').update(value, 'utf8').dig
  * holds the opaque per-tenant session cookie, checks CSRF and same-origin, and
  * talks to the private `/internal/bff/v1/*` channel with the deployment BFF
  * service key. The session id and access token never leave this class except
- * as the HttpOnly cookie value and the server-side `Authorization` header.
+ * as the HttpOnly cookie value and the server-side `X-Wyrd-Access-Token` header.
  */
 export class ServerSessions {
   constructor(private readonly fetcher: typeof fetch = (input, init) => fetch(input, init)) {}
@@ -297,7 +297,7 @@ export class ServerSessions {
   /**
    * Call a Wyrd `/v1` API as the session's principal. The short-lived access
    * token comes from the private channel and is used only in this request's
-   * `Authorization` header.
+   * `X-Wyrd-Access-Token` header.
    */
   async api(
     tenantKey: string,
@@ -320,7 +320,7 @@ export class ServerSessions {
       return await this.fetcher(new URL(`/v1${path}`, serverUrl()), {
         method,
         headers: {
-          authorization: `Bearer ${access_token}`,
+          'x-wyrd-access-token': `Bearer ${access_token}`,
           ...(body === undefined ? {} : { 'content-type': 'application/json' })
         },
         body: body === undefined ? undefined : JSON.stringify(body),

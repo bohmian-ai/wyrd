@@ -115,7 +115,7 @@ async fn call(
 ) -> Value {
     let response = reqwest::Client::new()
         .request(method, format!("{server}{path}"))
-        .bearer_auth(token)
+        .header("x-wyrd-access-token", format!("Bearer {token}"))
         .json(&body)
         .send()
         .await

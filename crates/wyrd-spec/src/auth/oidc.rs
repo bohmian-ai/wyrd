@@ -399,9 +399,12 @@ pub struct BeginLoginResponse {
 
 /// `GET /auth/callback` query: the provider's redirect back to the common
 /// callback. It carries no tenant selector.
+///
+/// Other provider response parameters (Keycloak's `session_state`, RFC 9207
+/// `iss`) are ignored, as RFC 6749 §4.1.2 requires of the client; only `code`
+/// and `state` are read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
 pub struct CallbackQuery {
     /// Authorization code from the identity provider callback.
     pub code: SecretBearer,
@@ -628,14 +631,27 @@ mod tests {
         );
     }
 
+    /// A provider callback carrying its own response parameters (Keycloak's
+    /// `session_state`, RFC 9207 `iss`) still parses, as RFC 6749 §4.1.2
+    /// requires; `code` and `state` remain mandatory.
     #[test]
-    fn callback_query_rejects_unknown_fields() {
+    fn callback_query_ignores_provider_parameters() {
         let json = serde_json::json!({
             "code": "auth-code",
             "state": "state-123",
-            "extra": true
+            "session_state": "kc-session",
+            "iss": "https://idp.example.com/realms/acme"
         });
-        assert!(serde_json::from_value::<CallbackQuery>(json).is_err());
+        let query = serde_json::from_value::<CallbackQuery>(json).expect("callback parses");
+        assert_eq!(query.state, "state-123");
+        assert!(
+            serde_json::from_value::<CallbackQuery>(serde_json::json!({ "code": "auth-code" }))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CallbackQuery>(serde_json::json!({ "state": "state-123" }))
+                .is_err()
+        );
     }
 
     /// A digest parses only in its canonical lowercase 64-hex form and

@@ -1115,6 +1115,36 @@ pub struct BifrostTelemetryDelta {
     pub(crate) process: ProcessWindow,
 }
 
+impl BifrostTelemetryDelta {
+    /// Renders this window's samples of the named families as one evidence line.
+    ///
+    /// Nonzero counter and histogram samples are window deltas, `peak:` gauges are the
+    /// highest value sampled while the window ran, and `final:` gauges are the
+    /// value rendered when it closed. Journeys print this beside the
+    /// independent fact they assert against, so a run's output records the
+    /// actual production samples rather than only the assertion's verdict.
+    /// Families with no sample in the window are omitted.
+    #[must_use]
+    pub fn evidence(&self, families: &[&str]) -> String {
+        let deltas = self
+            .metrics
+            .iter()
+            .filter(|sample| {
+                sample.kind != BifrostMetricKind::HistogramBucket && sample.value != 0.0
+            })
+            .map(|sample| ("", sample));
+        let peaks = self.gauge_maxima.iter().map(|sample| ("peak:", sample));
+        let finals = self.gauge_final.iter().map(|sample| ("final:", sample));
+        deltas
+            .chain(peaks)
+            .chain(finals)
+            .filter(|(_, sample)| families.contains(&sample.family.as_str()))
+            .map(|(prefix, sample)| format!("{prefix}{}={}", rendered_series(sample), sample.value))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// Values retained by the single bounded gauge/process sampler.
 #[derive(Debug)]
 struct SamplerSnapshot {

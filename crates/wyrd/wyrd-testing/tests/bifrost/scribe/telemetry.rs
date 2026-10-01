@@ -7,7 +7,7 @@
 //! memtable owners, committed hot files, and the rows a public strict read
 //! returns.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_telemetry::CapturedSpan;
@@ -39,6 +39,62 @@ const STAGING_GAUGES: [&str; 4] = [
     "bifrost_scribe_staging_oldest_member_timestamp_seconds",
     "bifrost_scribe_staging_outstanding_claims",
 ];
+
+/// Write-path families the write, retry, and failure windows print as evidence.
+const WRITE_FAMILIES: [&str; 11] = [
+    "bifrost_gate_requests_total",
+    "bifrost_gate_request_duration_seconds",
+    "bifrost_gate_frames_total",
+    "bifrost_gate_frame_bytes_total",
+    "bifrost_gate_rejections_total",
+    "bifrost_scribe_ack_seconds",
+    "bifrost_scribe_wal_append_total",
+    "bifrost_scribe_wal_append_bytes_total",
+    "bifrost_scribe_wal_fsync_total",
+    "bifrost_scribe_memtable_rows_inserted_total",
+    "bifrost_scribe_rejections_total",
+];
+
+/// Memory and lane families the freeze window prints as evidence.
+const MEMORY_FAMILIES: [&str; 5] = [
+    "bifrost_scribe_active_memtable_bytes",
+    "bifrost_scribe_immutable_memtable_bytes",
+    "bifrost_scribe_immutable_generation_count",
+    "bifrost_scribe_lane_queued",
+    "bifrost_scribe_lane_active",
+];
+
+/// Staging and publication families the publish window prints as evidence.
+const PUBLICATION_FAMILIES: [&str; 8] = [
+    "bifrost_scribe_staging_live_members",
+    "bifrost_scribe_staging_live_bytes",
+    "bifrost_scribe_staging_oldest_member_timestamp_seconds",
+    "bifrost_scribe_staging_outstanding_claims",
+    "bifrost_scribe_staging_claims_published_total",
+    "bifrost_scribe_publication_files_total",
+    "bifrost_scribe_publication_bytes_total",
+    "bifrost_scribe_seal_failed_total",
+];
+
+/// Prints every Bifrost and Oracle family the production exposition holds.
+///
+/// One line per family with its series count, so the run's output is an
+/// inventory of what an operator's scrape actually sees.
+///
+/// # Panics
+///
+/// Panics when the production recorder cannot render.
+fn print_family_inventory(telemetry: &BifrostTelemetryCapture) {
+    let mut families = BTreeMap::<String, usize>::new();
+    for sample in telemetry.snapshot().expect("production metrics render") {
+        if sample.kind != BifrostMetricKind::HistogramBucket {
+            *families.entry(sample.family).or_default() += 1;
+        }
+    }
+    for (family, series) in families {
+        eprintln!("evidence inventory family={family} series={series}");
+    }
+}
 
 /// Sums one family's window delta over every label set of one sample kind.
 fn delta_value(delta: &BifrostTelemetryDelta, family: &str, kind: BifrostMetricKind) -> f64 {
@@ -399,6 +455,10 @@ async fn scribe_hot_path_telemetry_reconciles() {
         batches.push(batch_id);
     }
     let written = telemetry.delta_since(&write).expect("write window");
+    eprintln!(
+        "evidence write acknowledged_batches=4 acknowledged_rows=64 samples: {}",
+        written.evidence(&WRITE_FAMILIES)
+    );
     assert_eq!(
         delta_value(
             &written,
@@ -456,6 +516,10 @@ async fn scribe_hot_path_telemetry_reconciles() {
         .await
         .expect("a same-batch retry is acknowledged");
     let retried = telemetry.delta_since(&retry).expect("retry window");
+    eprintln!(
+        "evidence retry acknowledged_batches=1 new_rows=0 samples: {}",
+        retried.evidence(&WRITE_FAMILIES)
+    );
     assert_eq!(
         delta_value(
             &retried,
@@ -485,11 +549,36 @@ async fn scribe_hot_path_telemetry_reconciles() {
 
     // Freeze, publication not yet requested: the staged backlog is visible
     // and equals the staging owner, while acknowledged rows stay readable.
+    let freeze = checkpoint(&telemetry);
     scribe
         .flush_writable_for_test()
         .await
         .expect("every writable bucket freezes");
     await_persistence_drained(&scribe).await;
+    // The memtable gauges are refreshed by the pod's own age tick, so the
+    // window stays open until that production emitter has published the
+    // frozen state rather than closing on a sample taken before it ran.
+    let deadline = tokio::time::Instant::now() + SETTLEMENT_DEADLINE;
+    while gauge(
+        &telemetry.snapshot().expect("production metrics render"),
+        "bifrost_scribe_active_memtable_bytes",
+    ) != Some(0.0)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the age tick did not publish the frozen memtable"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let frozen = telemetry.delta_since(&freeze).expect("freeze window");
+    eprintln!(
+        "evidence freeze memtable_writable_rows_after={} samples: {}",
+        scribe
+            .memtable_stats()
+            .expect("memtable stats")
+            .writable_rows,
+        frozen.evidence(&MEMORY_FAMILIES)
+    );
     let staged = server
         .scribe_staging_backlog_for_test()
         .expect("the pod's staged backlog is inspectable");
@@ -535,6 +624,13 @@ async fn scribe_hot_path_telemetry_reconciles() {
         .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), &name)
         .await
         .expect("published hot files are inspectable");
+    eprintln!(
+        "evidence publish committed_files={} committed_bytes={} committed_rows={} samples: {}",
+        files.len(),
+        files.iter().map(|file| file.file_size).sum::<u64>(),
+        files.iter().map(|file| file.row_count).sum::<u64>(),
+        published_window.evidence(&PUBLICATION_FAMILIES)
+    );
     assert_eq!(
         files.iter().map(|file| file.row_count).sum::<u64>(),
         64,
@@ -601,6 +697,10 @@ async fn scribe_hot_path_telemetry_reconciles() {
         .await
         .expect_err("a write whose WAL sync failed is not acknowledged");
     let failed = telemetry.delta_since(&failure).expect("failure window");
+    eprintln!(
+        "evidence wal_failure client_acknowledged=false samples: {}",
+        failed.evidence(&WRITE_FAMILIES)
+    );
     assert!(
         labelled_delta(
             &failed,
@@ -650,5 +750,6 @@ async fn scribe_hot_path_telemetry_reconciles() {
         );
     }
 
+    print_family_inventory(&telemetry);
     server.shutdown().await.expect("the server drains cleanly");
 }

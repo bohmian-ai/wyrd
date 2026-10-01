@@ -65,7 +65,7 @@ pub struct AssembleRequest<'a> {
     pub runs: &'a ClaimRuns,
     /// Directory receiving the sealed objects before upload.
     pub scratch_dir: &'a Path,
-    /// Move-only footer memory child retained through sealed inspection.
+    /// Scribe capability that assembly charges materialized batches against.
     pub memory: crate::resources::ScribeResources,
 }
 

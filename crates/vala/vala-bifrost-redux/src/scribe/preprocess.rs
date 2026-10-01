@@ -56,6 +56,8 @@ pub(crate) struct AdmittedAppend {
     /// Registered partition granularity every slice of this append is bucketed to.
     pub partition_granularity: TimeGranularity,
     pub queued_at: Instant,
+    /// Completion channel answered once the append is durable in the WAL, or
+    /// with the typed error that refused it; `None` for fire-and-forget appends.
     pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
     pub lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
@@ -112,6 +114,8 @@ pub(crate) struct PreparedAppend {
     pub slices: PreparedSliceSet,
     pub reservation: InflightFrameReservation,
     pub memory: Option<ScribeMemoryLease>,
+    /// Completion channel carried from the queued append, answered once the
+    /// prepared frame is durable or refused; `None` for fire-and-forget appends.
     pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
     pub lifecycle: Option<crate::scribe::telemetry::ScribeIngressLifecycleOwner>,

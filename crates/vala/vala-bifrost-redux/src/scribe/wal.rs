@@ -1977,6 +1977,11 @@ impl WalWriter {
     ///
     /// The WAL is not capacity-governed: a full device refuses the append as
     /// [`ScribeError::WalDiskFull`] through the write's own IO error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ScribeError`] when `config` is invalid, or when the existing
+    /// stream under `base_dir` cannot be listed or read to recover its counters.
     pub fn new(
         base_dir: impl AsRef<Path>,
         node_id: [u8; 16],

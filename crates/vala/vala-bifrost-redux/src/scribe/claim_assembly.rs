@@ -81,7 +81,7 @@ pub struct AssembleClaimRequest<'a> {
     pub object_base: &'a str,
     /// Approximate encoded size at which one object closes and the next opens.
     pub target_object_bytes: u64,
-    /// Move-only footer memory child retained through sealed inspection.
+    /// Scribe capability that assembly charges materialized batches against.
     pub memory: crate::resources::ScribeResources,
     /// Authenticated tenant of the claim's table binding, recorded in every
     /// emitted object's footer.

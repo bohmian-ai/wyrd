@@ -8422,9 +8422,9 @@ mod tests {
     /// Every worker bound is a hard invariant resolved once at composition.
     ///
     /// Each one, violated, makes the worker unable to do the thing it exists
-    /// for: a zero tenant cap claims nothing, a zero memory budget admits no
-    /// plan, zero running parallelism runs no plan, and a waiting budget below
-    /// running parallelism cannot even hold one maximally parallel plan.
+    /// for: a zero tenant cap claims nothing, zero running parallelism runs no
+    /// plan, and a waiting budget below running parallelism cannot even hold
+    /// one maximally parallel plan.
     ///
     /// # Panics
     ///

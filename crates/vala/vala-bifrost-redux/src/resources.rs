@@ -1140,6 +1140,8 @@ impl BifrostRuntimeResources {
 pub struct BifrostRoleResources {
     scribe: Option<ScribeResources>,
     oracle: Option<OracleResources>,
+    /// Forge capability, present only when the policy activated Forge; its
+    /// rewrites charge the same governor as Scribe and Oracle.
     forge: Option<ForgeResources>,
     governor: BifrostResourceGovernor,
     /// Process-wide encoded body owner shared by HTTP and tonic surfaces.

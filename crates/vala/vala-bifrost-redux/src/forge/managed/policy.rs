@@ -271,8 +271,8 @@ impl ForgeTablePolicy {
             ))
             // One runner executes exactly one plan, so the core's own
             // multi-plan concurrency is never used. Memory and spill are left
-            // unset so the processor selects the unbounded pool and no disk
-            // manager, matching the Forge execution model.
+            // unset here because they come from the attempt's governed
+            // `ManagedExecutionContext`, not from this configuration.
             .max_concurrent_compaction_plans(1)
             .build()
             .map_err(|error| ForgeError::InvalidConfig {

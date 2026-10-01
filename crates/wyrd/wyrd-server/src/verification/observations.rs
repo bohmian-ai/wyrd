@@ -19,6 +19,7 @@ use vala_bifrost_redux::gate::{AuthContext, ObservationAck};
 use vala_bifrost_redux::tables::EvalObservationsTable;
 use wyrd_runtime::Principal;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::request_id::RequestId;
 use wyrd_sql::WyrdPostgres;
 use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
 
@@ -110,13 +111,45 @@ impl ObservationAck for ObservationEnqueue {
         let principal = auth.principal.clone();
         self.tasks.spawn(async move {
             let _permit = permit;
-            if let Err(error) = owner
+            let mut lost = UnfinishedEnqueue {
+                tenant,
+                request_id,
+                armed: true,
+            };
+            let result = owner
                 .enqueue(tenant, &principal, &frame, receipt_micros)
-                .await
-            {
-                record_failure(tenant, request_id.as_str(), &error);
+                .await;
+            lost.armed = false;
+            if let Err(error) = result {
+                record_failure(tenant, lost.request_id.as_str(), &error);
             }
         });
+    }
+}
+
+/// Records an enqueue task dropped before it finished as a lost enqueue.
+///
+/// The task disarms it once `enqueue` returns, so only a task stopped mid-way
+/// (runtime teardown at process stop) records through [`Drop`].
+struct UnfinishedEnqueue {
+    /// Tenant of the acknowledged frame.
+    tenant: DataTenantId,
+    /// Request that carried the acknowledged frame.
+    request_id: RequestId,
+    /// Whether dropping still means the enqueue never completed.
+    armed: bool,
+}
+
+impl Drop for UnfinishedEnqueue {
+    /// Logs and counts the lost enqueue when still armed.
+    fn drop(&mut self) {
+        if self.armed {
+            record_failure(
+                self.tenant,
+                self.request_id.as_str(),
+                "process stopped before the observation enqueue completed",
+            );
+        }
     }
 }
 
@@ -129,4 +162,50 @@ fn record_failure(tenant: DataTenantId, request_id: &str, error: &str) {
         error,
         "acknowledged Eval observation did not enqueue verification runs"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::request_id::RequestId;
+
+    use super::UnfinishedEnqueue;
+
+    /// An armed guard dropped mid-enqueue counts one lost enqueue; a disarmed
+    /// guard counts nothing.
+    ///
+    /// # Panics
+    /// Panics when the failure counter does not match.
+    #[test]
+    fn dropped_enqueue_records_failure() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            drop(UnfinishedEnqueue {
+                tenant: DataTenantId::new_v7(),
+                request_id: RequestId::now_v7(),
+                armed: false,
+            });
+        });
+        assert!(
+            !handle
+                .render()
+                .contains("verification_observation_enqueue_failures_total"),
+            "a completed enqueue records no failure"
+        );
+        metrics::with_local_recorder(&recorder, || {
+            drop(UnfinishedEnqueue {
+                tenant: DataTenantId::new_v7(),
+                request_id: RequestId::now_v7(),
+                armed: true,
+            });
+        });
+        assert!(
+            handle
+                .render()
+                .contains("verification_observation_enqueue_failures_total 1"),
+            "a stopped enqueue records one failure"
+        );
+    }
 }

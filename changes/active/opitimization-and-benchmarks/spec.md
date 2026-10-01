@@ -1,6 +1,6 @@
 ---
 id: SPEC-opitimization-and-benchmarks
-revision: 3
+revision: 4
 status: draft
 ---
 
@@ -17,9 +17,10 @@ Bifrost is both an analytical store and an observability store, so this
 change measures it in both roles. It does three things:
 
 1. It reproduces the ClickHouse benchmark (ClickBench) in full against the real
-   production `wyrd-server`, with ClickHouse run on the same machine. The
-   results are published in ClickBench's own result format, so Bifrost numbers
-   compare directly with ClickHouse's.
+   production `wyrd-server`, on the same machine type ClickBench uses. The
+   results are written in ClickBench's own result format and compared with
+   ClickHouse's already-published ClickBench results. We do not run
+   ClickHouse.
 2. It adds an observability benchmark that ClickBench does not cover: ingest
    rate per core (rows/s and MB/s), compression ratio, and query latency over
    fixed time windows on logs, traces, and metrics. This benchmark measures
@@ -85,13 +86,14 @@ per query. The scan leaves are `OracleIcebergScanExec` and `HotParquetExec` in
 The harness pins a ClickBench repository commit. The run's queries, scoring
 rules, and dataset must match that commit.
 
-**REQ-002 — Query semantics.** Bifrost runs each query in its own SQL dialect,
-but every query must return the same answer as the ClickBench original. The
-harness translates each pinned ClickHouse query into Bifrost SQL and records
-every textual difference. It compares each Bifrost result with ClickHouse's result on the same data. A
-mismatch fails the run, with one exception: queries whose ClickBench text has
-no deterministic order or tie-break are compared as sets, and the harness lists
-every such query.
+**REQ-002 — Query semantics and correctness.** Bifrost runs each query in its
+own SQL dialect, but every query must mean the same as the ClickBench
+original. The harness translates each pinned ClickHouse query into Bifrost SQL
+and records every textual difference. ClickBench publishes timings, not
+answers, so the harness checks each result against a committed reference
+answer file chosen by decision D-3. A mismatch fails the run, with one
+exception: queries whose ClickBench text has no deterministic order or
+tie-break are compared as sets, and the harness lists every such query.
 
 **REQ-003 — Real production server, default settings.** The harness drives one
 release `wyrd-server` binary through its normal operator journey (migrate,
@@ -106,24 +108,22 @@ documented, like ClickHouse's `ORDER BY`. The harness records the full
 registration request. Every query passes through normal authentication,
 authorization, admission, and read audit.
 
-**REQ-004 — Measured resource envelope.** The run declares its hardware.
-Bifrost (server plus its Postgres catalog) and ClickHouse each run alone, one
-after the other, inside the same resource envelope: 16 vCPU and 32 GiB of
-memory, the c6a.4xlarge reference shape. On a host larger than that, the
-envelope is enforced as a systemd scope, the way the existing capacity
-benchmark does it. The output records the host CPU model, storage device,
-filesystem, kernel, and the enforced limits. Ratio targets (AC-*) are judged
-only against the ClickHouse run from the same host and envelope. Comparisons
-with the published c6a.4xlarge numbers are informational.
+**REQ-004 — Same machine as the published results.** The run declares its
+hardware. AC judgment runs on the ClickBench reference machine, an AWS
+c6a.4xlarge (16 vCPU, 32 GiB) with a 500 GB gp2 disk, with Bifrost (server
+plus its Postgres catalog) alone on it. Runs on other hardware, such as a
+16-vCPU/32-GiB systemd envelope on a larger local host, are for iteration only
+and never judge an AC, because the published numbers came from the reference
+machine. The output records the instance type, CPU model, storage device,
+filesystem, kernel, and any enforced limits.
 
-**REQ-005 — Side-by-side ClickHouse baseline.** The harness installs a pinned
-ClickHouse release and runs the pinned ClickBench `clickhouse` entry unchanged
-(its schema, load, and queries) in the same envelope, on the same storage
-device, from the same source data. That gives the reference load time, data
-size, and per-query cold and hot times for every ratio below.
+**REQ-005 — Published ClickHouse reference.** The reference is the ClickHouse
+result JSON for c6a.4xlarge in the pinned ClickBench commit (the
+self-managed `clickhouse` entry). It supplies ClickHouse's load time, data
+size, and three runs per query. Bifrost's cold and hot times are derived from
+its own three runs exactly as ClickBench derives them from the published ones.
 
-**REQ-006 — ClickBench metrics and output.** For each system, every run
-produces:
+**REQ-006 — ClickBench metrics and output.** Every Bifrost run produces:
 
 - load time in seconds (defined in REQ-007);
 - data size on disk in bytes (defined in REQ-008);
@@ -131,14 +131,14 @@ produces:
 - the ClickBench relative score. Each query's ratio is
   `(t_bifrost + 0.01 s) / (t_clickhouse + 0.01 s)`. The score is the geometric
   mean of those ratios, computed separately for cold and hot. Load time and
-  data size get their own ratios. Published ClickBench ranks each system
-  against the best system per query. The report also gives that ranking-style
-  score, taking the faster of the two systems per query as the best. The ACs
-  use the direct Bifrost/ClickHouse ratio.
+  data size get their own ratios. The ACs use this direct
+  Bifrost/ClickHouse ratio. The report also places Bifrost in the published
+  c6a.4xlarge ranking of the pinned commit, scored the way ClickBench scores
+  it (against the best published system per query).
 
 The output is a result JSON in the pinned ClickBench schema (`system`, `date`,
-`machine`, `cluster_size`, `tags`, `load_time`, `data_size`, `result`), one
-per system, plus a human-readable report with the ratios and pass/fail per AC.
+`machine`, `cluster_size`, `tags`, `load_time`, `data_size`, `result`),
+plus a human-readable report with the ratios and pass/fail per AC.
 It also includes the server log and a `/metrics` snapshot. A failed, rejected,
 or timed-out query is reported as `null`, as ClickBench does, and fails the run.
 
@@ -157,7 +157,7 @@ chooses otherwise.
 
 **REQ-009 — Invocation.** The benchmark is opt-in, one `mise` task, part of no
 gate or verify lane, and needs no cloud credentials. It downloads and caches
-the dataset and the ClickHouse binary. It exits nonzero when an AC target is
+the dataset and the pinned ClickBench results. It exits nonzero when an AC target is
 missed or a result is wrong. It is reproducible from a clean checkout on a
 Linux host that meets REQ-004.
 
@@ -227,7 +227,7 @@ generated, the generator also produces the expected answer for every REQ-016
 query.
 
 **REQ-014 — Ingest rate per core.** The benchmark loads the dataset into
-Bifrost in the REQ-004 envelope, through the public client with default server
+Bifrost on the REQ-004 machine, through the public client with default server
 settings (REQ-003). For each signal, the report gives:
 
 - rows per second per core, which is rows divided by the server's CPU-seconds
@@ -262,7 +262,7 @@ the generator's expected answer (REQ-013).
 
 **REQ-017 — Observability output and invocation.** The observability
 benchmark meets REQ-003, REQ-004, and REQ-009 the same way ClickBench does:
-real production server, the same envelope, and one opt-in `mise` task that
+real production server, the same machine, and one opt-in `mise` task that
 exits nonzero on a missed target or a wrong result. It writes a
 machine-readable result alongside the ClickBench outputs, plus the
 human-readable report.
@@ -292,7 +292,7 @@ These hold whatever the architecture documents say:
 - Beating ClickHouse, or matching it on every query.
 - Distributed or multi-node ClickBench runs. Only the single-node result
   counts.
-- Optimizing ClickHouse, or tuning its pinned ClickBench entry.
+- Running ClickHouse. Comparison uses its published results only.
 - Submitting results upstream to the ClickBench repository. Producing
   submittable output is in scope; submitting it is not.
 - Making the benchmark a CI gate.
@@ -301,9 +301,9 @@ These hold whatever the architecture documents say:
 
 ## Expensive-to-reverse decisions fixed here
 
-- ClickBench ratios are judged against ClickHouse measured in the same
-  envelope, not against published numbers (REQ-004, REQ-005). The
-  observability benchmark uses absolute targets and runs Bifrost only.
+- ClickBench ratios are judged against ClickHouse's published c6a.4xlarge
+  results, with Bifrost run on the same machine type. ClickHouse is never run
+  (REQ-004, REQ-005). The observability benchmark uses absolute targets.
 - The benchmark uses only the public, default-configured server and public
   client surfaces (REQ-003, REQ-012).
 - Load time includes publication. Data size counts the published table
@@ -315,14 +315,14 @@ These hold whatever the architecture documents say:
 
 ## Acceptance criteria
 
-AC-2 to AC-6 are Bifrost divided by ClickHouse from the same host and
-envelope, using the ClickBench `+0.01 s` scoring. AC-8 to AC-12 are absolute
-targets on Bifrost alone, in the REQ-004 envelope. The proposed targets need owner
+AC-2 to AC-6 are Bifrost on c6a.4xlarge divided by ClickHouse's published
+c6a.4xlarge results, using the ClickBench `+0.01 s` scoring. AC-8 to AC-12
+are absolute targets on Bifrost, on the same machine. The proposed targets need owner
 confirmation (D-1).
 
 | ID | Criterion | Proposed target |
 |---|---|---|
-| AC-1 | Completeness and correctness: all 43 queries complete under default settings and match ClickHouse answers (REQ-002) | 43/43 |
+| AC-1 | Completeness and correctness: all 43 queries complete under default settings and match the reference answers (REQ-002) | 43/43 |
 | AC-2 | Hot-run geometric-mean ratio | ≤ 2.0× |
 | AC-3 | Cold-run geometric-mean ratio | ≤ 3.0× |
 | AC-4 | Worst single-query hot ratio | ≤ 10× |
@@ -358,14 +358,20 @@ default.
    Iceberg and object-store metadata cost the most on a cold start. The AC-8 to
    AC-12 absolute targets are starting proposals for an observability store on
    one 16-vCPU node; confirm or change each.
-2. **D-2 — Hardware.** Use the 16-vCPU/32-GiB systemd envelope on the local
-   Ryzen 9 9950X host (32 threads, 91 GiB, NVMe), or rent an actual
-   c6a.4xlarge with 500 GB gp2. Recommended: the local envelope for iteration
-   and for AC judgment, and an optional c6a.4xlarge run for published-number
-   comparison.
-3. **D-3 — ClickHouse side-by-side is required.** Recommended: yes, as REQ-005
-   states. Published numbers come from different hardware and would make the
-   ratios meaningless.
+2. **D-2 — Reference machine.** AC judgment needs an AWS c6a.4xlarge with a
+   500 GB gp2 disk (REQ-004). Decide how it is provisioned (owner-rented
+   instance or a CI runner of that type). Recommended: an owner-rented
+   instance for each AC-judging run, with the local 16-vCPU/32-GiB envelope for
+   day-to-day iteration. The local host's faster CPU and NVMe flatter Bifrost,
+   so local numbers never count.
+3. **D-3 — Reference answers.** ClickBench publishes no query answers. Choose
+   how the committed answer file (REQ-002) is produced: (a) from Bifrost's
+   first complete run, hand-checked against facts known about `hits` (total
+   row count 99,997,497 and distinct counts computed independently from the
+   source Parquet), then frozen; or (b) from one off-line ClickHouse run
+   used only to produce answers, never timings. Recommended: (a), which keeps
+   ClickHouse out entirely. Its risk is freezing a Bifrost bug as the
+   reference, which the hand checks are there to catch.
 4. **D-4 — Bifrost table layout.** Allow the public `physical_layout` (up to
    four sort keys, for example `CounterID, EventDate, UserID, EventTime`) and
    Bloom columns, mirroring ClickHouse's `ORDER BY`. Also decide which column
@@ -436,6 +442,12 @@ default.
   query text is translated from the ClickHouse queries, with no other
   engine's entry as a source. AC-7's 2 ms selective p50 is confirmed. Draft;
   awaiting owner decisions D-1 to D-13.
+- Revision 4 (2026-10-01): Owner decision: ClickHouse is not run. ClickBench
+  results are compared with ClickHouse's published c6a.4xlarge results, so AC
+  judgment runs Bifrost on a c6a.4xlarge (REQ-004, REQ-005, D-2). Correctness
+  uses a committed reference answer file (REQ-002, D-3). The report places
+  Bifrost in the published ranking. Draft; awaiting owner decisions D-1 to
+  D-13.
 
 ## Authority and context
 

@@ -113,7 +113,7 @@ fn write_graph(root: &Path) -> PathBuf {
         ("traced-agent.yaml", agent("eval-traced-agent")),
         (
             "operator.yaml",
-            "apiVersion: wyrd/v1\nkind: Operator\nmetadata:\n  name: eval-operator\n  version: 1.0.0\n  space: default\nspec:\n  kind: notify\n  channel:\n    kind: slack\n    text: eval gate failed\n".to_owned(),
+            "apiVersion: wyrd/v1\nkind: Operator\nmetadata:\n  name: eval-operator\n  version: 1.0.0\n  space: default\nspec:\n  kind: http\n  method: post\n  url: https://hooks.example.com/eval-gate-failed\n".to_owned(),
         ),
         (
             "gated.yaml",

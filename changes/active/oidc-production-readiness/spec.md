@@ -1,18 +1,19 @@
 ---
 id: SPEC-oidc-production-readiness
-revision: 5
-status: approved
+revision: 6
+status: draft
 ---
 
-# Production OIDC for self-hosted and hosted Wyrd
+# Enterprise identity integration for self-hosted and hosted Wyrd
 
 ## Objective and user value
 
 A person can sign in to a self-hosted or hosted Wyrd tenant through that
-tenant's chosen OIDC provider, then use the UI, CLI, and SDKs without handling
-provider tokens. A deployed application keeps its own Wyrd identity and needs
-no interactive employee login. OIDC is optional: a Wyrd deployment and tenant
-remain usable without an identity provider.
+tenant's existing OIDC or SAML provider, then use the UI, CLI, and SDKs without
+handling provider tokens. An enterprise may use SCIM to provision the same
+tenant Users and role mappings. A deployed application keeps its own Wyrd
+identity and needs no interactive employee login. Human federation remains
+optional: a Wyrd deployment and tenant work without an identity provider.
 
 One hosted tenant may use Okta while another uses Keycloak in the same Wyrd
 service. Hosted signup and automatic tenant creation belong to the separate
@@ -27,8 +28,9 @@ authentication.
 
 ## Scope and ownership
 
-- The open-source Wyrd server owns tenant OIDC trust, callback verification,
-  principal resolution, role mapping, Wyrd credential issuance, and audit.
+- The open-source Wyrd server owns tenant OIDC/SAML trust and SCIM
+  provisioning, principal resolution, role mapping, Wyrd credential issuance,
+  and audit.
 - The existing SvelteKit BFF owns browser session handling and calls Wyrd as
   the signed-in tenant principal. The browser never becomes the identity or
   token authority.
@@ -104,10 +106,12 @@ authentication.
   platform connection.
 - **REQ-008**: Activating a tenant's human connection authorizes successful
   authentication by that exact provider to establish membership in that
-  tenant. A successful callback resolves or creates a tenant-bound `User`
+  tenant, except when that tenant has enabled SCIM-managed membership under
+  REQ-019. A successful callback resolves or creates a tenant-bound `User`
   principal for the verified `(issuer, subject)` and issues tenant-bound Wyrd
-  credentials. Wyrd maps verified provider groups only to roles valid in that
-  tenant. `User` is a principal kind, not a role; a user with no applicable
+  credentials. Outside SCIM-managed membership, Wyrd maps verified provider
+  groups only to roles valid in that tenant. `User` is a principal kind, not a
+  role; a user with no applicable
   role mapping receives no privileged grant. No provider claim directly names
   Wyrd permissions, and unknown or ambiguous privileged mappings cannot grant
   authority.
@@ -194,6 +198,30 @@ authentication.
   recovery, local CLI login and SDK credential selection, and the separate
   human and workload paths. Product surfaces must not advertise production
   SSO while only mock UI authentication works.
+- **REQ-019**: A tenant may opt into SCIM 2.0 provisioning from its existing
+  identity system. A tenant-bound provisioning credential can manage only that
+  tenant's Users and Groups through the standard SCIM resource operations.
+  The credential reuses Wyrd's existing tenant API-key verification and is
+  authorized only for provisioning; a SCIM client need not perform Wyrd's
+  JWT exchange, and no second secret or principal store is introduced.
+  The provider's stable `externalId` must equal the verified sign-in subject
+  for a provisioned user; email never links identities. In this mode, an
+  unprovisioned or inactive user cannot gain tenant membership through login.
+  SCIM Groups mapped by an authorized tenant administrator to existing tenant
+  roles are the authority for that user's mapped grants; sign-in claims do not
+  independently rewrite them. Suspension or removal revokes renewable Wyrd
+  authority using the existing User revocation path. Already issued access
+  tokens retain only their existing bounded lifetime.
+- **REQ-020**: A tenant may configure SAML 2.0 browser SSO as an alternative
+  to OIDC for its one active human login connection. Wyrd acts as a service
+  provider and supports SP-initiated login through tenant-selected,
+  server-bound state. An authenticated SAML response establishes only the
+  existing tenant User and Wyrd credential/session authority after signature,
+  issuer, audience, recipient, destination, time, request binding, and replay
+  validation. SAML metadata and signing-key rotation are tenant-scoped and
+  fail closed. A persistent verified NameID is the sign-in subject; transient
+  identifiers are refused. SAML assertions and IdP sessions are never Wyrd
+  API authority.
 
 ## Invariants and non-goals
 
@@ -201,8 +229,9 @@ authentication.
   provider tokens cannot select effective tenant identity or a connection
   after login starts. Only verified, server-bound state can do so.
 - **INV-002**: The stable external user identity is `(issuer, subject)` within
-  its tenant. Tenant membership through OIDC comes only from successful
-  authentication by that tenant's active configured provider. Email and email
+  its tenant. Tenant membership through OIDC requires successful
+  authentication by that tenant's active configured provider; a SCIM-managed
+  tenant additionally requires active provisioned membership. Email and email
   domain are display or invitation data, never automatic account linking or
   membership authority.
 - **INV-003**: Platform administrators, tenant users, and workloads remain
@@ -217,12 +246,23 @@ authentication.
 - **INV-006**: The open-source server has no hosted-signup, social-login,
   licensing, edition-detection, or commercial onboarding stub. A commercial
   distribution adds its own behavior through ordinary Wyrd contracts.
+- **INV-007**: OIDC, SAML, and SCIM use the same tenant User, role, revocation,
+  Wyrd credential/session, and canonical audit authorities. Each protocol has
+  its own standards-compliant validation at the trust boundary; no protocol
+  introduces a second principal store, role mapper, session issuer, raw SQL
+  pool path, or email-based account link. Tenant-scoped SQL uses `TenantConn`;
+  cross-tenant operator work uses `OperatorPool`.
 
-SAML, LDAP, SCIM, password authentication, simultaneous Okta and Keycloak
+LDAP, password authentication, simultaneous Okta and Keycloak
 login within one tenant, direct acceptance of arbitrary IdP access tokens as
 Wyrd API authority, public SaaS signup, social login, automatic tenant
 creation, and commercial-edition scaffolding in the open-source server are
 outside this change.
+
+The initial SAML delivery excludes IdP-initiated unsolicited login, Single
+Logout, and assertion encryption. A provider requiring one of these features
+cannot be claimed as supported until a later approved revision adds it.
+The initial SCIM delivery excludes using SCIM as an authentication mechanism.
 
 ## Expensive-to-reverse decisions and boundaries
 
@@ -248,6 +288,16 @@ outside this change.
    The deployment keyring protects recoverable provider and Wyrd session
    credentials in both self-hosted and hosted deployments; the number of
    tenants does not select a different secret-storage or login path.
+8. SCIM is optional per tenant. Its client-provided `externalId` is the
+   provisioned counterpart of the immutable subject asserted at sign-in;
+   enabling SCIM makes provisioned active membership authoritative for human
+   login and mapped roles. There is no email fallback or silent migration of
+   existing Users. Tenant administrators must resolve incompatible subject
+   formats or existing accounts before enabling SCIM.
+9. OIDC and SAML are mutually exclusive choices for the one active tenant
+   human connection. Both feed the existing tenant User and Wyrd credential
+   authority. A SAML response selects no tenant from unverified assertion
+   data; server-bound request state chooses the tenant and connection.
 
 ## Acceptance criteria and evidence
 
@@ -295,14 +345,33 @@ outside this change.
 - **AC-009**: Public contracts, CLI help, UI, self-hosted and SaaS docs, and
   generated schemas agree on optional OIDC, setup inputs, callback, one active
   connection, credential ownership, and failure behavior.
+- **AC-010**: A real-server SCIM journey provisions, updates, suspends, and
+  removes users and groups for one tenant while another tenant remains
+  unchanged. A provisioned user signs in through its verified immutable
+  subject, receives only mapped current roles, and loses renewable authority
+  after suspension. Wrong-tenant, inactive, unprovisioned, replayed, and
+  email-match attempts grant no membership or role.
+- **AC-011**: A real-server SAML journey signs a tenant user in through a
+  qualified IdP and existing Wyrd browser/CLI credential path, including a
+  hosted two-tenant case. Invalid signature, issuer, audience, recipient,
+  destination, request binding, time, replay, inactive connection, or
+  transient NameID fails without issuing Wyrd authority. OIDC and machine
+  paths continue to work for their configured tenants and principals.
 
 ## Open material decisions
 
-None. Implementation and review may reveal a conflict requiring a new draft
-revision and human approval.
+Revision 6 needs human approval of its two durable choices: SCIM-managed
+tenants require provisioned active membership with `externalId` equal to the
+verified sign-in subject, and SAML is an alternative to OIDC for the tenant's
+one active human connection. Revision 5 remains the approved authority for
+TASK-001–005 until this draft is approved; TASK-006/007 are proposed only.
 
 ## Revision history
 
+- **Revision 6 — 2026-10-01 — draft**: Proposed two additional enterprise
+  integration tasks: SCIM provisioning and SAML SSO, both sharing existing
+  Wyrd identity and security authorities. Keeps revision 5 tasks intact
+  pending approval of the new identity-matching and active-connection rules.
 - **Revision 5 — 2026-09-26 — approved**: Approved the existing encrypted,
   short-lived, one-time browser/CLI credential handoff. Clarified that the
   deployment sealing keyring also protects recoverable login and browser
@@ -345,6 +414,11 @@ revision and human approval.
   [RFC 9700](https://www.rfc-editor.org/rfc/rfc9700.html), and
   [RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html): protocol and
   browser/native-client security guidance.
+- [SCIM 2.0 protocol](https://www.rfc-editor.org/rfc/rfc7644.html),
+  [SCIM core schema](https://www.rfc-editor.org/rfc/rfc7643.html),
+  [SAML browser SSO profile](https://docs.oasis-open.org/security/saml/v2.0/saml-profiles-2.0-os.pdf),
+  and [SAML metadata](https://docs.oasis-open.org/security/saml/v2.0/saml-metadata-2.0-os.pdf):
+  the separate enterprise provisioning and federation trust boundaries.
 - [OWASP Cryptographic Storage](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html)
   and [Secrets Management](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html):
   protection and management of stored credentials and deployment keys.

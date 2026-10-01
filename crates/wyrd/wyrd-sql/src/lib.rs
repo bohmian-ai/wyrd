@@ -185,8 +185,12 @@ impl OperatorPool {
     ///
     /// Only the one-off `wyrd-server migrate` calls this, on an operator pool
     /// it builds from the database-owner DSN; serving pools never hold that
-    /// credential. The connection is detached from the pool so its session
-    /// state, and the lock, never return to it. The wait is bounded by `wait`
+    /// credential. The connection is opened from the pool's options rather
+    /// than detached from it, so its session state and the lock never return
+    /// to the pool, and the pool never starts a background reconnect to
+    /// replace it: a reconnect stranded mid-login holds up every
+    /// `DROP DATABASE` in the cluster until authentication times out. The
+    /// wait is bounded by `wait`
     /// through the session's `lock_timeout`, which is reset once the lock is
     /// held so migrations run with the server default.
     ///
@@ -195,12 +199,9 @@ impl OperatorPool {
     /// lease after `wait`, and [`SqlError::Connect`] when the connection or a
     /// session statement fails.
     pub async fn migration_lease(&self, wait: Duration) -> Result<MigrationLease, SqlError> {
-        let mut session = self
-            .pool()
-            .acquire()
+        let mut session = PgConnection::connect_with(&self.pool().connect_options())
             .await
-            .map_err(SqlError::Connect)?
-            .detach();
+            .map_err(SqlError::Connect)?;
         sqlx::query(AssertSqlSafe(format!(
             "SET lock_timeout = '{}ms'",
             wait.as_millis().max(1)

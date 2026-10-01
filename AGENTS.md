@@ -445,7 +445,7 @@ gate` is the broad repository aggregate reserved for nightly, release, mixed,
 global, and unclassified changes.
 
 ```bash
-# Always run the relevant format and lint checks.
+# For scoped verification, run the relevant format and lint checks.
 mise run fmt           # Rust formatting
 mise run lints         # Rust clippy, workspace-wide
 mise run py:format     # if Python files changed
@@ -453,6 +453,8 @@ mise run py:lints      # if Python files changed
 ```
 
 Then run the narrowest `mise` test/check tasks that cover the touched surface.
+The broad `gate` includes its own format and lint checks; the scoped commands
+above are not additional final commands when `gate` is selected.
 `mise run <task>` is for module-, crate-, family-, environment-, or
 aggregate-level coverage. Every specifically named Rust, Python, or TypeScript
 test in a task artifact or implementation report must also include and run its
@@ -503,6 +505,13 @@ several ownership boundaries without a complete capability gate, changes shared
 CI/build/test infrastructure, prepares a release, or when the user explicitly
 asks for it. Unknown CI paths fail over to this broad gate rather than silently
 skipping proof.
+
+When `mise run gate` is the final aggregate, do not also prescribe or rerun its
+component `mise` lanes as final verification. Focused exact test commands still
+belong in Red-Green iteration and in reports that name those tests. Check
+`mise.toml` before claiming the aggregate covers a specialized lane; list and
+run a separate lane only when its required behavior is genuinely outside the
+aggregate, and state that gap.
 
 Real cloud storage integration tests (`test:storage:*:cloud`) run against live
 infrastructure separately.

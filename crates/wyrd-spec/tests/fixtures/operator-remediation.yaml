@@ -11,6 +11,8 @@ spec:
   kind: notify
   channel:
     kind: slack
+    connection: ops-slack
+    channel_id: C0123456789
     text: "Churn drift exceeded its configured threshold."
 
   budget:

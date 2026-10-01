@@ -258,17 +258,10 @@ impl<'a> VerificationControl<'a> {
             &resource,
         )
         .await?;
-        match self
+        let committed = self
             .enqueue(caller, request, key, &allowed, &resource)
-            .await
-        {
-            Ok(committed) => committed,
-            Err(uncommitted) => {
-                audit::record_audit(self.state.postgres.vala(), caller.data_tenant_id, &allowed)
-                    .await?;
-                Err(uncommitted)
-            }
-        }
+            .await;
+        audit::record_unless_committed(self.state, caller, &allowed, committed).await?
     }
 
     /// Run the manual request transaction and commit its decision.

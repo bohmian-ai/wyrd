@@ -1,0 +1,27 @@
+[package]
+name = "wyrd-vault"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+publish = false
+description = "Bounded, screened, and pinned HashiCorp Vault KV v2 reader shared by the gateway and Operator key reads."
+
+[dependencies]
+reqwest = { workspace = true }
+secrecy = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "time"] }
+url = { workspace = true }
+wyrd-tls = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }
+workspace-hack.workspace = true
+
+[lints]
+workspace = true

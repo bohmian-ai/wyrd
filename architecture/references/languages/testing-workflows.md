@@ -209,6 +209,11 @@ and unclassified changes own that cost. Capability-scoped changes run their
 complete `verify:<scope>` task; unknown paths conservatively fall back to
 `gate`.
 
+Use `gate` as one final aggregate: do not list or rerun its component `mise`
+lanes alongside it. Keep exact focused tests for Red-Green iteration. If a
+required specialized lane is not covered by the aggregate, verify that from
+`mise.toml` and list only that exception with its reason.
+
 Run all Cargo-backed commands sequentially across agents sharing a checkout or
 target directory. Parallel source work must not create overlapping Cargo
 builds, tests, lints, docs, or codegen processes.

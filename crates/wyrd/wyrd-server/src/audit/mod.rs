@@ -158,6 +158,29 @@ pub async fn record_audit(
     Ok(())
 }
 
+/// Pass a committed operation result through; when its transaction did not
+/// commit, record the already-allowed decision standalone so an evaluated
+/// permission is never lost, then return the operation's error.
+///
+/// Every error from an operation transaction means nothing committed,
+/// including its in-transaction append, so the decision is recorded exactly
+/// once here.
+///
+/// # Errors
+/// Returns [`WyrdError::AuditUnavailable`] when the standalone record fails,
+/// otherwise the uncommitted operation's own error.
+pub(crate) async fn record_unless_committed<T>(
+    state: &AppState,
+    caller: &Caller,
+    allowed: &AuditEvent,
+    result: Result<T, WyrdError>,
+) -> Result<T, WyrdError> {
+    if result.is_err() {
+        record_audit(state.postgres.vala(), caller.data_tenant_id, allowed).await?;
+    }
+    result
+}
+
 /// Appends one owned audit event in its own tenant-scoped transaction.
 ///
 /// This adapter keeps event and Vala-handle ownership inside transport

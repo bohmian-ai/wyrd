@@ -104,13 +104,28 @@ pub async fn read_bounded_body(mut response: Response) -> Result<Vec<u8>, BodyEr
 pub struct ScreenedHttp {
     /// The internal-range policy this deployment runs under.
     policy: AddressPolicy,
+    /// Whole-request timeout of every client this builds.
+    timeout: Duration,
 }
 
 impl ScreenedHttp {
     /// Bind screening to a deployment's address policy.
     #[must_use]
     pub const fn new(policy: AddressPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            timeout: FETCH_TIMEOUT,
+        }
+    }
+
+    /// The same policy with a different whole-request timeout.
+    ///
+    /// Provider fetches keep the ten-second default; an Operator delivery
+    /// attempt carries its own server-owned ceiling.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// The policy a development or single-tenant deployment runs under.
@@ -152,7 +167,7 @@ impl ScreenedHttp {
         // hostname and choose its own destination, bypassing the pinned,
         // screened addresses below.
         let builder = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
+            .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy();
 

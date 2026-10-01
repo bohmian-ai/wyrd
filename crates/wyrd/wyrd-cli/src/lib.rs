@@ -15,6 +15,7 @@ pub mod error;
 mod eval;
 pub mod gateway;
 pub mod load;
+mod operator_connection;
 mod platform;
 mod principal;
 #[cfg(feature = "python")]

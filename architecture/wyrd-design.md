@@ -1308,26 +1308,52 @@ Notify Operator *is* the alert.
 `NotifyChannel` (v1 set; closed tagged union; additional channels are
 protocol-versioned additions):
 
-| Channel     | Carries                                                                       |
-|-------------|-------------------------------------------------------------------------------|
-| `PagerDuty` | `severity`, `summary`, `dedup_key?: string`                                   |
-| `Slack`     | `text: string`                                                                |
+| Channel     | Carries                                                                            |
+|-------------|------------------------------------------------------------------------------------|
+| `Slack`     | `connection`, `channel_id`, `text` — `chat.postMessage` with the bot token; success is JSON `ok` |
+| `PagerDuty` | `connection`, `route`, `severity`, `summary`, `dedup_key?` — Events API v2 trigger; the default dedup key is the dispatch ID |
 
 `HttpMethod`: closed enum — `Get | Post | Put | Patch | Delete`.
 
-`HttpAuth` (closed tagged union):
-- `None`
-- `Bearer { env: string }` — `env` names a server-side env var holding the token
-- `Basic { env: string }` — env var holds `user:password`
-- `Header { name: string, env: string }` (covers `X-API-Key`,
-  `Authorization: token <foo>`)
+`HttpAuth` (closed tagged union; absent means no credential):
+- `Bearer { connection }`
+- `Basic { connection }`
+- `Header { name, connection }` (covers `X-API-Key`)
 
-Wyrd-the-server resolves `env` by reading the process environment at fire time;
-missing env vars fail the action closed. Cards never carry secret material.
-Notify channels (Slack/PagerDuty) and Source (S3/GCS/Azure) resolve their
-credentials from the server's own configuration — webhook URLs, routing keys,
-and object-store credentials live in the server's env or its operator config,
-not in the card.
+**Operator connections.** Cards never carry secret material; they name a
+tenant connection by provider and name. Tenant administrators manage
+connections through `/v1/operator-connections` (`operators:read` /
+`operators:write`) and every SDK, CLI, and MCP projection. Wyrd stores each
+secret itself in Postgres, envelope-encrypted: a per-row data key sealed with
+AAD binding tenant, connection, provider, name, and secret version, wrapped by
+a versioned key-encryption key from an environment variable, owner-only
+files, or HashiCorp Vault KV v2. Multi-tenant production requires Vault over
+HTTPS so each tenant has its own key, and fails startup if the provider or any
+active tenant's active 32-byte key is unavailable; environment keys are
+development-only, and owner-only key files may serve an explicitly
+single-tenant deployment. Without a readable key only connection
+create/update refuses; other surfaces keep working and delivery retries with
+`credential_store_unavailable`. Vault reads use the shared screened and
+pinned `wyrd-vault` KV v2 reader that Gateway also uses for provider
+credentials; only the Operator owner interprets and validates the KEK, and no
+general secret resolver backs Operator keys. Rewrap onto a new active version
+runs beside delivery in bounded, cancellable tenant-scoped passes. Responses, errors,
+logs, and audit carry only redacted metadata, never key locations. Registration
+and every delivery attempt require an active connection whose provider — and,
+for HTTP, auth scheme, header name, and origin of every effective URL —
+match; a mismatch fails closed with one indistinguishable error. Rotation
+takes effect on the next attempt with no Card revision.
+
+**Delivery.** A generic Operator worker takes a global (16) and per-tenant (4)
+permit, claims a due dispatch, re-checks authority, decrypts the latest
+credential for that attempt only, and screens and pins every destination
+address before a credential is attached; HTTP follows only same-origin
+redirects and sends `Idempotency-Key: <dispatch_id>`. Each attempt is bounded
+to 30 seconds; a dispatch gets three attempts with 30-second then two-minute
+backoff (or a longer provider `Retry-After`) inside a five-minute deadline.
+Connection failures, timeouts, credential-store outages, 408, 429, and 5xx
+retry; missing or unauthorized credentials, invalid destinations or
+templates, and other 4xx fail terminally. Delivery is at least once.
 
 `HttpBody`: structured JSON (`JsonValue`). Any string leaf may contain
 `{{...}}` placeholders the server interpolates at fire time. Same templating
@@ -1336,9 +1362,33 @@ applies to `Http.url` and to text fields in `NotifyChannel` variants.
 Templating context is one bounded, immutable failure context derived from
 the failed Verification Result: dispatch, run, result, and binding IDs; the
 exact Verifier and subject Card identities; the `failed` verdict; completion
-time; and a bounded result summary. It never carries raw observation context,
-media, feature rows, or secret material, and registration rejects unknown
-template fields. Exact field schema lives in OpenAPI.
+time; a bounded result summary; and one count block for the failed run's
+Verifier implementation (`verifier`, tagged by `implementation`). It never
+carries raw observation context, media, feature rows, feature names, Eval task
+detail, or secret material, and registration rejects unknown template fields.
+Exact field schema lives in OpenAPI.
+
+| Implementation | Template fields |
+|---|---|
+| any | `dispatch_id`, `run_id`, `result_id`, `binding_id`, `verifier_ref`, `verifier_uid`, `subject_ref`, `subject_uid`, `verdict`, `completed_at`, `summary` |
+| `drift` | `drift.drifted_features`, `drift.total_features` |
+| `eval` | `eval.passed_tasks`, `eval.failed_tasks`, `eval.total_tasks`, `eval.pass_rate_percent` (rounded down; `0` with no tasks) |
+
+Counts render as base-10 digits and come from the same result as `summary`.
+A standalone Operator Card may use fields of either implementation; a
+binding refuses an attached Operator (inline or referenced) that uses the
+other implementation's fields, naming the binding field path.
+
+```yaml
+# Drift Verifier's on_failure
+kind: notify
+channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
+           text: "{{drift.drifted_features}}/{{drift.total_features}} features drifted on {{subject_ref}} ({{verifier_ref}})" }
+# Eval Verifier's on_failure
+kind: notify
+channel: { kind: slack, connection: ops-slack, channel_id: C0123456789,
+           text: "{{subject_ref}} passed {{eval.passed_tasks}}/{{eval.total_tasks}} tasks ({{eval.pass_rate_percent}}%)" }
+```
 
 ---
 

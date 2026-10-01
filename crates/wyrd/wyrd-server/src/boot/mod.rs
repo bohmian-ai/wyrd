@@ -9,7 +9,6 @@ pub mod node_identity;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use base64::Engine;
 use futures_util::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
@@ -57,7 +56,8 @@ use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
 use crate::components::auth::{ServerAuth, ServerAuthz};
-use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
+use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
+use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
 use crate::oracle::{OraclePeerAuthority, OracleQueryAudit, PostgresPeerSecurityAudit};
 use crate::postgres::ServerPostgres;
 use crate::state::{
@@ -304,6 +304,12 @@ pub enum ServerBootError {
     /// The serving database URLs are missing or invalid.
     #[error(transparent)]
     Postgres(#[from] DsnError),
+    /// Operator connection keys could not be built, or a multi-tenant
+    /// production deployment could not read and decode an active tenant key.
+    /// Boot fails closed; the error names only the source kind, key version,
+    /// and failure class.
+    #[error("Operator connection keys are unavailable: {0}")]
+    OperatorKeys(#[from] KeyError),
     /// Pool construction, schema readiness, or a SQL operation failed.
     #[error(transparent)]
     Sql(#[from] wyrd_sql::error::SqlError),
@@ -1247,7 +1253,7 @@ pub struct BootedServer {
 /// production config has already returned `ConfigError::Invalid`. This function
 /// only surfaces development-profile warnings for the same signals so an operator
 /// running a relaxed dev profile sees them on stderr.
-pub fn production_guards(config: &crate::config::WyrdServerConfig) {
+pub fn production_guards(config: &WyrdServerConfig) {
     if config.deployment_profile.is_production() {
         return;
     }
@@ -1273,7 +1279,7 @@ pub fn production_guards(config: &crate::config::WyrdServerConfig) {
 /// Returns [`ServerBootError`] on database/storage/bifrost boot, auth handle
 /// construction, federation seeding, or production validation failure.
 pub async fn build_state(
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
     overrides: StateOverrides,
 ) -> Result<BootedServer, ServerBootError> {
@@ -1352,6 +1358,10 @@ pub async fn build_state(
         rollback_state_roles(&state).await;
         return Err(ServerBootError::ProductionValidation(error));
     }
+    if let Err(error) = verify_operator_keys(&state, config).await {
+        rollback_state_roles(&state).await;
+        return Err(error);
+    }
     Ok(BootedServer {
         state,
         coordination_runtime,
@@ -1385,9 +1395,7 @@ async fn rollback_state_roles(state: &AppState) {
 ///
 /// Returns [`ServerBootError::SigningKey`] when production has no configured
 /// key or development cannot generate an ephemeral Ed25519 key.
-fn resolve_signing_key(
-    config: &crate::config::WyrdServerConfig,
-) -> Result<SecretString, ServerBootError> {
+fn resolve_signing_key(config: &WyrdServerConfig) -> Result<SecretString, ServerBootError> {
     if let Some(signing_key) = &config.auth.signing_key {
         return Ok(signing_key.clone());
     }
@@ -1407,6 +1415,41 @@ fn resolve_signing_key(
     Ok(ephemeral)
 }
 
+/// Refuse startup of a multi-tenant production API server unless every
+/// active provisioned tenant's active Operator key reads and decodes.
+///
+/// Development and explicitly single-tenant (`auth.tenant_slug`) deployments
+/// keep their deferred failure: a missing key refuses only credential writes
+/// and deliveries.
+///
+/// # Errors
+/// Returns [`ServerBootError::OperatorKeys`] when the tenant directory is
+/// unavailable or any tenant's active key is unavailable, missing, malformed,
+/// or not 32 bytes.
+pub async fn verify_operator_keys(
+    state: &AppState,
+    config: &WyrdServerConfig,
+) -> Result<(), ServerBootError> {
+    if !(config.role.serves_api()
+        && config.deployment_profile.is_production()
+        && config.auth.tenant_slug.is_none())
+    {
+        return Ok(());
+    }
+    let keys = &state.operator_keys;
+    let directory = state
+        .postgres
+        .operator_pool()
+        .ok_or_else(|| keys.unavailable(keys.active_version(), KeyFailure::Database))?;
+    let tenants = keys.verify_active(&directory).await?;
+    tracing::info!(
+        tenants,
+        key_version = keys.active_version(),
+        "active Operator tenant keys verified"
+    );
+    Ok(())
+}
+
 /// Apply caller overrides to a built state. Factored out for unit testing
 /// without a live DB boot.
 fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
@@ -1422,7 +1465,7 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
 /// dispatch screens endpoints under the deployment profile. Pure/sync (no I/O).
 fn attach_config_fields(
     state: AppState,
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
 ) -> Result<AppState, ServerBootError> {
     let gateway_secret_keys = Arc::new(
@@ -1433,6 +1476,10 @@ fn attach_config_fields(
     );
     Ok(state
         .with_deployment_profile(config.deployment_profile)
+        .with_operator_keys(OperatorKeys::for_role(
+            config.role,
+            &config.verification.operator_keys,
+        )?)
         .with_telemetry(telemetry)
         .with_limits(config.limits.into_state())
         .with_gateway(config.gateway.clone())
@@ -1507,7 +1554,7 @@ pub async fn rewrap_sealed_secrets(
 /// signing key, or when key material is invalid.
 async fn install_auth(
     postgres: &ServerPostgres,
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
     signing_key: &SecretString,
     sealing_key: Option<Arc<SealingKeyring>>,
 ) -> Result<ServerAuth, ServerBootError> {
@@ -1995,7 +2042,7 @@ async fn release_failed_oracle_role(
 /// reference them by FK.
 async fn seed_federation(
     state: &AppState,
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
     sealing_key: Option<&SealingKeyring>,
 ) -> Result<(), ServerBootError> {
     // Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
@@ -2040,7 +2087,7 @@ async fn seed_federation(
 /// base64 or does not decode to exactly 32 bytes, or when retained keys are set
 /// without a write key.
 fn build_sealing_keyring(
-    config: &crate::config::WyrdServerConfig,
+    config: &WyrdServerConfig,
 ) -> Result<Option<Arc<SealingKeyring>>, ServerBootError> {
     let Some(encoded) = config.auth.sealing_key.as_ref() else {
         if config.auth.sealing_retained_keys.is_empty() {
@@ -2068,18 +2115,12 @@ fn build_sealing_keyring(
 /// Returns [`ServerBootError::SealingKey`] naming `label` (never the key) when
 /// the value is not base64 or not 32 bytes.
 fn decode_sealing_key(encoded: &SecretString, label: &str) -> Result<SecretKey, ServerBootError> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded.expose_secret())
-        .map_err(|error| {
-            ServerBootError::SealingKey(format!("{label} is not valid base64: {error}"))
-        })?;
-    let key: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+    crate::components::operators::keys::decode_key(encoded.expose_secret()).map_err(|failure| {
         ServerBootError::SealingKey(format!(
-            "{label} must decode to 32 bytes, got {}",
-            bytes.len()
+            "{label} must be base64 of exactly 32 bytes: {}",
+            failure.as_str()
         ))
-    })?;
-    Ok(SecretKey::from_bytes(key))
+    })
 }
 
 /// Map `[[workload_bindings]]` config entries to domain [`WorkloadBinding`]s, all

@@ -194,7 +194,7 @@ impl PyRun {
 
     /// Enter this view's ambient OpenTelemetry span correlation.
     ///
-    /// Delegates to `wyrd.otel`, which attaches this view's exact CardRef and
+    /// Delegates to `wyrd.otel`, which attaches this view's exact `CardRef` and
     /// `run_id` to Python's execution-local OpenTelemetry context, stamps an
     /// already-active recording span, and ensures the global provider has the
     /// Wyrd span processor. The token lives in that module's execution-local
@@ -224,13 +224,13 @@ impl PyRun {
     /// flush, shutdown, or durability acknowledgement.
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
     fn __exit__(
-        &self,
-        py: Python<'_>,
+        slf: &Bound<'_, Self>,
         _exc_type: Option<&Bound<'_, PyAny>>,
         _exc_value: Option<&Bound<'_, PyAny>>,
         _traceback: Option<&Bound<'_, PyAny>>,
     ) -> bool {
-        let _ = py
+        let _ = slf
+            .py()
             .import("wyrd.otel")
             .and_then(|otel| otel.call_method0("_exit_run"));
         false

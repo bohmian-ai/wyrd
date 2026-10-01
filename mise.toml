@@ -707,7 +707,7 @@ ui_selected_count() {
 run_ui() {
   pnpm --dir "$ui_dir" install --frozen-lockfile
   pnpm --dir "$ui_dir" build
-  for required in "production SSO crosses replicas" "OIDC-off credential UI"; do
+  for required in "production SSO crosses replicas" "OIDC-off credential UI" "production multi-provider tenant switch" "production provider replacement settings"; do
     count="$(ui_selected_count "$required")"
     if [ "$count" != 1 ]; then
       echo "UI identity journey '$required' selects $count tests; expected exactly 1" >&2

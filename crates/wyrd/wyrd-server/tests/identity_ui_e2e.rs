@@ -2,7 +2,10 @@
 //!
 //! Starts one real Wyrd server on a bound socket with the deployment BFF
 //! service key and public origin, seeds an SSO tenant (Active Keycloak
-//! connection) and an OIDC-off tenant (API keys only), starts two production
+//! connection), an OIDC-off tenant (API keys only), three switch tenants (two
+//! on the same Keycloak issuer, one on the second Keycloak realm, a distinct
+//! issuer), and a provider-replacement tenant (Active first realm, replaced by
+//! the second realm through the settings page), starts two production
 //! BFF processes (`node build`) against that same server and Postgres with the
 //! same public origin, and runs the Vitest HTTP journey
 //! `src/lib/server/auth/production-auth.integration.test.ts` against them. The
@@ -19,7 +22,7 @@ use std::time::Duration;
 
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
-use wyrd_testing::WyrdTestServerBuilder;
+use wyrd_testing::{WyrdTestServer, WyrdTestServerBuilder};
 
 /// Keycloak realm issuer the lane's compose service serves.
 fn keycloak_issuer() -> String {
@@ -27,10 +30,26 @@ fn keycloak_issuer() -> String {
         .unwrap_or_else(|_| "http://localhost:18080/realms/wyrd-test".to_owned())
 }
 
+/// The second Keycloak realm's issuer: a distinct provider whose `alice`
+/// shares the first realm's `alice` email.
+fn keycloak_second_issuer() -> String {
+    format!("{}-2", keycloak_issuer().trim_end_matches('/'))
+}
+
 /// The fixture SSO tenant's route key.
 const SSO_TENANT: &str = "test-tenant-1";
 /// The seeded OIDC-off tenant's route key.
 const API_KEY_TENANT: &str = "ui-oidc-off";
+/// Switch tenant whose Active connection is Keycloak.
+const SWITCH_KEYCLOAK_TENANT: &str = "ui-switch-keycloak";
+/// Switch tenant whose Active connection is the second Keycloak realm.
+const SWITCH_SECOND_TENANT: &str = "ui-switch-second";
+/// Switch tenant on the same Keycloak issuer and client as
+/// [`SWITCH_KEYCLOAK_TENANT`], for same-issuer cross-tenant refusal.
+const SWITCH_PEER_TENANT: &str = "ui-switch-peer";
+/// Tenant whose first-realm connection is replaced by the second realm
+/// through settings.
+const REPLACEMENT_TENANT: &str = "ui-replace";
 
 /// A BFF process killed when the journey ends, however it ends.
 struct Bff {
@@ -146,25 +165,43 @@ async fn access_token(server: &str, api_key: &str) -> String {
         .to_owned()
 }
 
-/// Stage, test, and activate the SSO tenant's public Keycloak connection,
-/// granting `admin` to `wyrd-admins` and `reader` to `wyrd-viewers`.
+/// The public Keycloak `wyrd-human` connection, granting `admin` to
+/// `wyrd-admins` and `reader` to `wyrd-viewers`.
+fn keycloak_connection() -> Value {
+    json!({
+        "issuer": keycloak_issuer(),
+        "client_id": "wyrd-human",
+        "client_auth": "Public",
+        "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
+        "group_role_map": { "wyrd-admins": ["admin"], "wyrd-viewers": ["reader"] },
+    })
+}
+
+/// The second realm's public `wyrd-human` connection, granting only `reader`
+/// to `wyrd-admins`: the same group name carries no administration here.
+fn second_realm_connection() -> Value {
+    json!({
+        "issuer": keycloak_second_issuer(),
+        "client_id": "wyrd-human",
+        "client_auth": "Public",
+        "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
+        "group_role_map": { "wyrd-admins": ["reader"] },
+    })
+}
+
+/// Stage, test, and activate `connection` as the tenant's Active human
+/// connection, using `admin_key` as both caller and recovery key.
 ///
 /// # Panics
 /// Panics when any step fails.
-async fn activate_sso(server: &str, admin_key: &str) {
+async fn activate_connection(server: &str, admin_key: &str, connection: Value) {
     let token = access_token(server, admin_key).await;
     let candidate = call(
         server,
         &token,
         reqwest::Method::PUT,
         "/v1/identity/oidc/candidate",
-        json!({
-            "issuer": keycloak_issuer(),
-            "client_id": "wyrd-human",
-            "client_auth": "Public",
-            "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
-            "group_role_map": { "wyrd-admins": ["admin"], "wyrd-viewers": ["reader"] },
-        }),
+        connection,
     )
     .await;
     let revision = candidate["revision"].clone();
@@ -184,6 +221,26 @@ async fn activate_sso(server: &str, admin_key: &str) {
         json!({ "expected_revision": revision, "recovery_api_key": admin_key }),
     )
     .await;
+}
+
+/// Seed tenant `slug` with a headless `admin` owner and activate `connection`
+/// for it; returns the owner's API key, the tenant's recovery credential.
+///
+/// # Panics
+/// Panics when seeding, bootstrapping, or activation fails.
+async fn sso_tenant(srv: &WyrdTestServer, server: &str, slug: &str, connection: Value) -> String {
+    let tenant = srv.seed_tenant(slug).await.expect("tenant seeds");
+    let owner = srv
+        .bootstrap_service_in_tenant(tenant, &format!("{slug}-owner"), &["admin"])
+        .await
+        .expect("tenant owner bootstraps");
+    let key = owner
+        .api_key()
+        .expect("owner key")
+        .expose_secret()
+        .to_owned();
+    activate_connection(server, &key, connection).await;
+    key
 }
 
 /// The production UI journey over two BFF replicas and one real server.
@@ -218,7 +275,7 @@ async fn production_ui_bff_journey() {
         .expect("admin key")
         .expose_secret()
         .to_owned();
-    activate_sso(&server, &sso_admin_key).await;
+    activate_connection(&server, &sso_admin_key, keycloak_connection()).await;
 
     let off = srv.seed_tenant(API_KEY_TENANT).await.expect("tenant seeds");
     let off_admin = srv
@@ -229,6 +286,18 @@ async fn production_ui_bff_journey() {
         .bootstrap_service_in_tenant(off, "ui-off-reader", &["reader"])
         .await
         .expect("oidc-off reader bootstraps");
+
+    sso_tenant(&srv, &server, SWITCH_KEYCLOAK_TENANT, keycloak_connection()).await;
+    sso_tenant(
+        &srv,
+        &server,
+        SWITCH_SECOND_TENANT,
+        second_realm_connection(),
+    )
+    .await;
+    sso_tenant(&srv, &server, SWITCH_PEER_TENANT, keycloak_connection()).await;
+    let replacement_owner_key =
+        sso_tenant(&srv, &server, REPLACEMENT_TENANT, keycloak_connection()).await;
 
     let first = start_bff(&origin, &server, &service_key).await;
     let second = start_bff(&origin, &server, &service_key).await;
@@ -242,6 +311,13 @@ async fn production_ui_bff_journey() {
         "ssoAdminKey": sso_admin_key,
         "offAdminKey": off_admin.api_key().expect("admin key").expose_secret(),
         "offReaderKey": off_reader.api_key().expect("reader key").expose_secret(),
+        "switchTenants": {
+            "keycloak": SWITCH_KEYCLOAK_TENANT,
+            "second": SWITCH_SECOND_TENANT,
+            "peer": SWITCH_PEER_TENANT,
+        },
+        "replacementTenant": REPLACEMENT_TENANT,
+        "replacementOwnerKey": replacement_owner_key,
         "users": {
             "admin": { "username": "alice", "password": "alice-password" },
             "reader": { "username": "bob", "password": "wyrd-test" },

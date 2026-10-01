@@ -452,7 +452,6 @@ impl TryFrom<proto::ReserveNodeSlotsResponse> for domain::ReserveNodeSlotsRespon
                         &value.reservation_id,
                         "reservation_id",
                     )?),
-                    expires_at: datetime(value.expires_at_unix_ms, "expires_at_unix_ms")?,
                 }))
             }
             proto::reserve_node_slots_response::Outcome::Rejected(value) => {
@@ -473,7 +472,6 @@ impl From<domain::ReserveNodeSlotsResponse> for proto::ReserveNodeSlotsResponse 
                 proto::reserve_node_slots_response::Outcome::Pending(
                     proto::PendingNodeReservation {
                         reservation_id: value.reservation_id.as_uuid().as_bytes().to_vec(),
-                        expires_at_unix_ms: unix_millis(value.expires_at),
                     },
                 )
             }
@@ -485,46 +483,6 @@ impl From<domain::ReserveNodeSlotsResponse> for proto::ReserveNodeSlotsResponse 
         };
         Self {
             outcome: Some(outcome),
-        }
-    }
-}
-
-impl TryFrom<proto::ReleaseNodeSlotsRequest> for domain::ReleaseNodeSlotsRequest {
-    type Error = PrivateConversionError;
-
-    /// Decodes the reservation, query, and fenced leader identity for release.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] when any supplied identifier is not
-    /// a valid UUID.
-    fn try_from(value: proto::ReleaseNodeSlotsRequest) -> Result<Self, Self::Error> {
-        Ok(Self {
-            reservation_id: domain::ReservationId::new(uuid_bytes(
-                &value.reservation_id,
-                "reservation_id",
-            )?),
-            query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
-            leader_node_id: domain::NodeId::new(uuid_string(
-                &value.leader_node_id,
-                "leader_node_id",
-            )?),
-            leader_fencing_token: value.leader_fencing_token,
-        })
-    }
-}
-
-impl From<domain::ReleaseNodeSlotsRequest> for proto::ReleaseNodeSlotsRequest {
-    /// Encodes the complete fenced identity of a reservation release.
-    ///
-    /// The typed context is stamped by the leader's transport after this
-    /// conversion, because it binds the digest of this encoding.
-    fn from(value: domain::ReleaseNodeSlotsRequest) -> Self {
-        Self {
-            context: None,
-            reservation_id: value.reservation_id.as_uuid().as_bytes().to_vec(),
-            query_id: value.query_id.as_uuid().as_bytes().to_vec(),
-            leader_node_id: value.leader_node_id.as_uuid().to_string(),
-            leader_fencing_token: value.leader_fencing_token,
         }
     }
 }
@@ -1430,16 +1388,16 @@ mod tests {
 
     /// Every private UUID byte field requires exactly 16 bytes.
     #[test]
-    fn release_slots_rejects_malformed_uuid_bytes() {
-        let request = proto::ReleaseNodeSlotsRequest {
-            reservation_id: vec![0; 15],
-            query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
-            leader_node_id: uuid::Uuid::now_v7().to_string(),
-            leader_fencing_token: 1,
-            context: None,
+    fn held_grant_rejects_malformed_uuid_bytes() {
+        let response = proto::ReserveNodeSlotsResponse {
+            outcome: Some(proto::reserve_node_slots_response::Outcome::Pending(
+                proto::PendingNodeReservation {
+                    reservation_id: vec![0; 15],
+                },
+            )),
         };
         assert!(matches!(
-            domain::ReleaseNodeSlotsRequest::try_from(request),
+            domain::ReserveNodeSlotsResponse::try_from(response),
             Err(PrivateConversionError::InvalidUuid("reservation_id"))
         ));
     }
@@ -1617,13 +1575,12 @@ mod tests {
         );
     }
 
-    /// Reservation outcomes, release, and execution requests round-trip.
+    /// Held-grant outcomes and execution requests round-trip.
     #[test]
     fn private_peer_messages_round_trip() {
         let reservation_id = domain::ReservationId::new(uuid::Uuid::now_v7());
         let outcome = domain::ReserveNodeSlotsResponse::Pending(domain::PendingNodeReservation {
             reservation_id,
-            expires_at: chrono::DateTime::from_timestamp_millis(100).expect("valid timestamp"),
         });
         assert_eq!(
             domain::ReserveNodeSlotsResponse::try_from(proto::ReserveNodeSlotsResponse::from(
@@ -1631,19 +1588,6 @@ mod tests {
             ))
             .expect("reservation outcome round-trips"),
             outcome
-        );
-        let release = domain::ReleaseNodeSlotsRequest {
-            reservation_id,
-            query_id: domain::QueryId::new(uuid::Uuid::now_v7()),
-            leader_node_id: domain::NodeId::new(uuid::Uuid::now_v7()),
-            leader_fencing_token: 9,
-        };
-        assert_eq!(
-            domain::ReleaseNodeSlotsRequest::try_from(proto::ReleaseNodeSlotsRequest::from(
-                release.clone()
-            ))
-            .expect("reservation release round-trips"),
-            release
         );
         let execute = domain::ExecuteFragmentRequest {
             context: domain::PeerContext {

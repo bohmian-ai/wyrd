@@ -707,6 +707,7 @@ impl PeerCluster {
             queued_queries: runtime.queued_queries,
             reserved_memory_bytes: runtime.reserved_memory_bytes,
             peer_running: runtime.peer_running,
+            held_grants: runtime.held_grants,
             root_active_queries: root.oracle_active_queries,
             root_analytical_queries: root.oracle_analytical_queries,
             root_query_memory_used_bytes: u64::try_from(root.oracle_query_memory_used_bytes)
@@ -1226,6 +1227,8 @@ pub(crate) struct OracleOwnershipSnapshot {
     pub(crate) reserved_memory_bytes: u64,
     /// Peer running reservations held by this Oracle.
     pub(crate) peer_running: u64,
+    /// Analytical graph grants a leader's admit stream still holds open.
+    pub(crate) held_grants: u64,
     /// Live Oracle query owners at the pod's resource root.
     pub(crate) root_active_queries: u32,
     /// Live analytical-class Oracle query owners at that root.
@@ -1255,6 +1258,7 @@ impl OracleOwnershipSnapshot {
         queued_queries: 0,
         reserved_memory_bytes: 0,
         peer_running: 0,
+        held_grants: 0,
         root_active_queries: 0,
         root_analytical_queries: 0,
         root_query_memory_used_bytes: 0,

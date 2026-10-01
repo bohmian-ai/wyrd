@@ -257,7 +257,7 @@ pub struct AuthenticatedFollowerContext<'a> {
     pub tenant_id: DataTenantId,
     /// Exact table binding recovered from checked context claims.
     pub table_binding: &'a TenantTableBinding,
-    /// Exact pending reservation owned by this receiver for the query.
+    /// Exact grant this receiver holds for the query on its leader's stream.
     pub reservation_id: &'a ReservationId,
     /// Leader incarnation recovered from checked context claims.
     pub leader_fence: OracleRoleFence,

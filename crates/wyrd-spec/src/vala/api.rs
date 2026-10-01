@@ -1656,10 +1656,11 @@ pub struct TailStreamIdentity {
     pub writer_epoch: WriterEpoch,
 }
 
-/// Fenced request to reserve one participant's capacity for a distributed graph.
+/// Fenced request opening one participant's held grant for a distributed graph.
 ///
-/// Every reservation charges exactly one query envelope, holding one slot unit,
-/// on the receiving node, so the request carries no demand of its own.
+/// Every grant charges exactly one query envelope, holding one slot unit, on
+/// the receiving node, so the request carries no demand of its own. The grant
+/// is held only while the leader keeps the request's stream open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ReserveNodeSlotsRequest {
@@ -1669,7 +1670,7 @@ pub struct ReserveNodeSlotsRequest {
     pub leader_node_id: NodeId,
     /// Leader Oracle-role fence.
     pub leader_fencing_token: FencingToken,
-    /// Reservation expiry.
+    /// Absolute query deadline; the follower ends the held grant stream here.
     pub expires_at: DateTime<Utc>,
     /// Distributed Analytical graph this reservation is taken for.
     ///
@@ -1692,14 +1693,12 @@ pub struct AnalyticalGraphRef {
     pub datafusion_query_id: uuid::Uuid,
 }
 
-/// Accepted pending worker reservation.
+/// Accepted grant, held by the leader's open stream rather than by an expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct PendingNodeReservation {
     /// Reservation identity.
     pub reservation_id: ReservationId,
-    /// Reservation expiry.
-    pub expires_at: DateTime<Utc>,
 }
 
 /// Capacity rejection with bounded caller backoff.
@@ -1714,24 +1713,10 @@ pub struct ReservationRejected {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ReserveNodeSlotsResponse {
-    /// Slots are pending context-bound execution.
+    /// The grant is held for as long as the leader keeps the stream open.
     Pending(PendingNodeReservation),
     /// Node lacked capacity.
     Rejected(ReservationRejected),
-}
-
-/// Idempotent fenced reservation-release request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct ReleaseNodeSlotsRequest {
-    /// Reservation identity.
-    pub reservation_id: ReservationId,
-    /// Query identity.
-    pub query_id: QueryId,
-    /// Leader node identity.
-    pub leader_node_id: NodeId,
-    /// Leader Oracle-role fence.
-    pub leader_fencing_token: FencingToken,
 }
 
 /// Unsigned typed operation context carried on the private peer plane.
@@ -2835,7 +2820,6 @@ mod bifrost_wire_tests {
     fn private_query_schema_types_do_not_panic() {
         let _ = schema_for!(super::ReserveNodeSlotsRequest);
         let _ = schema_for!(super::ReserveNodeSlotsResponse);
-        let _ = schema_for!(super::ReleaseNodeSlotsRequest);
         let _ = schema_for!(super::ExecuteFragmentRequest);
         let _ = schema_for!(super::WorkerAttemptFrame);
     }

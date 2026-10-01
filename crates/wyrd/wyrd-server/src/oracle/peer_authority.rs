@@ -282,10 +282,9 @@ impl OraclePeerAuthority {
     /// Order: bounds, the body digest over the exact bytes received, claims
     /// decode, every bound identity against the receiver-derived binding
     /// (operation, both nodes, both fences, query), then bounded expiry. No
-    /// reservation is taken or released before all of it passes. A duplicate
-    /// release is harmless because release is idempotent on the receiver's
-    /// reservation registry; a duplicate reserve creates only a pending
-    /// reservation that expires on its own TTL.
+    /// grant is taken before all of it passes. A replayed reserve can only open
+    /// a second grant stream, and that grant lives no longer than the stream
+    /// the replaying caller holds open.
     ///
     /// The body is the encoded request with its context field cleared, which
     /// is what both sides digest.
@@ -678,9 +677,9 @@ mod tests {
 
     /// A reservation context authorizes exactly one operation over one body.
     ///
-    /// A release context does not authorize a reserve even with every identity
-    /// matching, and a substituted request body is refused while every
-    /// identity still matches.
+    /// A context naming another operation does not authorize a reserve even
+    /// with every identity matching, and a substituted request body is refused
+    /// while every identity still matches.
     #[tokio::test]
     async fn reservation_contexts_are_operation_and_body_exact() {
         let (authority, audit) = authority();
@@ -700,20 +699,24 @@ mod tests {
             PeerSecurityError::Body
         );
 
-        let release = ReservationBinding {
-            operation: ReservationOperationV1::ReleaseSlots,
-            ..reservation_binding()
-        };
+        let mut foreign = ReservationTicketClaims::for_binding(
+            &binding,
+            reservation_body_digest(body).expect("reservation body digest"),
+            (Utc::now() + chrono::Duration::seconds(5)).timestamp_millis(),
+        );
+        foreign.operation = ReservationOperationV1::ReserveSlots.as_u32() + 1;
         assert_eq!(
             authority
                 .verify_reservation(
-                    &reservation_context(&release, body),
+                    &PeerContext {
+                        claims_bytes: foreign.encode_to_vec(),
+                    },
                     &binding,
                     body,
                     Utc::now()
                 )
                 .await
-                .expect_err("a release context does not authorize a reserve"),
+                .expect_err("a context for another operation does not authorize a reserve"),
             PeerSecurityError::Operation
         );
         let stale = ReservationBinding {

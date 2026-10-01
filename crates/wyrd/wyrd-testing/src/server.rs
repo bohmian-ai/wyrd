@@ -279,6 +279,8 @@ pub struct OracleRuntimeInspection {
     pub reserved_memory_bytes: u64,
     /// Peer reservations executing worker streams.
     pub peer_running: u64,
+    /// Analytical graph grants a leader's admit stream still holds open.
+    pub held_grants: u64,
     /// Oracle audit outbox commits still in flight.
     pub audit_pending: u64,
     /// Active Oracle-owned process/query scratch directories.
@@ -1358,6 +1360,7 @@ impl WyrdTestServer {
             queued_queries: admission.queued_queries,
             reserved_memory_bytes: admission.reserved_memory_bytes,
             peer_running: admission.peer_running,
+            held_grants: admission.held_grants,
             audit_pending: audit_pending as u64,
             spill_directories,
             spill_files,

@@ -11,8 +11,7 @@ use vala_bifrost_redux::oracle::codec::{
 };
 use vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION;
 use vala_bifrost_redux::oracle::peer::{
-    PeerTicketClaims, ReservationBinding, ReservationOperationV1, assignment_authority_digest_for,
-    reservation_body_digest,
+    PeerTicketClaims, ReservationBinding, assignment_authority_digest_for, reservation_body_digest,
 };
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::{
@@ -66,7 +65,7 @@ async fn prove_peer_context_refusals() -> Result<(), PeerJourneyError> {
     a_cluster_member_reaches_both_adapters(&cluster, &destination).await?;
     first_frame_layout_does_not_change_admission(&cluster, &destination).await?;
     let plane = ReservationPlane::observe(&cluster).await?;
-    the_correct_context_is_accepted(&cluster, &plane).await?;
+    an_abandoned_grant_returns_the_follower_to_baseline(&cluster, &plane).await?;
     every_bound_identity_must_match(&cluster, &plane).await?;
     worker_discovery_is_always_refused(&cluster, &plane).await?;
     a_foreign_tenant_context_reads_no_scribe_rows(&cluster, &plane).await?;
@@ -139,22 +138,31 @@ async fn first_frame_layout_does_not_change_admission(
     Ok(())
 }
 
-/// The reservation context the leader would send is accepted and released.
+/// A leader that admits a grant and abandons its plan leaves the follower clean.
 ///
-/// This is the baseline that makes every refusal below attributable to its
-/// one deviation rather than to a context the follower never accepts. The
-/// accepted reservation is then released exactly as its leader would release
-/// it, so the follower returns every charged unit rather than holding a
-/// reservation no leader will ever claim.
+/// The correct context is the baseline that makes every refusal below
+/// attributable to its one deviation. It is also the exact shape of an
+/// abandoned plan: the leader opens the grant stream, receives `Pending`, and
+/// never sends a stage. While the stream is open the follower holds the grant
+/// and its query envelope; the moment the stream closes the follower must
+/// return to its pre-grant baseline — no held grant, no query runtime or
+/// governed memory, no spill directory — without waiting for the grant's
+/// query deadline, which is set far beyond the observation bound.
 ///
 /// # Errors
 ///
-/// Returns a message when the follower refuses the correct reserve or release
-/// context, or still charges units after the release.
-async fn the_correct_context_is_accepted(
+/// Returns a message when the follower refuses the correct context, does not
+/// hold the grant and its envelope on the open stream, or does not return to
+/// its baseline promptly after the close.
+async fn an_abandoned_grant_returns_the_follower_to_baseline(
     cluster: &PeerCluster,
     plane: &ReservationPlane,
 ) -> Result<(), PeerJourneyError> {
+    let ownership_before = cluster.ownership_snapshot(1)?;
+    let spill_before = cluster
+        .server(1)?
+        .oracle_runtime_inspection()?
+        .spill_directories;
     let query_id = uuid::Uuid::new_v4();
     let request = proto::ReserveNodeSlotsRequest::decode(
         stamped(
@@ -169,25 +177,61 @@ async fn the_correct_context_is_accepted(
             .connect()
             .await?,
     );
-    let accepted = client
+    let mut grant = client
         .reserve_slots(request)
         .await
         .map_err(|status| format!("a correct reserve context was refused with {status}"))?
         .into_inner();
-    let Some(proto::reserve_node_slots_response::Outcome::Pending(pending)) = accepted.outcome
-    else {
+    let accepted = grant
+        .message()
+        .await
+        .map_err(|status| format!("the grant stream failed before its verdict: {status}"))?
+        .ok_or("the grant stream closed before its verdict")?;
+    let Some(proto::reserve_node_slots_response::Outcome::Pending(_)) = accepted.outcome else {
         return Err(format!("a correct reserve context was not held: {accepted:?}").into());
     };
-    client
-        .release_slots(plane.release_request(pending.reservation_id, query_id)?)
-        .await
-        .map_err(|status| format!("a correct release context was refused with {status}"))?;
-    let held = cluster.ownership_snapshot(1)?.peer_running;
-    if held != 0 {
-        return Err(format!("the follower still charges {held} units after release").into());
+    let held = cluster.ownership_snapshot(1)?;
+    if held.held_grants != ownership_before.held_grants + 1
+        || held.root_analytical_queries != ownership_before.root_analytical_queries + 1
+    {
+        return Err(format!(
+            "the open stream does not hold exactly one grant and its envelope: {held:?}"
+        )
+        .into());
     }
-    Ok(())
+
+    // The abandonment: the leader drops its stream and sends nothing else.
+    drop(grant);
+    let deadline = tokio::time::Instant::now() + GRANT_CLOSE_DEADLINE;
+    loop {
+        let ownership = cluster.ownership_snapshot(1)?;
+        let spill = cluster
+            .server(1)?
+            .oracle_runtime_inspection()?
+            .spill_directories;
+        if ownership == ownership_before && spill == spill_before {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "after its leader abandoned the grant the follower holds {ownership:?} with \
+                 {spill} spill directories, not its {ownership_before:?} with {spill_before}"
+            )
+            .into());
+        }
+        tokio::time::sleep(GRANT_CLOSE_POLL).await;
+    }
 }
+
+/// Bound on the follower observing a closed grant stream.
+///
+/// A stream close reaches the follower as an HTTP/2 reset within one round
+/// trip, so this is generous by orders of magnitude and far below the grant's
+/// own query deadline, which would otherwise be what freed it.
+const GRANT_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Interval between ownership reads while a stream close propagates.
+const GRANT_CLOSE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Whether a probe outcome is a context refusal rather than an admission.
 fn is_refusal(outcome: &str) -> bool {
@@ -247,12 +291,6 @@ async fn every_bound_identity_must_match(
                 binding.query_id = foreign;
             }),
         ),
-        (
-            "a context built for the release operation",
-            Box::new(|binding: &mut ReservationBinding| {
-                binding.operation = ReservationOperationV1::ReleaseSlots;
-            }),
-        ),
     ];
     for (description, deviate) in deviations {
         let query_id = uuid::Uuid::new_v4();
@@ -265,7 +303,7 @@ async fn every_bound_identity_must_match(
         }
     }
 
-    let claim_deviations: [(&str, ClaimsDeviation); 2] = [
+    let claim_deviations: [(&str, ClaimsDeviation); 3] = [
         ("an expired context", |claims| {
             claims.expires_at_ms =
                 (chrono::Utc::now() - chrono::Duration::seconds(1)).timestamp_millis();
@@ -274,6 +312,12 @@ async fn every_bound_identity_must_match(
             "a context from an incompatible protocol version",
             |claims| {
                 claims.protocol_version = claims.protocol_version.wrapping_add(1);
+            },
+        ),
+        (
+            "a context for an operation this entry point does not implement",
+            |claims| {
+                claims.operation = claims.operation.wrapping_add(1);
             },
         ),
     ];

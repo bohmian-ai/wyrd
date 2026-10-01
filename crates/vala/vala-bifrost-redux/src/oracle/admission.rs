@@ -771,6 +771,7 @@ impl OracleAdmission {
             reserved_memory_bytes: u64::try_from(self.shared.resources.shared_memory_reserved())
                 .unwrap_or(u64::MAX),
             peer_running: self.shared.resources.live_slot_units(),
+            held_grants: 0,
         }
     }
 

@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 24
+revision: 25
 status: approved
 ---
 
@@ -317,16 +317,26 @@ workspace cannot refuse or invalidate the acknowledged write.
 Scribe live followers use the receiving pod's shared governed DataFusion pool
 and the leader-owned stream lifetime without a separate follower permit or
 estimated memory pool. Oracle metadata reads hold no fixed 40-MiB memory slot;
-retained decoded metadata is charged by actual held bytes. Oracle peers keep
-the receiving pod's real running-slot reservation because several leaders can
-send work to one pod. The only work an Oracle peer reserves or runs is one
-distributed Analytical graph; there is no separate fragment-worker path or
-worker quantum. Every query holds exactly one slot unit on each node it runs
-on, whatever its class, so the class selects capacity rules and never the
-charge. They do not maintain another peer-waiter limit or poll
-for slots: a genuine pre-accept capacity refusal carries retry timing, and
-only the leader may retry it within the same query deadline. Ambiguous or
-accepted work is never retried as a capacity refusal.
+retained decoded metadata is charged by actual held bytes. Oracle peers charge
+the receiving pod's real running slot because several leaders can send work to
+one pod. The only work an Oracle peer admits or runs is one distributed
+Analytical graph; there is no separate fragment-worker path or worker quantum.
+Every query holds exactly one slot unit on each node it runs on, whatever its
+class, so the class selects capacity rules and never the charge.
+
+A follower never outlives its leader. The leader's stream owns every grant a
+follower holds for its graph: slot, memory, scratch, query runtime and spill
+directory, task cache entries, and tasks. A follower takes no capacity before
+it accepts that stream; it admits the graph on accept or refuses at once.
+There is no pending reservation, reservation expiry, or reclaim-by-timeout.
+When the leader stream completes, fails, is cancelled, or is dropped, or the
+deadline passes, the follower cancels the graph immediately and releases every
+grant once its tasks have joined. Cleanup that cannot be confirmed stays
+observable and is never reported as free capacity. Peers do not maintain
+another peer-waiter limit or poll for slots: a genuine capacity refusal at
+stream accept carries retry timing, and only the leader may retry it within
+the same query deadline. Ambiguous or accepted work is never retried as a
+capacity refusal.
 
 The existing node-wide storage-I/O concurrency bound remains a work bound,
 not a query admission or memory charge. A request waits for I/O capacity under
@@ -462,7 +472,8 @@ publish within the configured retention of their last write.
 - **INV-008:** Only held bytes count toward the shared memory cap, apart from
   the one transferred, temporary OTLP decoder charge for allocations Wyrd
   cannot observe before decoding. Work bounds never masquerade as memory
-  charges. Accepted peer reservations retain actual receiving-node slots;
+  charges. A follower's receiving-node slot and every other follower grant
+  belong to the leader stream and end with it;
   storage-I/O waits and leader retries remain within the original operation
   or query deadline. Write ACK and query terminal rules are unchanged.
 - **INV-009:** Removing telemetry cannot change authorization, durability,
@@ -559,8 +570,12 @@ REQ-015's removal of the tenant column and its footer tenant record.
   restart. Concurrent footer and storage reads do not fail solely because a
   fixed footer slot or momentarily occupied I/O permit refused immediately.
   Multiple leaders cannot exceed a receiving Oracle's running slots; a
-  pre-accept peer refusal is retried only by its leader within the unchanged
-  deadline, while ambiguous work is never replayed. Focused ownership tests,
+  stream-accept peer refusal is retried only by its leader within the unchanged
+  deadline, while ambiguous work is never replayed. A follower holds no
+  capacity before it accepts a leader stream, and when the leader stream
+  closes or the leader abandons the query mid-plan, the follower returns to
+  its baseline ownership — slots, memory, query runtimes, and spill
+  directories — without any later request or timer. Focused ownership tests,
   real-server write/read and peer journeys, and the standard mixed benchmark
   prove the rule.
 - **AC-014:** Captured success and failure traces for a Scribe write and
@@ -597,7 +612,7 @@ REQ-015's removal of the tenant column and its footer tenant record.
 
 ## Open material decisions
 
-None. Revisions 22 through 24 were explicitly approved by the user on 2026-10-01.
+None. Revisions 22 through 25 were explicitly approved by the user on 2026-10-01.
 Revision 20 was explicitly approved by the user on 2026-09-30.
 Revision 17's single execution path and one-unit slot charge were
 explicitly approved by the user on 2026-09-30. Revision 16's per-query memory limit, 4 GiB pod floor, and governed
@@ -748,6 +763,14 @@ on 2026-09-28.
   latency targets are unchanged; the memory ceiling is the limit less the
   1-GiB default headroom (15 GiB). Approved by the user on 2026-10-01
   ("Run 8/16 and replace 4/8. Scale benchmarks accordingly").
+- Revision 25 (2026-10-01): Deletes the pre-stream Oracle peer reservation.
+  A follower admits its graph only when it accepts the leader's stream, and
+  that stream owns every follower grant, so a follower never outlives its
+  leader. Follows the diagnosis that an abandoned reservation kept a
+  follower's slot and query runtime, including its spill directory, until
+  its 2-second expiry was noticed by a later request. Approved by the user on
+  2026-10-01 ("we will fix the problem in this task"; "followers never
+  outlive leaders").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

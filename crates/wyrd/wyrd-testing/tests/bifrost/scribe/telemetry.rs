@@ -12,14 +12,16 @@ use std::collections::BTreeSet;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_telemetry::CapturedSpan;
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::bifrost::shared_process_telemetry_for_test;
 use wyrd_testing::bifrost::telemetry::{
     BifrostMetricKind, BifrostMetricSample, BifrostTelemetryCapture, BifrostTelemetryDelta,
 };
+use wyrd_testing::bifrost::{
+    BifrostClusterSpec, WyrdTestCluster, shared_process_telemetry_for_test,
+};
 
 use super::support::{
-    append_values, await_persistence_drained, register_table, sorted_values, tenant_client,
-    unique_table,
+    append_values, await_persistence_drained, published_rows, register_table, sorted_values,
+    tenant_client, unique_table,
 };
 
 /// Longest a settled pod may take to retire the members its publication replaced.
@@ -166,6 +168,170 @@ async fn await_settled(server: &WyrdTestServer, telemetry: &BifrostTelemetryCapt
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// Scrapes the four staged-backlog gauges and pairs them with the owner's backlog.
+///
+/// Prints one evidence line naming the phase, the scraped values, and the
+/// staging owner's values, so the run's output records the production samples
+/// beside the fact they are compared with.
+///
+/// # Panics
+///
+/// Panics when the recorder cannot render, the owner is not inspectable, or
+/// the scraped gauges disagree with the owner's backlog.
+fn scrape_staging(
+    server: &WyrdTestServer,
+    telemetry: &BifrostTelemetryCapture,
+    phase: &str,
+) -> [Option<f64>; 4] {
+    let samples = telemetry.snapshot().expect("production metrics render");
+    let scraped = STAGING_GAUGES.map(|family| gauge(&samples, family));
+    let owner = server
+        .scribe_staging_backlog_for_test()
+        .expect("the pod's staged backlog is inspectable");
+    let expected = [
+        Some(owner.live_members as f64),
+        Some(owner.live_bytes as f64),
+        Some(
+            owner
+                .oldest_ready_at
+                .map_or(0.0, |ready_at| ready_at.timestamp() as f64),
+        ),
+        Some(owner.outstanding_claims as f64),
+    ];
+    eprintln!("evidence staged_backlog phase={phase} scraped={scraped:?} owner={owner:?}");
+    assert_eq!(
+        scraped, expected,
+        "{phase}: the scraped staging gauges equal the staging owner's backlog"
+    );
+    scraped
+}
+
+/// Staged backlog survives an abrupt restart and settles after publication.
+///
+/// A one-node cluster acknowledges a known batch and freezes it into durable
+/// staging, below the object target and before its dwell, without requesting
+/// publication. The production Prometheus exposition then shows nonzero
+/// members and bytes and a persisted oldest ready time. The node is killed
+/// without a drain and replaced over its retained roots. Before publication is
+/// requested, the replacement's exposition still shows nonzero members and
+/// bytes, the same oldest ready time, and the claims the restored owner
+/// actually holds, and the client still reads every acknowledged row. A
+/// resent batch inserts nothing. Publication then commits the rows once and
+/// the backlog and claim gauges reach zero.
+///
+/// The recorder is process-global and survives the in-process restart, so an
+/// unchanged value here cannot prove the replacement re-emitted it; the
+/// fresh-recorder `restored_stage_republishes_backlog` test proves emission
+/// origin. This journey proves exposition, readback, and settlement.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, terminate, or restart the node, when
+/// a public append, read, or publication fails, or when a scrape disagrees with
+/// the staging owner, the persisted ready time, or the committed files.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn staged_backlog_survives_abrupt_restart() {
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let telemetry = cluster.telemetry().clone();
+    let tenant = cluster.data_tenant_id();
+    let name = unique_table("staged_restart");
+    let table = format!("{}.{name}", BifrostNamespace::Datasets.as_str());
+    let rows: Vec<i64> = (0..48).collect();
+    let batch_id = uuid::Uuid::now_v7();
+    let (node, before) = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        register_table(server, tenant, BifrostNamespace::Datasets, &name).await;
+        let client = tenant_client(server, tenant).await;
+        append_values(&client, &table, batch_id, &rows)
+            .await
+            .expect("the batch is acknowledged");
+        let scribe = server.bifrost_scribe().expect("the pod owns a Scribe");
+        scribe
+            .flush_writable_for_test()
+            .await
+            .expect("every writable bucket freezes");
+        await_persistence_drained(&scribe).await;
+        assert_eq!(
+            published_rows(server, tenant, &name).await,
+            0,
+            "the staged rows wait below the object target and dwell"
+        );
+        (
+            server.node_id(),
+            scrape_staging(server, &telemetry, "staged before restart"),
+        )
+    };
+    let [Some(members), Some(bytes), Some(oldest), _] = before else {
+        panic!("every staging gauge is exposed: {before:?}");
+    };
+    assert!(members > 0.0 && bytes > 0.0 && oldest > 0.0, "{before:?}");
+
+    let roots = cluster
+        .terminate_node_abruptly_for_test(node)
+        .await
+        .expect("the pod is terminated without a drain");
+    cluster
+        .restart_terminated_node_at_new_address(node, roots)
+        .await
+        .expect("a replacement pod restarts on the retained roots");
+    let server = cluster.server(0).expect("the replacement pod is running");
+    let restored = scrape_staging(server, &telemetry, "restored before publication");
+    let [Some(members), Some(bytes), Some(restored_oldest), _] = restored else {
+        panic!("every staging gauge is exposed after restart: {restored:?}");
+    };
+    assert!(members > 0.0 && bytes > 0.0, "{restored:?}");
+    assert_eq!(
+        restored_oldest, oldest,
+        "the restored backlog keeps its persisted oldest ready time"
+    );
+    let client = tenant_client(server, tenant).await;
+    assert_eq!(
+        sorted_values(&client, &table).await,
+        rows,
+        "the restored pod serves every acknowledged row before publication"
+    );
+
+    let resend = checkpoint(&telemetry);
+    append_values(&client, &table, batch_id, &rows)
+        .await
+        .expect("a resent acknowledged batch is acknowledged");
+    let resent = telemetry.delta_since(&resend).expect("resend window");
+    let inserted = delta_value(
+        &resent,
+        "bifrost_scribe_memtable_rows_inserted_total",
+        BifrostMetricKind::Counter,
+    );
+    eprintln!("evidence staged_backlog phase=resend rows_inserted_delta={inserted}");
+    assert_eq!(
+        inserted, 0.0,
+        "a resent batch does not claim a second insertion"
+    );
+
+    server
+        .flush_bifrost()
+        .await
+        .expect("the restored rows publish");
+    await_settled(server, &telemetry).await;
+    let settled = scrape_staging(server, &telemetry, "settled after publication");
+    assert_eq!(settled, [Some(0.0); 4], "backlog and claims settle to zero");
+    let committed = published_rows(server, tenant, &name).await;
+    eprintln!("evidence staged_backlog phase=published committed_rows={committed}");
+    assert_eq!(
+        committed,
+        rows.len() as u64,
+        "the committed files hold every acknowledged row exactly once"
+    );
+    assert_eq!(sorted_values(&client, &table).await, rows);
+
+    cluster
+        .shutdown()
+        .await
+        .expect("the cluster drains cleanly");
 }
 
 /// Scribe's production telemetry reconciles with its durable owners.

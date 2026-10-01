@@ -3,9 +3,9 @@
 //! Starts one real Wyrd server on a bound socket with the deployment BFF
 //! service key and public origin, seeds an SSO tenant (Active Keycloak
 //! connection), an OIDC-off tenant (API keys only), three switch tenants (two
-//! on the same Keycloak issuer, one on the second Keycloak realm, a distinct
-//! issuer), and a provider-replacement tenant (Active first realm, replaced by
-//! the second realm through the settings page), starts two production
+//! on the same Keycloak issuer, one on Dex, a different provider), and a
+//! provider-replacement tenant (Active first realm, replaced by the second
+//! Keycloak realm through the settings page), starts two production
 //! BFF processes (`node build`) against that same server and Postgres with the
 //! same public origin — the first over loopback HTTP, the second only through
 //! a Node TLS terminator whose certificate the repository's test CA issues and
@@ -16,6 +16,10 @@
 //!
 //! Ignored so the family lanes, which start no identity provider or BFF, skip
 //! it visibly; `mise run test:identity:journey` builds the UI and runs it.
+//!
+//! Every connection is activated as a deployment would: staged, tested
+//! through one real provider sign-in returned to the server's callback, and
+//! activated with the tenant's recovery key.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -25,7 +29,7 @@ use std::time::Duration;
 use secrecy::ExposeSecret as _;
 use serde_json::{Value, json};
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
-use wyrd_testing::{WyrdTestServer, WyrdTestServerBuilder};
+use wyrd_testing::{WyrdTestServer, WyrdTestServerBuilder, provider_sign_in};
 
 /// Keycloak realm issuer the lane's compose service serves.
 fn keycloak_issuer() -> String {
@@ -33,11 +37,20 @@ fn keycloak_issuer() -> String {
         .unwrap_or_else(|_| "http://localhost:18080/realms/wyrd-test".to_owned())
 }
 
-/// The second Keycloak realm's issuer: a distinct provider whose `alice`
-/// shares the first realm's `alice` email.
-fn keycloak_second_issuer() -> String {
-    format!("{}-2", keycloak_issuer().trim_end_matches('/'))
+/// Dex issuer the lane's compose service serves: the journey's second,
+/// different provider.
+fn dex_issuer() -> String {
+    std::env::var("WYRD_DEX_ISSUER").unwrap_or_else(|_| "http://localhost:5556".to_owned())
 }
+
+/// A provider account a connection test signs in as: `(username, password)`.
+type ProviderUser = (&'static str, &'static str);
+
+/// Keycloak's `alice`, present in both realms.
+const KEYCLOAK_ALICE: ProviderUser = ("alice", "alice-password");
+
+/// Dex's static password-database user.
+const DEX_ALICE: ProviderUser = ("alice@wyrd.test", "wyrd-test");
 
 /// The fixture SSO tenant's route key.
 const SSO_TENANT: &str = "test-tenant-1";
@@ -45,7 +58,7 @@ const SSO_TENANT: &str = "test-tenant-1";
 const API_KEY_TENANT: &str = "ui-oidc-off";
 /// Switch tenant whose Active connection is Keycloak.
 const SWITCH_KEYCLOAK_TENANT: &str = "ui-switch-keycloak";
-/// Switch tenant whose Active connection is the second Keycloak realm.
+/// Switch tenant whose Active connection is Dex.
 const SWITCH_SECOND_TENANT: &str = "ui-switch-second";
 /// Switch tenant on the same Keycloak issuer and client as
 /// [`SWITCH_KEYCLOAK_TENANT`], for same-issuer cross-tenant refusal.
@@ -252,24 +265,27 @@ fn keycloak_connection() -> Value {
     })
 }
 
-/// The second realm's public `wyrd-human` connection, granting only `reader`
-/// to `wyrd-admins`: the same group name carries no administration here.
-fn second_realm_connection() -> Value {
+/// The public Dex `wyrd-human` connection. Dex asserts no groups, so its
+/// users hold no roles.
+fn dex_connection() -> Value {
     json!({
-        "issuer": keycloak_second_issuer(),
+        "issuer": dex_issuer(),
         "client_id": "wyrd-human",
         "client_auth": "Public",
-        "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
-        "group_role_map": { "wyrd-admins": ["reader"] },
+        "claim_mapping": { "subject": "sub", "email": "email" },
     })
 }
 
 /// Stage, test, and activate `connection` as the tenant's Active human
 /// connection, using `admin_key` as both caller and recovery key.
 ///
+/// The test returns a provider authorization URL; `user` signs in there, and
+/// the provider's return is sent to the server's `/auth/callback` as the
+/// gateway routes it, which marks the candidate tested before activation.
+///
 /// # Panics
 /// Panics when any step fails.
-async fn activate_connection(server: &str, admin_key: &str, connection: Value) {
+async fn activate_connection(server: &str, admin_key: &str, connection: Value, user: ProviderUser) {
     let token = access_token(server, admin_key).await;
     let candidate = call(
         server,
@@ -280,7 +296,7 @@ async fn activate_connection(server: &str, admin_key: &str, connection: Value) {
     )
     .await;
     let revision = candidate["revision"].clone();
-    call(
+    let begun = call(
         server,
         &token,
         reqwest::Method::POST,
@@ -288,6 +304,30 @@ async fn activate_connection(server: &str, admin_key: &str, connection: Value) {
         json!({ "expected_revision": revision }),
     )
     .await;
+    let authorization_url: reqwest::Url = begun["authorization_url"]
+        .as_str()
+        .expect("test returns an authorization URL")
+        .parse()
+        .expect("authorization URL parses");
+    let (_, callback) = authorization_url
+        .query_pairs()
+        .find(|(name, _)| name == "redirect_uri")
+        .expect("the sign-in names the deployment callback");
+    let returned = provider_sign_in(&authorization_url, user.0, user.1, &callback).await;
+    let reply = reqwest::Client::new()
+        .get(format!(
+            "{server}/auth/callback?{}",
+            returned.query().unwrap_or_default()
+        ))
+        .send()
+        .await
+        .expect("callback answers");
+    let status = reply.status();
+    let page = reply.text().await.unwrap_or_default();
+    assert!(
+        status.is_success() && page.contains("Connection test complete"),
+        "the test sign-in completes: {status} {page}"
+    );
     call(
         server,
         &token,
@@ -299,11 +339,18 @@ async fn activate_connection(server: &str, admin_key: &str, connection: Value) {
 }
 
 /// Seed tenant `slug` with a headless `admin` owner and activate `connection`
-/// for it; returns the owner's API key, the tenant's recovery credential.
+/// for it, testing it as `user`; returns the owner's API key, the tenant's
+/// recovery credential.
 ///
 /// # Panics
 /// Panics when seeding, bootstrapping, or activation fails.
-async fn sso_tenant(srv: &WyrdTestServer, server: &str, slug: &str, connection: Value) -> String {
+async fn sso_tenant(
+    srv: &WyrdTestServer,
+    server: &str,
+    slug: &str,
+    connection: Value,
+    user: ProviderUser,
+) -> String {
     let tenant = srv.seed_tenant(slug).await.expect("tenant seeds");
     let owner = srv
         .bootstrap_service_in_tenant(tenant, &format!("{slug}-owner"), &["admin"])
@@ -314,7 +361,7 @@ async fn sso_tenant(srv: &WyrdTestServer, server: &str, slug: &str, connection: 
         .expect("owner key")
         .expose_secret()
         .to_owned();
-    activate_connection(server, &key, connection).await;
+    activate_connection(server, &key, connection, user).await;
     key
 }
 
@@ -351,7 +398,13 @@ async fn production_ui_bff_journey() {
         .expect("admin key")
         .expose_secret()
         .to_owned();
-    activate_connection(&server, &sso_admin_key, keycloak_connection()).await;
+    activate_connection(
+        &server,
+        &sso_admin_key,
+        keycloak_connection(),
+        KEYCLOAK_ALICE,
+    )
+    .await;
 
     let off = srv.seed_tenant(API_KEY_TENANT).await.expect("tenant seeds");
     let off_admin = srv
@@ -363,17 +416,38 @@ async fn production_ui_bff_journey() {
         .await
         .expect("oidc-off reader bootstraps");
 
-    sso_tenant(&srv, &server, SWITCH_KEYCLOAK_TENANT, keycloak_connection()).await;
+    sso_tenant(
+        &srv,
+        &server,
+        SWITCH_KEYCLOAK_TENANT,
+        keycloak_connection(),
+        KEYCLOAK_ALICE,
+    )
+    .await;
     sso_tenant(
         &srv,
         &server,
         SWITCH_SECOND_TENANT,
-        second_realm_connection(),
+        dex_connection(),
+        DEX_ALICE,
     )
     .await;
-    sso_tenant(&srv, &server, SWITCH_PEER_TENANT, keycloak_connection()).await;
-    let replacement_owner_key =
-        sso_tenant(&srv, &server, REPLACEMENT_TENANT, keycloak_connection()).await;
+    sso_tenant(
+        &srv,
+        &server,
+        SWITCH_PEER_TENANT,
+        keycloak_connection(),
+        KEYCLOAK_ALICE,
+    )
+    .await;
+    let replacement_owner_key = sso_tenant(
+        &srv,
+        &server,
+        REPLACEMENT_TENANT,
+        keycloak_connection(),
+        KEYCLOAK_ALICE,
+    )
+    .await;
 
     // Replica 0 keeps the loopback HTTP topology; replica 1 reaches the same
     // server only through a trusted TLS origin, so every journey step it
@@ -402,6 +476,7 @@ async fn production_ui_bff_journey() {
         "users": {
             "admin": { "username": "alice", "password": "alice-password" },
             "reader": { "username": "bob", "password": "wyrd-test" },
+            "dex": { "login": DEX_ALICE.0, "password": DEX_ALICE.1 },
         },
     });
 

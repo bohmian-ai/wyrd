@@ -735,7 +735,7 @@ elif [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
   fi
   cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1 -E "$expr"
 else
-  for required in tenant_connection_admin_journey tenant_connection_rotation_journey browser_session_sealing_rotation_journey tenant_connection_session_cutoff_journey tenant_human_login_journey tenant_callback_refusal_journey tenant_callback_issuer_binding_journey tenant_provider_switch_journey tenant_machine_independence_journey; do
+  for required in tenant_connection_admin_journey tenant_connection_rotation_journey browser_session_sealing_rotation_journey tenant_connection_session_cutoff_journey tenant_human_login_journey tenant_callback_refusal_journey tenant_callback_issuer_binding_journey tenant_connection_test_sign_in_journey tenant_provider_switch_journey tenant_machine_independence_journey; do
     count="$(selected_count "test(=$required)")"
     if [ "$count" != 1 ]; then
       echo "identity journey $required selects $count tests; expected exactly 1" >&2

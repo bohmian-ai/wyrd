@@ -80,7 +80,7 @@
           <form method="POST" action="?/test">
             <input type="hidden" name="csrf" value={data.session.csrf} />
             <input type="hidden" name="revision" value={candidate.revision} />
-            <button class="app-control" type="submit">Test</button>
+            <button class="app-control" type="submit" title="Sign in at the provider once to test this revision; no session is created">Test sign-in</button>
           </form>
           <form method="POST" action="?/remove">
             <input type="hidden" name="csrf" value={data.session.csrf} />

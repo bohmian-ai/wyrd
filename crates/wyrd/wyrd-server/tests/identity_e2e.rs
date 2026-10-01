@@ -39,6 +39,7 @@ use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_testing::{
     Bootstrap, KeycloakAdmin, OidcIssuerFixture, WyrdTestServer, WyrdTestServerBuilder,
+    provider_sign_in,
 };
 
 fn keycloak_issuer() -> String {
@@ -1086,7 +1087,8 @@ async fn activate_keycloak_connection(
 }
 
 /// Stage `input` as the candidate (at the current candidate revision, if
-/// any), test it, and activate it, returning the Active view.
+/// any), test it through one real sign-in, and activate it, returning the
+/// Active view.
 ///
 /// # Panics
 /// Panics when any step does not return `200`.
@@ -1097,15 +1099,9 @@ async fn activate_connection(srv: &WyrdTestServer, admin: &TenantAdmin, mut inpu
         call_json(srv, &admin.token, Method::PUT, CANDIDATE, Some(input)).await;
     assert_eq!(status, StatusCode::OK, "candidate stages: {candidate}");
     let revision = candidate["revision"].as_u64().expect("candidate revision");
-    let (status, tested) = call_json(
-        srv,
-        &admin.token,
-        Method::POST,
-        CANDIDATE_TEST,
-        Some(serde_json::json!({ "expected_revision": revision })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "candidate tests: {tested}");
+    let (status, begun) = begin_test(srv, &admin.token, revision).await;
+    assert_eq!(status, StatusCode::OK, "candidate test begins: {begun}");
+    assert_test_completion(&finish_test_sign_in(srv, &begun).await);
     let (status, active) = call_json(
         srv,
         &admin.token,
@@ -1117,6 +1113,73 @@ async fn activate_connection(srv: &WyrdTestServer, admin: &TenantAdmin, mut inpu
     assert_eq!(status, StatusCode::OK, "candidate activates: {active}");
     assert_eq!(active["state"], "Active");
     active
+}
+
+/// `POST` the candidate test for `revision` as `token`, returning the status
+/// and body; a begun test's body carries only the provider authorization URL.
+async fn begin_test(srv: &WyrdTestServer, token: &str, revision: u64) -> (StatusCode, Value) {
+    call_json(
+        srv,
+        token,
+        Method::POST,
+        CANDIDATE_TEST,
+        Some(serde_json::json!({ "expected_revision": revision })),
+    )
+    .await
+}
+
+/// Complete a begun candidate test as a browser would: sign Keycloak's
+/// `alice` in at the returned authorization URL (a mock provider redirects
+/// at once), then present every parameter of the provider's return —
+/// `code`, `state`, and any `iss` — to the common callback.
+///
+/// # Panics
+/// Panics when the body carries no authorization URL or the provider
+/// sign-in does not return to the deployment callback.
+async fn finish_test_sign_in(srv: &WyrdTestServer, begun: &Value) -> CallbackReply {
+    let authorization_url: Url = begun["authorization_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a begun test returns an authorization URL: {begun}"))
+        .parse()
+        .expect("authorization URL parses");
+    let returned = provider_sign_in(
+        &authorization_url,
+        "alice",
+        "alice-password",
+        &format!("{PUBLIC_ORIGIN}/auth/callback"),
+    )
+    .await;
+    let params: Vec<(String, String)> = returned.query_pairs().into_owned().collect();
+    let params: Vec<(&str, &str)> = params
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    callback_reply_with(srv, &params, None, "test-tenant-1.wyrd.test").await
+}
+
+/// Assert a candidate test sign-in completed: `200` with the static test
+/// page, which carries no token.
+///
+/// # Panics
+/// Panics when the reply differs.
+fn assert_test_completion(reply: &CallbackReply) {
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "the test sign-in completes: {}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("Connection test complete"),
+        "{}",
+        reply.body
+    );
+    for leaked in ["access_token", "refresh_token"] {
+        assert!(
+            !reply.body.contains(leaked),
+            "the test page carries no {leaked}"
+        );
+    }
 }
 
 /// A `ConnectionActivate` body.
@@ -1131,7 +1194,7 @@ fn activation(revision: u64, recovery_key: &SecretString) -> Value {
 const CONNECTIONS: &str = "/v1/identity/oidc/connections";
 /// Stage or replace the tenant's Candidate connection.
 const CANDIDATE: &str = "/v1/identity/oidc/candidate";
-/// Probe the Candidate and stamp it Tested on success.
+/// Check the Candidate's provider and begin its test sign-in.
 const CANDIDATE_TEST: &str = "/v1/identity/oidc/candidate/test";
 /// Promote the Tested Candidate to Active.
 const CANDIDATE_ACTIVATE: &str = "/v1/identity/oidc/candidate/activate";
@@ -2298,8 +2361,9 @@ async fn tenant_connection_admin_journey() {
 /// K2; the journey proves:
 ///   1. an unsafe issuer (cloud metadata address) stages but fails its test
 ///      before any connection, and a stale `expected_revision` conflicts;
-///   2. a candidate with a wrong secret fails its test as
-///      `client_auth_rejected` and cannot be activated;
+///   2. a candidate with a wrong secret begins its test, but the provider
+///      refuses the test sign-in's code exchange (`401 INVALID_TOKEN`), so
+///      it stays untested and cannot be activated;
 ///   3. the fixed candidate's stamp lasts fifteen minutes, a malformed
 ///      recovery key and one without `identity_connections:write` are
 ///      refused, and an injected audit failure rolls activation back;
@@ -2389,7 +2453,8 @@ async fn tenant_connection_rotation_journey() {
         "WYRD_AUTH_409_CONNECTION_CONFLICT",
     );
 
-    // 2. A wrong secret fails the client-authentication probe.
+    // 2. A wrong secret fails the test: the provider refuses the sign-in's
+    //    code exchange, and the candidate stays untested.
     let (status, staged) = call_json(
         &replica_a,
         token,
@@ -2405,21 +2470,20 @@ async fn tenant_connection_rotation_journey() {
     .await;
     assert_eq!(status, StatusCode::OK, "candidate replaces: {staged}");
     assert_eq!(staged["revision"], 2);
-    let (status, body) = call_json(
-        &replica_a,
-        token,
-        Method::POST,
-        CANDIDATE_TEST,
-        Some(serde_json::json!({ "expected_revision": 2 })),
-    )
-    .await;
+    let (status, begun) = begin_test(&replica_a, token, 2).await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    let reply = finish_test_sign_in(&replica_a, &begun).await;
     assert_refused(
-        status,
-        &body,
-        StatusCode::CONFLICT,
-        "WYRD_AUTH_409_CONNECTION_NOT_TESTED",
+        reply.status,
+        &reply.problem(),
+        StatusCode::UNAUTHORIZED,
+        "WYRD_AUTH_401_INVALID_TOKEN",
     );
-    assert_eq!(body["details"]["reason"], "client_auth_rejected", "{body}");
+    let (_, listed) = call_json(&replica_a, token, Method::GET, CONNECTIONS, None).await;
+    assert!(
+        listed["candidate"]["tested_until"].is_null(),
+        "a failed test leaves the candidate untested: {listed}"
+    );
     let (status, body) = call_json(
         &replica_a,
         token,
@@ -2455,15 +2519,10 @@ async fn tenant_connection_rotation_journey() {
         staged["tested_until"].is_null(),
         "a replaced candidate is untested"
     );
-    let (status, tested) = call_json(
-        &replica_a,
-        token,
-        Method::POST,
-        CANDIDATE_TEST,
-        Some(serde_json::json!({ "expected_revision": 3 })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "candidate tests: {tested}");
+    let (status, begun) = begin_test(&replica_a, token, 3).await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    assert_test_completion(&finish_test_sign_in(&replica_a, &begun).await);
+    let (_, tested) = call_json(&replica_a, token, Method::GET, CONNECTIONS, None).await;
     assert_eq!(tested["candidate"]["tested_revision"], 3);
     let tested_until: chrono::DateTime<chrono::Utc> =
         serde_json::from_value(tested["candidate"]["tested_until"].clone())
@@ -2756,15 +2815,9 @@ async fn tenant_connection_rotation_journey() {
     .await;
     assert_eq!(status, StatusCode::OK, "B stages the rotation: {staged}");
     let revision = staged["revision"].as_u64().expect("candidate revision");
-    let (status, tested) = call_json(
-        &replica_b,
-        token,
-        Method::POST,
-        CANDIDATE_TEST,
-        Some(serde_json::json!({ "expected_revision": revision })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "the rotation tests: {tested}");
+    let (status, begun) = begin_test(&replica_b, token, revision).await;
+    assert_eq!(status, StatusCode::OK, "the rotation test begins: {begun}");
+    assert_test_completion(&finish_test_sign_in(&replica_b, &begun).await);
     let recovery_id = recovery_admin.id().as_uuid();
     // `recovery_id` is a UUID, so interpolating it cannot inject SQL.
     sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -4256,17 +4309,16 @@ async fn tenant_callback_refusal_journey() {
     srv.shutdown().await.expect("server shuts down");
 }
 
-/// Serve a mock provider that passes every candidate probe under
-/// `discovery`: the mock JWKS, a `prompt=none` redirect to the common
-/// callback echoing the probe's state, and `invalid_grant` for the probe's
-/// invalid code.
-async fn mount_probe_passing_provider(server: &wiremock::MockServer, discovery: Value) {
-    mount_mock_provider_discovering(
-        server,
-        ResponseTemplate::new(400).set_body_json(serde_json::json!({ "error": "invalid_grant" })),
-        discovery,
-    )
-    .await;
+/// Serve a mock provider that signs any user in at once under `discovery`:
+/// the mock JWKS, `token_response` from the token endpoint, and an
+/// authorization endpoint redirecting to the common callback with
+/// `mock-code` and the request's state.
+async fn mount_authorizing_provider(
+    server: &wiremock::MockServer,
+    discovery: Value,
+    token_response: wiremock::ResponseTemplate,
+) {
+    mount_mock_provider_discovering(server, token_response, discovery).await;
     Mock::given(method("GET"))
         .and(path("/authorize"))
         .respond_with(|request: &wiremock::Request| {
@@ -4281,8 +4333,8 @@ async fn mount_probe_passing_provider(server: &wiremock::MockServer, discovery: 
                 .expect("callback parses");
             location
                 .query_pairs_mut()
-                .append_pair("state", &state)
-                .append_pair("error", "login_required");
+                .append_pair("code", "mock-code")
+                .append_pair("state", &state);
             ResponseTemplate::new(302).insert_header("location", location.as_str())
         })
         .mount(server)
@@ -4349,22 +4401,6 @@ async fn tenant_callback_issuer_binding_journey() {
     let mut advertising = silent.clone();
     advertising["authorization_response_iss_parameter_supported"] = Value::Bool(true);
 
-    // 1. A provider that does not advertise issuer support is tested and
-    //    activated.
-    mount_probe_passing_provider(&mock, silent.clone()).await;
-    let admin = tenant_admin(&srv, tenant, "issuer-binding-admin").await;
-    activate_connection(
-        &srv,
-        &admin,
-        serde_json::json!({
-            "issuer": issuer,
-            "client_id": MOCK_CLIENT_ID,
-            "client_auth": "Public",
-            "claim_mapping": { "subject": "sub" },
-        }),
-    )
-    .await;
-
     let mut eddsa = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
     eddsa.kid = Some("mock-1".to_owned());
     let id_token_for = |nonce: &str| {
@@ -4382,6 +4418,45 @@ async fn tenant_callback_issuer_binding_journey() {
             MOCK_SIGNING_KEY,
         ))
     };
+
+    // 1. A provider that does not advertise issuer support is tested through
+    //    a real sign-in (its return carries no `iss`) and activated.
+    let admin = tenant_admin(&srv, tenant, "issuer-binding-admin").await;
+    mount_mock_provider_discovering(&mock, id_token_reply("unused"), silent.clone()).await;
+    let (status, candidate) = call_json(
+        &srv,
+        &admin.token,
+        Method::PUT,
+        CANDIDATE,
+        Some(serde_json::json!({
+            "issuer": issuer,
+            "client_id": MOCK_CLIENT_ID,
+            "client_auth": "Public",
+            "claim_mapping": { "subject": "sub" },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate stages: {candidate}");
+    let (status, begun) = begin_test(&srv, &admin.token, 1).await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    let test_nonce = Url::parse(begun["authorization_url"].as_str().expect("url"))
+        .expect("authorization url parses")
+        .query_pairs()
+        .find(|(name, _)| name == "nonce")
+        .map(|(_, value)| value.into_owned())
+        .expect("the test sign-in carries a nonce");
+    mount_authorizing_provider(&mock, silent.clone(), id_token_for(&test_nonce)).await;
+    assert_test_completion(&finish_test_sign_in(&srv, &begun).await);
+    let (status, active) = call_json(
+        &srv,
+        &admin.token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(1, &admin.api_key)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate activates: {active}");
+
     let denied = || async {
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM vala.audit_staging \
@@ -4480,6 +4555,262 @@ async fn tenant_callback_issuer_binding_journey() {
     }
 
     srv.shutdown().await.expect("server shuts down");
+}
+
+/// Sign Keycloak's `alice` in at a begun test's authorization URL and return
+/// every query parameter of the provider's return to the deployment
+/// callback, without presenting it.
+///
+/// # Panics
+/// Panics when the body carries no authorization URL or the sign-in does not
+/// return to the deployment callback.
+async fn test_sign_in_return(begun: &Value) -> Vec<(String, String)> {
+    let authorization_url: Url = begun["authorization_url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a begun test returns an authorization URL: {begun}"))
+        .parse()
+        .expect("authorization URL parses");
+    provider_sign_in(
+        &authorization_url,
+        "alice",
+        "alice-password",
+        &format!("{PUBLIC_ORIGIN}/auth/callback"),
+    )
+    .await
+    .query_pairs()
+    .into_owned()
+    .collect()
+}
+
+/// Present `params` to the common callback, replacing `state` with
+/// `state_override` when one is given and keeping every other parameter.
+async fn present_test_return(
+    srv: &WyrdTestServer,
+    params: &[(String, String)],
+    state_override: Option<&str>,
+) -> CallbackReply {
+    let params: Vec<(&str, &str)> = params
+        .iter()
+        .map(|(name, value)| match (name.as_str(), state_override) {
+            ("state", Some(state)) => ("state", state),
+            (name, _) => (name, value.as_str()),
+        })
+        .collect();
+    callback_reply_with(srv, &params, None, "test-tenant-1.wyrd.test").await
+}
+
+/// The `state` of a provider return.
+///
+/// # Panics
+/// Panics when the return carries no state.
+fn returned_state(params: &[(String, String)]) -> &str {
+    params
+        .iter()
+        .find(|(name, _)| name == "state")
+        .map(|(_, value)| value.as_str())
+        .expect("the provider return carries state")
+}
+
+/// Stage a public Keycloak candidate for `admin`'s tenant and begin its test,
+/// returning the candidate revision and the begun test body.
+///
+/// # Panics
+/// Panics when staging or beginning the test does not return `200`.
+async fn begin_keycloak_test(srv: &WyrdTestServer, admin: &TenantAdmin) -> (u64, Value) {
+    let (_, listed) = call_json(srv, &admin.token, Method::GET, CONNECTIONS, None).await;
+    let (status, staged) = call_json(
+        srv,
+        &admin.token,
+        Method::PUT,
+        CANDIDATE,
+        Some(connection_input(
+            PUBLIC_HUMAN_CLIENT,
+            "Public",
+            None,
+            listed["candidate"]["revision"].as_u64(),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "candidate stages: {staged}");
+    let revision = staged["revision"].as_u64().expect("candidate revision");
+    let (status, begun) = begin_test(srv, &admin.token, revision).await;
+    assert_eq!(status, StatusCode::OK, "the test begins: {begun}");
+    (revision, begun)
+}
+
+/// Whether `admin`'s tenant candidate carries an unexpired test stamp.
+async fn candidate_tested(srv: &WyrdTestServer, admin: &TenantAdmin) -> bool {
+    let (_, listed) = call_json(srv, &admin.token, Method::GET, CONNECTIONS, None).await;
+    !listed["candidate"]["tested_until"].is_null()
+}
+
+/// A candidate is tested by one real provider sign-in through the common
+/// callback, with login state's protections and nothing issued:
+///   1. tenant A's genuine provider return presented under tenant B's test
+///      state is refused, and neither candidate is tested;
+///   2. an expired test state is refused `400 INVALID_STATE` and leaves the
+///      candidate untested;
+///   3. a completed test sign-in returns the static test page, marks the
+///      candidate tested, records one allowed `identity.oidc.candidate.tested`
+///      decision, and creates no User, refresh token, API key, browser
+///      session, or completion;
+///   4. replaying that return is refused `400 INVALID_STATE`;
+///   5. on a deployment whose callback the provider does not register, the
+///      provider refuses the sign-in and never returns to Wyrd, so the
+///      candidate stays untested and cannot be activated.
+///
+/// A wrong client secret failing the test is proven by
+/// `tenant_connection_rotation_journey`.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn tenant_connection_test_sign_in_journey() {
+    let srv = human_server_builder()
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant_a = srv.data_tenant_id();
+    let tenant_b = srv
+        .seed_tenant("test-sign-in-b")
+        .await
+        .expect("tenant B seeds");
+    let admin_a = tenant_admin(&srv, tenant_a, "test-sign-in-admin-a").await;
+    let admin_b = tenant_admin(&srv, tenant_b, "test-sign-in-admin-b").await;
+    let superuser = srv
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    let issued = || async {
+        sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+            "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE auth_type = 'oidc'),
+                    (SELECT count(*) FROM wyrd.auth_refresh_tokens),
+                    (SELECT count(*) FROM wyrd.auth_api_keys),
+                    (SELECT count(*) FROM wyrd.auth_browser_sessions),
+                    (SELECT count(*) FROM wyrd.auth_login_state
+                      WHERE completion_sealed IS NOT NULL)",
+        )
+        .fetch_one(&superuser)
+        .await
+        .expect("issued state reads")
+    };
+    let before = issued().await;
+
+    // 1. Cross-tenant: A's genuine return under B's state is refused.
+    let (_, begun_a) = begin_keycloak_test(&srv, &admin_a).await;
+    let (_, begun_b) = begin_keycloak_test(&srv, &admin_b).await;
+    let return_a = test_sign_in_return(&begun_a).await;
+    let return_b = test_sign_in_return(&begun_b).await;
+    let mixed = present_test_return(&srv, &return_a, Some(returned_state(&return_b))).await;
+    assert_refused(
+        mixed.status,
+        &mixed.problem(),
+        StatusCode::UNAUTHORIZED,
+        "WYRD_AUTH_401_INVALID_TOKEN",
+    );
+    assert!(!candidate_tested(&srv, &admin_a).await, "A stays untested");
+    assert!(!candidate_tested(&srv, &admin_b).await, "B stays untested");
+
+    // 2. Expired: a test state past its expiry is refused.
+    let (_, begun) = begin_keycloak_test(&srv, &admin_a).await;
+    let expired = test_sign_in_return(&begun).await;
+    sqlx::query(
+        "UPDATE wyrd.auth_login_state SET expires_at = now() - interval '1 second' \
+          WHERE state_hash = $1",
+    )
+    .bind(
+        Sha256Hex::digest(returned_state(&expired).as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(&superuser)
+    .await
+    .expect("the test state expires");
+    let reply = present_test_return(&srv, &expired, None).await;
+    assert_refused(
+        reply.status,
+        &reply.problem(),
+        StatusCode::BAD_REQUEST,
+        "WYRD_AUTH_400_INVALID_STATE",
+    );
+    assert!(!candidate_tested(&srv, &admin_a).await, "A stays untested");
+
+    // 3. A completed test sign-in marks the candidate tested and issues nothing.
+    let (revision, begun) = begin_keycloak_test(&srv, &admin_a).await;
+    let genuine = test_sign_in_return(&begun).await;
+    assert_test_completion(&present_test_return(&srv, &genuine, None).await);
+    let (_, listed) = call_json(&srv, &admin_a.token, Method::GET, CONNECTIONS, None).await;
+    assert_eq!(listed["candidate"]["tested_revision"], revision);
+    let decisions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging \
+          WHERE data_tenant_id = $1 AND operation = 'identity.oidc.candidate.tested' \
+            AND outcome = 'allowed'",
+    )
+    .bind(tenant_a.as_uuid())
+    .fetch_one(&superuser)
+    .await
+    .expect("tested decisions read");
+    assert_eq!(decisions, 1, "the tester's authority is decided once");
+    assert_eq!(
+        issued().await,
+        before,
+        "a test issues no User, credential, session, or completion"
+    );
+
+    // 4. Replay: the consumed test state is refused.
+    let replayed = present_test_return(&srv, &genuine, None).await;
+    assert_refused(
+        replayed.status,
+        &replayed.problem(),
+        StatusCode::BAD_REQUEST,
+        "WYRD_AUTH_400_INVALID_STATE",
+    );
+    srv.shutdown().await.expect("server shuts down");
+
+    // 5. Wrong callback: the provider refuses an unregistered redirect.
+    let unregistered = WyrdTestServerBuilder::default()
+        .with_public_origin(
+            "http://unregistered.wyrd.test"
+                .parse()
+                .expect("public origin parses"),
+        )
+        .start_in_process()
+        .await
+        .expect("unregistered server starts");
+    let admin = tenant_admin(&unregistered, unregistered.data_tenant_id(), "unregistered").await;
+    let (revision, begun) = begin_keycloak_test(&unregistered, &admin).await;
+    let refused = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client builds")
+        .get(begun["authorization_url"].as_str().expect("url"))
+        .send()
+        .await
+        .expect("provider answers");
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "the provider refuses an unregistered callback"
+    );
+    assert!(refused.headers().get(header::LOCATION).is_none());
+    assert!(!candidate_tested(&unregistered, &admin).await);
+    let (status, body) = call_json(
+        &unregistered,
+        &admin.token,
+        Method::POST,
+        CANDIDATE_ACTIVATE,
+        Some(activation(revision, &admin.api_key)),
+    )
+    .await;
+    assert_refused(
+        status,
+        &body,
+        StatusCode::CONFLICT,
+        "WYRD_AUTH_409_CONNECTION_NOT_TESTED",
+    );
+    unregistered.shutdown().await.expect("server shuts down");
 }
 
 /// Switching a tenant's provider ends the old provider's sessions and grants

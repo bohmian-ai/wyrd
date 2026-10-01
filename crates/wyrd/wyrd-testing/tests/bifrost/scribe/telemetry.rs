@@ -459,15 +459,24 @@ async fn scribe_hot_path_telemetry_reconciles() {
         .collect();
     assert!(!failed_writes.is_empty(), "the failed write is traced");
     for span in failed_writes {
-        let failures: Vec<_> = span
-            .events
+        // The whole trace, not only the root: a failure re-logged by a child
+        // span would repeat the reason under the same correlation identity.
+        let failures: Vec<_> = failed
+            .spans
             .iter()
-            .filter(|event| event.attributes.get("level").map(String::as_str) == Some("WARN"))
+            .filter(|child| child.trace_id == span.trace_id)
+            .flat_map(|child| &child.events)
+            .filter(|event| {
+                matches!(
+                    event.attributes.get("level").map(String::as_str),
+                    Some("WARN" | "ERROR")
+                )
+            })
             .collect();
         assert_eq!(
             failures.len(),
             1,
-            "one correlated failure event per failed write: {span:?}"
+            "one correlated failure event per failed write trace: {span:?}"
         );
         assert!(
             failures[0].attributes.contains_key("error"),

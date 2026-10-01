@@ -534,8 +534,9 @@ fn caller_auth_context(caller: &Caller) -> AuthContext {
 /// The signal contributes only its physical table hint. Identity, HTTP status,
 /// and the matching gRPC/ErrorInfo projection are selected by
 /// [`IngestError::to_wyrd_error`], so OTLP endpoints cannot drift into a second
-/// error taxonomy.
+/// error taxonomy. An internal failure is reported here, once per response.
 fn ingest_error_to_response(error: IngestError, signal: OtlpSignal) -> WyrdErrorResponse {
+    error.report_internal_at_edge();
     WyrdErrorResponse::from(error.to_wyrd_error(signal.table()))
 }
 

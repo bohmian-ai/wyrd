@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 21
+revision: 22
 status: approved
 ---
 
@@ -184,9 +184,9 @@ second and report p95 batch latency, written bytes per second, CPU, and memory.
 Under simultaneous sustained ingest of at least 100,000 acknowledged rows
 per second, the representative read mix must sustain at least 100 successful
 analytical queries per second. Small-query p95 remains <100 ms and medium-query
-p95 <300 ms. At the same read offer
-rate and client concurrency, each class's p95 may rise by less than 20%
-against its read-only baseline. Peak node memory stays below 7 GiB with no
+p95 <300 ms. Reads and writes share the node's CPU, so each class is
+judged against its own absolute target while writing, and its read-only p95
+is reported beside it rather than imposing a relative-rise limit. Peak node memory stays below 7 GiB with no
 OOM event. A 5,000/second selective rate is reported as a stretch result;
 it does not replace these required targets. CPU utilization is reported, not
 assigned an invented passing floor.
@@ -597,7 +597,8 @@ REQ-015's removal of the tenant column and its footer tenant record.
 
 ## Open material decisions
 
-None. Revision 20 was explicitly approved by the user on 2026-09-30.
+None. Revision 22 was explicitly approved by the user on 2026-10-01.
+Revision 20 was explicitly approved by the user on 2026-09-30.
 Revision 17's single execution path and one-unit slot charge were
 explicitly approved by the user on 2026-09-30. Revision 16's per-query memory limit, 4 GiB pod floor, and governed
 follower spill were explicitly approved by the user on 2026-09-30.
@@ -731,6 +732,11 @@ on 2026-09-28.
   to <7 ms and p95 <5 ms to <10 ms. Every query pays Postgres round trips for its reader cut, which
   2 ms cannot absorb on this node. Approved by the user on 2026-09-30 ("raise
   the bar to 5 ms"; then "bump p50 up to 7ms"; "p95 should be 10 ms").
+- Revision 22 (2026-10-01): Drops the <20% read p95 rise while writing.
+  Reads and writes compete for the node's 4 CPUs, so the rise measures CPU
+  sharing, not interference; each class is judged against its absolute target
+  while writing. Approved by the user on 2026-10-01 ("Go with your
+  recommendations").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

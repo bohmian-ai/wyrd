@@ -17,9 +17,6 @@ const MEMORY_CEILING_BYTES: u64 = 7 << 30;
 /// Durable acknowledged rows per second every write step must reach.
 const MIN_WRITE_ROWS_PER_SECOND: f64 = 100_000.0;
 
-/// Largest p95 rise reads may take while writes run, against reads alone.
-const MAX_P95_RISE: f64 = 1.2;
-
 /// The report table's header.
 const HEADER: &str = "| step | clients | rate | p50/p95/p99 ms | errors | server CPU | peak memory | seals | driver CPU | verdict | reason |\n|---|---|---|---|---|---|---|---|---|---|---|";
 
@@ -179,20 +176,16 @@ impl Report {
         });
     }
 
-    /// Adds `case` read while writes run: it must meet its target and its p95
-    /// may rise less than 20% against `alone`.
+    /// Adds `case` read while writes run: it must meet its own target, and its
+    /// p95 read alone is reported beside it because reads and writes share the
+    /// node's CPU.
     pub fn loaded(&mut self, case: Case, alone: &Measured, loaded: &Measured) {
-        let target = case.target(self.fixture);
-        let (before, after) = (
-            alone.percentile_ms(95.0).unwrap_or(f64::INFINITY),
-            loaded.percentile_ms(95.0).unwrap_or(f64::INFINITY),
-        );
-        let missed = missed(&target, loaded).or_else(|| {
-            (after >= before * MAX_P95_RISE)
-                .then(|| format!("p95 {after:.1} ms rose >= 20% from {before:.1} ms"))
-        });
+        let missed = missed(&case.target(self.fixture), loaded);
         let step = format!("{} while writing", case.name());
-        let reason = format!("p95 alone {before:.1} ms");
+        let reason = format!(
+            "p95 alone {:.1} ms",
+            alone.percentile_ms(95.0).unwrap_or(f64::INFINITY)
+        );
         let row = self.judge(&step, loaded, qps(loaded), missed, reason);
         self.add(row);
     }

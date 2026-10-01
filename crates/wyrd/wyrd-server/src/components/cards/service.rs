@@ -516,11 +516,11 @@ pub async fn register_card(
     let (operation_id, seed) = match written {
         Ok((written, true)) => written,
         Ok((written, false)) => {
-            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
+            audit::record_audit(state.postgres.vala(), caller.data_tenant_id, allowed).await?;
             written
         }
         Err(error) => {
-            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
+            audit::record_audit(state.postgres.vala(), caller.data_tenant_id, allowed).await?;
             return Err(error);
         }
     };
@@ -1775,7 +1775,7 @@ async fn record_unless_committed<T>(
     result: Result<T, WyrdError>,
 ) -> Result<T, WyrdError> {
     if result.is_err() {
-        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
+        audit::record_audit(state.postgres.vala(), caller.data_tenant_id, allowed).await?;
     }
     result
 }

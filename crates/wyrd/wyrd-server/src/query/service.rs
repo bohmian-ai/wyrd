@@ -173,7 +173,7 @@ impl<'a> QueryAuthority<'a> {
             outcome,
         );
         audit::record_audit_owned(
-            self.state.postgres.vala_pool().clone(),
+            self.state.postgres.vala().clone(),
             self.caller.data_tenant_id,
             event,
         )
@@ -211,7 +211,7 @@ impl<'a> QueryAuthority<'a> {
             AuditOutcome::Allowed,
         );
         audit::record_audit_owned(
-            self.state.postgres.vala_pool().clone(),
+            self.state.postgres.vala().clone(),
             self.caller.data_tenant_id,
             event,
         )

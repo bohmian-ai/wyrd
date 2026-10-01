@@ -718,7 +718,7 @@ impl<'a> GatewayAdministration<'a> {
         }
         .await;
         if result.is_err() {
-            audit::record_audit(self.postgres.vala_pool(), caller.data_tenant_id, &allowed).await?;
+            audit::record_audit(self.postgres.vala(), caller.data_tenant_id, &allowed).await?;
         }
         result
     }

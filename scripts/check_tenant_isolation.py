@@ -96,8 +96,10 @@ SQL_CAPABILITY_DIRS = (
     "crates/wyrd/wyrd-server/src/auth/",
     "crates/wyrd/wyrd-server/src/components/auth/",
     "crates/wyrd/wyrd-server/src/boot/",
+    # The canonical audit append: standalone forms acquire through `ValaPostgres`.
+    "crates/wyrd/wyrd-server/src/audit/",
 )
-RAW_POOL_PATTERN = r"\bPgPool\b|\.app_pool\s*\(\s*\)"
+RAW_POOL_PATTERN = r"\bPgPool\b|\.(app|vala)_pool\s*\(\s*\)"
 
 
 CLIENT_TIER_CRATES = [

@@ -98,7 +98,7 @@ pub async fn register_table(
         audit::authorize_recording_denial(state, &caller, &required, operation, &fqn_for_audit)
             .await?;
     let record_allowed = || async {
-        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &allowed).await
+        audit::record_audit(state.postgres.vala(), caller.data_tenant_id, &allowed).await
     };
 
     let ns = match convert::namespace_from_wire(&body.namespace) {

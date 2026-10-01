@@ -92,7 +92,7 @@ async fn refuse_after_decision<T>(
     decision: &AuditEvent,
     refusal: WyrdError,
 ) -> Result<T, WyrdErrorResponse> {
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, decision)
+    audit::record_audit(state.postgres.vala(), caller.data_tenant_id, decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
     Err(WyrdErrorResponse::from(refusal))
@@ -244,7 +244,7 @@ async fn test_candidate(
     Json(request): Json<ConnectionTestRequest>,
 ) -> Result<Json<ConnectionTestResponse>, WyrdErrorResponse> {
     let decision = decide(&state, &caller, "identity.oidc.candidate.test").await?;
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &decision)
+    audit::record_audit(state.postgres.vala(), caller.data_tenant_id, &decision)
         .await
         .map_err(WyrdErrorResponse::from)?;
     let owner = connections(&state)?;

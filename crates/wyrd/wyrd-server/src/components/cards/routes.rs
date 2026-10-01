@@ -396,8 +396,7 @@ pub(crate) async fn register_card_http(
     let idempotency_key = match extract_required_idempotency_key(&headers) {
         Ok(key) => key,
         Err(error) => {
-            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &allowed)
-                .await?;
+            audit::record_audit(state.postgres.vala(), caller.data_tenant_id, &allowed).await?;
             return Err(error);
         }
     };

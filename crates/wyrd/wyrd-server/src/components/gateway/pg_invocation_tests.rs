@@ -3447,7 +3447,18 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .execute(&owner)
         .await
         .expect("the catalog table goes offline");
-    unavailable(fetch(reader.clone(), digest.clone()).await).await;
+    // A node that already resolved the table keeps serving it from its
+    // registration cache, so the outage is observed by a replica that has not.
+    let cold = replica_with_fixture_catalog(&fixture, dispatch.clone()).await;
+    unavailable(
+        super::routes::gateway_payload_object(
+            State(cold),
+            reader.clone(),
+            axum::extract::Path(digest.clone()),
+        )
+        .await,
+    )
+    .await;
     sqlx::query("ALTER TABLE vala.bifrost_tables_offline RENAME TO bifrost_tables")
         .execute(&owner)
         .await

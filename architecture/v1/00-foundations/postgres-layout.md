@@ -7,10 +7,12 @@ crate:
 - `vala-sql` owns `vala`; and
 - Skald owns no schema in the Wyrd control-plane database.
 
-The runtime application role is `wyrd_app`. The short-lived migration role is
-`wyrd_migrator`. Named, audited cross-tenant operator capabilities use
-`wyrd_platform_admin` only when their owner requires it. Migrations never
-create cluster login roles; deployment bootstrap provisions roles before the
+Serving Wyrd holds exactly two logins: the runtime application role
+`wyrd_app` and `wyrd_platform_admin`, which carries named, audited cross-tenant
+operator capabilities and owns the Bifrost Iceberg catalog. Migrations run in
+the one-off `wyrd-server migrate` process under the existing database-owner
+login, which no serving process receives. Migrations never create cluster login
+roles; deployment bootstrap provisions the two serving roles before the
 migration gate.
 
 ## Migration ownership and order
@@ -25,7 +27,8 @@ or a snapshot of the table inventory. The deployment gate:
 4. applies `vala_sql::migrate`;
 5. verifies schema ownership, grants, RLS, required sentinels, and migration
    state; and
-6. closes every migrator connection before runtime readiness.
+6. exits; serving boot re-verifies applied versions, checksums, login
+   posture, and forced RLS read-only and refuses readiness when they fail.
 
 The order allows tenant-aware `vala.*` references to Wyrd control-plane state.
 There is no `skald_sql::migrate` step in the Wyrd server sequence.

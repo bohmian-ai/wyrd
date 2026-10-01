@@ -501,7 +501,7 @@ mod pg_tests {
             "rows are positional arrays carrying the selected trace"
         );
         assert_eq!(
-            content["terminal"]["execution_path"],
+            content["terminal"]["query_class"],
             serde_json::json!("interactive"),
             "Oracle owns path selection and chose Interactive: {content}"
         );

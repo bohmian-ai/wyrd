@@ -22,4 +22,20 @@ describe("WyrdClient", () => {
     expect(caught).toBeInstanceOf(WyrdError);
     expect((caught as WyrdError).code).not.toBe("WYRD_SPEC_400_VALIDATION");
   });
+
+  it("derives the gRPC endpoint from serverUrl unless overridden", () => {
+    const derived = WyrdClient.connect({
+      serverUrl: "https://wyrd.example.com/",
+      credential: "wyrd_test_actor",
+    });
+    expect(derived.serverUrl).toBe("https://wyrd.example.com");
+    expect(derived.grpcUrl).toBe("https://wyrd.example.com:50051");
+
+    const overridden = WyrdClient.connect({
+      serverUrl: "https://wyrd.example.com",
+      credential: "wyrd_test_actor",
+      grpcUrl: "https://grpc.example.com:443",
+    });
+    expect(overridden.grpcUrl).toBe("https://grpc.example.com:443");
+  });
 });

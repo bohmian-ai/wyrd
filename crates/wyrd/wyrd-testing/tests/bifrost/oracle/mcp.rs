@@ -2,7 +2,7 @@
 //!
 //! Everything else in this binary drives Oracle through the typed public
 //! surfaces. This module drives it the way an agent actually does — an `rmcp`
-//! client against one pod's real `/mcp` endpoint on a live four-process
+//! client against one pod's real `/mcp` endpoint on a live four-pod peer
 //! topology — because that is the only path where discovery, the closed input
 //! bounds, the single settled result, and Oracle's own path selection have to
 //! agree at once. The MCP adapter contributes no plan hint, so an Analytical
@@ -12,14 +12,11 @@ use rmcp::model::{CallToolRequest, CallToolRequestParams, CallToolResult, Client
 use rmcp::service::PeerRequestOptions;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use wyrd_testing::bifrost::process_cluster::{
-    BifrostProcessCluster, ProcessNode, ProcessNodeTarget,
-};
+use wyrd_server::config::BifrostTarget;
+use wyrd_testing::WyrdTestServer;
 
+use crate::peer_cluster::PeerCluster;
 use crate::support::{JourneyError, await_baseline};
-
-/// The pod-per-process test node every journey in this binary launches.
-const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
 
 /// Pod index that plans, admits, and coordinates every query.
 const COORDINATOR: usize = 0;
@@ -44,16 +41,20 @@ const FIXTURE_GROUPS: i64 = 3;
 ///
 /// # Errors
 ///
-/// Returns the transport error, or a description when the auth route refuses
-/// the key or answers with a body that is not a token response.
+/// Returns the transport error, or a description when the pod serves no
+/// public HTTP listener, the auth route refuses the key, or it answers with a
+/// body that is not a token response.
 async fn bearer(
-    node: &ProcessNode,
+    node: &WyrdTestServer,
     api_key: &secrecy::SecretString,
 ) -> Result<String, JourneyError> {
     use secrecy::ExposeSecret as _;
 
+    let base_url = node
+        .base_url()
+        .ok_or("the pod serves no public HTTP listener")?;
     let response = reqwest::Client::new()
-        .post(format!("http://{}/auth/token", node.http_addr()))
+        .post(format!("{base_url}/auth/token"))
         .json(&wyrd_spec::auth::TokenRequest::WyrdApiKey {
             api_key: wyrd_spec::auth::SecretBearer::new(api_key.expose_secret().to_owned()),
         })
@@ -76,13 +77,16 @@ async fn bearer(
 ///
 /// # Errors
 ///
-/// Returns an error when the bearer cannot be encoded as a header value.
+/// Returns an error when the pod serves no public HTTP listener or the bearer
+/// cannot be encoded as a header value.
 fn transport(
-    node: &ProcessNode,
+    node: &WyrdTestServer,
     bearer: &str,
 ) -> Result<StreamableHttpClientTransport<reqwest::Client>, JourneyError> {
-    let mut config =
-        StreamableHttpClientTransportConfig::with_uri(format!("http://{}/mcp", node.http_addr()));
+    let base_url = node
+        .base_url()
+        .ok_or("the pod serves no public HTTP listener")?;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
     config.allow_stateless = true;
     config.custom_headers.insert(
         http::HeaderName::from_static("x-wyrd-access-token"),
@@ -150,10 +154,10 @@ mod pg_tests {
     use rmcp::ClientServiceExt as _;
 
     use super::{
-        BifrostProcessCluster, COORDINATOR, CallToolRequest, CallToolRequestParams, ClientRequest,
-        FIXTURE_GROUPS, FIXTURE_ROWS, JourneyError, NODE_BINARY, PEER_FOLLOWERS, PEER_SCRIBE,
-        PeerRequestOptions, ProcessNodeTarget, await_baseline, bearer, discover, problem, query,
-        structured, transport,
+        BifrostTarget, COORDINATOR, CallToolRequest, CallToolRequestParams, ClientRequest,
+        FIXTURE_GROUPS, FIXTURE_ROWS, JourneyError, PEER_FOLLOWERS, PEER_SCRIBE, PeerCluster,
+        PeerRequestOptions, await_baseline, bearer, discover, problem, query, structured,
+        transport,
     };
 
     /// An agent joins three tables it discovered and gets one Analytical result.
@@ -170,7 +174,7 @@ mod pg_tests {
     }
 
     /// Drives discovery, the distributed join, both ceilings, repairs, and
-    /// cancellation against one live four-process topology.
+    /// cancellation against one live four-pod peer topology.
     ///
     /// # Errors
     ///
@@ -180,15 +184,12 @@ mod pg_tests {
     /// Panics if a ceiling result precedes retained cleanup, ownership is not
     /// charged during the hold, or a refusal includes partial rows.
     async fn prove_analytical_mcp_journey() -> Result<(), JourneyError> {
-        let mut cluster = BifrostProcessCluster::start(
-            NODE_BINARY,
-            &[
-                ProcessNodeTarget::Oracle,
-                ProcessNodeTarget::Oracle,
-                ProcessNodeTarget::Oracle,
-                ProcessNodeTarget::Scribe,
-            ],
-        )
+        let mut cluster = PeerCluster::start(&[
+            BifrostTarget::Oracle,
+            BifrostTarget::Oracle,
+            BifrostTarget::Oracle,
+            BifrostTarget::Scribe,
+        ])
         .await?;
         let api_key = cluster
             .provision_public_api_key("mcp-analytical-agent")
@@ -198,8 +199,10 @@ mod pg_tests {
             .map(|index| format!("mcp_join_{index}_{}", uuid::Uuid::now_v7().simple()))
             .collect();
         for table in &tables {
-            cluster.nodes_mut()[PEER_SCRIBE].register_table(table)?;
-            cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
+            cluster.register_table(PEER_SCRIBE, table).await?;
+            cluster
+                .ingest_rows(PEER_SCRIBE, table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
+                .await?;
         }
         for index in [
             COORDINATOR,
@@ -207,25 +210,23 @@ mod pg_tests {
             PEER_FOLLOWERS[1],
             PEER_SCRIBE,
         ] {
-            cluster.nodes_mut()[index].refresh_snapshot()?;
+            cluster.refresh_snapshot(index).await?;
         }
 
         let baseline: Vec<_> = [COORDINATOR, PEER_FOLLOWERS[0], PEER_FOLLOWERS[1]]
             .into_iter()
-            .map(|index| Ok((index, cluster.nodes_mut()[index].ownership_snapshot()?)))
+            .map(|index| Ok((index, cluster.ownership_snapshot(index)?)))
             .collect::<Result<_, JourneyError>>()?;
-        let polls_before: Vec<u64> = PEER_FOLLOWERS
+        let leases_before: Vec<u64> = PEER_FOLLOWERS
             .iter()
-            .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
+            .map(|index| Ok(cluster.graph_leases(*index)?.0))
             .collect::<Result<_, JourneyError>>()?;
+        let polls_before = cluster.peer_body_polls();
 
-        let token = bearer(&cluster.nodes()[COORDINATOR], &api_key).await?;
-        let client = ()
-            .serve_with_lifecycle(
-                transport(&cluster.nodes()[COORDINATOR], &token)?,
-                discover(),
-            )
-            .await?;
+        let token = bearer(cluster.server(COORDINATOR)?, &api_key).await?;
+        let client =
+            ().serve_with_lifecycle(transport(cluster.server(COORDINATOR)?, &token)?, discover())
+                .await?;
 
         // The agent learns the three tables and their columns from the catalog
         // alone: nothing below names a column this discovery did not return.
@@ -284,7 +285,7 @@ mod pg_tests {
                 .call_tool(query(serde_json::json!({"sql": join_sql, "max_rows": 100})))
                 .await?,
         )?;
-        if joined["terminal"]["execution_path"] != serde_json::json!("analytical") {
+        if joined["terminal"]["query_class"] != serde_json::json!("analytical") {
             return Err(format!("Oracle did not select Analytical: {joined}").into());
         }
         if joined["terminal"]["outcome"] != serde_json::json!("success") {
@@ -309,23 +310,30 @@ mod pg_tests {
             }
         }
 
-        // Real remote stages ran; a leader-local rewrite would not have polled.
+        // Real remote stages ran on both followers; a leader-local rewrite
+        // would have leased no follower graph and polled no peer body.
         for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
-            let polls = cluster.nodes_mut()[index].peer_body_polls()?;
-            if polls <= polls_before[offset] {
+            let activated = cluster.graph_leases(index)?.0;
+            if activated <= leases_before[offset] {
                 return Err(format!(
-                    "follower {index} admitted no peer body: {polls} polls, was {}",
-                    polls_before[offset]
+                    "follower {index} leased no graph: {activated} activations, was {}",
+                    leases_before[offset]
                 )
                 .into());
             }
+        }
+        let polls = cluster.peer_body_polls();
+        if polls <= polls_before {
+            return Err(
+                format!("no peer body was polled: {polls} polls, was {polls_before}").into(),
+            );
         }
 
         // A ceiling error remains pending through real cleanup, including a
         // Scribe ingress whose cancellation must reach its remote Oracle.
         for endpoint in [COORDINATOR, PEER_SCRIBE] {
             for (index, before) in &baseline {
-                await_baseline(&mut cluster, *index, *before).await?;
+                await_baseline(&cluster, *index, *before).await?;
             }
             let leader = if endpoint == COORDINATOR {
                 COORDINATOR
@@ -333,27 +341,27 @@ mod pg_tests {
                 baseline
                     .iter()
                     .map(|(index, _)| *index)
-                    .min_by_key(|index| cluster.nodes()[*index].ready_report().node_id)
+                    .min_by_key(|index| cluster.node_id(*index).as_uuid())
                     .ok_or("no Oracle candidate")?
             };
-            let token = bearer(&cluster.nodes()[endpoint], &api_key).await?;
+            let token = bearer(cluster.server(endpoint)?, &api_key).await?;
             let ingress =
-                ().serve_with_lifecycle(transport(&cluster.nodes()[endpoint], &token)?, discover())
+                ().serve_with_lifecycle(transport(cluster.server(endpoint)?, &token)?, discover())
                     .await?;
-            cluster.nodes_mut()[leader].arm_cleanup_pause()?;
+            cluster.arm_cleanup_pause();
             let peer = ingress.peer().clone();
             let arguments =
                 query(serde_json::json!({"sql": join_sql, "max_rows": 1, "deadline_ms": 15_000}));
             let result = tokio::spawn(async move { peer.call_tool(arguments).await });
-            cluster.nodes_mut()[leader].await_cleanup_paused()?;
+            cluster.await_cleanup_paused().await?;
             tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
             let premature = result.is_finished();
-            let held = cluster.nodes_mut()[leader].ownership_snapshot()?;
-            cluster.nodes_mut()[leader].release_cleanup_pause()?;
+            let held = cluster.ownership_snapshot(leader)?;
+            cluster.release_cleanup_pause();
             let refusal =
                 problem(tokio::time::timeout(std::time::Duration::from_secs(10), result).await???)?;
             for (index, before) in &baseline {
-                await_baseline(&mut cluster, *index, *before).await?;
+                await_baseline(&cluster, *index, *before).await?;
             }
             ingress.cancel().await?;
             assert!(
@@ -403,10 +411,10 @@ mod pg_tests {
         // Pause a real activated follower before source IO, so ordinary fast
         // completion cannot masquerade as cancellation.
         for (index, before) in &baseline {
-            await_baseline(&mut cluster, *index, *before).await?;
+            await_baseline(&cluster, *index, *before).await?;
         }
         let paused = PEER_FOLLOWERS[0];
-        cluster.nodes_mut()[paused].arm_execute_pause()?;
+        cluster.arm_execute_pause(paused)?;
         let handle = client
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(query(
@@ -415,21 +423,19 @@ mod pg_tests {
                 PeerRequestOptions::no_options(),
             )
             .await?;
-        cluster.nodes_mut()[paused].await_execute_paused()?;
+        cluster.await_execute_paused(paused).await?;
         let family = "oracle_query_duration_seconds";
         let labels = std::collections::BTreeMap::from([
             ("class".to_owned(), "analytical".to_owned()),
             ("outcome".to_owned(), "cancelled".to_owned()),
         ]);
-        let before_cancel =
-            cluster.nodes_mut()[COORDINATOR].metric_totals_labeled(&[family], &labels)?[family];
+        let before_cancel = cluster.metric_totals_labeled(&[family], &labels)?[family];
         handle.cancel(None).await?;
-        cluster.nodes_mut()[paused].release_execute_pause()?;
+        cluster.release_execute_pause(paused)?;
         for (index, before) in baseline {
-            await_baseline(&mut cluster, index, before).await?;
+            await_baseline(&cluster, index, before).await?;
         }
-        let after_cancel =
-            cluster.nodes_mut()[COORDINATOR].metric_totals_labeled(&[family], &labels)?[family];
+        let after_cancel = cluster.metric_totals_labeled(&[family], &labels)?[family];
         if after_cancel <= before_cancel {
             return Err(
                 "the active MCP query did not record Analytical cancellation before disconnect"
@@ -437,7 +443,7 @@ mod pg_tests {
             );
         }
         client.cancel().await?;
-        cluster.shutdown()?;
+        cluster.shutdown().await?;
         Ok(())
     }
 }

@@ -5,7 +5,7 @@
 //! only believed once the accepted siblings are queryable and the rejected ones
 //! are provably absent.
 
-use arrow::array::{Int32Array, StringArray};
+use arrow::array::StringArray;
 use arrow::record_batch::RecordBatch;
 use wyrd_tonic::otlp::logs::v1::{ResourceLogs, ScopeLogs};
 use wyrd_tonic::otlp::metrics::v1::{ResourceMetrics, ScopeMetrics};
@@ -194,25 +194,22 @@ fn correlated_resource_spans(anchor: i64) -> Vec<ResourceSpans> {
     resource_spans
 }
 
-/// Reads the ordered `(discriminator, wyrd_row_ordinal)` pairs of one query.
+/// Reads the sorted `discriminator` markers of one query.
 ///
-/// The caller orders the query by `wyrd_row_ordinal`, so the returned order is
-/// the stored order and both the accepted subset's relative order and its
-/// ordinal contiguity are readable from one projection.
+/// Sorting makes the result the stored marker multiset, independent of which
+/// file or tier answered, so duplicates and absences are both visible.
 ///
 /// # Panics
 ///
-/// Panics when either column is missing or is not the canonical type.
-fn ordered_rows(batches: &[RecordBatch], discriminator: &str) -> Vec<(String, i32)> {
-    let mut rows = Vec::new();
+/// Panics when the column is missing or is not the canonical type.
+fn sorted_markers(batches: &[RecordBatch], discriminator: &str) -> Vec<String> {
+    let mut markers = Vec::new();
     for batch in batches {
-        let markers = column::<StringArray>(batch, discriminator);
-        let ordinals = column::<Int32Array>(batch, "wyrd_row_ordinal");
-        for index in 0..batch.num_rows() {
-            rows.push((markers.value(index).to_owned(), ordinals.value(index)));
-        }
+        let column = column::<StringArray>(batch, discriminator);
+        markers.extend((0..batch.num_rows()).map(|index| column.value(index).to_owned()));
     }
-    rows
+    markers.sort_unstable();
+    markers
 }
 
 /// Tests that need Postgres, a bound server, and the publication boundary.
@@ -238,7 +235,7 @@ mod pg_tests {
         ATTRIBUTION_RUN, FAN_OUT_TRACE_SCOPE, LOG_MARKERS, LOG_REJECTION, METRIC_REJECTION,
         NEGATIVE_LOG_SCOPE, NEGATIVE_METRIC_SCOPE, NEGATIVE_TRACE_SCOPE, SPAN_MARKERS,
         SPAN_REJECTION, correlated_resource_spans, fan_out_resource_spans, negative_resource_logs,
-        negative_resource_metrics, negative_resource_spans, ordered_rows,
+        negative_resource_metrics, negative_resource_spans, sorted_markers,
     };
 
     /// A mixed request commits its complete siblings and reports exactly one.
@@ -248,9 +245,7 @@ mod pg_tests {
     /// the partial-success contract is proven on every encoding the collector
     /// exposes rather than on one. For each signal the case asserts the exact
     /// rejected count and the stable first reason, then reads the table back
-    /// and proves that only the complete siblings are stored, in their request
-    /// order, with `wyrd_row_ordinal` contiguous from zero over the accepted
-    /// subset alone.
+    /// and proves that exactly the complete siblings are stored, once each.
     ///
     /// The request is then replayed byte-identically, which is what an
     /// at-least-once OTLP exporter does after a lost acknowledgement. The
@@ -264,7 +259,7 @@ mod pg_tests {
     ///
     /// Panics when a transport is refused, when a partial success reports a
     /// different count or reason, or when the stored rows are not exactly the
-    /// accepted siblings in order.
+    /// accepted siblings.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success() {
@@ -336,36 +331,33 @@ mod pg_tests {
 
         let spans = journey
             .query(&format!(
-                "SELECT trace_state, wyrd_row_ordinal FROM {SPANS_TABLE} \
-                 WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}' ORDER BY wyrd_row_ordinal"
+                "SELECT trace_state FROM {SPANS_TABLE} WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}'"
             ))
             .await;
         assert_accepted_subset(
-            &ordered_rows(&spans, "trace_state"),
+            &sorted_markers(&spans, "trace_state"),
             &[SPAN_MARKERS[0], SPAN_MARKERS[2]],
             SPAN_MARKERS[1],
         );
 
         let logs = journey
             .query(&format!(
-                "SELECT event_name, wyrd_row_ordinal FROM {LOGS_TABLE} \
-                 WHERE scope_name = '{NEGATIVE_LOG_SCOPE}' ORDER BY wyrd_row_ordinal"
+                "SELECT event_name FROM {LOGS_TABLE} WHERE scope_name = '{NEGATIVE_LOG_SCOPE}'"
             ))
             .await;
         assert_accepted_subset(
-            &ordered_rows(&logs, "event_name"),
+            &sorted_markers(&logs, "event_name"),
             &[LOG_MARKERS[0], LOG_MARKERS[2]],
             LOG_MARKERS[1],
         );
 
         let metrics = journey
             .query(&format!(
-                "SELECT metric_name, wyrd_row_ordinal FROM {METRICS_TABLE} \
-                 WHERE scope_name = '{NEGATIVE_METRIC_SCOPE}' ORDER BY wyrd_row_ordinal"
+                "SELECT metric_name FROM {METRICS_TABLE} WHERE scope_name = '{NEGATIVE_METRIC_SCOPE}'"
             ))
             .await;
         assert_accepted_subset(
-            &ordered_rows(&metrics, "metric_name"),
+            &sorted_markers(&metrics, "metric_name"),
             &[support::GAUGE_INT_METRIC, support::SUM_INT_METRIC],
             "",
         );
@@ -472,37 +464,28 @@ mod pg_tests {
         journey.shutdown().await;
     }
 
-    /// Asserts the stored rows are exactly `accepted`, once each, in order.
+    /// Asserts the sorted stored markers are exactly `accepted`, once each.
     ///
     /// The replayed export carries the same accepted canonical rows, so the
     /// Gate derives the same batch identity and the durable fence suppresses
-    /// the repeat: each accepted sibling appears exactly once under the one
-    /// ordinal its position in the request earns. A rejected sibling must
-    /// never appear and must never consume an ordinal, which is what makes the
-    /// run contiguous from zero over the accepted subset alone.
+    /// the repeat: each accepted sibling appears exactly once. A rejected
+    /// sibling must never appear.
     ///
     /// # Panics
     ///
     /// Panics when a rejected marker is present, when an accepted sibling is
-    /// duplicated, or when the stored markers and ordinals are not exactly the
-    /// accepted subset's.
-    fn assert_accepted_subset(rows: &[(String, i32)], accepted: &[&str], rejected: &str) {
+    /// duplicated or missing, or when any other marker is stored.
+    fn assert_accepted_subset(markers: &[String], accepted: &[&str], rejected: &str) {
         assert!(
-            !rows.iter().any(|(marker, _)| marker == rejected),
+            !markers.iter().any(|marker| marker == rejected),
             "the rejected sibling `{rejected}` is never stored"
         );
-        let expected: Vec<(String, i32)> = accepted
-            .iter()
-            .enumerate()
-            .map(|(index, marker)| {
-                let ordinal = i32::try_from(index).expect("the fixture position fits i32");
-                ((*marker).to_owned(), ordinal)
-            })
-            .collect();
+        let mut expected: Vec<String> =
+            accepted.iter().map(|marker| (*marker).to_owned()).collect();
+        expected.sort_unstable();
         assert_eq!(
-            rows, expected,
-            "a replayed export stores its accepted siblings exactly once, in request \
-             order, with `wyrd_row_ordinal` contiguous from zero over that subset alone"
+            markers, expected,
+            "a replayed export stores its accepted siblings exactly once"
         );
     }
 
@@ -676,7 +659,7 @@ mod pg_tests {
         journey.publish().await;
         let stored: usize = journey
             .try_query(&format!(
-                "SELECT wyrd_row_ordinal FROM {SPANS_TABLE} WHERE scope_name = '{FAN_OUT_TRACE_SCOPE}'"
+                "SELECT wyrd_batch_id FROM {SPANS_TABLE} WHERE scope_name = '{FAN_OUT_TRACE_SCOPE}'"
             ))
             .await
             .expect("the accepted export is queryable")
@@ -699,7 +682,7 @@ mod pg_tests {
     /// Panics when a row is queryable or the query fails for any reason other
     /// than the table never having been created.
     async fn assert_no_rows(journey: &OtlpJourney, table: &str, scope: &str) {
-        let sql = format!("SELECT wyrd_row_ordinal FROM {table} WHERE scope_name = '{scope}'");
+        let sql = format!("SELECT wyrd_batch_id FROM {table} WHERE scope_name = '{scope}'");
         match journey.try_query(&sql).await {
             Ok(batches) => {
                 let stored: usize = batches.iter().map(RecordBatch::num_rows).sum();

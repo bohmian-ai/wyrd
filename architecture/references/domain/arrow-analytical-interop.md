@@ -11,7 +11,7 @@ names, Iceberg field IDs, logical types, nullability, metadata, decimal
 precision/scale, and timestamp units/timezones. Map by stable identity or name,
 never positional index when schemas can diverge.
 
-Reserved system columns and immutable `(wyrd_batch_id, wyrd_row_ordinal)` stay
+Reserved system columns and the immutable `wyrd_batch_id` stay
 present and non-null where the table contract requires them. The server stamps
 authenticated tenant, ingest time, and request identity; callers cannot
 override them. Schema fingerprints cover the canonical logical schema and are

@@ -184,7 +184,7 @@ change.
 
 RFC 8693 token exchange has no permission of its own. Service B acts for
 Service A by presenting A's token as `subject_token` and its own as
-`actor_token`; the invoke policy decides whether A may be served by B. The
+`actor_token`. The
 issued token names A as its principal and B as its outer `act`, and its
 permissions are `PermissionSet::intersection` of B's current permissions and
 A's verified ones, so delegation narrows authority and never amplifies either

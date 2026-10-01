@@ -951,12 +951,12 @@ mod pg_tests {
         .expect("retirement proof function exists");
         assert_eq!(
             (owner.as_str(), volatility.as_str(), security),
-            ("wyrd_migrator", "s", true)
+            ("wyrd_platform_admin", "s", true)
         );
         let executors: Vec<String> = sqlx::query_scalar(
             "SELECT grantee FROM information_schema.role_routine_grants \
               WHERE specific_schema = 'vala' AND routine_name = 'oracle_epoch_protection_count' \
-                AND privilege_type = 'EXECUTE' AND grantee <> 'wyrd_migrator' \
+                AND privilege_type = 'EXECUTE' \
               ORDER BY grantee",
         )
         .fetch_all(&pool)

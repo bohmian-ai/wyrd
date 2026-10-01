@@ -98,7 +98,6 @@ const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
     "oracle_query_duration_seconds",
     "oracle_query_time_to_first_batch_seconds",
     "oracle_query_phase_seconds",
-    "oracle_fragment_duration_seconds",
     WYRD_POSTGRES_POOL_ACQUIRE_SECONDS,
     VALA_POSTGRES_POOL_ACQUIRE_SECONDS,
     WYRD_STORAGE_OPERATION_DURATION_SECONDS,

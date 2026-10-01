@@ -17,7 +17,7 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 /// populated only for a skip. The workflow summary in
 /// `vala.verification.results` counts executed tasks alone, so a skipped task
 /// is visible only in this table. Rows join their parent result on
-/// (`data_tenant_id`, `result_id`). `actual`, `expected`, and `message` carry
+/// `result_id` inside the tenant's own namespace. `actual`, `expected`, and `message` carry
 /// captured task payloads and are classified sensitive.
 pub struct ResultItemsTable;
 

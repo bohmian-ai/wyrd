@@ -17,11 +17,25 @@ use crate::row_types::audit_staging::AuditStagingRow;
 
 /// Append one hash-chained audit row for the connection's tenant, returning its `seq`.
 ///
-/// Advances `vala.audit_chain_head` under `FOR UPDATE` so concurrent appends for
-/// the same tenant serialize into a gapless sequence, then inserts the row into
-/// `vala.audit_staging`. Runs inside the caller's transaction so the decision
-/// record is durable exactly when — and only when — the authorization decision
-/// that produced it is.
+/// This is [`append_audit_batch`] with one event, so a single row and a batch
+/// share one chaining and hashing path.
+///
+/// # Errors
+/// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
+pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
+    append_audit_batch(conn, std::slice::from_ref(event)).await
+}
+
+/// Append hash-chained audit rows for the connection's tenant, in order,
+/// returning the chain head's `seq` afterwards.
+///
+/// Locks `vala.audit_chain_head` under `FOR UPDATE` once, chains every event
+/// in memory from the locked head, inserts all rows in one statement, and
+/// advances the head once. Concurrent appends for the same tenant therefore
+/// still serialize into a gapless sequence, but a batch pays the lock and its
+/// round trips once rather than once per row. Runs inside the caller's
+/// transaction so the rows are durable exactly when — and only when — the
+/// caller commits. An empty batch changes nothing and returns the current head.
 ///
 /// Every statement names [`TenantConn::data_tenant_id`] explicitly rather than
 /// leaning on the row-level-security policy to supply it. Under the application
@@ -34,7 +48,10 @@ use crate::row_types::audit_staging::AuditStagingRow;
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
-pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
+pub async fn append_audit_batch(
+    conn: &mut TenantConn<'_>,
+    events: &[AuditEvent],
+) -> Result<i64, SqlError> {
     let data_tenant_id = conn.data_tenant_id().as_uuid();
     let conn = &mut **conn.transaction();
     sqlx::query(
@@ -49,7 +66,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .await
     .map_err(SqlError::from)?;
 
-    let (last_seq, prev_hash): (i64, Vec<u8>) = sqlx::query_as(
+    let (mut seq, mut prev_hash): (i64, Vec<u8>) = sqlx::query_as(
         r#"
         SELECT last_seq, head_hash
           FROM vala.audit_chain_head
@@ -61,17 +78,38 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .fetch_one(&mut *conn)
     .await
     .map_err(SqlError::from)?;
+    if events.is_empty() {
+        return Ok(seq);
+    }
 
-    let seq = last_seq + 1;
-    let card_ref = event.card_ref.as_ref().map(ToString::to_string);
-    let detail = event.detail.as_ref().map(audit_detail_canonical_json);
-    let entry_hash = entry_hash(
-        &prev_hash,
-        seq,
-        event,
-        card_ref.as_deref(),
-        detail.as_deref(),
-    );
+    let mut rows = AuditRows::with_capacity(events.len());
+    for event in events {
+        seq += 1;
+        let card_ref = event.card_ref.as_ref().map(ToString::to_string);
+        let detail = event.detail.as_ref().map(audit_detail_canonical_json);
+        let entry_hash = entry_hash(
+            &prev_hash,
+            seq,
+            event,
+            card_ref.as_deref(),
+            detail.as_deref(),
+        );
+        rows.seq.push(seq);
+        rows.prev_hash
+            .push(std::mem::replace(&mut prev_hash, entry_hash.to_vec()));
+        rows.entry_hash.push(entry_hash.to_vec());
+        rows.request_id.push(event.request_id.as_str());
+        rows.trace_id.push(event.trace_id.as_deref());
+        rows.operation.push(event.operation.as_str());
+        rows.resource.push(event.resource.as_str());
+        rows.card_ref.push(card_ref);
+        rows.principal_id.push(event.principal_id.as_uuid());
+        rows.principal_kind.push(event.principal_kind.as_str());
+        rows.credential_id.push(event.credential_id);
+        rows.permission.push(event.permission.as_str());
+        rows.outcome.push(outcome_str(event.outcome));
+        rows.detail.push(detail);
+    }
 
     sqlx::query(
         r#"
@@ -79,25 +117,28 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
             (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
              operation, resource, card_ref, principal_id, principal_kind,
              credential_id, permission, outcome, detail)
-        VALUES ($15, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14)
+        SELECT $1, row.*
+          FROM UNNEST($2::bigint[], $3::bytea[], $4::bytea[], $5::text[],
+                      $6::text[], $7::text[], $8::text[], $9::text[],
+                      $10::uuid[], $11::text[], $12::uuid[], $13::text[],
+                      $14::text[], $15::text[]) AS row
         "#,
     )
-    .bind(seq)
-    .bind(prev_hash.as_slice())
-    .bind(entry_hash.as_slice())
-    .bind(event.request_id.as_str())
-    .bind(event.trace_id.as_deref())
-    .bind(event.operation.as_str())
-    .bind(event.resource.as_str())
-    .bind(card_ref.as_deref())
-    .bind(event.principal_id.as_uuid())
-    .bind(event.principal_kind.as_str())
-    .bind(event.credential_id)
-    .bind(event.permission.as_str())
-    .bind(outcome_str(event.outcome))
-    .bind(detail.as_deref())
     .bind(data_tenant_id)
+    .bind(&rows.seq)
+    .bind(&rows.prev_hash)
+    .bind(&rows.entry_hash)
+    .bind(&rows.request_id)
+    .bind(&rows.trace_id)
+    .bind(&rows.operation)
+    .bind(&rows.resource)
+    .bind(&rows.card_ref)
+    .bind(&rows.principal_id)
+    .bind(&rows.principal_kind)
+    .bind(&rows.credential_id)
+    .bind(&rows.permission)
+    .bind(&rows.outcome)
+    .bind(&rows.detail)
     .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
@@ -110,13 +151,70 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
         "#,
     )
     .bind(seq)
-    .bind(entry_hash.as_slice())
+    .bind(prev_hash.as_slice())
     .bind(data_tenant_id)
     .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 
     Ok(seq)
+}
+
+/// Column arrays for one batched `vala.audit_staging` insert.
+///
+/// Each field holds one column for every row of the batch, in chain order, so
+/// the rows bind as `UNNEST` arrays of one statement.
+struct AuditRows<'a> {
+    /// Gapless chain sequence of each row.
+    seq: Vec<i64>,
+    /// Hash of the row before each row.
+    prev_hash: Vec<Vec<u8>>,
+    /// Hash of each row over its previous hash and contents.
+    entry_hash: Vec<Vec<u8>>,
+    /// Request each decision was made for.
+    request_id: Vec<&'a str>,
+    /// Trace each decision belongs to, when known.
+    trace_id: Vec<Option<&'a str>>,
+    /// Audited operation name.
+    operation: Vec<&'a str>,
+    /// Resource the decision covered.
+    resource: Vec<&'a str>,
+    /// Canonical writer-identity card, when the principal has one.
+    card_ref: Vec<Option<String>>,
+    /// Principal that was authorized.
+    principal_id: Vec<uuid::Uuid>,
+    /// Durable spelling of the principal's kind.
+    principal_kind: Vec<&'a str>,
+    /// Credential the principal used, when known.
+    credential_id: Vec<Option<uuid::Uuid>>,
+    /// Permission that was evaluated.
+    permission: Vec<&'a str>,
+    /// Durable spelling of the decision.
+    outcome: Vec<&'static str>,
+    /// Canonical JSON detail, when the event carries one.
+    detail: Vec<Option<String>>,
+}
+
+impl AuditRows<'_> {
+    /// Creates empty column arrays sized for `rows` rows.
+    fn with_capacity(rows: usize) -> Self {
+        Self {
+            seq: Vec::with_capacity(rows),
+            prev_hash: Vec::with_capacity(rows),
+            entry_hash: Vec::with_capacity(rows),
+            request_id: Vec::with_capacity(rows),
+            trace_id: Vec::with_capacity(rows),
+            operation: Vec::with_capacity(rows),
+            resource: Vec::with_capacity(rows),
+            card_ref: Vec::with_capacity(rows),
+            principal_id: Vec::with_capacity(rows),
+            principal_kind: Vec::with_capacity(rows),
+            credential_id: Vec::with_capacity(rows),
+            permission: Vec::with_capacity(rows),
+            outcome: Vec::with_capacity(rows),
+            detail: Vec::with_capacity(rows),
+        }
+    }
 }
 
 /// Read a bounded page of audit rows for one tenant-bound resource.

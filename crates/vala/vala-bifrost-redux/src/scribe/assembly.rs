@@ -434,7 +434,7 @@ pub enum ClaimCause {
     Dwell,
     /// The key's physical partition closed and will receive no more members.
     PartitionClosed,
-    /// Graceful drain is settling every admitted member before shutdown.
+    /// An explicit flush is publishing every ready member as residue.
     Drain,
     /// Startup resumed a durable claim taken by an earlier process.
     Recovery,
@@ -979,10 +979,9 @@ impl StagingAssembler {
 
     /// Returns every key that currently holds at least one ready member.
     ///
-    /// Drain and partition-close use this to sweep what target and dwell would
-    /// otherwise keep waiting: a member that is durable but unpublished costs
-    /// staging capacity, so at shutdown every remaining key is claimed as
-    /// residue rather than left for a dwell that will never expire.
+    /// An explicit flush and partition-close use this to sweep what target and
+    /// dwell would otherwise keep waiting. Shutdown does not sweep: its staged
+    /// members stay durable for the next process to restore and publish.
     #[must_use]
     pub fn ready_keys(&self) -> Vec<ScribeAssemblyKey> {
         self.ready

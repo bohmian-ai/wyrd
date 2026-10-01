@@ -1,6 +1,6 @@
 //! Rust e2e mirror for the happy-path and backpressure/drain journeys.
 //!
-//! These tests require a live `WyrdTestServer` (embedded Postgres + real server
+//! These tests require a live `WyrdTestServer` (repository-managed Postgres + real server
 //! socket), so they live in `mod pg_tests`: the fast family lane skips them via
 //! `--skip pg_tests`; `mise run test:e2e` (Postgres up) runs them.
 //!
@@ -24,7 +24,6 @@ mod pg_tests {
     use tokio::task::JoinHandle;
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
-    use vala_bifrost_redux::resources::ORACLE_MAX_BATCH_SIZE;
     use wyrd_client::WyrdClient;
     use wyrd_client::bifrost::BifrostClientError;
     use wyrd_client::bifrost::{
@@ -915,10 +914,10 @@ mod pg_tests {
         .await
         .expect("public SDK write door");
         let client = writer.client();
-        // One ingest larger than the widest admitted DataFusion batch size
+        // One ingest larger than DataFusion's default 8,192-row batch size
         // guarantees the result spans several batches on one shared IPC stream,
         // independent of how many files or partitions the scan happens to use.
-        let row_count = ORACLE_MAX_BATCH_SIZE + 1;
+        let row_count = 8_193_usize;
         let ids: Vec<i64> = (0..row_count)
             .map(|id| i64::try_from(id).expect("row id fits i64"))
             .collect();

@@ -1,0 +1,279 @@
+# Test-local dependencies for the kind autoscaling journey
+# (`scripts/server/test-kind-autoscale.sh`): an external Postgres, one shared
+# S3-compatible object store, and the Prometheus scrape plus custom-metrics
+# adapter that turn the Oracle's own `oracle_query_duration_seconds` count into
+# the per-pod Oracle-executed read rate a HorizontalPodAutoscaler consumes. Every container is
+# resource-limited; nothing here is a production default.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wyrd-kind
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: postgres, namespace: wyrd-kind}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - {name: POSTGRES_DB, value: wyrd}
+            - {name: POSTGRES_USER, value: wyrd_owner}
+            - {name: POSTGRES_PASSWORD, value: owner_pw_kind}
+          args: ["-c", "max_connections=400"]
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: [pg_isready, -h, 127.0.0.1, -U, wyrd_owner, -d, wyrd]}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+      volumes: [{name: data, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres, namespace: wyrd-kind}
+spec:
+  selector: {app: postgres}
+  ports: [{port: 5432}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: rustfs, namespace: wyrd-kind}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: rustfs}}
+  template:
+    metadata: {labels: {app: rustfs}}
+    spec:
+      containers:
+        - name: rustfs
+          image: rustfs/rustfs@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
+          env:
+            - {name: RUSTFS_VOLUMES, value: /data}
+            - {name: RUSTFS_ADDRESS, value: "0.0.0.0:9000"}
+            - {name: RUSTFS_CONSOLE_ENABLE, value: "false"}
+            - {name: RUSTFS_ACCESS_KEY, value: wyrd-kind-key}
+            - {name: RUSTFS_SECRET_KEY, value: wyrd-kind-secret}
+            - {name: RUSTFS_OBS_LOGGER_LEVEL, value: warn}
+          ports: [{containerPort: 9000}]
+          readinessProbe:
+            tcpSocket: {port: 9000}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes: [{name: data, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: rustfs, namespace: wyrd-kind}
+spec:
+  selector: {app: rustfs}
+  ports: [{port: 9000}]
+---
+# Prometheus scrapes every pod that opts in with `wyrd.ai/scrape-port`, and
+# labels each series with its namespace and pod so the adapter can attribute
+# the rate to the HPA's target pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: prometheus, namespace: wyrd-kind}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: prometheus, namespace: wyrd-kind}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: prometheus, namespace: wyrd-kind}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: prometheus}
+subjects: [{kind: ServiceAccount, name: prometheus, namespace: wyrd-kind}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: prometheus, namespace: wyrd-kind}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+      - job_name: wyrd
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces: {names: [wyrd-kind]}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_wyrd_ai_scrape_port]
+            regex: .+
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_wyrd_ai_scrape_port]
+            regex: (.+);(.+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: prometheus, namespace: wyrd-kind}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: prometheus}}
+  template:
+    metadata: {labels: {app: prometheus}}
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.5.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=1h
+          ports: [{containerPort: 9090}]
+          readinessProbe:
+            httpGet: {path: /-/ready, port: 9090}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/prometheus}
+            - {name: data, mountPath: /prometheus}
+      volumes:
+        - {name: config, configMap: {name: prometheus}}
+        - {name: data, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: prometheus, namespace: wyrd-kind}
+spec:
+  selector: {app: prometheus}
+  ports: [{port: 9090}]
+---
+# prometheus-adapter serves `custom.metrics.k8s.io` from one rule: the per-pod
+# rate of reads that pod's Oracle executed successfully, named
+# `wyrd_oracle_reads_per_second`. The HTTP ingress count would also rise on a
+# pod that only forwards reads, so it is not the scale signal.
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: custom-metrics-apiserver, namespace: wyrd-kind}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: wyrd-kind-custom-metrics-resource-reader}
+rules:
+  - apiGroups: [""]
+    resources: [pods, namespaces, nodes, services]
+    verbs: [get, list, watch]
+  - apiGroups: [flowcontrol.apiserver.k8s.io]
+    resources: [prioritylevelconfigurations, flowschemas]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: wyrd-kind-custom-metrics-resource-reader}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: wyrd-kind-custom-metrics-resource-reader}
+subjects: [{kind: ServiceAccount, name: custom-metrics-apiserver, namespace: wyrd-kind}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: wyrd-kind-custom-metrics-auth-delegator}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: "system:auth-delegator"}
+subjects: [{kind: ServiceAccount, name: custom-metrics-apiserver, namespace: wyrd-kind}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: wyrd-kind-custom-metrics-auth-reader, namespace: kube-system}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: extension-apiserver-authentication-reader}
+subjects: [{kind: ServiceAccount, name: custom-metrics-apiserver, namespace: wyrd-kind}]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: {name: wyrd-kind-custom-metrics-reader}
+rules:
+  - apiGroups: [custom.metrics.k8s.io]
+    resources: ["*"]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: {name: wyrd-kind-hpa-custom-metrics}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: wyrd-kind-custom-metrics-reader}
+subjects: [{kind: ServiceAccount, name: horizontal-pod-autoscaler, namespace: kube-system}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: adapter-config, namespace: wyrd-kind}
+data:
+  config.yaml: |
+    rules:
+      - seriesQuery: 'oracle_query_duration_seconds_count{namespace!="",pod!="",outcome="success"}'
+        resources:
+          overrides:
+            namespace: {resource: namespace}
+            pod: {resource: pod}
+        name:
+          matches: ^oracle_query_duration_seconds_count$
+          as: wyrd_oracle_reads_per_second
+        metricsQuery: 'sum(rate(<<.Series>>{<<.LabelMatchers>>,outcome="success"}[30s])) by (<<.GroupBy>>)'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: custom-metrics-apiserver, namespace: wyrd-kind}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: custom-metrics-apiserver}}
+  template:
+    metadata: {labels: {app: custom-metrics-apiserver}}
+    spec:
+      serviceAccountName: custom-metrics-apiserver
+      containers:
+        - name: adapter
+          image: registry.k8s.io/prometheus-adapter/prometheus-adapter:v0.12.0
+          args:
+            - --secure-port=6443
+            - --cert-dir=/tmp/cert
+            - --prometheus-url=http://prometheus.wyrd-kind.svc:9090/
+            - --metrics-relist-interval=10s
+            - --config=/etc/adapter/config.yaml
+          ports: [{containerPort: 6443}]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/adapter}
+            - {name: cert, mountPath: /tmp/cert}
+      volumes:
+        - {name: config, configMap: {name: adapter-config}}
+        - {name: cert, emptyDir: {}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: custom-metrics-apiserver, namespace: wyrd-kind}
+spec:
+  selector: {app: custom-metrics-apiserver}
+  ports: [{port: 443, targetPort: 6443}]
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata: {name: v1beta1.custom.metrics.k8s.io}
+spec:
+  service: {name: custom-metrics-apiserver, namespace: wyrd-kind}
+  group: custom.metrics.k8s.io
+  version: v1beta1
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 100

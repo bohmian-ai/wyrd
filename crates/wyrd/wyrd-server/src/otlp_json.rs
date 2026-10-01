@@ -57,12 +57,13 @@ pub(crate) struct JsonDecodePlan {
 }
 
 impl JsonDecodePlan {
-    /// Returns the simultaneous typed-backing, projected-output, and scratch
-    /// demand the caller reserves before generated decode.
+    /// Returns the simultaneous typed-backing and scratch demand the caller
+    /// reserves before generated decode.
+    ///
+    /// Projected Arrow output is not charged here: Scribe charges it when it
+    /// is materialized.
     pub(crate) const fn reservation_bytes(&self) -> usize {
-        self.decode_bytes
-            .saturating_add(self.projected_bytes)
-            .saturating_add(self.scratch_bytes)
+        self.decode_bytes.saturating_add(self.scratch_bytes)
     }
 }
 

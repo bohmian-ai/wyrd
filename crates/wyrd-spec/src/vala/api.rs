@@ -489,14 +489,19 @@ impl BifrostQueryRequest {
     }
 }
 
-/// Server-derived admission class.
+/// Server-derived class of one query: how Oracle admits and executes it.
+///
+/// Never a request field. Oracle reads it from the one physical root it built:
+/// a distributed root is Analytical, anything else Interactive. The class
+/// selects the admission rules and the execution path together, so the
+/// terminal's class is also the path that ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum QueryClass {
-    /// Latency-sensitive bounded work.
+    /// Executed locally on the leader.
     Interactive,
-    /// Larger analytical work.
+    /// Executed as a distributed graph across Oracle peers.
     Analytical,
 }
 
@@ -696,32 +701,6 @@ pub enum QueryTerminalOutcome {
     Failed,
 }
 
-/// The execution path Oracle selected for one logical query.
-///
-/// This is a server-derived terminal fact, never a request field: REQ-001 keeps
-/// path selection entirely on the server, and REQ-008 requires the terminal to
-/// name the path that actually ran. It is deliberately distinct from
-/// [`QueryClass`], which is the admission class of a *candidate*; a query
-/// admitted as an Analytical candidate still terminates as
-/// [`QueryExecutionPath::Interactive`] when its distributed plan is unsupported
-/// or carries no real exchange.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum QueryExecutionPath {
-    /// Oracle executed the query locally on the coordinator.
-    Interactive,
-    /// Oracle executed the query as a distributed graph across Oracle peers.
-    Analytical,
-}
-
-impl Default for QueryExecutionPath {
-    /// Uses Interactive so an unset path can never claim distributed execution.
-    fn default() -> Self {
-        Self::Interactive
-    }
-}
-
 /// Closed source tiers represented in terminal metadata.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
@@ -792,6 +771,8 @@ pub enum QueryTerminalErrorCode {
     StorageUnreachable,
     /// Query execution failed after framing began.
     QueryExecutionFailed,
+    /// The admitted query could not obtain the execution memory it needed.
+    QueryResourcesExhausted,
 }
 
 /// Scrubbed detail attached to a failed terminal.
@@ -861,13 +842,13 @@ pub struct QueryTerminalError {
 pub struct QueryTerminalFrame {
     /// Stream outcome.
     pub outcome: QueryTerminalOutcome,
-    /// Execution path Oracle selected for this query.
+    /// Class Oracle derived for this query, which is also the path that ran.
     ///
     /// Present on every terminal, successful or failed, so a caller always
-    /// learns which path ran. A failed terminal on
-    /// [`QueryExecutionPath::Analytical`] is the proof that selection was
-    /// irreversible: REQ-002 forbids rerunning that query through Interactive.
-    pub execution_path: QueryExecutionPath,
+    /// learns which path ran. A failed terminal on [`QueryClass::Analytical`]
+    /// is the proof that selection was irreversible: REQ-002 forbids rerunning
+    /// that query through Interactive.
+    pub query_class: QueryClass,
     /// Rows already emitted in batch frames.
     pub row_count: u64,
     /// Closed bounded warnings.
@@ -1024,7 +1005,7 @@ mod query_terminal_tests {
         let failed = outcome == QueryTerminalOutcome::Failed;
         QueryTerminalFrame {
             outcome,
-            execution_path: QueryExecutionPath::Interactive,
+            query_class: QueryClass::Interactive,
             row_count: 1,
             warnings,
             source_completion: sources(live),
@@ -1675,7 +1656,10 @@ pub struct TailStreamIdentity {
     pub writer_epoch: WriterEpoch,
 }
 
-/// Fenced request to reserve worker slots.
+/// Fenced request to reserve one participant's capacity for a distributed graph.
+///
+/// Every reservation charges exactly one query envelope, holding one slot unit,
+/// on the receiving node, so the request carries no demand of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ReserveNodeSlotsRequest {
@@ -1685,20 +1669,13 @@ pub struct ReserveNodeSlotsRequest {
     pub leader_node_id: NodeId,
     /// Leader Oracle-role fence.
     pub leader_fencing_token: FencingToken,
-    /// Required admission class.
-    pub query_class: QueryClass,
-    /// Requested worker slots.
-    pub slot_units: u32,
     /// Reservation expiry.
     pub expires_at: DateTime<Utc>,
     /// Distributed Analytical graph this reservation is taken for.
     ///
-    /// Present only for a graph reservation. A fragment reservation leaves it
-    /// absent, which is what keeps the two purposes distinguishable on one
-    /// wire: a follower charges a whole query envelope for a graph and a
-    /// worker quantum for a fragment, and it must not charge either for the
-    /// other.
-    pub graph: Option<AnalyticalGraphRef>,
+    /// A follower binds the reservation, and later the graph lease, to this
+    /// exact graph.
+    pub graph: AnalyticalGraphRef,
 }
 
 /// The two-identity name of one distributed Analytical graph.
@@ -1737,7 +1714,7 @@ pub struct ReservationRejected {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ReserveNodeSlotsResponse {
-    /// Slots are pending ticket-bound execution.
+    /// Slots are pending context-bound execution.
     Pending(PendingNodeReservation),
     /// Node lacked capacity.
     Rejected(ReservationRejected),
@@ -1757,16 +1734,17 @@ pub struct ReleaseNodeSlotsRequest {
     pub leader_fencing_token: FencingToken,
 }
 
-/// Signed opaque peer ticket verified before claims decoding.
+/// Unsigned typed operation context carried on the private peer plane.
+///
+/// The mTLS cluster identity establishes that a trusted Wyrd process sent it;
+/// the receiver validates every claim against its own trusted state (local
+/// node and role fence, reservations, deadlines, and bounds) before it decodes
+/// a plan or touches tenant storage. The bytes are bounded before decoding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct SignedPeerTicket {
-    /// ASCII signing-key identifier, at most 64 bytes.
-    pub key_id: String,
-    /// Opaque signed claims, at most 16 KiB.
+pub struct PeerContext {
+    /// Encoded typed claims, at most 16 KiB for a fragment.
     pub claims_bytes: Vec<u8>,
-    /// Exact 64-byte signature.
-    pub signature: Vec<u8>,
 }
 
 /// One signed persisted object a leader assigned to a follower.
@@ -1850,7 +1828,7 @@ impl PersistedFileDescriptor {
     ///
     /// A zero-row file is valid: an empty object still participates in residual
     /// execution. Whether the object exists, belongs to the tenant, or matches
-    /// the schema is decided by the binding and ticket checks that run before
+    /// the schema is decided by the binding and context checks that run before
     /// this value is used, not here.
     #[must_use]
     pub fn is_valid(&self) -> bool {
@@ -1980,17 +1958,15 @@ pub struct ScribeProviderCut {
     pub start_partition: TimePartitionWire,
     /// Inclusive final partition in the provider projection.
     pub end_partition: TimePartitionWire,
-    /// Maximum Arrow batches retained by the provider.
-    pub maximum_batch_count: u32,
-    /// Maximum bytes retained by the provider.
-    pub maximum_retained_bytes: u64,
 }
 
 impl ScribeProviderCut {
     /// Validates the canonical Scribe memory-provider cut.
     ///
-    /// The cut bounds which partitions a follower may read from memory, on which
-    /// writer incarnation, and how much it may retain. It carries no statement
+    /// The cut bounds which partitions a follower may read from memory and on
+    /// which writer incarnation. It carries no size limit: the read references
+    /// rows the Scribe already holds, and the query's own memory pool governs
+    /// what execution retains. It carries no statement
     /// about which rows are already published: Scribe decides that from the
     /// generation authority it owns, and a WAL interval on the wire would be a
     /// second, weaker answer that a reader could mistake for ownership.
@@ -1999,8 +1975,6 @@ impl ScribeProviderCut {
         self.writer_epoch > 0
             && self.start_partition.granularity() == self.end_partition.granularity()
             && self.start_partition <= self.end_partition
-            && self.maximum_batch_count > 0
-            && self.maximum_retained_bytes > 0
     }
 }
 
@@ -2093,26 +2067,26 @@ pub struct FollowerScanAssignment {
     pub predicates: Vec<crate::vala::assignment_authority::ScanPredicate>,
 }
 
-/// Ticket-bound worker request carrying one serialized physical subtree.
+/// Context-bound worker request carrying one serialized physical subtree.
 ///
 /// This is the sole domain projection of the private
 /// `wyrd.v1.ExecuteFragmentRequest` peer message. The leader mints it per
-/// follower after splitting the admitted plan; the follower verifies the
-/// ticket, both fences, and the assignment-authority digest before it
+/// follower after splitting the admitted plan; the follower checks the
+/// context, both fences, and the assignment-authority digest before it
 /// deserializes `physical_plan_bytes` and substitutes each remote placeholder
 /// with its role-local source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ExecuteFragmentRequest {
-    /// Opaque signed ticket.
-    pub ticket: SignedPeerTicket,
+    /// Typed fragment context validated before plan decode.
+    pub context: PeerContext,
     /// Runtime-bounded physical-plan bytes.
     pub physical_plan_bytes: Vec<u8>,
     /// Pending reservation identity.
     pub reservation_id: ReservationId,
-    /// Signed request-local leader incarnation.
+    /// Request-local leader incarnation.
     pub leader_fence: OracleRoleFence,
-    /// Signed target follower incarnation.
+    /// Target follower incarnation.
     pub target_fence: OracleRoleFence,
     /// Complete scan-keyed role-local assignment set.
     pub assignments: Vec<FollowerScanAssignment>,
@@ -2223,7 +2197,7 @@ mod tests {
         ];
         let base = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            execution_path: QueryExecutionPath::Interactive,
+            query_class: QueryClass::Interactive,
             row_count: 0,
             warnings: vec![],
             source_completion: sources,
@@ -2318,7 +2292,7 @@ mod tests {
             "the request must not accept a source, freshness, path, class, worker, or plan selector"
         );
 
-        let path = serde_json::to_value(schemars::schema_for!(QueryExecutionPath).schema)
+        let path = serde_json::to_value(schemars::schema_for!(QueryClass).schema)
             .expect("path schema serializes");
         let path_variants = path["oneOf"]
             .as_array()
@@ -2339,7 +2313,7 @@ mod tests {
 
         let terminal = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
-            execution_path: QueryExecutionPath::Analytical,
+            query_class: QueryClass::Analytical,
             row_count: 0,
             warnings: vec![],
             source_completion: vec![
@@ -2364,7 +2338,7 @@ mod tests {
             .expect("an Analytical terminal is valid");
         let encoded = serde_json::to_value(&terminal).expect("terminal serializes");
         assert_eq!(
-            encoded["execution_path"],
+            encoded["query_class"],
             serde_json::Value::from("analytical"),
             "the terminal names the server-selected path on the wire"
         );

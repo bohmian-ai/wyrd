@@ -1,31 +1,52 @@
 ---
 title: Docker
-description: Run the open-source server image against your own Postgres and object storage.
+description: Build the official server image locally and run it against your own Postgres and object storage.
 pillar: wyrd
 group: Self-hosting
-order: 10
+order: 12
 ---
 
 # Docker
 
-<Aside title="Placeholder">
+The official image runs three processes behind one port: the Rust server, the Node UI server, and nginx in front of both. nginx sends API paths (`/v1`, `/auth`, `/platform`, `/mcp`, `/openapi.json`, `/healthz`, `/readyz`) to Rust unchanged and everything else to the UI. It also serves public gRPC on port 50051. Clients derive the gRPC address from the server URL (same host, port 50051), so publish both ports on the same host.
 
-This page is a stub. The published image reference, a compose example, and the recommended way to pass secrets are still being written.
+No Wyrd image is published yet. Build the official image from the commit you are running and use its immutable image ID:
 
-</Aside>
+```bash
+mise run docker:build                              # tags the local image `wyrd`
+IMAGE="$(docker image inspect -f '{{.Id}}' wyrd)"  # sha256:… — record it with the commit
+```
 
-Running the server in Docker is mostly a matter of passing the same environment the binary reads. The container is stateless: it holds no database and no artifacts, so both must be external.
+Once a release is published, use its published digest instead.
 
-At minimum you will set:
+The container keeps no database. Local artifact storage and Bifrost data live under `/var/lib/wyrd`; mount a volume there, or point storage at a bucket.
 
-- `APP_ENV=production` (or `staging`).
-- The database variables from [Database](/self-hosting/database/), pointing at a Postgres you run.
-- The storage variables from [Storage](/self-hosting/storage/), pointing at a bucket.
-- `WYRD_SIGNING_KEY_FILE` mounted as a secret, per [Authentication](/self-hosting/authentication/).
+## First run
 
-Full image name, tags, and a worked compose file will land here.
+```bash
+# 1. Once per release, migrate with the database-owner login. This is the only
+#    process that ever gets the owner URL.
+docker run --rm -e WYRD_DATABASE_URL="postgresql://owner:…@db:5432/wyrd" \
+  "$IMAGE" wyrd-server migrate
+
+# 2. Serve with the two serving logins.
+docker run -d --name wyrd -p 8080:8080 -p 50051:50051 \
+  -e APP_ENV=production \
+  -e WYRD_DATABASE_URL="postgresql://wyrd_app:…@db:5432/wyrd" \
+  -e WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform_admin:…@db:5432/wyrd" \
+  -e WYRD_STORAGE_URL=file:///var/lib/wyrd/storage \
+  -e WYRD_SIGNING_KEY_FILE=/run/secrets/signing.pem \
+  -v wyrd-data:/var/lib/wyrd -v "$PWD/signing.pem:/run/secrets/signing.pem:ro" \
+  "$IMAGE"
+
+# 3. Create the first tenant. Safe to re-run: an existing tenant is a no-op.
+docker exec wyrd wyrd-server setup --tenant acme
+```
+
+`setup` initializes the platform root if needed, then creates the tenant through the running server. It prints the tenant's administrative credential once. If the root was already initialized, export its credential as `WYRD_PLATFORM_CREDENTIAL` first. If the schema is not migrated or does not match the binary, the server refuses to start with `WYRD_SQL_503_SCHEMA_NOT_READY`; run step 1 and start again.
 
 ## Related
 
 - [Configuration](/self-hosting/configuration/): the environment the container reads.
 - [Binary](/self-hosting/binary/): running the same server without a container.
+- [Development server on Kubernetes](/self-hosting/kubernetes-development/): the same image on a cluster.

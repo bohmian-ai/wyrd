@@ -1,13 +1,10 @@
 use wyrd_client::WyrdClient;
-use wyrd_client::config::ClientConfig;
-use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::vala::api::BifrostQueryRequest;
-use wyrd_testing::bifrost::process_cluster::{BifrostProcessCluster, ProcessNodeTarget};
 
 use super::support::PeerJourneyError;
-
-/// Path of the compiled child every simulated pod runs.
-const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
+use crate::peer_cluster::PeerCluster;
+use crate::support::public_client;
 
 /// Index of the pod that leads the distributed attempt.
 const LEADER: usize = 0;
@@ -42,30 +39,27 @@ async fn graph_lease_owns_exact_resources_for_complete_graph() {
 ///
 /// Returns the first scenario failure, which names the claim that broke.
 async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError> {
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
+    let cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
 
     let table = format!("graph_lease_{}", uuid::Uuid::now_v7().simple());
-    cluster.nodes_mut()[SCRIBE].register_table(&table)?;
-    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 0, 12, 3)?;
-    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.register_table(SCRIBE, &table).await?;
+    cluster.ingest_rows(SCRIBE, &table, 0, 12, 3).await?;
+    cluster.ingest_rows(SCRIBE, &table, 0, 12, 3).await?;
     for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     // Baseline first: every later count is a difference from a node that is
     // provably holding nothing, so a leak from an earlier lane cannot be read
     // as this attempt's own release.
     for index in FOLLOWERS {
-        let (activated, live) = cluster.nodes_mut()[index].graph_leases()?;
+        let (activated, live) = cluster.graph_leases(index)?;
         if (activated, live) != (0, 0) {
             return Err(PeerJourneyError::from(format!(
                 "follower {index} must start with no graph lease, held ({activated}, {live})"
@@ -77,7 +71,7 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
-    let rows = cluster.nodes_mut()[LEADER].execute_inactive_sql(&sql)?;
+    let rows = cluster.execute_sql(LEADER, &sql).await?;
     if rows != 3 {
         return Err(PeerJourneyError::from(format!(
             "the distributed attempt must return one row per group, returned {rows}"
@@ -89,7 +83,7 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
     // stream address the same graph; each must reuse the lease the first one
     // activated rather than charge a second envelope.
     for index in FOLLOWERS {
-        let (activated, live) = cluster.nodes_mut()[index].graph_leases()?;
+        let (activated, live) = cluster.graph_leases(index)?;
         if activated != 1 {
             return Err(PeerJourneyError::from(format!(
                 "follower {index} must activate exactly one graph lease, activated {activated}"
@@ -105,14 +99,14 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
     // A second attempt takes a second reservation and returns it too, which is
     // what distinguishes a lease that is released from one that was merely
     // never charged again.
-    let repeated = cluster.nodes_mut()[LEADER].execute_inactive_sql(&sql)?;
+    let repeated = cluster.execute_sql(LEADER, &sql).await?;
     if repeated != 3 {
         return Err(PeerJourneyError::from(format!(
             "the repeated attempt must return one row per group, returned {repeated}"
         )));
     }
     for index in FOLLOWERS {
-        let (activated, live) = cluster.nodes_mut()[index].graph_leases()?;
+        let (activated, live) = cluster.graph_leases(index)?;
         if (activated, live) != (2, 0) {
             return Err(PeerJourneyError::from(format!(
                 "follower {index} must activate and release one lease per attempt, \
@@ -121,7 +115,7 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
         }
     }
 
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -132,7 +126,7 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
 /// Panics when either ordering starts a successor or leaves ownership behind.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn one_attempt_peer_loss_and_cancellation_join_every_process() {
+async fn one_attempt_peer_loss_and_cancellation_join_every_pod() {
     prove_one_attempt_peer_loss_and_cancellation()
         .await
         .expect("one-attempt peer loss journey");
@@ -167,38 +161,35 @@ enum TerminalCause {
 ///
 /// Returns the first claim that broke.
 async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourneyError> {
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
+    let mut cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
 
     let table = format!("one_attempt_{}", uuid::Uuid::now_v7().simple());
-    cluster.nodes_mut()[SCRIBE].register_table(&table)?;
-    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 0, 12, 3)?;
-    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.register_table(SCRIBE, &table).await?;
+    cluster.ingest_rows(SCRIBE, &table, 0, 12, 3).await?;
+    cluster.ingest_rows(SCRIBE, &table, 0, 12, 3).await?;
     for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     // Armed before the query, so the follower is held at a real boundary: its
     // graph lease is active and it has consumed no source.
     let paused = FOLLOWERS[0];
-    cluster.nodes_mut()[paused].arm_execute_pause()?;
+    cluster.arm_execute_pause(paused)?;
 
     let sql = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
-    cluster.nodes_mut()[LEADER].start_inactive_sql(&sql)?;
-    cluster.nodes_mut()[paused].await_execute_paused()?;
+    cluster.start_sql(LEADER, &sql)?;
+    cluster.await_execute_paused(paused).await?;
 
-    let (activated, live) = cluster.nodes_mut()[paused].graph_leases()?;
+    let (activated, live) = cluster.graph_leases(paused)?;
     if (activated, live) != (1, 1) {
         return Err(PeerJourneyError::from(format!(
             "the paused follower must hold exactly one activated lease, held ({activated}, {live})"
@@ -206,11 +197,11 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
     }
 
     match cause {
-        TerminalCause::PeerLoss => cluster.nodes_mut()[paused].kill()?,
-        TerminalCause::Cancellation => cluster.nodes_mut()[LEADER].cancel_inactive_sql()?,
+        TerminalCause::PeerLoss => cluster.kill(paused).await?,
+        TerminalCause::Cancellation => cluster.cancel_sql(LEADER)?,
     }
 
-    let outcome = cluster.nodes_mut()[LEADER].await_inactive_sql()?;
+    let outcome = cluster.await_sql(LEADER).await?;
     if let Ok(rows) = outcome {
         return Err(PeerJourneyError::from(format!(
             "a lost peer must not produce a successful result, returned {rows} rows"
@@ -245,29 +236,10 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
     if cause == TerminalCause::Cancellation {
         // Released only after the terminal, so the release cannot be what
         // produced it. The killed process has nothing left to release.
-        cluster.nodes_mut()[paused].release_execute_pause()?;
+        cluster.release_execute_pause(paused)?;
     }
-    // A pod this journey killed on purpose has no stdin left to accept a
-    // shutdown request, so explicit shutdown reports it. Asserting on that
-    // rather than discarding it is the point: the report must name exactly the
-    // pod this journey removed, which means every other pod was still asked,
-    // reaped, and joined.
-    let killed = cluster.nodes()[paused].label().to_owned();
-    match (cause, cluster.shutdown()) {
-        (TerminalCause::Cancellation, Ok(())) => {}
-        (TerminalCause::PeerLoss, Err(reported)) => {
-            let detail = reported.to_string();
-            if !detail.contains(&killed) || detail.matches("pod-").count() != 1 {
-                return Err(format!(
-                    "shutdown after killing {killed} reported {detail}, not that pod alone"
-                )
-                .into());
-            }
-        }
-        (cause, result) => {
-            return Err(format!("shutdown after {cause:?} reported {result:?}").into());
-        }
-    }
+    // Every surviving pod drains cleanly; the killed pod is already gone.
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -280,12 +252,12 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
 ///
 /// Returns the node's last observed counts when it never released.
 async fn await_released_lease(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
     index: usize,
 ) -> Result<(u64, usize), PeerJourneyError> {
     let mut last = (0, 0);
     for _ in 0..CLEAN_LEASE_POLLS {
-        last = cluster.nodes_mut()[index].graph_leases()?;
+        last = cluster.graph_leases(index)?;
         if last.1 == 0 {
             return Ok(last);
         }
@@ -321,35 +293,21 @@ const INGEST_CHUNK: i64 = 100_000;
 /// it only keeps the published files from being one trivial group.
 const INGEST_GROUPS: i64 = 1_000;
 
-/// Smallest possible in-memory size of the output sort's input, in bytes.
-///
-/// 300,000 keys of 1,024 bytes, plus a 4-byte offset per key and one past the
-/// end, plus one 8-byte count per row. Arrow cannot represent this input in
-/// less, so exceeding the grant is arithmetic rather than an observation.
-const SORT_INPUT_LOWER_BOUND: u64 = 307_200_000 + 1_200_004 + 2_400_000;
-
-/// Memory ceiling the fixed pod envelope grants one Analytical query.
-///
-/// 512 MiB process memory less the 256 MiB unmanaged reserve leaves a 256 MiB
-/// Oracle budget, and one Analytical query holding both its slot units is
-/// granted all of it, clamped to the partition ceiling.
-const QUERY_GRANT_BYTES: u64 = 256 * 1024 * 1024;
-
 /// Counters proving followers exchanged real data rather than empty stages.
 const EXCHANGE_COUNTERS: [&str; 2] = [
     "bifrost_oracle_analytical_exchange_batches_total",
     "bifrost_oracle_analytical_exchange_bytes_total",
 ];
 
-/// A join whose grouped, ordered result cannot fit its grant spills on whichever
-/// Oracle coordinates it, and returns the same rows either way.
+/// A distributed join, grouped aggregate, and output sort returns the same rows
+/// on whichever Oracle coordinates it.
 ///
 /// # Panics
 ///
 /// Panics when the baseline cannot be driven across the process topology.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn inactive_baseline_executes_join_group_spill_and_interchangeable_topology() {
+async fn baseline_executes_join_group_sort_and_interchangeable_topology() {
     prove_physical_analytical_baseline()
         .await
         .expect("physical analytical baseline journey");
@@ -366,31 +324,28 @@ async fn inactive_baseline_executes_join_group_spill_and_interchangeable_topolog
 ///
 /// Returns the first claim that broke.
 async fn prove_physical_analytical_baseline() -> Result<(), PeerJourneyError> {
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
+    let mut cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
 
-    let mut pids = std::collections::BTreeSet::new();
-    for node in cluster.nodes() {
-        if !pids.insert(node.pid()) {
-            return Err(format!("pod {} shares a PID with another pod", node.label()).into());
+    let mut sockets = std::collections::BTreeSet::new();
+    for index in 0..cluster.len() {
+        if !sockets.insert(cluster.peer_addr(index)?) {
+            return Err(format!("pod {index} shares a peer socket with another pod").into());
         }
     }
 
     let suffix = uuid::Uuid::now_v7().simple();
     let left = format!("physical_left_{suffix}");
     let right = format!("physical_right_{suffix}");
-    seed(&mut cluster, &left, LEFT_ROWS)?;
-    seed(&mut cluster, &right, RIGHT_ROWS)?;
+    seed(&cluster, &left, LEFT_ROWS).await?;
+    seed(&cluster, &right, RIGHT_ROWS).await?;
     for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     let sql = crate::support::analytical_baseline_sql(&left, &right);
@@ -408,7 +363,7 @@ async fn prove_physical_analytical_baseline() -> Result<(), PeerJourneyError> {
 
     peer_planes_are_reachable_from_both_coordinators(&mut cluster).await?;
 
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -416,17 +371,15 @@ async fn prove_physical_analytical_baseline() -> Result<(), PeerJourneyError> {
 ///
 /// # Errors
 ///
-/// Returns the control-protocol failure unchanged.
-fn seed(
-    cluster: &mut BifrostProcessCluster,
-    table: &str,
-    rows: i64,
-) -> Result<(), PeerJourneyError> {
-    cluster.nodes_mut()[SCRIBE].register_table(table)?;
+/// Returns the registration or ingest failure unchanged.
+async fn seed(cluster: &PeerCluster, table: &str, rows: i64) -> Result<(), PeerJourneyError> {
+    cluster.register_table(SCRIBE, table).await?;
     let mut start_id = 0;
     while start_id < rows {
         let chunk = INGEST_CHUNK.min(rows - start_id);
-        cluster.nodes_mut()[SCRIBE].ingest_rows(table, start_id, chunk, INGEST_GROUPS)?;
+        cluster
+            .ingest_rows(SCRIBE, table, start_id, chunk, INGEST_GROUPS)
+            .await?;
         start_id += chunk;
     }
     Ok(())
@@ -440,7 +393,7 @@ fn seed(
 ///
 /// Returns the first claim that broke, naming the coordinator.
 async fn coordinate_baseline(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
     coordinator: usize,
     sql: &str,
     expected_digest: &str,
@@ -454,23 +407,18 @@ async fn coordinate_baseline(
     let mut ownership_before = Vec::new();
     let mut leases_before = Vec::new();
     for index in oracles {
-        ownership_before.push(cluster.nodes_mut()[index].ownership_snapshot()?);
-        leases_before.push(cluster.nodes_mut()[index].graph_leases()?.0);
+        ownership_before.push(cluster.ownership_snapshot(index)?);
+        leases_before.push(cluster.graph_leases(index)?.0);
     }
     // Sampled inside this iteration, not once for the whole journey: these are
     // cumulative counters, so a second coordinator that exchanged nothing would
     // still read above zero on its predecessor's totals.
-    let exchanged_before = cluster.nodes_mut()[coordinator].metric_totals(&EXCHANGE_COUNTERS)?;
+    let exchanged_before = cluster.metric_totals(&EXCHANGE_COUNTERS)?;
 
-    let evidence = cluster.nodes_mut()[coordinator].execute_analytical_baseline(sql)?;
+    let evidence = cluster
+        .execute_analytical_baseline(coordinator, sql)
+        .await?;
 
-    if evidence.granted_memory_bytes != QUERY_GRANT_BYTES {
-        return Err(format!(
-            "coordinator {coordinator} admits an Analytical query at {} bytes, not {QUERY_GRANT_BYTES}",
-            evidence.granted_memory_bytes
-        )
-        .into());
-    }
     let expected_rows = usize::try_from(RIGHT_ROWS)?;
     if evidence.rows != expected_rows {
         return Err(format!(
@@ -488,22 +436,6 @@ async fn coordinate_baseline(
     if evidence.result_digest != expected_digest {
         return Err(format!(
             "coordinator {coordinator} returned a result the fixture generator did not produce"
-        )
-        .into());
-    }
-    if evidence.batch_memory_bytes < SORT_INPUT_LOWER_BOUND {
-        return Err(format!(
-            "coordinator {coordinator} sorted {} bytes, below the arithmetic minimum \
-             {SORT_INPUT_LOWER_BOUND}",
-            evidence.batch_memory_bytes
-        )
-        .into());
-    }
-    if evidence.batch_memory_bytes <= QUERY_GRANT_BYTES {
-        return Err(format!(
-            "coordinator {coordinator} sorted {} bytes, which its {QUERY_GRANT_BYTES}-byte grant \
-             could have held without spilling",
-            evidence.batch_memory_bytes
         )
         .into());
     }
@@ -527,13 +459,6 @@ async fn coordinate_baseline(
         )
         .into());
     }
-    if physical.spill_count == 0 || physical.spilled_bytes == 0 || physical.spilled_rows == 0 {
-        return Err(format!(
-            "coordinator {coordinator} reported no spill: {} spills, {} bytes, {} rows",
-            physical.spill_count, physical.spilled_bytes, physical.spilled_rows
-        )
-        .into());
-    }
     if physical.aggregate_group_types != ["Int64".to_owned()] {
         return Err(format!(
             "coordinator {coordinator} grouped on {:?}, not the narrow join key alone",
@@ -554,7 +479,7 @@ async fn coordinate_baseline(
         .into());
     }
 
-    let exchanged = cluster.nodes_mut()[coordinator].metric_totals(&EXCHANGE_COUNTERS)?;
+    let exchanged = cluster.metric_totals(&EXCHANGE_COUNTERS)?;
     for family in EXCHANGE_COUNTERS {
         let before = exchanged_before.get(family).copied().unwrap_or_default();
         let after = exchanged.get(family).copied().unwrap_or_default();
@@ -571,7 +496,7 @@ async fn coordinate_baseline(
     // that lease admitted. A topology where one Oracle silently did nothing
     // would return the same rows and none of this.
     for index in &followers {
-        let activated = cluster.nodes_mut()[*index].graph_leases()?.0;
+        let activated = cluster.graph_leases(*index)?.0;
         if activated <= leases_before[*index] {
             return Err(format!(
                 "follower {index} activated no graph for coordinator {coordinator}"
@@ -590,7 +515,7 @@ async fn coordinate_baseline(
         // failure, admitted or queued query, peer reservation, slot unit,
         // query memory or scratch owner, spill entry, or live gauge that this
         // execution failed to return diverges here.
-        let ownership = cluster.nodes_mut()[index].ownership_snapshot()?;
+        let ownership = cluster.ownership_snapshot(index)?;
         if ownership != ownership_before[index] {
             return Err(format!(
                 "Oracle {index} left ownership at {ownership:?}, not its {:?} baseline",
@@ -613,10 +538,13 @@ async fn coordinate_baseline(
 ///
 /// Returns the first plane whose behavior diverged.
 async fn peer_planes_are_reachable_from_both_coordinators(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
 ) -> Result<(), PeerJourneyError> {
     for coordinator in [0_usize, 1] {
-        let address = format!("http://{}", cluster.nodes()[coordinator].grpc_addr());
+        let address = cluster
+            .server(coordinator)?
+            .grpc_url()
+            .ok_or("a coordinator bound no public gRPC socket")?;
         let channel = wyrd_tonic::transport::plaintext_endpoint(address)?
             .connect()
             .await?;
@@ -638,17 +566,14 @@ async fn peer_planes_are_reachable_from_both_coordinators(
             }
         }
 
-        let peer = cluster.nodes()[coordinator]
-            .ready_report()
-            .advertise_addr
-            .clone();
-        let before = super::support::polls_at(cluster, coordinator)?;
-        super::support::probe_from(
-            cluster,
-            SCRIBE,
-            &wyrd_testing::bifrost::process_cluster::PeerProbePlan::own(&peer),
-        )?;
-        if super::support::polls_at(cluster, coordinator)? == before {
+        // The body-poll counter is process-wide; the settled topology sends
+        // no peer traffic of its own, so the advance is this probe's.
+        let peer = cluster.advertise_addr(coordinator).await?;
+        let before = cluster.peer_body_polls();
+        cluster
+            .probe(&crate::peer_cluster::PeerProbePlan::own(&peer))
+            .await?;
+        if cluster.peer_body_polls() == before {
             return Err(format!(
                 "coordinator {coordinator} admitted no body on its private peer listener"
             )
@@ -684,24 +609,21 @@ async fn stage_graph_executes_representative_query_styles() {
 ///
 /// Returns the first claim that broke, naming the style.
 async fn prove_representative_query_styles() -> Result<(), PeerJourneyError> {
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
+    let mut cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
 
     let suffix = uuid::Uuid::now_v7().simple();
     let left = format!("styles_left_{suffix}");
     let right = format!("styles_right_{suffix}");
-    seed(&mut cluster, &left, LEFT_ROWS)?;
-    seed(&mut cluster, &right, RIGHT_ROWS)?;
+    seed(&cluster, &left, LEFT_ROWS).await?;
+    seed(&cluster, &right, RIGHT_ROWS).await?;
     for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     for style in query_styles(&left, &right) {
@@ -710,7 +632,7 @@ async fn prove_representative_query_styles() -> Result<(), PeerJourneyError> {
 
     prove_canonical_genai_span(&mut cluster).await?;
 
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
 }
 
@@ -726,8 +648,6 @@ struct QueryStyle {
     ordered: bool,
     /// Whether every grouped count in the result must be exactly one.
     unique_counts: bool,
-    /// Whether the statement's sort input must exceed its grant and spill.
-    spills: bool,
 }
 
 /// Builds the four representative statements over one seeded fixture pair.
@@ -737,10 +657,9 @@ struct QueryStyle {
 /// so each claim below fails if the engine drops, duplicates, or silently
 /// converts a join.
 fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
-    let wide_key = format!(
-        "LPAD(CAST(l.id AS VARCHAR), {digits}, '0') || REPEAT('x', {filler})",
-        digits = crate::support::ANALYTICAL_KEY_DIGITS,
-        filler = crate::support::ANALYTICAL_KEY_FILLER
+    let key = format!(
+        "LPAD(CAST(l.id AS VARCHAR), {digits}, '0')",
+        digits = crate::support::ANALYTICAL_KEY_DIGITS
     );
     vec![
         QueryStyle {
@@ -753,7 +672,6 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             rows: usize::try_from(LEFT_ROWS / INGEST_GROUPS).unwrap_or(usize::MAX),
             ordered: false,
             unique_counts: false,
-            spills: false,
         },
         QueryStyle {
             name: "grouped aggregation",
@@ -764,7 +682,6 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             rows: usize::try_from(INGEST_GROUPS).unwrap_or(usize::MAX),
             ordered: false,
             unique_counts: false,
-            spills: false,
         },
         QueryStyle {
             name: "left equi-join",
@@ -772,7 +689,7 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             // return RIGHT_ROWS here. Only a left join keeps the unmatched ids,
             // and only a correct one keeps each of them exactly once.
             sql: format!(
-                "SELECT {wide_key} AS filter_key, COUNT(*) AS matched \
+                "SELECT {key} AS filter_key, COUNT(*) AS matched \
                  FROM vala.bifrost.{left} AS l \
                  LEFT JOIN vala.bifrost.{right} AS r ON l.id = r.id \
                  GROUP BY l.id ORDER BY filter_key"
@@ -780,19 +697,17 @@ fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
             rows: usize::try_from(LEFT_ROWS).unwrap_or(usize::MAX),
             ordered: true,
             unique_counts: true,
-            spills: true,
         },
         QueryStyle {
             name: "sort with limit",
             sql: format!(
-                "SELECT {wide_key} AS filter_key, COUNT(*) AS matched \
+                "SELECT {key} AS filter_key, COUNT(*) AS matched \
                  FROM vala.bifrost.{left} AS l \
                  GROUP BY l.id ORDER BY filter_key LIMIT {SORT_LIMIT_ROWS}"
             ),
             rows: SORT_LIMIT_ROWS,
             ordered: true,
             unique_counts: true,
-            spills: false,
         },
     ]
 }
@@ -806,21 +721,22 @@ const SORT_LIMIT_ROWS: usize = 5;
 ///
 /// Returns the first claim that broke, naming the style.
 async fn execute_style(
-    cluster: &mut BifrostProcessCluster,
+    cluster: &mut PeerCluster,
     style: &QueryStyle,
 ) -> Result<(), PeerJourneyError> {
     let oracles = [0, 1, 2];
     let mut ownership_before = Vec::new();
     let mut leases_before = Vec::new();
     for index in oracles {
-        ownership_before.push(cluster.nodes_mut()[index].ownership_snapshot()?);
-        leases_before.push(cluster.nodes_mut()[index].graph_leases()?.0);
+        ownership_before.push(cluster.ownership_snapshot(index)?);
+        leases_before.push(cluster.graph_leases(index)?.0);
     }
-    let exchanged_before = cluster.nodes_mut()[LEADER].metric_totals(&EXCHANGE_COUNTERS)?;
+    let exchanged_before = cluster.metric_totals(&EXCHANGE_COUNTERS)?;
 
     let name = style.name;
-    let evidence = cluster.nodes_mut()[LEADER]
-        .execute_analytical_baseline(&style.sql)
+    let evidence = cluster
+        .execute_analytical_baseline(LEADER, &style.sql)
+        .await
         .map_err(|error| PeerJourneyError::from(format!("{name} failed: {error}")))?;
 
     if evidence.rows != style.rows {
@@ -837,19 +753,10 @@ async fn execute_style(
         return Err(format!("{name} returned unordered keys").into());
     }
 
-    // Only a statement with an output sort carries physical evidence, and only
-    // one whose sort input exceeds its grant may spill. A style that claims
-    // either and produced neither is the failure.
+    // Only a statement with an output sort carries physical evidence. A style
+    // that claims a sort and produced no evidence is the failure.
     match (&evidence.physical, style.ordered) {
-        (Some(physical), true) => {
-            if style.spills && (physical.spill_count == 0 || physical.spilled_rows == 0) {
-                return Err(format!(
-                    "{name} reported no spill: {} spills, {} rows",
-                    physical.spill_count, physical.spilled_rows
-                )
-                .into());
-            }
-        }
+        (Some(_), true) => {}
         (None, true) => {
             return Err(format!("{name} recorded no output-sort evidence").into());
         }
@@ -863,7 +770,7 @@ async fn execute_style(
     // Every style is a distributed graph, not a leader-local rewrite: a stage
     // that never crossed a peer socket would return the same rows and move no
     // exchange counter at all.
-    let exchanged = cluster.nodes_mut()[LEADER].metric_totals(&EXCHANGE_COUNTERS)?;
+    let exchanged = cluster.metric_totals(&EXCHANGE_COUNTERS)?;
     for family in EXCHANGE_COUNTERS {
         let before = exchanged_before.get(family).copied().unwrap_or_default();
         let after = exchanged.get(family).copied().unwrap_or_default();
@@ -876,7 +783,7 @@ async fn execute_style(
     // happened, not that every peer received some.
     let mut activated_followers = 0;
     for index in FOLLOWERS {
-        if cluster.nodes_mut()[index].graph_leases()?.0 > leases_before[index] {
+        if cluster.graph_leases(index)?.0 > leases_before[index] {
             activated_followers += 1;
         }
     }
@@ -889,7 +796,7 @@ async fn execute_style(
         if live != 0 {
             return Err(format!("{name} left {live} graph leases on Oracle {index}").into());
         }
-        let ownership = cluster.nodes_mut()[index].ownership_snapshot()?;
+        let ownership = cluster.ownership_snapshot(index)?;
         if ownership != ownership_before[index] {
             return Err(format!(
                 "{name} left Oracle {index} at {ownership:?}, not its {:?} baseline",
@@ -913,26 +820,24 @@ async fn execute_style(
 /// query listener over the same stage graph the styles used.
 ///
 /// A second data tenant then runs the identical statement against the identical
-/// listener. It must see none of it, which is the tenant tripwire stated as a
+/// listener. It must see none of it, which is tenant isolation stated as a
 /// read rather than as a configuration.
 ///
 /// # Errors
 ///
 /// Returns the first claim that broke: the OTLP export, the publication, the
 /// readback, or the foreign tenant reaching another tenant's span.
-async fn prove_canonical_genai_span(
-    cluster: &mut BifrostProcessCluster,
-) -> Result<(), PeerJourneyError> {
+async fn prove_canonical_genai_span(cluster: &mut PeerCluster) -> Result<(), PeerJourneyError> {
     use wyrd_testing::bifrost::canonical_signals as fixture;
 
     let api_key = cluster
         .provision_public_api_key("canonical-signal-caller")
         .await?;
     let scope = format!("wyrd.peer.canonical.{}", uuid::Uuid::now_v7().simple());
-    export_canonical_trace(&cluster.nodes()[SCRIBE], &api_key, &scope).await?;
-    cluster.nodes_mut()[SCRIBE].flush()?;
+    export_canonical_trace(cluster.server(SCRIBE)?, &api_key, &scope).await?;
+    cluster.flush(SCRIBE).await?;
     for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
-        cluster.nodes_mut()[index].refresh_snapshot()?;
+        cluster.refresh_snapshot(index).await?;
     }
 
     let sql = format!(
@@ -947,7 +852,7 @@ async fn prove_canonical_genai_span(
          FROM vala.traces.spans \
          WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
     );
-    let leader = public_client(&cluster.nodes()[LEADER], &api_key)?;
+    let leader = public_client(cluster.server(LEADER)?, &api_key)?;
     let parent = public_query(&leader, &sql).await?;
     if parent.len() != 1 {
         return Err(format!(
@@ -1028,11 +933,11 @@ async fn prove_canonical_genai_span(
         }
     }
 
-    // The tripwire: another tenant on the same listener reaches none of it.
+    // Isolation: another tenant on the same listener reaches none of it.
     let foreign_key = cluster
         .provision_foreign_public_api_key("canonical-foreign")
         .await?;
-    let foreign = public_client(&cluster.nodes()[LEADER], &foreign_key)?;
+    let foreign = public_client(cluster.server(LEADER)?, &foreign_key)?;
     if let Ok(rows) = public_query(&foreign, &sql).await
         && !rows.is_empty()
     {
@@ -1058,7 +963,7 @@ const CANONICAL_SERVICE: &str = "wyrd.peer.canonical";
 /// Returns a failure when the credential cannot be exchanged, the request
 /// cannot be sent, or the pod refuses the export.
 async fn export_canonical_trace(
-    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    node: &wyrd_testing::WyrdTestServer,
     api_key: &secrecy::SecretString,
     scope: &str,
 ) -> Result<(), PeerJourneyError> {
@@ -1122,7 +1027,11 @@ async fn export_canonical_trace(
         .await
         .map_err(|error| PeerJourneyError::from(error.to_string()))?;
     let response = reqwest::Client::new()
-        .post(format!("http://{}/v1/traces", node.http_addr()))
+        .post(format!(
+            "{}/v1/traces",
+            node.base_url()
+                .ok_or("the pod serves no public HTTP listener")?
+        ))
         .header("x-wyrd-access-token", format!("Bearer {}", bearer.expose()))
         .json(&serde_json::json!({"resourceSpans": [{
             "resource": {
@@ -1142,31 +1051,6 @@ async fn export_canonical_trace(
         return Err(format!("the canonical OTLP export was refused ({status}): {body}").into());
     }
     Ok(())
-}
-
-/// Builds one ordinary external client against a pod's public listeners.
-///
-/// # Errors
-///
-/// Returns a failure when the endpoints do not form a client.
-fn public_client(
-    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
-    api_key: &secrecy::SecretString,
-) -> Result<WyrdClient, PeerJourneyError> {
-    WyrdClient::with_config(ClientConfig {
-        grpc: GrpcConfig {
-            endpoint: format!("http://{}", node.grpc_addr()),
-            connect_retries: 0,
-            ..GrpcConfig::default()
-        },
-        http: HttpConfig {
-            base_url: format!("http://{}", node.http_addr()),
-            ..HttpConfig::default()
-        },
-        credential: Some(api_key.clone()),
-        ..ClientConfig::default()
-    })
-    .map_err(|error| PeerJourneyError::from(error.to_string()))
 }
 
 /// Runs one public query and renders every returned row as displayed text.
@@ -1216,4 +1100,585 @@ async fn public_query(
         .terminal()
         .ok_or("the canonical readback produced no terminal frame")?;
     Ok(rows)
+}
+
+/// Oracle pods of the remote live-read journey.
+const LIVE_ORACLES: [usize; 3] = [0, 1, 2];
+
+/// Deadline of the live reads that must outlive their pause.
+const LIVE_OPEN_DEADLINE_MS: i64 = 120_000;
+
+/// Deadline of the live read the leader must end while Scribe is paused.
+const LIVE_SHORT_DEADLINE_MS: i64 = 5_000;
+
+/// Stable code of a query the leader ended at its deadline.
+const QUERY_TIMEOUT_CODE: &str = "WYRD_VALA_504_QUERY_TIMEOUT";
+
+/// Bound on waiting for a remote live read to release every hold.
+const LIVE_RELEASE_POLLS: usize = 300;
+
+/// A live read served by a Scribe on another process is owned by its query.
+///
+/// Rows are left live on the Scribe pod, so the only source is a remote live
+/// fragment over the peer plane. With that Scribe's producer paused after its
+/// first batch, three endings are driven in turn: the client drops its
+/// stream, the leader's deadline expires, and the Scribe process dies after
+/// rows reached the client. Each ending must release the remote producer, its
+/// follower pool bytes, and every Oracle admission; the deadline ending carries the
+/// typed timeout, and the lost Scribe yields one failed terminal, never a
+/// successful partial result.
+///
+/// # Panics
+///
+/// Panics when any ending leaves a hold behind or reports the wrong terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn remote_live_scribe_drop_releases_query() {
+    prove_remote_live_scribe_release()
+        .await
+        .expect("remote live Scribe journey");
+}
+
+/// Drives the three remote live-read endings over one process topology.
+///
+/// # Errors
+///
+/// Returns the first ending whose release or terminal broke the contract.
+async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
+    let mut cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
+    .await?;
+    let api_key = cluster
+        .provision_public_api_key("remote-live-reader")
+        .await?;
+    let table = format!("remote_live_{}", uuid::Uuid::now_v7().simple());
+    cluster.register_table(SCRIBE, &table).await?;
+    // One row per ingest, so the paused producer has a later batch to withhold.
+    for id in 1..=3 {
+        cluster.ingest_live_rows(SCRIBE, &table, id, 1, 1).await?;
+    }
+    for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
+        cluster.refresh_snapshot(index).await?;
+    }
+    let client = public_client(cluster.server(LEADER)?, &api_key)?;
+    let query = wyrd_client::Bifrost::query_only(&client);
+    let sql = format!("SELECT id FROM vala.bifrost.{table}");
+
+    let case = "client dropped";
+    let stream = open_paused_remote_live(&mut cluster, &query, &sql, LIVE_OPEN_DEADLINE_MS).await?;
+    await_remote_live_held(&mut cluster, case).await?;
+    drop(stream);
+    await_remote_live_released(&mut cluster, case).await?;
+    cluster.release_live_production_pause();
+
+    let case = "leader deadline";
+    let mut stream =
+        open_paused_remote_live(&mut cluster, &query, &sql, LIVE_SHORT_DEADLINE_MS).await?;
+    await_remote_live_held(&mut cluster, case).await?;
+    let failure = loop {
+        match stream.next_batch().await {
+            Ok(Some(_)) => {}
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    let failure =
+        failure.ok_or_else(|| format!("{case}: the read ended {:?}", stream.terminal()))?;
+    let code = wyrd_spec::error::WyrdError::from(&failure).code();
+    if code != QUERY_TIMEOUT_CODE {
+        return Err(format!(
+            "{case}: the read failed with {code}: {failure}; terminal {:?}",
+            stream.terminal()
+        )
+        .into());
+    }
+    await_remote_live_released(&mut cluster, case).await?;
+    cluster.release_live_production_pause();
+
+    let case = "remote Scribe lost";
+    let mut stream =
+        open_paused_remote_live(&mut cluster, &query, &sql, LIVE_OPEN_DEADLINE_MS).await?;
+    await_remote_live_held(&mut cluster, case).await?;
+    let first = tokio::time::timeout(CLEAN_LEASE_INTERVAL * 100, stream.next_batch())
+        .await
+        .map_err(|_| format!("{case}: the first live batch never reached the client"))?
+        .map_err(|error| format!("{case}: the first live batch failed: {error}"))?
+        .ok_or_else(|| format!("{case}: the read ended before its first batch"))?;
+    let mut rows = first.num_rows();
+    cluster.kill(SCRIBE).await?;
+    let failure = loop {
+        match stream.next_batch().await {
+            Ok(Some(batch)) => rows += batch.num_rows(),
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    if failure.is_none() || rows >= 3 {
+        return Err(format!(
+            "{case}: a lost Scribe must end the read failed after {rows} rows, ended {:?}",
+            stream.terminal()
+        )
+        .into());
+    }
+    await_oracles_released(&mut cluster, case).await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Rows written to the Scribe pod so a remote live fragment outgrows its window.
+///
+/// Two million narrow rows encode to tens of MiB, far beyond the HTTP/2 window
+/// and the leader's bounded buffering between an undrained client and the peer.
+const WINDOW_ROWS: i64 = 2_000_000;
+
+/// Graceful shutdown ends a remote live fragment its reader stopped draining.
+///
+/// The public client opens a live read on the leader and never reads it, so the
+/// leader stops pulling the remote fragment and the Scribe's response blocks on
+/// HTTP/2 window credit rather than in the response body. Stopping that Scribe
+/// pod gracefully must still end the fragment's connection: the pod's drain
+/// completes cleanly within its own budget, the remote producer is released,
+/// the leader's read fails, and every Oracle admission is released — without
+/// the client resuming reads or the read's deadline expiring.
+///
+/// # Panics
+///
+/// Panics when the stop misses its drain, a hold survives, or the read succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn remote_live_window_blocked_scribe_stops_cleanly() {
+    prove_window_blocked_scribe_stop()
+        .await
+        .expect("window-blocked remote live Scribe stop");
+}
+
+/// Blocks one remote live fragment on window credit, then stops its Scribe.
+///
+/// The fragment is blocked once the Scribe holds its producer and that
+/// producer yields no batch across one lease interval while the client reads
+/// nothing.
+///
+/// # Errors
+///
+/// Returns the first step whose stop, release, or terminal broke the contract.
+async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
+    let case = "window-blocked Scribe stopped";
+    let mut cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
+    .await?;
+    let api_key = cluster.provision_public_api_key("window-reader").await?;
+    let table = format!("window_live_{}", uuid::Uuid::now_v7().simple());
+    cluster.register_table(SCRIBE, &table).await?;
+    for start in (0..WINDOW_ROWS).step_by(INGEST_CHUNK as usize) {
+        cluster
+            .ingest_live_rows(SCRIBE, &table, start, INGEST_CHUNK, INGEST_GROUPS)
+            .await?;
+    }
+    for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
+        cluster.refresh_snapshot(index).await?;
+    }
+    let client = public_client(cluster.server(LEADER)?, &api_key)?;
+    let query = wyrd_client::Bifrost::query_only(&client);
+    let mut stream = query
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
+            deadline_ms: Some(LIVE_OPEN_DEADLINE_MS),
+        })
+        .await
+        .map_err(|error| PeerJourneyError::from(error.to_string()))?;
+
+    let mut last = (
+        0,
+        vala_bifrost_redux::scribe::tail_rpc::live_batches_produced_for_test(),
+    );
+    let mut blocked = false;
+    for _ in 0..LIVE_RELEASE_POLLS {
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        let (producers, _) = cluster.live_scribe_holds(SCRIBE)?;
+        let now = (
+            producers,
+            vala_bifrost_redux::scribe::tail_rpc::live_batches_produced_for_test(),
+        );
+        if producers == 1 && now.1 > 0 && now == last {
+            blocked = true;
+            break;
+        }
+        last = now;
+    }
+    if !blocked {
+        return Err(format!(
+            "{case}: the remote fragment never blocked on window credit, last \
+             (producers, batches) {last:?}"
+        )
+        .into());
+    }
+
+    cluster.stop(SCRIBE).await?;
+    let producers = vala_bifrost_redux::scribe::tail_rpc::open_live_producers_for_test();
+    if producers != 0 {
+        return Err(format!("{case}: the stopped Scribe still holds {producers} producers").into());
+    }
+    let failure = loop {
+        match stream.next_batch().await {
+            Ok(Some(_)) => {}
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        }
+    };
+    if failure.is_none() {
+        return Err(format!(
+            "{case}: a stopped Scribe must fail the read, ended {:?}",
+            stream.terminal()
+        )
+        .into());
+    }
+    await_oracles_released(&mut cluster, case).await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Arms the Scribe pause, then opens one public live read on the leader.
+///
+/// # Errors
+///
+/// Returns the Scribe control failure or the query's open refusal.
+async fn open_paused_remote_live(
+    cluster: &mut PeerCluster,
+    query: &wyrd_client::Bifrost,
+    sql: &str,
+    deadline_ms: i64,
+) -> Result<wyrd_client::bifrost::QueryResultStream, PeerJourneyError> {
+    cluster.arm_live_production_pause();
+    query
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            deadline_ms: Some(deadline_ms),
+        })
+        .await
+        .map_err(|error| PeerJourneyError::from(error.to_string()))
+}
+
+/// Proves the paused remote read is held open by the leader's admitted query.
+///
+/// The remote Scribe holds exactly one paused producer with its snapshot, and
+/// the leader still admits the query that dispatched it. The follower takes no
+/// lease of its own: the leader stream owns its lifetime.
+///
+/// # Errors
+///
+/// Returns an error naming `case` when the producer never paused, the Scribe
+/// holds other than one producer, or the leader no longer admits the query.
+async fn await_remote_live_held(
+    cluster: &mut PeerCluster,
+    case: &str,
+) -> Result<(), PeerJourneyError> {
+    cluster.await_live_production_paused().await?;
+    let (producers, _) = cluster.live_scribe_holds(SCRIBE)?;
+    let admitted = cluster.ownership_snapshot(LEADER)?.active_queries;
+    if producers != 1 || admitted == 0 {
+        return Err(format!(
+            "{case}: the paused remote read must hold one producer under the leader's \
+             admitted query, held {producers} producers and {admitted} leader queries"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Waits until the remote Scribe and every Oracle hold nothing for the read.
+///
+/// # Errors
+///
+/// Returns an error naming `case` with the last holds when release never lands.
+async fn await_remote_live_released(
+    cluster: &mut PeerCluster,
+    case: &str,
+) -> Result<(), PeerJourneyError> {
+    let mut last = (0, 0);
+    for _ in 0..LIVE_RELEASE_POLLS {
+        last = cluster.live_scribe_holds(SCRIBE)?;
+        if last == (0, 0) {
+            return await_oracles_released(cluster, case).await;
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+    }
+    Err(format!("{case}: the remote Scribe still holds (producers, bytes) {last:?}").into())
+}
+
+/// Waits until no Oracle pod admits a query or reserves query memory.
+///
+/// # Errors
+///
+/// Returns an error naming `case` and the pod that still holds admission.
+async fn await_oracles_released(
+    cluster: &mut PeerCluster,
+    case: &str,
+) -> Result<(), PeerJourneyError> {
+    for index in LIVE_ORACLES {
+        let mut held = (0, 0);
+        for _ in 0..LIVE_RELEASE_POLLS {
+            let snapshot = cluster.ownership_snapshot(index)?;
+            held = (snapshot.active_queries, snapshot.reserved_memory_bytes);
+            if held == (0, 0) {
+                break;
+            }
+            tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        }
+        if held != (0, 0) {
+            return Err(
+                format!("{case}: Oracle {index} still holds (queries, bytes) {held:?}").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Indices of the two pods that each lead one Analytical graph.
+const RETRY_LEADERS: [usize; 2] = [0, 1];
+
+/// Index of the pod that publishes the data both leaders read.
+const RETRY_SCRIBE: usize = 2;
+
+/// Index of the one Oracle both leaders' graphs must be placed on.
+const RETRY_RECEIVER: usize = 3;
+
+/// Oracle slot units each leader admits with.
+///
+/// Room for its own graph envelope, the other leader's follower envelope, and
+/// the protected Interactive quantum, so neither leader is the node that runs
+/// out of capacity.
+const RETRY_LEADER_SLOTS: usize = 8;
+
+/// Oracle slot units the receiving node admits with.
+///
+/// One Analytical envelope charges one unit and the root keeps one
+/// Interactive quantum, so exactly one graph fits and the second leader's
+/// reservation must be refused before it is accepted.
+const RETRY_RECEIVER_SLOTS: usize = 2;
+
+/// Observations of a saturated receiver while the second leader retries.
+///
+/// At [`CLEAN_LEASE_INTERVAL`] this spans three seconds, longer than two of
+/// the receiver's one-second retry hints, so the second leader has been
+/// refused and has retried at least once inside the window.
+const RETRY_OBSERVATION_POLLS: usize = 30;
+
+/// Two leaders target one Oracle whose running slots never exceed its limit,
+/// and the refused leader retries within its original deadline.
+///
+/// # Panics
+///
+/// Panics when the retry journey cannot be driven to its claims.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn two_leaders_retry_preaccept_capacity() {
+    prove_two_leaders_retry_preaccept_capacity()
+        .await
+        .expect("two-leader pre-accept retry journey");
+}
+
+/// Drives two leaders' graphs onto one receiving Oracle that fits only one.
+///
+/// The first leader's graph is held at the receiver's follower `ExecuteTask`
+/// boundary, so the receiver's only Analytical envelope is running. The second
+/// leader's graph is then admitted locally and must place on the receiver. The
+/// receiver refuses it before accepting any work and never waits itself; the
+/// second leader releases its round, waits the refusal's hint, and retries.
+/// While the hold lasts the receiver must never run more than its limit, and
+/// once it returns the slot the second graph must complete inside the
+/// statement's original deadline. Every rejected round is released before
+/// activation, so each follower activates exactly one lease per query.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_two_leaders_retry_preaccept_capacity() -> Result<(), PeerJourneyError> {
+    let mut cluster = PeerCluster::start_with_slots(&[
+        (BifrostTarget::Oracle, Some(RETRY_LEADER_SLOTS)),
+        (BifrostTarget::Oracle, Some(RETRY_LEADER_SLOTS)),
+        (BifrostTarget::Scribe, None),
+        (BifrostTarget::Oracle, Some(RETRY_RECEIVER_SLOTS)),
+    ])
+    .await?;
+    let receiver = cluster.node_id(RETRY_RECEIVER).as_uuid();
+    await_receiver_membership(&cluster, receiver).await?;
+
+    let table = format!("preaccept_retry_{}", uuid::Uuid::now_v7().simple());
+    cluster.register_table(RETRY_SCRIBE, &table).await?;
+    cluster.ingest_rows(RETRY_SCRIBE, &table, 0, 12, 3).await?;
+    cluster.ingest_rows(RETRY_SCRIBE, &table, 0, 12, 3).await?;
+    for index in [
+        RETRY_LEADERS[0],
+        RETRY_LEADERS[1],
+        RETRY_SCRIBE,
+        RETRY_RECEIVER,
+    ] {
+        cluster.refresh_snapshot(index).await?;
+    }
+    let baseline = cluster.ownership_snapshot(RETRY_RECEIVER)?;
+    if baseline.root_active_queries != 0 {
+        return Err(format!("the receiver must start idle, held {baseline:?}").into());
+    }
+
+    let sql = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    );
+    // The first graph occupies the receiver's only Analytical envelope and is
+    // held there with its lease active.
+    cluster.arm_execute_pause(RETRY_RECEIVER)?;
+    cluster.start_sql(RETRY_LEADERS[0], &sql)?;
+    cluster.await_execute_paused(RETRY_RECEIVER).await?;
+    let held = cluster.ownership_snapshot(RETRY_RECEIVER)?;
+    if held.root_analytical_queries != 1 || held.follower_graphs != 1 {
+        return Err(format!("the receiver must run exactly the first graph, held {held:?}").into());
+    }
+
+    // The second graph is admitted by its own leader, so the only thing it can
+    // be waiting on is placement on the saturated receiver.
+    cluster.start_sql(RETRY_LEADERS[1], &sql)?;
+    await_leader_placing(&mut cluster, RETRY_LEADERS[1]).await?;
+    let receiver_slots = u32::try_from(RETRY_RECEIVER_SLOTS)?;
+    for _ in 0..RETRY_OBSERVATION_POLLS {
+        let receiving = cluster.ownership_snapshot(RETRY_RECEIVER)?;
+        if receiving.root_active_queries > receiver_slots
+            || receiving.root_analytical_queries > 1
+            || receiving.follower_graphs > 1
+        {
+            return Err(format!(
+                "the receiver ran beyond its {RETRY_RECEIVER_SLOTS} slots: {receiving:?}"
+            )
+            .into());
+        }
+        let placing = cluster.ownership_snapshot(RETRY_LEADERS[1])?;
+        if placing.leader_graphs != placing.follower_graphs + 1 || placing.active_queries != 1 {
+            return Err(format!(
+                "the refused leader must keep retrying its admitted graph, held {placing:?}"
+            )
+            .into());
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+    }
+
+    // Returning the slot is what lets the refused leader's next retry land,
+    // well inside the statement's original deadline.
+    cluster.release_execute_pause(RETRY_RECEIVER)?;
+    for leader in RETRY_LEADERS {
+        match cluster.await_sql(leader).await? {
+            Ok(3) => {}
+            Ok(rows) => {
+                return Err(format!("leader {leader} returned {rows} groups, not 3").into());
+            }
+            Err(detail) => {
+                return Err(format!("leader {leader} did not complete: {detail}").into());
+            }
+        }
+    }
+
+    // A refused round is released before activation, so each follower
+    // activated exactly one lease per query that it actually ran.
+    for (index, expected) in [
+        (RETRY_LEADERS[0], 1),
+        (RETRY_LEADERS[1], 1),
+        (RETRY_RECEIVER, 2),
+    ] {
+        let (activated, live) = await_released_lease(&mut cluster, index).await?;
+        if (activated, live) != (expected, 0) {
+            return Err(format!(
+                "node {index} must activate and release {expected} leases, reported \
+                 ({activated}, {live})"
+            )
+            .into());
+        }
+    }
+    for index in [RETRY_LEADERS[0], RETRY_LEADERS[1], RETRY_RECEIVER] {
+        await_root_released(&mut cluster, index).await?;
+    }
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Waits until both leaders observe the receiver as a ready Oracle.
+///
+/// Membership is heartbeat-driven, so the joined receiver appears in each
+/// leader's cut within a heartbeat rather than at once.
+///
+/// # Errors
+///
+/// Returns the leader that never observed the receiver.
+async fn await_receiver_membership(
+    cluster: &PeerCluster,
+    receiver: uuid::Uuid,
+) -> Result<(), PeerJourneyError> {
+    for leader in RETRY_LEADERS {
+        let mut observed = false;
+        for _ in 0..CLEAN_LEASE_POLLS {
+            observed =
+                cluster.membership(leader).await?.iter().any(|entry| {
+                    entry.node_id == receiver && entry.role == "oracle" && entry.ready
+                });
+            if observed {
+                break;
+            }
+            tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        }
+        if !observed {
+            return Err(format!("leader {leader} never observed the receiving Oracle").into());
+        }
+    }
+    Ok(())
+}
+
+/// Waits until `leader` has admitted its query and registered its graph.
+///
+/// Registration precedes participant placement, so from here the graph is
+/// either placing or retrying placement. The node's supervisor also registers
+/// every graph it follows, so the one graph it leads is the count beyond its
+/// follower graphs.
+///
+/// # Errors
+///
+/// Returns the leader's last ownership when it never registered the graph.
+async fn await_leader_placing(
+    cluster: &mut PeerCluster,
+    leader: usize,
+) -> Result<(), PeerJourneyError> {
+    let mut last = cluster.ownership_snapshot(leader)?;
+    for _ in 0..CLEAN_LEASE_POLLS {
+        if last.leader_graphs == last.follower_graphs + 1 && last.active_queries == 1 {
+            return Ok(());
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        last = cluster.ownership_snapshot(leader)?;
+    }
+    Err(format!("leader {leader} never registered its graph, held {last:?}").into())
+}
+
+/// Waits until `index` retains no Oracle query slot units at its root.
+///
+/// # Errors
+///
+/// Returns the node's last ownership when its slots never return.
+async fn await_root_released(
+    cluster: &mut PeerCluster,
+    index: usize,
+) -> Result<(), PeerJourneyError> {
+    let mut last = cluster.ownership_snapshot(index)?;
+    for _ in 0..CLEAN_LEASE_POLLS {
+        if last.root_active_queries == 0 && last.peer_running == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+        last = cluster.ownership_snapshot(index)?;
+    }
+    Err(format!("node {index} never returned its slots, held {last:?}").into())
 }

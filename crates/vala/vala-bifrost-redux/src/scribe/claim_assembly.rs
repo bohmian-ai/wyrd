@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use wyrd_spec::DataTenantId;
 
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
@@ -80,8 +81,11 @@ pub struct AssembleClaimRequest<'a> {
     pub object_base: &'a str,
     /// Approximate encoded size at which one object closes and the next opens.
     pub target_object_bytes: u64,
-    /// Move-only footer memory child retained through sealed inspection.
-    pub footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Scribe capability that assembly charges materialized batches against.
+    pub memory: crate::resources::ScribeResources,
+    /// Authenticated tenant of the claim's table binding, recorded in every
+    /// emitted object's footer.
+    pub tenant: DataTenantId,
 }
 
 /// One claim's sealed objects, ready for upload and fenced publication.
@@ -259,8 +263,9 @@ impl ClaimAssembler {
                 layout: request.layout,
                 first_ordinal: 0,
                 target_object_bytes: request.target_object_bytes,
+                tenant: request.tenant,
             },
-            request.footer_reservation,
+            &request.memory,
             merge,
         )?;
         let rows = artifacts.iter().try_fold(0_u64, |sum, artifact| {
@@ -291,11 +296,8 @@ impl ClaimAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    };
+    use arrow::array::{FixedSizeBinaryArray, RecordBatch, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use wyrd_spec::ids::DataTenantId;
 
     use crate::catalog::{TableRef, TenantTableBinding};
     use crate::namespaces::BifrostNamespace;
@@ -312,14 +314,12 @@ mod tests {
     /// Physical schema the fixtures stage, merge, and assemble under.
     fn assembly_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
             Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
-            Field::new("wyrd_row_ordinal", DataType::Int32, false),
         ]))
     }
 
@@ -330,23 +330,13 @@ mod tests {
     /// concatenated the runs would produce a different, detectable order.
     fn frozen_member(tenant: DataTenantId, rows: i64, offset: i64, batch: u8) -> FrozenMemtable {
         let schema = assembly_schema();
-        let tenant_value = tenant.to_string();
-        let count = usize::try_from(rows).expect("fixture row count fits usize");
         let times =
             TimestampMicrosecondArray::from_iter_values((0..rows).map(|row| row * 2 + offset));
         let batch_ids = FixedSizeBinaryArray::try_from_iter((0..rows).map(|_| [batch; 16]))
             .expect("fixture batch identity");
-        let ordinals = Int32Array::from_iter_values(
-            (0..rows).map(|row| i32::try_from(row).unwrap_or(i32::MAX)),
-        );
         let record = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![
-                Arc::new(StringArray::from(vec![tenant_value.as_str(); count])),
-                Arc::new(times),
-                Arc::new(batch_ids),
-                Arc::new(ordinals),
-            ],
+            vec![Arc::new(times), Arc::new(batch_ids)],
         )
         .expect("fixture member batch");
         FrozenMemtable {
@@ -416,7 +406,7 @@ mod tests {
                             max: u64::from(shard) * 100 + 99,
                         },
                     },
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 })
                 .expect("member stages");
             assert_eq!(
@@ -471,7 +461,8 @@ mod tests {
                 scratch_dir: &scratch,
                 object_base: "claims/one",
                 target_object_bytes: 512 * 1024 * 1024,
-                footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                memory: crate::resources::ScribeResources::for_test(),
+                tenant,
             })
             .expect("claim assembles");
         assert_eq!(assembled.rows, 2_048);
@@ -481,6 +472,7 @@ mod tests {
             "a claim under the target closes as one object"
         );
         let merged = read_event_times(
+            tenant,
             &assembled
                 .artifacts
                 .iter()
@@ -503,7 +495,8 @@ mod tests {
                 scratch_dir: &rolled_scratch,
                 object_base: "claims/rolled",
                 target_object_bytes: 4 * 1024,
-                footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                memory: crate::resources::ScribeResources::for_test(),
+                tenant,
             })
             .expect("claim assembles under a small target");
         assert!(
@@ -513,6 +506,7 @@ mod tests {
         assert_eq!(rolled.rows, assembled.rows);
         assert_eq!(
             read_event_times(
+                tenant,
                 &rolled
                     .artifacts
                     .iter()
@@ -524,16 +518,26 @@ mod tests {
         );
     }
 
-    /// Reads `wyrd_event_time` from sealed objects in publication order.
-    fn read_event_times(paths: &[PathBuf]) -> Vec<i64> {
+    /// Reads `wyrd_event_time` from sealed objects in publication order after
+    /// proving each object's footer records `tenant`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an object cannot be decoded or its footer does not record
+    /// `tenant`.
+    fn read_event_times(tenant: DataTenantId, paths: &[PathBuf]) -> Vec<i64> {
         let mut times = Vec::new();
         for path in paths {
             let file = std::fs::File::open(path).expect("sealed object");
-            let reader =
+            let builder =
                 parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-                    .expect("sealed object reader")
-                    .build()
-                    .expect("sealed object read");
+                    .expect("sealed object reader");
+            crate::parquet::footer::verify_footer_tenant(
+                builder.metadata().file_metadata(),
+                tenant,
+            )
+            .expect("every assembled object records the claim tenant");
+            let reader = builder.build().expect("sealed object read");
             for batch in reader {
                 let batch = batch.expect("sealed object batch");
                 let column = batch

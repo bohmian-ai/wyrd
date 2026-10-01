@@ -709,7 +709,11 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
         !cursors.is_empty(),
         "the bounded route checkpointed no resumable cursor"
     );
-    let root = format!("{}/data/forge/v1", promoted.fixture.binding.object_prefix);
+    let root = format!(
+        "{}/data/forge/{}",
+        promoted.fixture.binding.object_prefix,
+        vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE
+    );
     assert!(
         cursors.iter().all(|cursor| cursor.starts_with(&root)),
         "a durable cursor left the recipe root: {cursors:?}"

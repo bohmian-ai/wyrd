@@ -28,6 +28,19 @@ use crate::scribe::seal_key::{
 use crate::scribe::wal::PreparedWalAppend;
 use wyrd_spec::ids::DataTenantId;
 
+/// The successful terminal a shard owner sends to one admitted append's waiter.
+///
+/// Sent only after the append's rows are query-visible, or after the durable
+/// fence suppressed them as an already-committed replay of the same batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableCompletion {
+    /// Rows the append carried, whether inserted now or already visible.
+    pub rows: u64,
+    /// Whether this append's group inserted the batch rather than suppressing
+    /// a replay the fence or memtable identity showed was already committed.
+    pub first_commit: bool,
+}
+
 /// A complete request accepted by pod-global admission.
 #[derive(Debug)]
 pub(crate) struct AdmittedAppend {
@@ -36,9 +49,6 @@ pub(crate) struct AdmittedAppend {
     pub request_id: Uuid,
     pub rows: AdmittedRows,
     pub measured_wire_bytes: usize,
-    pub admitted_bytes: usize,
-    /// Maximum root envelope that must later replay this accepted unit.
-    pub maximum_scribe_envelope_bytes: usize,
     pub reservation: InflightFrameReservation,
     pub memory: ScribeMemoryLease,
     pub tenant: DataTenantId,
@@ -46,7 +56,9 @@ pub(crate) struct AdmittedAppend {
     /// Registered partition granularity every slice of this append is bucketed to.
     pub partition_granularity: TimeGranularity,
     pub queued_at: Instant,
-    pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
+    /// Completion channel answered once the append is durable in the WAL, or
+    /// with the typed error that refused it; `None` for fire-and-forget appends.
+    pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
     pub lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
 }
@@ -102,11 +114,9 @@ pub(crate) struct PreparedAppend {
     pub slices: PreparedSliceSet,
     pub reservation: InflightFrameReservation,
     pub memory: Option<ScribeMemoryLease>,
-    /// Exact retained and persistence facts from the sole materialization.
-    pub exact_material: ExactMaterialFacts,
-    /// Maximum root envelope checked again with exact grouped-candidate facts.
-    pub maximum_scribe_envelope_bytes: usize,
-    pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
+    /// Completion channel carried from the queued append, answered once the
+    /// prepared frame is durable or refused; `None` for fire-and-forget appends.
+    pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
     pub lifecycle: Option<crate::scribe::telemetry::ScribeIngressLifecycleOwner>,
 }
@@ -116,19 +126,6 @@ pub(crate) struct PreparedAppend {
 pub(crate) enum PreparedSliceSet {
     /// The complete once-materialized slice set retained through visibility.
     Materialized(Vec<PreparedSlice>),
-}
-
-/// Exact byte facts measured after the accepted unit is materialized once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ExactMaterialFacts {
-    /// Complete retained live-set charged after atomic shrink.
-    pub(crate) retained_live: usize,
-    /// Largest whole stored Arrow batch in this unit.
-    pub(crate) largest_stored_batch: usize,
-    /// Largest candidate persistence must later admit without splitting input.
-    pub(crate) persistence_candidate_peak: usize,
-    /// Immutable candidate plus its serial incremental Parquet workspace.
-    pub(crate) persistence_envelope_peak: usize,
 }
 
 /// Stateful current-only native slice producer.
@@ -146,8 +143,6 @@ pub(crate) struct NativeSliceProducer {
     request_id: Uuid,
     /// Zero-based ordinal assigned to the next slice.
     slice_index: u32,
-    /// Request-wide physical row ordinal assigned to the next decoded row.
-    next_row_ordinal: i32,
     /// Exact count established by the non-retaining first pass.
     slice_count: u32,
     /// Running decoded and stamped output checked against the expanded ceiling.
@@ -194,7 +189,6 @@ impl NativeSliceProducer {
             current: None,
             request_id,
             slice_index: 0,
-            next_row_ordinal: 0,
             slice_count: 0,
             output_bytes: 0,
             tenant,
@@ -254,7 +248,7 @@ impl NativeSliceProducer {
                 return Ok(None);
             };
             self.source_index += 1;
-            let rows = stamp_native_source(&rows, &self.source, self.next_row_ordinal)?;
+            let rows = stamp_native_source(&rows, &self.source)?;
             self.output_bytes = self
                 .output_bytes
                 .checked_add(crate::scribe::material_plan::retained_slice_bytes(&rows)?)
@@ -268,16 +262,6 @@ impl NativeSliceProducer {
                     limit: self.source.expanded_limit_bytes,
                 });
             }
-            // Advance only after stamping succeeded, so a refused record batch
-            // never consumes ordinals the accepted stream would have used.
-            self.next_row_ordinal = i32::try_from(rows.num_rows())
-                .ok()
-                .and_then(|count| self.next_row_ordinal.checked_add(count))
-                .ok_or(ScribeError::TooManyRows {
-                    rows: u64::try_from(self.next_row_ordinal).unwrap_or_default()
-                        + rows.num_rows() as u64,
-                    limit: (i32::MAX - 1) as u64,
-                })?;
             let partitions = plan_time_partitions(&rows, self.partition_granularity)?;
             self.current = Some(NativeCurrentSource {
                 rows,
@@ -398,7 +382,6 @@ fn decode_planned_native_source(
 fn stamp_native_source(
     rows: &RecordBatch,
     source: &NativeAdmittedRows,
-    start_row_ordinal: i32,
 ) -> Result<RecordBatch, ScribeError> {
     crate::scribe::execution_lanes::decode_native_batch(
         rows,
@@ -409,7 +392,6 @@ fn stamp_native_source(
             batch_id: source.batch_id,
             window: source.event_time_window,
             receipt_micros: Some(source.receipt_micros),
-            start_row_ordinal,
             definition: source.definition,
         },
     )
@@ -666,18 +648,19 @@ fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError
 
 /// Split and serialize an admitted append on the bounded pre-ACK CPU lane.
 ///
+/// The returned `prepared_bytes` is the exact retained memtable-plus-WAL set;
+/// the ingress owner charges it on the shared root before WAL/ACK.
+///
 /// # Errors
 ///
-/// Returns the preparation error after notifying the durable waiter, or a
-/// stable material refusal when the retained prepared source exceeds its root.
+/// Returns the preparation or category-transition error after notifying the
+/// durable waiter.
 pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
     let AdmittedAppend {
         batch_id,
         request_id,
         rows,
         measured_wire_bytes: _measured_wire_bytes,
-        admitted_bytes: _admitted_bytes,
-        maximum_scribe_envelope_bytes,
         reservation,
         mut memory,
         tenant,
@@ -717,39 +700,12 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             .saturating_add(slice.wal_append.data.len());
         lifecycle.materialized(bytes);
     }
-    if prepared_bytes > memory.bytes() {
-        let error = ScribeError::DecodedPayloadTooLarge {
-            bytes: prepared_bytes,
-            limit: memory.bytes(),
-        };
-        lifecycle.refuse();
-        notify_completion(&mut durable_ack, &error);
-        return Err(error);
-    }
-    if let Err(error) = memory.shrink_to(prepared_bytes) {
-        let error = ScribeError::Internal {
-            detail: format!("exact material shrink violated the admitted upper bound: {error}"),
-        };
-        lifecycle.refuse();
-        notify_completion(&mut durable_ack, &error);
-        return Err(error);
-    }
     if let Err(error) = memory.transfer_category(MemoryCategory::Prepared) {
         lifecycle.refuse();
         notify_completion(&mut durable_ack, &error);
         return Err(error);
     }
 
-    let exact_material = exact_material_facts(&slices, prepared_bytes)?;
-    if exact_material.persistence_envelope_peak > maximum_scribe_envelope_bytes {
-        let error = ScribeError::DecodedPayloadTooLarge {
-            bytes: exact_material.persistence_envelope_peak,
-            limit: maximum_scribe_envelope_bytes,
-        };
-        lifecycle.refuse();
-        notify_completion(&mut durable_ack, &error);
-        return Err(error);
-    }
     Ok(PreparedAppend {
         batch_id,
         tenant,
@@ -758,52 +714,8 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         slices,
         reservation,
         memory: Some(memory),
-        exact_material,
-        maximum_scribe_envelope_bytes,
         durable_ack,
         lifecycle: Some(lifecycle),
-    })
-}
-
-/// Measures exact retained and whole-batch persistence facts.
-fn exact_material_facts(
-    slices: &PreparedSliceSet,
-    retained_live_bytes: usize,
-) -> Result<ExactMaterialFacts, ScribeError> {
-    let largest_stored_batch_bytes = match slices {
-        PreparedSliceSet::Materialized(slices) => slices
-            .iter()
-            .map(|slice| slice.memtable_bytes)
-            .max()
-            .unwrap_or(0),
-    };
-    let persistence_candidate_peak = match slices {
-        PreparedSliceSet::Materialized(slices) => {
-            let mut by_key = std::collections::HashMap::<SealKey, Vec<(usize, usize)>>::new();
-            for slice in slices {
-                by_key
-                    .entry(slice.seal_key.clone())
-                    .or_default()
-                    .push((slice.rows.num_rows(), slice.memtable_bytes));
-            }
-            by_key.into_values().try_fold(0_usize, |largest, facts| {
-                crate::scribe::parquet_writer::largest_candidate_bytes_from_facts(facts)
-                    .map(|candidate| largest.max(candidate))
-            })?
-        }
-    };
-    let persistence_envelope_peak = persistence_candidate_peak
-        .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
-            persistence_candidate_peak,
-        )?)
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "persistence replayability envelope overflowed".to_owned(),
-        })?;
-    Ok(ExactMaterialFacts {
-        retained_live: retained_live_bytes,
-        largest_stored_batch: largest_stored_batch_bytes,
-        persistence_candidate_peak,
-        persistence_envelope_peak,
     })
 }
 
@@ -935,7 +847,7 @@ fn encode_ipc_fixed(
 }
 
 fn notify_completion(
-    completion: &mut Option<oneshot::Sender<Result<u64, ScribeError>>>,
+    completion: &mut Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
     error: &ScribeError,
 ) {
     if let Some(sender) = completion.take() {
@@ -1060,7 +972,7 @@ mod tests {
     /// Builds the retained owner required by the descriptor-driven decoder.
     fn planned_source(bytes: Bytes, fingerprint: SchemaFingerprint) -> NativeAdmittedRows {
         let plan = ScribeIngressPlanner::default()
-            .plan_native(&bytes, 0)
+            .plan_native(&bytes)
             .expect("native plan");
         let tenant = DataTenantId::new_v7();
         NativeAdmittedRows {
@@ -1092,7 +1004,7 @@ mod tests {
     fn native_descriptor_decoder_accepts_aligned_and_unaligned_transport() {
         let (aligned, fingerprint) = native_stream();
         let aligned_plan = ScribeIngressPlanner::default()
-            .plan_native(&aligned, 0)
+            .plan_native(&aligned)
             .expect("aligned plan");
         assert_eq!(aligned_plan.aligned_copy_bytes, 0);
 
@@ -1101,7 +1013,7 @@ mod tests {
         shifted.extend_from_slice(&aligned);
         let unaligned = Bytes::from(shifted).slice(1..);
         let unaligned_plan = ScribeIngressPlanner::default()
-            .plan_native(&unaligned, 0)
+            .plan_native(&unaligned)
             .expect("unaligned plan");
         assert_eq!(
             unaligned_plan.aligned_copy_bytes,

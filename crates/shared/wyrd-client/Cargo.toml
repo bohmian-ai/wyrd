@@ -68,6 +68,7 @@ vala-bifrost-redux = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["client", "server"] }
 
 [[test]]
 name = "pg_bifrost_e2e"

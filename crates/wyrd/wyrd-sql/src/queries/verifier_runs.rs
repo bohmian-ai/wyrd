@@ -70,19 +70,41 @@ const RESOLVE_DIRECT_SQL: &str = r#"
 /// inserts nothing.
 ///
 /// The run becomes claimable on the same clock the claim predicate reads, so
-/// no enqueueing process can write work into the queue's future or past.
+/// no enqueueing process can write work into the queue's future or past. An
+/// observation run takes the next ordinal of its binding; the caller holds
+/// [`LOCK_OBSERVATION_BINDING_SQL`] from an earlier statement, so this
+/// statement's snapshot already sees every committed predecessor. A conflict
+/// stores nothing, so a duplicate consumes no ordinal.
 const INSERT_RUN_SQL: &str = r#"
     INSERT INTO wyrd.verifier_runs (
         run_id, data_tenant_id, verifier_uid, verifier_version, subject_card_uid,
         origin, owner_card_uid, binding_id, trigger_uid, trigger_digest, operators,
         window_start, window_end, input_record_id, input_event_time,
         requested_by_principal_id, max_attempts, next_attempt_at, created_at, updated_at,
-        idempotency_key, request_sha256
+        idempotency_key, request_sha256, observation_ordinal
     ) VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10,
               $11, $12, $13, $14, $15, $16,
-              statement_timestamp(), statement_timestamp(), statement_timestamp(), $17, $18)
+              statement_timestamp(), statement_timestamp(), statement_timestamp(), $17, $18,
+              CASE WHEN $5 = 'observation' THEN (
+                  SELECT COALESCE(max(observation_ordinal), 0) + 1
+                    FROM wyrd.verifier_runs
+                   WHERE binding_id = $7 AND origin = 'observation'
+              ) END)
     ON CONFLICT DO NOTHING
     RETURNING run_id
+"#;
+
+/// Serialize observation-run creation for one binding until commit.
+///
+/// Row-locks the binding, so a concurrent observation enqueue for the same
+/// binding waits for this transaction and then numbers after its run.
+/// `FOR NO KEY UPDATE` leaves the key-share locks other runs' foreign keys
+/// take unblocked.
+const LOCK_OBSERVATION_BINDING_SQL: &str = r#"
+    SELECT 1
+      FROM wyrd.verification_bindings
+     WHERE binding_id = $1
+       FOR NO KEY UPDATE
 "#;
 
 /// Find the run that already holds a scheduled occurrence or observation record.
@@ -183,7 +205,7 @@ const CLAIM_RUN_SQL: &str = r#"
               r.origin, r.owner_card_uid, r.binding_id, r.trigger_uid,
               r.trigger_digest, r.window_start, r.window_end, r.input_record_id,
               r.input_event_time, r.requested_by_principal_id, r.attempts,
-              r.max_attempts, r.lease_expires_at
+              r.max_attempts, r.lease_expires_at, r.observation_ordinal
 "#;
 
 /// Complete a leased run, or re-apply the same completion idempotently.
@@ -240,13 +262,41 @@ const TERMINATE_RUN_SQL: &str = r#"
      WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
 "#;
 
-/// Return a leased run to the queue immediately, refunding its attempt.
+/// Return a leased run to the queue, refunding its attempt; `$3` is the delay
+/// in milliseconds before it is due again.
 const RELEASE_RUN_SQL: &str = r#"
     UPDATE wyrd.verifier_runs
        SET status = CASE WHEN attempts > 1 THEN 'retrying' ELSE 'pending' END,
            attempts = attempts - 1, lease_expires_at = NULL,
-           next_attempt_at = statement_timestamp(), updated_at = statement_timestamp()
+           next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
+           updated_at = statement_timestamp()
      WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
+"#;
+
+/// Requeue a leased run whose required trace has not landed, refunding its
+/// attempt, while PostgreSQL's statement time is still before the run's
+/// creation plus the fixed trace deadline.
+///
+/// `$3` is the poll delay and `$4` the deadline, both in milliseconds; both
+/// instants are derived from the database clock and the stored deadline anchor.
+const AWAIT_TRACE_SQL: &str = r#"
+    UPDATE wyrd.verifier_runs
+       SET status = CASE WHEN attempts > 1 THEN 'retrying' ELSE 'pending' END,
+           attempts = attempts - 1, error = $5, lease_expires_at = NULL,
+           next_attempt_at = statement_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
+           updated_at = statement_timestamp()
+     WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
+       AND created_at + ($4::bigint * INTERVAL '1 millisecond') > statement_timestamp()
+    RETURNING next_attempt_at
+"#;
+
+/// List a subject's `observations_ready` bindings in identity order.
+const OBSERVATION_BINDINGS_SQL: &str = r#"
+    SELECT binding_id
+      FROM wyrd.verification_bindings
+     WHERE activation = 'observations_ready'
+       AND subject_card_uid = $1
+     ORDER BY binding_id
 "#;
 
 /// Read one run's control-plane status.
@@ -593,6 +643,10 @@ pub struct ClaimedRun {
     pub input: RunInput,
     /// Manual requester; `None` for scheduled and observation runs.
     pub requested_by: Option<PrincipalId>,
+    /// One-based position among the binding's observation runs, assigned once
+    /// at enqueue; `None` for scheduled and manual runs. Eval's `every_nth`
+    /// sampling selects on it, so every attempt reaches the same decision.
+    pub observation_ordinal: Option<u64>,
 }
 
 /// Outcome of a token-fenced settlement.
@@ -613,6 +667,26 @@ pub enum RetryOutcome {
     Exhausted,
     /// The lease token no longer holds the run; nothing changed.
     StaleLease,
+}
+
+/// Outcome of requeueing a run whose required trace has not landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceWaitOutcome {
+    /// The run is queued again, attempt refunded, due at this time.
+    Requeued(DateTime<Utc>),
+    /// The fixed trace deadline passed; the run is now `timed_out`.
+    TimedOut,
+    /// The lease token no longer holds the run; nothing changed.
+    StaleLease,
+}
+
+/// What one observation did for one matching `observations_ready` binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationOutcome {
+    /// The shared enqueue path created, found, or refused the run.
+    Enqueue(EnqueueOutcome),
+    /// The binding owner was not runtime-active, so no run was created.
+    Inactive,
 }
 
 /// Terminal execution states that carry no verdict.
@@ -838,11 +912,14 @@ impl VerifierRunQueue {
     /// Resolve, check, and insert one run, storing `key` when one is given.
     ///
     /// Shared by every origin; see [`Self::enqueue`] for the resolution and
-    /// refusal rules. `key` is `Some` only for a keyed manual request.
+    /// refusal rules. `key` is `Some` only for a keyed manual request. An
+    /// observation request first locks its binding until the caller's
+    /// transaction ends, so the run's stored ordinal is its serialized
+    /// position; a concurrent enqueue for the same binding waits.
     ///
     /// # Errors
-    /// Returns the database error when a read or the insert fails, or a
-    /// decode error when stored identities are malformed.
+    /// Returns the database error when a read, the binding lock, or the
+    /// insert fails, or a decode error when stored identities are malformed.
     async fn insert(
         &self,
         conn: &mut TenantConn<'_>,
@@ -892,6 +969,12 @@ impl VerifierRunQueue {
             } => (None, None, Some(record_id.as_str()), Some(*event_time)),
         };
         let origin = request.origin();
+        if origin == RunOrigin::Observation {
+            sqlx::query(LOCK_OBSERVATION_BINDING_SQL)
+                .bind(resolved.binding_id)
+                .execute(&mut **conn.transaction())
+                .await?;
+        }
         let inserted: Option<Uuid> = sqlx::query_scalar(INSERT_RUN_SQL)
             .bind(VerificationRunId::new_v7().as_uuid())
             .bind(resolved.verifier_uid)
@@ -1192,11 +1275,105 @@ impl VerifierRunQueue {
         Ok(settlement(result.rows_affected()))
     }
 
-    /// Return a claimed run to the queue immediately, for shutdown drain.
+    /// Requeue a claimed run whose required trace has not landed yet.
     ///
-    /// The run keeps its identity and frozen input, becomes due at
-    /// PostgreSQL's statement time, and has the interrupted attempt refunded,
-    /// so a drained run does not consume its retry budget.
+    /// Waiting is not a failed attempt: while PostgreSQL's statement time is
+    /// before the run's `created_at` plus `deadline`, the run keeps its
+    /// identity and frozen input, has this attempt refunded, records `error`
+    /// as its waiting reason, and becomes due `poll` after that same database
+    /// instant. Once the deadline has passed the run settles `timed_out` with
+    /// `error`, no result, and no dispatch.
+    ///
+    /// # Errors
+    /// Returns the database error when a statement fails.
+    #[tracing::instrument(skip(self, conn, error), fields(operation = "verification.runs.await_trace", run_id = %lease.run_id))]
+    pub async fn await_trace(
+        &self,
+        conn: &mut TenantConn<'_>,
+        lease: RunLease,
+        poll: Duration,
+        deadline: Duration,
+        error: &VerificationError,
+    ) -> Result<TraceWaitOutcome, SqlxError> {
+        let next_attempt_at: Option<DateTime<Utc>> = sqlx::query_scalar(AWAIT_TRACE_SQL)
+            .bind(lease.run_id.as_uuid())
+            .bind(lease.token.0)
+            .bind(poll.num_milliseconds())
+            .bind(deadline.num_milliseconds())
+            .bind(Json(error))
+            .fetch_optional(&mut **conn.transaction())
+            .await?;
+        if let Some(next_attempt_at) = next_attempt_at {
+            return Ok(TraceWaitOutcome::Requeued(next_attempt_at));
+        }
+        Ok(
+            match self
+                .terminate(conn, lease, TerminalStatus::TimedOut, error)
+                .await?
+            {
+                Settlement::Applied => TraceWaitOutcome::TimedOut,
+                Settlement::StaleLease => TraceWaitOutcome::StaleLease,
+            },
+        )
+    }
+
+    /// Enqueue one Eval run per `observations_ready` binding of `subject`.
+    ///
+    /// Called after the observation is durably committed, never inside its
+    /// ingest transaction. Each binding whose owner is runtime-active goes
+    /// through the shared enqueue path with the exact `record_id` and the
+    /// committed row's server `event_time`, so a replayed observation finds
+    /// its existing run instead of creating another. Bindings of other
+    /// subjects or tenants are never read: the caller's tenant transaction
+    /// scopes the lookup.
+    ///
+    /// # Errors
+    /// Returns the database error when a read or insert fails, or a decode
+    /// error when a stored identity is malformed; runs inserted earlier in the
+    /// same transaction roll back with it.
+    #[tracing::instrument(
+        skip(self, conn, record_id),
+        fields(operation = "verification.runs.enqueue_observation")
+    )]
+    pub async fn enqueue_observation(
+        &self,
+        conn: &mut TenantConn<'_>,
+        subject: &CardUid,
+        record_id: &str,
+        event_time: DateTime<Utc>,
+    ) -> Result<Vec<(BindingId, ObservationOutcome)>, SqlxError> {
+        let bindings: Vec<Uuid> = sqlx::query_scalar(OBSERVATION_BINDINGS_SQL)
+            .bind(subject.as_uuid())
+            .fetch_all(&mut **conn.transaction())
+            .await?;
+        let mut outcomes = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let binding_id = stored(BindingId::new(binding))?;
+            let active = binding_activity(conn, binding_id, self.inactivity)
+                .await?
+                .is_some_and(|activity| activity.active);
+            let outcome = if active {
+                let request = RunRequest::Observation {
+                    binding_id,
+                    record_id: record_id.to_owned(),
+                    event_time,
+                };
+                ObservationOutcome::Enqueue(self.enqueue(conn, &request).await?)
+            } else {
+                ObservationOutcome::Inactive
+            };
+            outcomes.push((binding_id, outcome));
+        }
+        Ok(outcomes)
+    }
+
+    /// Return a claimed run to the queue with its attempt refunded.
+    ///
+    /// Shutdown drain releases with a zero `delay`; admission backpressure
+    /// releases with a poll delay so a saturated reader is not reclaimed in a
+    /// hot loop. The run keeps its identity and frozen input, becomes due
+    /// `delay` after PostgreSQL's statement time, and does not consume its
+    /// retry budget.
     ///
     /// # Errors
     /// Returns the database error when the update fails.
@@ -1205,10 +1382,12 @@ impl VerifierRunQueue {
         &self,
         conn: &mut TenantConn<'_>,
         lease: RunLease,
+        delay: Duration,
     ) -> Result<Settlement, SqlxError> {
         let result = sqlx::query(RELEASE_RUN_SQL)
             .bind(lease.run_id.as_uuid())
             .bind(lease.token.0)
+            .bind(delay.num_milliseconds())
             .execute(&mut **conn.transaction())
             .await?;
         Ok(settlement(result.rows_affected()))
@@ -1460,14 +1639,17 @@ struct ClaimedRunRow {
     max_attempts: i32,
     /// Lease expiry.
     lease_expires_at: DateTime<Utc>,
+    /// Stored observation ordinal.
+    observation_ordinal: Option<i64>,
 }
 
 impl ClaimedRunRow {
     /// Convert raw columns into a typed claim holding `token`.
     ///
     /// # Errors
-    /// Returns [`SqlxError::Decode`] when an identity is not `UUIDv7` or the
-    /// origin or input columns violate their closed shapes.
+    /// Returns [`SqlxError::Decode`] when an identity is not `UUIDv7`, the
+    /// origin or input columns violate their closed shapes, or the stored
+    /// observation ordinal is negative.
     fn into_claimed(self, token: LeaseToken) -> Result<ClaimedRun, SqlxError> {
         let input = match (
             self.window_start,
@@ -1516,6 +1698,10 @@ impl ClaimedRunRow {
             trigger,
             input,
             requested_by: self.requested_by_principal_id.map(PrincipalId::new),
+            observation_ordinal: self
+                .observation_ordinal
+                .map(|ordinal| stored(u64::try_from(ordinal)))
+                .transpose()?,
         })
     }
 }

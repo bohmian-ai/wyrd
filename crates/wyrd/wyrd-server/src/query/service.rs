@@ -140,7 +140,7 @@ impl<'a> QueryAuthority<'a> {
     ///
     /// Returns audit-unavailable when the append fails, and otherwise the
     /// caller's original stable query-forbidden error unchanged.
-    async fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
+    pub(crate) async fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
         #[cfg(feature = "test-support")]
         if self
             .state
@@ -389,6 +389,7 @@ pub(crate) fn terminal_error_to_bifrost(
             detail: "Oracle typed query storage unavailable".to_owned(),
         },
         QueryTerminalErrorCode::QueryExecutionFailed => BifrostError::QueryExecutionFailed,
+        QueryTerminalErrorCode::QueryResourcesExhausted => BifrostError::QueryResourcesExhausted,
     }
 }
 #[cfg(test)]

@@ -144,18 +144,69 @@ impl BifrostPeerCa {
     ///
     /// Returns [`PeerCaError::Generate`] when key generation or signing fails.
     pub fn issue_leaf(&self, common_name: &str) -> Result<BifrostPeerLeaf, PeerCaError> {
-        let key = KeyPair::generate().map_err(|error| PeerCaError::Generate(error.to_string()))?;
+        let params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|error| PeerCaError::Generate(error.to_string()))?;
+        self.sign_leaf(common_name, &self.server_name, params)
+    }
+
+    /// Issues a leaf from this authority whose only DNS SAN is `dns_name`.
+    ///
+    /// Everything else matches [`Self::issue_leaf`] — same CA, validity, and
+    /// usages — so a listener that refuses it is refusing the identity alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCaError::Generate`] when key generation or signing fails,
+    /// or `dns_name` is not a DNS name.
+    pub fn issue_misnamed_leaf(
+        &self,
+        common_name: &str,
+        dns_name: &str,
+    ) -> Result<BifrostPeerLeaf, PeerCaError> {
+        let params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|error| PeerCaError::Generate(error.to_string()))?;
+        self.sign_leaf(common_name, dns_name, params)
+    }
+
+    /// Issues a leaf from this authority whose validity window closed in 2001.
+    ///
+    /// Everything else matches [`Self::issue_leaf`], so a listener that refuses
+    /// it is refusing the expiry alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCaError::Generate`] when key generation or signing fails.
+    pub fn issue_expired_leaf(&self, common_name: &str) -> Result<BifrostPeerLeaf, PeerCaError> {
         let mut params = CertificateParams::new(Vec::<String>::new())
             .map_err(|error| PeerCaError::Generate(error.to_string()))?;
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        self.sign_leaf(common_name, &self.server_name, params)
+    }
+
+    /// Completes `params` as a peer leaf for this authority and signs it.
+    ///
+    /// `dns_name` becomes the leaf's only DNS SAN; every leaf but the
+    /// deliberately misnamed one passes this authority's shared name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerCaError::Generate`] when key generation or signing fails,
+    /// or `dns_name` is not a DNS name.
+    fn sign_leaf(
+        &self,
+        common_name: &str,
+        dns_name: &str,
+        mut params: CertificateParams,
+    ) -> Result<BifrostPeerLeaf, PeerCaError> {
+        let key = KeyPair::generate().map_err(|error| PeerCaError::Generate(error.to_string()))?;
         params
             .distinguished_name
             .push(DnType::CommonName, common_name);
         params.is_ca = IsCa::NoCa;
-        params.subject_alt_names = vec![SanType::DnsName(
-            self.server_name.clone().try_into().map_err(|_| {
-                PeerCaError::Generate("peer server name is not a DNS name".to_owned())
-            })?,
-        )];
+        params.subject_alt_names = vec![SanType::DnsName(dns_name.to_owned().try_into().map_err(
+            |_| PeerCaError::Generate("peer server name is not a DNS name".to_owned()),
+        )?)];
         params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
@@ -188,9 +239,12 @@ impl BifrostPeerCa {
         label: &str,
     ) -> Result<TestBifrostPeerTls, PeerCaError> {
         let leaf = self.issue_leaf(label)?;
-        let certificate_path = directory.join(format!("{label}-peer-cert.pem"));
-        let private_key_path = directory.join(format!("{label}-peer-key.pem"));
-        let ca_path = directory.join("bifrost-peer-ca.pem");
+        // The production `WYRD_PEER_TLS_DIR` layout: one directory per replica.
+        let dir = directory.join(label);
+        std::fs::create_dir_all(&dir).map_err(|error| PeerCaError::Write(error.to_string()))?;
+        let certificate_path = dir.join("tls.crt");
+        let private_key_path = dir.join("tls.key");
+        let ca_path = dir.join("ca.crt");
         let write = |path: &Path, contents: &str| -> Result<(), PeerCaError> {
             std::fs::write(path, contents).map_err(|error| PeerCaError::Write(error.to_string()))
         };
@@ -198,6 +252,7 @@ impl BifrostPeerCa {
         write(&private_key_path, leaf.private_key_pem())?;
         write(&ca_path, &self.ca_certificate_pem)?;
         Ok(TestBifrostPeerTls {
+            dir,
             certificate_path,
             private_key_path,
             ca_path,

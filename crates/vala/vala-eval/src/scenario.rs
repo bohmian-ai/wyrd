@@ -353,8 +353,8 @@ mod scenario_execution {
     use crate::scenario::{RecordWithMedia, ScenarioExecutionInputs, execute_scenario};
     use crate::store::TaskRegistry;
     use crate::tasks::{
-        AgentTaskExecutor, AssertionTaskExecutor, EvalMediaBinding, JudgeTaskExecutor,
-        MediaBindings, TraceTaskExecutor,
+        AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, MediaBindings,
+        TraceTaskExecutor,
     };
     use crate::{Executors, InMemoryTraceSource, MockJudgeInvoker};
     use serde_json::{Value, json};
@@ -460,12 +460,13 @@ mod scenario_execution {
     }
 
     fn media() -> MediaBindings {
-        let mut media = MediaBindings::new();
-        media.insert(EvalMediaBinding {
-            id: "screenshot".to_owned(),
-            payload: json!({"kind": "image", "uri": "file:///tmp/screenshot.png"}),
-        });
-        media
+        MediaBindings::from_refs([wyrd_spec::vala::eval::media::MediaRef {
+            id: wyrd_spec::ids::MediaBindingId::new("screenshot")
+                .expect("static binding id is valid"),
+            kind: wyrd_spec::vala::eval::media::MediaKind::Image,
+            uri: "file:///tmp/screenshot.png".to_owned(),
+            media_type: Some("image/png".to_owned()),
+        }])
     }
 
     fn record(id: u128, trace_hex: &str, context: Value) -> RecordWithMedia {
@@ -520,16 +521,9 @@ mod scenario_execution {
         assert!(results.passenger[0].passed);
         assert_eq!(results.passenger[0].actual, Some(final_response.clone()));
 
-        let calls = mock.calls().await;
-        assert_eq!(calls.len(), 2);
-        assert_eq!(
-            calls[0].1["media"]["screenshot"]["payload"]["uri"],
-            json!("file:///tmp/screenshot.png")
-        );
-        assert_eq!(
-            calls[1].1["media"]["screenshot"]["payload"]["uri"],
-            json!("file:///tmp/screenshot.png")
-        );
+        let media_calls = mock.media_calls().await;
+        assert_eq!(media_calls.len(), 2);
+        assert!(media_calls.iter().all(|seen| seen == &media()));
     }
 
     #[tokio::test]

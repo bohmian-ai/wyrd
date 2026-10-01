@@ -36,7 +36,7 @@ A seal-key is `(DataTenantId, TableRef, EventDay)`. Each seal-key has one active
 The seal itself is a pre-commit sequence followed by a single Postgres transaction:
 
 1. **Freeze memtable.** Swap the mutable buffer for a fresh one; the frozen snapshot is immutable from here.
-2. **Encode Parquet.** Sort by `(data_tenant_id, wyrd_event_time)`. Build bloom filters on tenant + trace_id, write the page index.
+2. **Encode Parquet.** Sort by `wyrd_event_time`. Record the seal key's tenant in the footer, build bloom filters on trace_id, write the page index.
 3. **PUT to object store.** Path: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`. The tenant-qualified prefix and `{pod_id}-{ulid}` suffix guarantee uniqueness across tenants and pods.
 4. **Atomic Postgres tx.** `INSERT INTO vala.file_list (...)`. Commit or rollback as one unit; this lineage row is the seal's durable record.
 5. **Retire WAL bytes.** Update the seal manifest with the new `sealed_lsn`, truncate the covered WAL segments.

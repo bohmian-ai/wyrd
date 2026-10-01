@@ -48,8 +48,13 @@ const AUTOMATION_CREDENTIAL_LIFETIME: std::time::Duration =
 const REQUIRED_PERMISSION: &str = "service_accounts:write";
 
 /// Build the tenant principal-administration routes for the `/v1` group.
+///
+/// Mounts principal creation, credential issue/list/revoke, and whole-principal
+/// revocation (`POST /principals/{id}/revoke`), all under the same tenant
+/// principal-management authority.
 pub fn principals_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::new()
+        .routes(routes!(crate::auth::revoke::revoke_principal))
         .routes(routes!(create_service_principal))
         .routes(routes!(list_credentials, issue_credential))
         .routes(routes!(revoke_credential))

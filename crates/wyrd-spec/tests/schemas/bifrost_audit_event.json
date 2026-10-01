@@ -1310,10 +1310,10 @@
           ]
         },
         {
-          "description": "Runtime row tenant mismatch.",
+          "description": "A scanned file's footer tenant is missing or foreign.",
           "type": "string",
           "enum": [
-            "tenant_row"
+            "tenant_file"
           ]
         },
         {
@@ -1373,14 +1373,14 @@
           ]
         },
         {
-          "description": "Peer assignment-authority digest mismatch: the recomputed digest over the follower's actual dispatched assignments does not match the digest signed into the ticket claims, so the closed predicate and projection closure cannot be trusted.",
+          "description": "Peer assignment-authority digest mismatch: the recomputed digest over the follower's actual dispatched assignments does not match the digest carried in the peer context claims, so the closed predicate and projection closure cannot be trusted.",
           "type": "string",
           "enum": [
             "peer_assignment_authority"
           ]
         },
         {
-          "description": "Private stage-operation binding mismatch: a signed Analytical stage ticket did not match the receiving follower's own expectation for the operation, either query identity, the pinned snapshot, the stage, the task, the attempt, the reservation, or the authorized permissions, so the operation was refused before any plan decode, task-cache lookup, provider construction, or object I/O.",
+          "description": "Private stage-operation binding mismatch: an Analytical stage context did not match the receiving follower's own expectation for the operation, either query identity, the pinned snapshot, the stage, the task, the attempt, the reservation, or the authorized permissions, so the operation was refused before any plan decode, task-cache lookup, provider construction, or object I/O.",
           "type": "string",
           "enum": [
             "peer_stage_binding"
@@ -1798,17 +1798,17 @@
       ]
     },
     "QueryClass": {
-      "description": "Server-derived admission class.",
+      "description": "Server-derived class of one query: how Oracle admits and executes it.\n\nNever a request field. Oracle reads it from the one physical root it built: a distributed root is Analytical, anything else Interactive. The class selects the admission rules and the execution path together, so the terminal's class is also the path that ran.",
       "oneOf": [
         {
-          "description": "Latency-sensitive bounded work.",
+          "description": "Executed locally on the leader.",
           "type": "string",
           "enum": [
             "interactive"
           ]
         },
         {
-          "description": "Larger analytical work.",
+          "description": "Executed as a distributed graph across Oracle peers.",
           "type": "string",
           "enum": [
             "analytical"

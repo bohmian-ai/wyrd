@@ -3,7 +3,7 @@ title: Enterprise
 description: Multi-tenant SaaS deployment with custom policy, audit, and identity.
 pillar: wyrd
 group: Self-hosting
-order: 12
+order: 14
 ---
 
 # Enterprise

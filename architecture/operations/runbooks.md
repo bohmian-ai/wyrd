@@ -24,8 +24,10 @@ audit-chain head, and assigned incident/evidence owners.
    tokens already issued lapse within their five-minute lifetime; removing a
    compromised signing key from verification state refuses them at once.
 3. Revoke refresh-token families and API keys whose confidentiality cannot be
-   established. Fence affected peer-ticket issuers independently from user JWT
-   issuers.
+   established. If the shared peer key is exposed, issue a new `wyrd-peer`
+   leaf from the dedicated cluster CA (or a new CA when its key is exposed),
+   roll it to every peer pod, and restart them; peer TLS is independent of
+   user JWT issuers.
 4. Preserve JWKS versions, KMS access logs, token/credential audit events,
    policy decisions, and gateway logs.
 
@@ -129,9 +131,9 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
    create a server-side successor attempt, even before the first result frame.
    The caller may submit a new logical query after the failed query has fully
    cancelled and released its resources.
-3. Fence a peer that presents invalid tickets, tenant/digest mismatch, stale
-   epoch, corrupt frames, or repeated availability loss. Preserve ticket and
-   transport evidence without recording sensitive payloads.
+3. Fence a peer that presents refused contexts, tenant/digest mismatch, stale
+   epoch, corrupt frames, or repeated availability loss. Preserve peer-refusal
+   audit and transport evidence without recording sensitive payloads.
 
 ### Go/no-go
 

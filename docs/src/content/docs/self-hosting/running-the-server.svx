@@ -8,7 +8,7 @@ order: 3
 
 # Running the server
 
-The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. Two operator subcommands exist: `init`, which establishes the deployment's platform administrative root, and `recover-root`, which reissues a credential for that root when every platform credential is gone.
+The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. Four operator subcommands exist: `migrate`, which applies the embedded schema with the database-owner login; `init`, which establishes the deployment's platform administrative root; `setup`, which runs `init` if needed and creates a first tenant (a no-op when the tenant exists); and `recover-root`, which reissues a credential for that root when every platform credential is gone.
 
 ## Command line
 
@@ -20,8 +20,14 @@ wyrd-server
 wyrd-server --mode http
 wyrd-server --mode grpc
 
+# Apply migrations with the owner login, then exit.
+wyrd-server migrate
+
 # Establish this deployment's administrative root, then exit.
 wyrd-server init
+
+# Idempotently create the first tenant through the running server.
+wyrd-server setup --tenant acme
 
 # Reissue a credential for the existing root, then exit.
 wyrd-server recover-root
@@ -202,7 +208,7 @@ Boot is ordered and fails closed. A failure at any step stops the process with a
   steps={[
     { label: 'Load config', sub: 'env > TOML > defaults, then validate' },
     { label: 'Init telemetry', sub: 'tracer provider, log filter' },
-    { label: 'Boot Postgres', sub: 'resolve DSNs, run migrations' },
+    { label: 'Boot Postgres', sub: 'resolve DSNs, validate migrated schema' },
     { label: 'Assemble state', sub: 'pools, storage, OLAP catalog' },
     { label: 'Install auth', sub: 'signing key, verifier, resolvers' },
     { label: 'Seed federation', sub: 'trusted issuers, workload bindings' },
@@ -243,5 +249,5 @@ When `metrics.enabled` is true (the default), the server serves Prometheus metri
 
 - [Configuration](/self-hosting/configuration/): the full env var and config file reference.
 - [Architecture](/self-hosting/architecture/): what supervises these tasks and how shutdown drains.
-- [Local development](/self-hosting/local-development/): embedded Postgres and server-owned credential bootstrap.
+- [Local development](/self-hosting/local-development/): throwaway Docker Postgres and server-owned credential bootstrap.
 - [Authentication](/self-hosting/authentication/): the key material and grants behind these commands.

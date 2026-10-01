@@ -479,31 +479,30 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
 
 /// Reads stay served while their audit commits wait on a locked chain head.
 ///
-/// Every Oracle read stages its read decision through a background commit, and
-/// that commit waits on the tenant's `audit_chain_head` row lock. A publication
-/// settling behind a locked staging row holds exactly that lock. If each
-/// waiting commit parked a pooled connection, a few dozen reads would exhaust
-/// the Vala pool that reader-epoch renewal and query pins also use, and the
-/// Oracle would fence itself once renewal missed its cutoff. The journey first
-/// publishes one decision, so retained history exists and a read is audited
-/// rather than refused as an unknown table. It then holds the chain head,
-/// issues twice as many reads as the pool has connections, confirms their audit
-/// commits are waiting, and requires the server's own Vala pool to hand out a
-/// connection while the lock is still held. Waiting for the lease cutoff itself would take tens of
-/// seconds; a pool with no connection to lend is the cause, observed directly.
-/// Pending commits must stop at the pool's connection count, with every read
-/// past that bound still served and its dropped decision counted in
-/// `oracle_audit_commit_failures_total`. Releasing the lock must then let the
-/// admitted decisions commit and drain to zero pending.
+/// Every Oracle read queues its read decision for one background writer, which
+/// commits each tenant's queued decisions in one transaction that waits on the
+/// tenant's `audit_chain_head` row lock. A publication settling behind a locked
+/// staging row holds exactly that lock. If waiting decisions parked pooled
+/// connections, a few dozen reads would exhaust the Vala pool that
+/// reader-epoch renewal and query pins also use, and the Oracle would fence
+/// itself once renewal missed its cutoff. The journey first publishes one
+/// decision, so retained history exists and a read is audited rather than
+/// refused as an unknown table. It then holds the chain head, issues twice as
+/// many reads as the pool has connections, and requires every read to be
+/// served, every decision to wait rather than be dropped, and the server's own
+/// Vala pool to still hand out a connection while the lock is held. Waiting for
+/// the lease cutoff itself would take tens of seconds; a pool with no
+/// connection to lend is the cause, observed directly. Releasing the lock must
+/// then let every waiting decision commit and drain to zero pending.
 ///
 /// # Errors
 /// Returns the server, Postgres, publication, or query failure, or a timeout
-/// when the pool has no connection left for renewal or admitted commits never
+/// when the pool has no connection left for renewal or waiting decisions never
 /// drain.
 ///
 /// # Panics
-/// Panics when pending commits exceed or never reach the bound, or overflow is
-/// not counted.
+/// Panics when fewer decisions wait than reads were served, or any decision is
+/// dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
@@ -523,21 +522,20 @@ async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
     sqlx::query("SELECT last_seq FROM vala.audit_chain_head FOR UPDATE")
         .fetch_all(&mut **fence.transaction())
         .await?;
-    let pool_connections = vala_sql::postgres::vala_pool_config().max_connections;
+    let reads = vala_sql::postgres::vala_pool_config().max_connections * 2;
     let failures_before = commit_failures(&metrics);
-    for _ in 0..pool_connections * 2 {
+    for _ in 0..reads {
         retained_rows(&server, tenant, &operation).await?;
     }
     let waiting = server.oracle_runtime_inspection()?.audit_pending;
-    assert_eq!(
-        waiting,
-        u64::from(pool_connections),
-        "fenced reads must fill, and never exceed, the pool-derived pending bound"
-    );
-    let overflow = commit_failures(&metrics) - failures_before;
     assert!(
-        overflow >= u64::from(pool_connections),
-        "every read past the pending bound must count its dropped decision: {overflow}"
+        waiting >= u64::from(reads),
+        "every served read's decision must wait for the chain head: {waiting} of {reads}"
+    );
+    assert_eq!(
+        commit_failures(&metrics) - failures_before,
+        0,
+        "no decision may be dropped while the chain head is held"
     );
     let spare = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -552,7 +550,7 @@ async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
     while server.oracle_runtime_inspection()?.audit_pending > 0 {
         if std::time::Instant::now() >= deadline {
             return Err(
-                "admitted audit commits did not drain after the chain head was released".into(),
+                "waiting audit decisions did not drain after the chain head was released".into(),
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -580,13 +578,16 @@ fn commit_failures(metrics: &metrics_exporter_prometheus::PrometheusHandle) -> u
 /// wait on the slowest: a tenant whose chain head is held by an unrelated
 /// transaction would stall the whole directory behind it. The journey seeds a
 /// second tenant, appends a decision in each, then holds the boot tenant's
-/// chain-head row so its cycle cannot even freeze. The second tenant must still
-/// reach retained history and drain inside the bounded wait, which only a
-/// concurrent sweep can do. Releasing the fence must then let the stalled
+/// chain-head row. A cycle that reaches that tenant afterwards cannot freeze;
+/// one that froze and appended before the fence landed blocks in settlement
+/// until the fence is released. The second tenant must still reach retained
+/// history and drain inside the bounded wait — including the read decisions the
+/// polling itself stages after its first publication — which only a publisher
+/// whose later sweeps never wait on a blocked cycle can do. Releasing the fence must then let the stalled
 /// tenant finish as well, proving the fence delayed rather than lost its work.
 ///
-/// Only unordered progress is proven here. The sweep's ceiling is the literal
-/// `PUBLICATION_TENANT_CONCURRENCY` handed to `for_each_concurrent`; proving it
+/// Only unordered progress is proven here. The publisher's ceiling is the
+/// literal `PUBLICATION_TENANT_CONCURRENCY` bounding its running cycles; proving it
 /// end to end would need more fenced tenants than the test pool can hold.
 ///
 /// # Errors

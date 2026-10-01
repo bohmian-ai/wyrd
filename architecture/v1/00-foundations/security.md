@@ -13,11 +13,9 @@ below define the narrower v1 types and service boundaries.
    resolution rules.
 3. [`permission-check.md`](permission-check.md) - the authorization
    chokepoint.
-4. [`policy-hook.md`](policy-hook.md) - policy evaluation and fail-closed
-   composition.
-5. [`service-identity.md`](service-identity.md) - card-bound non-human runtime
+4. [`service-identity.md`](service-identity.md) - card-bound non-human runtime
    identity.
-6. [`errors.md`](errors.md) - wire-visible error foundations.
+5. [`errors.md`](errors.md) - wire-visible error foundations.
 
 ## Boundary Diagram
 
@@ -68,12 +66,11 @@ backoff; permission denial is `WYRD_PERMISSION_403_DENIED_RBAC`.
 
 ## Security contract
 
-Production composition supplies the real issuance owner, policy decision
-point, and canonical audit writer. Permit-all, no-op,
-in-memory, and test substitutes cannot satisfy production readiness.
+Production composition supplies the real issuance owner and canonical audit
+writer. No-op, in-memory, and test substitutes cannot satisfy production
+readiness.
 
-Mesh `ext_authz` uses the same `X-Wyrd-Access-Token` contract; no additional
-Wyrd identity header is introduced. JWT verification uses configured issuer,
-audience, algorithm, key identity, delegation, and expiry rules from the
-repository-level security posture; external JWKS refresh stays on the issuance
-side. Uncertainty in identity or policy fails closed.
+JWT verification uses configured issuer, audience, algorithm, key identity,
+delegation, and expiry rules from the repository-level security posture;
+external JWKS refresh stays on the issuance side. Uncertainty in identity
+fails closed.

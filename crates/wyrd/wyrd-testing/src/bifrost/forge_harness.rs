@@ -56,13 +56,12 @@ fn forge_runtime_resources(
             roles: [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
                 .into_iter()
                 .collect(),
-            memory_limit_bytes: None,
-            unmanaged_reserve_bytes: None,
+            server_memory_min_bytes: None,
+            bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
-            forge_compaction_memory_limit_bytes: None,
-            scratch_root: scratch_root.to_owned(),
+            scratch_root: Some(scratch_root.to_owned()),
             volume_roots: None,
         },
     )?;
@@ -1362,22 +1361,21 @@ impl ForgeFixture {
         let roles = runtime_resources
             .compose_roles()
             .map_err(|_| "invalid Forge resource composition")?;
+        let spill_root = runtime_root.join("forge-spill");
+        std::fs::create_dir_all(&spill_root).map_err(|_| "Forge spill root is unwritable")?;
         let forge = Arc::new(
             Forge::new(ForgeBuildConfig {
-                resource_plan: roles.plan(),
+                resources: roles.forge().ok_or("Forge role is not composed")?,
+                spill_root,
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
                 staging: Arc::clone(&self.staging),
-                staging_lists_by_cursor: self
-                    .staging
-                    .info()
-                    .full_capability()
-                    .list_with_start_after,
                 object_store,
                 hints: inbox,
                 config,
                 maintenance_interval: std::time::Duration::from_secs(60),
+                scheduler_owner: uuid::Uuid::now_v7(),
                 clock: self.forge.clock_for_test(),
                 completion_observer: supervision.completion_observer,
                 scheduler_trigger: supervision.scheduler_trigger,

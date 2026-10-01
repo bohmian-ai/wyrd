@@ -1,24 +1,26 @@
 //! Typed, pod-local live-tail reads over writable and immutable memtable data.
 //!
 //! The Scribe live source owns no WAL or SQL access. Oracle discovers the
-//! partitions a Scribe serves through the authenticated private
-//! `ListActiveStreams` RPC and reads them as lazily produced live batches.
+//! partitions a Scribe serves through the mTLS private `ListActiveStreams`
+//! RPC and reads them as lazily produced live batches.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
+#[cfg(feature = "test-support")]
+use datafusion::physical_plan::SendableRecordBatchStream;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api as tail;
-use wyrd_spec::vala::assignment_authority::ScanPredicate;
-use wyrd_tonic::tonic::metadata::MetadataValue;
-use wyrd_tonic::tonic::{Code, Request, transport::Channel};
+use wyrd_tonic::tonic::{Code, transport::Channel};
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
-use crate::scribe::memtable::{Memtable, ReadableBatchLimits};
+use crate::scribe::hot_source::StagedSourceLease;
+use crate::scribe::memtable::Memtable;
 use crate::scribe::shards::ScribeShardRuntime;
-use crate::scribe::staged_tail::StagedTailReader;
 use crate::scribe::stream_identity::StreamIdentity;
 
 /// The only tail protocol revision understood by the Scribe v1 reader.
@@ -33,13 +35,14 @@ pub struct ActiveTailStream {
     pub stream: tail::TailStreamIdentity,
 }
 
-/// Private tonic client for authenticated active-stream discovery on one Scribe.
+/// Private tonic client for active-stream discovery on one Scribe.
+///
+/// The channel is the mTLS peer channel; the peer certificate is the only
+/// credential, so requests carry no per-call bearer.
 #[derive(Debug, Clone)]
 pub struct TonicTailReadTransport {
     /// Cloneable tonic client over one configured private Scribe endpoint.
     client: ScribeTailServiceClient<Channel>,
-    /// Already-issued service-workload bearer sent on every private RPC.
-    access_token: MetadataValue<wyrd_tonic::tonic::metadata::Ascii>,
 }
 
 impl TonicTailReadTransport {
@@ -56,11 +59,9 @@ impl TonicTailReadTransport {
     ) -> Result<Vec<ActiveTailStream>, TailReadError> {
         let mut client = self.client.clone();
         let response = client
-            .list_active_streams(self.authenticated_request(
-                wyrd_tonic::wyrd::v1::ListActiveStreamsRequest {
-                    binding: Some(binding.into()),
-                },
-            ))
+            .list_active_streams(wyrd_tonic::wyrd::v1::ListActiveStreamsRequest {
+                binding: Some(binding.into()),
+            })
             .await
             .map_err(|status| tonic_error(&status))?;
         response
@@ -91,35 +92,10 @@ impl TonicTailReadTransport {
             .collect()
     }
 
-    /// Creates a remote transport using the authenticated private Scribe channel.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TailReadError::State`] when the bearer cannot be represented as
-    /// gRPC metadata.
-    pub fn new(
-        client: ScribeTailServiceClient<Channel>,
-        bearer: &str,
-    ) -> Result<Self, TailReadError> {
-        let access_token =
-            MetadataValue::try_from(format!("Bearer {bearer}").as_str()).map_err(|_| {
-                TailReadError::State {
-                    detail: "tail bearer cannot be represented as gRPC metadata".to_owned(),
-                }
-            })?;
-        Ok(Self {
-            client,
-            access_token,
-        })
-    }
-
-    /// Adds the required private workload credential before a remote lookup.
-    fn authenticated_request<T>(&self, message: T) -> Request<T> {
-        let mut request = Request::new(message);
-        request
-            .metadata_mut()
-            .insert("x-wyrd-access-token", self.access_token.clone());
-        request
+    /// Creates a remote transport over the mTLS private Scribe channel.
+    #[must_use]
+    pub fn new(client: ScribeTailServiceClient<Channel>) -> Self {
+        Self { client }
     }
 }
 
@@ -279,16 +255,31 @@ pub fn open_live_producers_for_test() -> usize {
     OPEN_LIVE_PRODUCERS.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Batches every Scribe live producer in this process has yielded.
+#[cfg(feature = "test-support")]
+static LIVE_BATCHES_PRODUCED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns how many batches Scribe live producers in this process have yielded.
+///
+/// A journey reads it twice to tell a producer still yielding from one parked
+/// on its consumer, such as a response blocked on transport flow control.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn live_batches_produced_for_test() -> u64 {
+    LIVE_BATCHES_PRODUCED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Counts one open live producer for the test harness until it drops.
 ///
-/// Zero-sized and inert unless `test-support` is enabled.
+/// Compiled only with `test-support`; production producers carry no counter.
+#[cfg(feature = "test-support")]
 #[derive(Debug)]
 struct OpenLiveProducer;
 
+#[cfg(feature = "test-support")]
 impl OpenLiveProducer {
     /// Records one newly opened producer.
     fn open() -> Self {
-        #[cfg(feature = "test-support")]
         OPEN_LIVE_PRODUCERS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Self
     }
@@ -313,18 +304,8 @@ pub struct FetchLiveTailRequest {
     pub start_partition: TimePartition,
     /// Inclusive last partition day governed by the query.
     pub end_partition: TimePartition,
-    /// Columns required by Oracle filters, ordering, tripwire, and projection.
+    /// Columns required by Oracle filters, ordering, and projection.
     pub required_columns: Vec<String>,
-    /// Signed closed predicates the assignment authorized for this scan.
-    ///
-    /// Scribe applies this conjunction to the assembled snapshot before
-    /// returning it, so a selective query ships only matching rows back to
-    /// the follower instead of the whole live tail.
-    pub predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
-    /// Maximum shallow Arrow batches materialized by the snapshot.
-    pub max_batches: usize,
-    /// Maximum source-derived Arrow bytes retained by the snapshot.
-    pub max_retained_bytes: usize,
 }
 
 /// One shallow, structural hot snapshot returned by a shard owner.
@@ -342,15 +323,15 @@ pub struct HotBatch {
     pub rows: arrow::record_batch::RecordBatch,
 }
 
-/// One opened Scribe live read whose batches are produced only when pulled.
+/// One opened Scribe live read: its bounded memtable cut and the staged runs
+/// that cut did not already serve.
 ///
 /// Opening takes the bounded shallow memtable snapshot and leases the staged
 /// members not already served by it; nothing is filtered, decoded, or copied
-/// until the consumer asks for the next batch. The snapshot references and the
-/// staged lease live exactly as long as this value or the stream built from
-/// it, so dropping the stream — at completion, cancellation, or disconnect —
-/// releases them together, and an already-leased staged run stays readable
-/// even if publication retires its authority meanwhile.
+/// here. The Scribe follower turns it into one `DataFusion` plan: the memtable
+/// rows become an in-memory source, the unserved runs are read by Oracle's
+/// hot-Parquet scan, and the lease moves into that scan so an already-leased
+/// run stays readable even if publication retires its authority meanwhile.
 #[derive(Debug)]
 pub struct LiveTailBatches {
     /// Shallow memtable batches in acknowledgement order, not yet filtered.
@@ -359,12 +340,6 @@ pub struct LiveTailBatches {
     staged: Option<crate::scribe::hot_source::StagedSourceLease>,
     /// Leased staged members the memtable cut did not already serve.
     unserved: Vec<crate::scribe::hot_source::StagedSource>,
-    /// Signed projection closure, in caller order.
-    required_columns: Vec<String>,
-    /// Signed predicate conjunction every produced row must satisfy.
-    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
-    /// Test-harness accounting of this open producer.
-    open: OpenLiveProducer,
 }
 
 impl LiveTailBatches {
@@ -372,100 +347,58 @@ impl LiveTailBatches {
     ///
     /// Used by resolver fixtures that supply their own cohort.
     #[must_use]
-    pub fn from_snapshot(
-        memtable: Vec<HotBatch>,
-        predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
-    ) -> Self {
+    pub fn from_snapshot(memtable: Vec<HotBatch>) -> Self {
         Self {
             memtable,
             staged: None,
             unserved: Vec::new(),
-            required_columns: Vec::new(),
-            predicates,
-            open: OpenLiveProducer::open(),
         }
     }
 
-    /// Produces this read's rows one batch per pull.
+    /// Splits the read into its memtable rows, the unserved staged run paths
+    /// in merge order, and the lease keeping those runs on disk.
     ///
-    /// Memtable batches come first, then each unserved staged run read one
-    /// Parquet batch at a time through Parquet's async stream; each batch is
-    /// filtered by the signed predicates just before it is yielded and batches
-    /// retaining no row are skipped. Because the next batch is produced only
-    /// when the consumer polls again, a slow consumer holds production back
-    /// rather than accumulating output here.
-    ///
-    /// Staged reads charge their fetched row groups and decoded batches to
-    /// `memory_pool`, the follower's query grant; a read the grant cannot hold
-    /// fails the stream.
-    ///
-    /// The stream owns the staged lease, the open run, and the memtable
-    /// references. Dropping it — at completion, cancellation, or disconnect —
-    /// releases all of them together and starts no later batch or run; no
-    /// Wyrd task keeps reading on its behalf.
-    ///
-    /// # Errors
-    ///
-    /// The stream yields [`ScribeError::Internal`] when a signed predicate
-    /// cannot be compiled or evaluated, a staged run cannot be opened,
-    /// projected, or decoded, or a staged read exceeds the remaining grant; it
-    /// ends after the first error.
-    pub fn into_stream(
-        self,
-        memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
-    ) -> futures_util::stream::BoxStream<
-        'static,
-        Result<arrow::record_batch::RecordBatch, ScribeError>,
-    > {
-        let Self {
-            memtable,
-            staged,
-            unserved,
-            required_columns,
-            predicates,
-            open,
-        } = self;
-        Box::pin(async_stream::try_stream! {
-            let _open = open;
-            let _staged = staged;
-            let required_columns: Arc<[String]> = required_columns.into();
-            let predicates: Arc<[ScanPredicate]> = predicates.into();
-            let mut produced = false;
-            for batch in memtable {
-                #[cfg(feature = "test-support")]
-                if produced {
-                    scribe_live_production_pause_for_test().hold().await;
-                }
-                let rows = FetchLiveTailService::retain_signed(batch.rows, &predicates)?;
-                if rows.num_rows() == 0 {
-                    continue;
-                }
-                produced = true;
-                yield rows;
-            }
-            let reader = StagedTailReader::default();
-            for source in &unserved {
-                for run in &source.runs {
-                    let mut run = reader
-                        .open(
-                            run.clone(),
-                            Arc::clone(&required_columns),
-                            Arc::clone(&predicates),
-                            &memory_pool,
-                        )
-                        .await?;
-                    while let Some(rows) = run.next_rows().await? {
-                        #[cfg(feature = "test-support")]
-                        if produced {
-                            scribe_live_production_pause_for_test().hold().await;
-                        }
-                        produced = true;
-                        yield rows;
-                    }
-                }
-            }
-        })
+    /// The caller must hold the lease for as long as it reads any run path.
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (Vec<RecordBatch>, Vec<PathBuf>, Option<StagedSourceLease>) {
+        let rows = self.memtable.into_iter().map(|batch| batch.rows).collect();
+        let runs = self
+            .unserved
+            .into_iter()
+            .flat_map(|source| source.runs)
+            .collect();
+        (rows, runs, self.staged)
     }
+}
+
+/// Wraps one Scribe fragment's output with the test harness's live-production
+/// hooks.
+///
+/// The returned stream counts as one open live producer until it drops,
+/// counts every batch it yields, and holds an armed [`ScribeLiveProductionPause`] before every batch after the
+/// first, so a journey can observe Oracle holding an earlier batch while the
+/// Scribe has not yet produced the next. Compiled only with `test-support`.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub(crate) fn observe_live_production_for_test(
+    stream: SendableRecordBatchStream,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let open = OpenLiveProducer::open();
+    let observed = async_stream::stream! {
+        let _open = open;
+        let mut stream = stream;
+        let mut produced = false;
+        while let Some(batch) = futures_util::StreamExt::next(&mut stream).await {
+            if produced {
+                scribe_live_production_pause_for_test().hold().await;
+            }
+            produced = true;
+            LIVE_BATCHES_PRODUCED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            yield batch;
+        }
+    };
+    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, observed))
 }
 
 /// Pod-local live-tail service over the Scribe memtable.
@@ -628,23 +561,21 @@ impl FetchLiveTailService {
     /// Opens one lazily produced live read over this Scribe's stream.
     ///
     /// Validation, the bounded memtable snapshot, and the staged lease happen
-    /// here; filtering and staged decoding happen only as the returned
-    /// producer is pulled.
+    /// here; filtering and staged decoding happen only in the plan the Scribe
+    /// follower builds from the returned read.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when stream/range validation fails, the bounded
-    /// snapshot exceeds its count or retained-byte ceiling, the owning
-    /// memtable/shard cannot produce the projection, or the staged registry is
+    /// Returns [`ScribeError`] when stream/range validation fails, the owning
+    /// memtable cannot produce the projection, or the staged registry is
     /// unavailable.
-    pub async fn open_live_batches(
+    pub fn open_live_batches(
         &self,
-        request: FetchLiveTailRequest,
+        request: &FetchLiveTailRequest,
     ) -> Result<LiveTailBatches, ScribeError> {
-        let staged_request = request.clone();
-        let memtable = self.memtable_batches(request).await?;
+        let memtable = self.memtable_batches(request)?;
         let served = Self::served_generations(&memtable);
-        let staged = self.staged_lease(&staged_request)?;
+        let staged = self.staged_lease(request)?;
         let unserved = staged
             .as_ref()
             .map(|lease| {
@@ -660,9 +591,6 @@ impl FetchLiveTailService {
             memtable,
             staged,
             unserved,
-            required_columns: staged_request.required_columns,
-            predicates: staged_request.predicates,
-            open: OpenLiveProducer::open(),
         })
     }
 
@@ -671,11 +599,10 @@ impl FetchLiveTailService {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the request names another stream or an
-    /// inverted range, the snapshot exceeds its count or retained-byte ceiling,
-    /// or the owning memtable/shard cannot produce the projection.
-    async fn memtable_batches(
+    /// inverted range, or the owning memtable cannot produce the projection.
+    fn memtable_batches(
         &self,
-        request: FetchLiveTailRequest,
+        request: &FetchLiveTailRequest,
     ) -> Result<Vec<HotBatch>, ScribeError> {
         if request.target_stream != self.stream {
             return Err(ScribeError::StreamMismatch {
@@ -689,7 +616,7 @@ impl FetchLiveTailService {
             });
         }
         if let Some(shards) = &self.shards {
-            return shards.snapshot(request).await;
+            return shards.snapshot(request);
         }
         Ok(self
             .memtable
@@ -703,10 +630,6 @@ impl FetchLiveTailService {
                 request.start_partition,
                 request.end_partition,
                 &request.required_columns,
-                ReadableBatchLimits {
-                    max_batches: request.max_batches,
-                    max_retained_bytes: request.max_retained_bytes,
-                },
             )?
             .into_iter()
             .map(|readable| HotBatch {
@@ -765,39 +688,15 @@ impl FetchLiveTailService {
                 detail: format!("resolve the staged members serving a live-tail read: {error}"),
             })
     }
-
-    /// Keeps only the rows of one batch the signed predicate conjunction admits.
-    ///
-    /// An empty conjunction admits every row and returns the batch unchanged.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError::Internal`] when a signed predicate cannot be
-    /// compiled against, or evaluated over, the batch's own schema.
-    fn retain_signed(
-        rows: arrow::record_batch::RecordBatch,
-        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-    ) -> Result<arrow::record_batch::RecordBatch, ScribeError> {
-        if predicates.is_empty() {
-            return Ok(rows);
-        }
-        let filter = crate::oracle::exec::ScanPredicateFilter::compile(&rows.schema(), predicates)
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("live-tail predicate is invalid for this snapshot: {error}"),
-            })?;
-        filter.retain(rows).map_err(|error| ScribeError::Internal {
-            detail: format!("live-tail predicate evaluation failed: {error}"),
-        })
-    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::{FetchLiveTailService, TailReadError, tonic_error};
     use crate::scribe::hot_source::HotAuthority;
     use crate::scribe::memtable::Memtable;
-    use crate::scribe::staged_tail::tests::unbounded_pool;
     use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
     use crate::scribe::wal::WalLsn;
     use arrow::array::{Int64Array, RecordBatch};
@@ -821,26 +720,15 @@ mod tests {
         use crate::scribe::seal_key::SealKey;
         use crate::scribe::wal::ScribeAppendMeta;
 
-        // The managed row ordinal is part of every persisted append, and a fence
-        // cursor is derived from it, so the fixture carries it exactly as
-        // ingress would. It is excluded from the projected source fingerprint.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Int64, false),
-            Field::new(
-                wyrd_spec::vala::managed_columns::WYRD_ROW_ORDINAL,
-                DataType::Int32,
-                false,
-            ),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
         let batch = |values: Vec<i64>| {
-            let ordinals = (0..i32::try_from(values.len()).expect("fixture row count fits i32"))
-                .collect::<Vec<_>>();
             RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from(values)),
-                    Arc::new(arrow::array::Int32Array::from(ordinals)),
-                ],
+                vec![Arc::new(Int64Array::from(values))],
             )
             .expect("valid fixture batch")
         };
@@ -984,7 +872,9 @@ mod tests {
         }
     }
 
-    /// Writes `rows` as one staged Parquet run under `directory`.
+    /// Writes `rows` as one staged Parquet run under `directory`, one row per
+    /// row group, so a selective scan has row groups to prune. The footer
+    /// records `tenant`, the way every staged run Scribe writes does.
     ///
     /// # Panics
     /// Panics when the fixture cannot write its own run.
@@ -992,12 +882,20 @@ mod tests {
         directory: &std::path::Path,
         schema: Arc<Schema>,
         rows: &RecordBatch,
+        tenant: DataTenantId,
     ) -> std::path::PathBuf {
         let run = directory.join("run-0.parquet");
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             std::fs::File::create(&run).expect("staged run file"),
             schema,
-            None,
+            Some(
+                parquet::file::properties::WriterProperties::builder()
+                    .set_max_row_group_row_count(Some(1))
+                    .set_key_value_metadata(Some(vec![crate::parquet::footer::tenant_key_value(
+                        tenant,
+                    )]))
+                    .build(),
+            ),
         )
         .expect("staged run writer");
         writer.write(rows).expect("staged run rows");
@@ -1005,70 +903,78 @@ mod tests {
         run
     }
 
-    /// Opens one live read and drains every batch it produces.
+    /// Returns the `Int64` values of one batch's first column.
     ///
     /// # Panics
-    /// Panics when the read cannot open or any produced batch fails.
-    async fn live_batches(
-        service: &FetchLiveTailService,
-        request: super::FetchLiveTailRequest,
-    ) -> Vec<RecordBatch> {
-        futures_util::TryStreamExt::try_collect(
-            service
-                .open_live_batches(request)
-                .await
-                .expect("live read opens")
-                .into_stream(unbounded_pool()),
-        )
-        .await
-        .expect("live read drains")
+    /// Panics when the first column is not `Int64`.
+    fn first_column_values(batch: &RecordBatch) -> Vec<i64> {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 value column")
+            .values()
+            .to_vec()
     }
 
-    /// Returns every `value` a live read yields, sorted, so duplicates across
-    /// sources stay visible.
+    /// Returns every `value` one opened live read serves, sorted, so
+    /// duplicates across its memtable cut and staged runs stay visible.
+    ///
+    /// Staged runs are decoded directly while the read's lease is still held.
     ///
     /// # Panics
-    /// Panics when the read fails or the first column is not `Int64`.
-    async fn hot_values(
-        service: &FetchLiveTailService,
-        request: super::FetchLiveTailRequest,
-    ) -> Vec<i64> {
-        let mut values = live_batches(service, request)
-            .await
+    /// Panics when a staged run cannot be decoded.
+    fn served_values(read: super::LiveTailBatches) -> Vec<i64> {
+        let (rows, runs, _lease) = read.into_parts();
+        let mut values = rows
             .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("Int64 value column")
-                    .values()
-                    .to_vec()
-            })
+            .flat_map(first_column_values)
             .collect::<Vec<_>>();
+        for run in runs {
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(run).expect("leased staged run opens"),
+            )
+            .expect("staged run footer")
+            .build()
+            .expect("staged run reader");
+            for batch in reader {
+                values.extend(first_column_values(&batch.expect("staged run batch")));
+            }
+        }
         values.sort_unstable();
         values
     }
 
+    /// Opens one live read and returns every `value` it serves, sorted.
+    ///
+    /// # Panics
+    /// Panics when the read cannot open or a staged run cannot be decoded.
+    fn hot_values(
+        service: &FetchLiveTailService,
+        request: &super::FetchLiveTailRequest,
+    ) -> Vec<i64> {
+        served_values(service.open_live_batches(request).expect("live read opens"))
+    }
+
     /// One frozen generation whose rows are both in the memtable and in a
     /// registered staged run, served by a direct-memtable tail service.
-    struct StagedGenerationFixture {
+    pub(crate) struct StagedGenerationFixture {
         /// Service reading the memtable and the registry.
-        service: FetchLiveTailService,
+        pub(crate) service: Arc<FetchLiveTailService>,
         /// Memtable holding the frozen generation.
-        memtable: Arc<crate::scribe::memtable::Memtable>,
+        pub(crate) memtable: Arc<crate::scribe::memtable::Memtable>,
         /// Registry naming the generation's staged runs.
-        registry: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+        pub(crate) registry: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
         /// Seal key of the generation.
-        key: crate::scribe::seal_key::SealKey,
+        pub(crate) key: crate::scribe::seal_key::SealKey,
         /// The staged generation.
-        generation: crate::scribe::hot_source::GenerationOrdinal,
+        pub(crate) generation: crate::scribe::hot_source::GenerationOrdinal,
         /// Staged member holding the runs.
-        member: crate::scribe::assembly::StagedMemberId,
+        pub(crate) member: crate::scribe::assembly::StagedMemberId,
         /// Request reading the generation's day.
-        request: super::FetchLiveTailRequest,
+        pub(crate) request: super::FetchLiveTailRequest,
         /// Directory owning the staged run; the run is deleted when it drops.
-        directory: tempfile::TempDir,
+        pub(crate) directory: tempfile::TempDir,
     }
 
     /// Builds a [`StagedGenerationFixture`] holding rows `[1, 2, 3]`.
@@ -1080,11 +986,11 @@ mod tests {
     }
 
     /// Builds a [`StagedGenerationFixture`] whose generation is staged as
-    /// `runs` identical runs of rows `[1, 2, 3]`, one decode window each.
+    /// `runs` identical runs of rows `[1, 2, 3]`, one row group per row.
     ///
     /// # Panics
     /// Panics when any fixture step fails.
-    fn staged_generation_fixture_with_runs(runs: usize) -> StagedGenerationFixture {
+    pub(crate) fn staged_generation_fixture_with_runs(runs: usize) -> StagedGenerationFixture {
         use crate::catalog::TableRef;
         use crate::scribe::assembly::StagedMemberId;
         use crate::scribe::hot_source::{HotAuthority, ScribeHotSourceRegistry};
@@ -1138,7 +1044,7 @@ mod tests {
         };
 
         let directory = tempfile::tempdir().expect("staged run directory");
-        let run = write_staged_run(directory.path(), schema, &rows);
+        let run = write_staged_run(directory.path(), schema, &rows, tenant);
         let runs = (0..runs)
             .map(|index| {
                 let copy = directory.path().join(format!("run-copy-{index}.parquet"));
@@ -1160,8 +1066,10 @@ mod tests {
             )
             .expect("the generation moves to its staged runs");
 
-        let service = FetchLiveTailService::new(stream, Arc::clone(&memtable))
-            .with_hot_sources(Arc::clone(&registry));
+        let service = Arc::new(
+            FetchLiveTailService::new(stream, Arc::clone(&memtable))
+                .with_hot_sources(Arc::clone(&registry)),
+        );
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         let request = super::FetchLiveTailRequest {
@@ -1170,9 +1078,6 @@ mod tests {
             start_partition: day,
             end_partition: day,
             required_columns: vec!["value".to_owned()],
-            predicates: Vec::new(),
-            max_batches: 64,
-            max_retained_bytes: 64 * 1024 * 1024,
         };
         StagedGenerationFixture {
             service,
@@ -1197,8 +1102,8 @@ mod tests {
     /// # Panics
     /// Panics when the fixture cannot be built or a read returns any row other
     /// than exactly once.
-    #[tokio::test]
-    async fn a_generation_staged_before_the_shard_settles_is_read_once() {
+    #[test]
+    fn a_generation_staged_before_the_shard_settles_is_read_once() {
         let StagedGenerationFixture {
             service,
             memtable,
@@ -1208,28 +1113,24 @@ mod tests {
             directory: _directory,
             ..
         } = staged_generation_fixture();
-        let read = || hot_values(&service, request.clone());
+        let read = || hot_values(&service, &request);
 
-        assert_eq!(read().await, vec![1, 2, 3], "staged but not yet durable");
+        assert_eq!(read(), vec![1, 2, 3], "staged but not yet durable");
         memtable
             .complete_staged(generation.get(), member)
             .expect("the shard marks the generation durable");
-        assert_eq!(
-            read().await,
-            vec![1, 2, 3],
-            "durable and served by its runs"
-        );
+        assert_eq!(read(), vec![1, 2, 3], "durable and served by its runs");
     }
 
     /// A live read opened over durable staged runs keeps them readable after
-    /// publication retires their authority, and holds its lease until its
-    /// stream drops.
+    /// publication retires their authority, and holds its lease until it
+    /// drops.
     ///
     /// # Panics
     /// Panics when the fixture cannot be built, the leased run cannot be read
-    /// after publication, or the lease does not follow the stream.
-    #[tokio::test]
-    async fn an_open_live_read_keeps_staged_runs_across_publication() {
+    /// after publication, or the lease does not follow the read.
+    #[test]
+    fn an_open_live_read_keeps_staged_runs_across_publication() {
         let StagedGenerationFixture {
             service,
             memtable,
@@ -1239,14 +1140,12 @@ mod tests {
             member,
             request,
             directory: _directory,
-            ..
         } = staged_generation_fixture();
         memtable
             .complete_staged(generation.get(), member)
             .expect("the shard marks the generation durable");
         let open = service
-            .open_live_batches(request.clone())
-            .await
+            .open_live_batches(&request)
             .expect("the live read opens");
         assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
         registry
@@ -1258,149 +1157,23 @@ mod tests {
                 },
             )
             .expect("the generation publishes");
-        let mut stream = open.into_stream(unbounded_pool());
-        let batch = futures_util::StreamExt::next(&mut stream)
-            .await
-            .expect("the staged run yields a batch")
-            .expect("a leased staged run stays readable after publication");
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64 value column")
-            .values()
-            .to_vec();
-        assert_eq!(values, vec![1, 2, 3], "published after open, still read");
+        let (rows, runs, lease) = open.into_parts();
+        assert!(rows.is_empty(), "a durable staged generation leaves memory");
+        assert_eq!(runs.len(), 1, "the leased run is still named");
+        assert!(
+            runs[0].exists(),
+            "a leased staged run stays on disk after publication"
+        );
         assert_eq!(
             registry.leases(&key, generation).expect("locked"),
             1,
-            "an open stream keeps its lease"
+            "an open read keeps its lease"
         );
-        drop(stream);
+        drop(lease);
         assert_eq!(
             registry.leases(&key, generation).expect("locked"),
             0,
-            "dropping the stream releases the lease"
+            "dropping the read releases the lease"
         );
-    }
-
-    /// Cancelling a staged read releases its lease at once and reads no
-    /// further run.
-    ///
-    /// The generation is staged as two runs. A read that yielded the first
-    /// run's rows and is then dropped holds nothing afterwards; a read
-    /// cancelled at an arbitrary await inside its staged reads also holds
-    /// nothing once its task is gone, because no Wyrd task reads on a dropped
-    /// stream's behalf.
-    ///
-    /// # Panics
-    /// Panics when the lease outlives either dropped read.
-    #[tokio::test]
-    async fn a_cancelled_staged_read_releases_its_lease_immediately() {
-        let StagedGenerationFixture {
-            service,
-            memtable,
-            registry,
-            key,
-            generation,
-            member,
-            request,
-            directory: _directory,
-        } = staged_generation_fixture_with_runs(2);
-        memtable
-            .complete_staged(generation.get(), member)
-            .expect("the shard marks the generation durable");
-
-        let mut stream = service
-            .open_live_batches(request.clone())
-            .await
-            .expect("the live read opens")
-            .into_stream(unbounded_pool());
-        let first = futures_util::StreamExt::next(&mut stream)
-            .await
-            .expect("the first run yields")
-            .expect("the first run reads");
-        assert_eq!(first.num_rows(), 3);
-        assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
-        drop(stream);
-        assert_eq!(
-            registry.leases(&key, generation).expect("locked"),
-            0,
-            "dropping a read between runs releases its lease"
-        );
-
-        let stream = service
-            .open_live_batches(request)
-            .await
-            .expect("the live read reopens")
-            .into_stream(unbounded_pool());
-        let reading =
-            tokio::spawn(
-                async move { futures_util::TryStreamExt::try_collect::<Vec<_>>(stream).await },
-            );
-        tokio::task::yield_now().await;
-        reading.abort();
-        match reading.await {
-            Err(error) => assert!(error.is_cancelled()),
-            Ok(rows) => assert_eq!(rows.expect("the read completes").len(), 2),
-        }
-        assert_eq!(
-            registry.leases(&key, generation).expect("locked"),
-            0,
-            "a read cancelled mid-run releases its lease as soon as it is gone"
-        );
-    }
-
-    /// A signed predicate is applied inside Scribe, so a selective live-tail
-    /// fetch returns the same rows the leader would have kept but ships
-    /// strictly fewer of them into follower attempt encoding.
-    ///
-    /// # Panics
-    /// Panics when the fixture cannot be built or either snapshot fails.
-    #[tokio::test]
-    async fn selective_live_tail_fetch_returns_only_signed_rows() {
-        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
-
-        let tenant = DataTenantId::new_v7();
-        let day = crate::test_support::day_partition(2026, 7, 14);
-        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
-        let (service, binding) = selective_tail_fixture(tenant, day, stream);
-        let request = |predicates: Vec<ScanPredicate>| super::FetchLiveTailRequest {
-            binding: binding.clone(),
-            target_stream: stream,
-            start_partition: day,
-            end_partition: day,
-            required_columns: vec!["value".to_owned()],
-            predicates,
-            max_batches: 64,
-            max_retained_bytes: 64 * 1024 * 1024,
-        };
-
-        let unfiltered = live_batches(&service, request(Vec::new())).await;
-        let unfiltered_rows: usize = unfiltered.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(unfiltered.len(), 2);
-        assert_eq!(unfiltered_rows, 5);
-
-        let selective = live_batches(
-            &service,
-            request(vec![ScanPredicate::Eq(
-                "value".to_owned(),
-                ScanLiteral::I64(2),
-            )]),
-        )
-        .await;
-        // The batch holding no matching row is dropped entirely rather than
-        // returned empty, and the surviving batch carries only row `2`.
-        assert_eq!(selective.len(), 1);
-        let selective_rows: usize = selective.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(selective_rows, 1);
-        assert!(selective_rows < unfiltered_rows);
-        let retained = selective[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64 value column")
-            .value(0);
-        assert_eq!(retained, 2);
     }
 }

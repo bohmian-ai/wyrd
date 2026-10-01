@@ -42,7 +42,6 @@ FAMILY_VALA=(
 )
 
 FAMILY_SHARED=(
-  wyrd-auth-check
   wyrd-auth-issue
   wyrd-auth-oidc
   wyrd-auth-verify

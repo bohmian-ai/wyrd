@@ -18,6 +18,10 @@ use crate::{SqlError, TenantConn};
 /// the `query!` invocation. Tenant-scoped transactions remain the responsibility
 /// of [`crate::WyrdPostgres`] or the owning tier's equivalent Postgres handle.
 ///
+/// The one-off `wyrd-server migrate` process also wraps its database-owner
+/// pool in this handle to hold the migration lease and run the same schema
+/// checks serving boot runs; that owner pool never exists in a serving process.
+///
 /// `None` when no cross-tenant role is configured (single-app or dev setup).
 /// Production boot that requires cross-tenant maintenance fails fast when the
 /// accessor on `WyrdPostgres` / `ServerPostgres` returns `None`.

@@ -58,10 +58,6 @@ pub(crate) struct IngestMaterialPlan {
     pub(crate) path: IngestPath,
     /// Encoded request bytes retained through admission.
     pub(crate) request_bytes: usize,
-    /// Public layout bytes occupied by this fixed planner value.
-    pub(crate) planner_bytes: usize,
-    /// Bounded physical-name and binding construction bytes.
-    pub(crate) name_bytes: usize,
     /// Admitted overlap for a native aligned source copy.
     pub(crate) aligned_copy_bytes: usize,
     /// Start of the canonical schema message framing word.
@@ -90,16 +86,6 @@ pub(crate) struct IngestMaterialPlan {
     pub(crate) current_material_bytes: usize,
     /// Aggregate native rows transferred into active memtable ownership.
     pub(crate) active_output_bytes: usize,
-    /// Conservative Arrow bytes that can form one later file candidate.
-    pub(crate) persistence_candidate_bytes: usize,
-    /// Authorized fixed backing ceiling for WAL-durable slice descriptors.
-    pub(crate) durable_metadata_bytes: usize,
-    /// Fixed WAL framing/digest workspace.
-    pub(crate) wal_workspace_bytes: usize,
-    /// Conservative immutable-plus-serial-workspace replayability peak.
-    pub(crate) persistence_replay_bytes: usize,
-    /// Complete simultaneous-live-set charge.
-    pub(crate) root_bytes: usize,
 }
 
 /// Canonical two-phase materialization plan used by every Scribe producer.
@@ -108,115 +94,22 @@ pub(crate) struct IngestMaterialPlan {
 /// making the preflight owner explicit at ingress and recovery call sites.
 pub(crate) type MaterialPlan = IngestMaterialPlan;
 
-/// Derives the largest configured preflight or persistence envelope.
-///
-/// Every ingest decoder refuses output above the derived expanded ceiling, so
-/// one file candidate never exceeds it. The preflight live set is the retained
-/// wire request plus, for typed OTLP, the generated request backing and the
-/// projected output together, each bounded by the expanded ceiling; native
-/// output aliases or copies its borrowed wire and fits the same sum. The result
-/// includes the durable slice layout, WAL workspace, and the same
-/// candidate-local persistence projection used after materialization.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::DecodedPayloadTooLarge`] when configured bound
-/// arithmetic cannot be represented on this platform.
-pub(crate) fn configured_maximum_envelope_bytes(
-    limits: crate::gate::limits::IngestLimits,
-) -> Result<usize, ScribeError> {
-    let overflow = || ScribeError::DecodedPayloadTooLarge {
-        bytes: usize::MAX,
-        limit: usize::MAX,
-    };
-    let candidate = limits
-        .max_frame_bytes
-        .checked_mul(crate::gate::limits::BIFROST_INGEST_EXPANSION_FACTOR)
-        .ok_or_else(overflow)?;
-    let durable_metadata = MAX_SOURCE_PLANS
-        .checked_mul(limits.otlp.time_partitions.max(1))
-        .and_then(|count| count.checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES))
-        .ok_or_else(overflow)?;
-    let preflight = candidate
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(limits.max_frame_bytes))
-        .and_then(|bytes| bytes.checked_add(durable_metadata))
-        .and_then(|bytes| bytes.checked_add(limits.wal_workspace_bytes))
-        .ok_or_else(overflow)?;
-    let persistence = candidate
-        .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
-            candidate,
-        )?)
-        .ok_or_else(overflow)?;
-    Ok(preflight.max(persistence))
-}
-
-/// Pre-mutation decision for one plan against the node's replayable envelope.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MaximumEnvelopeDecision {
-    /// The complete planned live set can be accepted and replayed.
-    Fits,
-    /// The request can never fit this node even when all temporary occupancy drains.
-    IntrinsicRefusal {
-        /// Request-specific upper-bound demand computed before materialization.
-        demand_bytes: usize,
-        /// Maximum root envelope available to Scribe on this node.
-        limit_bytes: usize,
-    },
-}
-
 impl IngestMaterialPlan {
-    /// Classifies intrinsic envelope compatibility without observing temporary occupancy.
+    /// Returns the materialized Arrow bytes the admitted payload already holds.
+    ///
+    /// Canonical batches were materialized by Gate before Scribe admission, so
+    /// their retained buffers are charged now. A native stream's source bytes
+    /// are the transport-owned wire body; its decoded output is charged when
+    /// preprocessing materializes it.
     #[must_use]
-    pub(crate) fn maximum_envelope_decision(
-        &self,
-        maximum_scribe_envelope_bytes: usize,
-    ) -> MaximumEnvelopeDecision {
-        let demand_bytes = self.root_bytes.max(self.persistence_replay_bytes);
-        if demand_bytes <= maximum_scribe_envelope_bytes {
-            MaximumEnvelopeDecision::Fits
-        } else {
-            MaximumEnvelopeDecision::IntrinsicRefusal {
-                demand_bytes,
-                limit_bytes: maximum_scribe_envelope_bytes,
-            }
+    pub(crate) fn held_material_bytes(&self) -> usize {
+        match self.path {
+            IngestPath::Native => 0,
+            IngestPath::Otlp => self.sources[..self.source_count]
+                .iter()
+                .map(|source| source.body_bytes)
+                .sum(),
         }
-    }
-
-    /// Completes checked simultaneous-live-set arithmetic.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::DecodedPayloadTooLarge`] on checked overflow.
-    /// The existing T5A Scribe root applies the authoritative live-capacity
-    /// refusal to the resulting exact charge.
-    fn finish(mut self) -> Result<Self, ScribeError> {
-        self.root_bytes = [
-            self.request_bytes,
-            self.planner_bytes,
-            self.name_bytes,
-            self.aligned_copy_bytes,
-            self.current_material_bytes,
-            self.active_output_bytes,
-            self.durable_metadata_bytes,
-            self.wal_workspace_bytes,
-        ]
-        .into_iter()
-        .try_fold(0_usize, usize::checked_add)
-        .ok_or(ScribeError::DecodedPayloadTooLarge {
-            bytes: usize::MAX,
-            limit: usize::MAX,
-        })?;
-        let candidate_upper_bound = self.persistence_candidate_bytes;
-        self.persistence_replay_bytes = candidate_upper_bound
-            .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
-                candidate_upper_bound,
-            )?)
-            .ok_or(ScribeError::DecodedPayloadTooLarge {
-                bytes: usize::MAX,
-                limit: usize::MAX,
-            })?;
-        Ok(self)
     }
 }
 
@@ -589,7 +482,7 @@ impl NativeScan {
     /// # Errors
     ///
     /// Returns a material error when checked capacity or root arithmetic overflows.
-    fn finish(self, bytes: &Bytes, name_bytes: usize) -> Result<IngestMaterialPlan, ScribeError> {
+    fn finish(self, bytes: &Bytes) -> Result<IngestMaterialPlan, ScribeError> {
         let current_material_bytes = self
             .schema_material_bytes
             .checked_add(self.max_metadata_bytes)
@@ -598,11 +491,9 @@ impl NativeScan {
                 bytes: usize::MAX,
                 limit: self.limits.max_frame_bytes,
             })?;
-        IngestMaterialPlan {
+        Ok(IngestMaterialPlan {
             path: IngestPath::Native,
             request_bytes: bytes.len(),
-            planner_bytes: size_of::<IngestMaterialPlan>(),
-            name_bytes,
             aligned_copy_bytes: self.sources[..self.source_count]
                 .iter()
                 .filter(|source| {
@@ -623,22 +514,7 @@ impl NativeScan {
             time_partition_count: self.limits.otlp.time_partitions,
             current_material_bytes,
             active_output_bytes: self.active_output_bytes,
-            persistence_candidate_bytes: self.active_output_bytes,
-            durable_metadata_bytes: self
-                .source_count
-                .checked_mul(self.limits.otlp.time_partitions)
-                .and_then(|count| {
-                    count.checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
-                })
-                .ok_or(ScribeError::DecodedPayloadTooLarge {
-                    bytes: usize::MAX,
-                    limit: self.limits.max_frame_bytes,
-                })?,
-            wal_workspace_bytes: self.limits.wal_workspace_bytes,
-            persistence_replay_bytes: 0,
-            root_bytes: 0,
-        }
-        .finish()
+        })
     }
 }
 
@@ -662,7 +538,6 @@ impl ScribeIngressPlanner {
         &self,
         batches: &[RecordBatch],
         request_bytes: usize,
-        name_bytes: usize,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let overflow = || ScribeError::DecodedPayloadTooLarge {
             bytes: usize::MAX,
@@ -726,11 +601,9 @@ impl ScribeIngressPlanner {
                 limit: self.limits.max_frame_bytes,
             },
         )?;
-        IngestMaterialPlan {
+        Ok(IngestMaterialPlan {
             path: IngestPath::Otlp,
             request_bytes,
-            planner_bytes: size_of::<IngestMaterialPlan>(),
-            name_bytes,
             aligned_copy_bytes: 0,
             native_schema_start: 0,
             native_schema_end: 0,
@@ -742,19 +615,7 @@ impl ScribeIngressPlanner {
             time_partition_count: self.limits.otlp.time_partitions,
             current_material_bytes,
             active_output_bytes: 0,
-            persistence_candidate_bytes: decoded_bytes,
-            durable_metadata_bytes: batches
-                .len()
-                .checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
-                .ok_or(ScribeError::DecodedPayloadTooLarge {
-                    bytes: usize::MAX,
-                    limit: self.limits.max_frame_bytes,
-                })?,
-            wal_workspace_bytes: self.limits.wal_workspace_bytes,
-            persistence_replay_bytes: 0,
-            root_bytes: 0,
-        }
-        .finish()
+        })
     }
 
     /// Scans a canonical native stream without Arrow decode or body allocation.
@@ -764,11 +625,7 @@ impl ScribeIngressPlanner {
     /// Returns stable invalid or material-too-large Scribe errors for malformed
     /// framing, non-V5 metadata, dictionaries, compression, unsupported
     /// layouts, invalid ranges, missing EOS, overflow, or ceiling excess.
-    pub(crate) fn plan_native(
-        &self,
-        bytes: &Bytes,
-        name_bytes: usize,
-    ) -> Result<IngestMaterialPlan, ScribeError> {
+    pub(crate) fn plan_native(&self, bytes: &Bytes) -> Result<IngestMaterialPlan, ScribeError> {
         if bytes.len() > self.limits.max_frame_bytes {
             return Err(ScribeError::PayloadTooLarge {
                 bytes: bytes.len(),
@@ -777,7 +634,7 @@ impl ScribeIngressPlanner {
         }
         let mut scan = NativeScan::new(self.limits);
         scan.scan(bytes)?;
-        scan.finish(bytes, name_bytes)
+        scan.finish(bytes)
     }
 }
 
@@ -1249,7 +1106,7 @@ fn validate_offsets(
 ///
 /// The calculation includes the nullable `run_id`/`card_uid` validity and
 /// offsets, three non-null UTF-8 columns, one aliased receipt timestamp buffer,
-/// fixed batch identity, and row ordinals. Source-owned buffers remain in the
+/// and fixed batch identity. Source-owned buffers remain in the
 /// native body fact and are not charged twice.
 ///
 /// # Errors
@@ -1276,7 +1133,7 @@ fn managed_projection_bytes(rows: usize, request_id_bytes: usize) -> Result<usiz
         .and_then(|value| value.checked_add(rows.checked_mul(36)?))
         .ok_or_else(overflow)?;
     let fixed_values = rows
-        .checked_mul(size_of::<i64>() + 16 + size_of::<i32>())
+        .checked_mul(size_of::<i64>() + 16)
         .ok_or_else(overflow)?;
     let array_owners = size_of::<arrow::array::StringArray>()
         .checked_mul(5)
@@ -1284,7 +1141,6 @@ fn managed_projection_bytes(rows: usize, request_id_bytes: usize) -> Result<usiz
             value.checked_add(size_of::<arrow::array::TimestampMicrosecondArray>() * 2)
         })
         .and_then(|value| value.checked_add(size_of::<arrow::array::FixedSizeBinaryArray>()))
-        .and_then(|value| value.checked_add(size_of::<arrow::array::Int32Array>()))
         .ok_or_else(overflow)?;
     offsets
         .checked_mul(5)
@@ -1300,7 +1156,7 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
-    use super::{ScribeIngressPlanner, configured_maximum_envelope_bytes, root_as_message};
+    use super::{ScribeIngressPlanner, root_as_message};
     use crate::contracts::ScribeError;
     use arrow::array::{
         ArrayRef, Decimal128Array, Int64Array, NullArray, StringArray, Time64MicrosecondArray,
@@ -1408,7 +1264,7 @@ mod tests {
     fn native_preflight_accepts_canonical_v1_stream() {
         let bytes = canonical_stream();
         let plan = ScribeIngressPlanner::default()
-            .plan_native(&bytes, 32)
+            .plan_native(&bytes)
             .expect("canonical stream plan");
         assert_eq!(plan.source_count, 1);
         assert_eq!(plan.rows, 2);
@@ -1429,7 +1285,7 @@ mod tests {
         let bytes = canonical_stream();
         let truncated = bytes.slice(..bytes.len() - 8);
         assert!(matches!(
-            ScribeIngressPlanner::default().plan_native(&truncated, 0),
+            ScribeIngressPlanner::default().plan_native(&truncated),
             Err(ScribeError::InvalidFrame)
         ));
     }
@@ -1438,7 +1294,7 @@ mod tests {
     #[test]
     fn native_preflight_rejects_nonnullable_nulls() {
         assert!(matches!(
-            ScribeIngressPlanner::default().plan_native(&nonnullable_stream_with_null(), 0),
+            ScribeIngressPlanner::default().plan_native(&nonnullable_stream_with_null()),
             Err(ScribeError::InvalidFrame)
         ));
     }
@@ -1468,7 +1324,7 @@ mod tests {
         bytes[start + bit_width_offset..start + bit_width_offset + 4]
             .copy_from_slice(&32_i32.to_le_bytes());
         assert!(matches!(
-            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes), 0),
+            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes)),
             Err(ScribeError::InvalidFrame)
         ));
     }
@@ -1498,7 +1354,7 @@ mod tests {
         bytes[start + precision_offset..start + precision_offset + 4]
             .copy_from_slice(&39_i32.to_le_bytes());
         assert!(matches!(
-            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes), 0),
+            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes)),
             Err(ScribeError::InvalidFrame)
         ));
     }
@@ -1512,7 +1368,7 @@ mod tests {
         );
         let original = Bytes::copy_from_slice(&bytes);
         let plan = ScribeIngressPlanner::default()
-            .plan_native(&original, 0)
+            .plan_native(&original)
             .expect("canonical null stream");
         let frame_start = plan.sources[0].frame_start;
         let prefix = u32::from_le_bytes(
@@ -1538,7 +1394,7 @@ mod tests {
         bytes[metadata_start + null_count_offset..metadata_start + null_count_offset + 8]
             .copy_from_slice(&0_i64.to_le_bytes());
         assert!(matches!(
-            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes), 0),
+            ScribeIngressPlanner::default().plan_native(&Bytes::from(bytes)),
             Err(ScribeError::InvalidFrame)
         ));
     }
@@ -1550,22 +1406,6 @@ mod tests {
             arrow::ipc::reader::StreamReader::try_new(Cursor::new(canonical_stream()), None)
                 .expect("stream reader");
         assert_eq!(reader.count(), 1);
-    }
-    /// The configured envelope refuses an unrepresentable expanded ceiling.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an overflowing wire ceiling produces an envelope.
-    #[test]
-    fn configured_ceilings_refuse_overflowing_limits() {
-        let limits = crate::gate::limits::IngestLimits {
-            max_frame_bytes: usize::MAX / 2,
-            ..crate::gate::limits::IngestLimits::default()
-        };
-        assert!(matches!(
-            configured_maximum_envelope_bytes(limits),
-            Err(ScribeError::DecodedPayloadTooLarge { .. })
-        ));
     }
 
     /// Encodes `rows` sequential `Int64` values as one canonical native stream.
@@ -1607,11 +1447,11 @@ mod tests {
     fn native_preflight_refuses_output_above_expanded_ceiling() {
         let planner = ScribeIngressPlanner::new(small_limits());
         let (_, fits) = int64_stream(10);
-        planner.plan_native(&fits, 0).expect("small stream fits");
+        planner.plan_native(&fits).expect("small stream fits");
         let (_, expands) = int64_stream(200);
         assert!(expands.len() <= small_limits().max_frame_bytes);
         assert!(matches!(
-            planner.plan_native(&expands, 0),
+            planner.plan_native(&expands),
             Err(ScribeError::DecodedPayloadTooLarge { limit, .. })
                 if limit == small_limits().expanded_bytes()
         ));
@@ -1627,13 +1467,13 @@ mod tests {
     fn canonical_plan_bounds_output_bytes_not_rows() {
         let (small, _) = int64_stream(200);
         assert!(matches!(
-            ScribeIngressPlanner::new(small_limits()).plan_canonical(&[small], 0, 0),
+            ScribeIngressPlanner::new(small_limits()).plan_canonical(&[small], 0),
             Err(ScribeError::DecodedPayloadTooLarge { limit, .. })
                 if limit == small_limits().expanded_bytes()
         ));
         let (many, _) = int64_stream(131_073);
         let plan = ScribeIngressPlanner::default()
-            .plan_canonical(&[many], 0, 0)
+            .plan_canonical(&[many], 0)
             .expect("many tiny rows fit the default expanded ceiling");
         assert_eq!(plan.rows, 131_073);
     }

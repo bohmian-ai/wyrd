@@ -1,4 +1,4 @@
-//! Attempt-scoped supervision for Oracle's inactive Analytical execution path.
+//! Attempt-scoped supervision for Oracle's Analytical execution path.
 //!
 //! A distributed graph fans work out across followers, so nothing about its
 //! cleanup is implied by a leader stream ending. This module owns the one place
@@ -20,12 +20,13 @@
 //!   of the same key finds nothing and refuses, so no child reservation is
 //!   returned twice and no gauge is decremented twice.
 //!
-//! The supervisor is inactive in T1: production Oracle routing still selects the
-//! Interactive path, and only [`super::analytical`]'s inactive handle and the
-//! crate's tests construct one.
+//! [`super::analytical`]'s execution handle constructs the one per-node
+//! supervisor when Oracle runs in peer mode.
 
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -34,11 +35,11 @@ use tokio_util::sync::CancellationToken;
 use wyrd_spec::vala::BifrostError;
 
 use super::analytical::{
-    AnalyticalAttemptNumber, AnalyticalGraphKey, AnalyticalGraphRuntime, AnalyticalRuntimeRegistry,
-    DataFusionQueryId, PublicQueryId,
+    AnalyticalAttemptNumber, AnalyticalGraphKey, AnalyticalRuntimeRegistry, DataFusionQueryId,
+    PublicQueryId,
 };
 use super::telemetry::{AnalyticalAttemptOutcome, AnalyticalAttemptTelemetry};
-use crate::resources::OracleQueryResources;
+use crate::resources::{OracleExecution, OracleQueryResources};
 
 /// A graph-local stage ordinal.
 ///
@@ -197,7 +198,7 @@ struct AnalyticalGraphState {
     /// long as this node still holds its residue.
     running_query: Option<super::query_stream::RunningQueryTerminalOwner>,
     /// The query-owned runtime every follower of this graph installs.
-    runtime: AnalyticalGraphRuntime,
+    runtime: OracleExecution,
     /// Every outbound exchange stream this graph opened, owned by the graph.
     ///
     /// Shared by the leader session that opens them and the lease that settles
@@ -349,7 +350,7 @@ pub struct AnalyticalSupervisorInspection {
 
 /// Node-local owner of every live Analytical attempt.
 ///
-/// One supervisor exists per Oracle node and is shared by the leader's inactive
+/// One supervisor exists per Oracle node and is shared by the leader's
 /// execution handle and by the follower ingress that installs stage plans. It
 /// owns the node's [`AnalyticalRuntimeRegistry`], so registering an attempt and
 /// making its graph resolvable to upstream session construction are the same
@@ -373,8 +374,8 @@ pub struct AnalyticalSupervisor {
     /// Most recently settled graph's own output-sort evidence.
     ///
     /// Test-tier only. Production reports the same values as counters; a
-    /// process-cluster journey needs the exact per-operator numbers its own
-    /// query produced, which no counter family can attribute.
+    /// test needs the exact per-operator numbers its own query produced,
+    /// which no counter family can attribute.
     #[cfg(feature = "test-support")]
     physical_evidence: Mutex<Option<super::analytical::AnalyticalPhysicalEvidence>>,
     /// Graphs whose metric fold has settled on this node.
@@ -385,6 +386,13 @@ pub struct AnalyticalSupervisor {
     /// settled. This counter can, and it advances for every settled graph.
     #[cfg(feature = "test-support")]
     settled_graphs: std::sync::atomic::AtomicU64,
+    /// Attempts this node admitted, and how many of them settled successfully.
+    ///
+    /// Test-tier only. The attempt counter family is process-wide, so a
+    /// journey running several pods in one process cannot attribute it to one
+    /// node; this pair is the same count scoped to this supervisor.
+    #[cfg(feature = "test-support")]
+    attempt_counts: (AtomicU64, AtomicU64),
 }
 
 impl fmt::Debug for AnalyticalSupervisor {
@@ -412,6 +420,8 @@ impl AnalyticalSupervisor {
             physical_evidence: Mutex::new(None),
             #[cfg(feature = "test-support")]
             settled_graphs: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            attempt_counts: (AtomicU64::new(0), AtomicU64::new(0)),
         }
     }
 
@@ -471,7 +481,7 @@ impl AnalyticalSupervisor {
         self: &Arc<Self>,
         graph: AnalyticalGraphKey,
         resources: OracleQueryResources,
-        runtime: AnalyticalGraphRuntime,
+        runtime: OracleExecution,
     ) -> Result<AnalyticalGraphGuard, (Box<OracleQueryResources>, BifrostError)> {
         if !self.is_healthy() {
             return Err((
@@ -654,6 +664,9 @@ impl AnalyticalSupervisor {
     /// The guard must already be cycle-free: its Analytical ownership names
     /// this supervisor, so storing a guard that still holds it would make the
     /// graph own a handle to itself.
+    /// Its physical projections are released here, at the one transfer seam,
+    /// because they are children of the envelope this graph must see idle
+    /// before it can release.
     ///
     /// # Errors
     ///
@@ -679,6 +692,8 @@ impl AnalyticalSupervisor {
         if state.retained_admission.is_some() {
             return Err(Box::new(admitted));
         }
+        let mut admitted = admitted;
+        admitted.release_physical_projections();
         state.retained_admission = Some(admitted);
         Ok(())
     }
@@ -724,13 +739,12 @@ impl AnalyticalSupervisor {
         graphs.get_mut(&graph)?.state_mut().metric_fold.take()
     }
 
-    /// Records one settled graph and whatever output-sort evidence it carried.
+    /// Retains the most recently settled graph's output-sort evidence.
     ///
     /// Test-tier only: production publishes the same evidence as counters from
-    /// [`super::telemetry::record_output_sort_spill`]. A journey needs the exact
+    /// [`super::telemetry::record_output_sort_spill`]. A test needs the exact
     /// per-operator values its own query produced, and a counter family cannot
-    /// answer "which sort" — so the settled evidence is kept verbatim for the
-    /// process-cluster control protocol to project.
+    /// answer "which sort", so the settled evidence is kept verbatim.
     ///
     /// `evidence` is `None` for a plan with no uniquely identifiable output
     /// sort. That case still advances [`Self::settled_graph_count`] and clears
@@ -755,6 +769,16 @@ impl AnalyticalSupervisor {
     pub fn settled_graph_count(&self) -> u64 {
         self.settled_graphs
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Reports `(admitted, succeeded)` Analytical attempts on this node.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn attempt_counts(&self) -> (u64, u64) {
+        (
+            self.attempt_counts.0.load(Ordering::Acquire),
+            self.attempt_counts.1.load(Ordering::Acquire),
+        )
     }
 
     /// Reports the most recently settled graph's output-sort evidence.
@@ -981,7 +1005,7 @@ impl AnalyticalSupervisor {
     pub fn graph_runtime(
         &self,
         graph: AnalyticalGraphKey,
-    ) -> Result<AnalyticalGraphRuntime, BifrostError> {
+    ) -> Result<OracleExecution, BifrostError> {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
         graphs
             .get(&graph)
@@ -1117,6 +1141,8 @@ impl AnalyticalSupervisor {
         }
         let cancel = self.root_cancel.child_token();
         let egressed = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "test-support")]
+        self.attempt_counts.0.fetch_add(1, Ordering::AcqRel);
         let telemetry = AnalyticalAttemptTelemetry::start(
             &key.public_query_id.to_string(),
             &key.datafusion_query_id.to_string(),
@@ -1221,6 +1247,10 @@ impl AnalyticalSupervisor {
             egressed: state.egressed.load(Ordering::Acquire),
         };
         state.telemetry.finish(outcome);
+        #[cfg(feature = "test-support")]
+        if outcome == AnalyticalAttemptOutcome::Success {
+            self.attempt_counts.1.fetch_add(1, Ordering::AcqRel);
+        }
         tracing::debug!(
             public_query_id = %key.public_query_id,
             datafusion_query_id = %key.datafusion_query_id,
@@ -1552,11 +1582,9 @@ fn poisoned_supervisor() -> BifrostError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use wyrd_spec::vala::api::QueryClass;
 
-    use super::super::spill::OracleSpillRuntime;
     use super::*;
     use crate::resources::{
         BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, OracleResourceRequest,
@@ -1586,13 +1614,12 @@ mod tests {
         };
         let policy = BifrostResourcePolicy {
             roles: [BifrostRole::Oracle].into_iter().collect(),
-            memory_limit_bytes: None,
-            forge_compaction_memory_limit_bytes: None,
-            unmanaged_reserve_bytes: None,
+            server_memory_min_bytes: None,
+            bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
-            scratch_root: PathBuf::new(),
+            scratch_root: None,
             volume_roots: None,
         };
         BifrostRuntimeResources::from_snapshot(snapshot, policy)
@@ -1601,32 +1628,6 @@ mod tests {
             .expect("role composition is issued from an unpoisoned root")
             .oracle()
             .expect("the Oracle role is active in this policy")
-    }
-
-    /// Builds the query-owned runtime an admitted analytical query installs.
-    ///
-    /// The runtime carries the query's own admitted pool and a disk manager
-    /// bounded by its own spill limit, so a follower that installs it cannot
-    /// reach process-wide capacity.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the pod spill owner or the query runtime cannot be built.
-    fn query_runtime(
-        resources: &OracleQueryResources,
-        spill: &OracleSpillRuntime,
-    ) -> AnalyticalGraphRuntime {
-        let runtime = spill
-            .build_query_runtime(resources.memory_pool(), resources.spill_limit_bytes)
-            .expect("an admitted spill limit builds a bounded query runtime");
-        AnalyticalGraphRuntime::new(
-            runtime,
-            crate::resources::OracleSessionShape::for_grant(
-                resources.granted_memory_bytes,
-                resources.target_partitions,
-                resources.target_partitions,
-            ),
-        )
     }
 
     /// Names one stage-scoped attempt zero for `graph`.
@@ -1688,7 +1689,7 @@ mod tests {
         supervisor: &Arc<AnalyticalSupervisor>,
         graph: AnalyticalGraphKey,
         resources: OracleQueryResources,
-        runtime: AnalyticalGraphRuntime,
+        runtime: OracleExecution,
         deadline: tokio::time::Instant,
         fold: futures_util::future::BoxFuture<
             'static,
@@ -1716,13 +1717,11 @@ mod tests {
                 query_id: QueryId::new(graph.public_query_id.as_uuid()),
                 leader_node_id: uuid::Uuid::now_v7().into(),
                 leader_fencing_token: 1,
-                query_class: QueryClass::Analytical,
-                slot_units: 2,
                 expires_at: chrono::Utc::now() + chrono::Duration::seconds(30),
-                graph: Some(AnalyticalGraphRef {
+                graph: AnalyticalGraphRef {
                     public_query_id: graph.public_query_id.as_uuid(),
                     datafusion_query_id: graph.datafusion_query_id.as_uuid(),
-                }),
+                },
             },
             deadline,
             AnalyticalGraphLifecycleOwners {
@@ -1775,7 +1774,7 @@ mod tests {
     /// Panics when the fixture owners cannot be composed or the settlement
     /// diverges from the retained-cleanup route.
     #[cfg(feature = "test-support")]
-    async fn rewrite_error_retains_its_own_graph(spill: &OracleSpillRuntime) {
+    async fn rewrite_error_retains_its_own_graph() {
         use super::super::analytical::AnalyticalGraphResult;
 
         let failing_oracle = oracle_role();
@@ -1790,7 +1789,7 @@ mod tests {
                 0.0,
             ))
             .expect("an idle Oracle admits the rewrite-failure query");
-        let failing_runtime = query_runtime(&failing_resources, spill);
+        let failing_runtime = failing_resources.execution().clone();
         let failing = lifecycle_over_fold(
             &failing_supervisor,
             failing_graph,
@@ -1868,9 +1867,6 @@ mod tests {
         use super::super::analytical::AnalyticalGraphResult;
 
         let oracle = oracle_role();
-        let scratch_root = tempfile::tempdir().expect("fixture scratch root");
-        let spill = OracleSpillRuntime::new(scratch_root.path(), 2 * 1024 * 1024 * 1024)
-            .expect("a positive pod ceiling builds the process spill owner");
         let supervisor = Arc::new(AnalyticalSupervisor::new());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
 
@@ -1885,7 +1881,7 @@ mod tests {
                 0.0,
             ))
             .expect("an idle Oracle admits the held query");
-        let expired_runtime = query_runtime(&expired_resources, &spill);
+        let expired_runtime = expired_resources.execution().clone();
         let never = Arc::clone(&held);
         let expired = lifecycle_over_fold(
             &supervisor,
@@ -1932,7 +1928,7 @@ mod tests {
                 0.0,
             ))
             .expect("an idle Oracle admits the released query");
-        let settled_runtime = query_runtime(&settled_resources, &spill);
+        let settled_runtime = settled_resources.execution().clone();
         let settled = lifecycle_over_fold(
             &supervisor,
             settled_graph,
@@ -1973,7 +1969,7 @@ mod tests {
             "shutdown observes and reports the retained draining graph"
         );
 
-        rewrite_error_retains_its_own_graph(&spill).await;
+        rewrite_error_retains_its_own_graph().await;
     }
 
     /// Two `DataFusion` graphs under one public query never reach each other.
@@ -1994,9 +1990,6 @@ mod tests {
     #[tokio::test]
     async fn analytical_stage_identity_separates_public_and_datafusion_queries() {
         let oracle = oracle_role();
-        let scratch_root = tempfile::tempdir().expect("fixture scratch root");
-        let spill = OracleSpillRuntime::new(scratch_root.path(), 2 * 1024 * 1024 * 1024)
-            .expect("a positive pod ceiling builds the process spill owner");
         let resources = oracle
             .try_acquire_query(OracleResourceRequest::for_class(
                 QueryClass::Analytical,
@@ -2009,8 +2002,8 @@ mod tests {
                 0.0,
             ))
             .expect("an idle Oracle admits a second analytical query");
-        let runtime_a = query_runtime(&resources, &spill);
-        let runtime_b = query_runtime(&resources_b, &spill);
+        let runtime_a = resources.execution().clone();
+        let runtime_b = resources_b.execution().clone();
         let supervisor = Arc::new(AnalyticalSupervisor::new());
 
         let public_query_id = PublicQueryId::from_uuid(uuid::Uuid::now_v7());
@@ -2146,17 +2139,14 @@ mod tests {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         let metrics_guard = metrics::set_default_local_recorder(&recorder);
         let oracle = oracle_role();
-        let scratch_root = tempfile::tempdir().expect("fixture scratch root");
-        let spill = OracleSpillRuntime::new(scratch_root.path(), 2 * 1024 * 1024 * 1024)
-            .expect("a positive pod ceiling builds the process spill owner");
         let resources = oracle
             .try_acquire_query(OracleResourceRequest::for_class(
                 QueryClass::Analytical,
                 0.0,
             ))
             .expect("an idle Oracle admits one analytical query");
-        let pool = resources.memory_pool();
-        let runtime = query_runtime(&resources, &spill);
+        let pool = Arc::clone(resources.execution().memory_pool());
+        let runtime = resources.execution().clone();
         let supervisor = Arc::new(AnalyticalSupervisor::new());
 
         let graph = AnalyticalGraphKey {

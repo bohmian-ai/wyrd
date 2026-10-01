@@ -21,13 +21,23 @@ tenant key in their foreign keys, including cross-schema references.
 
 Postgres row-level security is the authoritative tenant boundary. Runtime
 tenant traffic uses the `wyrd_app` login role without `BYPASSRLS`. Every
-tenant-scoped logical operation acquires one `TenantConn`, which opens a
-transaction and binds the verified `DataTenantId` through transaction-local
-configuration:
+tenant-scoped logical operation acquires one `TenantConn`, which binds the
+verified `DataTenantId` through transaction-local configuration and opens the
+transaction in one round trip:
 
 ```sql
-SELECT set_config('app.current_tenant', $1, true)
+SELECT set_config('app.current_tenant', '<tenant uuid>', true); BEGIN
 ```
+
+The binding precedes `BEGIN` deliberately. Postgres runs the two statements as
+one implicit transaction that `BEGIN` turns explicit, so the binding survives
+into it; if the binding fails, `BEGIN` never runs and Postgres rolls everything
+back, returning the pooled connection idle. `BEGIN` first would leave a failed
+binding inside an aborted transaction that SQLx does not roll back, poisoning
+the next borrower. A simple query takes no parameters, so the tenant is inlined
+from the typed `DataTenantId`, whose UUID rendering cannot contain a quote.
+`TenantConn` is the only code that builds this statement and the only code
+allowed raw transaction control.
 
 RLS policies use the strict `wyrd.current_tenant()` helper and apply both
 `USING` and `WITH CHECK` predicates:
@@ -41,8 +51,9 @@ CREATE POLICY tenant_isolation ON wyrd.example
 ```
 
 A missing tenant binding fails rather than returning an empty cross-tenant
-result. Tenant identity is parameter-bound; callers do not build tenant SQL
-strings or add a second hand-written tenant predicate.
+result. Outside `TenantConn`'s begin statement, tenant identity is
+parameter-bound; callers do not build tenant SQL strings or add a second
+hand-written tenant predicate.
 
 ## Transaction discipline
 
@@ -70,29 +81,31 @@ handoff and idempotent consumer semantics.
 | Role | Lifetime | Capability |
 |---|---|---|
 | `wyrd_app` | Runtime | Tenant-scoped RLS traffic through `TenantConn` |
-| `wyrd_migrator` | Boot migration gate only | Ordered DDL for Wyrd and Vala schemas |
-| `wyrd_platform_admin` | Runtime only where an operator capability requires it | Fenced, audited cross-tenant work through `OperatorPool` |
+| `wyrd_platform_admin` | Runtime | Fenced, audited cross-tenant work through `OperatorPool`; Bifrost Iceberg catalog owner |
+| database owner | `wyrd-server migrate` only | Ordered DDL for Wyrd and Vala schemas; never given to a serving process |
 
-Boot performs these steps in order:
+`wyrd-server migrate` reads the owner DSN from `WYRD_DATABASE_URL`, applies
+`wyrd_sql::migrate` and then `vala_sql::migrate` under the migration advisory
+lock, validates both ledgers and forced RLS, and exits.
 
-1. Resolve role-separated credentials and validate the typed pool
-   configuration.
-2. Build the short-lived migrator pool.
-3. Acquire the deployment migration lease and verify migration checksums.
-4. Apply `wyrd_sql::migrate` and then `vala_sql::migrate`.
-5. Verify required schemas, roles, grants, RLS policies, and sentinels.
-6. Close every migrator connection.
-7. Construct runtime `TenantConn` and approved `OperatorPool` owners and make
+Serving boot performs these steps in order:
+
+1. Resolve `WYRD_DATABASE_URL` (`wyrd_app`) and `WYRD_PLATFORM_DATABASE_URL`
+   (`wyrd_platform_admin`); both are required.
+2. Build the serving pools. No DDL runs.
+3. `WyrdPostgres::validate_schema` and `ValaPostgres::validate_schema` verify
+   login posture, every embedded migration version and checksum, forced RLS on
+   tenant tables, and the catalog privilege boundary.
+4. Construct runtime `TenantConn` and approved `OperatorPool` owners and make
    only those capabilities available to services.
 
-Embedded Postgres is a local development convenience only. The canonical test
-harness uses repository-managed, lane-isolated Postgres databases. A production
-profile without its required external DSN and role credentials fails startup;
-it never falls back to an embedded database.
+There is no embedded Postgres. The canonical test harness uses
+repository-managed, lane-isolated Postgres databases migrated by their owner
+login.
 
 Pool configuration has one canonical typed model. Unsuffixed `WYRD_DB_*`
-settings tune the application pool; `_MIGRATOR` and `_PLATFORM_ADMIN` suffixes
-tune the corresponding role pools. Missing suffixed settings use that role's
+settings tune the application pool; `_MIGRATOR` tunes the one-off migration
+pool and `_PLATFORM_ADMIN` the platform pool. Missing suffixed settings use that role's
 typed defaults and never inherit the application value.
 
 The deployment proves this connection budget against the maximum replica and

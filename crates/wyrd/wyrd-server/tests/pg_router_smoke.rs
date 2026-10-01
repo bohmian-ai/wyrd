@@ -17,23 +17,6 @@ use axum::http::{Request, StatusCode};
 use wyrd_server::components::health::{ProbeOutcome, ProbeReason, ReadinessSnapshot};
 use wyrd_testing::WyrdTestServer;
 
-#[cfg(feature = "test-support")]
-use vala_bifrost_redux::oracle::{
-    codec::{RemoteSourcePlaceholderExec, encode_follower_subtree},
-    dispatcher::{OraclePeerWorker, PEER_PROTOCOL_VERSION},
-    peer::{
-        PeerTicketClaims, PeerTicketMinter, assignment_authority_digest_for, projection_digest,
-    },
-};
-#[cfg(feature = "test-support")]
-use vala_sql::row_types::oracle_reader_authority::{ProtectionMember, TableAuthorityIdentity};
-#[cfg(feature = "test-support")]
-use wyrd_spec::vala::api::{
-    ClusterRole, ExecuteFragmentRequest, FollowerReaderCut, FollowerScanAssignment,
-    IcebergFileDescriptor, OracleRoleFence, PersistedFileAssignment, PersistedFileDescriptor,
-    QueryClass, QueryId, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse, TenantTableBinding,
-};
-
 /// Build an upload-init request body that is well formed enough to pass the
 /// auth layer and reach its handler.
 fn upload_init_body() -> axum::body::Body {
@@ -348,6 +331,7 @@ async fn readyz_returns_ok_when_all_probes_pass() {
         forge_coordinator: None,
         forge_worker: None,
         verification: None,
+        scribe_fault_is_role_local: false,
     }));
 
     let response = server
@@ -519,8 +503,8 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// A composed, API-serving target refuses the production profile while it still
-/// carries the stub policy hook.
+/// A composed, API-serving target validates on the production profile only
+/// while it carries a token verifier.
 ///
 /// `AppState::production_validate` short-circuits for a target that serves no
 /// public API, so the guard can only be observed against a state composed
@@ -529,12 +513,11 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
 ///
 /// # Panics
 ///
-/// Panics when the test server fails to start or shut down, or when the
-/// production profile accepts the state or refuses it for anything other than
-/// the stub policy hook, then the no-op audit writer, then the missing token
-/// verifier, as each guard is cleared in turn.
+/// Panics when the test server fails to start or shut down, when the composed
+/// production state is refused, or when removing its token verifier is not
+/// refused as missing.
 #[tokio::test]
-async fn production_profile_refuses_a_serving_target_with_stub_defaults() {
+async fn production_profile_requires_a_token_verifier_on_a_serving_target() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -542,43 +525,56 @@ async fn production_profile_refuses_a_serving_target_with_stub_defaults() {
         .state()
         .clone()
         .with_deployment_profile(wyrd_server::config::DeploymentProfile::Production);
-
-    let refusal = state
+    state
         .production_validate()
-        .expect_err("a serving production target must refuse its stub defaults");
+        .expect("a composed serving target with a verifier is production-valid");
 
-    assert!(
-        matches!(
-            refusal,
-            wyrd_server::state::ProductionValidationError::StubPolicyHook
-        ),
-        "the stub policy hook is the first production guard to refuse; got {refusal:?}"
-    );
-
-    let without_audit = state.with_authz(wyrd_server::components::auth::ServerAuthz {
-        policy_hook: Arc::new(wyrd_auth_check::RecordingPolicyHook::default()),
-        ..wyrd_server::components::auth::ServerAuthz::default()
-    });
-    assert!(
-        matches!(
-            without_audit.production_validate(),
-            Err(wyrd_server::state::ProductionValidationError::NoopAuditWriter)
-        ),
-        "a real policy hook alone must still be refused for its no-op audit writer"
-    );
-
-    let mut without_verifier = without_audit.clone();
-    without_verifier.authz.audit_writer =
-        Arc::new(wyrd_server::components::auth::audit_writer::RealAuthzAuditWriter);
+    let mut without_verifier = state;
     without_verifier.auth.token_verifier = None;
     assert!(
         matches!(
             without_verifier.production_validate(),
             Err(wyrd_server::state::ProductionValidationError::MissingTokenVerifier)
         ),
-        "a production target without a token verifier must still be refused"
+        "a production target without a token verifier must be refused"
     );
 
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// The removed authorization-check route answers as any unknown route does.
+///
+/// # Panics
+///
+/// Panics when the test server fails to start or shut down, the user cannot be
+/// bootstrapped, or an authenticated request to the route is answered with
+/// anything other than `404`.
+#[tokio::test]
+async fn authz_check_route_is_not_served() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+
+    let user = server
+        .bootstrap_user("authz-route-absent", &["admin"])
+        .await
+        .expect("user bootstraps");
+
+    let response = server
+        .oneshot_authenticated(
+            user.jwt()
+                .expect("bootstrapped user carries a minted token"),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/authz/check")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     server.shutdown().await.expect("server shuts down");
 }
 
@@ -586,25 +582,18 @@ async fn production_profile_refuses_a_serving_target_with_stub_defaults() {
 /// with no preview setting anywhere in its configuration.
 ///
 /// The harness composes the same signing key, concrete verifier, and
-/// `TenantTokenIssuer` a production boot does; the test installs a non-stub
-/// policy hook and the canonical audit writer, proves that exact state passes
-/// `production_validate` under the production profile, and then exchanges a
-/// subject and actor token through the real `/auth/token` route. Nothing gates
-/// the grant beyond its verifier, invoke policy, and audit.
+/// `TenantTokenIssuer` a production boot does; the test proves that exact
+/// state passes `production_validate` under the production profile, and then
+/// exchanges a subject and actor token through the real `/auth/token` route.
+/// Nothing gates the grant beyond its verifier, permissions, and audit.
 ///
 /// # Panics
 ///
 /// Panics when the production-profile state is refused, a fixture cannot be
-/// bootstrapped, or the exchange does not issue a token after asking the
-/// invoke policy.
+/// bootstrapped, or the exchange does not issue a token.
 #[tokio::test]
 async fn production_valid_target_serves_token_exchange_without_preview() {
-    let policy = Arc::new(wyrd_auth_check::RecordingPolicyHook::default());
     let server = WyrdTestServer::builder()
-        .with_policy_hook(policy.clone())
-        .with_audit_writer(Arc::new(
-            wyrd_server::components::auth::audit_writer::RealAuthzAuditWriter,
-        ))
         .start_in_process()
         .await
         .expect("test server starts");
@@ -613,7 +602,7 @@ async fn production_valid_target_serves_token_exchange_without_preview() {
         .clone()
         .with_deployment_profile(wyrd_server::config::DeploymentProfile::Production)
         .production_validate()
-        .expect("real verifier, policy, audit, and signing key are production-valid");
+        .expect("real verifier, audit, and signing key are production-valid");
 
     let subject = server
         .bootstrap_service("production-subject", &["writer"])
@@ -640,11 +629,6 @@ async fn production_valid_target_serves_token_exchange_without_preview() {
         )
         .await
         .expect("a production-valid target serves standard token exchange");
-    assert_eq!(
-        policy.calls().len(),
-        1,
-        "the exchange asked the invoke policy exactly once"
-    );
 
     server.shutdown().await.expect("server shuts down");
 }
@@ -1482,79 +1466,6 @@ async fn forge_begin_shutdown_closes_readiness_before_cancellation() {
     assert!(
         !coordinator_ready.is_ready() && !worker_ready.is_ready(),
         "a closed role never republishes readiness while its loop drains"
-    );
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// A worker whose staging backend cannot resume a listing never starts.
-///
-/// Orphan collection's only anti-starvation mechanism is an exclusive
-/// `start_after` cursor, so a backend that cannot resume natively cannot keep
-/// the guarantee this worker's cleanup authority depends on. The refusal
-/// therefore lands before registration, recovery, readiness,
-/// or any claim — not at the first orphan listing, after the worker has already
-/// advertised itself and taken destructive work. The filesystem service is the
-/// already-installed backend that advertises the capability as absent, which is
-/// exactly the case this gate exists for.
-///
-/// # Panics
-///
-/// Panics when the server cannot start, when the incapable worker starts
-/// anyway, when it registers itself, or when it publishes ready.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn forge_worker_refuses_staging_without_native_cursor_listing() {
-    let root = tempfile::tempdir().expect("staging root");
-    let storage = wyrd_storage::StorageHandle::from_settings(wyrd_storage::StorageSettings {
-        backend: wyrd_storage::BackendConfig::Local {
-            root: root.path().to_path_buf(),
-        },
-        require_encryption: false,
-        presign_ttl: std::time::Duration::from_secs(600),
-        part_size_bytes: 16 * 1024 * 1024,
-        multipart_threshold_bytes: 100 * 1024 * 1024,
-        public_base_url: Some("https://wyrd.test".to_owned()),
-    })
-    .await
-    .expect("plain filesystem storage builds");
-    let server = WyrdTestServer::builder()
-        .with_storage_handle(storage)
-        .start_in_process()
-        .await
-        .expect("test server starts");
-    assert!(
-        !server
-            .state()
-            .storage
-            .operator()
-            .info()
-            .full_capability()
-            .list_with_start_after,
-        "the plain filesystem backend is the incapable staging this gate refuses"
-    );
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .worker_readiness();
-
-    let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
-        .expect("the worker composes");
-    let error = worker
-        .await
-        .expect_err("an incapable staging backend refuses to start a worker");
-    assert!(
-        matches!(
-            error,
-            vala_bifrost_redux::forge::ForgeError::InvalidConfig { ref detail }
-                if detail.contains("list_with_start_after")
-        ),
-        "the refusal names the missing native cursor capability, got {error:?}"
-    );
-    assert!(
-        !readiness.is_ready(),
-        "a refused worker never publishes ready"
     );
     server.shutdown().await.expect("test server shuts down");
 }
@@ -3152,364 +3063,6 @@ async fn release_failure_clears_readiness() {
     await_forge_role_while_running(&server, "worker after its release recovers").await;
     server.shutdown().await.expect("test server shuts down");
 }
-/// Reserves and signs a snapshot-bearing fragment for the retained production peer.
-///
-/// The registered table is real; the single-snapshot cut exercises authority
-/// admission and intentionally stops at catalog resolution of an absent snapshot.
-/// No physical object is needed to prove the protection-before-resolution boundary.
-///
-/// # Panics
-/// Panics if registration, reservation, encoding, or signing fails.
-#[cfg(feature = "test-support")]
-async fn oracle_authority_request(
-    server: &WyrdTestServer,
-    worker: &OraclePeerWorker,
-) -> ExecuteFragmentRequest {
-    register_forge_table(server, "authority_order").await;
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
-    let uid: Vec<u8> = sqlx::query_scalar(
-        "SELECT table_uid FROM vala.bifrost_tables WHERE data_tenant_id=$1 AND fqn='vala.bifrost.authority_order'",
-    ).bind(uuid::Uuid::from(server.data_tenant_id())).fetch_one(&pool).await.expect("registered table identity");
-    let identity = TableAuthorityIdentity {
-        tenant: server.data_tenant_id(),
-        table_uid: uid.try_into().expect("table UUID bytes"),
-        catalog_name: "wyrd-redux".to_owned(),
-        namespace_name: "vala.bifrost".to_owned(),
-        table_name: "authority_order".to_owned(),
-    };
-    let member = ProtectionMember::new(&identity, vec![4242], 1000, 1000).expect("valid ancestry");
-    let oracle = server.state().bifrost_query().expect("Oracle role");
-    let fence =
-        u64::try_from(oracle.engine().reader_authority().fencing_token()).expect("positive fence");
-    let node = server.node_id();
-    let query = QueryId::new(uuid::Uuid::now_v7());
-    let expires = chrono::Utc::now() + chrono::Duration::seconds(15);
-    let ReserveNodeSlotsResponse::Pending(pending) = worker
-        .reserve(&ReserveNodeSlotsRequest {
-            query_id: query,
-            leader_node_id: node,
-            leader_fencing_token: fence,
-            query_class: QueryClass::Interactive,
-            slot_units: 1,
-            expires_at: expires,
-            // A fragment reservation, which charges a worker quantum rather
-            // than a whole graph envelope.
-            graph: None,
-        })
-        .await
-    else {
-        panic!("Oracle reservation refused")
-    };
-    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-        arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
-        arrow::datatypes::Field::new("data_tenant_id", arrow::datatypes::DataType::Utf8, false),
-    ]));
-    let fingerprint = vala_bifrost_redux::oracle::assignment_schema_fingerprint(&schema);
-    let (physical_plan_bytes, plan_fingerprint) = encode_follower_subtree(Arc::new(
-        RemoteSourcePlaceholderExec::new("authority-scan", &fingerprint, schema),
-    ))
-    .expect("physical placeholder encodes");
-    let assignments = vec![FollowerScanAssignment {
-        scan_id: "authority-scan".to_owned(),
-        binding: TenantTableBinding {
-            tenant_id: identity.tenant,
-            namespace: identity.namespace_name,
-            table: identity.table_name,
-        },
-        persisted: PersistedFileAssignment {
-            files: vec![PersistedFileDescriptor::Iceberg(IcebergFileDescriptor {
-                path: "authority-input.parquet".to_owned(),
-                size_bytes: 1,
-                row_count: 1,
-                snapshot_id: 4242,
-                min_event_time_micros: None,
-                max_event_time_micros: None,
-            })],
-        },
-        scribe_provider_cut: None,
-        schema_fingerprint: fingerprint,
-        required_columns: vec!["value".to_owned(), "data_tenant_id".to_owned()],
-        predicates: vec![],
-        reader_cut: FollowerReaderCut {
-            table_uid: uuid::Uuid::from_bytes(identity.table_uid),
-            snapshot_id: 4242,
-            snapshot_timestamp_ms: 1000,
-            retained_head_snapshot_id: 4242,
-            ancestry_path: vec![4242],
-            ancestry_digest_version: 1,
-            ancestry_digest_hex: hex::encode(member.ancestry_digest),
-            target_epoch_fence: fence,
-        },
-    }];
-    // Signed by this server's own peer authority, which is the only signer its
-    // verifier publishes a key for: the harness generates a fresh peer keyring
-    // per topology, so a ticket minted from any other key material is refused
-    // as an unknown key before the authority gate this journey observes.
-    let ticket = oracle
-        .peer()
-        .authority()
-        .mint_peer_ticket(&PeerTicketClaims {
-            protocol_version: PEER_PROTOCOL_VERSION,
-            audience: node.as_uuid().as_bytes().to_vec(),
-            worker_fence: fence,
-            leader_node_id: node.as_uuid().as_bytes().to_vec(),
-            leader_fence: fence,
-            query_id: query.as_uuid().as_bytes().to_vec(),
-            tenant_id: identity.tenant.as_uuid().as_bytes().to_vec(),
-            expires_at_ms: expires.timestamp_millis(),
-            execution_deadline_unix_ms: expires.timestamp_millis(),
-            binding: "vala.bifrost.authority_order".to_owned(),
-            fragment_digest: plan_fingerprint.clone(),
-            manifest_digest: plan_fingerprint.clone(),
-            projection_digest: projection_digest(&["value".to_owned()]),
-            permission_digest: "authority-test".to_owned(),
-            assignment_authority_digest: assignment_authority_digest_for(&assignments)
-                .expect("assignment digest"),
-        })
-        .expect("production ticket signs");
-    let role = OracleRoleFence {
-        node_id: node,
-        role: ClusterRole::Oracle,
-        fencing_token: fence,
-    };
-    ExecuteFragmentRequest {
-        ticket,
-        physical_plan_bytes,
-        reservation_id: pending.reservation_id,
-        leader_fence: role.clone(),
-        target_fence: role,
-        assignments,
-        plan_fingerprint,
-    }
-}
-
-/// Boot installs the engine's exact epoch; committed protection precedes resolution.
-///
-/// Reader protection is an engine-internal transition, so the protection row is
-/// its own durable authority. Existing Postgres lock gates stop that commit and
-/// the catalog read independently. The worker is aborted before any diagnostic
-/// timeout panics.
-///
-/// # Panics
-/// Panics if source resolution starts before durable protection commits.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn oracle_authority_is_installed_before_source_io() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("server starts");
-    let oracle = server.state().bifrost_query().expect("Oracle role");
-    let worker = oracle.peer().worker();
-    let installed = worker
-        .authority_inspection_for_test()
-        .0
-        .expect("boot installed authority");
-    assert!(Arc::ptr_eq(&installed, oracle.engine().reader_authority()));
-    assert_eq!(installed.node_id(), uuid::Uuid::from(server.node_id()));
-    let request = oracle_authority_request(&server, &worker).await;
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
-    let mut protection_gate = pool.begin().await.expect("protection gate");
-    sqlx::query("LOCK TABLE vala.oracle_table_protections IN EXCLUSIVE MODE")
-        .execute(&mut *protection_gate)
-        .await
-        .expect("hold protection commit");
-    let mut source_gate = pool.begin().await.expect("source gate");
-    sqlx::query("LOCK TABLE iceberg_catalog.iceberg_tables IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *source_gate)
-        .await
-        .expect("hold resolver catalog IO");
-    let executing = Arc::clone(&worker);
-    let mut handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-        executing.execute(request).await
-    }));
-    let mut blocked: i64 = 0;
-    let reached = tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        loop {
-            blocked = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE relation='vala.oracle_table_protections'::regclass AND NOT granted")
-                .fetch_one(&mut *source_gate).await.expect("protection waiters");
-            if blocked > 0 || handle.is_finished() { break; }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    }).await;
-    if reached.is_err() || handle.is_finished() {
-        handle.abort();
-        panic!(
-            "protection did not reach its commit: ready={}, inspection={:?}, waiters={blocked}",
-            oracle.engine().is_ready(),
-            worker.authority_inspection_for_test()
-        );
-    }
-    assert_eq!(
-        worker.authority_inspection_for_test().2,
-        0,
-        "protection must commit before resolver entry"
-    );
-    let uncommitted: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM vala.oracle_table_protections WHERE node_id=$1")
-            .bind(installed.node_id())
-            .fetch_one(&mut *source_gate)
-            .await
-            .expect("protection visibility");
-    assert_eq!(uncommitted, 0, "protection is not visible while it is held");
-    protection_gate
-        .rollback()
-        .await
-        .expect("release protection gate");
-    let reached = tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        while worker.authority_inspection_for_test().2 == 0 && !handle.is_finished() {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await;
-    if reached.is_err() || handle.is_finished() {
-        handle.abort();
-        panic!(
-            "resolver never entered: ready={}, inspection={:?}",
-            oracle.engine().is_ready(),
-            worker.authority_inspection_for_test()
-        );
-    }
-    let committed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.oracle_table_protections WHERE node_id=$1 AND fencing_token=$2",
-    )
-    .bind(installed.node_id())
-    .bind(installed.fencing_token())
-    .fetch_one(&mut *source_gate)
-    .await
-    .expect("independently committed protection");
-    assert_eq!(committed, 1);
-    eprintln!(
-        "Oracle authority: node={}, fence={}; before protection commit: resolver=0, protection=0; resolver entry: protection={committed}",
-        installed.node_id(),
-        installed.fencing_token()
-    );
-    source_gate.rollback().await.expect("release source gate");
-    let outcome = tokio::time::timeout(FORGE_READINESS_CEILING, &mut handle).await;
-    if outcome.is_err() {
-        handle.abort();
-        panic!(
-            "Oracle resolution did not return: inspection={:?}",
-            worker.authority_inspection_for_test()
-        );
-    }
-    assert!(
-        outcome
-            .expect("bounded completion")
-            .expect("worker joins")
-            .is_err(),
-        "absent snapshot stops resolution"
-    );
-    server.shutdown().await.expect("server shuts down");
-}
-
-/// An uninstalled production peer refuses a valid snapshot assignment before resolution.
-///
-/// # Panics
-/// Panics if refusal bypasses preflight, enters the resolver, or admits source IO.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn oracle_missing_authority_refuses_before_source_io() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("server starts");
-    let worker = server
-        .state()
-        .bifrost_query()
-        .expect("Oracle role")
-        .peer()
-        .worker()
-        .without_reader_authority_for_test();
-    let request = oracle_authority_request(&server, &worker).await;
-    assert!(worker.authority_inspection_for_test().0.is_none());
-    let outcome = tokio::time::timeout(FORGE_READINESS_CEILING, worker.execute(request)).await;
-    if outcome.is_err() {
-        server.state().shutdown_token.cancel();
-        panic!(
-            "missing-authority refusal timed out; inspection={:?}",
-            worker.authority_inspection_for_test()
-        );
-    }
-    assert!(matches!(
-        outcome.expect("bounded refusal"),
-        Err(vala_bifrost_redux::oracle::dispatcher::DispatchError::Terminal)
-    ));
-    let (_, preflight, resolver) = worker.authority_inspection_for_test();
-    assert_eq!(
-        (preflight, resolver),
-        (1, 0),
-        "valid request reaches the authority gate and no source resolver"
-    );
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
-    let protections: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM vala.oracle_table_protections WHERE node_id=$1")
-            .bind(uuid::Uuid::from(server.node_id()))
-            .fetch_one(&pool)
-            .await
-            .expect("protection rows");
-    assert_eq!(protections, 0);
-    assert_eq!(worker.physical_inspection().oracle_executions, 0);
-    eprintln!(
-        "missing authority: preflight={preflight}, resolver={resolver}, protections={protections}, executions=0; typed Terminal refusal"
-    );
-    server.shutdown().await.expect("server shuts down");
-}
-
-/// Single assignment rejects a different live epoch and preserves boot's exact authority.
-///
-/// # Panics
-/// Panics if installation replaces the authority or returns an untyped/different error.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn oracle_authority_installation_rejects_replacement() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("server starts");
-    let replacement = WyrdTestServer::start_in_process()
-        .await
-        .expect("replacement server starts");
-    let oracle = server.state().bifrost_query().expect("Oracle role");
-    let worker = oracle.peer().worker();
-    let original = Arc::clone(oracle.engine().reader_authority());
-    let other = Arc::clone(
-        replacement
-            .state()
-            .bifrost_query()
-            .expect("replacement Oracle role")
-            .engine()
-            .reader_authority(),
-    );
-    assert_ne!(original.node_id(), other.node_id());
-    assert!(matches!(worker.install_reader_authority(other),
-        Err(vala_bifrost_redux::oracle::follower::PhysicalPlanFollowerError::AuthorityAlreadyInstalled)));
-    let (installed, preflight, resolver) = worker.authority_inspection_for_test();
-    assert!(Arc::ptr_eq(
-        &installed.expect("original stays installed"),
-        &original
-    ));
-    assert_eq!((preflight, resolver), (0, 0));
-    eprintln!(
-        "replacement refused: AuthorityAlreadyInstalled; original node={}, fence={} unchanged; preflight/resolver=0/0",
-        original.node_id(),
-        original.fencing_token()
-    );
-    replacement
-        .shutdown()
-        .await
-        .expect("replacement shuts down");
-    server.shutdown().await.expect("server shuts down");
-}
 
 /// Preseeded demand cannot authorize readiness when the independent roster read
 /// is unavailable. Restoring discovery permits a fresh complete cycle.
@@ -3583,50 +3136,31 @@ async fn coordinator_preseeded_demand_requires_roster_discovery() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// A real boot reserves a usable compaction budget only for a Forge process.
+/// A real boot composes Forge only for a Forge process.
 ///
-/// The budget is decided during composition, against the same Postgres-backed
-/// graph the worker later admits plans on, so the only place it can be observed
-/// as the worker sees it is a booted server. Two facts are asserted there: a
-/// Forge process reserves a positive budget that leaves both protected floors
-/// intact, and a process without the Forge role composes no Forge at all — so
-/// there is no admitting worker charging memory it never reserved.
+/// Composition runs against the same Postgres-backed graph the worker later
+/// admits plans on, so a booted server is where it is observed: the default
+/// target composes a Forge coordinator, and a process without the Forge role
+/// composes no Forge at all.
 ///
 /// # Panics
 ///
-/// Panics when either server fails to boot, when the composed budget is zero or
-/// exceeds what the floors leave, or when a Forge-absent target still composes
-/// a Forge.
+/// Panics when either server fails to boot, when the default target composes
+/// no Forge, or when a Forge-absent target still composes one.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn forge_budget_and_runtime_compose_with_postgres() {
+async fn forge_runtime_composes_only_for_forge_targets() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
-    let plan = server
-        .state()
-        .forge()
-        .and_then(|forge| forge.coordinator())
-        .expect("the default target selects Forge")
-        .resource_plan_for_test();
-
     assert!(
-        plan.forge_compaction_memory_limit_bytes > 0,
-        "a booted Forge process must reserve memory it can admit plans against"
+        server
+            .state()
+            .forge()
+            .and_then(|forge| forge.coordinator())
+            .is_some(),
+        "the default target selects Forge"
     );
-    let safe = plan.managed_memory_bytes - plan.scribe_floor_bytes - plan.oracle_floor_bytes;
-    assert!(
-        plan.forge_compaction_memory_limit_bytes <= safe,
-        "the reserved budget must leave both co-located floors intact"
-    );
-    vala_bifrost_redux::forge::ForgeWorkerConfig {
-        per_tenant_active_cap: 1,
-        compaction_memory_budget_bytes: plan.forge_compaction_memory_limit_bytes,
-        max_task_parallelism: 3,
-        pending_task_parallelism: 12,
-    }
-    .validate()
-    .expect("the composed budget yields usable admission bounds");
 
     server.shutdown().await.expect("server shuts down");
 

@@ -7,7 +7,7 @@ use arrow::datatypes::{Field, Schema};
 use iceberg::io::object_cache::ObjectCache;
 use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::{FormatVersion, TableMetadata, TableProperties, Transform};
-use iceberg::{Catalog as _, TableCreation};
+use iceberg::{Catalog as _, Error as IcebergError, TableCreation};
 use iceberg_catalog_sql::SqlCatalog;
 use sha2::{Digest as _, Sha256};
 use vala_sql::queries::file_list::HotFileCatalog;
@@ -32,10 +32,10 @@ use crate::catalog::wire::{
 };
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
-use crate::provider::ReduxTableProvider;
 use crate::schema::{SchemaFingerprint, with_managed_columns};
 use crate::storage::BifrostStorage;
 use crate::tables::{BuiltinTableDefinition, builtin_table};
+use iceberg_datafusion::IcebergStaticTableProvider;
 
 /// Hashes an ordered metadata identity projection for immutable cut auditing.
 fn digest_strings(values: impl IntoIterator<Item = String>) -> String {
@@ -120,8 +120,6 @@ pub struct PinnedSealedTable {
     pub iceberg_files: Vec<PinnedIcebergFile>,
     /// Ordered tenant hot rows absent from the exact pinned snapshot manifest.
     pub hot_files: Vec<vala_sql::row_types::file_list::HotFileRow>,
-    /// Complete validated sealed manifest retained for live-tail watermarks.
-    pub sealed_manifest: Vec<vala_sql::row_types::file_list::HotFileRow>,
     /// Stable digest of the ordered, post-subtraction hot manifest.
     pub hot_manifest_digest: String,
     /// Bounded sealed-byte estimate used by Oracle classification.
@@ -159,7 +157,7 @@ impl PinnedIcebergFile {
     ///
     /// Decoding never fails the pin. Every defect normalizes into
     /// [`EventTimeStatistics::Unusable`] so the file is retained and executed
-    /// through the residual predicate and tenant tripwire.
+    /// through the residual predicate and footer tenant proof.
     #[must_use]
     fn from_manifest_entry(
         file_path: String,
@@ -309,6 +307,14 @@ pub struct BifrostCatalog {
     /// each immutable manifest once per node instead of once per consumer per
     /// query. Seeded lazily because iceberg only builds a cache with a table.
     manifest_cache: Arc<std::sync::OnceLock<Arc<ObjectCache>>>,
+    /// Registered UIDs this node has already read, by tenant and table name.
+    ///
+    /// A registration row is immutable once written: its UID is minted once,
+    /// `(tenant, fqn)` is unique, and no production path updates or deletes
+    /// it. Only found rows are cached, so a table registered later is still
+    /// seen on its first lookup. Grows with registered tables, never with
+    /// queries.
+    table_uids: Arc<std::sync::RwLock<HashMap<(DataTenantId, String), TableUid>>>,
 }
 
 /// Estimated-weight eviction limit of the node-wide decoded manifest cache.
@@ -403,7 +409,9 @@ impl BifrostCatalog {
     /// Resolves only the identity of the cut a reader is about to protect.
     ///
     /// This is deliberately the whole of what may happen before protection: a
-    /// registration lookup, one authoritative metadata-pointer read, one read of
+    /// registration lookup (served from [`BifrostCatalog::table_uid`]'s cache
+    /// after the node's first write or query of the table), one authoritative
+    /// metadata-pointer read, one read of
     /// the immutable metadata document it names, and the facts derived from
     /// that document. Reading that document is the allowed
     /// identity step because there is no other way to name the snapshot that
@@ -424,14 +432,10 @@ impl BifrostCatalog {
     ) -> Result<PreparedReaderIdentity, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
         TEST_PREPARED_IDENTITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let fqn = table.fqn();
         let started = std::time::Instant::now();
-        let row = self.lookup_table_row(&fqn, tenant).await;
+        let table_uid = self.table_uid(table, tenant).await;
         crate::oracle::QueryPhase::TableLookup.record(started);
-        let Some(row) = row? else {
-            return Err(BifrostCatalogError::TableNotFound(fqn));
-        };
-        let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
+        let table_uid = table_uid?;
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let identifier = binding.table_ident();
@@ -582,8 +586,7 @@ impl BifrostCatalog {
             return Err(BifrostCatalogError::AmbiguousPublication);
         }
         let hot_files = cut.hot_files;
-        let sealed_manifest = cut.sealed_manifest;
-        for row in &sealed_manifest {
+        for row in &hot_files {
             let valid_identity = row.data_tenant_id == tenant.as_uuid()
                 && row.namespace == binding.logical_namespace
                 && row.table_name == binding.table_name
@@ -599,13 +602,12 @@ impl BifrostCatalog {
                 ));
             }
         }
-        let hot_file_count = sealed_manifest.len();
         metrics::counter!(
             "bifrost_oracle_files_pruned_total",
             "source" => "hot_sealed",
             "reason" => "snapshot_overlap"
         )
-        .increment(hot_file_count.saturating_sub(hot_files.len()) as u64);
+        .increment(cut.represented as u64);
         for row in &hot_files {
             estimated_bytes = estimated_bytes
                 .checked_add(u64::try_from(row.file_size).map_err(|_| {
@@ -640,7 +642,6 @@ impl BifrostCatalog {
             iceberg_file_paths,
             iceberg_files: iceberg_files.into_values().collect(),
             hot_files,
-            sealed_manifest,
             hot_manifest_digest,
             estimated_bytes,
         })
@@ -938,6 +939,7 @@ impl BifrostCatalog {
             storage,
             storage_properties,
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
+            table_uids: Arc::default(),
         })
     }
 
@@ -1371,24 +1373,44 @@ impl BifrostCatalog {
 
     /// Return the registered UID of one tenant/logical table.
     ///
-    /// This is a single control-row lookup: nothing is provisioned and no
-    /// Iceberg metadata is loaded, so Gate can name a write destination's
-    /// object scope cheaply on every frame.
+    /// Answers from the node's registration cache when this table was found
+    /// before, and otherwise from one control-row lookup whose result it then
+    /// caches. Nothing is provisioned and no Iceberg metadata is loaded, so
+    /// Gate can name a write destination's object scope on every frame and
+    /// Oracle can resolve every query's tables without a Postgres round trip.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant does not
     /// own the registration, or a metadata or SQL error otherwise.
+    ///
+    /// # Panics
+    /// Panics only if a thread panicked while holding the cache lock.
     pub async fn table_uid(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
     ) -> Result<TableUid, BifrostCatalogError> {
-        let fqn = table.fqn();
+        let key = (tenant, table.fqn());
+        let cached = self
+            .table_uids
+            .read()
+            .expect("the registration cache lock is never poisoned")
+            .get(&key)
+            .copied();
+        if let Some(table_uid) = cached {
+            return Ok(table_uid);
+        }
+        let fqn = &key.1;
         let row = self
-            .lookup_table_row(&fqn, tenant)
+            .lookup_table_row(fqn, tenant)
             .await?
             .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
-        TableUid::from_row(&row.table_uid, &fqn)
+        let table_uid = TableUid::from_row(&row.table_uid, fqn)?;
+        self.table_uids
+            .write()
+            .expect("the registration cache lock is never poisoned")
+            .insert(key, table_uid);
+        Ok(table_uid)
     }
 
     /// Return the registered user-schema fingerprint for one tenant/logical table.
@@ -1440,9 +1462,9 @@ impl BifrostCatalog {
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
-        let provider = ReduxTableProvider::try_new(iceberg_table, tenant)
+        let provider = IcebergStaticTableProvider::try_new_from_table(iceberg_table)
             .await
-            .map_err(BifrostCatalogError::DataFusion)?;
+            .map_err(provider_error)?;
         Ok(datafusion::datasource::TableProvider::schema(&provider))
     }
 
@@ -1526,8 +1548,8 @@ impl BifrostCatalog {
     /// Build an execution provider for one authenticated tenant's table.
     ///
     /// The control-plane lookup and physical Iceberg binding both use the
-    /// authenticated tenant. The returned provider adds an execution-time
-    /// tenant predicate as a second fail-closed boundary.
+    /// authenticated tenant. Its data-file footers are tenant-proved by the
+    /// Oracle scan that reads them, never by a row predicate.
     /// # Errors
     /// Returns [`BifrostCatalogError::TableNotFound`] when the control-plane row
     /// is absent for this tenant, [`BifrostCatalogError::InvalidBinding`] when
@@ -1540,7 +1562,7 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
         permit: &crate::oracle::reader_pins::ReaderIoPermit,
-    ) -> Result<ReduxTableProvider, BifrostCatalogError> {
+    ) -> Result<IcebergStaticTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));
@@ -1555,9 +1577,9 @@ impl BifrostCatalog {
             loaded.metadata_location().map(ToOwned::to_owned),
             permit,
         )?;
-        ReduxTableProvider::try_new(iceberg_table, tenant)
+        IcebergStaticTableProvider::try_new_from_table(iceberg_table)
             .await
-            .map_err(BifrostCatalogError::DataFusion)
+            .map_err(provider_error)
     }
 
     /// Resolves one registered tenant table pinned to an exact published
@@ -1580,7 +1602,7 @@ impl BifrostCatalog {
         tenant: DataTenantId,
         snapshot_id: i64,
         permit: &crate::oracle::reader_pins::ReaderIoPermit,
-    ) -> Result<ReduxTableProvider, BifrostCatalogError> {
+    ) -> Result<IcebergStaticTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));
@@ -1595,9 +1617,9 @@ impl BifrostCatalog {
             loaded.metadata_location().map(ToOwned::to_owned),
             permit,
         )?;
-        ReduxTableProvider::try_new_pinned(iceberg_table, tenant, snapshot_id)
+        IcebergStaticTableProvider::try_new_from_table_snapshot(iceberg_table, snapshot_id)
             .await
-            .map_err(BifrostCatalogError::DataFusion)
+            .map_err(provider_error)
     }
 
     async fn ensure_namespace(
@@ -1796,12 +1818,19 @@ fn assert_compaction_target(
     }
 }
 
+/// Maps an Iceberg scan-provider construction failure into the catalog error
+/// its callers document.
+fn provider_error(error: IcebergError) -> BifrostCatalogError {
+    BifrostCatalogError::DataFusion(datafusion::error::DataFusionError::External(Box::new(
+        error,
+    )))
+}
+
 #[cfg(test)]
 mod schema_shape_tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use wyrd_spec::DataTenantId;
 
-    use super::{BifrostCatalog, ReduxTableProvider, TableRef, schema_shape_matches};
+    use super::schema_shape_matches;
 
     /// UTC and Iceberg's equivalent offset spelling have the same physical shape.
     #[test]
@@ -1856,38 +1885,6 @@ mod schema_shape_tests {
 
         assert!(!schema_shape_matches(&declared, &reordered));
         assert!(!schema_shape_matches(&reordered, &declared));
-    }
-
-    /// Table providers are constructed directly from one pinned Iceberg table
-    /// and its authenticated tenant, with no hot-batch source to union in.
-    ///
-    /// Both constructors are checked as values against an exact argument shape,
-    /// so reintroducing a hot-batch parameter, or restoring a wrapper that
-    /// forwards an empty batch vector, fails to compile here rather than
-    /// silently returning a union plan at execution time.
-    #[test]
-    fn table_providers_are_constructed_from_one_tenant_qualified_table() {
-        /// Accepts only a constructor taking exactly a table and its tenant.
-        fn accepts_direct_provider_constructor<T, F>(_constructor: F)
-        where
-            F: Fn(iceberg::table::Table, DataTenantId) -> T,
-        {
-        }
-
-        /// Accepts only a catalog lookup taking exactly a table reference and tenant.
-        fn accepts_direct_catalog_provider<T, F>(_provider: F)
-        where
-            F: Fn(
-                &'static BifrostCatalog,
-                &'static TableRef,
-                DataTenantId,
-                &'static crate::oracle::reader_pins::ReaderIoPermit,
-            ) -> T,
-        {
-        }
-
-        accepts_direct_provider_constructor(ReduxTableProvider::try_new);
-        accepts_direct_catalog_provider(BifrostCatalog::provider);
     }
 }
 
@@ -2296,6 +2293,62 @@ mod production_pin_tests {
                 denied.to_string().contains("permission denied"),
                 "the request role is refused by privilege, not by absence: {denied}"
             );
+        });
+    }
+
+    /// The registration cache keeps found UIDs and never remembers a miss.
+    ///
+    /// A table looked up before it exists must still be found on the first
+    /// lookup after it registers, and every later lookup must return the UID
+    /// registration minted.
+    ///
+    /// # Panics
+    /// Panics when the fixture or registration fails, when the unregistered
+    /// lookup succeeds, or when a later lookup misses or returns another UID.
+    #[test]
+    fn registration_cache_keeps_found_uids_only() {
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                local_storage_owner(warehouse.path()),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+            let tenant = fixture.data_tenant_id();
+            let table = TableRef::new(BifrostNamespace::Datasets, "registered_later");
+            assert!(matches!(
+                catalog.table_uid(&table, tenant).await,
+                Err(crate::catalog::BifrostCatalogError::TableNotFound(_))
+            ));
+            let registered = catalog
+                .register_dataset(
+                    tenant,
+                    table.clone(),
+                    vec![arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )],
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("dataset registers");
+            for _ in 0..2 {
+                assert_eq!(
+                    catalog
+                        .table_uid(&table, tenant)
+                        .await
+                        .expect("the registered table resolves"),
+                    registered
+                );
+            }
         });
     }
 

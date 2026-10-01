@@ -58,6 +58,46 @@ pub struct RunRow {
     pub error_code: Option<String>,
 }
 
+/// One observation-created run, named by its Verifier for journey assertions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservationRun {
+    /// The run.
+    pub run: VerificationRunId,
+    /// Name of the Verifier Card the run executes.
+    pub verifier: String,
+    /// The frozen `record_id` of the observation that created the run.
+    pub record_id: String,
+    /// The frozen server-managed `wyrd_event_time` of that observation.
+    pub event_time: chrono::DateTime<chrono::Utc>,
+    /// The run's durable control-plane state.
+    pub state: RunRow,
+    /// Operator dispatches the run created.
+    pub dispatches: i64,
+}
+
+/// The stored columns [`VerificationFixture::observation_runs`] selects.
+#[derive(sqlx::FromRow)]
+struct ObservationRunRow {
+    /// The run ID.
+    run_id: Uuid,
+    /// The Verifier Card name.
+    verifier: String,
+    /// The frozen observation record ID.
+    record_id: String,
+    /// The frozen observation event time.
+    event_time: chrono::DateTime<chrono::Utc>,
+    /// Stored status.
+    status: String,
+    /// Attempts charged.
+    attempts: i32,
+    /// Completed result.
+    result_id: Option<Uuid>,
+    /// Stored error code.
+    error_code: Option<String>,
+    /// Operator dispatches of the run.
+    dispatches: i64,
+}
+
 /// Seeds and reads verification state in one tenant.
 #[derive(Clone)]
 pub struct VerificationFixture {
@@ -288,6 +328,32 @@ impl VerificationFixture {
         Ok(())
     }
 
+    /// Bring a still-`retrying` run's retry deadline to database statement
+    /// time, leaving a run in any other status untouched.
+    ///
+    /// The status guard sits in the same `UPDATE`, so a poller acting on a
+    /// stale snapshot cannot expire the fresh lease of a run a live runtime
+    /// has just reclaimed; [`Self::expire_deadlines`] is for tests whose
+    /// subject is the lease itself.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when the update fails.
+    pub async fn make_retry_due(
+        &self,
+        run: VerificationRunId,
+    ) -> Result<(), VerificationFixtureError> {
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        sqlx::query(
+            "UPDATE wyrd.verifier_runs SET next_attempt_at = statement_timestamp() \
+              WHERE run_id = $1 AND status = 'retrying'",
+        )
+        .bind(run.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await?;
+        conn.commit().await?;
+        Ok(())
+    }
+
     /// Bring one armed schedule cursor to database statement time.
     ///
     /// Dueness is PostgreSQL's decision, so a scheduling test places the
@@ -415,6 +481,44 @@ impl VerificationFixture {
             .map(|id| {
                 VerificationRunId::new(id)
                     .map_err(|error| VerificationFixtureError::Card(error.to_string()))
+            })
+            .collect()
+    }
+
+    /// Every observation-created run of this tenant with its Verifier name,
+    /// frozen input, state, and dispatch count, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when the runs cannot be read.
+    pub async fn observation_runs(&self) -> Result<Vec<ObservationRun>, VerificationFixtureError> {
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let rows: Vec<ObservationRunRow> = sqlx::query_as(
+            "SELECT r.run_id, c.name AS verifier, r.input_record_id AS record_id, \
+                    r.input_event_time AS event_time, r.status, r.attempts, r.result_id, \
+                    r.error->>'code' AS error_code, \
+                    (SELECT count(*) FROM wyrd.operator_dispatches d \
+                      WHERE d.run_id = r.run_id) AS dispatches \
+               FROM wyrd.verifier_runs r JOIN wyrd.cards c ON c.card_uid = r.verifier_uid \
+              WHERE r.origin = 'observation' ORDER BY r.created_at, r.run_id",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ObservationRun {
+                    run: VerificationRunId::new(row.run_id)
+                        .map_err(|error| VerificationFixtureError::Card(error.to_string()))?,
+                    verifier: row.verifier,
+                    record_id: row.record_id,
+                    event_time: row.event_time,
+                    state: RunRow {
+                        status: row.status,
+                        attempts: row.attempts,
+                        result_id: row.result_id,
+                        error_code: row.error_code,
+                    },
+                    dispatches: row.dispatches,
+                })
             })
             .collect()
     }

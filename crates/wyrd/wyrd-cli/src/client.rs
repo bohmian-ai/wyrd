@@ -20,7 +20,7 @@ use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::HttpTransport;
-use wyrd_client::{Principals, WyrdClient};
+use wyrd_client::{GlobalConfig, Principals, WyrdClient};
 
 use crate::error::WyrdCliError;
 
@@ -37,11 +37,10 @@ use crate::error::WyrdCliError;
 /// [`WyrdCliError::ClientConfig`] for a rejected endpoint, and
 /// [`WyrdCliError::ClientTransport`] when the HTTP stack cannot be assembled.
 pub fn from_global(server: Option<&str>) -> Result<WyrdClient, WyrdCliError> {
-    let mut config = ClientConfig::from_global().map_err(map_client_error)?;
-    if let Some(server) = server {
-        config.http.base_url = server.trim_end_matches('/').to_owned();
-    }
-    assemble(config)
+    let global = GlobalConfig::load().map_err(map_client_error)?;
+    assemble(ClientConfig::from_global_with_overrides(
+        &global, server, None,
+    ))
 }
 
 /// Validate one configuration and stack the client layers over it.

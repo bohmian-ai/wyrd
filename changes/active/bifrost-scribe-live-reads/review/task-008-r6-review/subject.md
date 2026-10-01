@@ -1,0 +1,12 @@
+# Immutable review subject and navigation
+Candidate 8955e75b71ded9d39daf7649a0c985be0803e266, detached HEAD; correction parent 1a66d8a7b4583c9798c2f1573dc6ab1f3eadb027. TASK-007 cumulative base a7582db587c6170a290760f1741673125612b797; TASK-008 base f7bebf704d6f3b1dd20d041e70c6ca512c0da307. No CodeGraph directory present.
+Approved spec: ../../spec.md revision 20. Original tasks: ../../tasks/TASK-007-one-parquet-scan-for-live-reads.md and ../../tasks/TASK-008-tenant-proven-per-file.md. Remediation chain: sibling task-008* review directories, particularly ../task-008-r5-review/TASK-008-R6-align-shutdown-residue-descriptions.md and verdict.md. Evidence appended to task files is attributable supplied proof only.
+Review static only: no cargo, nextest, mise, builds, tests, benchmarks, source edits or commits. Each reviewer owns only its exact assigned report. No intended verdict. Standing decisions: FIND-007-3 unchanged, Postgres data_tenant_id columns excluded, error WYRD_VALA_500_QUERY_TENANT_INVARIANT, no live-read cap, shutdown does not publish staged residue. TASK-006 benchmark delta explicitly authorized for correctness-only inspection; do not classify its presence as scope drift.
+Starting map (expand against source):
+- oracle/exec.rs shared HotParquetExec, footer verification/caches; follower/live/dispatcher/codec remote scan/status; parquet/footer and writer_properties; Scribe parquet_writer/claim_assembly/memtable/staging_runtime binding; Forge managed policy/executor rewrite.
+- Scribe mod.rs shutdown, startup/recovery; persistence.rs drain, explicit flush/publish_residue and ordinary tick; assembly.rs ClaimCause/ready_keys; staging_runtime.rs test doc.
+- wyrd-server oracle/peer_service.rs capability-dependent listener, StoppingIo and Connected; public listener unchanged.
+- analytical-operations-reliability.md and wyrd-testing Scribe lifecycle journey prose/assertions.
+- TASK-006 Bench::full_queue run.rs, metrics parser/server.rs, Oracle local slot accounting/holder barrier, report validation. Latest executable delta waits for slot gauge before waiter spawn.
+- tests: oracle distributed/peer_network; Scribe lifecycle/write_read; server query/peer harness; manifests, TESTING.md and mise.toml for interpreting recorded evidence.
+Authorities: AGENTS.md; architecture/agent-rules.md, wyrd-design.md, wyrd-doctrine.mdx, bifrost-design.md; references/README.md and applicable routed references; languages/spec-driven-development.md and maintainer-style.md.

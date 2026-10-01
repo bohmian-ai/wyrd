@@ -167,36 +167,59 @@ impl CancelCause {
     }
 }
 
-/// The complete identity of one immutable hot object's decoded metadata.
+/// The complete identity of one immutable object's decoded metadata.
 ///
 /// Every component is part of the object's identity, not the request's: the
-/// tenant and logical table scope it, the canonical object path and the owning
-/// `vala.file_list` row name it, and the writer's checksum plus the positive
-/// object size pin the exact bytes. Two queries with different projections,
-/// predicates, or schema fingerprints read the same footer and so must share
-/// one entry; including any of those would fragment the cache without making it
-/// safer, because none of them is validated here.
+/// tenant and logical table scope it, the canonical object path names it, and
+/// the [`ObjectPin`] plus the positive object size pin the exact bytes. Two
+/// queries with different projections, predicates, or schema fingerprints read
+/// the same footer and so must share one entry; including any of those would
+/// fragment the cache without making it safer, because none of them is
+/// validated here.
 ///
-/// The values are already validated upstream: a key is only ever built from a
-/// signed `PersistedFileDescriptor` that passed its own identity checks, so
-/// this type does not re-litigate them.
+/// The values are already validated upstream: a hot key is only ever built from
+/// a signed `PersistedFileDescriptor` that passed its own identity checks, and
+/// a published key from a data file of the pinned Iceberg snapshot, so this
+/// type does not re-litigate them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct HotMetadataKey {
+pub struct ObjectMetadataKey {
     /// Authenticated data tenant owning the object.
     tenant_id: DataTenantId,
     /// Canonical logical table name the object belongs to.
     table: String,
-    /// Canonical tenant-relative object path.
+    /// Canonical object path.
     object: String,
-    /// Identity of the `vala.file_list` row that declared this object.
-    file_list_id: uuid::Uuid,
-    /// Writer-recorded checksum of the decoded object.
-    checksum: [u8; 32],
+    /// What pins the object's bytes beyond its path and size.
+    pin: ObjectPin,
     /// Exact object size in bytes; always positive.
     size_bytes: u64,
 }
 
-impl HotMetadataKey {
+/// What pins one keyed object's bytes beyond its path and size.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ObjectPin {
+    /// A hot object: the `vala.file_list` row that declared it and the
+    /// writer-recorded checksum of its bytes.
+    Hot {
+        /// Identity of the declaring `vala.file_list` row.
+        file_list_id: uuid::Uuid,
+        /// Writer-recorded checksum of the decoded object.
+        checksum: [u8; 32],
+    },
+    /// A data file of a pinned Iceberg snapshot. Iceberg data files are
+    /// immutable and every Bifrost writer names each one uniquely, so the
+    /// manifest path and size alone name the bytes.
+    Published,
+    /// A run a Scribe staged on its local volume. A registered run is fsynced
+    /// once and never rewritten, and a writer epoch never reuses a staged
+    /// path, so the epoch plus the path and size name the bytes.
+    Staged {
+        /// Writer epoch of the Scribe stream that staged the run.
+        writer_epoch: u64,
+    },
+}
+
+impl ObjectMetadataKey {
     /// Builds one hot-object identity from already-validated signed facts.
     #[must_use]
     pub fn new(
@@ -211,10 +234,58 @@ impl HotMetadataKey {
             tenant_id,
             table,
             object,
-            file_list_id,
-            checksum,
+            pin: ObjectPin::Hot {
+                file_list_id,
+                checksum,
+            },
             size_bytes,
         }
+    }
+
+    /// Builds one published Iceberg data file's identity from its pinned
+    /// manifest path and manifest-recorded size.
+    #[must_use]
+    pub fn published(
+        tenant_id: DataTenantId,
+        table: String,
+        object: String,
+        size_bytes: u64,
+    ) -> Self {
+        Self {
+            tenant_id,
+            table,
+            object,
+            pin: ObjectPin::Published,
+            size_bytes,
+        }
+    }
+
+    /// Builds one Scribe staged run's identity from its local path, the
+    /// staging stream's writer epoch, and the run's size on disk.
+    #[must_use]
+    pub fn staged(
+        tenant_id: DataTenantId,
+        table: String,
+        object: String,
+        writer_epoch: u64,
+        size_bytes: u64,
+    ) -> Self {
+        Self {
+            tenant_id,
+            table,
+            object,
+            pin: ObjectPin::Staged { writer_epoch },
+            size_bytes,
+        }
+    }
+
+    /// Returns the authenticated tenant owning the object.
+    ///
+    /// Every constructor takes it from the reader's authenticated binding, so
+    /// a scan compares each opened object's footer tenant with this value.
+    #[must_use]
+    pub const fn tenant_id(&self) -> DataTenantId {
+        self.tenant_id
     }
 
     /// Returns the object's exact size in bytes.
@@ -286,11 +357,11 @@ struct CacheState {
     ///
     /// Holds no errors and no in-flight state, so its length and charged bytes
     /// are exactly the resident entries a snapshot reports.
-    entries: LruCache<HotMetadataKey, CachedMetadata>,
+    entries: LruCache<ObjectMetadataKey, CachedMetadata>,
     /// Charged bytes currently resident in `entries`.
     resident_bytes: u64,
     /// Loads with an owner that has not yet published a terminal result.
-    inflight: HashMap<HotMetadataKey, InFlight>,
+    inflight: HashMap<ObjectMetadataKey, InFlight>,
     /// Whether the owner still admits new loads.
     lifecycle: StorageLifecycle,
 }
@@ -332,7 +403,7 @@ struct WaiterGuard {
     /// The cache whose accounting this guard settles.
     cache: Arc<ParquetMetadataCache>,
     /// The load this guard is joined to.
-    key: HotMetadataKey,
+    key: ObjectMetadataKey,
     /// When this caller joined, for the wait-latency histogram.
     joined: Instant,
     /// Whether [`Self::settle`] already reconciled this membership.
@@ -430,7 +501,7 @@ impl ParquetMetadataCache {
     /// cache cannot make a safe retention decision.
     pub(crate) async fn get_or_load(
         self: &Arc<Self>,
-        key: HotMetadataKey,
+        key: ObjectMetadataKey,
         load: MetadataLoadFuture,
         deadline: Instant,
         cancel: CancellationToken,
@@ -469,7 +540,7 @@ impl ParquetMetadataCache {
     /// closed, or its state lock is poisoned.
     fn register(
         self: &Arc<Self>,
-        key: &HotMetadataKey,
+        key: &ObjectMetadataKey,
         load: MetadataLoadFuture,
         requested_deadline: Instant,
     ) -> Result<Registration, Arc<BifrostStorageError>> {
@@ -545,7 +616,7 @@ impl ParquetMetadataCache {
     /// rather than left to poison the key.
     fn spawn_loader(
         self: &Arc<Self>,
-        key: HotMetadataKey,
+        key: ObjectMetadataKey,
         load: MetadataLoadFuture,
         publisher: watch::Sender<Option<MetadataLoadResult>>,
         cancel: CancellationToken,
@@ -591,7 +662,12 @@ impl ParquetMetadataCache {
     /// still running under an open owner, its token is triggered with
     /// [`CancelCause::Abandoned`]: the loader then publishes `Cancelled`,
     /// retires its own key, and a later request is free to elect a fresh load.
-    fn release_waiter(&self, key: &HotMetadataKey, outcome: MetadataLoadOutcome, joined: Instant) {
+    fn release_waiter(
+        &self,
+        key: &ObjectMetadataKey,
+        outcome: MetadataLoadOutcome,
+        joined: Instant,
+    ) {
         let abandoned = {
             let Ok(mut state) = self.state.lock() else {
                 return;
@@ -619,7 +695,7 @@ impl ParquetMetadataCache {
     /// Removes the in-flight registration first so a caller arriving after the
     /// publish sees either the newly resident entry or a fresh miss, and never
     /// joins a load that has already finished.
-    fn settle(&self, key: &HotMetadataKey, result: &MetadataLoadResult, elapsed: Duration) {
+    fn settle(&self, key: &ObjectMetadataKey, result: &MetadataLoadResult, elapsed: Duration) {
         let outcome = match result {
             Ok(_) => MetadataLoadOutcome::Success,
             Err(error) if matches!(**error, BifrostStorageError::Deadline) => {
@@ -651,7 +727,7 @@ impl ParquetMetadataCache {
     /// still returned to its callers, it is simply not kept.
     fn retain(
         &self,
-        key: &HotMetadataKey,
+        key: &ObjectMetadataKey,
         metadata: Option<&RetainedMetadata>,
     ) -> Option<CacheEffectReason> {
         let Ok(mut state) = self.state.lock() else {
@@ -715,7 +791,7 @@ impl ParquetMetadataCache {
     /// The key's own heap is included because the cache stores it beside the
     /// metadata; charging only the footer would let a table full of long object
     /// paths grow past both the local ceiling and the root's view of it.
-    fn weight_of(key: &HotMetadataKey, metadata: &RetainedMetadata) -> u64 {
+    fn weight_of(key: &ObjectMetadataKey, metadata: &RetainedMetadata) -> u64 {
         u64::try_from(metadata.memory_size())
             .unwrap_or(u64::MAX)
             .saturating_add(key.owned_bytes())
@@ -729,7 +805,7 @@ impl ParquetMetadataCache {
     /// none or N. A root that declines still returns the metadata — the
     /// elected query already paid for that decode and is entitled to it — but
     /// the node keeps nothing it could not account for.
-    fn fund(&self, key: &HotMetadataKey, metadata: Arc<ParquetMetaData>) -> RetainedMetadata {
+    fn fund(&self, key: &ObjectMetadataKey, metadata: Arc<ParquetMetaData>) -> RetainedMetadata {
         let unfunded = RetainedMetadata {
             metadata,
             reservation: None,
@@ -952,7 +1028,7 @@ mod tests {
 
     /// One in-memory object reader that counts the decodes it actually served.
     ///
-    /// Every caller of `hot_metadata` supplies its own reader, so a reader that
+    /// Every caller of `object_metadata` supplies its own reader, so a reader that
     /// never performs a range read is positive evidence that the caller's bytes
     /// were never fetched: that is how "one decode for N waiters" and "a warm
     /// hit performs no backend load" are proven without a spy on the backend.
@@ -1021,8 +1097,8 @@ mod tests {
         object: &str,
         checksum: u8,
         size_bytes: u64,
-    ) -> HotMetadataKey {
-        HotMetadataKey::new(
+    ) -> ObjectMetadataKey {
+        ObjectMetadataKey::new(
             tenant,
             "vala.bifrost.events".to_owned(),
             object.to_owned(),
@@ -1126,7 +1202,7 @@ mod tests {
             let gate = (index == 0).then(|| Arc::clone(&gate));
             waiters.push(tokio::spawn(async move {
                 storage
-                    .hot_metadata(
+                    .object_metadata(
                         waiter_key,
                         move || CountingReader::new(&object, &decodes, gate.clone()),
                         deadline,
@@ -1170,7 +1246,7 @@ mod tests {
 
         // Repeat hit: a warm entry performs no backend load at all.
         let warm = storage
-            .hot_metadata(
+            .object_metadata(
                 key.clone(),
                 {
                     let object = object.clone();
@@ -1195,7 +1271,7 @@ mod tests {
         // Identity: the same path under a different checksum is a different
         // object and must not be served by the resident entry.
         let rewritten = storage
-            .hot_metadata(
+            .object_metadata(
                 test_key(tenant, "a.parquet", 0x22, size),
                 {
                     let object = object.clone();
@@ -1238,7 +1314,7 @@ mod tests {
         let disabled_decodes = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             disabled
-                .hot_metadata(
+                .object_metadata(
                     key.clone(),
                     {
                         let object = object.clone();
@@ -1290,7 +1366,7 @@ mod tests {
             Arc::clone(&telemetry),
             oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
-        let resident = |cache: &Arc<ParquetMetadataCache>, key: HotMetadataKey| {
+        let resident = |cache: &Arc<ParquetMetadataCache>, key: ObjectMetadataKey| {
             let loaded = Arc::clone(&metadata);
             let cache = Arc::clone(cache);
             async move {
@@ -1947,7 +2023,7 @@ mod tests {
         let mut held = Vec::new();
         // Coarse first, then exact, so the root is drained past the point where
         // even one more entry's worth of bytes is available.
-        for bytes in [crate::resources::ORACLE_METADATA_MEMORY_BYTES, exact] {
+        for bytes in [1024 * 1024, exact] {
             while let Ok(reservation) = oracle.metadata().try_reserve_metadata(bytes) {
                 held.push(reservation);
             }
@@ -2051,7 +2127,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
 
         let retried = storage
-            .hot_metadata(
+            .object_metadata(
                 test_key(tenant, "flaky.parquet", 0x61, size),
                 {
                     let object = object.clone();
@@ -2078,7 +2154,7 @@ mod tests {
         let corrupt = Bytes::from_static(b"not a parquet footer at all");
         let corrupt_attempts = Arc::new(AtomicUsize::new(0));
         let failure = storage
-            .hot_metadata(
+            .object_metadata(
                 test_key(
                     tenant,
                     "corrupt.parquet",
@@ -2128,7 +2204,7 @@ mod tests {
         cancel.cancel();
         let decodes = Arc::new(AtomicUsize::new(0));
         let observed = storage
-            .hot_metadata(
+            .object_metadata(
                 test_key(tenant, "cancelled.parquet", 0x71, size),
                 {
                     let object = object.clone();

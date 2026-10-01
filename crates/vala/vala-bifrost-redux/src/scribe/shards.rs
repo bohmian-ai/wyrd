@@ -13,14 +13,12 @@ use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
-use crate::scribe::admission::AdmissionController;
 use crate::scribe::execution_lanes::{
     ScribePersistenceCpuPool, ScribeWalIoOp, ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::memory::{MemoryCategory, ScribeOwnership};
 use crate::scribe::memtable::{
-    BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate, ReadableBatchLimits,
-    SealTriggerReason,
+    BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate, SealTriggerReason,
 };
 use crate::scribe::persistence::{
     ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
@@ -653,10 +651,6 @@ impl ShardItem for PreparedAppend {
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
     Append(Box<PreparedAppend>),
-    Snapshot {
-        request: FetchLiveTailRequest,
-        response: tokio::sync::oneshot::Sender<Result<Vec<HotBatch>, ScribeError>>,
-    },
     FlushExpired {
         now: std::time::Instant,
     },
@@ -763,10 +757,9 @@ struct ShardOwner {
     /// so the current group plus already-admitted scheduler entries remain the
     /// complete bounded ambiguity set until process restart.
     retained_commit_ambiguity: Option<GroupWalState>,
-    /// Admission controller shared by all shard owners.
-    admission: AdmissionController,
-    /// Mutable memtable owned exclusively by this shard task.
-    memtable: Memtable,
+    /// This shard's memtable. Only this task writes it; live reads share it
+    /// through [`ScribeShardRuntime::snapshot`] under the memtable's own locks.
+    memtable: Arc<Memtable>,
     /// Bounded CPU lane for replay and persistence preparation.
     persistence_cpu: ScribePersistenceCpuPool,
     /// Bounded WAL IO lane for append, sync, manifest, and retirement work.
@@ -810,6 +803,8 @@ pub(crate) struct ShardMemtableSnapshot {
 pub(crate) struct ScribeShardRuntime {
     /// Fixed owner mailboxes used for internal and admitted commands.
     senders: Vec<ScribeShard<ShardCommand>>,
+    /// Each owner's memtable, in shard order, read directly by live reads.
+    memtables: Vec<Arc<Memtable>>,
     /// Coalescing pressure channels paired with the fixed owners.
     pressure_senders: Vec<watch::Sender<Option<PressureSignal>>>,
     /// Last snapshots published by the fixed owners.
@@ -841,8 +836,6 @@ pub(crate) struct ScribeShardRuntime {
 /// retire immediately at the first lifecycle sweep after their SQL commit; there
 /// is no configurable grace period.
 pub(crate) struct ScribeShardStartConfig {
-    /// Admission controller shared by all shard owners.
-    pub(crate) admission: AdmissionController,
     /// Validated independent geometry every shard rotation limit derives from.
     pub(crate) geometry: crate::scribe::geometry::ScribeGeometry,
     /// Active-generation max age consulted by the age seal predicate.
@@ -872,28 +865,24 @@ pub(crate) struct ScribeShardStartConfig {
 impl ScribeShardRuntime {
     /// Returns every writable or pending immutable seal key for one tenant table.
     ///
-    /// The result is assembled from owner-published snapshots, so discovery
-    /// never traverses another shard's mutable state and remains safe for the
-    /// private list-active-streams RPC. Only `table`'s keys are collected; the
-    /// caller deduplicates.
+    /// Reads each shard's memtable directly, as [`Self::snapshot`] does for
+    /// rows. An owner inserts rows before it acknowledges them but republishes
+    /// its inspection snapshot only afterwards, so discovery from published
+    /// snapshots could omit the partition of an already acknowledged write.
+    /// Only `table`'s keys are collected; the caller deduplicates.
     ///
     /// # Errors
-    /// Returns [`ScribeError::Internal`] when an owner inspection snapshot is
-    /// poisoned or unavailable.
+    /// Returns [`ScribeError::Internal`] when a memtable lock is poisoned.
     pub(crate) fn active_seal_keys_for_table(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
     ) -> Result<Vec<crate::scribe::seal_key::SealKey>, ScribeError> {
-        Ok(self
-            .memtable_snapshots()?
-            .into_iter()
-            .flat_map(|snapshot| snapshot.bucket_memory)
-            .filter_map(|bucket| {
-                (bucket.seal_key.tenant == tenant && bucket.seal_key.table == *table)
-                    .then_some(bucket.seal_key)
-            })
-            .collect())
+        let mut keys = Vec::new();
+        for memtable in &self.memtables {
+            keys.extend(memtable.seal_keys_for_table(tenant, table)?);
+        }
+        Ok(keys)
     }
 
     /// Closes shard admission before any potentially stalled graceful wait.
@@ -960,7 +949,6 @@ impl ScribeShardRuntime {
     /// the WAL can name.
     pub(crate) fn start(config: ScribeShardStartConfig, runtime: &Handle) -> Arc<Self> {
         let ScribeShardStartConfig {
-            admission,
             geometry,
             seal_max_age,
             wal,
@@ -982,6 +970,7 @@ impl ScribeShardRuntime {
         let pending = Arc::new(AtomicUsize::new(0));
         let drained = Arc::new(Notify::new());
         let mut tasks = Vec::with_capacity(shard_count);
+        let mut memtables = Vec::with_capacity(shard_count);
         let abort_handles = Mutex::new(Vec::with_capacity(shard_count));
         let pressure_channels = (0..shard_count)
             .map(|_| watch::channel(None))
@@ -998,6 +987,11 @@ impl ScribeShardRuntime {
                 panic!("fixed shard WAL handle must be constructible: {error}")
             });
             let (_, pressure_receiver) = &pressure_channels[id];
+            let memtable = Arc::new(
+                Memtable::new_with_config(generation_rotation_bytes, seal_max_age)
+                    .with_hot_sources(id, Arc::clone(&hot_sources)),
+            );
+            memtables.push(Arc::clone(&memtable));
             let owner = ShardOwner {
                 id,
                 receiver,
@@ -1017,9 +1011,7 @@ impl ScribeShardRuntime {
                 seal_retry: HashSet::new(),
                 retained_generations: HashMap::new(),
                 retained_commit_ambiguity: None,
-                admission: admission.clone(),
-                memtable: Memtable::new_with_config(generation_rotation_bytes, seal_max_age)
-                    .with_hot_sources(id, Arc::clone(&hot_sources)),
+                memtable: Arc::clone(&memtable),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
@@ -1035,15 +1027,15 @@ impl ScribeShardRuntime {
                 fail_next_retirement_release: false,
             };
             let task = runtime.spawn(owner.run());
-            if let Ok(mut handles) = abort_handles.lock() {
-                handles.push(task.abort_handle());
-            } else {
-                panic!("Scribe shard abort-handle registry must not be poisoned at startup");
-            }
+            abort_handles
+                .lock()
+                .expect("Scribe shard abort-handle registry must not be poisoned at startup")
+                .push(task.abort_handle());
             tasks.push(task);
         }
         Arc::new(Self {
             senders,
+            memtables,
             pressure_senders,
             snapshots,
             tasks: tokio::sync::Mutex::new(tasks),
@@ -1140,66 +1132,42 @@ impl ScribeShardRuntime {
         Ok(())
     }
 
-    /// Fan out a bounded hot snapshot to all shards and merge the results.
+    /// Reads every shard's readable memtable rows for one live-tail request.
     ///
-    /// Under batch-spread routing the live-tail data for one (tenant, table)
-    /// may be spread across all sixteen shard lanes. This method sends a
-    /// [`ShardCommand::Snapshot`] to every shard and merges the `HotBatch`
-    /// vectors. The existing `HotBatch` contract is preserved: the caller
-    /// receives a single flat list of per-partition-day batches.
+    /// Reads the memtables directly instead of asking the shard owners, so a
+    /// query never waits behind an owner's queued writes. Each memtable read
+    /// holds both of its maps for one consistent cut, and an owner inserts rows
+    /// before it acknowledges them, so every acknowledged row is visible. The
+    /// result is one flat list of per-partition-day batches in shard order.
     ///
     /// # Errors
     /// Returns [`ScribeError::IngressClosed`] when the runtime has shut down,
-    /// [`ScribeError::IngestBusy`] when a shard mailbox is full, or any
-    /// shard-level snapshot error.
-    pub(crate) async fn snapshot(
+    /// or the memtable error when a projection cannot be read.
+    pub(crate) fn snapshot(
         &self,
-        request: FetchLiveTailRequest,
+        request: &FetchLiveTailRequest,
     ) -> Result<Vec<HotBatch>, ScribeError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(ScribeError::IngressClosed);
         }
-        let mut merged = Vec::with_capacity(request.max_batches);
-        let mut retained_bytes = 0_usize;
-        for sender in &self.senders {
-            let (response, result) = tokio::sync::oneshot::channel();
-            let command = ShardCommand::Snapshot {
-                request: request.clone(),
-                response,
-            };
-            tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                sender.sender.send(command),
-            )
-            .await
-            .map_err(|_| ScribeError::IngestBusy {
-                table: "live-tail".to_owned(),
-            })?
-            .map_err(|_| ScribeError::IngressClosed)?;
-            let batches = result.await.map_err(|_| ScribeError::Internal {
-                detail: "shard dropped live-tail snapshot response".to_owned(),
-            })??;
-            let batch_bytes = batches.iter().try_fold(0_usize, |bytes, batch| {
-                bytes
-                    .checked_add(batch.rows.get_array_memory_size())
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "live-tail retained byte count overflow".to_owned(),
-                    })
-            })?;
-            retained_bytes =
-                retained_bytes
-                    .checked_add(batch_bytes)
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "live-tail retained byte count overflow".to_owned(),
-                    })?;
-            if merged.len().saturating_add(batches.len()) > request.max_batches
-                || retained_bytes > request.max_retained_bytes
-            {
-                return Err(ScribeError::IngestBusy {
-                    table: request.binding.table_ref.fqn(),
-                });
-            }
-            merged.extend(batches);
+        let mut merged = Vec::new();
+        for memtable in &self.memtables {
+            merged.extend(
+                memtable
+                    .readable_batches_for_range(
+                        request.binding.tenant,
+                        &request.binding.table_ref,
+                        request.start_partition,
+                        request.end_partition,
+                        &request.required_columns,
+                    )?
+                    .into_iter()
+                    .map(|readable| HotBatch {
+                        partition_day: readable.partition_day,
+                        generation: readable.generation,
+                        rows: readable.batch,
+                    }),
+            );
         }
         Ok(merged)
     }
@@ -1462,9 +1430,6 @@ impl ShardOwner {
     async fn handle_command(&mut self, command: ShardCommand) -> bool {
         match command {
             ShardCommand::Append(append) => self.scheduler.push(*append),
-            ShardCommand::Snapshot { request, response } => {
-                let _ = response.send(self.snapshot_at(&request));
-            }
             ShardCommand::FlushExpired { now } => {
                 if let Err(error) = self.flush_expired(now) {
                     tracing::warn!(error = %error, shard = self.id, "age flush failed");
@@ -1498,35 +1463,6 @@ impl ShardOwner {
             ShardCommand::Shutdown => return true,
         }
         false
-    }
-
-    /// Builds a bounded live-tail projection from this owner's readable memtable rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when the requested range or projection cannot be read.
-    fn snapshot_at(&self, request: &FetchLiveTailRequest) -> Result<Vec<HotBatch>, ScribeError> {
-        let readable = self.memtable.readable_batches_for_provider_cut(
-            request.binding.tenant,
-            &request.binding.table_ref,
-            &crate::scribe::memtable::ProviderCut {
-                start_partition: request.start_partition,
-                end_partition: request.end_partition,
-                required_columns: &request.required_columns,
-                limits: ReadableBatchLimits {
-                    max_batches: request.max_batches,
-                    max_retained_bytes: request.max_retained_bytes,
-                },
-            },
-        )?;
-        Ok(readable
-            .into_iter()
-            .map(|batch| HotBatch {
-                partition_day: batch.partition_day,
-                generation: batch.generation,
-                rows: batch.batch,
-            })
-            .collect())
     }
 
     /// Resolves and reconstructs every replay state in stable seal-key order.
@@ -1621,7 +1557,6 @@ impl ShardOwner {
             states,
             memory,
             identity_memory,
-            identity_owner_bytes,
         } = chunk;
         if self.replay_chunk.is_some() {
             let _ = response.send(Err(ScribeError::Internal {
@@ -1652,18 +1587,7 @@ impl ShardOwner {
             let _ = response.send(Err(error));
             return;
         }
-        let owner_stats = match self.memtable.stats() {
-            Ok(stats) => stats,
-            Err(error) => {
-                self.rollback_prepared_replay(&mut prepared);
-                let _ = response.send(Err(error));
-                return;
-            }
-        };
-        self.admission
-            .sync_memtable_bytes(owner_stats.writable_bytes, owner_stats.immutable_bytes);
-        let identity = match self.adopt_replay_identity_owner(identity_memory, identity_owner_bytes)
-        {
+        let identity = match self.adopt_replay_identity_owner(identity_memory) {
             Ok(identity) => identity,
             Err(error) => {
                 self.rollback_prepared_replay(&mut prepared);
@@ -1760,10 +1684,6 @@ impl ShardOwner {
 
     /// Moves the current stream's identity lease into replay persistence ownership.
     ///
-    /// `producer_owner_bytes` remains the aggregate identity charge across all
-    /// live replay streams so the producer workspace is bounded by the complete
-    /// Scribe role ownership, not only the stream being persisted.
-    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the lease cannot be transferred between
@@ -1771,13 +1691,9 @@ impl ShardOwner {
     fn adopt_replay_identity_owner(
         &self,
         identity_memory: Option<crate::resources::ScribeMemoryLease>,
-        producer_owner_bytes: usize,
     ) -> Result<Option<crate::scribe::memory::ReplayIdentityOwnership>, ScribeError> {
         identity_memory
-            .map(|lease| {
-                self.memory_ownership
-                    .adopt_replay_identity(lease, producer_owner_bytes)
-            })
+            .map(|lease| self.memory_ownership.adopt_replay_identity(lease))
             .transpose()
     }
 
@@ -2056,9 +1972,6 @@ impl ShardOwner {
             .preflight_release_immutable(arrow_bytes)?;
         self.memory_ownership.release_immutable(arrow_bytes)?;
         self.memtable.discard_pending_generation(seal_id)?;
-        let owner_stats = self.memtable.stats()?;
-        self.admission
-            .sync_memtable_bytes(owner_stats.writable_bytes, owner_stats.immutable_bytes);
         Ok(())
     }
 
@@ -2077,11 +1990,18 @@ impl ShardOwner {
 
     /// Flushes every active bucket owned by this shard.
     ///
+    /// Generations a failed stage attempt left retryable are resubmitted first,
+    /// so an explicit flush or shutdown drain re-drives them rather than
+    /// waiting for the next age tick; `submit_front` only ever submits an
+    /// unsubmitted queue front, which keeps FIFO order and never double-submits
+    /// an in-flight generation.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when active bucket selection or generation
     /// preparation fails.
     fn flush_all(&mut self) -> Result<(), ScribeError> {
+        self.retry_pending();
         let keys = self.memtable.active_seal_keys_for_shard(self.id)?;
         self.flush_keys(keys, None)
     }
@@ -2157,12 +2077,8 @@ impl ShardOwner {
             // retried freeze never double-counts `bifrost_scribe_seal_total`.
             let active_bytes = self.memtable.writable_bytes(&seal_key)?;
             if let Err(error) = self
-                .admission
-                .preflight_transfer_active_to_immutable(active_bytes)
-                .and_then(|()| {
-                    self.memory_ownership
-                        .preflight_move_active_to_immutable(active_bytes)
-                })
+                .memory_ownership
+                .preflight_move_active_to_immutable(active_bytes)
             {
                 self.seal_retry.insert(seal_key.clone());
                 return Err(error);
@@ -2177,8 +2093,6 @@ impl ShardOwner {
                 // legal state for this path (semantics unchanged by this task).
                 self.memory_ownership
                     .move_active_to_immutable(frozen.arrow_bytes)?;
-                self.admission
-                    .transfer_active_to_immutable(frozen.arrow_bytes)?;
                 self.seal_retry.remove(&seal_key);
                 continue;
             }
@@ -2209,7 +2123,7 @@ impl ShardOwner {
     /// net-zero, poison-only failure) is the last fallible step, run
     /// immediately before the infallible queue push. As a result a single-step
     /// failure leaves exactly one of two states: (A) prep failed, bytes remain
-    /// Active-accounted, admission Active-accounted, and the `wal_segments`
+    /// Active-accounted and the `wal_segments`
     /// entry is intact for an identical retry; or (B) the generation is queued,
     /// bytes are Immutable-accounted, and its segments are retained. There is
     /// no state in which bytes are Immutable-accounted with no queued
@@ -2249,8 +2163,6 @@ impl ShardOwner {
         // push (AC1).
         self.memory_ownership
             .move_active_to_immutable(frozen.arrow_bytes)?;
-        self.admission
-            .transfer_active_to_immutable(frozen.arrow_bytes)?;
         self.wal_segments.remove(seal_key);
         tracing::info!(
             tenant = %seal_key.tenant,
@@ -2444,8 +2356,7 @@ impl ShardOwner {
     /// A generation is eligible the moment its state is
     /// `ImmutableState::Committed`, which is only reached after the fenced
     /// `vala.file_list` transaction commits. Retirement ordering is
-    /// preserved: `admission.release_immutable` and `memory_ownership.release_immutable`
-    /// are called before `ScribeWalIoOp::RetireWal` is submitted, so WAL
+    /// preserved: `memory_ownership.release_immutable` is called before `ScribeWalIoOp::RetireWal` is submitted, so WAL
     /// segment refcounts are released last.
     ///
     /// A failed WAL retirement is logged and remains recoverable on the next
@@ -2509,8 +2420,6 @@ impl ShardOwner {
                 detail: format!("retirement bytes mismatch for generation {generation_id}"),
             });
         }
-        self.admission
-            .preflight_release_immutable(token.arrow_bytes)?;
         self.memory_ownership
             .preflight_release_immutable(token.arrow_bytes)?;
         #[cfg(test)]
@@ -2521,7 +2430,6 @@ impl ShardOwner {
                 detail: "injected immutable retirement release failure".to_owned(),
             });
         }
-        self.admission.release_immutable(token.arrow_bytes)?;
         self.memory_ownership.release_immutable(token.arrow_bytes)?;
         if let Err(error) = self.memtable.commit_retirement(token) {
             self.memory_ownership.poison();
@@ -3048,12 +2956,6 @@ struct DurableSlice {
     commit_already_synced: bool,
 }
 
-/// Public-layout bytes retained for one WAL-durable slice descriptor.
-///
-/// Scribe material planning uses this fact before root admission so the exact
-/// fixed `Vec<DurableSlice>` backing allocated by group write is never hidden.
-pub(crate) const DURABLE_SLICE_LAYOUT_BYTES: usize = std::mem::size_of::<DurableSlice>();
-
 /// A WAL-synced slice whose Arrow rows have not yet reached the active
 /// memtable. Successful insertion removes the entry, so this bounded index
 /// only covers the fsync-success/memtable-failure retry window.
@@ -3111,6 +3013,11 @@ struct GroupWalState {
     /// time, so insertion releases them instead of inserting them and replay
     /// suppresses them on the same logical-identity rule.
     spent_batch_ids: HashSet<[u8; 16]>,
+    /// Batch identities at least one of whose slices this group made visible.
+    ///
+    /// A batch absent here was a replay: the fence spent it or the memtable
+    /// already retained every slice, so its ACK reports no first commit.
+    inserted_batch_ids: HashSet<[u8; 16]>,
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -3209,21 +3116,30 @@ impl ShardOwner {
         };
         let state = post_commit.into_state();
         let _ = touched_keys;
+        Self::acknowledge_visible(state);
+        Ok(())
+    }
+
+    /// Completes every waiter of a group whose rows are now query-visible.
+    ///
+    /// Each ACK carries the rows its batch accounted for and whether this group
+    /// inserted that batch; a replay suppressed by the fence or the memtable
+    /// identity reports no first commit. Reservations drop with each append.
+    fn acknowledge_visible(state: GroupWalState) {
         for mut append in state.prepared {
             if let Some(lifecycle) = append.lifecycle.as_mut() {
                 lifecycle.succeed();
             }
             if let Some(sender) = append.durable_ack {
-                let rows = state
-                    .rows_by_append
-                    .get(append.batch_id.as_bytes())
-                    .copied()
-                    .unwrap_or(0);
-                let _ = sender.send(Ok(rows));
+                let batch_id = append.batch_id.as_bytes();
+                let rows = state.rows_by_append.get(batch_id).copied().unwrap_or(0);
+                let _ = sender.send(Ok(crate::scribe::preprocess::DurableCompletion {
+                    rows,
+                    first_commit: state.inserted_batch_ids.contains(batch_id),
+                }));
             }
             drop(append.reservation);
         }
-        Ok(())
     }
 
     /// Re-drives the sole WAL/SQL-committed insertion owner before new work.
@@ -3246,20 +3162,7 @@ impl ShardOwner {
             self.retained_commit_ambiguity = Some(state);
             return Err(error);
         }
-        for mut append in state.prepared {
-            if let Some(lifecycle) = append.lifecycle.as_mut() {
-                lifecycle.succeed();
-            }
-            if let Some(sender) = append.durable_ack {
-                let rows = state
-                    .rows_by_append
-                    .get(append.batch_id.as_bytes())
-                    .copied()
-                    .unwrap_or(0);
-                let _ = sender.send(Ok(rows));
-            }
-            drop(append.reservation);
-        }
+        Self::acknowledge_visible(state);
         Ok(())
     }
 
@@ -3288,31 +3191,6 @@ impl ShardOwner {
         let wal_has_records = self.wal_handle.has_active_records()?;
         if stats.writable_buckets == 0 && !wal_has_records {
             return Ok(());
-        }
-        for append in group {
-            let PreparedSliceSet::Materialized(slices) = &append.slices;
-            for slice in slices {
-                let incoming = group.iter().flat_map(|candidate_append| {
-                    let PreparedSliceSet::Materialized(candidate_slices) = &candidate_append.slices;
-                    candidate_slices
-                        .iter()
-                        .filter(|candidate| candidate.seal_key == slice.seal_key)
-                        .map(|candidate| (candidate.rows.num_rows(), candidate.memtable_bytes))
-                });
-                let candidate_peak = self
-                    .memtable
-                    .projected_candidate_peak(&slice.seal_key, incoming)?;
-                let persistence_peak = candidate_peak
-                    .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
-                        candidate_peak,
-                    )?)
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "projected persistence envelope overflowed".to_owned(),
-                    })?;
-                if persistence_peak > append.maximum_scribe_envelope_bytes {
-                    return self.rotate_active_generation();
-                }
-            }
         }
         let mut incoming_encoded = 0_usize;
         let mut incoming_uncompressed = 0_usize;
@@ -3408,8 +3286,6 @@ impl ShardOwner {
                     detail: "automatic rotation active-byte preflight overflow".to_owned(),
                 })?;
         }
-        self.admission
-            .preflight_transfer_active_to_immutable(active_bytes)?;
         self.memory_ownership
             .preflight_move_active_to_immutable(active_bytes)?;
 
@@ -3457,7 +3333,6 @@ impl ShardOwner {
         })?;
         self.memory_ownership
             .move_active_to_immutable(frozen_bytes)?;
-        self.admission.transfer_active_to_immutable(frozen_bytes)?;
         // A selective seal can already be waiting or retained against the
         // segment being closed.  Its segment reference is informational only:
         // the closed cohort is the unique retirement owner and must retain it
@@ -3837,16 +3712,8 @@ impl ShardOwner {
             }
             let batch_id = *append.batch_id.as_bytes();
             loop {
-                let slice = match Self::next_prepared_slice(&self.persistence_cpu, append) {
-                    Ok(Some(slice)) => slice,
-                    Ok(None) => break,
-                    Err(error) => {
-                        if let Err(cleanup_error) = self.release_active_reservations(&durable) {
-                            tracing::error!(error = %cleanup_error, "active cleanup failed after slice production error");
-                        }
-                        Self::notify_prepared_error(&mut prepared, &error);
-                        return Err(error);
-                    }
+                let Some(slice) = Self::next_prepared_slice(append) else {
+                    break;
                 };
                 let identity = slice.wal_append.payload_identity()?;
                 match self.memtable.retained_batch_rows(&slice.seal_key, identity) {
@@ -3914,39 +3781,21 @@ impl ShardOwner {
             touched,
             rows_by_append,
             spent_batch_ids: HashSet::new(),
+            inserted_batch_ids: HashSet::new(),
         })
     }
 
-    /// Advances one materialized or lazy prepared-slice source.
+    /// Takes the next prepared slice of one append, in order.
     ///
-    /// Native production runs on the bounded persistence CPU lane and returns
-    /// the producer owner with every result so cancellation cannot orphan its
-    /// retained raw source or decoder state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when the producer owner is missing, the CPU lane
-    /// refuses/fails, or it returns a result for a different operation.
-    fn next_prepared_slice(
-        _persistence_cpu: &crate::scribe::execution_lanes::ScribePersistenceCpuPool,
-        append: &mut PreparedAppend,
-    ) -> Result<Option<PreparedSlice>, ScribeError> {
-        if append.exact_material.retained_live != append.prepared_bytes
-            || append.exact_material.largest_stored_batch
-                > append.exact_material.persistence_candidate_peak
-            || append.exact_material.persistence_envelope_peak
-                > append.maximum_scribe_envelope_bytes
-        {
-            return Err(ScribeError::Internal {
-                detail: "prepared exact-material facts contradict the retained owner".to_owned(),
-            });
-        }
+    /// Slices are fully materialized before the append reaches the shard, so
+    /// this only pops the next one; `None` means the append has no slices left.
+    fn next_prepared_slice(append: &mut PreparedAppend) -> Option<PreparedSlice> {
         match &mut append.slices {
             PreparedSliceSet::Materialized(slices) => {
                 if slices.is_empty() {
-                    Ok(None)
+                    None
                 } else {
-                    Ok(Some(slices.remove(0)))
+                    Some(slices.remove(0))
                 }
             }
         }
@@ -3956,8 +3805,7 @@ impl ShardOwner {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when active admission, memory accounting, or WAL
-    /// append fails; all acquired active reservations are released on failure.
+    /// Returns [`ScribeError`] when memory accounting or WAL append fails; all acquired active reservations are released on failure.
     async fn write_prepared_slice(
         &mut self,
         append: &mut PreparedAppend,
@@ -3979,7 +3827,7 @@ impl ShardOwner {
         let data_len = wal_append.logical_data_len;
         let materialized_bytes = memtable_bytes.saturating_add(wal_append.data.len());
         if retain_rows {
-            self.reserve_slice_active(append, &seal_key, memtable_bytes)?;
+            self.reserve_slice_active(append, memtable_bytes)?;
         }
         let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
             detail: "ingress root owner missing before WAL dispatch".to_owned(),
@@ -4057,7 +3905,7 @@ impl ShardOwner {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when active admission or memory accounting fails.
+    /// Returns [`ScribeError`] when memory accounting fails.
     fn reuse_synced_slice(
         &mut self,
         append: &mut PreparedAppend,
@@ -4075,7 +3923,7 @@ impl ShardOwner {
         } = slice;
         let materialized_bytes = memtable_bytes.saturating_add(wal_append.data.len());
         if retain_rows {
-            self.reserve_slice_active(append, &seal_key, memtable_bytes)?;
+            self.reserve_slice_active(append, memtable_bytes)?;
         }
         append
             .lifecycle
@@ -4143,6 +3991,9 @@ impl ShardOwner {
 
     /// Inserts once-materialized rows after the durable fence.
     ///
+    /// Slices of a spent batch are discarded; every inserted slice records its
+    /// batch in `inserted_batch_ids`, which the ACK reports as a first commit.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when memtable insertion or rotation fails.
@@ -4157,7 +4008,9 @@ impl ShardOwner {
                 self.discard_already_committed_slice(slice, &mut state.rows_by_append)?;
                 continue;
             }
+            let batch_id = slice.batch_id;
             self.insert_committed_slice(slice, &mut state.rows_by_append, &mut touched_keys)?;
+            state.inserted_batch_ids.insert(batch_id);
         }
         Ok(touched_keys)
     }
@@ -4175,7 +4028,7 @@ impl ShardOwner {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the slice lost its rows before settlement
-    /// or when releasing its active admission and memory ownership fails.
+    /// or when releasing its active memory ownership fails.
     fn discard_already_committed_slice(
         &mut self,
         mut slice: DurableSlice,
@@ -4304,12 +4157,8 @@ impl ShardOwner {
         bytes: usize,
         already_absorbed: bool,
     ) -> Result<(), ScribeError> {
-        self.admission.preflight_release_active(bytes)?;
         if already_absorbed {
             self.memory_ownership.preflight_release_active(bytes)?;
-        }
-        self.admission.release_active(bytes)?;
-        if already_absorbed {
             self.memory_ownership.release_active(bytes)?;
         }
         Ok(())
@@ -4319,8 +4168,8 @@ impl ShardOwner {
     ///
     /// # Errors
     ///
-    /// Returns the first admission or memory-ledger release error after
-    /// attempting to settle every active durable slice.
+    /// Returns the first memory-ledger release error after attempting to settle
+    /// every active durable slice.
     fn release_active_reservations(&self, durable: &[DurableSlice]) -> Result<(), ScribeError> {
         let mut first_error = None;
         for slice in durable {
@@ -4345,16 +4194,13 @@ impl ShardOwner {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when active admission refuses the slice, the root
-    /// cannot supply its exact child, or the ownership ledger refuses transfer.
+    /// Returns [`ScribeError`] when the root cannot supply the slice's exact
+    /// child or the ownership ledger refuses transfer.
     fn reserve_slice_active(
         &mut self,
         append: &mut PreparedAppend,
-        seal_key: &crate::scribe::seal_key::SealKey,
         memtable_bytes: usize,
     ) -> Result<(), ScribeError> {
-        self.admission
-            .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
         let active_memory = append
             .memory
             .as_mut()
@@ -4574,10 +4420,6 @@ mod tests {
                 .memory_ownership
                 .reserve_active(active_bytes)
                 .expect("active memory ownership");
-            owner
-                .admission
-                .try_reserve_active("distinct-threshold", active_bytes)
-                .expect("active admission ownership");
 
             owner
                 .rotate_before_append_if_needed(&[])
@@ -4766,10 +4608,6 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
-        owner
-            .admission
-            .try_reserve_active("rotation-test", active_bytes)
-            .expect("active admission ownership");
 
         owner
             .rotate_active_generation()
@@ -4862,10 +4700,6 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
-        owner
-            .admission
-            .try_reserve_active("age-owner", active_bytes)
-            .expect("active admission ownership");
         owner.generation_started_at = std::time::Instant::now()
             .checked_sub(owner.generation_max_age)
             .expect("clock supports expired generation");
@@ -4954,10 +4788,6 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
-        owner
-            .admission
-            .try_reserve_active("pressure-owner", active_bytes)
-            .expect("active admission ownership");
         let opened_at = owner.generation_started_at;
         let wal_bytes = owner
             .wal_handle
@@ -5110,55 +4940,6 @@ mod tests {
         assert!(!cohort.complete_member(11));
         assert!(!cohort.complete_member(11));
         assert!(cohort.complete_member(12));
-    }
-
-    /// Shutdown closes new producer work while accepted incremental ownership
-    /// and the final cohort member both drain to terminal release.
-    ///
-    /// # Panics
-    ///
-    /// Panics if closing admission cancels an accepted producer, releases a
-    /// cohort early, or leaves a waiter or lease after both owners settle.
-    #[tokio::test]
-    async fn shutdown_drains_cohorts_and_incremental_producers() {
-        const MIB: usize = 1024 * 1024;
-        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * MIB,
-            512 * MIB as u64,
-            [crate::resources::BifrostRole::Scribe],
-        );
-        let resources = roles.scribe().expect("Scribe resources");
-        let baseline = resources.memory_snapshot();
-        let admission = crate::scribe::persistence::ProducerAdmission::new(resources.clone());
-        let blocker = admission.acquire(500 * MIB).await.expect("active producer");
-        let accepted = tokio::spawn({
-            let admission = admission.clone();
-            async move { admission.acquire_accepted(32 * MIB).await }
-        });
-        tokio::task::yield_now().await;
-        assert_eq!(admission.queue_len(), 1);
-
-        admission.close();
-        assert!(admission.acquire(1).await.is_err());
-        let mut cohort = ShardRotationCohort {
-            shard_id: 0,
-            wal_segments: Vec::new(),
-            pending_member_seal_ids: BTreeSet::from([71_u64, 72_u64]),
-        };
-        assert!(!cohort.complete_member(71));
-        drop(blocker);
-        let incremental = tokio::time::timeout(std::time::Duration::from_secs(1), accepted)
-            .await
-            .expect("accepted producer drains")
-            .expect("producer task")
-            .expect("incremental lease");
-        assert!(cohort.complete_member(72));
-        drop(incremental);
-        assert_eq!(admission.queue_len(), 0);
-        assert_eq!(
-            resources.memory_snapshot().total_bytes(),
-            baseline.total_bytes()
-        );
     }
 
     /// Failed replay binding or adoption restores memtable and memory baselines.
@@ -5344,7 +5125,6 @@ mod tests {
             states: HashMap::new(),
             memory: None,
             identity_memory: Some(identity),
-            identity_owner_bytes: 64,
         };
         let stream = StreamIdentity::new(
             crate::scribe::stream_identity::NodeId::generate(),
@@ -5385,6 +5165,63 @@ mod tests {
                 .scribe_memory_used_bytes,
             0
         );
+    }
+
+    /// An explicit flush resubmits a generation a failed stage attempt left
+    /// retryable instead of waiting for the next age tick.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the flush fails or the retained front is not resubmitted.
+    #[tokio::test]
+    async fn flush_all_resubmits_a_retained_generation() {
+        let key = owner_key();
+        let memtable = Memtable::new();
+        memtable
+            .insert(&key, owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let frozen = memtable.freeze(&key).expect("owner freeze");
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let generation = owner_generation(&key, &frozen, stream, wal_handle.clone());
+        let mut owner = owner_for_completion_test(memtable, &wal, wal_handle, stream);
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        owner.persistence = Some(Arc::new(persistence));
+        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
+            .expect("test binding");
+        owner.pending_generations.insert(
+            key.clone(),
+            VecDeque::from([PendingGeneration {
+                generation: Arc::clone(&generation),
+                binding,
+                submitted: false,
+                retry_scheduled: false,
+                replay_response: None,
+                replay_owned: false,
+            }]),
+        );
+
+        owner.flush_all().expect("explicit flush");
+
+        let front = owner
+            .pending_generations
+            .get(&key)
+            .and_then(VecDeque::front)
+            .expect("retained front");
+        assert!(front.submitted, "the flush resubmits the retained front");
+        let job = persistence_rx.recv().await.expect("resubmitted job");
+        assert_eq!(job.generation.generation_id, generation.generation_id);
     }
 
     /// Replay owns its own retries across persistence-queue backpressure.
@@ -5568,7 +5405,7 @@ mod tests {
             .expect("advance-failure identity lease");
         let advance_identity = owner
             .memory_ownership
-            .adopt_replay_identity(advance_lease, 64)
+            .adopt_replay_identity(advance_lease)
             .expect("advance-failure identity adoption");
         let completion_result = owner.handle_persistence_completion(
             PersistenceCompletion {
@@ -5627,7 +5464,7 @@ mod tests {
             .expect("terminal identity lease");
         let terminal_identity = owner
             .memory_ownership
-            .adopt_replay_identity(terminal_lease, 64)
+            .adopt_replay_identity(terminal_lease)
             .expect("terminal identity adoption");
         let (terminal_response, terminal_rx) = tokio::sync::oneshot::channel();
         owner.replay_chunk = Some(ReplayChunkOwner {
@@ -5695,9 +5532,6 @@ mod tests {
             .memory_ownership
             .reserve_immutable(poisoned_generation.arrow_bytes)
             .expect("lock-failure immutable ownership");
-        owner
-            .admission
-            .sync_memtable_bytes(0, poisoned_generation.arrow_bytes);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _identity = poisoned_generation
                 .replay_identity
@@ -5710,7 +5544,7 @@ mod tests {
             .expect("lock-failure identity lease");
         let lock_identity = owner
             .memory_ownership
-            .adopt_replay_identity(lock_lease, 64)
+            .adopt_replay_identity(lock_lease)
             .expect("lock-failure identity adoption");
         let (lock_response, lock_rx) = tokio::sync::oneshot::channel();
         owner.replay_chunk = Some(ReplayChunkOwner {
@@ -5805,7 +5639,6 @@ mod tests {
             .memory_ownership
             .reserve_immutable(replay_bytes)
             .expect("advance-failure immutable ownership");
-        owner.admission.sync_memtable_bytes(0, replay_bytes);
         settle_poisoned_advance(
             &mut owner,
             &budget,
@@ -5845,14 +5678,12 @@ mod tests {
         assert!(retirement_owner.replay_chunk.is_none());
         assert!(retirement_owner.pending_generations.is_empty());
         assert_eq!(retirement_owner.retained_generations.len(), 1);
-        assert_eq!(
+        assert!(
             retirement_owner.retained_generations[&retirement_generation.generation_id.0]
                 .replay_identity
                 .lock()
                 .expect("retained retirement identity")
-                .as_ref()
-                .map(crate::scribe::memory::ReplayIdentityOwnership::bytes),
-            Some(64)
+                .is_some()
         );
         assert_eq!(
             retirement_owner.memory_ownership.immutable_bytes(),
@@ -5938,9 +5769,6 @@ mod tests {
             .memory_ownership
             .reserve_immutable(retirement_generation.arrow_bytes)
             .expect("retirement immutable ownership");
-        retirement_owner
-            .admission
-            .sync_memtable_bytes(0, retirement_generation.arrow_bytes);
         retirement_owner.pending_generations.insert(
             retirement_key.clone(),
             VecDeque::from([PendingGeneration {
@@ -5970,7 +5798,6 @@ mod tests {
                 retirement_budget
                     .try_reserve_maintenance(MemoryCategory::Decode, 64)
                     .expect("retirement identity lease"),
-                64,
             )
             .expect("retirement identity adoption");
         retirement_owner.fail_next_retirement_release = true;
@@ -6300,12 +6127,10 @@ mod tests {
                     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                     false,
                 ),
-                Field::new("wyrd_row_ordinal", DataType::Int32, false),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
                 Arc::new(TimestampMicrosecondArray::from(vec![event_micros]).with_timezone("UTC")),
-                Arc::new(arrow::array::Int32Array::from(vec![0_i32])),
             ],
         )
         .expect("owner prepared batch")
@@ -6396,12 +6221,7 @@ mod tests {
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
             retained_commit_ambiguity: None,
-            admission: AdmissionController::with_config_and_memory(
-                crate::scribe::admission::AdmissionConfig::default(),
-                budget.clone(),
-            )
-            .expect("the default Scribe geometry fits the default test budget"),
-            memtable,
+            memtable: Arc::new(memtable),
             persistence_cpu: ScribePersistenceCpuPool::new(1),
             wal_io: ScribeWalIoPool::new(1),
             persistence: None,
@@ -6446,10 +6266,6 @@ mod tests {
             .memory_ownership
             .reserve_active(rotation_bytes.saturating_mul(2))
             .expect("active ledger reservation");
-        owner
-            .admission
-            .try_reserve_active("owner-test", rotation_bytes.saturating_mul(2))
-            .expect("active admission accounting");
 
         let next_batch = owner_batch();
         let next_id = *uuid::Uuid::now_v7().as_bytes();
@@ -6538,10 +6354,6 @@ mod tests {
             .memory_ownership
             .reserve_active(active_seed)
             .expect("seed active ledger");
-        owner
-            .admission
-            .try_reserve_active("owner-test", active_seed)
-            .expect("seed active admission");
         (owner, wal, wal_root)
     }
 
@@ -6581,15 +6393,10 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(memtable, &wal, wal_handle.clone(), stream);
-        owner.admission.sync_memtable_bytes(0, frozen.arrow_bytes);
         owner
             .memory_ownership
             .reserve_immutable(frozen.arrow_bytes)
             .expect("immutable ledger ownership");
-        owner
-            .admission
-            .preflight_release_immutable(frozen.arrow_bytes)
-            .expect("immutable admission preflight");
         owner
             .memory_ownership
             .preflight_release_immutable(frozen.arrow_bytes)
@@ -6607,16 +6414,14 @@ mod tests {
         (owner, frozen.seal_id, wal, wal_root, budget)
     }
 
-    /// Builds one real prepared append with reservations owned by `owner`'s budget.
+    /// Builds one real prepared append with reservations owned by `budget`.
     ///
-    /// The initial charge deliberately exceeds the small owner batch so normal
-    /// preprocessing exercises the production shrink and category-transfer path
-    /// before `process_group` owns the append.
+    /// The lease is resized to the exact prepared bytes after preprocessing,
+    /// matching the ingress charge made before `process_group` owns the append.
     fn prepared_append_for_group_test(
-        owner: &ShardOwner,
         budget: &crate::resources::ScribeResources,
     ) -> PreparedAppend {
-        prepared_append_for_key(owner, budget, owner_key(), uuid::Uuid::now_v7())
+        prepared_append_for_key(budget, owner_key(), uuid::Uuid::now_v7())
     }
 
     /// Builds one real prepared append for an exact key and batch identity.
@@ -6627,42 +6432,50 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics if `owner`'s admission or `budget` cannot reserve the initial
-    /// charge or preprocessing rejects the fixed owner batch.
+    /// Panics if `budget` cannot reserve the item or the prepared bytes, or
+    /// preprocessing rejects the fixed owner batch.
     fn prepared_append_for_key(
-        owner: &ShardOwner,
         budget: &crate::resources::ScribeResources,
         key: SealKey,
         batch_id: uuid::Uuid,
     ) -> PreparedAppend {
         let initial_bytes = 1024 * 1024;
-        let reservation = owner
-            .admission
-            .try_reserve("owner-test".to_owned(), initial_bytes)
-            .expect("in-flight admission");
+        let reservation = crate::scribe::admission::AdmissionController::with_config_and_memory(
+            crate::scribe::admission::AdmissionConfig::default(),
+            budget.clone(),
+        )
+        .try_reserve("owner-test")
+        .expect("in-flight admission");
         let memory = budget
             .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
             .expect("ingress memory");
         let lifecycle = Arc::new(crate::scribe::telemetry::ScribeIngressLifecycle::default());
         let mut lifecycle = lifecycle.begin();
         lifecycle.reserved(initial_bytes);
-        crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
-            batch_id,
-            request_id: uuid::Uuid::now_v7(),
-            rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
-            measured_wire_bytes: initial_bytes,
-            admitted_bytes: initial_bytes,
-            maximum_scribe_envelope_bytes: budget.ingress_limit_bytes(),
-            reservation,
-            memory,
-            tenant: key.tenant,
-            table: key.table,
-            partition_granularity: key.partition.granularity(),
-            queued_at: std::time::Instant::now(),
-            durable_ack: None,
-            lifecycle,
-        })
-        .expect("prepared append")
+        let mut prepared =
+            crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
+                batch_id,
+                request_id: uuid::Uuid::now_v7(),
+                rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
+                measured_wire_bytes: initial_bytes,
+                reservation,
+                memory,
+                tenant: key.tenant,
+                table: key.table,
+                partition_granularity: key.partition.granularity(),
+                queued_at: std::time::Instant::now(),
+                durable_ack: None,
+                lifecycle,
+            })
+            .expect("prepared append");
+        let prepared_bytes = prepared.prepared_bytes;
+        prepared
+            .memory
+            .as_mut()
+            .expect("prepared lease")
+            .resize_ingress(prepared_bytes)
+            .expect("prepared bytes fit the test budget");
+        prepared
     }
 
     /// Builds one ACK-observed group for exact batch identities under `key`.
@@ -6675,18 +6488,21 @@ mod tests {
     ///
     /// Panics under the same conditions as [`prepared_append_for_key`].
     fn acked_group_for_key(
-        owner: &ShardOwner,
         budget: &crate::resources::ScribeResources,
         key: &SealKey,
         batch_ids: &[uuid::Uuid],
     ) -> (
         Vec<PreparedAppend>,
-        Vec<tokio::sync::oneshot::Receiver<Result<u64, ScribeError>>>,
+        Vec<
+            tokio::sync::oneshot::Receiver<
+                Result<crate::scribe::preprocess::DurableCompletion, ScribeError>,
+            >,
+        >,
     ) {
         batch_ids
             .iter()
             .map(|batch_id| {
-                let mut append = prepared_append_for_key(owner, budget, key.clone(), *batch_id);
+                let mut append = prepared_append_for_key(budget, key.clone(), *batch_id);
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                 append.durable_ack = Some(ack_tx);
                 (append, ack_rx)
@@ -6810,9 +6626,6 @@ mod tests {
             // State A: nothing moved, segment map intact, key retry-reachable.
             assert_eq!(owner.memory_ownership.active_bytes(), seed);
             assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
-            let admission = owner.admission.snapshot();
-            assert_eq!(admission.active_bytes, seed);
-            assert_eq!(admission.immutable_bytes, 0);
             assert!(owner.wal_segments.contains_key(&key));
             assert!(!owner.pending_generations.contains_key(&key));
             assert!(owner.seal_retry.contains(&key));
@@ -7020,7 +6833,8 @@ mod tests {
 
     /// An injected failure after WAL/SQL durability retains the same material
     /// owner, retries on the serial shard, and acknowledges only after the
-    /// original Arrow buffers are visible from the memtable snapshot.
+    /// original Arrow buffers are visible from the memtable snapshot; that
+    /// retried ACK still reports the batch's first commit.
     #[tokio::test]
     async fn post_commit_insertion_failure_retries_without_black_hole_or_early_ack() {
         let wal_root = tempfile::tempdir().expect("WAL directory");
@@ -7038,7 +6852,7 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
-        let mut append = prepared_append_for_group_test(&owner, &budget);
+        let mut append = prepared_append_for_group_test(&budget);
         let PreparedSliceSet::Materialized(slices) = &append.slices;
         let original_buffer = slices[0].rows.column(0).to_data().buffers()[0].as_ptr();
         let expected_rows = slices
@@ -7063,12 +6877,17 @@ mod tests {
         owner
             .retry_retained_post_commit()
             .expect("same-owner retry");
+        let completion = ack_rx
+            .await
+            .expect("visible success response")
+            .expect("visible insertion succeeds");
         assert_eq!(
-            ack_rx
-                .await
-                .expect("visible success response")
-                .expect("visible insertion succeeds"),
+            completion.rows,
             u64::try_from(expected_rows).expect("test row count fits u64")
+        );
+        assert!(
+            completion.first_commit,
+            "the retried insertion is the batch's first commit"
         );
         let visible = owner.memtable.stats().expect("query-visible rows");
         assert_eq!(
@@ -7107,7 +6926,7 @@ mod tests {
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
         let group = (0..3)
-            .map(|_| prepared_append_for_group_test(&owner, &budget))
+            .map(|_| prepared_append_for_group_test(&budget))
             .collect::<Vec<_>>();
 
         owner.process_group(group).await.expect("group commits");
@@ -7164,7 +6983,7 @@ mod tests {
         };
 
         let (mut owner, budget, _command_tx, _wal, _stream) = open_owner(1);
-        let (group, acks) = acked_group_for_key(&owner, &budget, &key, &batch_ids);
+        let (group, acks) = acked_group_for_key(&budget, &key, &batch_ids);
         let mut blocker = superuser.begin().await.expect("fence blocker");
         sqlx::query(
             "INSERT INTO vala.scribe_batch_commits (data_tenant_id, logical_table_fqn, batch_id, \
@@ -7223,7 +7042,7 @@ mod tests {
         };
         assert_eq!(rows(&owner), batch_ids.len());
 
-        let (retry, acks) = acked_group_for_key(&owner, &budget, &key, &batch_ids);
+        let (retry, acks) = acked_group_for_key(&budget, &key, &batch_ids);
         owner.process_group(retry).await.expect("same-ID retry");
         for ack in acks {
             ack.await.expect("retry ACK").expect("retry succeeds");
@@ -7253,7 +7072,7 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
-        let mut append = prepared_append_for_group_test(&owner, &budget);
+        let mut append = prepared_append_for_group_test(&budget);
         let PreparedSliceSet::Materialized(slices) = &append.slices;
         let expected_rows = slices
             .iter()
@@ -7289,7 +7108,8 @@ mod tests {
             ack_rx
                 .await
                 .expect("post-visible ACK")
-                .expect("visible insertion succeeds"),
+                .expect("visible insertion succeeds")
+                .rows,
             u64::try_from(expected_rows).expect("test row count fits u64")
         );
         assert_eq!(
@@ -7347,50 +7167,36 @@ mod tests {
         assert!(visibility_error.contains("generation"));
     }
 
-    /// Proves the staged generation left the owner's snapshot, then retires it.
+    /// Proves the staged generation left the live read, then retires it.
     ///
-    /// The snapshot goes through the real `Snapshot` mailbox command with a
-    /// narrow required-column projection, so this observes the owner's own
-    /// live-tail path rather than its internals. A generation whose persistence
-    /// completion carried a staged member has handed its rows to that member:
-    /// the staged source is their single authority from that moment, and an
-    /// owner that still served the retained Arrow copy would double every one
-    /// of those rows for any reader that consults both. Retirement and shutdown
-    /// then run as mailbox commands too, so the owner task must terminate on
-    /// its own.
+    /// The read goes through the same memtable cut live reads take, with a
+    /// narrow required-column projection, while the owner task runs. A
+    /// generation whose persistence completion carried a staged member has
+    /// handed its rows to that member: the staged source is their single
+    /// authority from that moment, and a live read that still served the
+    /// retained Arrow copy would double every one of those rows for any reader
+    /// that consults both. Retirement and shutdown then run as mailbox
+    /// commands, so the owner task must terminate on its own.
     ///
     /// # Panics
     ///
-    /// Panics if any mailbox send or response fails, if the owner still serves
-    /// the staged generation, or if the owner task does not join.
+    /// Panics if the cut fails, if a mailbox send or response fails, if the
+    /// live read still serves the staged generation, or if the owner task does
+    /// not join.
     async fn assert_visible_rows_then_retire_and_shutdown(
         key: &SealKey,
-        stream: StreamIdentity,
+        live: &Memtable,
         command_tx: &mpsc::Sender<ShardCommand>,
         task: tokio::task::JoinHandle<()>,
     ) {
-        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
-            .expect("owner binding");
-        let (snapshot_response, snapshot_rx) = tokio::sync::oneshot::channel();
-        command_tx
-            .send(ShardCommand::Snapshot {
-                request: FetchLiveTailRequest {
-                    binding,
-                    target_stream: stream,
-                    start_partition: key.partition,
-                    end_partition: key.partition,
-                    required_columns: vec!["value".to_owned()],
-                    predicates: Vec::new(),
-                    max_batches: 4,
-                    max_retained_bytes: 1 << 20,
-                },
-                response: snapshot_response,
-            })
-            .await
-            .expect("visible snapshot command mailbox");
-        let visible = snapshot_rx
-            .await
-            .expect("snapshot response")
+        let visible = live
+            .readable_batches_for_range(
+                key.tenant,
+                &key.table,
+                key.partition,
+                key.partition,
+                &["value".to_owned()],
+            )
             .expect("visible owner rows");
         assert!(
             visible.is_empty(),
@@ -7446,10 +7252,6 @@ mod tests {
             .memory_ownership
             .reserve_active(active_bytes)
             .expect("active memory ownership");
-        owner
-            .admission
-            .try_reserve_active("owner-proof", active_bytes)
-            .expect("active admission ownership");
         let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
         owner.persistence = Some(Arc::new(persistence.clone()));
         owner.generation_started_at = std::time::Instant::now()
@@ -7457,9 +7259,10 @@ mod tests {
             .expect("expired owner generation");
         assert!(owner.wal_handle.has_active_records().expect("active WAL"));
         assert!(owner.generation_started_at.elapsed() >= owner.generation_max_age);
-        let append = prepared_append_for_group_test(&owner, &budget);
+        let append = prepared_append_for_group_test(&budget);
         owner.pending.fetch_add(1, Ordering::AcqRel);
 
+        let live = Arc::clone(&owner.memtable);
         let task = tokio::spawn(owner.run());
         command_tx
             .send(ShardCommand::Append(Box::new(append)))
@@ -7502,7 +7305,7 @@ mod tests {
                 .has_active_records()
                 .expect("fresh WAL generation")
         );
-        assert_visible_rows_then_retire_and_shutdown(&key, stream, &command_tx, task).await;
+        assert_visible_rows_then_retire_and_shutdown(&key, &live, &command_tx, task).await;
     }
 
     #[test]
@@ -7785,12 +7588,18 @@ mod tests {
         bounded_group_preserves_fifo_and_rotation(busy, quiet);
     }
 
-    /// Two tenants with uneven table counts still alternate at the tenant level.
+    /// Two tenants with uneven table counts or request sizes still alternate
+    /// at the tenant level.
+    ///
+    /// Scheduling is the only fairness owner once memory is one shared root:
+    /// no per-table byte reserve exists, so request size must not buy or cost
+    /// a turn either.
     ///
     /// # Panics
     ///
-    /// Panics when a tenant that owns more tables receives more turns than a
-    /// tenant that owns one, which would make table count a fairness lever.
+    /// Panics when a tenant that owns more tables, or sends larger requests,
+    /// receives more or fewer turns than its peer, which would make table
+    /// count or byte size a fairness lever.
     #[test]
     fn scheduler_tenant_fairness_is_independent_of_table_count() {
         let wide = DataTenantId::new_v7();
@@ -7812,6 +7621,25 @@ mod tests {
         );
         let alternating: Vec<bool> = group.iter().map(|item| item.tenant() == wide).collect();
         assert_eq!(alternating, vec![true, false, true, false, true, false]);
+
+        let heavy = DataTenantId::new_v7();
+        let light = DataTenantId::new_v7();
+        for sequence in 0..3 {
+            let mut large = scheduled(heavy, "hot", sequence);
+            large.bytes = 64 * 1024 * 1024;
+            scheduler.push(large);
+            scheduler.push(scheduled(light, "hot", 100 + sequence));
+        }
+        let sized: Vec<bool> = scheduler
+            .pop_group()
+            .iter()
+            .map(|item| item.tenant() == heavy)
+            .collect();
+        assert_eq!(
+            sized,
+            vec![true, false, true, false, true, false],
+            "request size buys no extra tenant-level turns"
+        );
     }
 
     /// Verify that shard lookup is bounded within the fixed topology for any batch.
@@ -8011,7 +7839,6 @@ mod tests {
             },
         );
         let governor_before = budget.accounting_snapshot_for_test();
-        let admission_before = owner.admission.snapshot();
         let active_ledger_before = owner.memory_ownership.active_bytes();
         let immutable_ledger_before = owner.memory_ownership.immutable_bytes();
         let wal_bytes_before = crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir());
@@ -8026,7 +7853,6 @@ mod tests {
         assert!(matches!(result, Err(ScribeError::Internal { .. })));
         assert!(owner.retained_generations.contains_key(&frozen.seal_id));
         assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
-        assert_eq!(owner.admission.snapshot(), admission_before);
         assert_eq!(owner.memory_ownership.active_bytes(), active_ledger_before);
         assert_eq!(
             owner.memory_ownership.immutable_bytes(),
@@ -8064,7 +7890,6 @@ mod tests {
             .expect("retirement plan")
             .expect("token");
         let governor_before = budget.accounting_snapshot_for_test();
-        let admission_before = owner.admission.snapshot();
         let ledger_before = owner.memory_ownership.immutable_bytes();
         let wal_before = crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir());
         let wal_files_before = wal_file_snapshot(root.path()).expect("WAL file snapshot");
@@ -8079,7 +7904,6 @@ mod tests {
         );
         assert!(owner.retained_generations.contains_key(&generation_id));
         assert_eq!(budget.accounting_snapshot_for_test(), governor_before);
-        assert_eq!(owner.admission.snapshot(), admission_before);
         assert_eq!(owner.memory_ownership.immutable_bytes(), ledger_before);
         assert_eq!(
             crate::scribe::wal::wal_file_bytes_for_test(wal.base_dir()),
@@ -8214,31 +8038,6 @@ mod tests {
         );
     }
 
-    /// A failed seal preparation leaves active ownership retry-reachable.
-    #[test]
-    fn seal_transfer_failure_preserves_retryable_active_state() {
-        let key = owner_key();
-        let seed = 1_usize << 20;
-        let (mut owner, _wal, _root) = owner_for_seal_atomicity_test(&key, seed);
-        let before = owner.admission.snapshot();
-        owner.admission.sync_memtable_bytes(0, 0);
-
-        let error = owner
-            .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
-            .expect_err("admission preflight must reject before freezing");
-        assert!(matches!(error, ScribeError::Internal { .. }));
-        assert!(owner.memtable.row_count(&key).expect("bucket bytes") > 0);
-        assert!(!owner.pending_generations.contains_key(&key));
-        assert!(owner.wal_segments.contains_key(&key));
-        assert!(owner.seal_retry.contains(&key));
-        assert_eq!(owner.memory_ownership.active_bytes(), seed);
-        assert_eq!(
-            owner.admission.snapshot().immutable_bytes,
-            before.immutable_bytes
-        );
-        assert!(owner.memory_ownership.is_poisoned());
-    }
-
     /// The legacy post-sync fault is now an owner-local retry point and cannot
     /// enter cleanup or consume a separately armed cleanup-accounting fault.
     #[tokio::test]
@@ -8259,7 +8058,7 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
-        let prepared = prepared_append_for_group_test(&owner, &budget);
+        let prepared = prepared_append_for_group_test(&budget);
         wal.trip_post_sync_failure_for_test();
         let PreparedSliceSet::Materialized(expected_slices) = &prepared.slices;
         let expected_rows = expected_slices
@@ -8278,7 +8077,6 @@ mod tests {
         let memtable = owner.memtable.stats().expect("memtable stats");
         assert_eq!(memtable.writable_rows, expected_rows);
         assert_eq!(memtable.immutable_rows, 0);
-        assert!(owner.admission.snapshot().active_bytes > 0);
         assert!(owner.memory_ownership.active_bytes() > 0);
         assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_ok());
     }

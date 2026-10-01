@@ -31,8 +31,8 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
@@ -46,8 +46,7 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
 use datafusion_distributed::NetworkBoundaryExt as _;
 use futures_util::FutureExt;
@@ -59,19 +58,21 @@ use iceberg::io::{FileIO, FileRead};
 use iceberg::scan::FileScanTask;
 use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
-use tracing::Instrument;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::{BifrostSecurityPhase, BifrostSecurityViolationKind, QueryClass};
-use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
-use super::{
-    AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit, OracleMemoryResources,
-    OracleTelemetry, VerifiedSecurityContext,
-};
+use crate::scribe::hot_source::StagedSourceLease;
+use crate::storage::error_chain_contains_not_found;
+use wyrd_spec::vala::api::{QueryClass, WorkerScanStats};
+use wyrd_spec::vala::assignment_authority::ScanPredicate;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
+
+use super::live::LiveScribeExec;
+use super::{AuthorizedQueryContext, OracleMemoryResources, OracleTelemetry};
 
 #[cfg(feature = "test-support")]
 static REMOTE_PARTITION_ATTEMPTS: std::sync::atomic::AtomicU64 =
@@ -93,13 +94,14 @@ pub fn remote_partition_attempts_for_test() -> u64 {
 /// Shared physical scan state retained by one executing source plan.
 #[derive(Debug, Default)]
 pub(super) struct OracleScanMetricsHandle {
-    /// Iceberg's dependency-reported requested-range counter.
-    iceberg: Mutex<Option<ScanMetrics>>,
+    /// Iceberg's dependency-reported requested-range counters, one per
+    /// partition reader that started.
+    iceberg: Mutex<Vec<ScanMetrics>>,
     /// Requested bytes from governed hot Parquet range reads.
     hot_bytes: AtomicU64,
     /// Whether at least one hot object read was requested.
     hot_available: AtomicBool,
-    /// Number of Iceberg file tasks delivered to the reader.
+    /// Number of Iceberg files delivered to the readers, counted once per file.
     iceberg_files: AtomicU64,
     /// Whether the Iceberg reader received at least one task.
     iceberg_partitions: AtomicU64,
@@ -114,16 +116,22 @@ pub(super) struct OracleScanMetricsHandle {
 }
 
 impl OracleScanMetricsHandle {
-    /// Stores the dependency counter before its stream is consumed.
-    fn set_iceberg_metrics(&self, metrics: ScanMetrics) {
+    /// Retains one partition reader's dependency counter before its stream
+    /// is consumed; terminal bytes sum every retained counter.
+    fn add_iceberg_metrics(&self, metrics: ScanMetrics) {
         if let Ok(mut current) = self.iceberg.lock() {
-            *current = Some(metrics);
+            current.push(metrics);
         }
     }
 
-    /// Records one task delivered to the Iceberg reader.
-    fn record_iceberg_task(&self) {
-        self.iceberg_files.fetch_add(1, Ordering::Relaxed);
+    /// Records one task delivered to an Iceberg reader.
+    ///
+    /// A file split across partitions is counted only by the piece that
+    /// begins at the file's first byte, so each file counts once.
+    fn record_iceberg_task(&self, task: &FileScanTask) {
+        if task.start == 0 {
+            self.iceberg_files.fetch_add(1, Ordering::Relaxed);
+        }
         self.iceberg_partitions.store(1, Ordering::Relaxed);
     }
 
@@ -157,9 +165,11 @@ impl OracleScanMetricsHandle {
         let mut total = 0_u64;
         let mut available = false;
         if let Ok(metrics) = self.iceberg.lock()
-            && let Some(metrics) = metrics.as_ref()
+            && !metrics.is_empty()
         {
-            total = total.saturating_add(metrics.bytes_read());
+            total = metrics.iter().fold(total, |total, metrics| {
+                total.saturating_add(metrics.bytes_read())
+            });
             available = true;
         }
         if self.hot_available.load(Ordering::Acquire) {
@@ -189,8 +199,62 @@ impl OracleScanMetricsHandle {
 /// Records one pinned Iceberg task and returns it without altering its delete
 /// metadata, schema, predicate, or byte range.
 fn retain_iceberg_task(task: FileScanTask, metrics: &Arc<OracleScanMetricsHandle>) -> FileScanTask {
-    metrics.record_iceberg_task();
+    metrics.record_iceberg_task(&task);
     task
+}
+
+/// Returns the byte ranges one partition reads when `sizes` are laid end to end.
+///
+/// The concatenated bytes are cut into `partitions` equal contiguous ranges and
+/// each returned `(file index, range)` is the non-empty intersection of this
+/// partition's range with one file. The ranges of all partitions tile every
+/// file exactly, so a row group assigned by its midpoint (see
+/// [`row_groups_in_byte_range`]) is read by exactly one partition. This is the
+/// split Iceberg's own reader honors through `FileScanTask::start`/`length`.
+fn partition_byte_ranges(
+    sizes: &[u64],
+    partition: usize,
+    partitions: usize,
+) -> Vec<(usize, Range<u64>)> {
+    let total: u128 = sizes.iter().map(|size| u128::from(*size)).sum();
+    let partitions = u128::try_from(partitions.max(1)).unwrap_or(u128::MAX);
+    let partition = u128::try_from(partition).unwrap_or(u128::MAX);
+    let bound = |index: u128| total.saturating_mul(index) / partitions;
+    let (low, high) = (bound(partition), bound(partition.saturating_add(1)));
+    let mut ranges = Vec::new();
+    let mut offset = 0_u128;
+    for (index, size) in sizes.iter().enumerate() {
+        let end = offset + u128::from(*size);
+        let (start, stop) = (low.max(offset), high.min(end));
+        if start < stop {
+            // Both bounds lie within this file, so they fit its u64 size.
+            let local = |at: u128| u64::try_from(at - offset).unwrap_or(u64::MAX);
+            ranges.push((index, local(start)..local(stop)));
+        }
+        offset = end;
+    }
+    ranges
+}
+
+/// Returns the row groups of `metadata` whose byte midpoint lies in `range`.
+///
+/// Row groups are laid out after the four-byte magic header in index order,
+/// exactly as Iceberg's reader locates them for a split `FileScanTask`, so a
+/// hot file and a published file split identically.
+fn row_groups_in_byte_range(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    range: &Range<u64>,
+) -> Vec<usize> {
+    let mut offset = 4_u64;
+    let mut owned = Vec::new();
+    for (index, row_group) in metadata.row_groups().iter().enumerate() {
+        let size = u64::try_from(row_group.compressed_size()).unwrap_or_default();
+        if range.contains(&(offset + size / 2)) {
+            owned.push(index);
+        }
+        offset += size;
+    }
+    owned
 }
 
 /// Physical scan volume reported by every participant of one distributed query.
@@ -221,7 +285,11 @@ pub(crate) struct RemoteScanMetrics {
 
 impl RemoteScanMetrics {
     /// Folds one completed participant's footer evidence into the running total.
-    fn record_footer(&self, stats: wyrd_spec::vala::api::WorkerScanStats) {
+    ///
+    /// Called once per completed participant: a distributed fold records its
+    /// whole cut once, and a live Scribe fragment records its footer or
+    /// in-process completion once, when that completion validates.
+    pub(super) fn record_footer(&self, stats: WorkerScanStats) {
         if let Some(bytes) = stats.bytes_scanned {
             self.bytes_scanned.fetch_add(bytes, Ordering::Relaxed);
             self.bytes_available.store(true, Ordering::Release);
@@ -377,6 +445,9 @@ impl OracleQueryScanStats {
         if let Some(source) = plan.downcast_ref::<HotParquetExec>() {
             stats.scan_handles.push(Arc::clone(source.metrics()));
         }
+        if let Some(source) = plan.downcast_ref::<LiveScribeExec>() {
+            stats.remote_handles.push(Arc::clone(source.scan_metrics()));
+        }
         // A remote placeholder hides the leaf it substituted from `children`
         // so the distributed planner keeps scaling it as one. The leader still
         // executes that leaf whenever the stage stays in the head, so scan
@@ -505,7 +576,7 @@ pub(crate) async fn record_distributed_scan_metrics(
         datafusion_distributed::DistributedMetricsFormat::Aggregated,
     )
     .await?;
-    let mut totals = wyrd_spec::vala::api::WorkerScanStats::default();
+    let mut totals = WorkerScanStats::default();
     fold_distributed_scan_metrics(&with_metrics, &mut totals);
     sink.record_footer(totals);
     Ok(with_metrics)
@@ -518,10 +589,7 @@ pub(crate) async fn record_distributed_scan_metrics(
 /// plain child walk sees only the coordinator's own stage and reports a query
 /// that scanned nothing. Descending both edges is what reaches the follower
 /// leaves where the reads actually happened.
-fn fold_distributed_scan_metrics(
-    node: &Arc<dyn ExecutionPlan>,
-    totals: &mut wyrd_spec::vala::api::WorkerScanStats,
-) {
+fn fold_distributed_scan_metrics(node: &Arc<dyn ExecutionPlan>, totals: &mut WorkerScanStats) {
     if let Some(metrics) = node.metrics() {
         let metrics = metrics.aggregate_by_name();
         for name in ["bytes_scanned", WYRD_BYTES_SCANNED_METRIC] {
@@ -804,10 +872,213 @@ pub(crate) struct OracleIcebergScanExec {
     /// two are the same object, so drift detection has to compare them in one
     /// spelling or it refuses every promoted file.
     assigned_aliases: std::collections::BTreeMap<String, String>,
-    /// Cached properties copied from the pinned source plan.
+    /// Properties copied from the pinned source plan, at this scan's
+    /// partition count.
     properties: Arc<PlanProperties>,
     /// Shared terminal metric owner retained by query telemetry.
     metrics: Arc<OracleScanMetricsHandle>,
+    /// Governed footer cache the reader loads data-file metadata through;
+    /// `None` leaves footer decoding to the Iceberg reader.
+    footers: Option<PublishedFooters>,
+    /// Pinned file tasks, planned once and shared by every partition.
+    planned: Arc<tokio::sync::OnceCell<Vec<FileScanTask>>>,
+    /// Iceberg reader built once and cloned by every partition, because
+    /// building one probes the host's CPU limits.
+    reader: Arc<tokio::sync::OnceCell<iceberg::arrow::ArrowReader>>,
+}
+
+/// What a pinned Iceberg scan needs to load data-file footers through the
+/// node's one governed metadata cache.
+///
+/// Built at planning time, before admission, so it retains only the
+/// planning-time [`HotParquetPlan`]; the admitted pool, class, and deadline
+/// are resolved from the executing task, exactly as a hot leaf resolves them.
+#[derive(Clone)]
+pub(super) struct PublishedFooters {
+    /// The node's one storage owner and its decoded-metadata cache.
+    storage: Arc<crate::storage::BifrostStorage>,
+    /// Authenticated tenant owning every scanned object.
+    tenant_id: wyrd_spec::DataTenantId,
+    /// Canonical logical table name scoping every key.
+    table: String,
+    /// Planning-time governance for the footer ranges a cache miss reads.
+    governance: HotParquetPlan,
+}
+
+impl PublishedFooters {
+    /// Captures the storage owner, tenant, table, and governance mode one
+    /// pinned Iceberg scan loads its footers under.
+    pub(super) fn new(
+        storage: Arc<crate::storage::BifrostStorage>,
+        tenant_id: wyrd_spec::DataTenantId,
+        table: String,
+        governance: HotParquetPlan,
+    ) -> Self {
+        Self {
+            storage,
+            tenant_id,
+            table,
+            governance,
+        }
+    }
+
+    /// Resolves one executing scan's footer loader.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` execution error when the admitted governance
+    /// cannot be resolved from `task`: absent bindings, a cancelled query, or
+    /// an elapsed deadline.
+    fn loader(
+        &self,
+        file_io: FileIO,
+        task: &TaskContext,
+    ) -> DataFusionResult<Arc<PublishedFooterLoader>> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        Ok(Arc::new(PublishedFooterLoader {
+            storage: Arc::clone(&self.storage),
+            file_io,
+            tenant_id: self.tenant_id,
+            table: self.table.clone(),
+            governance: self.governance.resolve(task)?,
+            retained: Arc::new(Mutex::new(Vec::new())),
+            _cancel_on_drop: cancel.clone().drop_guard(),
+            cancel,
+        }))
+    }
+}
+
+/// Serves one pinned Iceberg scan's data-file footers from the node's one
+/// governed metadata cache.
+///
+/// Without it the Iceberg reader decodes every data file's footer and page
+/// index again on every query. Through it, one decode per immutable object is
+/// shared across queries, concurrent misses single-flight, and retained
+/// footers are charged to the one Oracle memory root. Every load's
+/// [`crate::storage::RetainedMetadata`] is held for the loader's life, which is
+/// the scan stream's life, so evicting an entry never releases the charge for
+/// bytes this scan still reads. Dropping the loader cancels any decode it still
+/// has outstanding.
+struct PublishedFooterLoader {
+    /// The node's one storage owner and its decoded-metadata cache.
+    storage: Arc<crate::storage::BifrostStorage>,
+    /// Pinned table reader, used only when a footer is not cached.
+    file_io: FileIO,
+    /// Authenticated tenant owning every scanned object.
+    tenant_id: wyrd_spec::DataTenantId,
+    /// Canonical logical table name scoping every key.
+    table: String,
+    /// Admitted governance charged for the footer ranges a miss reads.
+    governance: HotParquetGovernance,
+    /// Every footer this scan loaded, retained until the scan ends.
+    retained: Arc<Mutex<Vec<crate::storage::RetainedMetadata>>>,
+    /// Cancels outstanding decodes when the loader is dropped.
+    _cancel_on_drop: tokio_util::sync::DropGuard,
+    /// Token every decode this loader starts is bound to.
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl iceberg::arrow::ParquetMetadataLoader for PublishedFooterLoader {
+    /// Loads one data file's footer through the governed cache and proves its
+    /// tenant.
+    ///
+    /// A miss reads the footer and page index through the same governed,
+    /// range-reserving reader the hot tier uses; its range observations go to
+    /// a scratch handle because they are not hot-tier reads. Every load, hit
+    /// or miss, compares the footer tenant with the authenticated tenant before
+    /// the reader sees the metadata.
+    ///
+    /// # Errors
+    ///
+    /// The returned future fails with the storage owner's closed error as the
+    /// Iceberg error's source, so a vanished object keeps its not-found cause
+    /// for stale-object classification, and with
+    /// [`BifrostError::QueryTenantInvariant`] as the source when the footer
+    /// tenant is missing or foreign.
+    fn load(
+        &self,
+        path: &str,
+        size: u64,
+    ) -> BoxFuture<'static, iceberg::Result<Arc<ParquetMetaData>>> {
+        let key = crate::storage::ObjectMetadataKey::published(
+            self.tenant_id,
+            self.table.clone(),
+            path.to_owned(),
+            size,
+        );
+        let build_reader = {
+            let file_io = self.file_io.clone();
+            let location = path.to_owned();
+            let governance = self.governance.clone();
+            move || {
+                IcebergParquetReader::new(
+                    HotObjectSource::Pending {
+                        file_io: file_io.clone(),
+                        location: location.clone(),
+                    },
+                    size,
+                    governance.clone(),
+                    Arc::new(OracleScanMetricsHandle::default()),
+                )
+            }
+        };
+        let storage = Arc::clone(&self.storage);
+        let cancel = self.cancel.clone();
+        let retained = Arc::clone(&self.retained);
+        let tenant = self.tenant_id;
+        async move {
+            let loaded = storage
+                .object_metadata(key, build_reader, storage.metadata_deadline(), cancel)
+                .await
+                .map_err(|error| {
+                    iceberg::Error::new(
+                        iceberg::ErrorKind::Unexpected,
+                        "governed data-file footer load failed",
+                    )
+                    .with_source((*error).clone())
+                })?;
+            let metadata = Arc::clone(loaded.metadata());
+            // Checked before the metadata reaches the reader, so a foreign or
+            // unproven file yields no row group, page, or row.
+            verify_scanned_footer_tenant(&metadata, tenant).map_err(|error| {
+                iceberg::Error::new(
+                    iceberg::ErrorKind::DataInvalid,
+                    "scanned data-file footer violates the tenant invariant",
+                )
+                .with_source(error)
+            })?;
+            retained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(loaded);
+            Ok(metadata)
+        }
+        .boxed()
+    }
+}
+
+/// Routes every pinned Iceberg scan in `plan` through `footers`.
+///
+/// Used where a plan's Iceberg leaves were built by code that cannot see the
+/// storage owner, such as a follower's catalog scan.
+///
+/// # Errors
+///
+/// Returns the `DataFusion` error of a failed plan rewrite.
+pub(super) fn route_published_footers(
+    plan: Arc<dyn ExecutionPlan>,
+    footers: &PublishedFooters,
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    use datafusion::common::tree_node::{Transformed, TreeNode as _};
+    plan.transform_up(|node| {
+        let Some(exec) = node.downcast_ref::<OracleIcebergScanExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        Ok(Transformed::yes(Arc::new(
+            exec.clone().with_footers(footers.clone()),
+        )))
+    })
+    .map(|transformed| transformed.data)
 }
 
 /// Domain marker for one authenticated Iceberg object lost after cut selection.
@@ -817,30 +1088,6 @@ struct OracleIcebergStaleObject {
     /// Exact typed storage cause retained for diagnostics and downcast proof.
     #[source]
     source: Box<dyn std::error::Error + Send + Sync>,
-}
-
-/// Returns whether an error chain contains an exact filesystem or `OpenDAL` not-found cause.
-///
-/// Object-store backends report a vanished object through their own typed
-/// error, wrapped an arbitrary number of times by Iceberg, Parquet, and
-/// `DataFusion`. Walking the whole chain and downcasting is the only way to
-/// separate a pinned object that disappeared after cut selection from a
-/// genuine storage outage, which the caller must classify differently.
-pub(super) fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(error);
-    while let Some(source) = current {
-        if source
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            || source
-                .downcast_ref::<opendal::Error>()
-                .is_some_and(|error| error.kind() == opendal::ErrorKind::NotFound)
-        {
-            return true;
-        }
-        current = source.source();
-    }
-    false
 }
 
 /// Preserves a typed Iceberg-only stale marker without classifying adjacent IO.
@@ -857,12 +1104,37 @@ where
     }
 }
 
-/// Detects the tenant tripwire's terminal refusal anywhere in an execution
-/// error chain.
+/// Proves one scanned object's footer names the authenticated tenant.
 ///
-/// [`TenantTripwireExec`] fails a stream with
-/// [`BifrostError::QueryTenantInvariant`] the moment a physically scanned row
-/// carries a foreign tenant. That refusal is a security outcome, not a
+/// This is the one tenant check of the shared Parquet scan: published Iceberg
+/// footers, hot objects, and Scribe staged runs all reach it before any row
+/// group is decoded. The comparison happens once per opened object, so its
+/// cost is independent of row count.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryTenantInvariant`] when the footer carries no
+/// tenant, more than one tenant, or a tenant other than `tenant`.
+fn verify_scanned_footer_tenant(
+    metadata: &ParquetMetaData,
+    tenant: DataTenantId,
+) -> Result<(), BifrostError> {
+    crate::parquet::footer::verify_footer_tenant(metadata.file_metadata(), tenant).map_err(
+        |detail| {
+            tracing::error!(
+                detail = %detail,
+                "scanned object footer does not prove the authenticated tenant"
+            );
+            BifrostError::QueryTenantInvariant
+        },
+    )
+}
+
+/// Detects the footer tenant refusal anywhere in an execution error chain.
+///
+/// [`verify_scanned_footer_tenant`] fails a scan with
+/// [`BifrostError::QueryTenantInvariant`] the moment an opened object's footer
+/// is missing or names a foreign tenant. That refusal is a security outcome, not a
 /// transport failure, so every layer that classifies a stream error must
 /// recognize it here rather than collapsing it into a retryable class and
 /// losing the reason the query was refused.
@@ -927,7 +1199,30 @@ impl OracleIcebergScanExec {
             assigned_aliases: std::collections::BTreeMap::new(),
             properties: Arc::clone(plan.properties()),
             metrics: Arc::new(OracleScanMetricsHandle::default()),
+            footers: None,
+            planned: Arc::default(),
+            reader: Arc::default(),
         })
+    }
+
+    /// Reads this scan across `partitions` byte-range partitions.
+    ///
+    /// Callers pass their session's target partitions, the way a `DataFusion`
+    /// listing scan splits its file groups. See [`partition_byte_ranges`].
+    pub(crate) fn with_partitions(mut self, partitions: usize) -> Self {
+        self.properties = Arc::new(
+            self.properties
+                .as_ref()
+                .clone()
+                .with_partitioning(Partitioning::UnknownPartitioning(partitions.max(1))),
+        );
+        self
+    }
+
+    /// Loads this scan's data-file footers through the governed cache.
+    pub(super) fn with_footers(mut self, footers: PublishedFooters) -> Self {
+        self.footers = Some(footers);
+        self
     }
 
     /// Restricts this pinned scan to one exact authenticated follower assignment.
@@ -943,6 +1238,9 @@ impl OracleIcebergScanExec {
     ) -> Self {
         self.assigned_files = Some(assigned_files);
         self.assigned_aliases = assigned_aliases;
+        // A restricted scan plans a different task set, never the one an
+        // unrestricted clone may already have planned.
+        self.planned = Arc::default();
         self
     }
 
@@ -1000,7 +1298,7 @@ impl OracleIcebergScanExec {
             .map_err(iceberg_datafusion_error)
     }
 
-    /// Rebuilds the exact pinned Iceberg scan and starts its reader stream.
+    /// Rebuilds the exact pinned Iceberg scan and plans its file tasks.
     ///
     /// Where the predicate is applied depends on who selected the files.
     ///
@@ -1023,10 +1321,10 @@ impl OracleIcebergScanExec {
     ///
     /// # Errors
     ///
-    /// Returns a typed `DataFusion` error when scan planning, task planning,
-    /// predicate binding, reader construction, or object-store reads fail, and
-    /// a plan error when an assigned file is absent from the pinned snapshot.
-    async fn start_stream(&self) -> DataFusionResult<SendableRecordBatchStream> {
+    /// Returns a typed `DataFusion` error when scan planning, task planning, or
+    /// predicate binding fails, and a plan error when an assigned file is
+    /// absent from the pinned snapshot.
+    async fn plan_tasks(&self) -> DataFusionResult<Vec<FileScanTask>> {
         let mut builder = self.table.scan();
         if let Some(snapshot_id) = self.snapshot_id {
             builder = builder.snapshot_id(snapshot_id);
@@ -1046,7 +1344,7 @@ impl OracleIcebergScanExec {
             .try_collect::<Vec<_>>()
             .await
             .map_err(iceberg_datafusion_error)?;
-        let tasks = if let Some(assigned) = &self.assigned_files {
+        if let Some(assigned) = &self.assigned_files {
             let planned = tasks
                 .iter()
                 .map(|task| self.assignment_location(&task.data_file_path))
@@ -1076,32 +1374,81 @@ impl OracleIcebergScanExec {
                 ));
             }
             let row_filter = self.assignment_row_filter()?;
-            tasks
+            return Ok(tasks
                 .into_iter()
                 .filter(|task| assigned.contains(&self.assignment_location(&task.data_file_path)))
                 .map(|mut task| {
                     task.predicate.clone_from(&row_filter);
                     task
                 })
-                .collect::<Vec<_>>()
-        } else {
-            tasks
-        };
-        let tasks = futures_util::stream::iter(tasks.into_iter().map(Ok));
+                .collect());
+        }
+        Ok(tasks)
+    }
+
+    /// Starts one partition's Iceberg reader over its byte ranges.
+    ///
+    /// Every partition awaits the same planned task list, then reads only the
+    /// byte ranges [`partition_byte_ranges`] assigns it; the reader keeps each
+    /// row group whose midpoint lies in a task's range. `footers` is the
+    /// resolved governed footer loader the reader loads, and tenant-proves,
+    /// every data file's metadata through. The first partition to start
+    /// builds the one reader every partition clones, so its loader serves the
+    /// whole query; every partition of one execution resolves the same
+    /// admitted governance, so any partition's loader is equivalent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed `DataFusion` error when task planning, reader
+    /// construction, or object-store reads fail, and
+    /// [`BifrostError::QueryTenantInvariant`] when a planned file carries key
+    /// metadata, because the reader opens such a file without the loader.
+    async fn start_stream(
+        &self,
+        partition: usize,
+        footers: Arc<PublishedFooterLoader>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let planned = self.planned.get_or_try_init(|| self.plan_tasks()).await?;
+        // Bifrost writes no encrypted data file. One that claims key metadata
+        // would bypass the tenant-proving loader, so it is refused outright.
+        if planned.iter().any(|task| task.key_metadata.is_some()) {
+            return Err(DataFusionError::External(Box::new(
+                BifrostError::QueryTenantInvariant,
+            )));
+        }
+        let sizes = planned.iter().map(|task| task.length).collect::<Vec<_>>();
+        let partitions = self.properties.partitioning.partition_count();
+        let tasks = partition_byte_ranges(&sizes, partition, partitions)
+            .into_iter()
+            .map(|(index, range)| {
+                let mut task = planned[index].clone();
+                task.start += range.start;
+                task.length = range.end - range.start;
+                Ok(task)
+            })
+            .collect::<Vec<_>>();
+        let tasks = futures_util::stream::iter(tasks);
         // Row selection turns each task predicate into a page-index selection,
         // so a point lookup decodes the matching pages instead of every page
         // of each surviving row group. The reader defaults it off.
-        let metrics = self
-            .table
-            .reader_builder()
-            .with_row_selection_enabled(true)
-            .build()
+        let reader = self
+            .reader
+            .get_or_init(|| async {
+                self.table
+                    .reader_builder()
+                    .with_row_selection_enabled(true)
+                    .with_parquet_metadata_loader(footers)
+                    .build()
+            })
+            .await
+            .clone();
+        let metrics = reader
             .read(Box::pin(tasks.map_ok({
                 let metrics = Arc::clone(&self.metrics);
                 move |task| retain_iceberg_task(task, &metrics)
             })))
             .map_err(iceberg_datafusion_error)?;
-        self.metrics.set_iceberg_metrics(metrics.metrics().clone());
+        self.metrics.add_iceberg_metrics(metrics.metrics().clone());
         let stream = metrics
             .stream()
             .map(|result| result.map_err(iceberg_datafusion_error));
@@ -1187,24 +1534,34 @@ impl ExecutionPlan for OracleIcebergScanExec {
         &self.properties
     }
 
-    /// Starts one single-partition Iceberg reader stream.
+    /// Starts one partition's Iceberg reader stream.
     ///
     /// # Errors
     ///
     /// Returns a typed `DataFusion` error when scan planning or storage setup
-    /// fails, or when a non-zero partition is requested.
+    /// fails, when the partition is out of range, or when footer governance
+    /// cannot be resolved from the admitted task.
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
+        if partition >= self.properties.partitioning.partition_count() {
             return Err(DataFusionError::Execution(format!(
                 "OracleIcebergScanExec has no partition {partition}"
             )));
         }
+        // Resolved here, never at planning time: the admitted pool, class,
+        // cancellation, and deadline all arrive with this task. The loader is
+        // mandatory because it is what proves every opened footer's tenant; a
+        // scan without it would read files no check has seen.
+        let footers = self
+            .footers
+            .as_ref()
+            .ok_or_else(|| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?
+            .loader(self.table.file_io().clone(), context.as_ref())?;
         let source = self.clone();
-        let future = async move { source.start_stream().await };
+        let future = async move { source.start_stream(partition, footers).await };
         let stream = futures_util::stream::once(future).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -1219,15 +1576,18 @@ impl ExecutionPlan for OracleIcebergScanExec {
 /// the object's location, because the location is a path and two distinct
 /// durable objects must never share a decode. A row without a usable writer
 /// checksum is refused here rather than keyed on a zero digest, which would let
-/// every unchecksummed object collide on one entry.
+/// every unchecksummed object collide on one entry. The key's tenant is the
+/// authenticated binding's, never the row's, because the scan proves each
+/// object's footer against it.
 ///
 /// # Errors
 /// Returns `BifrostError::MetadataMismatch` when the row carries no decodable
 /// nonzero SHA-256.
 pub(super) fn hot_metadata_key(
+    tenant: DataTenantId,
     file: &vala_sql::row_types::file_list::HotFileRow,
     size_bytes: usize,
-) -> Result<crate::storage::HotMetadataKey, BifrostError> {
+) -> Result<crate::storage::ObjectMetadataKey, BifrostError> {
     let size_bytes_u64 = u64::try_from(size_bytes).map_err(|_| BifrostError::MetadataMismatch {
         detail: "hot file size exceeds process bounds".to_owned(),
     })?;
@@ -1240,12 +1600,8 @@ pub(super) fn hot_metadata_key(
         .ok_or_else(|| BifrostError::MetadataMismatch {
             detail: "hot file row carries no usable object checksum".to_owned(),
         })?;
-    Ok(crate::storage::HotMetadataKey::new(
-        wyrd_spec::DataTenantId::new(file.data_tenant_id).map_err(|_| {
-            BifrostError::MetadataMismatch {
-                detail: "hot file row carries a non-v7 tenant identity".to_owned(),
-            }
-        })?,
+    Ok(crate::storage::ObjectMetadataKey::new(
+        tenant,
         file.table_name.clone(),
         file.file_path.clone(),
         file.id,
@@ -1272,7 +1628,7 @@ pub(crate) struct HotFileSource {
     /// Built from the signed `vala.file_list` facts rather than from the
     /// location, so two queries for the same durable object share one decode
     /// and two distinct objects never collide even under the same path prefix.
-    pub(crate) metadata_key: crate::storage::HotMetadataKey,
+    pub(crate) metadata_key: crate::storage::ObjectMetadataKey,
 }
 
 /// One table cut's persisted sources delegated to a frozen remote participant.
@@ -1312,12 +1668,10 @@ pub(crate) struct OracleTableInputs {
     /// applies the identical bounds when it plans the scan, so this is the
     /// leader's own statement of a decision the reader then enforces.
     pub(crate) iceberg_event_times: Vec<crate::catalog::event_time::EventTimeStatistics>,
-    /// Authenticated request context retained by the tenant tripwire.
+    /// Authenticated request context whose tenant every scanned footer must name.
     pub(crate) context: AuthorizedQueryContext,
     /// Canonical table name used in security diagnostics.
     pub(crate) table_name: String,
-    /// Mandatory audit collaborator.
-    pub(crate) audit: Arc<dyn OracleAudit>,
     /// Frozen remote owner of this cut's persisted sources, when the cut chose
     /// one. `None` keeps every persisted leaf leader-local.
     pub(crate) remote: Option<OracleRemoteSource>,
@@ -1338,16 +1692,12 @@ pub(crate) struct OracleTableProvider {
     file_io: FileIO,
     /// The node's one storage owner, handed to every hot leaf this builds.
     storage: Arc<crate::storage::BifrostStorage>,
-    /// Full physical schema, including the hidden tenant column.
+    /// Full physical schema, which is also the caller-visible schema.
     physical_schema: SchemaRef,
-    /// Caller-visible schema after the tripwire removes its tenant column.
-    public_schema: SchemaRef,
-    /// Authenticated request context used by the security audit.
+    /// Authenticated request context whose tenant every scanned footer must name.
     context: AuthorizedQueryContext,
     /// Canonical table name included in scrubbed security diagnostics.
     table: String,
-    /// Standard read/security audit collaborator.
-    audit: Arc<dyn OracleAudit>,
     /// Frozen remote owner of this cut's persisted sources, when the cut chose
     /// one. `None` keeps every persisted leaf leader-local.
     remote: Option<OracleRemoteSource>,
@@ -1451,7 +1801,7 @@ impl OracleTableProvider {
     /// # Errors
     ///
     /// Returns a `DataFusion` error when Iceberg cannot construct its static
-    /// provider or the physical schema lacks the required tenant column.
+    /// provider.
     pub(crate) async fn try_new(inputs: OracleTableInputs) -> DataFusionResult<Self> {
         let OracleTableInputs {
             table,
@@ -1460,7 +1810,6 @@ impl OracleTableProvider {
             iceberg_event_times,
             context,
             table_name,
-            audit,
             remote,
             live,
         } = inputs;
@@ -1469,7 +1818,6 @@ impl OracleTableProvider {
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let physical_schema = iceberg.schema();
-        let public_schema = schema_without(&physical_schema, DATA_TENANT_ID)?;
         Ok(Self {
             iceberg,
             hot_files,
@@ -1477,10 +1825,8 @@ impl OracleTableProvider {
             file_io,
             storage,
             physical_schema,
-            public_schema,
             context,
             table: table_name,
-            audit,
             remote,
             live,
             scan_occurrences: std::sync::atomic::AtomicU64::new(0),
@@ -1529,6 +1875,9 @@ impl OracleTableProvider {
         occurrence: u64,
     ) -> DataFusionResult<Vec<Arc<dyn ExecutionPlan>>> {
         let required_schema = Arc::clone(&scan_projection.required_schema);
+        // Like a `DataFusion` listing scan, each persisted leaf reads across
+        // the session's target partitions.
+        let partitions = state.config_options().execution.target_partitions;
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         let published_index = inputs.len();
         {
@@ -1546,8 +1895,16 @@ impl OracleTableProvider {
                     limit,
                 )
                 .await?;
-            let published: Arc<dyn ExecutionPlan> =
-                Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
+            let published: Arc<dyn ExecutionPlan> = Arc::new(
+                OracleIcebergScanExec::from_plan(published.as_ref())?
+                    .with_partitions(partitions)
+                    .with_footers(PublishedFooters::new(
+                        Arc::clone(&self.storage),
+                        self.context.data_tenant_id,
+                        self.table.clone(),
+                        HotParquetPlan::Leader,
+                    )),
+            );
             // The dependency may return the projected columns in its own
             // physical order. The signed closure is authoritative, so the plan
             // is normalized to it here rather than the closure being reordered
@@ -1558,15 +1915,18 @@ impl OracleTableProvider {
             )?);
         }
         if !self.hot_files.is_empty() {
-            inputs.push(Arc::new(HotParquetExec::new(
-                self.retained_hot_files(supported_predicates),
-                self.file_io.clone(),
-                Arc::clone(&self.storage),
-                Arc::clone(&required_schema),
-                HotParquetPlan::Leader,
-                Arc::new(OracleScanMetricsHandle::default()),
-                supported_predicates.to_vec(),
-            )));
+            inputs.push(Arc::new(
+                HotParquetExec::new(
+                    self.retained_hot_files(supported_predicates),
+                    self.file_io.clone(),
+                    Arc::clone(&self.storage),
+                    Arc::clone(&required_schema),
+                    HotParquetPlan::Leader,
+                    Arc::new(OracleScanMetricsHandle::default()),
+                    supported_predicates.to_vec(),
+                )
+                .with_partitions(partitions),
+            ));
         }
         let Some(remote) = self.remote.as_ref() else {
             return Ok(inputs);
@@ -1713,9 +2073,10 @@ fn classify_filter_for_schema(physical_schema: &Schema, filter: &Expr) -> Filter
 
 #[async_trait]
 impl TableProvider for OracleTableProvider {
-    /// Returns the caller-visible schema with no tenant selector column.
+    /// Returns the table's complete physical schema, which is also the
+    /// caller-visible schema.
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.public_schema)
+        Arc::clone(&self.physical_schema)
     }
 
     /// Oracle tables are durable base tables.
@@ -1741,7 +2102,7 @@ impl TableProvider for OracleTableProvider {
             .collect())
     }
 
-    /// Builds the exact `Iceberg + hot + live -> tripwire` disjoint source.
+    /// Builds the exact `Iceberg + hot + live` disjoint source.
     ///
     /// Row IO remains lazy in returned execution plans. Iceberg and hot Parquet
     /// bytes are first accessed only when `DataFusion` executes the already
@@ -1780,7 +2141,6 @@ impl TableProvider for OracleTableProvider {
         // operator above. Nothing downstream recomputes a column set or order.
         let scan_projection = OracleScanProjection::try_new(
             &self.physical_schema,
-            &self.public_schema,
             projection,
             &supported_predicates,
         )?;
@@ -1810,214 +2170,30 @@ impl TableProvider for OracleTableProvider {
                     scan_projection.required_columns.clone(),
                     supported_predicates.clone(),
                     Arc::clone(&required_schema),
+                    state.config().target_partitions(),
                 )));
             }
         }
         let union = UnionExec::try_new(inputs)?;
-        let tripwire = Arc::new(TenantTripwireExec::new(
-            union,
-            self.context.clone(),
-            self.table.clone(),
-            Arc::clone(&self.audit),
-        )?);
         // Provider-local filter over the closed predicates. This is a real
         // pruning aid, not a substitute for correctness: pushdown is reported
         // `Inexact`, so DataFusion still applies its own residual copy above
         // this provider regardless of what happens here.
         let physical_predicates = supported_predicates
             .iter()
-            .map(|predicate| scan_predicate_physical_expr(predicate, &tripwire.schema()))
+            .map(|predicate| scan_predicate_physical_expr(predicate, &union.schema()))
             .collect::<DataFusionResult<Vec<_>>>()?;
         let filtered: Arc<dyn ExecutionPlan> =
             match conjoin_physical_predicates(physical_predicates) {
                 Some(predicate) => Arc::new(
-                    datafusion::physical_plan::filter::FilterExec::try_new(predicate, tripwire)?,
+                    datafusion::physical_plan::filter::FilterExec::try_new(predicate, union)?,
                 ),
-                None => tripwire,
+                None => union,
             };
         // Resolved by name against the filter's actual output, which is the
-        // closure minus the tenant column — never against the original
-        // full-public-schema ordinals the caller supplied.
+        // closure — never against the full-schema ordinals the caller
+        // supplied.
         project_plan_by_name(filtered, &scan_projection.output_names)
-    }
-}
-
-/// Runtime tenant assertion surrounding one complete physical table source union.
-pub struct TenantTripwireExec {
-    /// Tagged `Iceberg + hot + live` source union.
-    input: Arc<dyn ExecutionPlan>,
-    /// Authenticated query context retained for standard security audit.
-    context: AuthorizedQueryContext,
-    /// Canonical table identifier with no object path.
-    table: String,
-    /// Standard audit collaborator used before a mismatch becomes visible.
-    audit: Arc<dyn OracleAudit>,
-    /// Output properties after the hidden tenant column is stripped.
-    properties: Arc<PlanProperties>,
-}
-
-impl fmt::Debug for TenantTripwireExec {
-    /// Redacts authenticated and audit state from physical-plan diagnostics.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TenantTripwireExec")
-            .field("table", &self.table)
-            .finish_non_exhaustive()
-    }
-}
-
-impl TenantTripwireExec {
-    /// Creates a tripwire around one complete table source union.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` plan error when the input lacks `data_tenant_id`.
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
-        context: AuthorizedQueryContext,
-        table: String,
-        audit: Arc<dyn OracleAudit>,
-    ) -> DataFusionResult<Self> {
-        let schema = schema_without(&input.schema(), DATA_TENANT_ID)?;
-        let partition_count = input.output_partitioning().partition_count();
-        Ok(Self {
-            input,
-            context,
-            table,
-            audit,
-            properties: plan_properties_with_partitions(schema, partition_count),
-        })
-    }
-
-    /// Borrows the authenticated context encoded into a follower subtree.
-    pub(crate) const fn context(&self) -> &AuthorizedQueryContext {
-        &self.context
-    }
-
-    /// Borrows the canonical table label encoded into a follower subtree.
-    pub(crate) fn table(&self) -> &str {
-        &self.table
-    }
-}
-
-impl DisplayAs for TenantTripwireExec {
-    /// Renders the invariant boundary without tenant values.
-    fn fmt_as(
-        &self,
-        _format: DisplayFormatType,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        write!(formatter, "TenantTripwireExec")
-    }
-}
-
-impl ExecutionPlan for TenantTripwireExec {
-    /// Visits every physical expression this plan owns.
-    ///
-    /// This plan owns no `PhysicalExpr`, so the traversal reports
-    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
-    ///
-    /// # Errors
-    /// Never returns an error; the signature is fixed by the trait.
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(
-            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-        ) -> DataFusionResult<TreeNodeRecursion>,
-    ) -> DataFusionResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    /// Returns the stable physical operator name.
-    fn name(&self) -> &'static str {
-        "TenantTripwireExec"
-    }
-
-    /// Returns cached bounded plan properties.
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    /// Returns the complete source union as the sole child.
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    /// Rebuilds the tripwire around exactly one replacement union.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` plan error unless exactly one child is supplied.
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let [input] = children.try_into().map_err(|_| {
-            DataFusionError::Plan("TenantTripwireExec requires one child".to_owned())
-        })?;
-        Ok(Arc::new(Self::new(
-            input,
-            self.context.clone(),
-            self.table.clone(),
-            Arc::clone(&self.audit),
-        )?))
-    }
-
-    /// Validates every row, audits a mismatch fail-closed, then strips tenant.
-    ///
-    /// No mismatched batch is yielded. If the security audit also fails, the
-    /// query still fails closed and the audit failure is surfaced.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` execution error for source failure, malformed
-    /// tenant data, mismatch, security-audit failure, or Arrow projection.
-    fn execute(
-        &self,
-        partition: usize,
-        task: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let mut input = self.input.execute(partition, task)?;
-        let schema = self.schema();
-        let context = self.context.clone();
-        let audit = Arc::clone(&self.audit);
-        let stream = async_stream::try_stream! {
-            while let Some(batch) = input.next().await {
-                let batch = batch?;
-                if tenant_mismatch_row(&batch, context.data_tenant_id)?.is_some() {
-                    metrics::counter!(
-                        "bifrost_oracle_security_events_total",
-                        "event_class" => "tenant_row"
-                    )
-                    .increment(1);
-                    let audit_span = tracing::info_span!(
-                        "bifrost.oracle.audit",
-                        audit_kind = "security_violation",
-                        event_class = "tenant_row"
-                    );
-                    let audit_result = audit
-                        .append_security_violation(
-                            VerifiedSecurityContext {
-                                query: context.clone(),
-                                query_digest: None,
-                            },
-                            BifrostSecurityViolation {
-                                violation: BifrostSecurityViolationKind::TenantRow,
-                                phase: BifrostSecurityPhase::Source,
-                            },
-                        )
-                        .instrument(audit_span)
-                        .await;
-                    audit_result
-                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                    Err::<(), _>(DataFusionError::External(Box::new(
-                        BifrostError::QueryTenantInvariant,
-                    )))?;
-                }
-                yield remove_column(&batch, DATA_TENANT_ID)?;
-            }
-        };
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
@@ -2411,14 +2587,16 @@ impl AsyncFileReader for IcebergParquetReader {
                 self.reader
                     .read(range)
                     .await
-                    .map_err(|error| ParquetError::General(error.to_string()))?
+                    .map_err(|error| ParquetError::External(Box::new(error)))?
             };
             #[cfg(not(test))]
+            // Kept typed so the storage owner can tell a vanished object from
+            // an outage when this read backs a governed footer decode.
             let bytes = self
                 .reader
                 .read(range)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))?;
+                .map_err(|error| ParquetError::External(Box::new(error)))?;
             if bytes.len() != requested {
                 return Err(ParquetError::General(format!(
                     "hot Parquet short range: requested {requested} bytes, received {}",
@@ -2475,6 +2653,12 @@ pub(super) struct HotParquetExec {
     /// Closed predicate conjunction used to skip a file whose footer
     /// statistics prove no row group can satisfy every leaf.
     predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+    /// Lease keeping Scribe staged runs on disk while any partition reads them.
+    ///
+    /// `None` for durable hot objects, which need no lease. Each partition
+    /// stream holds a clone, so the lease is released once the plan and every
+    /// stream it produced are dropped.
+    staged_lease: Option<Arc<StagedSourceLease>>,
     /// Deterministic reader injected only by focused unit tests.
     #[cfg(test)]
     reader_override: Option<HotReadOverride>,
@@ -2493,11 +2677,15 @@ impl fmt::Debug for HotParquetExec {
 }
 
 impl HotParquetExec {
-    /// Creates a single-partition hot-file leaf from validated manifests.
+    /// Creates a hot-file leaf from validated manifests, single-partition
+    /// until [`Self::with_partitions`] splits it.
     ///
     /// Callers must have already authenticated the assignment, validated every
     /// object identity and size, and chosen the governance mode that matches
     /// their role; this constructor performs no IO and no authorization.
+    /// Each file's metadata key must carry the authenticated binding's tenant:
+    /// every opened object's footer is compared with it before a row is
+    /// decoded.
     pub(super) fn new(
         files: Vec<HotFileSource>,
         file_io: FileIO,
@@ -2514,11 +2702,52 @@ impl HotParquetExec {
             governance,
             metrics,
             predicates,
+            staged_lease: None,
             #[cfg(test)]
             reader_override: None,
             properties: plan_properties(Arc::clone(&schema)),
             schema,
         }
+    }
+
+    /// Reads this leaf across `partitions` byte-range partitions.
+    ///
+    /// Callers pass their session's target partitions; see
+    /// [`partition_byte_ranges`].
+    pub(super) fn with_partitions(mut self, partitions: usize) -> Self {
+        self.properties =
+            plan_properties_with_partitions(Arc::clone(&self.schema), partitions.max(1));
+        self
+    }
+
+    /// Holds `lease` for as long as this leaf or any of its streams lives.
+    ///
+    /// The Scribe follower reads its own staged runs through this leaf; the
+    /// lease is what keeps publication from deleting a run mid-read.
+    pub(super) fn with_staged_lease(mut self, lease: StagedSourceLease) -> Self {
+        self.staged_lease = Some(Arc::new(lease));
+        self
+    }
+
+    /// Returns the files and byte ranges `partition` owns, in file order.
+    ///
+    /// Every file's bytes are tiled across this leaf's partition count by
+    /// [`partition_byte_ranges`], so the union over partitions covers each byte
+    /// exactly once. A size that does not fit `u64` counts as empty.
+    fn partition_pieces(&self, partition: usize) -> Vec<(HotFileSource, Range<u64>)> {
+        let sizes = self
+            .files
+            .iter()
+            .map(|file| u64::try_from(file.size_bytes).unwrap_or_default())
+            .collect::<Vec<_>>();
+        partition_byte_ranges(
+            &sizes,
+            partition,
+            self.properties.partitioning.partition_count(),
+        )
+        .into_iter()
+        .map(|(index, range)| (self.files[index].clone(), range))
+        .collect()
     }
 
     /// Returns the shared terminal metric owner for this hot leaf.
@@ -2595,7 +2824,7 @@ impl ExecutionPlan for HotParquetExec {
         }
     }
 
-    /// Reads validated hot files sequentially through governed Parquet ranges.
+    /// Reads this partition's byte ranges through governed Parquet ranges.
     ///
     /// # Errors
     ///
@@ -2606,7 +2835,7 @@ impl ExecutionPlan for HotParquetExec {
         partition: usize,
         task: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
+        if partition >= self.properties.partitioning.partition_count() {
             return Err(DataFusionError::Execution(format!(
                 "HotParquetExec has no partition {partition}"
             )));
@@ -2618,30 +2847,40 @@ impl ExecutionPlan for HotParquetExec {
         // The hot leaf decodes at the admitted session's batch size, so this
         // path is shaped by the same grant as every other operator in the plan
         // rather than by a fixed constant of its own.
-        let stream = hot_stream(self, task.session_config().batch_size(), governance);
+        let stream = hot_stream(
+            self,
+            partition,
+            task.session_config().batch_size(),
+            governance,
+        );
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
-/// Builds the hot-file stream after partition validation has completed.
+/// Builds one partition's hot-file stream after partition validation.
 ///
-/// Files are read sequentially. Each one publishes a file observation before
-/// its footer is touched, prunes row groups against the closed predicates,
-/// decodes at the admitted `batch_size`, projects to the authenticated physical
-/// schema, and holds one governed reservation for exactly the lifetime of the
-/// yielded batch. Dropping the stream releases every retained reservation,
+/// The partition's byte ranges are read sequentially. The piece holding a
+/// file's first byte publishes its file observation before the footer is
+/// touched; every piece proves the footer's tenant before decoding anything,
+/// then keeps only the row groups whose midpoint lies in its
+/// range, prunes those and then pages against the closed predicates, decodes
+/// at the session `batch_size`, projects to the
+/// authenticated physical schema, and holds one governed reservation for
+/// exactly the lifetime of the yielded batch. Dropping the stream releases every retained reservation,
 /// which is what makes cancellation return the query's memory.
 fn hot_stream(
     exec: &HotParquetExec,
+    partition: usize,
     batch_size: usize,
     governance: HotParquetGovernance,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static {
-    let files = exec.files.clone();
+    let pieces = exec.partition_pieces(partition);
     let file_io = exec.file_io.clone();
     let storage = Arc::clone(&exec.storage);
     let schema = Arc::clone(&exec.schema);
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
+    let staged_lease = exec.staged_lease.clone();
     #[cfg(test)]
     let reader_override = exec.reader_override.clone();
     // Cancelling the query drops this stream, which drops the guard and
@@ -2651,7 +2890,8 @@ fn hot_stream(
     let cancel_on_drop = cancel.clone().drop_guard();
     async_stream::try_stream! {
         let _cancel_on_drop = cancel_on_drop;
-        for file in files {
+        let _staged_lease = staged_lease;
+        for (file, range) in pieces {
             let size = u64::try_from(file.size_bytes).map_err(|_| {
                 DataFusionError::Execution("hot object size exceeds u64".to_owned())
             })?;
@@ -2685,13 +2925,17 @@ fn hot_stream(
             // for every attempt on this file, including one whose reader fails
             // or is abandoned mid-open. Row-group pruning is reported
             // separately, so a file whose groups are all pruned still counts as
-            // opened rather than vanishing from the scan accounting.
-            metrics.record_hot_file();
+            // opened rather than vanishing from the scan accounting. Only the
+            // piece holding the file's first byte records it, so a file split
+            // across partitions counts once.
+            if range.start == 0 {
+                metrics.record_hot_file();
+            }
             // The owner, not this leaf, decides whether this object's footer is
             // decoded again: it owns the node-wide cache, single-flight, request
             // admission, and retry bound for every hot identity.
             let retained = storage
-                .hot_metadata(
+                .object_metadata(
                     file.metadata_key.clone(),
                     build_reader.clone(),
                     storage.metadata_deadline(),
@@ -2701,24 +2945,30 @@ fn hot_stream(
                 .map_err(|error| {
                     DataFusionError::External(Box::new((*error).clone()))
                 })?;
-            let metadata = parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new(
-                Arc::clone(retained.metadata()),
-                ArrowReaderOptions::new(),
-            )
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            let Some((metadata, retained_groups)) = hot_piece_metadata(
+                retained.metadata(),
+                file.metadata_key.tenant_id(),
+                &range,
+                &predicates,
+                &metrics,
+            )?
+            else {
+                continue;
+            };
             let builder =
                 ParquetRecordBatchStreamBuilder::new_with_metadata(build_reader(), metadata);
-            let selection = select_row_groups_for_predicates(builder.metadata(), &predicates);
-            metrics.record_row_groups(&selection);
-            if selection.excludes_file() {
-                continue;
-            }
             // Selective decode: only the closure's leaves leave storage. The
             // post-decode `project_batch` below then normalizes exact order and
             // types; it is a normalizer, not the thing that avoids the IO.
             let mask = hot_projection_mask(builder.parquet_schema(), schema.as_ref());
+            let pages =
+                select_pages_for_predicates(builder.metadata(), &retained_groups, &predicates);
+            let builder = match pages {
+                Some(pages) => builder.with_row_selection(pages),
+                None => builder,
+            };
             let mut batches = builder
-                .with_row_groups(selection.retained)
+                .with_row_groups(retained_groups)
                 .with_batch_size(batch_size)
                 .with_projection(mask)
                 .build()
@@ -2734,6 +2984,43 @@ fn hot_stream(
             }
         }
     }
+}
+
+/// Decides what one hot piece reads from its object's cached footer.
+///
+/// The tenant proof runs first, so a missing or foreign footer yields no row
+/// group, page, or row. Range ownership and predicate pruning then read only
+/// the cached footer, so a piece that owns or keeps no row group never pays the
+/// Arrow schema conversion; only a piece with surviving row groups builds its
+/// reader metadata. Pruning is recorded in `metrics` for every owning piece.
+///
+/// # Errors
+///
+/// Returns an external [`BifrostError::QueryTenantInvariant`] when the footer
+/// does not prove `tenant`, or the Parquet error when the footer cannot be
+/// projected into Arrow reader metadata.
+fn hot_piece_metadata(
+    metadata: &Arc<ParquetMetaData>,
+    tenant: DataTenantId,
+    range: &Range<u64>,
+    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    metrics: &OracleScanMetricsHandle,
+) -> DataFusionResult<Option<(ArrowReaderMetadata, Vec<usize>)>> {
+    verify_scanned_footer_tenant(metadata, tenant)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let owned = row_groups_in_byte_range(metadata, range);
+    if owned.is_empty() {
+        return Ok(None);
+    }
+    let selection = select_row_groups_for_predicates(metadata, owned, predicates);
+    metrics.record_row_groups(&selection);
+    if selection.excludes_file() {
+        return Ok(None);
+    }
+    let reader_metadata =
+        ArrowReaderMetadata::try_new(Arc::clone(metadata), ArrowReaderOptions::new())
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    Ok(Some((reader_metadata, selection.retained)))
 }
 
 /// Derives the Parquet projection mask that decodes exactly `schema`'s columns.
@@ -2757,29 +3044,6 @@ fn hot_projection_mask(
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     parquet::arrow::ProjectionMask::roots(parquet_schema, indices)
-}
-
-/// Returns the first tenant mismatch row, or `None` for a valid batch.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` error when the managed tenant column is absent or has
-/// a non-UTF8 physical type.
-fn tenant_mismatch_row(
-    batch: &RecordBatch,
-    tenant: wyrd_spec::DataTenantId,
-) -> DataFusionResult<Option<usize>> {
-    let index = batch
-        .schema()
-        .index_of(DATA_TENANT_ID)
-        .map_err(|_| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?;
-    let values = batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .ok_or_else(|| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?;
-    let expected = tenant.to_string();
-    Ok((0..values.len()).find(|row| values.is_null(*row) || values.value(*row) != expected))
 }
 
 /// Result of classifying one `DataFusion` filter expression against the
@@ -2976,20 +3240,20 @@ fn classify_literal(expr: &Expr) -> Option<wyrd_spec::vala::assignment_authority
 ///
 /// A repeated requested ordinal stays repeated: the caller's output shape is
 /// the caller's business, and only the leaf closure derived from these names is
-/// deduplicated. A `None` projection means every public column plus the hidden
-/// tenant column below it; it never means zero columns.
+/// deduplicated. A `None` projection means every table column; it never means
+/// zero columns.
 ///
 /// # Errors
 ///
 /// Returns a `DataFusion` plan error when a requested ordinal falls outside the
-/// public schema, which is a planner contract failure rather than a column the
+/// table schema, which is a planner contract failure rather than a column the
 /// scan may quietly drop.
 fn scan_output_names(
-    public_schema: &Schema,
+    schema: &Schema,
     projection: Option<&Vec<usize>>,
 ) -> DataFusionResult<Vec<String>> {
     let Some(projection) = projection else {
-        return Ok(public_schema
+        return Ok(schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
@@ -2998,7 +3262,7 @@ fn scan_output_names(
     projection
         .iter()
         .map(|index| {
-            public_schema
+            schema
                 .fields()
                 .get(*index)
                 .map(|field| field.name().clone())
@@ -3011,27 +3275,29 @@ fn scan_output_names(
 
 /// Computes the canonical `required_columns` closure: the requested scan output
 /// names, followed by the first occurrence of each predicate column in filter
-/// order, followed by the always-present hidden tenant column — stably
-/// deduplicated.
+/// order — stably deduplicated.
+///
+/// A closure is never empty. A request that reads no column, such as
+/// `COUNT(*)`, still needs every leaf to report row counts, so it reads the
+/// always-present non-null `wyrd_event_time` instead of producing zero-column
+/// batches across Iceberg, Parquet, IPC, and distributed frames.
 fn required_columns_closure(
     output_names: &[String],
     predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
 ) -> Vec<String> {
     let mut required = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for name in output_names
-        .iter()
-        .cloned()
-        .chain(
-            predicates
-                .iter()
-                .map(|predicate| predicate.column().to_string()),
-        )
-        .chain(std::iter::once(DATA_TENANT_ID.to_string()))
-    {
+    for name in output_names.iter().cloned().chain(
+        predicates
+            .iter()
+            .map(|predicate| predicate.column().to_string()),
+    ) {
         if seen.insert(name.clone()) {
             required.push(name);
         }
+    }
+    if required.is_empty() {
+        required.push(WYRD_EVENT_TIME.to_owned());
     }
     required
 }
@@ -3087,17 +3353,18 @@ pub(super) fn select_schema_by_name(
 ///
 /// [`OracleTableProvider::scan`] builds this once from the complete physical
 /// schema and the caller's request, then hands the same value to every union
-/// leaf, the remote placeholders, the tenant tripwire, the provider-local
-/// filter, and the final public projection. No leaf recomputes its own column
+/// leaf, the remote placeholders, the provider-local filter, and the final
+/// output projection. No leaf recomputes its own column
 /// set or order: a follower revalidates the signed closure against the schema
 /// its own catalog resolves, so two components deriving the same set in a
 /// different order would refuse each other's assignments.
 #[derive(Debug)]
 struct OracleScanProjection {
-    /// Public column names this scan outputs, in requested order, with a
-    /// repeated requested ordinal preserved.
+    /// Column names this scan outputs, in requested order, with a repeated
+    /// requested ordinal preserved.
     output_names: Vec<String>,
-    /// Stable-deduplicated leaf closure: outputs, predicate columns, tenant.
+    /// Stable-deduplicated, never-empty leaf closure: outputs, then predicate
+    /// columns.
     required_columns: Vec<String>,
     /// Complete-schema fields selected by `required_columns`, in that order.
     required_schema: SchemaRef,
@@ -3115,11 +3382,10 @@ impl OracleScanProjection {
     /// name is absent from it.
     fn try_new(
         physical_schema: &Schema,
-        public_schema: &Schema,
         projection: Option<&Vec<usize>>,
         predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
     ) -> DataFusionResult<Self> {
-        let output_names = scan_output_names(public_schema, projection)?;
+        let output_names = scan_output_names(physical_schema, projection)?;
         let required_columns = required_columns_closure(&output_names, predicates);
         let (required_schema, physical_indices) =
             select_schema_by_name(physical_schema, &required_columns)?;
@@ -3313,64 +3579,25 @@ fn conjoin_physical_predicates(
         .reduce(|left, right| Arc::new(BinaryExpr::new(left, Operator::And, right)))
 }
 
-/// Compiled conjunction of one assignment's signed closed predicates,
-/// evaluated directly over Arrow batches that never pass through a
-/// `DataFusion` plan.
+/// Compiles one assignment's signed closed predicates into a single physical
+/// conjunction over `schema`, or `None` when the assignment carries none.
 ///
-/// Persisted follower scans get their predicates enforced by the physical
-/// plan itself, but the Scribe live-tail snapshot is assembled inside the
-/// Scribe pod and shipped back as ready Arrow. Compiling the closure once
-/// here lets that path apply the same signed filter to every hot batch
-/// before it is returned, so a selective query sends only matching rows
-/// into follower attempt encoding instead of the whole tail.
-#[derive(Debug)]
-pub(crate) struct ScanPredicateFilter {
-    /// The conjunction, or `None` when the assignment carries no predicates
-    /// and every row is retained unchanged.
-    predicate: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
-}
-
-impl ScanPredicateFilter {
-    /// Compiles the signed predicate list against the batch schema it will
-    /// be evaluated over.
-    ///
-    /// # Errors
-    /// Returns a `DataFusion` error when a predicate names a column absent
-    /// from `schema` or compares it against an incompatible literal.
-    pub(crate) fn compile(
-        schema: &SchemaRef,
-        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-    ) -> DataFusionResult<Self> {
-        let compiled = predicates
-            .iter()
-            .map(|predicate| scan_predicate_physical_expr(predicate, schema))
-            .collect::<DataFusionResult<Vec<_>>>()?;
-        Ok(Self {
-            predicate: conjoin_physical_predicates(compiled),
-        })
-    }
-
-    /// Returns only the rows of `batch` satisfying the conjunction.
-    ///
-    /// Rows whose predicate evaluates to `NULL` are dropped, matching SQL
-    /// `WHERE` semantics and the `FilterExec` the leader would otherwise
-    /// have applied above the provider.
-    ///
-    /// # Errors
-    /// Returns a `DataFusion` error when the conjunction cannot be evaluated
-    /// against `batch` or does not produce a boolean mask.
-    pub(crate) fn retain(
-        &self,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> DataFusionResult<arrow::record_batch::RecordBatch> {
-        let Some(predicate) = &self.predicate else {
-            return Ok(batch);
-        };
-        let rows = batch.num_rows();
-        let evaluated = predicate.evaluate(&batch)?.into_array(rows)?;
-        let mask = datafusion::common::cast::as_boolean_array(&evaluated)?;
-        arrow::compute::filter_record_batch(&batch, mask).map_err(Into::into)
-    }
+/// The Scribe follower places it in a `FilterExec` above its live leaf, so a
+/// selective query ships only matching rows back to the leader. Rows whose
+/// conjunction evaluates to `NULL` are dropped, matching SQL `WHERE`.
+///
+/// # Errors
+/// Returns a `DataFusion` plan error when a predicate names a column absent
+/// from `schema`.
+pub(super) fn scan_predicate_conjunction(
+    predicates: &[ScanPredicate],
+    schema: &SchemaRef,
+) -> DataFusionResult<Option<Arc<dyn PhysicalExpr>>> {
+    let compiled = predicates
+        .iter()
+        .map(|predicate| scan_predicate_physical_expr(predicate, schema))
+        .collect::<DataFusionResult<Vec<_>>>()?;
+    Ok(conjoin_physical_predicates(compiled))
 }
 
 /// One statistic bound value in the closed subset this pruning path
@@ -3447,8 +3674,6 @@ fn leaf_excludes_row_group(
     row_group_index: usize,
     predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
 ) -> bool {
-    use wyrd_spec::vala::assignment_authority::ScanPredicate;
-
     let Some(column_index) = parquet_column_index(metadata, predicate.column()) else {
         return false;
     };
@@ -3456,73 +3681,171 @@ fn leaf_excludes_row_group(
     let Some(stats) = row_group.column(column_index).statistics() else {
         return false;
     };
+    leaf_excludes_span(
+        predicate,
+        |target| statistics_bound(stats, target),
+        stats.null_count_opt(),
+        u64::try_from(row_group.num_rows()).unwrap_or(0),
+    )
+}
+
+/// Returns true only when one span's evidence proves no row in it can satisfy
+/// `predicate`.
+///
+/// A span is a row group or one data page; both prune through this one
+/// decision so page selection can never disagree with row-group pruning.
+/// `bounds` yields the span's min/max matched to the literal's type, and
+/// `null_count` with `rows` decides the null checks. Absent evidence always
+/// keeps the span, so this never produces a false exclusion.
+fn leaf_excludes_span(
+    predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
+    bounds: impl Fn(&StatBound) -> Option<(StatBound, StatBound)>,
+    null_count: Option<u64>,
+    rows: u64,
+) -> bool {
+    use std::cmp::Ordering;
+    use wyrd_spec::vala::assignment_authority::ScanPredicate;
+
     match predicate {
-        ScanPredicate::IsNull(_) => stats.null_count_opt() == Some(0),
-        ScanPredicate::IsNotNull(_) => {
-            let rows = u64::try_from(row_group.num_rows()).unwrap_or(0);
-            stats.null_count_opt() == Some(rows)
+        ScanPredicate::IsNull(_) => return null_count == Some(0),
+        ScanPredicate::IsNotNull(_) => return null_count == Some(rows),
+        _ => {}
+    }
+    let Some(target) = predicate.literal().and_then(literal_bound) else {
+        return false;
+    };
+    let Some((min, max)) = bounds(&target) else {
+        return false;
+    };
+    match predicate {
+        ScanPredicate::Eq(..) => target < min || max < target,
+        ScanPredicate::NotEq(..) => min == max && min == target,
+        ScanPredicate::Lt(..) => matches!(
+            min.partial_cmp(&target),
+            Some(Ordering::Equal | Ordering::Greater)
+        ),
+        ScanPredicate::LtEq(..) => target < min,
+        ScanPredicate::Gt(..) => matches!(
+            target.partial_cmp(&max),
+            Some(Ordering::Equal | Ordering::Greater)
+        ),
+        ScanPredicate::GtEq(..) => max < target,
+        ScanPredicate::IsNull(_) | ScanPredicate::IsNotNull(_) => false,
+    }
+}
+
+/// Reads one page's typed min/max from a column index as comparable bounds.
+///
+/// The page-index counterpart of [`statistics_bound`]: returns `None` for an
+/// all-null page, a missing index, or a physical type that does not match
+/// `target`'s variant, so the caller keeps the page.
+fn page_bound(
+    index: &parquet::file::page_index::column_index::ColumnIndexMetaData,
+    page: usize,
+    target: &StatBound,
+) -> Option<(StatBound, StatBound)> {
+    use parquet::file::page_index::column_index::ColumnIndexMetaData;
+    match (index, target) {
+        (ColumnIndexMetaData::BOOLEAN(pages), StatBound::Bool(_)) => Some((
+            StatBound::Bool(*pages.min_value(page)?),
+            StatBound::Bool(*pages.max_value(page)?),
+        )),
+        (ColumnIndexMetaData::INT64(pages), StatBound::I64(_)) => Some((
+            StatBound::I64(*pages.min_value(page)?),
+            StatBound::I64(*pages.max_value(page)?),
+        )),
+        (ColumnIndexMetaData::BYTE_ARRAY(pages), StatBound::Utf8(_)) => Some((
+            StatBound::Utf8(String::from_utf8_lossy(pages.min_value(page)?).into_owned()),
+            StatBound::Utf8(String::from_utf8_lossy(pages.max_value(page)?).into_owned()),
+        )),
+        _ => None,
+    }
+}
+
+/// Selects the pages of `row_groups` whose page index can still satisfy every
+/// predicate leaf, as one row selection over those groups in order.
+///
+/// Row-group pruning alone makes a point lookup decode its whole row group;
+/// this narrows the retained groups to the pages that may match, and the
+/// reader then fetches and decodes only those pages of every projected column.
+/// A page is skipped only when [`leaf_excludes_span`] proves it empty for some
+/// leaf, so the selection is always a superset of the matching rows and the
+/// plan's own filter still decides exact membership. Returns `None` when the
+/// file carries no page index or no page was excluded, leaving the reader
+/// unchanged.
+fn select_pages_for_predicates(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    row_groups: &[usize],
+    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+) -> Option<parquet::arrow::arrow_reader::RowSelection> {
+    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+    let (Some(column_indexes), Some(offset_indexes)) =
+        (metadata.column_index(), metadata.offset_index())
+    else {
+        return None;
+    };
+    let mut selectors = Vec::new();
+    let mut excluded_any = false;
+    for &row_group in row_groups {
+        let rows = usize::try_from(metadata.row_group(row_group).num_rows()).unwrap_or(0);
+        let mut excluded: Vec<Range<usize>> = Vec::new();
+        for predicate in predicates {
+            let Some(column) = parquet_column_index(metadata, predicate.column()) else {
+                continue;
+            };
+            let (Some(index), Some(offsets)) = (
+                column_indexes
+                    .get(row_group)
+                    .and_then(|group| group.get(column)),
+                offset_indexes
+                    .get(row_group)
+                    .and_then(|group| group.get(column)),
+            ) else {
+                continue;
+            };
+            let pages = offsets.page_locations();
+            if usize::try_from(index.num_pages()).ok() != Some(pages.len()) {
+                continue;
+            }
+            let first_row = |page: usize| {
+                pages.get(page).map_or(rows, |location| {
+                    usize::try_from(location.first_row_index).map_or(rows, |row| row.min(rows))
+                })
+            };
+            for page in 0..pages.len() {
+                let start = first_row(page);
+                let end = first_row(page + 1).max(start);
+                let null_count = index
+                    .null_count(page)
+                    .and_then(|count| u64::try_from(count).ok());
+                if leaf_excludes_span(
+                    predicate,
+                    |target| page_bound(index, page, target),
+                    null_count,
+                    u64::try_from(end - start).unwrap_or(u64::MAX),
+                ) {
+                    excluded.push(start..end);
+                }
+            }
         }
-        ScanPredicate::Eq(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((min, max)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            target < min || max < target
+        excluded_any |= !excluded.is_empty();
+        excluded.sort_by_key(|range| range.start);
+        let mut cursor = 0;
+        for range in excluded {
+            if range.start > cursor {
+                selectors.push(RowSelector::select(range.start - cursor));
+            }
+            if range.end > cursor {
+                selectors.push(RowSelector::skip(range.end - range.start.max(cursor)));
+                cursor = range.end;
+            }
         }
-        ScanPredicate::NotEq(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((min, max)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            min == max && min == target
-        }
-        ScanPredicate::Lt(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((min, _)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            matches!(
-                min.partial_cmp(&target),
-                Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
-            )
-        }
-        ScanPredicate::LtEq(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((min, _)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            target < min
-        }
-        ScanPredicate::Gt(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((_, max)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            matches!(
-                target.partial_cmp(&max),
-                Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
-            )
-        }
-        ScanPredicate::GtEq(_, literal) => {
-            let Some(target) = literal_bound(literal) else {
-                return false;
-            };
-            let Some((_, max)) = statistics_bound(stats, &target) else {
-                return false;
-            };
-            max < target
+        if rows > cursor {
+            selectors.push(RowSelector::select(rows - cursor));
         }
     }
+    excluded_any.then(|| RowSelection::from(selectors))
 }
 
 /// Row groups retained after closed-predicate statistics pruning for one
@@ -3547,25 +3870,21 @@ impl RowGroupSelection {
     }
 }
 
-/// Selects the row groups of `metadata` whose statistics can still satisfy the
-/// closed predicate conjunction, pruning the rest.
+/// Selects the `candidates` row groups of `metadata` whose statistics can
+/// still satisfy the closed predicate conjunction, pruning the rest.
 ///
 /// A row group is pruned only when at least one leaf proves it cannot contain a
 /// matching row; absent, type-mismatched, or unusable statistics always retain
 /// it, so pruning is a pure IO optimization and never changes results. An empty
-/// predicate conjunction retains every row group and prunes none.
+/// predicate conjunction retains every candidate and prunes none.
 pub(super) fn select_row_groups_for_predicates(
     metadata: &parquet::file::metadata::ParquetMetaData,
+    candidates: Vec<usize>,
     predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
 ) -> RowGroupSelection {
-    let total = metadata.num_row_groups();
-    if predicates.is_empty() || total == 0 {
-        return RowGroupSelection {
-            retained: (0..total).collect(),
-            pruned: 0,
-        };
-    }
-    let retained: Vec<usize> = (0..total)
+    let total = candidates.len();
+    let retained: Vec<usize> = candidates
+        .into_iter()
         .filter(|row_group_index| {
             !predicates
                 .iter()
@@ -3579,11 +3898,10 @@ pub(super) fn select_row_groups_for_predicates(
 /// Projects one physical batch to the pinned schema by field name.
 ///
 /// The row count is carried explicitly rather than inferred from the columns,
-/// because the pinned schema is legitimately allowed to be empty: `count(*)`
-/// requests no output column, so its closure is the hidden tenant column alone
-/// and the batch that survives the tripwire has zero columns and a real row
-/// count. Arrow cannot recover that count from the columns, so dropping it
-/// would turn a valid narrow scan into an execution failure.
+/// because a projected schema is legitimately allowed to be empty: an output
+/// projection for `count(*)` has zero columns and a real row count. Arrow
+/// cannot recover that count from the columns, so dropping it would turn a
+/// valid narrow scan into an execution failure.
 ///
 /// # Errors
 ///
@@ -3611,59 +3929,6 @@ pub(super) fn project_batch(
             }
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
-    RecordBatch::try_new_with_options(
-        schema,
-        columns,
-        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-    )
-    .map_err(DataFusionError::from)
-}
-
-/// Removes one named physical field from a schema.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` plan error when the field is absent.
-fn schema_without(schema: &Schema, name: &str) -> DataFusionResult<SchemaRef> {
-    let index = schema
-        .index_of(name)
-        .map_err(|_| DataFusionError::Plan(format!("physical schema missing `{name}`")))?;
-    let fields = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(ordinal, _)| *ordinal != index)
-        .map(|(_, field)| field.as_ref().clone())
-        .collect::<Vec<_>>();
-    Ok(Arc::new(Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    )))
-}
-
-/// Removes one named array from a batch without copying retained arrays.
-///
-/// The row count is carried explicitly so a batch whose only column was the
-/// hidden tenant column — the closure of a `count(*)` scan — survives the
-/// tripwire as a zero-column batch with its real row count intact.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` execution error when the field is absent or Arrow
-/// rejects the projected batch.
-fn remove_column(batch: &RecordBatch, name: &str) -> DataFusionResult<RecordBatch> {
-    let index = batch
-        .schema()
-        .index_of(name)
-        .map_err(|_| DataFusionError::Execution(format!("batch missing `{name}`")))?;
-    let schema = schema_without(&batch.schema(), name)?;
-    let columns = batch
-        .columns()
-        .iter()
-        .enumerate()
-        .filter(|(ordinal, _)| *ordinal != index)
-        .map(|(_, column)| Arc::clone(column))
-        .collect();
     RecordBatch::try_new_with_options(
         schema,
         columns,
@@ -3701,7 +3966,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::oracle::BifrostQueryReadDecision;
     use crate::oracle::bindings::{
         FollowerSourceKey, OracleExecutionBindingInputs, OracleExecutionBindings,
     };
@@ -3711,8 +3975,8 @@ mod tests {
     use datafusion::common::tree_node::TreeNode;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::logical_expr::{col, lit};
-    use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
+    use parquet::file::properties::WriterProperties;
     use wyrd_runtime::Principal;
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_spec::DataTenantId;
@@ -3723,210 +3987,6 @@ mod tests {
     use wyrd_spec::vala::api::QueryStreamFrame;
 
     use crate::oracle::live::LiveTableRoutes;
-
-    /// In-memory audit sink used only to inspect physical plan structure.
-    struct NoopAudit;
-
-    #[async_trait]
-    impl OracleAudit for NoopAudit {
-        /// Accepts a read-decision event without persisting it in this plan test.
-        async fn append_read_decision(
-            &self,
-            _context: &AuthorizedQueryContext,
-            _decision: BifrostQueryReadDecision,
-        ) -> Result<(), BifrostError> {
-            Ok(())
-        }
-
-        /// Accepts a security-violation event without persisting it in this plan test.
-        async fn append_security_violation(
-            &self,
-            _context: VerifiedSecurityContext,
-            _violation: BifrostSecurityViolation,
-        ) -> Result<(), BifrostError> {
-            Ok(())
-        }
-    }
-
-    /// Tenant validation finds foreign rows at every batch position.
-    #[test]
-    fn tripwire_detects_first_middle_and_last_foreign_rows() {
-        let tenant = wyrd_spec::DataTenantId::new_v7();
-        let foreign = wyrd_spec::DataTenantId::new_v7();
-        for position in 0..3 {
-            let values = (0..3)
-                .map(|row| {
-                    if row == position {
-                        foreign.to_string()
-                    } else {
-                        tenant.to_string()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                DATA_TENANT_ID,
-                DataType::Utf8,
-                false,
-            )]));
-            let batch = RecordBatch::try_new(
-                schema,
-                vec![Arc::new(StringArray::from(values)) as ArrayRef],
-            )
-            .expect("test tenant batch");
-            assert_eq!(
-                tenant_mismatch_row(&batch, tenant).expect("tenant column is valid"),
-                Some(position)
-            );
-        }
-    }
-
-    /// A `count(*)` closure survives the tripwire as a zero-column batch and
-    /// still refuses a foreign row.
-    ///
-    /// `count(*)` requests no output column, so its signed closure is the
-    /// hidden tenant column alone and the batch the tripwire emits has zero
-    /// columns. Arrow cannot infer a row count from no columns, so the count
-    /// has to be carried explicitly; when it was not, the leaf failed with
-    /// `must either specify a row count or at least one column` and the query
-    /// surfaced as a degraded partition rather than as the tenant refusal it
-    /// actually was. Both halves are pinned here: the owning-tenant scan keeps
-    /// its rows, and the foreign row is still classified as a tenant invariant.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture plan cannot be built or executed, or when the
-    /// tripwire loses the row count or the refusal.
-    #[tokio::test]
-    async fn count_star_closure_keeps_its_row_count_through_the_tripwire() {
-        let tenant = wyrd_spec::DataTenantId::new_v7();
-        let foreign = wyrd_spec::DataTenantId::new_v7();
-        for (owner_rows, expect_refusal) in [(3_usize, false), (3, true)] {
-            let values = (0..owner_rows)
-                .map(|row| {
-                    if expect_refusal && row == 1 {
-                        foreign.to_string()
-                    } else {
-                        tenant.to_string()
-                    }
-                })
-                .collect::<Vec<_>>();
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                DATA_TENANT_ID,
-                DataType::Utf8,
-                false,
-            )]));
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(StringArray::from(values)) as ArrayRef],
-            )
-            .expect("tenant-only closure batch");
-            let source =
-                MemorySourceConfig::try_new_exec(std::slice::from_ref(&vec![batch]), schema, None)
-                    .expect("closure source");
-            let principal = Principal {
-                id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: wyrd_runtime::PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
-                effective_permissions: PermissionSet::default(),
-                credential_id: None,
-            };
-            let context = AuthorizedQueryContext::try_new(
-                principal,
-                tenant,
-                RequestId::now_v7(),
-                None,
-                AuthMethod::Internal,
-                wyrd_runtime::Permission::bifrost_query_read(),
-            )
-            .expect("query context");
-            let tripwire = TenantTripwireExec::new(
-                source,
-                context,
-                "vala.traces.spans".to_owned(),
-                Arc::new(NoopAudit),
-            )
-            .expect("tripwire plan");
-            assert_eq!(
-                tripwire.schema().fields().len(),
-                0,
-                "a count(*) closure leaves the tripwire with no output column"
-            );
-            let stream = tripwire
-                .execute(0, Arc::new(TaskContext::default()))
-                .expect("tripwire stream");
-            let collected = futures_util::TryStreamExt::try_collect::<Vec<_>>(stream).await;
-            if expect_refusal {
-                let error = collected.expect_err("a foreign row must refuse the scan");
-                assert!(
-                    is_tenant_invariant_error(&error),
-                    "the refusal must stay a tenant invariant: {error}"
-                );
-            } else {
-                let batches = collected.expect("an owning-tenant closure scan succeeds");
-                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-                assert_eq!(rows, owner_rows, "the zero-column batch kept its row count");
-                assert!(
-                    batches.iter().all(|batch| batch.num_columns() == 0),
-                    "the tenant column must not survive the tripwire"
-                );
-            }
-        }
-    }
-
-    /// Keeps the tenant tripwire immediately above an unordered source union.
-    #[test]
-    fn unordered_union_has_no_mandatory_reconciliation_sort() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            DATA_TENANT_ID,
-            DataType::Utf8,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(StringArray::from(vec![
-                wyrd_spec::DataTenantId::new_v7().to_string(),
-            ])) as ArrayRef],
-        )
-        .expect("source batch");
-        let source: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(std::slice::from_ref(&vec![batch]), schema, None)
-                .expect("source batch schema");
-        let tenant = wyrd_spec::DataTenantId::new_v7();
-        let principal = Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: wyrd_runtime::PrincipalKind::User,
-            tenant_id: tenant,
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::default(),
-            credential_id: None,
-        };
-        let context = AuthorizedQueryContext::try_new(
-            principal,
-            tenant,
-            RequestId::now_v7(),
-            None,
-            AuthMethod::Internal,
-            wyrd_runtime::Permission::bifrost_query_read(),
-        )
-        .expect("query context");
-        let source_union =
-            UnionExec::try_new(vec![Arc::clone(&source), source]).expect("source union");
-        let tripwire = Arc::new(
-            TenantTripwireExec::new(
-                source_union,
-                context,
-                "vala.traces.spans".to_owned(),
-                Arc::new(NoopAudit),
-            )
-            .expect("tripwire plan"),
-        );
-        assert_eq!(tripwire.name(), "TenantTripwireExec");
-        assert_eq!(tripwire.children()[0].name(), "UnionExec");
-        let tripwire_plan: Arc<dyn ExecutionPlan> = Arc::clone(&tripwire) as Arc<dyn ExecutionPlan>;
-        assert!(tripwire_plan.downcast_ref::<SortExec>().is_none());
-        assert!(tripwire.children()[0].downcast_ref::<SortExec>().is_none());
-    }
 
     /// Composes one Oracle capability for hot-read resource tests.
     /// Event-time statistics for a fixture whose pruning decision is not the
@@ -3948,19 +4008,33 @@ mod tests {
         crate::storage::BifrostStorage::for_test(&root.keep(), true)
     }
 
+    /// The one tenant every fixture object is written for and read as.
+    static FIXTURE_TENANT: std::sync::LazyLock<DataTenantId> =
+        std::sync::LazyLock::new(DataTenantId::new_v7);
+
+    /// Builds the production writer recipe with a footer proving
+    /// [`FIXTURE_TENANT`], the way every Bifrost producer writes.
+    fn fixture_writer_properties(row_count: usize, bloom_columns: &[String]) -> WriterProperties {
+        crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
+            row_count,
+            vec![crate::parquet::footer::tenant_key_value(*FIXTURE_TENANT)],
+            bloom_columns,
+        )
+    }
+
     /// Builds one immutable metadata identity for a fixture object.
     ///
     /// The checksum is derived from the name so two differently named fixture
     /// objects never share a cache entry, which is the same property the
     /// durable writer checksum gives production.
-    fn fixture_metadata_key(name: &str, size_bytes: usize) -> crate::storage::HotMetadataKey {
+    fn fixture_metadata_key(name: &str, size_bytes: usize) -> crate::storage::ObjectMetadataKey {
         let mut checksum = [0_u8; 32];
         for (slot, byte) in checksum.iter_mut().zip(name.as_bytes()) {
             *slot = *byte;
         }
         checksum[31] = 1;
-        crate::storage::HotMetadataKey::new(
-            wyrd_spec::DataTenantId::new_v7(),
+        crate::storage::ObjectMetadataKey::new(
+            *FIXTURE_TENANT,
             "vala.traces.spans".to_owned(),
             name.to_owned(),
             uuid::Uuid::now_v7(),
@@ -3989,13 +4063,12 @@ mod tests {
                 roles: [crate::resources::BifrostRole::Oracle]
                     .into_iter()
                     .collect(),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: Some(256 * 1024 * 1024),
+                server_memory_min_bytes: None,
+                bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: Some(1024 * 1024 * 1024),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                forge_compaction_memory_limit_bytes: None,
-                scratch_root: std::env::temp_dir(),
+                scratch_root: None,
                 volume_roots: None,
             },
         )
@@ -4104,7 +4177,7 @@ mod tests {
     ) {
         let snapshot = roles.snapshot().expect("root snapshot");
         assert_eq!(snapshot.oracle_memory_used_bytes, 0);
-        assert_eq!(snapshot.elastic_memory_used_bytes, 0);
+        assert_eq!(snapshot.governed_memory_used_bytes, 0);
         assert_eq!(query_pool.reserved(), 0);
     }
 
@@ -4194,10 +4267,7 @@ mod tests {
     /// size-driven fixture could produce two groups at unit scale.
     fn write_grouped_fixture(schema: &SchemaRef, blocks: &[RecordBatch]) -> bytes::Bytes {
         let rows: usize = blocks.iter().map(RecordBatch::num_rows).sum();
-        let properties = crate::parquet::writer_properties::bifrost_writer_properties(
-            rows,
-            &["service_name".to_owned()],
-        );
+        let properties = fixture_writer_properties(rows, &["service_name".to_owned()]);
         let mut sink = Vec::new();
         let mut writer =
             parquet::arrow::ArrowWriter::try_new(&mut sink, Arc::clone(schema), Some(properties))
@@ -4344,6 +4414,68 @@ mod tests {
         );
     }
 
+    /// Page selection measured on one production-recipe row group: an
+    /// equality leaf on a sorted column skips every page whose index proves it
+    /// cannot match, keeps strictly fewer rows than the group, and still
+    /// yields the one matching row when the reader applies the selection.
+    #[test]
+    fn page_index_selects_only_the_matching_pages() {
+        use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+
+        const ROWS: i64 = 100_000;
+        const TARGET: i64 = 54_321;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let published =
+            write_grouped_fixture(&schema, &[service_block(&schema, "checkout", 0, ROWS)]);
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional)
+            .parse_and_finish(&published)
+            .expect("valid Parquet footer and page index");
+        let predicates = vec![ScanPredicate::Eq(
+            "value".to_owned(),
+            ScanLiteral::I64(TARGET),
+        )];
+
+        let selection = select_pages_for_predicates(&metadata, &[0], &predicates)
+            .expect("the sorted column's page index excludes pages");
+        let kept = selection.row_count();
+        assert!(
+            kept > 0 && kept < usize::try_from(ROWS).expect("fixture rows fit usize"),
+            "kept {kept} of {ROWS} rows"
+        );
+
+        let matching: usize = ParquetRecordBatchReaderBuilder::try_new_with_options(
+            published,
+            ArrowReaderOptions::new()
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional),
+        )
+        .expect("reader builder")
+        .with_row_selection(selection)
+        .build()
+        .expect("selected reader")
+        .map(|batch| {
+            let batch = batch.expect("selected batch");
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column")
+                .iter()
+                .filter(|value| *value == Some(TARGET))
+                .count()
+        })
+        .sum();
+        assert_eq!(matching, 1, "the selection must keep the matching row");
+        assert!(
+            select_pages_for_predicates(&metadata, &[0], &[]).is_none(),
+            "an empty conjunction leaves the reader unchanged"
+        );
+    }
+
     /// Closed-predicate pruning measured on a real two-row-group file written
     /// by the production recipe: the file's low-cardinality `service_name`
     /// column is dictionary-encoded and Bloom-filtered, an equality leaf
@@ -4379,7 +4511,11 @@ mod tests {
             "service_name".to_owned(),
             ScanLiteral::Utf8("checkout".to_owned()),
         )];
-        let selection = select_row_groups_for_predicates(&metadata, &predicates);
+        let selection = select_row_groups_for_predicates(
+            &metadata,
+            (0..metadata.num_row_groups()).collect(),
+            &predicates,
+        );
         assert_eq!(selection.retained, vec![0]);
         assert_eq!(selection.pruned, 1);
         assert!(!selection.excludes_file());
@@ -4420,8 +4556,7 @@ mod tests {
         batch: &RecordBatch,
         context: &str,
     ) {
-        let properties =
-            crate::parquet::writer_properties::bifrost_writer_properties(batch.num_rows(), &[]);
+        let properties = fixture_writer_properties(batch.num_rows(), &[]);
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(path).unwrap_or_else(|error| panic!("{context} file: {error}")),
             schema,
@@ -4573,6 +4708,327 @@ mod tests {
         assert_position_delete_rows(&reader, forwarded, fixture.data_schema).await;
     }
 
+    /// Every partition count tiles each non-empty file exactly once.
+    ///
+    /// The union of all partitions' ranges for a file must be `[0, size)`
+    /// with no overlap, and an empty file must never be assigned, so each
+    /// row group's midpoint lands in exactly one partition.
+    #[test]
+    fn partition_byte_ranges_tile_every_file_once() {
+        let sizes = [10_u64, 3, 0, 20, 1];
+        for partitions in 1..=8 {
+            let mut covered = vec![Vec::<Range<u64>>::new(); sizes.len()];
+            for partition in 0..partitions {
+                for (index, range) in partition_byte_ranges(&sizes, partition, partitions) {
+                    assert!(range.start < range.end, "ranges are never empty");
+                    covered[index].push(range);
+                }
+            }
+            for (index, ranges) in covered.iter_mut().enumerate() {
+                ranges.sort_by_key(|range| range.start);
+                let mut next = 0;
+                for range in ranges.iter() {
+                    assert_eq!(range.start, next, "file {index} has a gap or overlap");
+                    next = range.end;
+                }
+                assert_eq!(next, sizes[index], "file {index} is not fully covered");
+            }
+        }
+        assert!(partition_byte_ranges(&[], 0, 4).is_empty());
+    }
+
+    /// Writes `values` as a Parquet file with two-row row groups.
+    fn write_split_fixture(path: &std::path::Path, schema: &SchemaRef, values: &[i64]) -> usize {
+        let batch = RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![Arc::new(Int64Array::from(values.to_vec())) as ArrayRef],
+        )
+        .expect("split fixture batch");
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(2))
+            .set_key_value_metadata(Some(vec![crate::parquet::footer::tenant_key_value(
+                *FIXTURE_TENANT,
+            )]))
+            .build();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(path).expect("split fixture file"),
+            Arc::clone(schema),
+            Some(properties),
+        )
+        .expect("split fixture writer");
+        writer.write(&batch).expect("split fixture write");
+        writer.close().expect("split fixture close");
+        usize::try_from(std::fs::metadata(path).expect("split fixture size").len())
+            .expect("split fixture size fits usize")
+    }
+
+    /// Collects every `Int64` value one stream yields.
+    async fn collect_int64(
+        mut stream: datafusion::execution::SendableRecordBatchStream,
+    ) -> Vec<i64> {
+        let mut values = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("split partition batch");
+            values.extend(
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("split values remain Int64")
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+        }
+        values
+    }
+
+    /// A hot leaf split across partitions reads every row exactly once.
+    ///
+    /// One multi-row-group file and one small file are read at several
+    /// partition counts, including more partitions than row groups. The union
+    /// of all partitions must equal the source rows, and each file must count
+    /// once in scan telemetry however many partitions read it.
+    #[tokio::test]
+    async fn hot_parquet_split_partitions_read_every_row_once() {
+        let directory = tempfile::tempdir().expect("split fixture directory");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let large: Vec<i64> = (0..11).collect();
+        let small: Vec<i64> = vec![100, 101];
+        let files = [("large.parquet", &large), ("small.parquet", &small)]
+            .into_iter()
+            .map(|(name, values)| {
+                let path = directory.path().join(name);
+                let size_bytes = write_split_fixture(&path, &schema, values);
+                HotFileSource {
+                    metadata_key: fixture_metadata_key(&path.to_string_lossy(), size_bytes),
+                    location: path.to_string_lossy().into_owned(),
+                    size_bytes,
+                    event_time: unusable_event_time(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut expected = large.iter().chain(&small).copied().collect::<Vec<_>>();
+        expected.sort_unstable();
+        let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
+        let telemetry = Arc::new(OracleTelemetry::new());
+        for partitions in [1, 2, 3, 4, 16] {
+            let metrics = Arc::new(OracleScanMetricsHandle::default());
+            let exec = HotParquetExec::new(
+                files.clone(),
+                FileIO::new_with_fs(),
+                fixture_storage(),
+                Arc::clone(&schema),
+                HotParquetPlan::Leader,
+                Arc::clone(&metrics),
+                Vec::new(),
+            )
+            .with_partitions(partitions);
+            assert_eq!(exec.properties().partitioning.partition_count(), partitions);
+            let context = bound_leader_task(
+                oracle_memory_resources(&governor, 1024 * 1024),
+                &telemetry,
+                crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+            );
+            let mut actual = Vec::new();
+            for partition in 0..partitions {
+                let stream = exec
+                    .execute(partition, Arc::clone(&context))
+                    .expect("split partition stream");
+                actual.extend(collect_int64(stream).await);
+            }
+            assert!(exec.execute(partitions, context).is_err());
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{partitions} partitions");
+            let (_, scanned_files, _) = metrics.terminal_values();
+            assert_eq!(
+                scanned_files, 2,
+                "{partitions} partitions count each file once"
+            );
+        }
+    }
+
+    /// A hot object whose footer is missing or names a foreign tenant fails
+    /// the scan with the tenant invariant before any row is yielded.
+    ///
+    /// The first file is written by the fixture tenant but read under another
+    /// tenant's authenticated binding; the second carries no footer tenant at
+    /// all. Both must refuse with [`BifrostError::QueryTenantInvariant`] and
+    /// yield zero rows, so no per-row check is needed downstream.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either object yields a row, completes without error, or
+    /// fails with anything other than the tenant invariant.
+    #[tokio::test]
+    async fn hot_parquet_refuses_foreign_or_missing_footer_tenant_before_any_row() {
+        let directory = tempfile::tempdir().expect("tenant fixture directory");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let foreign_path = directory.path().join("foreign.parquet");
+        let foreign_size = write_split_fixture(&foreign_path, &schema, &[1, 2, 3]);
+        let missing_path = directory.path().join("missing.parquet");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(&missing_path).expect("missing-tenant fixture file"),
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("missing-tenant fixture writer");
+        writer
+            .write(
+                &RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![4, 5])) as ArrayRef],
+                )
+                .expect("missing-tenant fixture batch"),
+            )
+            .expect("missing-tenant fixture write");
+        writer.close().expect("missing-tenant fixture close");
+        let missing_size = usize::try_from(
+            std::fs::metadata(&missing_path)
+                .expect("missing-tenant fixture size")
+                .len(),
+        )
+        .expect("fixture size fits usize");
+        let reading_tenant = DataTenantId::new_v7();
+        let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
+        let telemetry = Arc::new(OracleTelemetry::new());
+        for (path, size_bytes, tenant) in [
+            (&foreign_path, foreign_size, reading_tenant),
+            (&missing_path, missing_size, *FIXTURE_TENANT),
+        ] {
+            let location = path.to_string_lossy().into_owned();
+            let file = HotFileSource {
+                metadata_key: crate::storage::ObjectMetadataKey::new(
+                    tenant,
+                    "vala.traces.spans".to_owned(),
+                    location.clone(),
+                    uuid::Uuid::now_v7(),
+                    [7; 32],
+                    u64::try_from(size_bytes).expect("fixture size fits u64"),
+                ),
+                location,
+                size_bytes,
+                event_time: unusable_event_time(),
+            };
+            let exec = HotParquetExec::new(
+                vec![file],
+                FileIO::new_with_fs(),
+                fixture_storage(),
+                Arc::clone(&schema),
+                HotParquetPlan::Leader,
+                Arc::new(OracleScanMetricsHandle::default()),
+                Vec::new(),
+            );
+            let context = bound_leader_task(
+                oracle_memory_resources(&governor, 1024 * 1024),
+                &telemetry,
+                crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+            );
+            let mut stream = exec.execute(0, context).expect("tenant fixture stream");
+            let mut rows = 0;
+            let mut refusal = None;
+            while let Some(batch) = stream.next().await {
+                match batch {
+                    Ok(batch) => rows += batch.num_rows(),
+                    Err(error) => {
+                        refusal = Some(error);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(rows, 0, "an unproven file yields no row");
+            let refusal = refusal.expect("an unproven file fails the scan");
+            assert!(
+                is_tenant_invariant_error(&refusal),
+                "an unproven file is a tenant refusal, saw {refusal}"
+            );
+        }
+    }
+
+    /// Byte-range pieces handed to Iceberg's reader return every row once.
+    ///
+    /// This pins the contract between [`partition_byte_ranges`] and the
+    /// reader's midpoint rule for a split `FileScanTask`: the published leaf
+    /// relies on it to split one data file across partitions.
+    #[tokio::test]
+    async fn iceberg_reader_honors_partition_byte_ranges() {
+        let directory = tempfile::tempdir().expect("split fixture directory");
+        let path = directory.path().join("data.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_owned(),
+                "1".to_owned(),
+            )])),
+        ]));
+        let values: Vec<i64> = (0..9).collect();
+        let size = u64::try_from(write_split_fixture(&path, &schema, &values))
+            .expect("fixture size fits u64");
+        let iceberg_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "value",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("Iceberg task schema"),
+        );
+        let reader = iceberg::arrow::ArrowReaderBuilder::new(
+            FileIO::new_with_fs(),
+            iceberg::Runtime::current(),
+        )
+        .build();
+        for partitions in [1, 2, 3, 5, 12] {
+            let mut actual = Vec::new();
+            for partition in 0..partitions {
+                for (_, range) in partition_byte_ranges(&[size], partition, partitions) {
+                    let task = FileScanTask::builder()
+                        .with_file_size_in_bytes(size)
+                        .with_start(range.start)
+                        .with_length(range.end - range.start)
+                        .with_record_count(None)
+                        .with_data_file_path(path.to_string_lossy().to_string())
+                        .with_data_file_format(iceberg::spec::DataFileFormat::Parquet)
+                        .with_schema(Arc::clone(&iceberg_schema))
+                        .with_project_field_ids(vec![1])
+                        .with_deletes(Vec::new())
+                        .with_case_sensitive(false)
+                        .build();
+                    let batches = reader
+                        .clone()
+                        .read(Box::pin(futures_util::stream::iter(vec![Ok(task)])))
+                        .expect("split reader")
+                        .stream()
+                        .try_collect::<Vec<RecordBatch>>()
+                        .await
+                        .expect("split rows");
+                    for batch in batches {
+                        actual.extend(
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .expect("Iceberg split keeps Int64")
+                                .values()
+                                .iter()
+                                .copied(),
+                        );
+                    }
+                }
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, values, "{partitions} partitions");
+        }
+    }
+
     /// Production hot execution records requested bytes once on success,
     /// manifest-size failure, and a retried read before the stream is dropped.
     #[tokio::test]
@@ -4594,9 +5050,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot file"),
             Arc::clone(&schema),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties(batch.num_rows(), &[]),
-            ),
+            Some(fixture_writer_properties(batch.num_rows(), &[])),
         )
         .expect("hot writer");
         writer.write(&batch).expect("hot batch write");
@@ -4701,9 +5155,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot causal file"),
             Arc::clone(&schema),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties(batch.num_rows(), &[]),
-            ),
+            Some(fixture_writer_properties(batch.num_rows(), &[])),
         )
         .expect("hot causal writer");
         writer.write(&batch).expect("hot causal write");
@@ -4920,12 +5372,10 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("compressible file"),
             Arc::clone(&schema),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties(
-                    usize::try_from(requests * rows_per_request).expect("rows fit usize"),
-                    &[],
-                ),
-            ),
+            Some(fixture_writer_properties(
+                usize::try_from(requests * rows_per_request).expect("rows fit usize"),
+                &[],
+            )),
         )
         .expect("compressible writer");
         for request in 0..requests {
@@ -5066,7 +5516,9 @@ mod tests {
         assert_eq!(pool.reserved(), 0);
     }
 
-    /// An indivisible range above its ceiling is rejected before storage IO.
+    /// An indivisible range above its ceiling is refused before storage IO
+    /// as the admitted query's typed resource exhaustion, not an admission
+    /// refusal.
     #[tokio::test]
     async fn hot_parquet_oversized_single_range_fails_before_io() {
         let fixture = build_hot_causal_fixture();
@@ -5087,7 +5539,7 @@ mod tests {
         let error = DataFusionError::External(Box::new(parquet_error));
         assert_eq!(
             crate::oracle::map_first_batch_failure(Some(&Err(error))),
-            Some(BifrostError::QueryAdmissionRejected)
+            Some(BifrostError::QueryResourcesExhausted)
         );
         assert!(ranges.lock().expect("recorded ranges").is_empty());
         drop(occupied);
@@ -5169,7 +5621,7 @@ mod tests {
             governor
                 .snapshot()
                 .expect("root snapshot")
-                .elastic_memory_used_bytes,
+                .governed_memory_used_bytes,
             0
         );
         assert_eq!(query_pool.reserved(), 0);
@@ -5303,9 +5755,7 @@ mod tests {
     ///
     /// Covers: supported `AND` conjunction of typed comparisons and a null
     /// leaf; a literal-on-the-left comparison normalized by reversing the
-    /// operator; the exact stable-dedup closure order (scan output, then
-    /// first-occurrence predicate columns, then the always-present hidden
-    /// tenant column); and every closed-subset-violating shape (`OR`, `NOT`,
+    /// operator; and every closed-subset-violating shape (`OR`, `NOT`,
     /// cast, column-to-column, non-finite float) reported `Unsupported`.
     #[test]
     fn closed_predicate_projection_contract() {
@@ -5317,7 +5767,6 @@ mod tests {
             Field::new("service_name", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
             Field::new("wyrd_event_time", DataType::Int64, true),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
         ]);
 
         // Supported AND conjunction: comparison + null-check, and a
@@ -5402,8 +5851,8 @@ mod tests {
         );
     }
 
-    /// The projection closure is `scan output + predicate columns + hidden
-    /// tenant column`, in that order, stably deduplicated.
+    /// The projection closure is `scan output + predicate columns`, in that
+    /// order, stably deduplicated, and never empty.
     ///
     /// Order is part of the contract, not an implementation detail: the
     /// closure is hashed into the assignment-authority digest, so two
@@ -5417,27 +5866,24 @@ mod tests {
             Field::new("service_name", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
             Field::new("wyrd_event_time", DataType::Int64, true),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
         ]);
-        let public_schema = schema_without(&physical_schema, DATA_TENANT_ID).unwrap();
         let supported = col("service_name")
             .eq(lit("api"))
             .and(col("duration_ms").is_not_null());
 
         // Projection-closure order: requested scan output first, then the
-        // first occurrence of each predicate column in filter order, then
-        // the always-present hidden tenant column, stably deduplicated
-        // (`duration_ms` appears in both the projection and the predicates).
+        // first occurrence of each predicate column in filter order, stably
+        // deduplicated (`duration_ms` appears in both the projection and the predicates).
         let leaves = match classify_filter(&supported) {
             FilterClassification::Supported(leaves) => leaves,
             FilterClassification::Unsupported => unreachable!(),
         };
         let projection = vec![
-            public_schema.index_of("duration_ms").unwrap(),
-            public_schema.index_of("wyrd_event_time").unwrap(),
+            physical_schema.index_of("duration_ms").unwrap(),
+            physical_schema.index_of("wyrd_event_time").unwrap(),
         ];
         let closure = required_columns_closure(
-            &scan_output_names(&public_schema, Some(&projection)).expect("valid ordinals"),
+            &scan_output_names(&physical_schema, Some(&projection)).expect("valid ordinals"),
             &leaves,
         );
         assert_eq!(
@@ -5446,13 +5892,12 @@ mod tests {
                 "duration_ms".to_string(),
                 "wyrd_event_time".to_string(),
                 "service_name".to_string(),
-                DATA_TENANT_ID.to_string(),
             ]
         );
 
-        // A `None` projection closes over every public column.
+        // A `None` projection closes over every table column.
         let full_closure = required_columns_closure(
-            &scan_output_names(&public_schema, None).expect("full public projection"),
+            &scan_output_names(&physical_schema, None).expect("full projection"),
             &[],
         );
         assert_eq!(
@@ -5461,9 +5906,16 @@ mod tests {
                 "service_name".to_string(),
                 "duration_ms".to_string(),
                 "wyrd_event_time".to_string(),
-                DATA_TENANT_ID.to_string(),
             ]
         );
+
+        // A `count(*)` scan requests no column, so its closure reads the
+        // always-present event time rather than producing zero-column leaves.
+        let count_closure = required_columns_closure(
+            &scan_output_names(&physical_schema, Some(&Vec::new())).expect("empty projection"),
+            &[],
+        );
+        assert_eq!(count_closure, vec!["wyrd_event_time".to_string()]);
     }
 
     /// Column ownership, not qualification, decides pushdown eligibility.
@@ -5482,10 +5934,7 @@ mod tests {
         use datafusion::logical_expr::{col, lit};
         use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
 
-        let physical_schema = Schema::new(vec![
-            Field::new("service_name", DataType::Utf8, true),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
-        ]);
+        let physical_schema = Schema::new(vec![Field::new("service_name", DataType::Utf8, true)]);
 
         let qualified_owned = Expr::Column(Column::new(
             Some(TableReference::full("vala", "bifrost", "events")),
@@ -5568,9 +6017,7 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot batch fixture file"),
             Arc::clone(&schema),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties(batch.num_rows(), &[]),
-            ),
+            Some(fixture_writer_properties(batch.num_rows(), &[])),
         )
         .expect("hot batch fixture writer");
         writer.write(&batch).expect("hot batch fixture write");
@@ -5608,6 +6055,69 @@ mod tests {
             Arc::clone(metrics),
             Vec::new(),
         )
+    }
+
+    /// Published data-file footers load once through the governed cache, stay
+    /// retained for the scan, and a vanished object keeps its stale cause.
+    ///
+    /// The second load of the same object must return the identical decoded
+    /// metadata, proving the cache served it; both loads are held by the
+    /// loader so eviction cannot release bytes the scan still reads. A missing
+    /// path must classify as a stale Iceberg object so the query retries
+    /// against a fresh snapshot instead of failing as an outage.
+    #[tokio::test]
+    async fn published_footer_loader_serves_retains_and_classifies_stale() {
+        use iceberg::arrow::ParquetMetadataLoader as _;
+
+        // Reads go through the production Iceberg storage adapter, which keeps
+        // the owner's typed not-found cause a vanished object reports.
+        let fixture = build_hot_batch_fixture();
+        let size = u64::try_from(fixture.bytes.len()).expect("fixture size fits u64");
+        let root = tempfile::tempdir().expect("published footer root");
+        std::fs::write(root.path().join("data.parquet"), &fixture.bytes)
+            .expect("published footer object");
+        let storage = crate::storage::BifrostStorage::for_test(root.path(), true);
+        let warehouse = format!("file://{}", root.path().display());
+        let file_io = iceberg::io::FileIOBuilder::new(Arc::new(
+            crate::catalog::iceberg_storage::BifrostIcebergStorageFactory::new(
+                Arc::clone(&storage),
+                &warehouse,
+            ),
+        ))
+        .build();
+        let footers = PublishedFooters::new(
+            storage,
+            *FIXTURE_TENANT,
+            "vala.traces.spans".to_owned(),
+            HotParquetPlan::Follower {
+                memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+            },
+        );
+        let loader = footers
+            .loader(file_io, &task_context_with_batch_size(8))
+            .expect("footer loader");
+        let path = format!("{warehouse}/data.parquet");
+
+        let first = loader.load(&path, size).await.expect("first footer load");
+        let second = loader.load(&path, size).await.expect("cached footer load");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.num_row_groups(), 1);
+        assert_eq!(
+            loader
+                .retained
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
+
+        let error = loader
+            .load(&format!("{warehouse}/vanished.parquet"), size)
+            .await
+            .expect_err("a vanished object must not load");
+        assert!(is_stale_iceberg_object_error(&iceberg_datafusion_error(
+            error
+        )));
     }
 
     /// Builds one bound task context for a leader leaf under test.
@@ -6008,15 +6518,15 @@ mod tests {
         );
     }
 
-    /// Asserts admission changed no optimizer or memory knob of the retained shape.
+    /// Asserts admission changed no planning knob of the retained shape.
     ///
-    /// Admission supplies a runtime and a memory pool only, so a grant larger
-    /// than the minimum-grant planning shape must leave target partitions,
-    /// batch size, hash-join preference, and sort-spill reservation untouched.
+    /// Admission supplies a runtime, a memory pool, and the execution-time
+    /// sort-merge reservation only, so target partitions, batch size, and
+    /// hash-join preference stay exactly as planned.
     ///
     /// # Panics
     ///
-    /// Panics when any of those four knobs differs between the two configs.
+    /// Panics when any of those three knobs differs between the two configs.
     fn assert_same_session_shape(
         planned: &datafusion::prelude::SessionConfig,
         executed: &datafusion::prelude::SessionConfig,
@@ -6026,10 +6536,6 @@ mod tests {
         assert_eq!(
             executed.options().optimizer.prefer_hash_join,
             planned.options().optimizer.prefer_hash_join
-        );
-        assert_eq!(
-            executed.options().execution.sort_spill_reservation_bytes,
-            planned.options().execution.sort_spill_reservation_bytes
         );
     }
 
@@ -6054,10 +6560,8 @@ mod tests {
         let tenant = wyrd_spec::DataTenantId::new_v7();
         let (provider, _live) = projection_closure_provider(tenant, None, None).await;
 
-        let shape = crate::resources::OracleSessionShape::for_grant(
-            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+        let shape = crate::resources::OracleSessionShape::new(
             crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
-            1,
         );
         let lock = Arc::new(crate::oracle::bindings::OracleExecutionLock::new());
         let retained_config = shape.session_config().with_extension(Arc::clone(&lock));
@@ -6412,11 +6916,6 @@ mod tests {
                     "duration_ms",
                     IcebergType::Primitive(PrimitiveType::Long),
                 )),
-                Arc::new(NestedField::required(
-                    3,
-                    DATA_TENANT_ID,
-                    IcebergType::Primitive(PrimitiveType::String),
-                )),
             ])
             .build()
             .expect("fixture Iceberg schema");
@@ -6474,7 +6973,6 @@ mod tests {
             iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
-            audit: Arc::new(NoopAudit),
             remote: None,
             live: None,
         })
@@ -6656,11 +7154,6 @@ mod tests {
                 optional(1, "unused_payload", PrimitiveType::String),
                 optional(2, "duration_ms", PrimitiveType::Long),
                 optional(3, "status_code", PrimitiveType::String),
-                Arc::new(NestedField::required(
-                    4,
-                    DATA_TENANT_ID,
-                    IcebergType::Primitive(PrimitiveType::String),
-                )),
             ])
             .build()
             .expect("fixture Iceberg schema");
@@ -6716,10 +7209,9 @@ mod tests {
 
     /// Builds the pinned wide-table provider the closure owner scans.
     ///
-    /// The live batch carries the full four-column physical schema —
-    /// `unused_payload`, `duration_ms`, `status_code`, `data_tenant_id` — with
-    /// one `STATUS_CODE_ERROR` row and one `STATUS_CODE_OK` row, both owned by
-    /// `tenant`. Keeping fixture construction here leaves the owning test to
+    /// The live batch carries the full three-column physical schema —
+    /// `unused_payload`, `duration_ms`, `status_code` — with one
+    /// `STATUS_CODE_ERROR` row and one `STATUS_CODE_OK` row, read as `tenant`. Keeping fixture construction here leaves the owning test to
     /// assert only closure behavior.
     ///
     /// # Panics
@@ -6751,7 +7243,6 @@ mod tests {
             Field::new("unused_payload", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
             Field::new("status_code", DataType::Utf8, true),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
         ]));
         let live = RecordBatch::try_new(
             Arc::clone(&live_schema),
@@ -6761,10 +7252,6 @@ mod tests {
                 Arc::new(StringArray::from(vec![
                     "STATUS_CODE_ERROR",
                     "STATUS_CODE_OK",
-                ])) as ArrayRef,
-                Arc::new(StringArray::from(vec![
-                    tenant.to_string(),
-                    tenant.to_string(),
                 ])) as ArrayRef,
             ],
         )
@@ -6776,7 +7263,6 @@ mod tests {
             iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
-            audit: Arc::new(NoopAudit),
             remote,
             live: live_routes,
         })
@@ -6816,21 +7302,20 @@ mod tests {
     }
 
     /// One leader-owned closure governs every leaf, the placeholder, the
-    /// tripwire, the provider-local filter, and the public result.
+    /// provider-local filter, and the result.
     ///
     /// This is the production Interactive leader path for
     /// `SELECT duration_ms FROM ... WHERE status_code = 'STATUS_CODE_ERROR'`.
-    /// The closure is `[duration_ms, status_code, data_tenant_id]`: the
-    /// requested output, the predicate-only column that must survive to the
-    /// provider-local filter, and the hidden tenant column that must survive to
-    /// the tripwire. `unused_payload` is requested by nobody and must not
-    /// appear in any leaf.
+    /// The closure is `[duration_ms, status_code]`: the requested output and
+    /// the predicate-only column that must survive to the provider-local
+    /// filter. `unused_payload` is requested by nobody and must not appear in
+    /// any leaf.
     ///
     /// # Panics
     /// Panics if provider construction, scan planning, or execution violates
     /// the closure contract this owner pins.
     #[tokio::test]
-    async fn projected_leaf_union_preserves_predicate_and_tenant_columns() {
+    async fn projected_leaf_union_preserves_predicate_columns() {
         use datafusion::execution::context::SessionContext;
         use datafusion::logical_expr::{col, lit};
         use datafusion::physical_plan::collect;
@@ -6856,23 +7341,11 @@ mod tests {
         let filter = filtered
             .downcast_ref::<FilterExec>()
             .expect("provider keeps its local filter over the closed predicates");
-        let tripwire_plan = Arc::clone(filter.children()[0]);
-        let tripwire = tripwire_plan
-            .downcast_ref::<TenantTripwireExec>()
-            .expect("tripwire sits directly under the provider-local filter");
-
-        // The tripwire consumes the tenant column and never emits it.
-        let union = Arc::clone(tripwire.children()[0]);
-        let closure = vec![
-            "duration_ms".to_string(),
-            "status_code".to_string(),
-            DATA_TENANT_ID.to_string(),
-        ];
+        // The source union sits directly under the provider-local filter.
+        let union = Arc::clone(filter.children()[0]);
+        assert!(union.downcast_ref::<UnionExec>().is_some());
+        let closure = vec!["duration_ms".to_string(), "status_code".to_string()];
         assert_eq!(column_names(&union), closure);
-        assert_eq!(
-            column_names(&tripwire_plan),
-            vec!["duration_ms".to_string(), "status_code".to_string()]
-        );
 
         // Every union child — the published Iceberg leaf and the live Scribe
         // leaf alike — exposes exactly the closure, in closure order.
@@ -6917,7 +7390,10 @@ mod tests {
                 crate::resources::bounded_memory_pool(64 * 1024 * 1024),
                 crate::oracle::bindings::OracleExecutionGrant::for_test(
                     QueryClass::Interactive,
-                    oracle_memory_resources(&oracle_test_roles(1024 * 1024 * 1024), 1024 * 1024),
+                    oracle_memory_resources(
+                        &oracle_test_roles(2 * 1024 * 1024 * 1024),
+                        1024 * 1024,
+                    ),
                     Arc::new(OracleTelemetry::new()),
                 ),
             ),

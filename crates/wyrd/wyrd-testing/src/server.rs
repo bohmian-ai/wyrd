@@ -11,7 +11,6 @@ use std::time::Duration;
 use wyrd_sql::OperatorPool;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use base64::Engine as _;
@@ -36,21 +35,18 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
 use vala_bifrost_redux::resources::{
-    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, MIN_UNMANAGED_RESERVE_BYTES,
-    ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
+    BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+    SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
 use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
-use wyrd_auth::exchange_api_key::ExchangeApiKey;
-use wyrd_auth::issuance::{TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
+use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
-use wyrd_auth_check::{AuthzCheckRequest, AuthzCheckResponse, PolicyHook};
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_oidc::JwksCache;
 use wyrd_auth_verify::{
@@ -61,14 +57,11 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_crypt::SecretKey;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::BuiltinEndpoints;
-#[cfg(test)]
-use wyrd_runtime::PermissionSet;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
-use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
     GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, ServeMode, WorkloadBindingEntry,
@@ -87,90 +80,22 @@ use wyrd_telemetry::TelemetryGuard;
 
 use crate::bifrost::ForgeObjectStoreControl;
 
-/// Harness-owned credential that exchanges one persisted Service API key.
-struct TestOraclePeerCredentials {
-    /// Shared real Postgres fixture containing the credential record.
-    fixture: Arc<PgFixture>,
-    /// Control tenant that owns the credential record.
-    ///
-    /// An API key is exchanged on a connection scoped to the tenant the key
-    /// embeds; presenting it on any other tenant's connection is refused as a
-    /// cross-tenant key. A peer journey seeds near-miss principals inside an
-    /// ordinary data tenant too, so the tenant travels with the key rather
-    /// than being assumed to be the control tenant.
-    tenant_id: DataTenantId,
-    /// Durable API key retained only for the cluster lifetime.
-    api_key: SecretString,
-    /// Production exchange service used for each access-token acquisition.
-    exchange: ExchangeApiKey,
-    /// Cached short-lived service bearer shared by every peer RPC in the
-    /// cluster, retained with its own expiry so a journey that outlives one
-    /// access TTL re-exchanges instead of presenting an expired token.
-    bearer: tokio::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>,
-}
-
-impl std::fmt::Debug for TestOraclePeerCredentials {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TestOraclePeerCredentials")
-            .finish_non_exhaustive()
-    }
-}
-
-#[async_trait]
-impl OraclePeerCredentials for TestOraclePeerCredentials {
-    /// Exchange the retained API key through the production auth service.
-    async fn bearer(&self, force_refresh: bool) -> Result<String, DispatchError> {
-        let mut cached = self.bearer.lock().await;
-        let fresh_until = chrono::Utc::now() + chrono::Duration::seconds(60);
-        if !force_refresh
-            && let Some((bearer, expires_at)) = cached.as_ref()
-            && *expires_at > fresh_until
-        {
-            return Ok(bearer.clone());
-        }
-        let mut conn = self
-            .fixture
-            .tenant_conn_for(self.tenant_id)
-            .await
-            .map_err(|_| DispatchError::Terminal)?;
-        let exchanged = self
-            .exchange
-            .execute(
-                &mut conn,
-                self.api_key.clone(),
-                &RequestId::now_v7().to_string(),
-            )
-            .await
-            .map_err(|_| DispatchError::Terminal)?;
-        conn.commit().await.map_err(|_| DispatchError::Terminal)?;
-        let bearer = exchanged.access_token.expose_secret().to_owned();
-        *cached = Some((bearer.clone(), exchanged.expires_at));
-        Ok(bearer)
-    }
-}
-
 use wyrd_spec::auth::{
     ExchangeTokenType, SecretBearer, TokenAudience, TokenRequest, TokenResponse,
 };
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::request_id::RequestId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
-    grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_role,
-    insert_service_account, insert_user, provision_system_principal,
-    revoke_role_from_service_account, revoke_role_from_user, role_by_name, trusted_issuer_by_url,
-    workload_binding_by_subject,
+    grant_role_to_service_account, grant_role_to_user, insert_api_key, insert_service_account,
+    insert_user, provision_system_principal, revoke_role_from_service_account,
+    revoke_role_from_user, role_by_name, trusted_issuer_by_url, workload_binding_by_subject,
 };
 use wyrd_storage::{BackendConfig, StorageSettings};
 
 use crate::time::ClockHandle;
 use crate::verification::{VerificationFixture, VerificationFixtureError};
-
-/// Dedicated least-privilege role assigned to the test Oracle Service.
-const BIFROST_PEER_ROLE: &str = "bifrost_peer";
 
 /// Retained authorization history: the durable home of every published decision.
 const AUDIT_LOG: &str = "vala.system.audit_log";
@@ -190,22 +115,12 @@ const AUDIT_INSPECTION_PRINCIPAL: Uuid = Uuid::from_u128(0x0AD1_7000_0000_0000_0
 /// The retained read-decision operation every Bifrost read commits.
 const READ_DECISION: &str = "bifrost.query.read_decision";
 
-/// Default Forge compaction budget a harness node carrying a Forge role names.
-///
-/// The production default is four fifths of the memory limit and deliberately
-/// does not clamp, so a co-located harness whose Scribe and Oracle floors are
-/// also protected must name a budget that fits the remainder — exactly as a
-/// co-located deployment configures one. The constant is public because a test
-/// that pins two Oracle replicas to one durable admission ceiling has to
-/// subtract the same reservation the Forge-carrying replica takes.
-pub const HARNESS_FORGE_COMPACTION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-
 /// Memory limit a harness node observes when a test injects no snapshot.
 ///
 /// Every node in a test cluster is carved from the same fixed observation, so
 /// role placement is the only thing that moves a node's derived plan. The
 /// constant is public because a test that pins two Oracle replicas to one
-/// durable admission ceiling has to name the limit it sheds role floors from.
+/// durable admission ceiling has to name the limit its shared cap derives from.
 pub const HARNESS_NODE_MEMORY_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Separates a serve-task join failure from the server's own terminal outcome.
@@ -239,16 +154,8 @@ pub struct WyrdTestServer {
     requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// Peer identity this server presents and verifies on the private plane.
     peer_tls: Option<TestBifrostPeerTls>,
-    /// Peer workload credential this server's private plane admits.
-    ///
-    /// Retained so a test can dial the peer plane as the one Service principal
-    /// the composed listener authorizes, instead of minting a second identity
-    /// the server was never told about.
-    peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Retains generated peer PEM files for as long as this server exists.
     _peer_tls_root: Option<Arc<tempfile::TempDir>>,
-    /// Peer ticket keyring paths this server loads its peer authority from.
-    peer_keyring_paths: Option<crate::bifrost::peer_keyring::TestPeerKeyringPaths>,
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Test-only readiness failure requested by the builder.
@@ -303,8 +210,11 @@ struct WyrdTestServerInner {
     query_stream_fault: QueryStreamFaultController,
     /// Atomic lifecycle-audit fault controls for causal query tests.
     query_control_audit_fault: wyrd_server::state::QueryControlAuditFaultController,
-    /// Current notification-backed schema stall used by cancellation journeys.
-    query_stream_stall: std::sync::Mutex<Option<Arc<wyrd_server::state::QueryStreamStall>>>,
+    /// Every notification-backed schema stall armed, newest last.
+    ///
+    /// Retained so a journey holding several stalled queries can still resolve
+    /// each one's lifecycle probe by its identity.
+    query_stream_stall: std::sync::Mutex<Vec<Arc<wyrd_server::state::QueryStreamStall>>>,
     /// Sole owner of the dedicated Scribe coordination runtime this server composed.
     ///
     /// The harness calls `compose_bifrost` directly, so a bound test server
@@ -362,8 +272,6 @@ pub struct OracleRuntimeInspection {
     pub queued_queries: u64,
     /// Memory bytes reserved by active queries.
     pub reserved_memory_bytes: u64,
-    /// Peer reservations waiting for worker execution.
-    pub peer_pending: u64,
     /// Peer reservations executing worker streams.
     pub peer_running: u64,
     /// Oracle audit outbox commits still in flight.
@@ -482,8 +390,6 @@ enum Mode {
 
 /// Builder for [`WyrdTestServer`].
 pub struct WyrdTestServerBuilder {
-    policy_hook: Option<Arc<dyn PolicyHook>>,
-    audit_writer: Option<Arc<dyn AuthzAuditWriter>>,
     storage_settings: Option<StorageSettings>,
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
     access_ttl: Option<ChronoDuration>,
@@ -527,23 +433,15 @@ pub struct WyrdTestServerBuilder {
     /// A journey that proves queue or total-deadline expiry states short
     /// limits rather than waiting out the hour-scale production defaults.
     oracle_runtime: Option<wyrd_server::config::OracleRuntimeConfig>,
-    /// Forge compaction budget replacing the harness default on this node.
-    forge_compaction_memory_limit_bytes: Option<usize>,
     /// Process-installed production telemetry guard shared by every node.
     telemetry: Option<Arc<TelemetryGuard>>,
     /// Optional fixed HTTP/gRPC addresses used for truthful peer advertisement.
     bind_addrs: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
-    /// Optional cluster-scoped Oracle peer credential injected by the harness.
-    oracle_peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
     /// Peer identity for this server; provisioned by the builder when absent.
     peer_tls: Option<TestBifrostPeerTls>,
     /// Temporary root retaining generated peer PEM files for this server's life.
     peer_tls_root: Option<Arc<tempfile::TempDir>>,
-    /// Optional topology-wide peer ticket keyring shared by every replica.
-    peer_keyring: Option<Arc<crate::bifrost::peer_keyring::TestPeerKeyring>>,
-    /// Materialized keyring paths resolved during composition.
-    peer_keyring_paths: Option<crate::bifrost::peer_keyring::TestPeerKeyringPaths>,
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Production Forge process role used by bound test servers.
@@ -595,6 +493,9 @@ pub struct WyrdTestServerBuilder {
 /// server identity and the client identity presented on outbound peer dials.
 #[derive(Clone, Debug)]
 pub struct TestBifrostPeerTls {
+    /// Directory in the production `WYRD_PEER_TLS_DIR` layout holding the
+    /// three files below as `ca.crt`, `tls.crt`, and `tls.key`.
+    pub dir: std::path::PathBuf,
     /// Dual-EKU certificate chain PEM path.
     pub certificate_path: std::path::PathBuf,
     /// Private-key PEM path paired with the certificate chain.
@@ -605,12 +506,55 @@ pub struct TestBifrostPeerTls {
     pub server_name: String,
 }
 
+impl TestBifrostPeerTls {
+    /// Rebuilds the identity from a production-layout bundle directory.
+    #[must_use]
+    pub fn from_dir(dir: std::path::PathBuf) -> Self {
+        Self {
+            certificate_path: dir.join("tls.crt"),
+            private_key_path: dir.join("tls.key"),
+            ca_path: dir.join("ca.crt"),
+            server_name: wyrd_server::config::PEER_SERVER_NAME.to_owned(),
+            dir,
+        }
+    }
+
+    /// Loads this identity into the production outbound peer TLS owner.
+    ///
+    /// The bundle is read by the production peer configuration loader over
+    /// [`Self::dir`], so an incomplete or unreadable bundle fails composition
+    /// exactly as it fails a deployed `wyrd-server` start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdTestServerError::Start`] when the production loader
+    /// refuses the bundle: `ca.crt`, `tls.crt`, or `tls.key` is unreadable,
+    /// or the key is not PEM text.
+    pub fn bifrost_peer_tls(
+        &self,
+    ) -> Result<vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls, WyrdTestServerError> {
+        let bundle = wyrd_server::config::BifrostPeerConfig {
+            tls_dir: Some(self.dir.clone()),
+            ..wyrd_server::config::BifrostPeerConfig::default()
+        }
+        .read_bundle()
+        .map_err(WyrdTestServerError::Start)?
+        .ok_or_else(|| {
+            WyrdTestServerError::Start("peer TLS directory enables no peer bundle".to_owned())
+        })?;
+        Ok(vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls::new(
+            bundle.ca_certificate,
+            self.server_name.clone(),
+            bundle.certificate_chain,
+            bundle.private_key,
+        ))
+    }
+}
+
 impl Default for WyrdTestServerBuilder {
     /// A builder with every test hook off and audit publication enabled.
     fn default() -> Self {
         Self {
-            policy_hook: None,
-            audit_writer: None,
             storage_settings: None,
             storage_handle: None,
             access_ttl: None,
@@ -638,14 +582,10 @@ impl Default for WyrdTestServerBuilder {
             system_resources: None,
             oracle_query_slot_limit: None,
             oracle_runtime: None,
-            forge_compaction_memory_limit_bytes: None,
             telemetry: None,
             bind_addrs: None,
-            oracle_peer_credentials: None,
             peer_tls: None,
             peer_tls_root: None,
-            peer_keyring: None,
-            peer_keyring_paths: None,
             peer_bind: None,
             forge_process_role: BifrostTarget::All,
             forge_completion_observer: None,
@@ -669,9 +609,6 @@ impl Default for WyrdTestServerBuilder {
 
 /// Result of a fixture-path principal bootstrap.
 pub use crate::principal::Bootstrap;
-
-/// Result of an authz-check request.
-pub use crate::principal::CheckResult;
 
 /// Test server errors.
 #[derive(Debug, Error)]
@@ -802,9 +739,8 @@ impl WyrdTestServer {
     /// committed row — principals, API keys, role grants, gateway
     /// configuration, and sealed managed-secret envelopes — survives, while
     /// in-memory state, the token-signing key, sockets, and the Bifrost data
-    /// root are rebuilt. The fixture, storage, and Bifrost peer credential are
-    /// retained across the shutdown so dropping the old server does not
-    /// release the database and the durable peer principal is reused.
+    /// root are rebuilt. The fixture and storage are retained across the
+    /// shutdown so dropping the old server does not release the database.
     /// Previously minted access tokens are signed by the old process's key, so
     /// callers exchange their API keys again against the restarted server.
     ///
@@ -818,11 +754,7 @@ impl WyrdTestServer {
         let fixture = Arc::clone(&self.inner.fixture);
         let storage = Arc::clone(&self.inner.state.storage);
         let storage_root = self.inner._storage_root.clone();
-        let peer_credentials = Arc::clone(&self.peer_credentials);
         self.shutdown().await?;
-        // The peer principal is durable, so the replacement admits the one
-        // the database already holds instead of provisioning a duplicate.
-        builder = builder.with_oracle_peer_credentials(peer_credentials);
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
@@ -1260,8 +1192,8 @@ impl WyrdTestServer {
     /// Stall the next query after its schema frame using test-tier notifications.
     pub fn stall_next_query_after_schema(&self) {
         let stall = self.inner.query_stream_fault.stall_next_after_schema();
-        if let Ok(mut current) = self.inner.query_stream_stall.lock() {
-            *current = Some(stall);
+        if let Ok(mut stalls) = self.inner.query_stream_stall.lock() {
+            stalls.push(stall);
         }
     }
 
@@ -1294,6 +1226,21 @@ impl WyrdTestServer {
             .map_err(|_| {
                 WyrdTestServerError::Start("query memory hold deadline elapsed".to_owned())
             })
+    }
+
+    /// Arms the next admitted Oracle query to park after its first batch frame.
+    ///
+    /// Forwards to the controller `OracleResources` owns; the returned park
+    /// reports when the query has streamed rows and parked, and resolves it to
+    /// resume or to fail through a real refused growth of its own pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start error when this server does not host an Oracle role.
+    pub fn park_next_query_after_rows(
+        &self,
+    ) -> Result<Arc<vala_bifrost_redux::resources::OracleQueryPark>, WyrdTestServerError> {
+        Ok(self.oracle_memory_hold()?.park_next_after_rows())
     }
 
     /// Releases the retained reservation back to the shared Oracle root.
@@ -1350,7 +1297,8 @@ impl WyrdTestServer {
             .query_stream_stall
             .lock()
             .map_err(|_| WyrdTestServerError::Start("query stall lock poisoned".to_owned()))?
-            .clone()
+            .last()
+            .cloned()
             .ok_or_else(|| WyrdTestServerError::Start("query stall is not scheduled".to_owned()))?;
         let deadline = Duration::from_millis(WyrdServerConfig::default().shutdown.drain_ms);
         tokio::time::timeout(deadline, stall.wait_entered())
@@ -1379,7 +1327,6 @@ impl WyrdTestServer {
             active_queries: admission.active_queries,
             queued_queries: admission.queued_queries,
             reserved_memory_bytes: admission.reserved_memory_bytes,
-            peer_pending: admission.peer_pending,
             peer_running: admission.peer_running,
             audit_pending: audit_pending as u64,
             spill_directories,
@@ -1476,27 +1423,31 @@ impl WyrdTestServer {
 
     /// Resolves the lifecycle observation for one exact Oracle query identity.
     ///
+    /// Searches every armed stall for the one bound to `query_id`.
+    ///
     /// # Errors
     ///
-    /// Returns an error when no stalled query is bound or the identity differs.
+    /// Returns an error when the stall lock is poisoned or no stalled query
+    /// carries that identity.
     fn query_resource_probe(
         &self,
         query_id: &str,
     ) -> Result<Arc<vala_bifrost_redux::oracle::QueryResourceProbe>, WyrdTestServerError> {
-        let stall = self
+        let stalls = self
             .inner
             .query_stream_stall
             .lock()
             .map_err(|_| WyrdTestServerError::Start("query stall lock poisoned".to_owned()))?
-            .clone()
-            .ok_or_else(|| WyrdTestServerError::Start("query stall is not scheduled".to_owned()))?;
-        let probe = stall.resource_probe().map_err(WyrdTestServerError::Start)?;
-        if probe.query_id().as_uuid().to_string() != query_id {
-            return Err(WyrdTestServerError::Start(format!(
-                "query resource identity mismatch: requested {query_id}"
-            )));
-        }
-        Ok(probe)
+            .clone();
+        stalls
+            .iter()
+            .filter_map(|stall| stall.resource_probe().ok())
+            .find(|probe| probe.query_id().as_uuid().to_string() == query_id)
+            .ok_or_else(|| {
+                WyrdTestServerError::Start(format!(
+                    "query resource identity mismatch: requested {query_id}"
+                ))
+            })
     }
 
     /// Wake the already-running production Forge scheduler for a test pass.
@@ -2119,25 +2070,6 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
     }
 
-    /// Report the pod's closed contention registry totals.
-    ///
-    /// Fairness is a scheduling decision, not a row: the only truthful evidence
-    /// that a vector was lent, released, or queued is the production registry
-    /// that recorded the decision, so a contention case reads these totals
-    /// instead of inferring capacity from configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this server owns no Scribe.
-    pub fn scribe_contention_totals_for_test(
-        &self,
-    ) -> Result<vala_bifrost_redux::scribe::telemetry::ScribeTelemetrySnapshot, WyrdTestServerError>
-    {
-        self.bifrost_scribe()
-            .map(|scribe| scribe.contention_totals_for_test())
-            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
-    }
-
     /// Report the pod's closed staged-member and claim registry totals.
     ///
     /// Durability is a lifecycle transition, not a file: the only truthful
@@ -2158,22 +2090,22 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
     }
 
-    /// Report how many complete lifecycle vectors this pod's capacity completes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this server owns no Scribe.
-    pub fn scribe_ownership_ceiling_for_test(&self) -> Result<usize, WyrdTestServerError> {
-        self.bifrost_scribe()
-            .map(|scribe| scribe.ownership_ceiling_for_test())
-            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
-    }
-
     /// Trip the server-owned WAL breaker for a deterministic failure probe.
     pub fn trip_bifrost_wal_disk_full_for_test(&self) -> Result<(), WyrdTestServerError> {
         self.inner
             .state
             .trip_scribe_wal_disk_full_for_test()
+            .map_err(WyrdTestServerError::Start)
+    }
+
+    /// Fail the next WAL sync after its record is written, faulting only Scribe.
+    ///
+    /// # Errors
+    /// Returns a start error when this server hosts no Scribe.
+    pub fn trip_bifrost_wal_sync_fault_for_test(&self) -> Result<(), WyrdTestServerError> {
+        self.inner
+            .state
+            .trip_scribe_wal_sync_fault_for_test()
             .map_err(WyrdTestServerError::Start)
     }
 
@@ -2245,23 +2177,6 @@ impl WyrdTestServer {
     #[must_use]
     pub fn peer_tls(&self) -> Option<&TestBifrostPeerTls> {
         self.peer_tls.as_ref()
-    }
-
-    /// Returns a bearer for the one workload principal the peer plane admits.
-    ///
-    /// The private listener authenticates exactly the Service principal bound
-    /// to this server's peer API key, so a test that dials the peer plane needs
-    /// this bearer rather than a user or data-tenant service token.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WyrdTestServerError::Auth`] when the credential exchange
-    /// cannot produce a bearer.
-    pub async fn peer_bearer(&self) -> Result<String, WyrdTestServerError> {
-        self.peer_credentials
-            .bearer(false)
-            .await
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
     }
 
     /// Return the placeholder API key (full bootstrap is complex).
@@ -3166,48 +3081,6 @@ impl WyrdTestServer {
         Ok(token.access_token.expose().to_owned())
     }
 
-    /// Call `/v1/authz/check` using a delegated token and projected request headers.
-    ///
-    /// # Errors
-    /// Returns an error if request construction or routing fails.
-    pub async fn authz_check(
-        &self,
-        jwt: &str,
-        request: AuthzCheckRequest,
-    ) -> Result<CheckResult, WyrdTestServerError> {
-        let response = self
-            .raw_call(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/authz/check")
-                    .header("x-wyrd-access-token", format!("Bearer {jwt}"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(serde_json::to_vec(&request).map_err(
-                        |error| WyrdTestServerError::Io(error.to_string()),
-                    )?))
-                    .map_err(|error| WyrdTestServerError::Io(error.to_string()))?,
-            )
-            .await?;
-        let status = response.status();
-        let request_id = response
-            .headers()
-            .get("wyrd-request-id")
-            .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| WyrdTestServerError::Io("missing wyrd-request-id header".to_owned()))
-            .and_then(|value| {
-                RequestId::parse(value).map_err(|error| WyrdTestServerError::Io(error.to_string()))
-            })?;
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
-        let check_response: Option<AuthzCheckResponse> = serde_json::from_slice(&body).ok();
-        Ok(CheckResult {
-            status,
-            wyrd_request_id: request_id,
-            response: check_response,
-        })
-    }
-
     /// Seed a Service/Agent principal under the client-expressible `card_ref`.
     ///
     /// Workload bindings resolve to a server-owned `CardRef` with `uid = None`
@@ -3565,28 +3438,6 @@ impl WyrdTestServer {
         primary
     }
 
-    /// Verify one Oracle peer bearer and return its effective permission set.
-    ///
-    /// # Errors
-    ///
-    /// Returns an auth error when the bearer is invalid, expired, or not bound
-    /// to the reserved system tenant.
-    #[cfg(test)]
-    pub(crate) async fn oracle_peer_permissions_for_test(
-        &self,
-        bearer: String,
-    ) -> Result<PermissionSet, WyrdTestServerError> {
-        self.inner
-            .state
-            .auth
-            .token_verifier
-            .as_deref()
-            .ok_or_else(|| WyrdTestServerError::Auth("no token verifier".to_owned()))?
-            .verify(&SecretString::from(bearer), &DataTenantId::SYSTEM_OWNER)
-            .map(|verified| verified.principal.effective_permissions.clone())
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
-    }
-
     /// Bind an already-constructed server to OS-assigned HTTP and gRPC ports.
     pub(crate) async fn bind(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
         // Reuse the production composition's shutdown token so the harness
@@ -3622,28 +3473,16 @@ impl WyrdTestServer {
         config.http.bind = http_bind;
         config.grpc.bind = grpc_bind;
         config.role = self.forge_process_role();
-        let peer_tls = self
-            .peer_tls
-            .as_ref()
-            .expect("peer identity is provisioned during composition");
-        config.bifrost.peer.bind = self
-            .peer_bind
-            .expect("peer bind is reserved during composition");
-        config.bifrost.peer.ca_certificate_path = Some(peer_tls.ca_path.clone());
-        config.bifrost.peer.certificate_chain_path = Some(peer_tls.certificate_path.clone());
-        config.bifrost.peer.private_key_path = Some(peer_tls.private_key_path.clone());
-        config.bifrost.peer.server_name = Some(peer_tls.server_name.clone());
-        config.bifrost.peer.advertise_addr = Some(format!(
-            "https://{}",
-            self.peer_bind
-                .expect("peer bind is reserved during composition")
-        ));
-        config.bifrost.peer.api_key = Some("harness-peer-api-key".to_owned());
-        config.bifrost.peer.ticket = peer_keyring_config(
-            self.peer_keyring_paths
-                .as_ref()
-                .expect("peer ticket keyring is materialized during composition"),
-        );
+        // Peer mode only when a test supplied a cluster identity; the default
+        // server runs its Bifrost roles in-process with no private listener.
+        if let Some(peer_tls) = &self.peer_tls {
+            let bind = self
+                .peer_bind
+                .expect("peer bind is reserved during composition");
+            config.bifrost.peer.bind = bind;
+            config.bifrost.peer.address = Some(bind.to_string());
+            config.bifrost.peer.tls_dir = Some(peer_tls.dir.clone());
+        }
         config.metrics.enabled = false;
         config.serve.mode = ServeMode::Both;
         config.verification.enabled = self.verification_runtime;
@@ -3983,20 +3822,6 @@ impl WyrdTestServerBuilder {
         self.bind_addrs = Some((http, grpc));
         self
     }
-    /// Override the default allow policy hook.
-    #[must_use]
-    pub fn with_policy_hook(mut self, hook: Arc<dyn PolicyHook>) -> Self {
-        self.policy_hook = Some(hook);
-        self
-    }
-
-    /// Override the default no-op audit writer.
-    #[must_use]
-    pub fn with_audit_writer(mut self, writer: Arc<dyn AuthzAuditWriter>) -> Self {
-        self.audit_writer = Some(writer);
-        self
-    }
-
     /// Override the storage backend used by the test server.
     ///
     /// By default the server uses a local filesystem backend backed by a
@@ -4160,11 +3985,11 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Mount a caller-owned durable Bifrost data root that outlives the process.
+    /// Mount a caller-owned durable Bifrost data root that outlives the server.
     ///
-    /// A simulated pod in a multi-process cluster is restarted by launching a
-    /// new child over the same directory, which is what makes a Scribe's
-    /// volume-coupled identity observable across restart.
+    /// A pod restarted on its own volume is a new server composed over the
+    /// same directory, which is what makes a Scribe's volume-coupled identity
+    /// observable across restart.
     #[must_use]
     pub fn with_durable_bifrost_data_root(mut self, data_root: std::path::PathBuf) -> Self {
         self.bifrost_data_path = Some(data_root);
@@ -4183,8 +4008,8 @@ impl WyrdTestServerBuilder {
 
     /// Injects complete process-visible resources into the production bootstrap.
     ///
-    /// Tests vary raw observations through this seam; all reserve, floor,
-    /// elastic, lease, and partition calculations remain production-owned.
+    /// Tests vary raw observations through this seam; all server-minimum,
+    /// shared-cap, lease, and partition calculations remain production-owned.
     #[must_use]
     pub(crate) fn with_system_resources_for_test(
         mut self,
@@ -4221,17 +4046,6 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Names the Forge compaction budget this node admits plans against.
-    ///
-    /// The harness default is sized for the small tables most fixtures compact.
-    /// A journey that compacts production-sized inputs states the budget its
-    /// pod was sized for here, exactly as a deployment configures one.
-    #[must_use]
-    pub(crate) fn with_forge_compaction_memory_limit_for_test(mut self, bytes: usize) -> Self {
-        self.forge_compaction_memory_limit_bytes = Some(bytes);
-        self
-    }
-
     /// Attach the process-installed production telemetry pipeline.
     #[must_use]
     pub(crate) fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
@@ -4250,16 +4064,6 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Inject the cluster-owned Oracle peer credential without process globals.
-    #[must_use]
-    pub(crate) fn with_oracle_peer_credentials(
-        mut self,
-        credentials: Arc<dyn OraclePeerCredentials>,
-    ) -> Self {
-        self.oracle_peer_credentials = Some(credentials);
-        self
-    }
-
     /// Share one cluster-owned peer identity instead of provisioning a new one.
     ///
     /// Every replica in a topology must chain to the same peer CA, so a
@@ -4271,41 +4075,11 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Share one topology-wide peer ticket keyring with this server.
-    ///
-    /// Peer tickets are verified against a published manifest, so every replica
-    /// that must accept another's tickets loads the same keyring. A multi-node
-    /// harness generates it once and hands it to each server through this seat;
-    /// a solitary server generates its own.
-    #[must_use]
-    pub fn with_peer_keyring(
-        mut self,
-        keyring: Arc<crate::bifrost::peer_keyring::TestPeerKeyring>,
-    ) -> Self {
-        self.peer_keyring = Some(keyring);
-        self
-    }
-
-    /// Load peer ticket material a harness already wrote to disk.
-    ///
-    /// A multi-process topology materializes one shared keyring per child root
-    /// and passes only paths across the process boundary, so this seat takes
-    /// the paths rather than the generated keys. Setting it suppresses
-    /// generation.
-    #[must_use]
-    pub fn with_peer_keyring_paths(
-        mut self,
-        paths: crate::bifrost::peer_keyring::TestPeerKeyringPaths,
-    ) -> Self {
-        self.peer_keyring_paths = Some(paths);
-        self
-    }
-
     /// Pin the exact private peer address this server binds and advertises.
     ///
-    /// A multi-process harness gives each simulated pod a distinct loopback
-    /// address on the canonical peer port so membership records one exact
-    /// pod-like endpoint rather than a load-balanced one.
+    /// A cluster pins it per node so a restarted node comes back at the
+    /// address membership already published for it, as a pod restarted on its
+    /// own network identity does.
     #[must_use]
     pub fn with_peer_bind(mut self, bind: std::net::SocketAddr) -> Self {
         self.peer_bind = Some(bind);
@@ -4356,13 +4130,6 @@ impl WyrdTestServerBuilder {
                         presign_ttl: Duration::from_secs(600),
                         part_size_bytes: 16 * 1024 * 1024,
                         multipart_threshold_bytes: 100 * 1024 * 1024,
-                        // A bound server serves its own storage URLs, so they
-                        // must share its HTTP origin: the client refuses to
-                        // send credentials to any other origin.
-                        public_base_url: Some(self.bind_addrs.map_or_else(
-                            || "https://wyrd.test".to_owned(),
-                            |(http, _)| format!("http://{http}"),
-                        )),
                     };
                     (Some(Arc::new(root)), settings)
                 }
@@ -4372,13 +4139,6 @@ impl WyrdTestServerBuilder {
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (root, handle)
         };
-        if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)
-            && self.oracle_peer_credentials.is_none()
-        {
-            self.oracle_peer_credentials =
-                Some(provision_oracle_peer_credentials(Arc::clone(&fixture)).await?);
-        }
-
         self.start_with_resources(fixture, storage, storage_root)
             .await
     }
@@ -4511,60 +4271,17 @@ impl WyrdTestServerBuilder {
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         });
-        // The formula's default (four fifths of the memory limit) deliberately
-        // does not clamp, so a co-located harness whose Scribe and Oracle floors
-        // are also protected must name a budget that fits the remainder —
-        // exactly as a co-located deployment configures one.
-        let forge_budget_bytes = self
-            .bifrost_roles
-            .iter()
-            .any(|role| {
-                matches!(
-                    role,
-                    BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker
-                )
-            })
-            .then(|| {
-                self.forge_compaction_memory_limit_bytes.unwrap_or_else(|| {
-                    // The default is sized for the tables most fixtures
-                    // compact, but a small pod still has to leave elastic
-                    // memory for the Scribe and Oracle work beside it, so the
-                    // remainder left by the protected floors halves it.
-                    let protected = self
-                        .bifrost_roles
-                        .iter()
-                        .filter(|role| {
-                            matches!(
-                                role,
-                                BifrostRuntimeRole::Scribe | BifrostRuntimeRole::Oracle
-                            )
-                        })
-                        .count()
-                        * ROLE_MEMORY_FLOOR_BYTES;
-                    let safe = snapshot
-                        .memory_limit_bytes
-                        .saturating_sub(MIN_UNMANAGED_RESERVE_BYTES)
-                        .saturating_sub(protected);
-                    HARNESS_FORGE_COMPACTION_BUDGET_BYTES.min(safe / 2)
-                })
-            });
         let runtime_resources =
             BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
                 snapshot,
                 BifrostResourcePolicy {
                     roles: resource_roles,
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
+                    server_memory_min_bytes: None,
+                    bifrost_memory_limit_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: self.oracle_query_slot_limit,
-                    // The formula's default (four fifths of the memory limit)
-                    // deliberately does not clamp, so a co-located harness whose
-                    // Scribe and Oracle floors are also protected must name a
-                    // budget that fits the remainder — exactly as a co-located
-                    // deployment configures one.
-                    forge_compaction_memory_limit_bytes: forge_budget_bytes,
-                    scratch_root,
+                    scratch_root: Some(scratch_root),
                     volume_roots,
                 },
                 self.scribe_ingest_limits.max_frame_bytes,
@@ -4602,10 +4319,17 @@ impl WyrdTestServerBuilder {
             }
             None => NodeId::new(Uuid::now_v7()),
         };
-        let cluster_registry = Arc::new(if let Some(timing) = self.role_timing {
+        let cluster_registry = if let Some(timing) = self.role_timing {
             ClusterRegistry::new_with_role_timing(postgres.vala().clone(), node_id, timing)
         } else {
             ClusterRegistry::new(postgres.vala().clone(), node_id)
+        };
+        // Mirrors production boot: a server without peer mode serves no
+        // private listener, so it offers only its own roles as candidates.
+        let cluster_registry = Arc::new(if self.peer_tls.is_some() {
+            cluster_registry
+        } else {
+            cluster_registry.process_local()
         });
         let forge_config = self.forge_config.unwrap_or_default();
         let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
@@ -4636,84 +4360,18 @@ impl WyrdTestServerBuilder {
             scribe_admission: self.scribe_admission,
             role_timing: self.role_timing,
         };
-        let peer_credentials = match self.oracle_peer_credentials {
-            Some(credentials) => credentials,
-            None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
-        };
-        let retained_peer_credentials = Arc::clone(&peer_credentials);
-        // Every Scribe- or Oracle-bearing target requires a complete peer
-        // identity, so the harness provisions one unconditionally rather than
-        // letting a test boot a server that production configuration would
-        // reject. A caller that already minted cluster-wide material keeps it.
-        if self.peer_tls.is_none() {
-            let root = Arc::new(
-                tempfile::tempdir()
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            );
-            let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            self.peer_tls = Some(
-                authority
-                    .materialize(root.path(), "node")
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            );
-            self.peer_tls_root = Some(root);
-        }
-        // The peer ticket keyring is independent of the workload signing key
-        // and of the peer certificate: a journey rotates it, presents retired
-        // and unpublished identifiers against it, and proves a user token
-        // never validates as a peer ticket. It is materialized beside the peer
-        // PEMs so a child process mounts one private root.
-        if self.peer_keyring_paths.is_none() {
-            let keyring = match self.peer_keyring.take() {
-                Some(keyring) => keyring,
-                None => Arc::new(crate::bifrost::peer_keyring::TestPeerKeyring::generate()),
-            };
-            let root = match &self.peer_tls_root {
-                Some(root) => root.path().to_owned(),
-                None => self
-                    .peer_tls
-                    .as_ref()
-                    .and_then(|tls| tls.private_key_path.parent().map(std::path::Path::to_owned))
-                    .ok_or_else(|| {
-                        WyrdTestServerError::Start(
-                            "peer identity has no directory to hold ticket keyring material"
-                                .to_owned(),
-                        )
-                    })?,
-            };
-            self.peer_keyring_paths = Some(
-                keyring
-                    .materialize(&root, "node")
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            );
-            self.peer_keyring = Some(keyring);
-        }
         // Reserving the port here — before composition — is what lets the node
         // advertise the exact address its listener will hold. Binding and
         // dropping an ephemeral socket is the only way to learn a free port
         // ahead of the production bind, which happens later in `start`.
-        if self.peer_bind.is_none() {
+        if self.peer_tls.is_some() && self.peer_bind.is_none() {
             self.peer_bind = Some(reserve_loopback_addr()?);
         }
-        let peer_tls = match &self.peer_tls {
-            Some(tls) => {
-                let read = |path: &std::path::Path| {
-                    std::fs::read(path)
-                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))
-                };
-                let key = String::from_utf8(read(&tls.private_key_path)?).map_err(|error| {
-                    WyrdTestServerError::Start(format!("peer private key is not PEM text: {error}"))
-                })?;
-                Some(vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls::new(
-                    read(&tls.ca_path)?,
-                    tls.server_name.clone(),
-                    read(&tls.certificate_path)?,
-                    SecretString::from(key),
-                ))
-            }
-            None => None,
-        };
+        let peer_tls = self
+            .peer_tls
+            .as_ref()
+            .map(TestBifrostPeerTls::bifrost_peer_tls)
+            .transpose()?;
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         bifrost_config.storage = self.bifrost_storage_io;
@@ -4724,17 +4382,6 @@ impl WyrdTestServerBuilder {
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()
         };
-        // Composition loads the peer keyring from the same files a deployment
-        // mounts, so the in-process graph and a child process reach identical
-        // peer authority.
-        let peer_keyring = Arc::new(
-            wyrd_server::oracle::PeerTicketKeyring::load(&peer_keyring_config(
-                self.peer_keyring_paths
-                    .as_ref()
-                    .expect("peer ticket keyring is materialized during composition"),
-            ))
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        );
         let shutdown = CancellationToken::new();
         let ComposedBifrost {
             bifrost: bifrost_runtime,
@@ -4751,9 +4398,7 @@ impl WyrdTestServerBuilder {
             resources: bifrost_resources,
             cluster: cluster_registry,
             token_verifier: Arc::clone(&verifier),
-            peer_credentials,
             peer_tls,
-            peer_keyring,
             config: bifrost_config,
             forge_config: forge_runtime,
             node_id,
@@ -4764,10 +4409,11 @@ impl WyrdTestServerBuilder {
             // gRPC one: a selected node and fence must be dialed on the
             // mutually authenticated plane. The port is reserved before this
             // point so the advertised value is the address the listener holds.
-            advertise_addr: format!(
-                "https://{}",
-                self.peer_bind
-                    .expect("peer bind is reserved before composition")
+            // A server without peer mode publishes production's undialable
+            // process-local marker instead.
+            advertise_addr: self.peer_bind.map_or_else(
+                || format!("local://{}", node_id.as_uuid()),
+                |bind| format!("https://{bind}"),
             ),
             data_root,
             shutdown: shutdown.clone(),
@@ -4832,12 +4478,6 @@ impl WyrdTestServerBuilder {
             .with_mcp_context_probe(self.mcp_context_probe)
             .with_audit_publication_disabled(self.audit_publication_disabled);
         state.authz.permission_check = Arc::new(RbacCheck);
-        state.authz.audit_writer = self
-            .audit_writer
-            .unwrap_or_else(|| Arc::new(NoopAuthzAuditWriter));
-        if let Some(hook) = self.policy_hook {
-            state.authz.policy_hook = hook;
-        }
         let (forge_publisher, _forge_inbox) = staging_file_channel(16)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let router = build_router(state.clone());
@@ -4862,7 +4502,7 @@ impl WyrdTestServerBuilder {
                 node_id,
                 query_stream_fault,
                 query_control_audit_fault,
-                query_stream_stall: std::sync::Mutex::new(None),
+                query_stream_stall: std::sync::Mutex::new(Vec::new()),
                 _coordination_runtime: coordination_runtime,
                 _compaction_runtime: compaction_runtime,
             },
@@ -4871,9 +4511,7 @@ impl WyrdTestServerBuilder {
             serve_handle: None,
             requested_bind: self.bind_addrs,
             peer_tls: self.peer_tls,
-            peer_credentials: retained_peer_credentials,
             _peer_tls_root: self.peer_tls_root,
-            peer_keyring_paths: self.peer_keyring_paths,
             peer_bind: self.peer_bind,
             readiness_failure: self.readiness_failure,
             stalled_drain_for_test: self.stalled_drain_for_test,
@@ -5088,64 +4726,6 @@ fn test_gateway_config(
     })
 }
 
-/// Mints one complete `bifrost.peer` identity under `directory`.
-///
-/// A Scribe- or Oracle-bearing target refuses to compose without a complete
-/// peer identity, so a test that hand-builds a [`WyrdServerConfig`] rather than
-/// taking one from [`WyrdTestServerBuilder`] still needs real CA, leaf, and
-/// ticket-keyring material on disk. This mints exactly that through the same
-/// authorities the harness uses, so no test grows a second notion of what a
-/// peer identity is.
-///
-/// The caller owns `directory` and must keep it alive for as long as the
-/// composed server may read the material.
-///
-/// # Errors
-///
-/// Returns [`WyrdTestServerError::Start`] when certificate or keyring material
-/// cannot be minted or written under `directory`.
-pub fn materialize_test_peer_config(
-    directory: &std::path::Path,
-    label: &str,
-) -> Result<wyrd_server::config::BifrostPeerConfig, WyrdTestServerError> {
-    let start = |error: String| WyrdTestServerError::Start(error);
-    let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
-        .map_err(|error| start(error.to_string()))?;
-    let tls = authority
-        .materialize(directory, label)
-        .map_err(|error| start(error.to_string()))?;
-    let keyring = crate::bifrost::peer_keyring::TestPeerKeyring::generate()
-        .materialize(directory, label)
-        .map_err(|error| start(error.to_string()))?;
-    let bind = reserve_loopback_addr()?;
-    Ok(wyrd_server::config::BifrostPeerConfig {
-        bind,
-        advertise_addr: Some(format!("https://{bind}")),
-        ca_certificate_path: Some(tls.ca_path),
-        certificate_chain_path: Some(tls.certificate_path),
-        private_key_path: Some(tls.private_key_path),
-        server_name: Some(tls.server_name),
-        api_key: Some("harness-peer-api-key".to_owned()),
-        ticket: peer_keyring_config(&keyring),
-        ..wyrd_server::config::BifrostPeerConfig::default()
-    })
-}
-
-/// Projects materialized keyring paths onto the production configuration shape.
-///
-/// The harness deliberately goes through the same configuration struct a
-/// deployment fills from `WYRD_BIFROST_PEER_TICKET_*`, so a test cannot load
-/// keyring material by a path production has no way to express.
-fn peer_keyring_config(
-    paths: &crate::bifrost::peer_keyring::TestPeerKeyringPaths,
-) -> wyrd_server::config::PeerTicketKeyringConfig {
-    wyrd_server::config::PeerTicketKeyringConfig {
-        active_key_id: Some(paths.active_key_id.clone()),
-        signing_key_path: Some(paths.signing_key_path.clone()),
-        verifying_keyring_path: Some(paths.verifying_keyring_path.clone()),
-    }
-}
-
 /// Candidate ports tried before a reservation gives up on its band.
 ///
 /// Bounded so a host whose band is genuinely saturated fails with a bind error
@@ -5268,8 +4848,7 @@ fn claim_port(port: u16) -> Result<bool, WyrdTestServerError> {
 /// staging backend that cannot resume a bounded orphan scan. A Local fixture
 /// stands in for a production object store, so it declares the support it
 /// actually has; every other backend is opened unchanged, and a caller wanting
-/// the incapable backend supplies its own plain storage handle instead. Both
-/// the in-process server and every process-cluster child open storage here.
+/// the incapable backend supplies its own plain storage handle instead.
 ///
 /// # Errors
 ///
@@ -5358,298 +4937,6 @@ async fn grant_role(
                 .map_err(sql)
         }
     }
-}
-
-/// Provision the cluster-scoped SYSTEM_OWNER Service credential used by Oracle peers.
-///
-/// The returned owner retains the API key only in memory and exchanges it
-/// through [`ExchangeApiKey`] whenever a node boots or refreshes.
-///
-/// # Errors
-///
-/// Returns an error when role seeding, principal/key persistence, hashing, or
-/// issuing-key construction fails.
-pub(crate) async fn provision_oracle_peer_credentials(
-    fixture: Arc<PgFixture>,
-) -> Result<Arc<dyn OraclePeerCredentials>, WyrdTestServerError> {
-    let api_key = provision_bifrost_peer_principal(&fixture, PeerPrincipalShape::Canonical).await?;
-    oracle_peer_credentials_from_key(fixture, api_key).await
-}
-
-/// Seeds one tenant-scoped Service principal directly against a fixture.
-///
-/// The multi-process harness has no in-process `WyrdTestServer` to bootstrap
-/// through, but a peer-network journey still has to drive a real public query
-/// against a child's public listener. This is the fixture-level equivalent of
-/// [`WyrdTestServer::bootstrap_service_in_tenant`]: it seeds the tenant's
-/// built-in roles, ensures the fixture admin exists, and returns the new
-/// principal's API key.
-///
-/// # Errors
-///
-/// Returns an error when role seeding, principal or key persistence, hashing,
-/// or the role grant fails.
-pub(crate) async fn provision_tenant_service_principal(
-    fixture: &PgFixture,
-    tenant_id: DataTenantId,
-    name: &str,
-    roles: &[&str],
-) -> Result<SecretString, WyrdTestServerError> {
-    let creator_id = fixture_admin_id(tenant_id);
-    let principal_id = Uuid::now_v7();
-    let service_ref = card_ref(CardKind::Service, name)?;
-    let api_key = WyrdApiKey::generate(tenant_id);
-    let raw = api_key.secret.clone();
-    let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-        .await
-        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
-        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
-    let mut conn = fixture.tenant_conn_for(tenant_id).await.map_err(sql)?;
-    seed_builtin_roles_for_tenant(&mut conn, tenant_id)
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    let email = format!("fixture-admin-{}@test.wyrd", creator_id.simple());
-    insert_user(&mut conn, creator_id, Some(&email), "password", None)
-        .await
-        .or_else(|error| {
-            if is_unique_violation(&error) {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-        .map_err(sql)?;
-    seed_machine_card(&mut conn, &service_ref, creator_id).await?;
-    insert_service_account(
-        &mut conn,
-        principal_id,
-        "service",
-        Some(&service_ref),
-        name,
-        None,
-        creator_id,
-    )
-    .await
-    .map_err(sql)?;
-    insert_api_key(
-        &mut conn,
-        Uuid::now_v7(),
-        principal_id,
-        &api_key.prefix,
-        &key_hash,
-        creator_id,
-        Some(std::time::Duration::from_secs(24 * 60 * 60)),
-    )
-    .await
-    .map_err(sql)?;
-    for role in roles {
-        grant_role(
-            &mut conn,
-            principal_id,
-            PrincipalTable::ServiceAccount,
-            role,
-        )
-        .await?;
-    }
-    conn.commit().await.map_err(sql)?;
-    Ok(api_key.secret)
-}
-
-/// One Bifrost peer Service principal shape a journey can seed.
-///
-/// The private plane admits exactly one identity, so proving that requires
-/// seeding the near misses too: a different SYSTEM_OWNER service, a service
-/// without the peer permission, and a service that holds the permission inside
-/// an ordinary data tenant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerPrincipalShape {
-    /// The one principal every peer-bearing process authenticates as.
-    Canonical,
-    /// A different SYSTEM_OWNER service that also holds the peer permission.
-    AlternateService,
-    /// A SYSTEM_OWNER service that holds no peer permission.
-    WithoutPermission,
-    /// A data-tenant service that holds the peer permission.
-    TenantScoped,
-}
-
-impl PeerPrincipalShape {
-    /// Names the Service card and account this shape seeds.
-    const fn service_name(self) -> &'static str {
-        match self {
-            Self::Canonical => "bifrost-peer",
-            Self::AlternateService => "bifrost-peer-alternate",
-            Self::WithoutPermission => "bifrost-peer-unpermitted",
-            Self::TenantScoped => "bifrost-peer-tenant",
-        }
-    }
-
-    /// Names the role this shape grants.
-    const fn role_name(self) -> &'static str {
-        match self {
-            Self::Canonical => BIFROST_PEER_ROLE,
-            Self::AlternateService => "bifrost_peer_alternate",
-            Self::WithoutPermission => "bifrost_peer_unpermitted",
-            Self::TenantScoped => "bifrost_peer_tenant",
-        }
-    }
-
-    /// Returns the permissions the granted role carries.
-    fn permissions(self) -> Vec<Permission> {
-        match self {
-            Self::WithoutPermission => Vec::new(),
-            _ => vec![Permission::bifrost_peer_invoke()],
-        }
-    }
-
-    /// Returns the control tenant this shape's principal belongs to.
-    const fn tenant(self, data_tenant: DataTenantId) -> DataTenantId {
-        match self {
-            Self::TenantScoped => data_tenant,
-            _ => DataTenantId::SYSTEM_OWNER,
-        }
-    }
-}
-
-/// Ensures the tenant's fixture admin exists, tolerating a prior seeding.
-///
-/// The admin is per tenant while peer principals are per shape, so the second
-/// shape would otherwise collide on the primary key. The insert runs on its own
-/// transaction because a unique violation aborts the transaction it occurs in,
-/// which would poison every later statement of the caller's seeding.
-///
-/// # Errors
-///
-/// Returns the persistence failure unless it is the expected unique violation.
-async fn ensure_fixture_admin(
-    fixture: &PgFixture,
-    tenant_id: DataTenantId,
-    creator_id: Uuid,
-) -> Result<(), WyrdTestServerError> {
-    let email = format!("fixture-admin-{}@test.wyrd", creator_id.simple());
-    let mut conn = fixture.tenant_conn_for(tenant_id).await.map_err(sql)?;
-    match insert_user(&mut conn, creator_id, Some(&email), "password", None).await {
-        Ok(()) => conn.commit().await.map_err(sql),
-        Err(error) if is_unique_violation(&error) => Ok(()),
-        Err(error) => Err(sql(error)),
-    }
-}
-
-/// Seeds one Bifrost peer Service principal shape and returns its API key.
-///
-/// Separated from credential construction because the seeding is not
-/// idempotent: a multi-process cluster provisions the canonical principal once
-/// in the parent and hands every child the resulting key, rather than having
-/// each child insert another principal for the same plane.
-///
-/// # Errors
-///
-/// Returns an error when role seeding, principal/key persistence, or hashing
-/// fails.
-pub(crate) async fn provision_bifrost_peer_principal(
-    fixture: &PgFixture,
-    shape: PeerPrincipalShape,
-) -> Result<SecretString, WyrdTestServerError> {
-    let tenant_id = shape.tenant(fixture.data_tenant_id());
-    let creator_id = fixture_admin_id(tenant_id);
-    let principal_id = Uuid::now_v7();
-    let service_ref = card_ref(CardKind::Service, shape.service_name())?;
-    let api_key = WyrdApiKey::generate(tenant_id);
-    let raw = api_key.secret.clone();
-    let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-        .await
-        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
-        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
-    ensure_fixture_admin(fixture, tenant_id, creator_id).await?;
-    let mut conn = fixture.tenant_conn_for(tenant_id).await.map_err(sql)?;
-    seed_builtin_roles_for_tenant(&mut conn, tenant_id)
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    let permissions = shape.permissions();
-    let permissions_json = serde_json::to_value(&permissions)
-        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
-    insert_role(
-        &mut conn,
-        Uuid::now_v7(),
-        shape.role_name(),
-        &permissions_json,
-        false,
-    )
-    .await
-    .map_err(sql)?;
-    seed_machine_card(&mut conn, &service_ref, creator_id).await?;
-    insert_service_account(
-        &mut conn,
-        principal_id,
-        "service",
-        Some(&service_ref),
-        shape.service_name(),
-        None,
-        creator_id,
-    )
-    .await
-    .map_err(sql)?;
-    insert_api_key(
-        &mut conn,
-        Uuid::now_v7(),
-        principal_id,
-        &api_key.prefix,
-        &key_hash,
-        creator_id,
-        Some(std::time::Duration::from_secs(24 * 60 * 60)),
-    )
-    .await
-    .map_err(sql)?;
-    grant_role(
-        &mut conn,
-        principal_id,
-        PrincipalTable::ServiceAccount,
-        shape.role_name(),
-    )
-    .await?;
-    conn.commit().await.map_err(sql)?;
-    Ok(api_key.secret)
-}
-
-/// Builds refreshing peer credentials for an already-seeded principal key.
-///
-/// The key's embedded tenant selects the connection every exchange runs on, so
-/// a journey can present a data-tenant principal's key and still reach the peer
-/// plane's authorization verdict rather than failing the exchange itself.
-///
-/// # Errors
-///
-/// Returns an error when the key is malformed, the issuing key cannot be
-/// constructed, or the first bearer exchange fails.
-pub(crate) async fn oracle_peer_credentials_from_key(
-    fixture: Arc<PgFixture>,
-    api_key: SecretString,
-) -> Result<Arc<dyn OraclePeerCredentials>, WyrdTestServerError> {
-    let issuing_key = Arc::new(
-        IssuingKey::from_ed_pem(
-            crate::keys::private_key_pem(),
-            Kid::new("test").expect("static kid is valid"),
-            "wyrd",
-        )
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-    );
-    let tenant_id = WyrdApiKey::parse(api_key.expose_secret())
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
-        .tenant_id;
-    let credentials = Arc::new(TestOraclePeerCredentials {
-        fixture,
-        tenant_id,
-        api_key,
-        exchange: ExchangeApiKey {
-            issuer: TenantTokenIssuer::new(issuing_key, TokenExchangeSettings::default()),
-        },
-        bearer: tokio::sync::Mutex::new(None),
-    });
-    credentials
-        .bearer(false)
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    Ok(credentials)
 }
 
 async fn lookup_role_id(
@@ -5942,14 +5229,14 @@ mod production_composition_tests {
     /// Injected raw observations reach production composition unmodified.
     ///
     /// The harness supplies only raw process-visible observations and the
-    /// enabled roles. Every reserve, floor, elastic, scratch, and partition
+    /// enabled roles. Every server-minimum, shared-cap, scratch, and partition
     /// number the booted server holds must therefore equal the plan
     /// [`BifrostRuntimeResources`] derives from the same observation, proving
     /// the harness derives no allocator output of its own.
     #[test]
     fn test_server_uses_one_bifrost_composer_and_lifecycle() {
         let observation = SystemResourceSnapshot {
-            memory_limit_bytes: 3 * 1024 * 1024 * 1024,
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             effective_cpu: 6,
             scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
             scratch_available_bytes: 4 * 1024 * 1024 * 1024,
@@ -5963,13 +5250,12 @@ mod production_composition_tests {
                 roles: [vala_bifrost_redux::resources::BifrostRole::Oracle]
                     .into_iter()
                     .collect(),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: None,
+                server_memory_min_bytes: None,
+                bifrost_memory_limit_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                forge_compaction_memory_limit_bytes: None,
-                scratch_root: scratch.path().to_owned(),
+                scratch_root: Some(scratch.path().to_owned()),
                 volume_roots: None,
             },
         )

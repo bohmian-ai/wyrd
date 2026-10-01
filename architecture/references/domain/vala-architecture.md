@@ -62,7 +62,7 @@ semantics.
 
 - Physical analytical identity is `(tenant, logical table)`. Shared
   physical tables with caller-supplied tenant predicates are forbidden.
-- Server-owned system columns and `(wyrd_batch_id, wyrd_row_ordinal)` survive
+- Server-owned system columns and `wyrd_batch_id` survive
   WAL, staging, Parquet, Iceberg promotion, Forge rewrite, and query unchanged.
 - A Card is an optional declared subject. A Run is one client execution. Every
   Observation retains authenticated tenant and publisher `principal_id`; when

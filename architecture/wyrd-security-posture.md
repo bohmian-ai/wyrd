@@ -24,7 +24,7 @@ controls required to operate those boundaries.
   never Card fields, generated artifacts, logs, traces, errors, or audit
   payloads.
 - Authentication establishes who may call a Wyrd route. Policy governs Card
-  state and cross-service invocation. These are separate decision planes.
+  state (classify, gate). These are separate decision planes.
 
 ## Trust boundaries
 
@@ -32,7 +32,7 @@ controls required to operate those boundaries.
 |---|---|
 | Client or agent to gateway | TLS, verified Wyrd token, typed permission, request bounds |
 | Gateway to `wyrd-server` | Authenticated transport; original credentials preserved; gateway metadata is never tenant authority |
-| `wyrd-server` replica to replica | Mutually authenticated TLS plus a purpose-bound, signed, expiring peer ticket |
+| `wyrd-server` replica to replica | Mutual TLS from one dedicated cluster CA with the fixed `wyrd-peer` identity; the receiver checks every operation's context against its own state |
 | Application to Postgres | Role-separated DSNs; RLS for tenant traffic; privileged pools excluded from handlers by construction |
 | Application to object storage | Workload identity or short-lived credentials; tenant-qualified prefixes; encryption in transit and at rest |
 | Server to a Source endpoint | Credential indirection, DNS resolution and SSRF screening, address pinning, bounded IO |
@@ -79,12 +79,18 @@ Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
 Credential issuance is a separate privileged operation and is policy-gated.
 The verification runtime also provisions one UUIDv7 `system` principal per
-tenant for canonical result publication and the fixed Drift observation read.
-It is not Card-bound or publicly manageable, has no credential, role grant,
-refresh, workload, or delegation path, and can receive only server-minted
-access tokens scoped to one exact Verifier Card: one for the reserved
-verification result tables, or one for reading the tenant's
-`vala.drift.observations` table.
+tenant, the server's own identity for continuous verification work that has no
+direct principal. It is not Card-bound or publicly manageable and has no
+credential, role grant, refresh, workload, or delegation path. It has three
+separately scoped, server-minted uses: an access token scoped to one exact
+Verifier Card for writing the reserved verification result tables; an access
+token scoped to one exact Verifier Card for reading the tenant's
+`vala.drift.observations` table; and an in-process, tokenless
+`bifrost_query:read` authority scoped by table UID to exactly continuous Eval's
+input tables (`vala.eval.observations` and `vala.traces.spans`). None is a
+general Bifrost grant, and Oracle authorizes and audits every read under them
+like any caller's. The server never fabricates a user or other identity for its
+own reads.
 
 A tenant administrator is created once, during tenant provisioning, and is the
 tenant's headless root of trust: it holds credentials and roles, federates no
@@ -162,6 +168,11 @@ credential.
   authorization enforces the read, and the server-built SQL, not the token,
   limits subject, series, and window. These fixed server capabilities are not
   public grants.
+  The same principal's continuous Eval input reads mint no token: the server
+  resolves the stored principal and binds it in-process to `bifrost_query:read`
+  scoped to the two Eval input tables only, kept separate from the result-write
+  scope. A missing principal, mismatched tenant, or insufficient table scope
+  fails closed before any row is returned.
 - Revoking a credential, suspending or deleting a principal, suspending a
   tenant, or changing grants refuses the next issuance immediately. A tenant
   token already issued keeps its snapshot authority until its five-minute
@@ -174,11 +185,11 @@ credential.
 ### Delegation and federation
 
 - Cross-service delegation uses RFC 8693 token exchange: the actor presents
-  the subject's token as `subject_token` and its own as `actor_token`, the
-  invoke policy must allow the pair, and the signed token names the subject as
-  its principal and the actor as its outer `act`. Both are verified from that
-  token; no caller-supplied identity header is accepted, and `act` confers no
-  authority.
+  the subject's token as `subject_token` and its own as `actor_token`; the
+  actor must be a direct Card-bound Service or Agent token, and the signed
+  token names the subject as its principal and the actor as its outer `act`.
+  Both are verified from that token; no caller-supplied identity header is
+  accepted, `act` confers no authority, and exchange consults no policy.
 - A delegated token is bound to the `wyrd` or `bifrost` audience; a `bifrost`
   token is refused outside the Bifrost ingest and query surfaces.
 - Delegation depth is bounded, every hop is authorized, and the effective
@@ -237,66 +248,54 @@ uncovered object denies the whole request without returning rows, and the
 approved scoped decision is bound into the distributed permission digest so a
 worker cannot widen it.
 
-`POST /v1/authz/check` is the policy decision point for cross-service invokes.
-It requires a valid delegated Wyrd token and denies when the policy engine,
-policy inputs, Card state, or audit path is unavailable. An enforcement point
-may cache a decision only when the cache key includes the complete verified
-principal, delegation chain, target, action, policy revision, and relevant
-Card revisions. A cached allow expires no later than the token or policy
-revision and is invalidated on either change.
-There is no stale-allow mode.
-
-Service-local policy may tighten organization policy and cannot override an
-organization denial. Policy evaluation and the resulting allow or deny are
-audited with request, principal, target, policy revision, and outcome identity.
+There is no runtime cross-service invoke policy decision point. Wyrd
+authorizes every API request with its own RBAC permission check on the
+verified principal, recorded to canonical audit; there is no separate
+policy engine, policy cache, or stale-allow mode to reason about.
 
 ### Production composition
 
-Server construction injects the configured policy decision point, permission
-resolver, and canonical audit writer as required
-capabilities. A production profile cannot substitute a
-permit-all policy evaluator, no-op audit sink, in-memory credential store,
-test key, or best-effort background audit emitter. Missing or unhealthy
-capabilities prevent the affected role from becoming ready. Dependency
-injection exists to make the boundary testable, not to make a security control
-optional.
+Server construction injects the configured permission resolver and canonical
+audit writer as required capabilities. A production profile cannot substitute
+an in-memory credential store, test key, or best-effort background audit
+emitter. Missing or unhealthy capabilities prevent the affected role from
+becoming ready. Dependency injection exists to make the boundary testable, not
+to make a security control optional.
 
 ## Peer identity and distributed Oracle
 
-Internal Oracle and Scribe RPCs use mutually authenticated TLS. Certificate
-identity admits the peer transport; a signed peer ticket authorizes one exact
-remote engine operation that can return rows or reserve resources.
+Internal Oracle and Scribe RPCs run only in peer mode, on a private listener
+that uses mutual TLS alone for cluster-member authentication. The default
+one-process `all` target makes its Scribe, Oracle, and Forge calls in-process
+and opens no private listener.
 
-- Scribe live-stream listing returns partition metadata, never rows. It trusts
-  the authenticated internal peer: mTLS plus the shared Bifrost workload
-  credential admit it, with no ticket, replay record, or audit event. Any
-  holder of that credential can read listing metadata; that is the accepted
-  trust boundary. User and table authorization happen at Oracle before any
-  listing is issued.
-- Work that stays in one process — Gate to its local Oracle, and a fragment
-  the leader runs on itself — passes the already-verified context, deadline,
-  and fence directly and mints no ticket.
-
-- Peer tickets are domain-separated from user JWTs and use independently
-  managed keys.
-- A ticket binds tenant, query, snapshot digest, fragment or request digest,
-  retry epoch, source node, destination node, deadline, and fence.
-- The receiver verifies signature, `kid`, audience, destination, expiry,
-  tenant, snapshot, fragment, and fence before decoding a physical plan or
-  touching storage.
-- Read-only tickets (query forwarding and Oracle or Scribe read fragments)
-  consume no nonce: a repeated, still-valid read is bounded by expiry and
-  ordinary resource admission, not a one-use quota. Slot reservation and stage
-  assignment tickets create state, so they keep single-use replay rejection
-  over an expiry-pruned record with no fixed capacity.
-- Rotation follows publish-before-use and bounded-overlap semantics. A ticket
-  never remains valid beyond its query deadline, so retired verification keys
-  need only cover the maximum ticket lifetime and clock skew.
-- Tickets are single-purpose and cannot be promoted into user credentials,
-  database roles, generic internal authorization, or cross-tenant capability.
-- A rejected ticket is audited under the verified tenant when safe; rejection
-  before trusted tenant decoding uses `DataTenantId::SYSTEM_OWNER`. Unverified
-  bytes never select an audit tenant.
+- Each peer-mode process reads one dedicated Wyrd cluster CA certificate and
+  one shared peer leaf certificate and private key from `WYRD_PEER_TLS_DIR`
+  (`ca.crt`, `tls.crt`, `tls.key`). The CA private key stays outside every
+  Wyrd process and pod.
+- Both directions validate the CA chain, validity window, client/server key
+  usage, and the fixed `wyrd-peer` DNS identity. The listener refuses a
+  same-CA leaf with any other identity before polling a request body. Missing
+  or invalid peer inputs keep the process out of ready membership.
+- Possession of the shared leaf confers only trusted-cluster-process identity.
+  It never confers tenant identity, a specific replica identity, a user
+  credential, a database role, or cross-tenant capability. The model does not
+  protect against a compromised cluster member that holds the shared key.
+- The receiver owns authorization context. For query forwarding,
+  reservations, stages and fragments, shuffle reads, Scribe active-stream
+  listing, and Scribe live fragments, it checks the applicable tenant,
+  table/object/snapshot, query or
+  assignment, target node and fence, deadline, protocol version, request body
+  digest, and resource bounds against its own trusted state before decoding
+  an executable plan or touching tenant storage. A mismatched or unresolvable
+  context fails closed with no cross-tenant result.
+- A peer refusal is audited on the system-owner chain
+  (`DataTenantId::SYSTEM_OWNER`) until the receiver's own query, reservation,
+  or stage state binds a tenant. Only a refusal after that binding is
+  attributed to the bound tenant. Unverified request bytes never select an
+  audit tenant.
+- Public client authentication and authorization are unchanged by peer mode;
+  peer TLS is not public TLS and grants nothing on public listeners.
 
 ## Source credentials and SSRF defense
 
@@ -410,7 +409,7 @@ chain.
 
 Security events include credential issuance and revocation, token replay,
 unknown signing keys, policy unavailability, repeated authorization denial,
-peer-ticket rejection, tenant-tripwire failure, Oracle audit commit failure, audit-chain or
+peer context refusal, tenant-tripwire failure, Oracle audit commit failure, audit-chain or
 publication failure, SSRF rejection, secret-resolution failure, and privileged
 operator use.
 
@@ -429,7 +428,6 @@ post-incident verification.
 | Access control | NIST SP 800-53 AC family; OWASP ASVS V4 |
 | Audit integrity | NIST SP 800-53 AU-9/AU-10; ISO 27001 A.8.15 |
 | Delegation and federation | RFC 8693; RFC 7523; OpenID Connect |
-| Policy decision/enforcement | XACML PDP/PEP; Envoy `ext_authz` pattern |
 | Provenance | SLSA; in-toto; EU AI Act Article 12; NIST AI RMF |
 
 Standards alignment does not substitute for deployment-specific threat

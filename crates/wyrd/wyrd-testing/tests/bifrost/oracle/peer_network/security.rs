@@ -1,137 +1,78 @@
-//! Peer workload authentication, and the ordering it must hold against decode.
+//! Peer receiver context checks on the mTLS-only private plane.
 
-use ed25519_dalek::SigningKey;
-use secrecy::ExposeSecret as _;
+use std::sync::Arc;
+
+use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::oracle::assignment_schema_fingerprint;
+use vala_bifrost_redux::oracle::codec::{
+    OraclePhysicalExtensionCodec, RemoteSourcePlaceholderExec, physical_plan_fingerprint,
+};
+use vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION;
 use vala_bifrost_redux::oracle::peer::{
-    ReservationBinding, ReservationOperationV1, reservation_body_digest,
+    PeerTicketClaims, ReservationBinding, ReservationOperationV1, assignment_authority_digest_for,
+    reservation_body_digest,
 };
-use wyrd_spec::vala::api::NodeId;
-use wyrd_testing::bifrost::process_cluster::{
-    BifrostProcessCluster, PeerProbeCredential, PeerProbeFraming, PeerProbePlan, PeerProbeService,
-    ProcessNodeTarget,
+use wyrd_server::config::BifrostTarget;
+use wyrd_spec::vala::api::{
+    ClusterRole, ExecuteFragmentRequest, FollowerReaderCut, FollowerScanAssignment, NodeId,
+    OracleRoleFence, PeerContext, PersistedFileAssignment, ReservationId, ScribeProviderCut,
+    TenantTableBinding,
 };
-use wyrd_testing::server::PeerPrincipalShape;
 use wyrd_tonic::prost::Message as _;
+use wyrd_tonic::tonic;
+use wyrd_tonic::wyrd::v1 as proto;
+use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
 use super::support::{
-    KeyringSigners, PeerJourneyError, ReservationPlane, polls_at, probe, reserve, sign_ticket,
-    stamped,
+    PeerDial, PeerJourneyError, ReservationPlane, proto_with_context, reserve, stamped,
 };
+use crate::peer_cluster::{PeerCluster, PeerProbeFraming, PeerProbePlan, PeerProbeService};
 
-/// Path of the compiled child every simulated pod runs.
-const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
-
-/// Both private adapters share one authentication layer that runs to a verdict
-/// before any request body is polled, admits exactly the configured peer
-/// Service principal, and is indifferent to first-frame layout.
+/// A cluster member reaches both private adapters, and every operation it
+/// sends is still checked against the receiver's own state before any
+/// capacity moves: a forged, stale, expired, incompatible, or substituted
+/// reservation context is refused while the correct one is accepted.
 ///
 /// # Panics
 ///
 /// Panics when any scenario in the table fails, naming the scenario.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn peer_authentication_precedes_body_admission() {
-    prove_peer_authentication_precedes_body_admission()
+async fn peer_context_refusals() {
+    prove_peer_context_refusals()
         .await
-        .expect("peer authentication journey");
+        .expect("peer context journey");
 }
 
-/// Drives every peer-authentication scenario against one live topology.
+/// Drives every receiver-context scenario against one live topology.
 ///
 /// # Errors
 ///
 /// Returns the first scenario failure, which names the claim that broke.
-async fn prove_peer_authentication_precedes_body_admission() -> Result<(), PeerJourneyError> {
-    // Two Oracles so one pod probes another over the real peer listener, and
+async fn prove_peer_context_refusals() -> Result<(), PeerJourneyError> {
+    // Two Oracles so one pod calls another over the real peer listener, and
     // one Scribe so the topology owns a catalog and a tail source exactly as a
     // deployment that serves queries does.
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
+    let cluster = PeerCluster::start(&[
+        BifrostTarget::Oracle,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+    ])
     .await?;
+    let destination = cluster.advertise_addr(1).await?;
 
-    let wrong = WrongPrincipals::provision(&cluster).await?;
-    let destination = cluster.nodes()[1].ready_report().advertise_addr.clone();
+    a_cluster_member_reaches_both_adapters(&cluster, &destination).await?;
+    first_frame_layout_does_not_change_admission(&cluster, &destination).await?;
+    let plane = ReservationPlane::observe(&cluster).await?;
+    the_correct_context_is_accepted(&cluster, &plane).await?;
+    every_bound_identity_must_match(&cluster, &plane).await?;
+    worker_discovery_is_always_refused(&cluster, &plane).await?;
+    a_foreign_tenant_context_reads_no_scribe_rows(&cluster, &plane).await?;
 
-    refused_identities_never_reach_a_body(&mut cluster, &destination, &wrong)?;
-    the_configured_principal_is_admitted_on_both_adapters(&mut cluster, &destination)?;
-    first_frame_layout_does_not_change_admission(&mut cluster, &destination)?;
-
-    cluster.shutdown()?;
+    cluster.shutdown().await?;
     Ok(())
-}
-
-/// The deliberately wrong peer credentials one journey seeds.
-///
-/// Each is a real, exchangeable API key: the refusal under test is an
-/// authorization verdict on a verified principal, not a malformed token.
-struct WrongPrincipals {
-    /// A different SYSTEM_OWNER service that also holds the peer permission.
-    alternate: String,
-    /// A SYSTEM_OWNER service holding no peer permission.
-    unpermitted: String,
-    /// A data-tenant service holding the peer permission.
-    tenant_scoped: String,
-}
-
-impl WrongPrincipals {
-    /// Seeds all three near-miss principals against the shared fixture.
-    ///
-    /// # Errors
-    ///
-    /// Returns the provisioning failure unchanged.
-    async fn provision(cluster: &BifrostProcessCluster) -> Result<Self, PeerJourneyError> {
-        let alternate = cluster
-            .provision_peer_principal(PeerPrincipalShape::AlternateService)
-            .await?;
-        let unpermitted = cluster
-            .provision_peer_principal(PeerPrincipalShape::WithoutPermission)
-            .await?;
-        let tenant_scoped = cluster
-            .provision_peer_principal(PeerPrincipalShape::TenantScoped)
-            .await?;
-        Ok(Self {
-            alternate: alternate.expose_secret().to_owned(),
-            unpermitted: unpermitted.expose_secret().to_owned(),
-            tenant_scoped: tenant_scoped.expose_secret().to_owned(),
-        })
-    }
-
-    /// Returns each wrong identity with the refusal it must produce.
-    fn cases(&self) -> Vec<(&'static str, PeerProbeCredential, &'static str)> {
-        vec![
-            (
-                "no credential at all",
-                PeerProbeCredential::Absent,
-                "Unauthenticated",
-            ),
-            (
-                "an unverifiable bearer",
-                PeerProbeCredential::Invalid,
-                "Unauthenticated",
-            ),
-            (
-                "a different platform service",
-                PeerProbeCredential::ApiKey(self.alternate.clone()),
-                "PermissionDenied",
-            ),
-            (
-                "a platform service without the peer permission",
-                PeerProbeCredential::ApiKey(self.unpermitted.clone()),
-                "PermissionDenied",
-            ),
-            (
-                "a data-tenant service holding the peer permission",
-                PeerProbeCredential::ApiKey(self.tenant_scoped.clone()),
-                "PermissionDenied",
-            ),
-        ]
-    }
 }
 
 /// Every private adapter this target serves.
@@ -140,84 +81,31 @@ const ADAPTERS: [PeerProbeService; 2] = [
     PeerProbeService::AnalyticalWorker,
 ];
 
-/// Reads the destination's body-poll counter through its own control channel.
+/// A certificate from the cluster authority reaches the body on both adapters.
+///
+/// mTLS is the only peer trust, so admission is observed as a body poll: the
+/// request reached the plane that decodes and checks its typed context. The
+/// verdict itself cannot carry the claim, because this probe deliberately
+/// carries no operation context and each adapter refuses it after reading it.
+/// The poll counter is process-wide; the idle topology sends no peer traffic
+/// of its own, so the only request that can advance it is this probe.
 ///
 /// # Errors
 ///
-/// Returns the control-protocol failure unchanged.
-fn body_polls(cluster: &mut BifrostProcessCluster) -> Result<u64, PeerJourneyError> {
-    polls_at(cluster, 1)
-}
-
-/// No unauthorized identity causes the destination to poll a request body.
-///
-/// This is the ordering claim itself: authentication runs to a verdict on
-/// metadata alone, so a refused caller never reaches transport admission, the
-/// frame parser, or a protobuf decode on either adapter.
-///
-/// # Errors
-///
-/// Returns a message naming the adapter and identity that broke the claim.
-fn refused_identities_never_reach_a_body(
-    cluster: &mut BifrostProcessCluster,
-    destination: &str,
-    wrong: &WrongPrincipals,
-) -> Result<(), PeerJourneyError> {
-    for adapter in ADAPTERS.iter() {
-        for (description, credential, expected) in wrong.cases() {
-            let before = body_polls(cluster)?;
-            let plan = PeerProbePlan::own(destination)
-                .against(adapter.clone())
-                .presenting(credential);
-            let outcome = probe(cluster, &plan)?;
-            if outcome != expected {
-                return Err(format!(
-                    "{adapter:?} answered {description} with {outcome}, expected {expected}"
-                )
-                .into());
-            }
-            let after = body_polls(cluster)?;
-            if after != before {
-                return Err(format!(
-                    "{adapter:?} polled {} request bodies for {description}",
-                    after - before
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The one configured peer Service principal is admitted on both adapters.
-///
-/// Admission is observed as a body poll the refused cases never produce: the
-/// request reached the plane that decodes it. The verdict cannot carry the
-/// claim on either adapter, because both apply a second, independent
-/// operation-authority check to the decoded message — a stage ticket on the
-/// worker adapter, a reservation purpose ticket on the Oracle one — and this
-/// probe deliberately carries neither. Body polls are what separate an
-/// identity refusal, which never reaches a body, from an operation refusal,
-/// which necessarily has.
-///
-/// # Errors
-///
-/// Returns a message naming the adapter that refused the configured identity.
-fn the_configured_principal_is_admitted_on_both_adapters(
-    cluster: &mut BifrostProcessCluster,
+/// Returns a message naming the adapter that never reached a body.
+async fn a_cluster_member_reaches_both_adapters(
+    cluster: &PeerCluster,
     destination: &str,
 ) -> Result<(), PeerJourneyError> {
     for adapter in ADAPTERS.iter() {
-        let before = body_polls(cluster)?;
-        probe(
-            cluster,
-            &PeerProbePlan::own(destination).against(adapter.clone()),
-        )?;
-        if body_polls(cluster)? == before {
-            return Err(format!(
-                "{adapter:?} admitted the configured peer principal without reaching a body"
-            )
-            .into());
+        let before = cluster.peer_body_polls();
+        cluster
+            .probe(&PeerProbePlan::own(destination).against(adapter.clone()))
+            .await?;
+        if cluster.peer_body_polls() == before {
+            return Err(
+                format!("{adapter:?} admitted a cluster member without reaching a body").into(),
+            );
         }
     }
     Ok(())
@@ -232,13 +120,15 @@ fn the_configured_principal_is_admitted_on_both_adapters(
 /// # Errors
 ///
 /// Returns a message naming the layout whose verdict diverged.
-fn first_frame_layout_does_not_change_admission(
-    cluster: &mut BifrostProcessCluster,
+async fn first_frame_layout_does_not_change_admission(
+    cluster: &PeerCluster,
     destination: &str,
 ) -> Result<(), PeerJourneyError> {
-    let baseline = probe(cluster, &PeerProbePlan::own(destination))?;
+    let baseline = cluster.probe(&PeerProbePlan::own(destination)).await?;
     for framing in [PeerProbeFraming::SplitHeader, PeerProbeFraming::Coalesced] {
-        let outcome = probe(cluster, &PeerProbePlan::own(destination).framed(framing))?;
+        let outcome = cluster
+            .probe(&PeerProbePlan::own(destination).framed(framing))
+            .await?;
         if outcome != baseline {
             return Err(format!(
                 "a {framing:?} first frame answered {outcome}, but a whole frame answered {baseline}"
@@ -249,97 +139,59 @@ fn first_frame_layout_does_not_change_admission(
     Ok(())
 }
 
-/// Reservation authority is an independent, rotatable, exactly-bound,
-/// single-use credential: a workload token cannot stand in for it, only
-/// published keys verify, every bound identity must match, and no
-/// state-changing operation may be replayed.
+/// The reservation context the leader would send is accepted and released.
 ///
-/// # Panics
-///
-/// Panics when any scenario in the table fails, naming the scenario.
-#[tokio::test]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn peer_tickets_are_independent_exact_and_replay_safe() {
-    prove_peer_tickets_are_independent_exact_and_replay_safe()
-        .await
-        .expect("peer ticket journey");
-}
-
-/// Drives every reservation-authority scenario against one live topology.
+/// This is the baseline that makes every refusal below attributable to its
+/// one deviation rather than to a context the follower never accepts. The
+/// accepted reservation is then released exactly as its leader would release
+/// it, so the follower returns every charged unit rather than holding a
+/// reservation no leader will ever claim.
 ///
 /// # Errors
 ///
-/// Returns the first scenario failure, which names the claim that broke.
-async fn prove_peer_tickets_are_independent_exact_and_replay_safe() -> Result<(), PeerJourneyError>
-{
-    let mut cluster = BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Oracle,
-            ProcessNodeTarget::Scribe,
-        ],
-    )
-    .await?;
-
-    let plane = ReservationPlane::observe(&mut cluster)?;
-    let keyring = KeyringSigners::from(cluster.peer_keyring());
-
-    only_published_unexpired_keys_authorize(&mut cluster, &plane, &keyring)?;
-    every_bound_identity_must_match(&mut cluster, &plane, &keyring)?;
-    a_state_changing_ticket_is_single_use(&mut cluster, &plane, &keyring)?;
-    worker_discovery_is_always_refused(&mut cluster, &plane)?;
-
-    cluster.shutdown()?;
-    Ok(())
-}
-
-/// Only a published, unexpired key authorizes a reservation.
-///
-/// This is the rotation claim and the independence claim in one table: the
-/// active and the still-valid retired key are accepted, while an expired key,
-/// a key no manifest publishes, and the deployment's own workload signing key
-/// are all refused. The workload case is the one that would silently pass if
-/// peer authority were ever folded back into the north-south key.
-///
-/// # Errors
-///
-/// Returns a message naming the key whose verdict broke the claim.
-fn only_published_unexpired_keys_authorize(
-    cluster: &mut BifrostProcessCluster,
+/// Returns a message when the follower refuses the correct reserve or release
+/// context, or still charges units after the release.
+async fn the_correct_context_is_accepted(
+    cluster: &PeerCluster,
     plane: &ReservationPlane,
-    keyring: &KeyringSigners,
 ) -> Result<(), PeerJourneyError> {
-    let cases: [(&str, &(String, SigningKey), bool); 4] = [
-        ("the active key", &keyring.active, true),
-        (
-            "a retired key inside its window",
-            &keyring.retired_valid,
-            true,
-        ),
-        (
-            "a retired key past its window",
-            &keyring.retired_expired,
-            false,
-        ),
-        ("a key no manifest publishes", &keyring.unpublished, false),
-    ];
-    for (description, key, accepted) in cases {
-        let query_id = uuid::Uuid::new_v4();
-        let binding = plane.reserve_binding(query_id);
-        let payload = stamped(plane.reserve_request(query_id), |digest| {
-            sign_ticket(key, &binding, digest)
-        })?;
-        let outcome = reserve(cluster, &plane.destination, payload)?;
-        let refused = outcome == "PermissionDenied" || outcome == "Unauthenticated";
-        if accepted && refused {
-            return Err(format!("{description} was refused with {outcome}").into());
-        }
-        if !accepted && !refused {
-            return Err(format!("{description} was accepted with {outcome}").into());
-        }
+    let query_id = uuid::Uuid::new_v4();
+    let request = proto::ReserveNodeSlotsRequest::decode(
+        stamped(
+            plane.reserve_request(query_id),
+            &plane.reserve_binding(query_id),
+            |_| {},
+        )?
+        .as_slice(),
+    )?;
+    let mut client = OraclePeerServiceClient::new(
+        PeerDial::member(cluster.peer_ca(), cluster.peer_addr(1)?)
+            .connect()
+            .await?,
+    );
+    let accepted = client
+        .reserve_slots(request)
+        .await
+        .map_err(|status| format!("a correct reserve context was refused with {status}"))?
+        .into_inner();
+    let Some(proto::reserve_node_slots_response::Outcome::Pending(pending)) = accepted.outcome
+    else {
+        return Err(format!("a correct reserve context was not held: {accepted:?}").into());
+    };
+    client
+        .release_slots(plane.release_request(pending.reservation_id, query_id)?)
+        .await
+        .map_err(|status| format!("a correct release context was refused with {status}"))?;
+    let held = cluster.ownership_snapshot(1)?.peer_running;
+    if held != 0 {
+        return Err(format!("the follower still charges {held} units after release").into());
     }
     Ok(())
+}
+
+/// Whether a probe outcome is a context refusal rather than an admission.
+fn is_refusal(outcome: &str) -> bool {
+    outcome == "PermissionDenied" || outcome == "Unauthenticated"
 }
 
 /// One field-level change applied to an otherwise correct reservation binding.
@@ -349,54 +201,54 @@ fn only_published_unexpired_keys_authorize(
 /// changes.
 type BindingDeviation = Box<dyn Fn(&mut ReservationBinding)>;
 
-/// Every identity a ticket binds must match the receiver's own derivation.
+/// Every field a context binds must match the receiver's own derivation.
 ///
-/// Each case changes exactly one bound value away from the correct ticket, so
-/// each refusal is attributable: nothing here is refused because two things
-/// were wrong at once.
+/// Each case changes exactly one value away from the correct context, so each
+/// refusal is attributable: nothing here is refused because two things were
+/// wrong at once. The expired and incompatible-version cases are claims-level
+/// deviations; the rest change the binding the context was built from.
 ///
 /// # Errors
 ///
 /// Returns a message naming the deviation the follower accepted.
-fn every_bound_identity_must_match(
-    cluster: &mut BifrostProcessCluster,
+async fn every_bound_identity_must_match(
+    cluster: &PeerCluster,
     plane: &ReservationPlane,
-    keyring: &KeyringSigners,
 ) -> Result<(), PeerJourneyError> {
     let foreign = uuid::Uuid::new_v4();
     let deviations: Vec<(&str, BindingDeviation)> = vec![
         (
-            "a ticket addressed to another follower",
+            "a context addressed to another follower",
             Box::new(move |binding: &mut ReservationBinding| {
                 binding.destination_node_id = NodeId::new(foreign);
             }),
         ),
         (
-            "a ticket carrying a stale follower fence",
+            "a context carrying a stale follower fence",
             Box::new(|binding: &mut ReservationBinding| {
                 binding.destination_fence = binding.destination_fence.wrapping_add(1);
             }),
         ),
         (
-            "a ticket claiming another leader",
+            "a context claiming another leader",
             Box::new(move |binding: &mut ReservationBinding| {
                 binding.source_node_id = NodeId::new(foreign);
             }),
         ),
         (
-            "a ticket carrying a stale leader fence",
+            "a context carrying a stale leader fence",
             Box::new(|binding: &mut ReservationBinding| {
                 binding.source_fence = binding.source_fence.wrapping_add(1);
             }),
         ),
         (
-            "a ticket minted for another query",
+            "a context built for another query",
             Box::new(move |binding: &mut ReservationBinding| {
                 binding.query_id = foreign;
             }),
         ),
         (
-            "a ticket minted for the release operation",
+            "a context built for the release operation",
             Box::new(|binding: &mut ReservationBinding| {
                 binding.operation = ReservationOperationV1::ReleaseSlots;
             }),
@@ -406,60 +258,265 @@ fn every_bound_identity_must_match(
         let query_id = uuid::Uuid::new_v4();
         let mut binding = plane.reserve_binding(query_id);
         deviate(&mut binding);
-        let payload = stamped(plane.reserve_request(query_id), |digest| {
-            sign_ticket(&keyring.active, &binding, digest)
-        })?;
-        let outcome = reserve(cluster, &plane.destination, payload)?;
-        if outcome != "PermissionDenied" && outcome != "Unauthenticated" {
+        let payload = stamped(plane.reserve_request(query_id), &binding, |_| {})?;
+        let outcome = reserve(cluster, &plane.destination, payload).await?;
+        if !is_refusal(&outcome) {
             return Err(format!("{description} was answered with {outcome}").into());
         }
     }
 
-    // A correct ticket presented on a substituted request: the signature and
-    // every identity still verify, and only the body digest does not.
+    let claim_deviations: [(&str, ClaimsDeviation); 2] = [
+        ("an expired context", |claims| {
+            claims.expires_at_ms =
+                (chrono::Utc::now() - chrono::Duration::seconds(1)).timestamp_millis();
+        }),
+        (
+            "a context from an incompatible protocol version",
+            |claims| {
+                claims.protocol_version = claims.protocol_version.wrapping_add(1);
+            },
+        ),
+    ];
+    for (description, deviate) in claim_deviations {
+        let query_id = uuid::Uuid::new_v4();
+        let payload = stamped(
+            plane.reserve_request(query_id),
+            &plane.reserve_binding(query_id),
+            deviate,
+        )?;
+        let outcome = reserve(cluster, &plane.destination, payload).await?;
+        if !is_refusal(&outcome) {
+            return Err(format!("{description} was answered with {outcome}").into());
+        }
+    }
+
+    // A correct context presented on a substituted request: every identity
+    // still matches, and only the body digest does not.
     let query_id = uuid::Uuid::new_v4();
-    let binding = plane.reserve_binding(query_id);
-    let mut request = plane.reserve_request(query_id);
+    let request = plane.reserve_request(query_id);
     let digest = reservation_body_digest(&request.encode_to_vec())
         .map_err(|error| format!("reserve body digest: {error}"))?;
-    request.slot_units = 64;
-    request.ticket = Some(sign_ticket(&keyring.active, &binding, digest));
-    let outcome = reserve(cluster, &plane.destination, request.encode_to_vec())?;
-    if outcome != "PermissionDenied" && outcome != "Unauthenticated" {
+    let mut substituted = proto_with_context(request, &plane.reserve_binding(query_id), digest);
+    substituted.expires_at_unix_ms -= 1;
+    let outcome = reserve(cluster, &plane.destination, substituted.encode_to_vec()).await?;
+    if !is_refusal(&outcome) {
         return Err(format!("a substituted request body was answered with {outcome}").into());
     }
     Ok(())
 }
 
-/// A reservation ticket authorizes exactly one state change.
+/// Scribe pod in [`prove_peer_context_refusals`]'s topology.
+const SCRIBE_POD: usize = 2;
+
+/// A Scribe fragment whose context names another tenant reads nothing.
 ///
-/// The same bytes are sent twice. The first send is the accepted case proved
-/// above; the second must be refused on the nonce before any capacity moves,
-/// which is what stops a captured reserve from charging a follower repeatedly.
+/// The leader's context is unsigned, so the receiver's comparison of the
+/// context tenant with the tenant of every assignment it received is the only
+/// thing keeping one tenant's hot tail away from another. The same live
+/// fragment is sent twice over the Scribe's real peer listener: once with the
+/// correct context, which executes, and once with only the context tenant
+/// changed, which must be refused before the fragment executes or a row is
+/// streamed.
 ///
 /// # Errors
 ///
-/// Returns a message naming the replay the follower accepted.
-fn a_state_changing_ticket_is_single_use(
-    cluster: &mut BifrostProcessCluster,
+/// Returns a message when the correct fragment does not execute, or the
+/// foreign-tenant fragment is answered or executes.
+async fn a_foreign_tenant_context_reads_no_scribe_rows(
+    cluster: &PeerCluster,
     plane: &ReservationPlane,
-    keyring: &KeyringSigners,
 ) -> Result<(), PeerJourneyError> {
-    let query_id = uuid::Uuid::new_v4();
-    let binding = plane.reserve_binding(query_id);
-    let payload = stamped(plane.reserve_request(query_id), |digest| {
-        sign_ticket(&keyring.active, &binding, digest)
-    })?;
-    let first = reserve(cluster, &plane.destination, payload.clone())?;
-    if first == "PermissionDenied" || first == "Unauthenticated" {
-        return Err(format!("a correct reserve ticket was refused with {first}").into());
+    let fragment = ScribeFragment::live(cluster, plane, "peer_tenant_probe").await?;
+    let mut client = OraclePeerServiceClient::new(
+        PeerDial::member(cluster.peer_ca(), cluster.peer_addr(SCRIBE_POD)?)
+            .connect()
+            .await?,
+    );
+
+    let before = cluster.scribe_fragments(SCRIBE_POD)?;
+    let mut accepted = client
+        .execute_fragment(fragment.request(cluster.tenant().as_uuid())?)
+        .await
+        .map_err(|status| format!("a correct Scribe fragment was refused with {status}"))?
+        .into_inner();
+    let mut frames = 0_usize;
+    while let Some(frame) = accepted.message().await? {
+        drop(frame);
+        frames += 1;
     }
-    let replayed = reserve(cluster, &plane.destination, payload)?;
-    if replayed != "PermissionDenied" && replayed != "Unauthenticated" {
-        return Err(format!("a replayed reserve ticket was answered with {replayed}").into());
+    if frames == 0 || cluster.scribe_fragments(SCRIBE_POD)? != before + 1 {
+        return Err("a correct Scribe fragment did not execute".into());
+    }
+
+    let before = cluster.scribe_fragments(SCRIBE_POD)?;
+    match client
+        .execute_fragment(fragment.request(uuid::Uuid::now_v7())?)
+        .await
+    {
+        Err(status) if status.code() == tonic::Code::PermissionDenied => {}
+        Err(status) => {
+            return Err(format!("a foreign-tenant fragment failed with {status}").into());
+        }
+        Ok(_) => return Err("a foreign-tenant fragment opened a row stream".into()),
+    }
+    if cluster.scribe_fragments(SCRIBE_POD)? != before {
+        return Err("a foreign-tenant fragment executed on the Scribe".into());
     }
     Ok(())
 }
+
+/// One live Scribe fragment built exactly as an Oracle leader builds it.
+struct ScribeFragment {
+    /// The fragment's single hot-provider assignment, owned by the real tenant.
+    assignment: FollowerScanAssignment,
+    /// Encoded placeholder plan the Scribe decodes.
+    plan: Vec<u8>,
+    /// Fingerprint of `plan`, bound by the context and the footer.
+    fingerprint: String,
+    /// Leader Oracle incarnation the fragment claims to come from.
+    leader: OracleRoleFence,
+    /// Scribe incarnation serving the live stream.
+    target: OracleRoleFence,
+}
+
+impl ScribeFragment {
+    /// Registers `table`, leaves rows live on the Scribe, and builds the
+    /// fragment for the one partition the Scribe reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the table cannot be written, the Scribe reports
+    /// no live partition, or the plan cannot be encoded.
+    async fn live(
+        cluster: &PeerCluster,
+        plane: &ReservationPlane,
+        table: &str,
+    ) -> Result<Self, PeerJourneyError> {
+        cluster.register_table(SCRIBE_POD, table).await?;
+        cluster.ingest_live_rows(SCRIBE_POD, table, 0, 8, 2).await?;
+        let state = cluster.server(SCRIBE_POD)?.state();
+        let catalog = state
+            .bifrost_catalog()
+            .ok_or("the Scribe pod composes no catalog")?;
+        let scribe = state
+            .bifrost_ingest()
+            .ok_or("the Scribe pod composes no Scribe")?;
+        let tenant = cluster.tenant();
+        let table_ref = TableRef::new(BifrostNamespace::Bifrost, table);
+        let binding = TenantTableBinding {
+            tenant_id: tenant,
+            namespace: "bifrost".to_owned(),
+            table: table.to_owned(),
+        };
+        let (partition, stream) = scribe
+            .tail_service()
+            .list_active_streams(&binding)?
+            .into_iter()
+            .next()
+            .ok_or("the Scribe reports no live partition")?;
+        let schema = catalog.assignment_schema(&table_ref, tenant).await?;
+        let schema_fingerprint = assignment_schema_fingerprint(&schema);
+        let projected = Arc::new(schema.project(&[schema.index_of("id")?])?);
+        let scan_id = format!(
+            "oracle:bifrost.{table}:scribe:{}:{}:live",
+            stream.node_id.as_uuid(),
+            stream.writer_epoch
+        );
+        let plan = physical_plan_to_bytes_with_extension_codec(
+            Arc::new(RemoteSourcePlaceholderExec::new(
+                scan_id.clone(),
+                schema_fingerprint.clone(),
+                projected,
+            )),
+            &OraclePhysicalExtensionCodec::encoder(),
+        )?
+        .to_vec();
+        let table_uid = catalog.table_uid(&table_ref, tenant).await?;
+        Ok(Self {
+            fingerprint: physical_plan_fingerprint(&plan),
+            plan,
+            assignment: FollowerScanAssignment {
+                reader_cut: FollowerReaderCut::no_snapshot(
+                    uuid::Uuid::from_bytes(*table_uid.as_bytes()),
+                    stream.writer_epoch,
+                ),
+                scan_id,
+                binding,
+                persisted: PersistedFileAssignment { files: Vec::new() },
+                scribe_provider_cut: Some(ScribeProviderCut {
+                    writer_epoch: stream.writer_epoch,
+                    start_partition: partition,
+                    end_partition: partition,
+                }),
+                schema_fingerprint,
+                required_columns: vec!["id".to_owned()],
+                predicates: Vec::new(),
+            },
+            leader: OracleRoleFence {
+                node_id: NodeId::new(plane.leader_node_id),
+                role: ClusterRole::Oracle,
+                fencing_token: plane.leader_fence,
+            },
+            target: OracleRoleFence {
+                node_id: stream.node_id,
+                role: ClusterRole::Scribe,
+                fencing_token: stream.writer_epoch,
+            },
+        })
+    }
+
+    /// Encodes the fragment with a context naming `context_tenant`.
+    ///
+    /// Every other claim is the leader's own, so a refusal is attributable to
+    /// the tenant alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the assignment-authority digest failure unchanged.
+    fn request(
+        &self,
+        context_tenant: uuid::Uuid,
+    ) -> Result<proto::ExecuteFragmentRequest, PeerJourneyError> {
+        let assignments = vec![self.assignment.clone()];
+        let deadline = (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis();
+        let claims = PeerTicketClaims {
+            protocol_version: PEER_PROTOCOL_VERSION,
+            audience: self.target.node_id.as_uuid().as_bytes().to_vec(),
+            worker_fence: self.target.fencing_token,
+            leader_node_id: self.leader.node_id.as_uuid().as_bytes().to_vec(),
+            leader_fence: self.leader.fencing_token,
+            query_id: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            tenant_id: context_tenant.as_bytes().to_vec(),
+            expires_at_ms: deadline,
+            execution_deadline_unix_ms: deadline,
+            binding: format!(
+                "{}.{}",
+                self.assignment.binding.namespace, self.assignment.binding.table
+            ),
+            fragment_digest: self.fingerprint.clone(),
+            manifest_digest: self.fingerprint.clone(),
+            projection_digest: self.fingerprint.clone(),
+            permission_digest: "journey-permissions".to_owned(),
+            assignment_authority_digest: assignment_authority_digest_for(&assignments)
+                .map_err(|error| format!("assignment-authority digest: {error:?}"))?,
+        };
+        Ok(ExecuteFragmentRequest {
+            context: PeerContext {
+                claims_bytes: claims.encode_to_vec(),
+            },
+            physical_plan_bytes: self.plan.clone(),
+            reservation_id: ReservationId::new(uuid::Uuid::nil()),
+            leader_fence: self.leader.clone(),
+            target_fence: self.target.clone(),
+            assignments,
+            plan_fingerprint: self.fingerprint.clone(),
+        }
+        .into())
+    }
+}
+
+/// One claims-level change applied after an otherwise correct context is built.
+type ClaimsDeviation = fn(&mut vala_bifrost_redux::oracle::peer::ReservationTicketClaims);
 
 /// Worker discovery is refused on the private plane and has no internal caller.
 ///
@@ -471,14 +528,15 @@ fn a_state_changing_ticket_is_single_use(
 /// # Errors
 ///
 /// Returns a message when the private listener answers the call.
-fn worker_discovery_is_always_refused(
-    cluster: &mut BifrostProcessCluster,
+async fn worker_discovery_is_always_refused(
+    cluster: &PeerCluster,
     plane: &ReservationPlane,
 ) -> Result<(), PeerJourneyError> {
-    let outcome = probe(
-        cluster,
-        &PeerProbePlan::own(&plane.destination).on_path("/worker.WorkerService/GetWorkerInfo"),
-    )?;
+    let outcome = cluster
+        .probe(
+            &PeerProbePlan::own(&plane.destination).on_path("/worker.WorkerService/GetWorkerInfo"),
+        )
+        .await?;
     if outcome == "Ok" {
         return Err("worker discovery was answered on the private peer plane".into());
     }

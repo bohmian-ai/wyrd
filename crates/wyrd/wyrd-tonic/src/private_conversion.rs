@@ -9,12 +9,8 @@ use wyrd_spec::DataTenantId;
 
 use crate::wyrd::v1 as proto;
 
-/// Hard protocol ceiling for opaque signed claims.
+/// Hard protocol ceiling for typed peer-context claims, enforced before decode.
 const MAX_CLAIMS_BYTES: usize = 16 * 1024;
-/// Exact v1 peer signature width.
-const SIGNATURE_BYTES: usize = 64;
-/// Hard protocol ceiling for an ASCII signing-key identifier.
-const MAX_KEY_ID_BYTES: usize = 64;
 
 /// Decodes one required [`proto::TimePartition`] into its validated domain value.
 ///
@@ -383,9 +379,8 @@ impl TryFrom<proto::ReserveNodeSlotsRequest> for domain::ReserveNodeSlotsRequest
     ///
     /// # Errors
     /// Returns [`PrivateConversionError`] for malformed identifiers, an
-    /// unknown class, zero capacity, or an invalid expiry timestamp.
+    /// unknown class, a missing graph, or an invalid expiry timestamp.
     fn try_from(value: proto::ReserveNodeSlotsRequest) -> Result<Self, Self::Error> {
-        positive(value.slot_units, "slot_units")?;
         Ok(Self {
             query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
             leader_node_id: domain::NodeId::new(uuid_string(
@@ -393,10 +388,12 @@ impl TryFrom<proto::ReserveNodeSlotsRequest> for domain::ReserveNodeSlotsRequest
                 "leader_node_id",
             )?),
             leader_fencing_token: value.leader_fencing_token,
-            query_class: query_class(value.query_class)?,
-            slot_units: value.slot_units,
             expires_at: datetime(value.expires_at_unix_ms, "expires_at_unix_ms")?,
-            graph: value.graph.map(analytical_graph_ref).transpose()?,
+            graph: analytical_graph_ref(
+                value
+                    .graph
+                    .ok_or(PrivateConversionError::Missing("graph"))?,
+            )?,
         })
     }
 }
@@ -419,23 +416,18 @@ fn analytical_graph_ref(
 impl From<domain::ReserveNodeSlotsRequest> for proto::ReserveNodeSlotsRequest {
     /// Encodes a validated Oracle capacity-reservation request.
     ///
-    /// The purpose ticket is deliberately absent here: it binds the digest of
+    /// The typed context is deliberately absent here: it binds the digest of
     /// this encoding, so the leader's transport stamps it after conversion.
     fn from(value: domain::ReserveNodeSlotsRequest) -> Self {
         Self {
-            ticket: None,
+            context: None,
             query_id: value.query_id.as_uuid().as_bytes().to_vec(),
             leader_node_id: value.leader_node_id.as_uuid().to_string(),
             leader_fencing_token: value.leader_fencing_token,
-            query_class: match value.query_class {
-                domain::QueryClass::Interactive => proto::QueryClass::Interactive as i32,
-                domain::QueryClass::Analytical => proto::QueryClass::Analytical as i32,
-            },
-            slot_units: value.slot_units,
             expires_at_unix_ms: unix_millis(value.expires_at),
-            graph: value.graph.map(|graph| proto::AnalyticalGraphRef {
-                public_query_id: graph.public_query_id.as_bytes().to_vec(),
-                datafusion_query_id: graph.datafusion_query_id.as_bytes().to_vec(),
+            graph: Some(proto::AnalyticalGraphRef {
+                public_query_id: value.graph.public_query_id.as_bytes().to_vec(),
+                datafusion_query_id: value.graph.datafusion_query_id.as_bytes().to_vec(),
             }),
         }
     }
@@ -524,11 +516,11 @@ impl TryFrom<proto::ReleaseNodeSlotsRequest> for domain::ReleaseNodeSlotsRequest
 impl From<domain::ReleaseNodeSlotsRequest> for proto::ReleaseNodeSlotsRequest {
     /// Encodes the complete fenced identity of a reservation release.
     ///
-    /// The purpose ticket is stamped by the leader's transport after this
+    /// The typed context is stamped by the leader's transport after this
     /// conversion, because it binds the digest of this encoding.
     fn from(value: domain::ReleaseNodeSlotsRequest) -> Self {
         Self {
-            ticket: None,
+            context: None,
             reservation_id: value.reservation_id.as_uuid().as_bytes().to_vec(),
             query_id: value.query_id.as_uuid().as_bytes().to_vec(),
             leader_node_id: value.leader_node_id.as_uuid().to_string(),
@@ -537,40 +529,27 @@ impl From<domain::ReleaseNodeSlotsRequest> for proto::ReleaseNodeSlotsRequest {
     }
 }
 
-impl TryFrom<proto::SignedPeerTicket> for domain::SignedPeerTicket {
+impl TryFrom<proto::PeerContext> for domain::PeerContext {
     type Error = PrivateConversionError;
 
-    /// Decodes a signed peer ticket under fixed key, claim, and signature bounds.
+    /// Decodes a typed peer context under the fixed claims-byte bound.
     ///
     /// # Errors
-    /// Returns [`PrivateConversionError`] when the key identifier, claims, or
-    /// signature violates the private protocol's size or encoding rules.
-    fn try_from(value: proto::SignedPeerTicket) -> Result<Self, Self::Error> {
-        if value.key_id.is_empty()
-            || value.key_id.len() > MAX_KEY_ID_BYTES
-            || !value.key_id.is_ascii()
-        {
-            return Err(PrivateConversionError::Invalid { field: "key_id" });
-        }
+    /// Returns [`PrivateConversionError::TooLarge`] when the claims exceed the
+    /// private protocol's bound; nothing is decoded before this check.
+    fn try_from(value: proto::PeerContext) -> Result<Self, Self::Error> {
         bounded(&value.claims_bytes, MAX_CLAIMS_BYTES, "claims_bytes")?;
-        if value.signature.len() != SIGNATURE_BYTES {
-            return Err(PrivateConversionError::Invalid { field: "signature" });
-        }
         Ok(Self {
-            key_id: value.key_id,
             claims_bytes: value.claims_bytes,
-            signature: value.signature,
         })
     }
 }
 
-impl From<domain::SignedPeerTicket> for proto::SignedPeerTicket {
-    /// Encodes an already validated opaque signed peer ticket.
-    fn from(value: domain::SignedPeerTicket) -> Self {
+impl From<domain::PeerContext> for proto::PeerContext {
+    /// Encodes an already bounded typed peer context.
+    fn from(value: domain::PeerContext) -> Self {
         Self {
-            key_id: value.key_id,
             claims_bytes: value.claims_bytes,
-            signature: value.signature,
         }
     }
 }
@@ -978,21 +957,19 @@ impl TryFrom<proto::ScribeProviderCut> for domain::ScribeProviderCut {
 
     /// Decodes the bounded Scribe provider projection.
     ///
-    /// The cut bounds partitions, writer incarnation, and retention only. It
+    /// The cut bounds partitions and writer incarnation only. It
     /// carries no published-WAL statement, because Scribe's generation
     /// authority is the exact answer to what a follower may still read from
     /// memory and a wire-carried interval would be a weaker second one.
     ///
     /// # Errors
     /// Returns a conversion error when either partition endpoint is absent or
-    /// the complete cut violates its canonical ordering or signed bounds.
+    /// the complete cut violates its canonical ordering.
     fn try_from(value: proto::ScribeProviderCut) -> Result<Self, Self::Error> {
         let cut = Self {
             writer_epoch: value.writer_epoch,
             start_partition: time_partition(value.start_partition, "start_partition")?,
             end_partition: time_partition(value.end_partition, "end_partition")?,
-            maximum_batch_count: value.maximum_batch_count,
-            maximum_retained_bytes: value.maximum_retained_bytes,
         };
         if !cut.is_valid() {
             return Err(PrivateConversionError::Invalid {
@@ -1010,8 +987,6 @@ impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
             writer_epoch: value.writer_epoch,
             start_partition: Some(time_partition_proto(value.start_partition)),
             end_partition: Some(time_partition_proto(value.end_partition)),
-            maximum_batch_count: value.maximum_batch_count,
-            maximum_retained_bytes: value.maximum_retained_bytes,
         }
     }
 }
@@ -1022,7 +997,7 @@ impl TryFrom<proto::ExecuteFragmentRequest> for domain::ExecuteFragmentRequest {
     /// Decodes one authenticated worker-fragment execution request.
     ///
     /// # Errors
-    /// Returns [`PrivateConversionError`] for a missing or invalid ticket, an
+    /// Returns [`PrivateConversionError`] for a missing or oversized context, an
     /// empty fragment payload, or a malformed reservation identifier.
     fn try_from(value: proto::ExecuteFragmentRequest) -> Result<Self, Self::Error> {
         if value.physical_plan_bytes.is_empty() {
@@ -1032,9 +1007,9 @@ impl TryFrom<proto::ExecuteFragmentRequest> for domain::ExecuteFragmentRequest {
         }
         nonempty(&value.plan_fingerprint, "plan_fingerprint")?;
         Ok(Self {
-            ticket: value
-                .ticket
-                .ok_or(PrivateConversionError::Missing("ticket"))?
+            context: value
+                .context
+                .ok_or(PrivateConversionError::Missing("context"))?
                 .try_into()?,
             physical_plan_bytes: value.physical_plan_bytes,
             reservation_id: domain::ReservationId::new(uuid_bytes(
@@ -1063,7 +1038,7 @@ impl From<domain::ExecuteFragmentRequest> for proto::ExecuteFragmentRequest {
     /// Encodes an authenticated worker-fragment execution request.
     fn from(value: domain::ExecuteFragmentRequest) -> Self {
         Self {
-            ticket: Some(value.ticket.into()),
+            context: Some(value.context.into()),
             physical_plan_bytes: value.physical_plan_bytes,
             reservation_id: value.reservation_id.as_uuid().as_bytes().to_vec(),
             leader_fence: Some(value.leader_fence.into()),
@@ -1162,20 +1137,6 @@ impl From<domain::WorkerAttemptFrame> for proto::WorkerAttemptFrame {
             }),
         };
         Self { frame: Some(frame) }
-    }
-}
-
-/// Decodes one required closed admission class.
-///
-/// # Errors
-/// Returns [`PrivateConversionError::RequiredEnum`] for zero or unknown values.
-fn query_class(value: i32) -> Result<domain::QueryClass, PrivateConversionError> {
-    match proto::QueryClass::try_from(value)
-        .map_err(|_| PrivateConversionError::RequiredEnum("query_class"))?
-    {
-        proto::QueryClass::Interactive => Ok(domain::QueryClass::Interactive),
-        proto::QueryClass::Analytical => Ok(domain::QueryClass::Analytical),
-        proto::QueryClass::Unspecified => Err(PrivateConversionError::RequiredEnum("query_class")),
     }
 }
 
@@ -1450,22 +1411,20 @@ mod tests {
         }
     }
 
-    /// Required private enum zero values fail closed.
+    /// A reservation that names no graph fails before reaching a follower.
     #[test]
-    fn reserve_slots_rejects_unspecified_query_class() {
+    fn reserve_slots_rejects_missing_graph() {
         let request = proto::ReserveNodeSlotsRequest {
             query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
             leader_node_id: uuid::Uuid::now_v7().to_string(),
             leader_fencing_token: 1,
-            query_class: 0,
-            slot_units: 1,
             expires_at_unix_ms: 1,
-            ticket: None,
+            context: None,
             graph: None,
         };
         assert!(matches!(
             domain::ReserveNodeSlotsRequest::try_from(request),
-            Err(PrivateConversionError::RequiredEnum("query_class"))
+            Err(PrivateConversionError::Missing("graph"))
         ));
     }
 
@@ -1477,7 +1436,7 @@ mod tests {
             query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
             leader_node_id: uuid::Uuid::now_v7().to_string(),
             leader_fencing_token: 1,
-            ticket: None,
+            context: None,
         };
         assert!(matches!(
             domain::ReleaseNodeSlotsRequest::try_from(request),
@@ -1485,47 +1444,17 @@ mod tests {
         ));
     }
 
-    /// Peer ticket bounds are enforced before opaque claims can be decoded.
+    /// Peer context bounds are enforced before typed claims can be decoded.
     #[test]
-    fn peer_ticket_rejects_field_bound_violations() {
-        let ticket = proto::SignedPeerTicket {
-            key_id: "k".into(),
+    fn peer_context_rejects_oversized_claims() {
+        let context = proto::PeerContext {
             claims_bytes: vec![0; MAX_CLAIMS_BYTES + 1],
-            signature: vec![0; SIGNATURE_BYTES],
         };
         assert!(matches!(
-            domain::SignedPeerTicket::try_from(ticket),
+            domain::PeerContext::try_from(context),
             Err(PrivateConversionError::TooLarge {
                 field: "claims_bytes"
             })
-        ));
-    }
-
-    /// Peer signatures must use the exact v1 Ed25519 byte width.
-    #[test]
-    fn peer_ticket_rejects_wrong_signature_width() {
-        let ticket = proto::SignedPeerTicket {
-            key_id: "k".into(),
-            claims_bytes: vec![],
-            signature: vec![0; SIGNATURE_BYTES - 1],
-        };
-        assert!(matches!(
-            domain::SignedPeerTicket::try_from(ticket),
-            Err(PrivateConversionError::Invalid { field: "signature" })
-        ));
-    }
-
-    /// Peer key identifiers are bounded ASCII.
-    #[test]
-    fn peer_ticket_rejects_non_ascii_key_id() {
-        let ticket = proto::SignedPeerTicket {
-            key_id: "é".into(),
-            claims_bytes: vec![],
-            signature: vec![0; SIGNATURE_BYTES],
-        };
-        assert!(matches!(
-            domain::SignedPeerTicket::try_from(ticket),
-            Err(PrivateConversionError::Invalid { field: "key_id" })
         ));
     }
 
@@ -1545,13 +1474,11 @@ mod tests {
             query_id: domain::QueryId::new(uuid::Uuid::now_v7()),
             leader_node_id: domain::NodeId::new(uuid::Uuid::now_v7()),
             leader_fencing_token: 42,
-            query_class: domain::QueryClass::Analytical,
-            slot_units: 3,
             expires_at: chrono::DateTime::from_timestamp_millis(99).expect("valid timestamp"),
-            graph: Some(domain::AnalyticalGraphRef {
+            graph: domain::AnalyticalGraphRef {
                 public_query_id: uuid::Uuid::now_v7(),
                 datafusion_query_id: uuid::Uuid::now_v7(),
-            }),
+            },
         };
         let actual = domain::ReserveNodeSlotsRequest::try_from(
             proto::ReserveNodeSlotsRequest::from(expected.clone()),
@@ -1599,8 +1526,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
-            maximum_batch_count: 16,
-            maximum_retained_bytes: 1_048_576,
         };
         assert_eq!(
             domain::ScribeProviderCut::try_from(proto::ScribeProviderCut::from(cut.clone()))
@@ -1721,10 +1646,8 @@ mod tests {
             release
         );
         let execute = domain::ExecuteFragmentRequest {
-            ticket: domain::SignedPeerTicket {
-                key_id: "key-1".into(),
+            context: domain::PeerContext {
                 claims_bytes: vec![1, 2],
-                signature: vec![3; SIGNATURE_BYTES],
             },
             physical_plan_bytes: vec![4, 5],
             reservation_id,

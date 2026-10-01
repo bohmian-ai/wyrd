@@ -74,7 +74,6 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_jcs = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["postgres"] }
 tempfile = { workspace = true }
@@ -90,7 +89,6 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost-redux = { workspace = true, features = ["bench-support", "test-support"] }
 vala-sql = { workspace = true }
 wyrd-auth = { workspace = true }
-wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
@@ -112,6 +110,13 @@ wiremock = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# The peer-context journey encodes a Scribe fragment exactly as a leader does.
+datafusion-proto = { workspace = true }
+# The continuous Eval journey builds its native judge Prompt and points the
+# production judge at a local OpenAI-compatible provider.
+skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
+skald-spec = { workspace = true }
 metrics = { workspace = true }
 # Local provider upstream of the native gateway ingress journey.
 wiremock = { workspace = true }
@@ -123,28 +128,17 @@ opentelemetry = { workspace = true, features = ["logs", "metrics"] }
 opentelemetry_sdk = { workspace = true, features = ["logs", "metrics"] }
 opentelemetry-otlp = { workspace = true, features = ["logs", "metrics"] }
 # Journey plumbing only: the Oracle MCP journey drives a real MCP client against
-# a process-cluster pod's `/mcp` endpoint, so it needs the protocol client the
+# a peer-cluster pod's `/mcp` endpoint, so it needs the protocol client the
 # way an agent would use it. No `wyrd-testing` library code speaks MCP.
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",
 ] }
 
-# One test-support binary, not a test target. Registering it is what makes
-# Cargo hand `CARGO_BIN_EXE_bifrost_peer_test_node` to the Oracle integration
-# test, which is how `BifrostProcessCluster` launches each simulated pod as a
-# real child process instead of shelling out to Cargo.
-[[bin]]
-name = "bifrost_peer_test_node"
-path = "src/bin/bifrost_peer_test_node.rs"
-test = false
-bench = false
-
 # The opt-in single-pod query capacity benchmark. Run only through
-# `mise run bench:bifrost:query-capacity`; it is part of no test, gate, or
-# verify lane.
+# `mise run bench:bifrost:query-capacity`; only its unit tests run in a lane,
+# with the crate's other tests.
 [[bin]]
 name = "bifrost_query_capacity"
-path = "src/bin/bifrost_query_capacity.rs"
-test = false
+path = "src/bin/bifrost_query_capacity/main.rs"
 bench = false

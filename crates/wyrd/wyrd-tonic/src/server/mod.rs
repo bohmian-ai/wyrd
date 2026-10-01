@@ -2,15 +2,21 @@
 //!
 //! No business services are mounted here. Health and (optional) reflection only.
 
+use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_stream::StreamExt as _;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::server::Router as TonicRouter;
+use tonic::transport::server::{Connected, Router as TonicRouter, TcpConnectInfo};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::server::HealthReporter;
@@ -120,12 +126,6 @@ pub enum GrpcError {
     /// Building the incoming stream from a pre-bound listener failed.
     #[error("gRPC incoming listener setup failed: {0}")]
     IncomingSetup(String),
-    /// A private peer router was requested without the resolved peer Service
-    /// identity or the role-owned security audit it authenticates against.
-    /// Serving the peer plane without either would mean admitting traffic the
-    /// process cannot authorize or refuse on the record, so it is a boot error.
-    #[error("Bifrost peer plane identity or security audit is unavailable")]
-    MissingPeerIdentity,
     /// Ingest mount was requested but no token verifier is configured. Ingest is
     /// never mounted unauthenticated, so a missing verifier is a hard boot error.
     #[error("gRPC ingest requires a token verifier but none is configured")]
@@ -241,6 +241,164 @@ pub async fn serve_grpc_with_listener(
         .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
         .await
         .map_err(GrpcError::Transport)
+}
+
+/// Drive a private peer tonic server on a pre-bound listener to completion.
+///
+/// Serves like [`serve_grpc_with_listener`], but every accepted connection is
+/// wrapped in [`StoppingIo`], so cancelling `shutdown` fails each connection's
+/// socket IO. Graceful tonic shutdown alone cannot end a response whose reader
+/// stopped granting HTTP/2 window credit: hyper waits on send capacity and never
+/// polls the body again, so the connection — and every stream, fragment, and
+/// lease it owns — would stay open until the peer drains. Failing the IO ends
+/// the connection driver, which drops those streams. Only the private peer
+/// listener of a pod serving Scribe fragments uses this; the public listener
+/// and Oracle-only peer listeners keep graceful semantics.
+///
+/// # Errors
+///
+/// Returns [`GrpcError::Transport`] when tonic fails to serve the listener.
+#[tracing::instrument(skip(router, listener, shutdown))]
+pub async fn serve_peer_grpc_with_listener(
+    router: TonicRouter,
+    listener: TcpListener,
+    shutdown: CancellationToken,
+) -> Result<(), GrpcError> {
+    let connections = shutdown.clone();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
+        .map(move |accepted| accepted.map(|io| StoppingIo::new(io, connections.clone())));
+    router
+        .serve_with_incoming_shutdown(incoming, async move { shutdown.cancelled().await })
+        .await
+        .map_err(GrpcError::Transport)
+}
+
+/// Accepted peer TCP connection whose IO fails once the server stops.
+///
+/// Each read and write first polls the shutdown token, which registers the
+/// connection driver's waker; cancellation therefore wakes a driver parked on
+/// flow-control credit and fails it with [`io::ErrorKind::ConnectionAborted`].
+/// Before cancellation every operation forwards to the socket unchanged.
+struct StoppingIo {
+    /// The accepted socket; its connect info is forwarded for peer mTLS auth.
+    io: TcpStream,
+    /// Resolves once the server's shutdown token is cancelled.
+    stopped: Pin<Box<WaitForCancellationFutureOwned>>,
+}
+
+impl StoppingIo {
+    /// Wraps one accepted socket with the server's shutdown token.
+    fn new(io: TcpStream, shutdown: CancellationToken) -> Self {
+        Self {
+            io,
+            stopped: Box::pin(shutdown.cancelled_owned()),
+        }
+    }
+
+    /// Fails with `ConnectionAborted` once shutdown was requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::ConnectionAborted`] after cancellation.
+    fn poll_running(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        match self.stopped.as_mut().poll(cx) {
+            Poll::Ready(()) => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "peer server is shutting down",
+            )),
+            Poll::Pending => Ok(()),
+        }
+    }
+}
+
+impl AsyncRead for StoppingIo {
+    /// Reads from the socket unless shutdown was requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::ConnectionAborted`] once the shutdown token is
+    /// cancelled, otherwise any error the socket read returns.
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.poll_running(cx)?;
+        Pin::new(&mut this.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for StoppingIo {
+    /// Writes to the socket unless shutdown was requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::ConnectionAborted`] once the shutdown token is
+    /// cancelled, otherwise any error the socket write returns.
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        this.poll_running(cx)?;
+        Pin::new(&mut this.io).poll_write(cx, buf)
+    }
+
+    /// Writes vectored buffers to the socket unless shutdown was requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::ConnectionAborted`] once the shutdown token is
+    /// cancelled, otherwise any error the socket write returns.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        this.poll_running(cx)?;
+        Pin::new(&mut this.io).poll_write_vectored(cx, bufs)
+    }
+
+    /// Reports the socket's vectored-write support.
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    /// Flushes the socket unless shutdown was requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::ConnectionAborted`] once the shutdown token is
+    /// cancelled, otherwise any error the socket flush returns.
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.poll_running(cx)?;
+        Pin::new(&mut this.io).poll_flush(cx)
+    }
+
+    /// Shuts the socket's write half down; allowed during server shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the socket's write-half shutdown returns; cancellation
+    /// never refuses it.
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+impl Connected for StoppingIo {
+    /// The accepted socket's own TCP connect info, which tonic wraps with the
+    /// peer's TLS certificates for peer authorization.
+    type ConnectInfo = TcpConnectInfo;
+
+    /// Forwards the socket's TCP connect info so TLS still wraps it for peer auth.
+    fn connect_info(&self) -> Self::ConnectInfo {
+        self.io.connect_info()
+    }
 }
 
 /// Publish the snapshot-driven initial health status before the gRPC bind opens.

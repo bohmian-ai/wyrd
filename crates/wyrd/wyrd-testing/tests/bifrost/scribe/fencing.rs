@@ -101,6 +101,14 @@ async fn scribe_tenant_partition_schema_fencing() {
         "a refused schema may not leave any of its rows behind"
     );
 
+    // Publish the fence rows first. They share the current-hour key, so left
+    // staged they would stretch the later member's WAL envelope below every
+    // interleaved append and no earlier envelope could enclose it.
+    server
+        .flush_bifrost()
+        .await
+        .expect("the tenant fence rows publish");
+
     // Partition fence: the client's own event time decides the partition.
     // Ingest fences event time to a window around now, so the two partitions
     // are the current hour and the one before it rather than fixed literals.

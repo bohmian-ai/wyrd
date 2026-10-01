@@ -5,8 +5,10 @@ use sqlx::PgPool;
 use wyrd_spec::DataTenantId;
 
 use crate::dsn::ResolvedDsns;
+use crate::dsn::WYRD_APP_ROLE;
 use crate::operator_pool::OperatorPool;
 use crate::pool::{PoolConfig, build_pool};
+use crate::schema_check::verify_login_name;
 use crate::{SqlError, TenantConn};
 
 /// Drop-safe telemetry for one Wyrd application-pool acquisition.
@@ -58,8 +60,10 @@ impl Drop for PoolAcquireLifecycle<'_> {
 
 /// Runtime-ready Wyrd Postgres handle.
 ///
-/// Construction applies Wyrd migrations through the boot-only migrator role,
-/// closes that migrator pool, then returns only runtime pools.
+/// Holds only the two serving pools. Construction never migrates; serving
+/// boot calls [`Self::validate_schema`] before it reports ready, and the
+/// one-off `wyrd-server migrate` process applies migrations with the owner
+/// login through [`crate::migrate`].
 #[derive(Clone)]
 pub struct WyrdPostgres {
     app: PgPool,
@@ -67,44 +71,70 @@ pub struct WyrdPostgres {
 }
 
 impl WyrdPostgres {
-    /// Apply Wyrd migrations and build runtime role pools from resolved DSNs.
+    /// Build the serving `wyrd_app` and `wyrd_platform_admin` pools.
+    ///
+    /// No DDL runs and nothing is validated; call [`Self::validate_schema`]
+    /// before serving.
     ///
     /// # Errors
-    /// Returns [`SqlError`] when migration or pool construction fails.
+    /// Returns [`SqlError::Connect`] when either pool cannot be built.
     pub async fn connect_from_dsns(dsns: &ResolvedDsns) -> Result<Self, SqlError> {
-        let migrator = build_pool(
-            dsns.migrator.expose_secret(),
-            PoolConfig::migrator_from_env(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
-
-        let migration_result = crate::migrate(&migrator).await;
-        migrator.close().await;
-        migration_result?;
-
         let app = build_pool(dsns.app.expose_secret(), PoolConfig::app_from_env())
             .await
             .map_err(SqlError::Connect)?;
-        let platform_admin = match &dsns.platform_admin {
-            Some(dsn) => Some(
-                build_pool(dsn.expose_secret(), PoolConfig::platform_admin_from_env())
-                    .await
-                    .map_err(SqlError::Connect)?,
-            ),
-            None => None,
-        };
-
+        let platform_admin = build_pool(
+            dsns.platform_admin.expose_secret(),
+            PoolConfig::platform_admin_from_env(),
+        )
+        .await
+        .map_err(SqlError::Connect)?;
         Ok(Self {
             app,
-            platform_admin,
+            platform_admin: Some(platform_admin),
         })
+    }
+
+    /// Prove the database is ready for serving Wyrd control-plane traffic.
+    ///
+    /// Checks, in order: the app pool logs in as exactly `wyrd_app`; the
+    /// platform pool logs in as exactly `wyrd_platform_admin`; and the Wyrd
+    /// schema contract ([`crate::verify_schema`]) — role attributes, every
+    /// embedded migration and checksum, schema privileges, and tenant
+    /// isolation policies. Read-only; no DDL runs.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::SchemaNotReady`] for the first failed check (including
+    /// a handle without a platform pool), [`SqlError::MigrateChecksum`] for
+    /// checksum drift, and [`SqlError::Connect`] on query failure.
+    pub async fn validate_schema(&self) -> Result<(), SqlError> {
+        let operator = self
+            .operator_pool()
+            .ok_or_else(|| SqlError::SchemaNotReady {
+                detail: "no wyrd_platform_admin pool is configured".to_owned(),
+            })?;
+        self.verify_app_login().await?;
+        operator.verify_platform_login().await?;
+        crate::verify_schema(&operator).await
+    }
+
+    /// Prove the app pool logs in, and acts, as exactly `wyrd_app`.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::SchemaNotReady`] naming the observed role when it
+    /// differs, and [`SqlError::Connect`] on query failure.
+    async fn verify_app_login(&self) -> Result<(), SqlError> {
+        let (session, current): (String, String) =
+            sqlx::query_as("SELECT session_user::text, current_user::text")
+                .fetch_one(&self.app)
+                .await
+                .map_err(SqlError::Connect)?;
+        verify_login_name(WYRD_APP_ROLE, &session, &current)
     }
 
     /// Wrap pre-built pools into a handle.
     ///
     /// **Migrations are assumed already applied elsewhere.** Production and
-    /// DB-backed tests use `connect_from_dsns`, which migrates. This seam exists
+    /// DB-backed tests use `connect_from_dsns`. This seam exists
     /// only for DB-free unit tests that construct lazy pools and never issue a
     /// query. Gated behind `testing` / `cfg(test)` so it cannot be reached from a
     /// production build.

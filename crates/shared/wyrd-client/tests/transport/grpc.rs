@@ -1,6 +1,5 @@
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::config::GrpcConfig;
-use wyrd_spec::security::{SecretRef, TlsConfig};
 
 #[test]
 fn grpc_default_values() {
@@ -8,31 +7,11 @@ fn grpc_default_values() {
     assert_eq!(g.endpoint, "http://localhost:50051");
     assert_eq!(g.timeout_ms, 30_000);
     assert_eq!(g.connect_retries, 3);
-    assert!(g.tls.is_none());
 }
 
 #[test]
 fn grpc_default_round_trips() {
     let g = GrpcConfig::default();
-    let s = serde_json::to_string(&g).unwrap();
-    let back: GrpcConfig = serde_json::from_str(&s).unwrap();
-    assert_eq!(g, back);
-}
-
-#[test]
-fn grpc_with_tls_round_trips() {
-    let g = GrpcConfig {
-        tls: Some(TlsConfig {
-            ca_cert: Some(SecretRef::File {
-                path: "/etc/ssl/ca.pem".to_string(),
-            }),
-            client_cert: None,
-            client_key: None,
-            server_name_override: None,
-            insecure_skip_verify: false,
-        }),
-        ..GrpcConfig::default()
-    };
     let s = serde_json::to_string(&g).unwrap();
     let back: GrpcConfig = serde_json::from_str(&s).unwrap();
     assert_eq!(g, back);
@@ -207,5 +186,59 @@ mod grpc_connection {
             .expect("connect without keepalive succeeds");
 
         let _ = conn.channel();
+    }
+
+    /// An `https://` endpoint trusts the platform roots, which honor the
+    /// standard `SSL_CERT_FILE`, so a server whose certificate chains to that
+    /// file is accepted. A TLS config with no roots rejects every server.
+    #[tokio::test]
+    async fn https_endpoint_trusts_the_platform_roots() {
+        use tokio::net::TcpListener;
+        use tokio_util::sync::CancellationToken;
+        use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
+        use wyrd_tonic::server::{
+            GrpcRouterConfig, NoopInterceptor, build_grpc_router, serve_grpc_with_listener,
+        };
+        use wyrd_tonic::tonic::transport::Identity;
+        use wyrd_tonic::tonic_health::server::health_reporter;
+
+        let ca = BifrostPeerCa::generate("localhost").expect("test CA");
+        let leaf = ca.issue_leaf("edge").expect("server leaf");
+        let roots = tempfile::NamedTempFile::new().expect("roots file");
+        std::fs::write(roots.path(), ca.ca_certificate_pem()).expect("write roots");
+        // SAFETY: nextest runs each test in its own process, so no other
+        // thread reads the environment concurrently.
+        unsafe { std::env::set_var("SSL_CERT_FILE", roots.path()) };
+
+        let (_, health) = health_reporter();
+        let router = build_grpc_router(
+            health,
+            NoopInterceptor,
+            GrpcRouterConfig {
+                reflection_enabled: false,
+                tls_identity: Some(Identity::from_pem(
+                    leaf.certificate_pem(),
+                    leaf.private_key_pem(),
+                )),
+            },
+        )
+        .expect("TLS router");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        tokio::spawn(serve_grpc_with_listener(
+            router,
+            listener,
+            CancellationToken::new(),
+        ));
+
+        let config = GrpcConfig {
+            endpoint: format!("https://localhost:{port}"),
+            timeout_ms: 2_000,
+            connect_retries: 2,
+            ..GrpcConfig::default()
+        };
+        GrpcConnection::connect(&config, make_auth())
+            .await
+            .expect("TLS dial verified against SSL_CERT_FILE");
     }
 }

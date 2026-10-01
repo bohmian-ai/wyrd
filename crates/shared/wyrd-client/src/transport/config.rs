@@ -1,13 +1,32 @@
 //! Wyrd client transport configuration types.
 
 use serde::{Deserialize, Serialize};
-use wyrd_spec::security::TlsConfig;
 
 use crate::error::WyrdClientError;
 
-/// Default endpoint for [`GrpcConfig`]. Matches predecessor parity row C in
-/// `01-parity-audit.md`.
+/// Default endpoint for [`GrpcConfig`]: the public gRPC port on the default
+/// HTTP host, i.e. [`grpc_endpoint_for`] of [`HTTP_DEFAULT_BASE_URL`].
 pub const GRPC_DEFAULT_ENDPOINT: &str = "http://localhost:50051";
+/// Public gRPC port a deployment serves beside its HTTP `server_url`.
+pub const GRPC_DEFAULT_PORT: u16 = 50051;
+
+/// Derive the default gRPC endpoint from an HTTP `server_url`.
+///
+/// Keeps the URL's scheme and host and replaces its port and path with the
+/// public gRPC port, so a client configured with only `server_url` reaches
+/// the gRPC listener of the same deployment. An unparseable or host-less
+/// `server_url` is returned unchanged so the transport reports it rather than
+/// silently dialing a different address.
+#[must_use]
+pub fn grpc_endpoint_for(server_url: &str) -> String {
+    match reqwest::Url::parse(server_url) {
+        Ok(url) => match url.host_str() {
+            Some(host) => format!("{}://{host}:{GRPC_DEFAULT_PORT}", url.scheme()),
+            None => server_url.to_owned(),
+        },
+        Err(_) => server_url.to_owned(),
+    }
+}
 /// Default per-call timeout (ms) for [`GrpcConfig`].
 pub const GRPC_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// Default connect-retry budget for [`GrpcConfig`].
@@ -32,7 +51,9 @@ pub const GRPC_DEFAULT_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct GrpcConfig {
     /// gRPC server endpoint. Must be `http://host:port` (plaintext) or
-    /// `https://host:port` (TLS). Must be non-empty.
+    /// `https://host:port` (TLS). Must be non-empty. TLS verifies the server
+    /// against the platform trust store; point `SSL_CERT_FILE` or
+    /// `SSL_CERT_DIR` at a private CA.
     ///
     /// Default: [`GRPC_DEFAULT_ENDPOINT`] (`"http://localhost:50051"`).
     pub endpoint: String,
@@ -41,12 +62,6 @@ pub struct GrpcConfig {
     ///
     /// Default: [`GRPC_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).
     pub timeout_ms: u64,
-
-    /// Optional TLS configuration. When `None`, connections use the scheme
-    /// in `endpoint` to decide TLS (`https://` implies TLS with the system CA
-    /// pool, `http://` means plaintext).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<TlsConfig>,
 
     /// Connection-level retry budget. The transport retries the initial
     /// connection up to this many times before surfacing an error.
@@ -91,7 +106,6 @@ impl Default for GrpcConfig {
         Self {
             endpoint: GRPC_DEFAULT_ENDPOINT.to_string(),
             timeout_ms: GRPC_DEFAULT_TIMEOUT_MS,
-            tls: None,
             connect_retries: GRPC_DEFAULT_CONNECT_RETRIES,
             keepalive_interval_ms: GRPC_DEFAULT_KEEPALIVE_INTERVAL_MS,
             keepalive_timeout_ms: GRPC_DEFAULT_KEEPALIVE_TIMEOUT_MS,
@@ -124,7 +138,7 @@ impl GrpcConfig {
 /// Default base URL for [`HttpConfig`]. Matches the local-development
 /// gateway port. HTTP is the secondary path; this default mirrors
 /// [`GrpcConfig`] for parity with predecessor row D.
-pub const HTTP_DEFAULT_BASE_URL: &str = "http://localhost:50050";
+pub const HTTP_DEFAULT_BASE_URL: &str = "http://localhost:8080";
 /// Default per-request timeout (ms) for [`HttpConfig`].
 pub const HTTP_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -145,7 +159,7 @@ pub struct HttpConfig {
     /// call time.
     ///
     /// Example: `"https://wyrd-ingest.example.com"`.
-    /// Default: [`HTTP_DEFAULT_BASE_URL`] (`"http://localhost:50050"`).
+    /// Default: [`HTTP_DEFAULT_BASE_URL`] (`"http://localhost:8080"`).
     #[serde(default = "default_base_url")]
     pub base_url: String,
 
@@ -157,11 +171,6 @@ pub struct HttpConfig {
     /// Default: [`HTTP_DEFAULT_TIMEOUT_MS`] (`30_000`, 30 s).
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
-
-    /// Optional TLS configuration. When `None`, the system CA pool is used
-    /// and the scheme in `base_url` governs whether TLS is active.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls: Option<TlsConfig>,
 
     /// Whether to gzip-compress request bodies. Useful for high-volume
     /// payloads; the server must accept `Content-Encoding: gzip`.
@@ -184,7 +193,6 @@ impl Default for HttpConfig {
         Self {
             base_url: HTTP_DEFAULT_BASE_URL.to_string(),
             timeout_ms: HTTP_DEFAULT_TIMEOUT_MS,
-            tls: None,
             compression: false,
         }
     }
@@ -344,15 +352,15 @@ mod tests {
     #[test]
     fn cleartext_remote_flags_plaintext_non_loopback() {
         assert!(is_cleartext_remote("http://wyrd.example.com"));
-        assert!(is_cleartext_remote("http://wyrd.example.com:50050/api"));
+        assert!(is_cleartext_remote("http://wyrd.example.com:8080/api"));
         assert!(is_cleartext_remote("http://10.0.0.5:8080"));
     }
 
     #[test]
     fn cleartext_remote_exempts_https_and_loopback() {
         assert!(!is_cleartext_remote("https://wyrd.example.com"));
-        assert!(!is_cleartext_remote("http://localhost:50050"));
-        assert!(!is_cleartext_remote("http://127.0.0.1:50050"));
-        assert!(!is_cleartext_remote("http://[::1]:50050"));
+        assert!(!is_cleartext_remote("http://localhost:8080"));
+        assert!(!is_cleartext_remote("http://127.0.0.1:8080"));
+        assert!(!is_cleartext_remote("http://[::1]:8080"));
     }
 }

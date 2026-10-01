@@ -4,26 +4,33 @@ set -Eeuo pipefail
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly wrapper="$root/scripts/postgres/with-test-postgres.sh"
 readonly temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/wyrd-pg-contract.XXXXXX")"
-trap 'rm -rf "$temp_dir"' EXIT
 mkdir -p "$temp_dir/bin"
+
+# The wrapper TCP-probes the published endpoint before trusting it, so the fake
+# publishes a real loopback listener that accepts and drops every connection.
+coproc listener {
+  exec python3 -c 'import socket
+s = socket.create_server(("127.0.0.1", 0))
+print(s.getsockname()[1], flush=True)
+while True:
+    s.accept()[0].close()'
+}
+listener_pid=$listener_PID
+trap 'kill "$listener_pid" 2>/dev/null; rm -rf "$temp_dir"' EXIT
+read -r FAKE_POSTGRES_PORT <&"${listener[0]}"
+export FAKE_POSTGRES_PORT
 
 cat >"$temp_dir/bin/docker" <<'DOCKER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 log="${FAKE_DOCKER_LOG:?}"
 printf '%s\n' "$*" >>"$log"
-project=default
-for ((i=1; i<=$#; i++)); do
-  if [[ ${!i} == --project-name ]]; then
-    j=$((i + 1)); project=${!j}
-  fi
-done
 case "${*: -1}" in
   5432)
     if [[ ${FAKE_DOCKER_BAD_ENDPOINT:-0} == 1 ]]; then
       printf 'not-a-loopback-endpoint\n'
     else
-      printf '127.0.0.1:%s\n' "$((30000 + $(printf '%s' "$project" | cksum | cut -d' ' -f1) % 20000))"
+      printf '127.0.0.1:%s\n' "${FAKE_POSTGRES_PORT:?}"
     fi
     ;;
 esac
@@ -48,7 +55,7 @@ rm -f "$FAKE_DOCKER_LOG" "$FAKE_PSQL_LOG"
 env_capture="$temp_dir/env"
 "$wrapper" -- bash -c 'printf "%s\n%s\n" "$DATABASE_URL" "$WYRD_DATABASE_URL" >"$1"' _ "$env_capture"
 test "$(wc -l <"$env_capture" | tr -d ' ')" -eq 2
-grep -Eq '^postgres://wyrd_migrator:.*@127\.0\.0\.1:[1-9][0-9]*/wyrd$' "$env_capture"
+grep -Eq '^postgres://wyrd_test_admin:.*@127\.0\.0\.1:[1-9][0-9]*/wyrd$' "$env_capture"
 grep -Eq '^postgres://wyrd_app:.*@127\.0\.0\.1:[1-9][0-9]*/wyrd$' "$env_capture"
 up_project="$(awk '/ up / {for(i=1;i<=NF;i++) if($i=="--project-name") print $(i+1)}' "$FAKE_DOCKER_LOG")"
 down_project="$(awk '/ down / {for(i=1;i<=NF;i++) if($i=="--project-name") print $(i+1)}' "$FAKE_DOCKER_LOG")"

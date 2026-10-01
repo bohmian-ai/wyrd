@@ -292,6 +292,26 @@ pub trait GateAudit: Send + Sync {
     ) -> Result<(), IngestError>;
 }
 
+/// Receives Eval observation frames after Scribe has durably acknowledged them.
+///
+/// Gate calls it only for the acknowledgement whose attempt first committed the
+/// batch; a replay Scribe suppressed as already committed is never handed over,
+/// so the receipt instant a frame arrives with is the one stamped on its rows.
+///
+/// The server composes one implementation that enqueues Verifier runs; the
+/// trait exists because that queue lives in a crate Gate must not depend on.
+/// The call is synchronous and must return without IO: implementations hand
+/// the frame to their own tracked task, so the hook can neither delay nor roll
+/// back the acknowledgement Gate has already earned.
+pub trait ObservationAck: Send + Sync {
+    /// Accepts one acknowledged `vala.eval.observations` frame.
+    ///
+    /// `frame` is the exact Arrow IPC payload Scribe admitted and
+    /// `receipt_micros` the receipt instant it stamped on rows without a
+    /// caller `wyrd_event_time`.
+    fn acknowledged(&self, auth: &AuthContext, frame: bytes::Bytes, receipt_micros: i64);
+}
+
 /// The concrete Bifrost write boundary.
 ///
 /// Gate owns authentication, request bounds, and transport response ordering.
@@ -305,6 +325,8 @@ pub struct Gate<A: GateAudit + 'static> {
     scribe: Option<Arc<dyn Scribe>>,
     /// Optional SQL dispatch seam reaching an Oracle this Gate does not own.
     query: Option<Arc<dyn OracleQueryDispatch>>,
+    /// Post-acknowledgement hook for Eval observation frames, when composed.
+    observations: Option<Arc<dyn ObservationAck>>,
     /// Durable sink for write-authorization decisions.
     ///
     /// Absent only where no Scribe is attached: a Gate that cannot write also
@@ -329,6 +351,7 @@ impl<A: GateAudit + 'static> Clone for Gate<A> {
         Self {
             scribe: self.scribe.clone(),
             query: self.query.clone(),
+            observations: self.observations.clone(),
             audit: self.audit.clone(),
             limits: self.limits,
             auth: self.auth.clone(),
@@ -383,6 +406,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         Self {
             scribe: Some(scribe),
             query: None,
+            observations: None,
             audit: None,
             limits,
             auth,
@@ -401,6 +425,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         Self {
             scribe: Some(scribe),
             query: None,
+            observations: None,
             audit: None,
             limits,
             auth,
@@ -419,6 +444,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         Self {
             scribe: None,
             query: None,
+            observations: None,
             audit: None,
             limits,
             auth,
@@ -434,6 +460,13 @@ impl<A: GateAudit + 'static> Gate<A> {
     #[must_use]
     pub fn with_query_dispatch(mut self, query: Arc<dyn OracleQueryDispatch>) -> Self {
         self.query = Some(query);
+        self
+    }
+
+    /// Attaches the hook every acknowledged Eval observation frame is handed to.
+    #[must_use]
+    pub fn with_observation_ack(mut self, observations: Arc<dyn ObservationAck>) -> Self {
+        self.observations = Some(observations);
         self
     }
 
@@ -783,6 +816,9 @@ impl<A: GateAudit + 'static> Gate<A> {
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("trace", &error))?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Traces, "spans"),
@@ -825,6 +861,9 @@ impl<A: GateAudit + 'static> Gate<A> {
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("metric", &error))?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Metrics, "points"),
@@ -867,6 +906,9 @@ impl<A: GateAudit + 'static> Gate<A> {
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("log", &error))?;
+        // The generated request is no longer read; free its backing before
+        // Scribe adopts the decode owner and charges the projected Arrow.
+        drop(decoded.request);
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Logs, "records"),
@@ -997,6 +1039,14 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.authorize_record_write(auth, &table, Some(&frame.arrow_ipc))
             .await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
+        let observed = self
+            .observations
+            .as_ref()
+            .filter(|_| {
+                table.namespace == BifrostNamespace::Eval
+                    && table.name == crate::tables::EvalObservationsTable::NAME
+            })
+            .map(|hook| (Arc::clone(hook), frame.arrow_ipc.clone()));
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
             authenticated_tenant: auth.tenant,
@@ -1024,6 +1074,11 @@ impl<A: GateAudit + 'static> Gate<A> {
         );
         metrics::histogram!("bifrost_gate_resolution_seconds")
             .record(resolution_started.elapsed().as_secs_f64());
+        // Only the attempt that inserted the batch activates runs: a suppressed
+        // replay carries its own receipt instant, not the one stored on the rows.
+        if let Some((hook, frame)) = observed.filter(|_| admission.first_commit) {
+            hook.acknowledged(auth, frame, admission.receipt_micros);
+        }
         Ok(admission.rows_accepted)
     }
 }
@@ -1433,6 +1488,8 @@ mod tests {
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
+                receipt_micros: 0,
+                first_commit: true,
             })
         }
 
@@ -1599,6 +1656,8 @@ mod tests {
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
+                receipt_micros: 0,
+                first_commit: true,
             })
         }
 
@@ -1653,6 +1712,8 @@ mod tests {
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
+                receipt_micros: 0,
+                first_commit: true,
             })
         }
 
@@ -2245,7 +2306,7 @@ mod tests {
             let frames = futures_util::stream::iter([Ok(QueryStreamFrame::Terminal(
                 wyrd_spec::vala::api::QueryTerminalFrame {
                     outcome: wyrd_spec::vala::api::QueryTerminalOutcome::Success,
-                    execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                    query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                     row_count: 0,
                     warnings: Vec::new(),
                     source_completion: Vec::new(),
@@ -2883,6 +2944,8 @@ mod tests {
             Ok(FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
+                receipt_micros: 0,
+                first_commit: true,
             })
         }
     }

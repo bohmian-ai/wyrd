@@ -14,9 +14,8 @@ use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::Gate;
-use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;
-use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
+use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, RunningQueryRegistry};
@@ -30,6 +29,7 @@ use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::bifrost::gate_audit::PostgresGateAudit;
+use crate::boot::ServerBootError;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::health::ReadinessSnapshot;
@@ -78,22 +78,11 @@ pub struct BifrostBuildInputs {
     pub cluster: Arc<ClusterRegistry>,
     /// Exact public and private request token verifier.
     pub token_verifier: Arc<TokenVerifier>,
-    /// Existing outbound peer bearer owner.
-    pub peer_credentials: Arc<dyn OraclePeerCredentials>,
-    /// Immutable peer TLS trust policy validated before composition.
+    /// Cluster mTLS identity loaded from `WYRD_PEER_TLS_DIR`.
     ///
-    /// `Some` exactly when peer CA material is configured. This is the single
-    /// predicate deciding whether outbound peer transports use TLS, matching
-    /// what `TonicOraclePeerTransport` already requires of advertised
-    /// addresses; it is deliberately not keyed on the deployment profile.
+    /// `Some` exactly in explicit peer mode. A process-local node has no
+    /// peers, so every outbound peer transport is absent rather than plaintext.
     pub peer_tls: Option<BifrostPeerTls>,
-    /// Independent Bifrost peer ticket keyring used to mint and verify peer
-    /// and tail tickets.
-    ///
-    /// This is deliberately not the north-south workload signing key: a user
-    /// or API token must never validate as a peer-purpose ticket, and the peer
-    /// keyring rotates on its own schedule.
-    pub peer_keyring: Arc<crate::oracle::PeerTicketKeyring>,
     /// Immutable role configuration snapshot.
     pub config: BifrostRuntimeConfig,
     /// Immutable Forge configuration snapshot.
@@ -135,6 +124,9 @@ pub struct OracleBuildInputs {
     pub peer: Arc<crate::oracle::OraclePeerRuntime>,
     /// Role-scoped cancellation signal.
     pub role_shutdown: CancellationToken,
+    /// Whether boot already activated the fence; `false` keeps heartbeats
+    /// unready until [`Oracle::activate`] runs once the peer listener serves.
+    pub activated: bool,
 }
 
 /// Composed inputs for one selected Scribe ingest role.
@@ -156,13 +148,11 @@ pub struct ScribeBuildInputs {
     pub fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Audit sink for refused inbound fragment requests.
     pub fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Audit outbox writer for follower tenant tripwires.
-    pub fragment_query_audit: Arc<crate::oracle::OracleQueryAudit>,
-    /// Whether this role owns `fragment_query_audit`'s shutdown, which it does
-    /// only when no local Oracle role shares the publisher.
-    pub owns_fragment_query_audit: bool,
     /// Role-scoped cancellation signal.
     pub role_shutdown: CancellationToken,
+    /// Whether boot already activated the fence; `false` keeps heartbeats
+    /// unready until [`Scribe::activate`] runs once the peer listener serves.
+    pub activated: bool,
 }
 
 /// Sole owner of the dedicated Tokio runtime that hosts Scribe coordination tasks.
@@ -421,14 +411,10 @@ pub struct Scribe {
     lifecycle: RoleLifecycle,
     /// Shared tenant-qualified catalog retained by the selected data subsystem.
     catalog: Arc<BifrostCatalog>,
-    /// Raw-ticket verifier for Scribe-targeted physical fragments.
+    /// Peer-context verifier for Scribe-targeted physical fragments.
     fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Durable security audit for rejected Scribe fragment authority.
     fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Process-owned query audit required by decoded tenant tripwires.
-    fragment_query_audit: Arc<crate::oracle::OracleQueryAudit>,
-    /// Retains audit shutdown ownership only when this process has no Oracle owner.
-    owns_fragment_query_audit: bool,
     /// Cancels the recurring heartbeat and snapshot tasks before role removal.
     role_shutdown: CancellationToken,
     /// Retains the heartbeat task so teardown can prove it stopped before unregister.
@@ -441,6 +427,10 @@ pub struct Scribe {
     snapshot_poller_abort: AbortHandle,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
+    /// Withdraws this role when its WAL faults; ends with `role_shutdown`.
+    wal_fault_monitor: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Synchronously aborts the WAL fault monitor.
+    wal_fault_monitor_abort: AbortHandle,
 }
 
 /// Owns one retained Oracle and its independent fenced server lifecycle.
@@ -532,8 +522,9 @@ impl Oracle {
             resources,
             peer,
             role_shutdown,
+            activated,
         } = inputs;
-        let advertise_ready = Arc::new(AtomicBool::new(true));
+        let advertise_ready = Arc::new(AtomicBool::new(activated));
         let lifecycle = RoleLifecycle::serving();
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
@@ -653,6 +644,45 @@ impl Oracle {
         }
     }
 
+    /// Activates a peer-mode Oracle fence once its private listener serves.
+    ///
+    /// Boot leaves a peer-mode Oracle reserved but unready so no replica routes
+    /// to an unreachable socket. This advertises readiness to the heartbeat,
+    /// marks the exact fence ready, republishes membership into the local
+    /// engine, and requires the engine to report ready. On any failure it
+    /// withdraws the advertisement and marks the fence unready again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerBootError::OraclePeer`] when the role is no
+    /// longer serving, the fence cannot be activated or published, or the
+    /// engine is not ready after publication.
+    pub async fn activate(&self) -> Result<(), ServerBootError> {
+        if !self.lifecycle.is_serving() {
+            return Err(ServerBootError::OraclePeer(
+                "Oracle stopped serving before peer activation".to_owned(),
+            ));
+        }
+        self.advertise_ready.store(true, Ordering::Release);
+        let published = match self.cluster.activate(&self.registered_role).await {
+            Ok(()) => self.cluster.refresh_snapshot().await,
+            Err(error) => Err(error),
+        };
+        self.engine.refresh_membership(&self.cluster.snapshot());
+        let activated = match published {
+            Ok(()) if self.engine.is_ready() => Ok(()),
+            Ok(()) => Err("Oracle role did not become ready after activation".to_owned()),
+            Err(error) => Err(error.to_string()),
+        };
+        if activated.is_err() {
+            self.advertise_ready.store(false, Ordering::Release);
+            if let Err(error) = self.cluster.deactivate(&self.registered_role).await {
+                tracing::warn!(%error, "failed to withdraw Oracle readiness after activation failure");
+            }
+        }
+        activated.map_err(ServerBootError::OraclePeer)
+    }
+
     /// Removes durable readiness before transport draining begins.
     ///
     /// # Errors
@@ -702,7 +732,6 @@ impl Oracle {
         await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await?;
         if report.active_queries != 0
             || report.queued_queries != 0
-            || report.peer_pending != 0
             || report.peer_running != 0
             || report.reserved_memory_bytes != 0
             || audit != 0
@@ -802,6 +831,50 @@ where
     settlement.await
 }
 
+/// Withdraws this Scribe role once its WAL faults.
+///
+/// A WAL integrity or ambiguous-mutation fault is role-local: the writer has
+/// already refused new appends, so the monitor closes local readiness, stops
+/// the heartbeat advertising it, and marks the exact durable fence unready so
+/// no peer routes ingest or live-tail reads here. Accepted work keeps draining
+/// through the running shard and persistence owners, WAL and staged files are
+/// kept, and the process supervisor is never asked to exit. Only a restart,
+/// whose replay finishes before Scribe reports ready, restores the role.
+struct ScribeWalFaultMonitor {
+    /// Cancelled by the WAL writer when it faults.
+    fault: CancellationToken,
+    /// Durable cluster registry holding this Scribe's fence.
+    cluster: Arc<ClusterRegistry>,
+    /// Exact fence registration withdrawn on fault.
+    registered_role: RegisteredRole,
+    /// Local Scribe lifecycle moved to draining on fault.
+    lifecycle: RoleLifecycle,
+    /// Readiness flag the heartbeat advertises; cleared on fault.
+    advertise_ready: Arc<AtomicBool>,
+    /// Role shutdown; ends the monitor without withdrawing anything.
+    shutdown: CancellationToken,
+}
+
+impl ScribeWalFaultMonitor {
+    /// Waits for the WAL fault or role shutdown, and on a fault withdraws
+    /// local readiness, the heartbeat advertisement, and the durable fence.
+    ///
+    /// A failed fence withdrawal is logged; local readiness is already closed.
+    async fn run(self) {
+        tokio::select! {
+            () = self.shutdown.cancelled() => return,
+            () = self.fault.cancelled() => {}
+        }
+        self.advertise_ready.store(false, Ordering::Release);
+        self.lifecycle.begin_draining();
+        metrics::gauge!("bifrost_role_ready", "role" => "scribe").set(0.0);
+        tracing::error!("Scribe WAL faulted; withdrawing Scribe readiness and its cluster fence");
+        if let Err(error) = self.cluster.deactivate(&self.registered_role).await {
+            tracing::error!(%error, "failed to withdraw the Scribe fence after a WAL fault");
+        }
+    }
+}
+
 impl Scribe {
     /// Borrows the durable Scribe implementation handed to the one Gate.
     ///
@@ -830,6 +903,7 @@ impl Scribe {
         self.role_shutdown.cancel();
         self.heartbeat_abort.abort();
         self.snapshot_poller_abort.abort();
+        self.wal_fault_monitor_abort.abort();
         self.ingest.abort_shutdown();
     }
     /// Builds the Scribe runtime retained by the process composition owner.
@@ -846,23 +920,22 @@ impl Scribe {
             registered_role,
             fragment_verifier,
             fragment_security_audit,
-            fragment_query_audit,
-            owns_fragment_query_audit,
             role_shutdown,
+            activated,
         } = inputs;
         let tail_service = Arc::new(
             ingest
                 .tail_service()
                 .expect("constructed Scribe must retain a valid UUID stream identity"),
         );
-        let fragment_follower = Arc::new(
-            PhysicalPlanFollower::new(ScribeTailResolver::new(
-                Arc::clone(&tail_service),
-                Arc::clone(&catalog),
-            ))
-            .with_audit(fragment_query_audit.clone()),
-        );
-        let advertise_ready = Arc::new(AtomicBool::new(true));
+        let fragment_follower = Arc::new(PhysicalPlanFollower::new(ScribeTailResolver::new(
+            Arc::clone(&tail_service),
+            Arc::clone(&catalog),
+        )));
+        // A WAL that faulted during boot replay never advertises ready.
+        let advertise_ready = Arc::new(AtomicBool::new(
+            activated && !ingest.wal_fault().is_cancelled(),
+        ));
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
             Arc::clone(&advertise_ready),
@@ -871,6 +944,19 @@ impl Scribe {
         let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
         let heartbeat_abort = heartbeat.abort_handle();
         let snapshot_poller_abort = snapshot_poller.abort_handle();
+        let lifecycle = RoleLifecycle::serving();
+        let wal_fault_monitor = tokio::spawn(
+            ScribeWalFaultMonitor {
+                fault: ingest.wal_fault(),
+                cluster: Arc::clone(&cluster),
+                registered_role: registered_role.clone(),
+                lifecycle: lifecycle.clone(),
+                advertise_ready: Arc::clone(&advertise_ready),
+                shutdown: role_shutdown.clone(),
+            }
+            .run(),
+        );
+        let wal_fault_monitor_abort = wal_fault_monitor.abort_handle();
         Self {
             ingest,
             tail_service,
@@ -880,18 +966,18 @@ impl Scribe {
             resources,
             cluster,
             registered_role,
-            lifecycle: RoleLifecycle::serving(),
+            lifecycle,
             catalog,
             fragment_verifier,
             fragment_security_audit,
-            fragment_query_audit,
-            owns_fragment_query_audit,
             role_shutdown,
             heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
             heartbeat_abort,
             snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
             snapshot_poller_abort,
             advertise_ready,
+            wal_fault_monitor: Arc::new(Mutex::new(Some(wal_fault_monitor))),
+            wal_fault_monitor_abort,
         }
     }
 
@@ -945,7 +1031,7 @@ impl Scribe {
         Arc::clone(&self.cluster)
     }
 
-    /// Borrows the raw-ticket verifier for Scribe fragment dispatch.
+    /// Borrows the context verifier for Scribe fragment dispatch.
     #[must_use]
     pub fn fragment_verifier(&self) -> Arc<dyn PeerTicketVerifier> {
         Arc::clone(&self.fragment_verifier)
@@ -969,12 +1055,55 @@ impl Scribe {
         self.lifecycle.is_serving() && self.ingest.is_ready()
     }
 
+    /// Reports whether this role's WAL faulted and withdrew it until restart.
+    #[must_use]
+    pub fn wal_faulted(&self) -> bool {
+        self.ingest.wal_fault().is_cancelled()
+    }
+
     /// Synchronously closes local Scribe readiness before transport cancellation.
     pub(crate) fn start_draining(&self) {
         if self.lifecycle.begin_draining() {
             metrics::gauge!("bifrost_role_ready", "role" => "scribe").set(0.0);
             self.advertise_ready.store(false, Ordering::Release);
         }
+    }
+
+    /// Activates a peer-mode Scribe fence once its private listener serves.
+    ///
+    /// Boot leaves a peer-mode Scribe reserved but unready so no replica dials
+    /// its tail before the socket serves. This advertises readiness to the
+    /// heartbeat, marks the exact fence ready, and republishes membership. On
+    /// failure it withdraws the advertisement and marks the fence unready. A
+    /// Scribe whose WAL faulted, including a failed boot replay, is left
+    /// unready and activation succeeds without touching the fence, so the
+    /// other peer roles still activate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerBootError::Scribe`] when the role is no
+    /// longer serving or the fence cannot be activated or published.
+    pub async fn activate(&self) -> Result<(), ServerBootError> {
+        if self.wal_faulted() {
+            return Ok(());
+        }
+        if !self.lifecycle.is_serving() {
+            return Err(ServerBootError::Scribe(
+                "Scribe stopped serving before peer activation".to_owned(),
+            ));
+        }
+        self.advertise_ready.store(true, Ordering::Release);
+        let published = match self.cluster.activate(&self.registered_role).await {
+            Ok(()) => self.cluster.refresh_snapshot().await,
+            Err(error) => Err(error),
+        };
+        if published.is_err() {
+            self.advertise_ready.store(false, Ordering::Release);
+            if let Err(error) = self.cluster.deactivate(&self.registered_role).await {
+                tracing::warn!(%error, "failed to withdraw Scribe readiness after activation failure");
+            }
+        }
+        published.map_err(|error| ServerBootError::Scribe(error.to_string()))
     }
 
     /// Removes Scribe readiness before transport draining begins.
@@ -1016,14 +1145,14 @@ impl Scribe {
                 detail: "Scribe shutdown did not flush every retained owner".to_owned(),
             });
         }
-        if self.owns_fragment_query_audit && self.fragment_query_audit.shutdown(deadline).await != 0
-        {
-            return Err(wyrd_spec::vala::error::BifrostError::Internal {
-                detail: "Scribe shutdown retained tenant-tripwire audit state".to_owned(),
-            });
-        }
         await_role_task(&self.heartbeat, deadline, "scribe heartbeat").await?;
         await_role_task(&self.snapshot_poller, deadline, "scribe snapshot poller").await?;
+        await_role_task(
+            &self.wal_fault_monitor,
+            deadline,
+            "scribe WAL fault monitor",
+        )
+        .await?;
         Ok(())
     }
 
@@ -1475,9 +1604,6 @@ pub struct Bifrost {
     transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
     token_verifier: Arc<TokenVerifier>,
-    /// The one peer Service principal this process admits, when it serves the
-    /// private plane. Absent for targets that open no peer listener.
-    peer_identity: Option<crate::grpc::PeerWorkloadIdentity>,
     /// Retained forwarder, reachable by the private peer inbound handler.
     query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Lifecycle routing retained by every query ingress, regardless of local role.
@@ -1516,9 +1642,6 @@ pub(crate) struct BifrostComposition {
     pub(crate) transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
     pub(crate) token_verifier: Arc<TokenVerifier>,
-    /// The one peer Service principal this process admits, when it serves the
-    /// private plane.
-    pub(crate) peer_identity: Option<crate::grpc::PeerWorkloadIdentity>,
     /// Canonical ready-Oracle selector and authenticated private forwarder.
     pub(crate) query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Shared local controls or remote-only routing for a forwarding ingress.
@@ -1539,7 +1662,6 @@ impl Bifrost {
             bifrost_storage,
             transport,
             token_verifier,
-            peer_identity,
             query_forwarder,
             query_controls,
             #[cfg(feature = "test-support")]
@@ -1553,7 +1675,6 @@ impl Bifrost {
             bifrost_storage: Some(bifrost_storage),
             transport,
             token_verifier,
-            peer_identity,
             query_forwarder,
             query_controls,
             #[cfg(feature = "test-support")]
@@ -1573,14 +1694,13 @@ impl Bifrost {
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
                     &token_verifier,
                 )),
-                IngestLimits::default(),
+                vala_bifrost_redux::gate::limits::IngestLimits::default(),
             ),
             scribe: None,
             forge: None,
             oracle: None,
             transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission::for_tests(),
             token_verifier,
-            peer_identity: None,
             query_forwarder: None,
             query_controls: None,
             test_resources: None,
@@ -1591,7 +1711,7 @@ impl Bifrost {
     /// Builds an ownerless unit-test shell that can still reach one catalog.
     ///
     /// The in-crate `bifrost::service` tests call the catalog service functions
-    /// directly against the shared embedded-Postgres catalog. They compose no
+    /// directly against the shared repository-managed Postgres catalog. They compose no
     /// Scribe or Oracle runtime, so the shell retains the catalog itself and
     /// [`Self::catalog`] resolves to it. Everything else matches
     /// [`Self::test_shell`].
@@ -1607,19 +1727,38 @@ impl Bifrost {
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
                     &token_verifier,
                 )),
-                IngestLimits::default(),
+                vala_bifrost_redux::gate::limits::IngestLimits::default(),
             ),
             scribe: None,
             forge: None,
             oracle: None,
             transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission::for_tests(),
             token_verifier,
-            peer_identity: None,
             query_forwarder: None,
             query_controls: None,
             test_resources: None,
             test_catalog: Some(catalog),
         })
+    }
+
+    /// Activates peer-mode Scribe and Oracle fences once the private listener serves.
+    ///
+    /// The serving owner calls this only after it has handed the bound peer
+    /// listener to its serving task, so membership never names a socket that
+    /// cannot answer. A role that fails leaves its own fence unready; the
+    /// caller's terminal shutdown withdraws any role already activated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first role's [`ServerBootError`] activation failure.
+    pub async fn activate_peer_roles(&self) -> Result<(), ServerBootError> {
+        if let Some(scribe) = &self.scribe {
+            scribe.activate().await?;
+        }
+        if let Some(oracle) = &self.oracle {
+            oracle.activate().await?;
+        }
+        Ok(())
     }
 
     /// Borrows the selected Scribe runtime.
@@ -1650,20 +1789,11 @@ impl Bifrost {
         Arc::clone(&self.token_verifier)
     }
 
-    /// Borrows the one peer Service principal this process admits.
-    ///
-    /// `None` on a target that opens no peer listener, which is why composing
-    /// a peer router without it is a boot error rather than a silent default.
-    #[must_use]
-    pub fn peer_identity(&self) -> Option<&crate::grpc::PeerWorkloadIdentity> {
-        self.peer_identity.as_ref()
-    }
-
     /// Borrows the retained ready-Oracle forwarder, when this process has one.
     ///
     /// Public SQL reaches the forwarder through the Gate dispatch seam. This
     /// accessor exists for the private peer inbound path, which executes an
-    /// already-signed envelope rather than beginning a public request.
+    /// already-authorized forwarding context rather than beginning a public request.
     #[must_use]
     pub(crate) fn query_forwarder(&self) -> Option<&Arc<crate::oracle::ReadyOracleForwarder>> {
         self.query_forwarder.as_ref()
@@ -2379,6 +2509,22 @@ impl AppState {
         Ok(())
     }
 
+    /// Fail the next Scribe WAL sync after its record bytes are written.
+    ///
+    /// The ambiguous durability faults only the Scribe role; see
+    /// [`ScribeImpl::trip_wal_sync_fault_for_test`].
+    ///
+    /// # Errors
+    /// Returns an error when this server hosts no Scribe.
+    #[cfg(feature = "test-support")]
+    pub fn trip_scribe_wal_sync_fault_for_test(&self) -> Result<(), String> {
+        let Some(runtime) = self.bifrost.scribe() else {
+            return Err("Scribe is not configured".to_owned());
+        };
+        runtime.scribe().trip_wal_sync_fault_for_test();
+        Ok(())
+    }
+
     /// Release the held Scribe WAL refusal so retirement clears the breaker.
     ///
     /// # Errors
@@ -2410,16 +2556,6 @@ impl AppState {
 /// Errors raised by [`AppState::production_validate`].
 #[derive(Debug, thiserror::Error)]
 pub enum ProductionValidationError {
-    /// Stub allow policy hook is mounted in a production build.
-    #[error(
-        "authz.policy_hook is StubAllowPolicyHook in a production build; install a real PolicyHook"
-    )]
-    StubPolicyHook,
-    /// Noop audit writer is mounted in a production build.
-    #[error(
-        "authz.audit_writer is NoopAuthzAuditWriter in a production build; install a real AuthzAuditWriter"
-    )]
-    NoopAuditWriter,
     /// Token verifier is absent in a production build.
     #[error("auth.token_verifier is None in a production build; auth-plan boot must install it")]
     MissingTokenVerifier,
@@ -2444,12 +2580,6 @@ impl AppState {
         if !serves_api {
             return Ok(());
         }
-        if self.authz.policy_hook.is_stub_default() {
-            return Err(ProductionValidationError::StubPolicyHook);
-        }
-        if self.authz.audit_writer.is_stub_default() {
-            return Err(ProductionValidationError::NoopAuditWriter);
-        }
         if self.auth.token_verifier.is_none() {
             return Err(ProductionValidationError::MissingTokenVerifier);
         }
@@ -2466,18 +2596,6 @@ mod tests {
     use super::{AppState, LimitsConfig};
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use wyrd_auth_check::AuthzCheckContext;
-    use wyrd_auth_verify::VerifiedToken;
-    use wyrd_runtime::{
-        DelegationStep, PermissionSet, Principal, PrincipalId, PrincipalKind, PrincipalRef,
-    };
-    use wyrd_semver::VersionBlock;
-    use wyrd_spec::DataTenantId;
-    use wyrd_spec::card::policy::PolicyDecision;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::CardRef;
-    use wyrd_spec::request_id::RequestId;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
@@ -2597,17 +2715,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn defaults_for_test_safe() {
-        let state = test_state().await;
-
-        assert_eq!(
-            state.authz.policy_hook.evaluate(&context()).await,
-            PolicyDecision::Allow
-        );
-        assert!(state.authz.audit_writer.is_stub_default());
-    }
-
-    #[tokio::test]
     async fn new_state_has_fresh_cancellation_token() {
         let state = test_state().await;
         assert!(!state.shutdown_token.is_cancelled());
@@ -2630,14 +2737,14 @@ mod tests {
         assert!(state.production_validate().is_ok());
     }
 
-    /// The production stub rule applies exactly to processes that serve the API.
+    /// The production verifier rule applies exactly to processes that serve the API.
     ///
-    /// The shell fixture carries the stub policy hook the rule refuses, so the
-    /// only reason it validates on a production profile is the dedicated-worker
-    /// carve-out: a process with no Scribe and no Oracle exposes no public
-    /// surface for a stub hook to decide anything on. Asserting both halves is
+    /// The shell fixture carries no token verifier, which the rule refuses, so
+    /// the only reason it validates on a production profile is the
+    /// dedicated-worker carve-out: a process with no Scribe and no Oracle
+    /// exposes no public surface to authenticate. Asserting both halves is
     /// what keeps the carve-out from silently becoming a hole — if `serves_api`
-    /// ever reports true for this shell, the stub hook must start failing it.
+    /// ever reports true for this shell, the missing verifier must fail it.
     ///
     /// The serving half of the rule needs a state with a real Scribe or Oracle
     /// owner and is proven where such a state exists, not in this unit tier.
@@ -2647,8 +2754,8 @@ mod tests {
             .await
             .with_deployment_profile(crate::config::DeploymentProfile::Production);
         assert!(
-            state.authz.policy_hook.is_stub_default(),
-            "the shell fixture carries the stub hook the production rule refuses"
+            state.auth.token_verifier.is_none(),
+            "the shell fixture lacks the verifier the production rule requires"
         );
         assert!(
             !state.bifrost.serves_api(),
@@ -2656,7 +2763,7 @@ mod tests {
         );
         assert!(
             state.production_validate().is_ok(),
-            "a process that serves no public surface is not refused for a stub hook"
+            "a process that serves no public surface is not refused for a missing verifier"
         );
     }
 
@@ -2687,51 +2794,5 @@ mod tests {
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             crate::test_support::test_catalog().await,
         )
-    }
-
-    fn card_ref(name: &str) -> CardRef {
-        CardRef {
-            kind: CardKind::Service,
-            name: CardName::new(name).expect("static card name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: Some(SpaceName::new("prod").expect("static space is valid")),
-            uid: None,
-        }
-    }
-
-    fn principal(name: &str) -> Principal {
-        Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: PrincipalKind::Service {
-                card_ref: Some(card_ref(name)),
-                card_ref_scope: wyrd_spec::reference::CardRefScope::own(&card_ref(name)),
-            },
-            tenant_id: DataTenantId::new_v7(),
-            roles: Vec::new(),
-            effective_permissions: PermissionSet::new(),
-            credential_id: None,
-        }
-    }
-
-    fn context() -> AuthzCheckContext {
-        let caller = principal("caller");
-        let callee = principal("callee");
-        let verified = VerifiedToken {
-            principal: callee,
-            delegation_chain: vec![DelegationStep {
-                principal: PrincipalRef::from_principal(&caller),
-            }],
-            exp: chrono::Utc::now(),
-        };
-        let request = wyrd_auth_check::AuthzCheckRequest {
-            target: card_ref("callee"),
-            action: "card_write".to_owned(),
-            context: serde_json::json!({}),
-        };
-        let request_id = RequestId::parse(&uuid::Uuid::now_v7().to_string())
-            .expect("generated UUIDv7 is a valid request id");
-
-        AuthzCheckContext::from_verified(&verified, request, None, request_id)
-            .expect("test context is delegated")
     }
 }

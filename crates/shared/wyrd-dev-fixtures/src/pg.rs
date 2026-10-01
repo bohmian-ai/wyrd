@@ -15,7 +15,9 @@ use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
-use wyrd_sql::{OperatorPool, PoolConfig, SqlError, TenantConn, WyrdPostgres};
+use wyrd_sql::{
+    MIGRATION_LEASE_WAIT, OperatorPool, PoolConfig, SqlError, TenantConn, WyrdPostgres,
+};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -33,7 +35,7 @@ pub struct PgFixture {
     data_tenant_id: DataTenantId,
     /// Human-readable slug associated with the seeded tenant.
     tenant_slug: String,
-    /// Shared table-owner pool retained for BYPASSRLS assertion probes.
+    /// Shared database-owner pool retained for BYPASSRLS assertion probes.
     ///
     /// Callers receive cheap clones and must drop them normally. They must not
     /// call [`PgPool::close`] because SQLx closes the shared pool across every
@@ -93,17 +95,12 @@ impl PgFixture {
         let test_db = TestDatabase::attach(database_name).map_err(FixtureError::from)?;
         let handles = test_db.connect_handles().await?;
         let resolved = test_db.resolved_dsns()?;
-        let assertion_pool = build_pool(
-            resolved.migrator.expose_secret(),
-            PoolConfig::migrator_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
+        let assertion_pool = test_db.owner_pool().await?;
         Ok(Self {
             operator_pool: handles.operator_pool,
             wyrd: handles.wyrd,
             vala: handles.vala,
-            catalog_dsn: resolved.catalog_app,
+            catalog_dsn: resolved.catalog(),
             data_tenant_id,
             tenant_slug,
             assertion_pool,
@@ -164,7 +161,7 @@ impl PgFixture {
     pub async fn fresh_runtime_handles(&self) -> Result<(WyrdPostgres, ValaPostgres), SqlError> {
         let dsns = self._test_db.resolved_dsns()?;
         let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
-        let vala = ValaPostgres::connect_after_wyrd(&dsns).await?;
+        let vala = ValaPostgres::connect_from_dsns(&dsns).await?;
         Ok((wyrd, vala))
     }
 
@@ -217,20 +214,6 @@ impl PgFixture {
         &self.tenant_slug
     }
 
-    /// Build the iceberg catalog URI for this fixture's database.
-    ///
-    /// The iceberg-catalog-sql crate builds its own pool from this URI; it does
-    /// not accept a shared pool handle. The URI sets `role=wyrd_catalog` and
-    /// `search_path=iceberg_catalog` as PostgreSQL session options so that tables
-    /// created by the catalog crate are owned by `wyrd_catalog`, matching the
-    /// `ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_catalog` boundary in the migration.
-    #[must_use]
-    pub fn catalog_uri(&self) -> String {
-        let base = self.catalog_dsn.expose_secret();
-        let sep = if base.contains('?') { "&" } else { "?" };
-        format!("{base}{sep}options=-c%20role%3Dwyrd_catalog%20-c%20search_path%3Diceberg_catalog")
-    }
-
     /// Seed an additional active tenant row with a caller-supplied isolation key.
     ///
     /// Use this when a test needs a tenant with a **specific** [`DataTenantId`]
@@ -249,13 +232,12 @@ impl PgFixture {
         seed_tenant(&self.operator_pool, data_tenant_id, slug).await
     }
 
-    /// Clone the fixture-owned pool connected as the `wyrd_migrator` role.
+    /// Clone the fixture-owned pool connected as the database-owner login.
     ///
     /// Use this pool in test assertions that need to read across all tenants
-    /// without RLS. The `wyrd_migrator` role is the table owner and has the
-    /// `BYPASSRLS` attribute, making it the lowest-friction read path for raw
-    /// assertion queries. It is not a PostgreSQL superuser and cannot create
-    /// databases.
+    /// without RLS. The owner login ran the migrations, owns every migrated
+    /// object, and bypasses row-level security, making it the lowest-friction
+    /// read path for raw assertion queries. Serving code never holds it.
     ///
     /// The fixture retains this pool for its full lifetime so repeated probes
     /// do not create new SQLx pool graphs. Callers must drop returned clones
@@ -281,15 +263,8 @@ impl PgFixture {
     ) -> Result<Self, FixtureError> {
         let test_db = TestDatabase::create().await?;
         let handles = test_db.connect_handles().await?;
-        let resolved = test_db.resolved_dsns()?;
-        let catalog_dsn = resolved.catalog_app;
-        let migrator_dsn = resolved.migrator;
-        let assertion_pool = build_pool(
-            migrator_dsn.expose_secret(),
-            PoolConfig::migrator_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
+        let catalog_dsn = test_db.resolved_dsns()?.catalog();
+        let assertion_pool = test_db.owner_pool().await?;
         seed_tenant(&handles.operator_pool, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
@@ -329,14 +304,13 @@ struct TestDbHandles {
 }
 
 impl TestDatabase {
-    /// Creates an isolated database, grants the migrator its narrow database
-    /// privileges, and applies migrations through the migrator connection.
+    /// Creates an isolated database and applies migrations through its owner
+    /// login, exactly as `wyrd-server migrate` does for a deployment.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the admin DSN is missing or invalid, the
-    /// database cannot be created or granted, or migrations fail.
+    /// database cannot be created, or migrations fail.
     async fn create() -> Result<Self, SqlError> {
-        let base = resolved_external_test_dsns()?;
         let admin_dsn = test_database_admin_dsn("wyrd")?;
         let name = unique_database_name();
         let admin_pool = build_pool(admin_dsn.expose_secret(), PoolConfig::migrator_defaults())
@@ -347,12 +321,6 @@ impl TestDatabase {
             .execute(&admin_pool)
             .await
             .map_err(SqlError::from)?;
-        sqlx::query(AssertSqlSafe(format!(
-            "GRANT CONNECT, CREATE ON DATABASE {name} TO wyrd_migrator"
-        )))
-        .execute(&admin_pool)
-        .await
-        .map_err(SqlError::from)?;
         admin_pool.close().await;
 
         let test_db = Self {
@@ -360,7 +328,7 @@ impl TestDatabase {
             admin_dsn,
             owned: true,
         };
-        test_db.migrate(&base).await?;
+        test_db.migrate().await?;
         Ok(test_db)
     }
 
@@ -378,20 +346,23 @@ impl TestDatabase {
         })
     }
 
-    /// Connect the typed runtime handles used by a migrated fixture database.
+    /// Connect the typed serving handles of a migrated fixture database and
+    /// prove it is ready to serve, as serving boot does.
     ///
     /// # Errors
-    /// Returns [`SqlError`] when DSN resolution, pool construction, or the
-    /// required operator capability is unavailable.
+    /// Returns [`SqlError`] when DSN resolution, pool construction, or either
+    /// schema readiness check fails.
     async fn connect_handles(&self) -> Result<TestDbHandles, SqlError> {
         let dsns = self.resolved_dsns()?;
         let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
-        let vala = ValaPostgres::connect_after_wyrd(&dsns).await?;
+        let vala = ValaPostgres::connect_from_dsns(&dsns).await?;
+        wyrd.validate_schema().await?;
         let operator_pool = wyrd
             .operator_pool()
             .ok_or_else(|| SqlError::InvariantViolation {
-                detail: "test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
+                detail: "serving handles always carry a platform-admin pool".to_owned(),
             })?;
+        vala.validate_schema(&operator_pool).await?;
         Ok(TestDbHandles {
             wyrd,
             vala,
@@ -399,35 +370,55 @@ impl TestDatabase {
         })
     }
 
-    async fn migrate(&self, base: &ResolvedDsns) -> Result<(), SqlError> {
-        let migrator_dsn = database_dsn(&base.migrator, &self.name)?;
-        let migrator = build_pool(
-            migrator_dsn.expose_secret(),
-            PoolConfig::migrator_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
-
+    /// Apply Wyrd then Vala migrations through a transient owner pool, under
+    /// one migration lease as `wyrd-server migrate` does.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the owner pool cannot connect, the lease
+    /// cannot be acquired or released, or either migration set fails.
+    async fn migrate(&self) -> Result<(), SqlError> {
+        let owner = self.owner_pool().await?;
         let result = async {
-            wyrd_sql::migrate(&migrator).await?;
-            vala_sql::migrate(&migrator).await
+            let mut lease = OperatorPool::from(owner.clone())
+                .migration_lease(MIGRATION_LEASE_WAIT)
+                .await?;
+            let migrated = async {
+                wyrd_sql::migrate(&mut lease).await?;
+                vala_sql::migrate(&mut lease).await
+            }
+            .await;
+            let released = lease.release().await;
+            migrated.and(released)
         }
         .await;
-        migrator.close().await;
+        owner.close().await;
         result
     }
 
+    /// Open a pool on this fixture database as its owner login.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the owner DSN cannot be rewritten or the pool
+    /// cannot connect.
+    async fn owner_pool(&self) -> Result<PgPool, SqlError> {
+        let owner_dsn = database_dsn(&self.admin_dsn, &self.name)?;
+        build_pool(owner_dsn.expose_secret(), PoolConfig::migrator_defaults())
+            .await
+            .map_err(SqlError::Connect)
+    }
+
+    /// Point the serving DSNs from the environment at this fixture database.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::InvariantViolation`] when the serving DSNs are unset
+    /// or cannot be rewritten.
     fn resolved_dsns(&self) -> Result<ResolvedDsns, SqlError> {
-        let base = resolved_external_test_dsns()?;
+        let base = ResolvedDsns::from_env().map_err(|error| SqlError::InvariantViolation {
+            detail: format!("test DB serving DSN config error: {error}"),
+        })?;
         Ok(ResolvedDsns {
             app: database_dsn(&base.app, &self.name)?,
-            migrator: database_dsn(&base.migrator, &self.name)?,
-            platform_admin: base
-                .platform_admin
-                .as_ref()
-                .map(|dsn| database_dsn(dsn, &self.name))
-                .transpose()?,
-            catalog_app: database_dsn(&base.catalog_app, &self.name)?,
+            platform_admin: database_dsn(&base.platform_admin, &self.name)?,
         })
     }
 }
@@ -483,16 +474,6 @@ impl Drop for TestDatabase {
             eprintln!("test database cleanup thread panicked");
         }
     }
-}
-
-fn resolved_external_test_dsns() -> Result<ResolvedDsns, SqlError> {
-    wyrd_sql::dsn::resolve_external_dsns_from_env()
-        .map_err(|error| SqlError::InvariantViolation {
-            detail: format!("test DB DSN config error: {error}"),
-        })?
-        .ok_or_else(|| SqlError::InvariantViolation {
-            detail: "test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
-        })
 }
 
 /// Resolves the neutral admin DSN to a specific ephemeral database name.
@@ -563,16 +544,21 @@ async fn seed_tenant(
 
 #[cfg(test)]
 mod pg_tests {
-    use secrecy::ExposeSecret;
+    use secrecy::{ExposeSecret, SecretString};
+    use sqlx::AssertSqlSafe;
+    use vala_sql::ValaPostgres;
+    use wyrd_sql::WyrdPostgres;
+    use wyrd_sql::dsn::ResolvedDsns;
 
     use super::{PgFixture, database_dsn};
     use wyrd_spec::DataTenantId;
     use wyrd_sql::PoolConfig;
+    use wyrd_sql::SqlError;
     use wyrd_sql::pool::build_pool;
     use wyrd_sql::tenant_conn::CURRENT_TENANT_GUC;
 
     /// A real fixture migrates, binds tenants, and preserves the database
-    /// lifecycle boundary between its neutral administrator and migrator.
+    /// lifecycle boundary between its owner login and the serving logins.
     #[tokio::test]
     async fn fixture_smoke() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -586,8 +572,8 @@ mod pg_tests {
         assert_database_authority_boundary(&fixture).await;
     }
 
-    /// The lifecycle administrator owns the database while the migrator owns
-    /// migrated schemas but cannot create or drop databases.
+    /// The owner login owns the database and every migrated schema, while
+    /// neither serving login can create or drop databases.
     async fn assert_database_authority_boundary(fixture: &PgFixture) {
         let admin = build_pool(
             fixture._test_db.admin_dsn.expose_secret(),
@@ -625,44 +611,276 @@ mod pg_tests {
         assert_eq!(
             schema_owners,
             vec![
-                ("platform".to_owned(), "wyrd_migrator".to_owned()),
-                ("vala".to_owned(), "wyrd_migrator".to_owned()),
-                ("wyrd".to_owned(), "wyrd_migrator".to_owned()),
+                ("platform".to_owned(), "wyrd_test_admin".to_owned()),
+                ("vala".to_owned(), "wyrd_test_admin".to_owned()),
+                ("wyrd".to_owned(), "wyrd_test_admin".to_owned()),
             ]
         );
         fixture_admin.close().await;
 
-        let migrator_dsn = fixture
+        let serving = fixture
             ._test_db
             .resolved_dsns()
-            .expect("fixture DSNs resolve")
-            .migrator;
-        let postgres_migrator_dsn =
-            database_dsn(&migrator_dsn, "postgres").expect("migrator DSN rewrites");
-        let migrator = build_pool(
-            postgres_migrator_dsn.expose_secret(),
-            PoolConfig::migrator_defaults(),
-        )
-        .await
-        .expect("migrator connects to maintenance database");
-        for statement in [
-            "CREATE DATABASE wyrd_forbidden_create",
-            "DROP DATABASE wyrd",
-        ] {
-            let error = sqlx::query(statement)
-                .execute(&migrator)
-                .await
-                .expect_err("migrator database lifecycle operation is denied");
-            assert_eq!(
-                error
-                    .as_database_error()
-                    .and_then(|database| database.code())
-                    .as_deref(),
-                Some("42501"),
-                "{statement}"
-            );
+            .expect("fixture DSNs resolve");
+        for login in [&serving.app, &serving.platform_admin] {
+            let maintenance_dsn = database_dsn(login, "postgres").expect("serving DSN rewrites");
+            let pool = build_pool(
+                maintenance_dsn.expose_secret(),
+                PoolConfig::migrator_defaults(),
+            )
+            .await
+            .expect("serving login connects to maintenance database");
+            for statement in [
+                "CREATE DATABASE wyrd_forbidden_create",
+                "DROP DATABASE wyrd",
+            ] {
+                let error = sqlx::query(statement)
+                    .execute(&pool)
+                    .await
+                    .expect_err("serving database lifecycle operation is denied");
+                assert_eq!(
+                    error
+                        .as_database_error()
+                        .and_then(|database| database.code())
+                        .as_deref(),
+                    Some("42501"),
+                    "{statement}"
+                );
+            }
+            pool.close().await;
         }
-        migrator.close().await;
+    }
+
+    /// Serving readiness refuses a schema whose migrations drifted, are
+    /// missing, or whose tenant tables lost row-level security, their
+    /// isolation policy, or the narrow grants the migrations establish; once
+    /// restored, readiness and ordinary tenant and platform work pass again.
+    #[tokio::test]
+    async fn validate_schema_refuses_drifted_or_unprotected_schemas() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let owner = fixture.superuser_pool().await.expect("owner pool");
+        let operator = fixture.operator_pool();
+        fixture
+            .wyrd_postgres()
+            .validate_schema()
+            .await
+            .expect("freshly migrated Wyrd schema validates");
+        fixture
+            .vala_postgres()
+            .validate_schema(operator)
+            .await
+            .expect("freshly migrated Vala schema validates");
+
+        for (break_sql, restore_sql, table) in [
+            (
+                "ALTER TABLE wyrd.storage_multipart_uploads NO FORCE ROW LEVEL SECURITY",
+                "ALTER TABLE wyrd.storage_multipart_uploads FORCE ROW LEVEL SECURITY",
+                "storage_multipart_uploads",
+            ),
+            (
+                "DROP POLICY tenant_isolation ON wyrd.cards",
+                "CREATE POLICY tenant_isolation ON wyrd.cards \
+                 USING (data_tenant_id = wyrd.current_tenant()) \
+                 WITH CHECK (data_tenant_id = wyrd.current_tenant())",
+                "cards",
+            ),
+            (
+                "CREATE POLICY widened ON wyrd.verifier_runs USING (true)",
+                "DROP POLICY widened ON wyrd.verifier_runs",
+                "verifier_runs",
+            ),
+        ] {
+            sqlx::query(AssertSqlSafe(break_sql))
+                .execute(&owner)
+                .await
+                .expect("owner breaks tenant isolation");
+            assert!(
+                matches!(
+                    fixture.wyrd_postgres().validate_schema().await,
+                    Err(SqlError::SchemaNotReady { ref detail }) if detail.contains(table)
+                ),
+                "{break_sql}"
+            );
+            sqlx::query(AssertSqlSafe(restore_sql))
+                .execute(&owner)
+                .await
+                .expect("owner restores tenant isolation");
+        }
+
+        for (break_sql, restore_sql) in [
+            (
+                "GRANT CREATE ON SCHEMA wyrd TO wyrd_app",
+                "REVOKE CREATE ON SCHEMA wyrd FROM wyrd_app",
+            ),
+            (
+                "GRANT TRUNCATE ON wyrd.cards TO wyrd_app",
+                "REVOKE TRUNCATE ON wyrd.cards FROM wyrd_app",
+            ),
+            (
+                "GRANT CREATE ON SCHEMA platform TO wyrd_platform_admin",
+                "REVOKE CREATE ON SCHEMA platform FROM wyrd_platform_admin",
+            ),
+        ] {
+            sqlx::query(AssertSqlSafe(break_sql))
+                .execute(&owner)
+                .await
+                .expect("owner widens a serving grant");
+            assert!(
+                matches!(
+                    fixture.wyrd_postgres().validate_schema().await,
+                    Err(SqlError::SchemaNotReady { ref detail }) if detail.contains("holds")
+                ),
+                "{break_sql}"
+            );
+            sqlx::query(AssertSqlSafe(restore_sql))
+                .execute(&owner)
+                .await
+                .expect("owner restores the grant");
+        }
+
+        sqlx::query("GRANT USAGE ON SCHEMA iceberg_catalog TO wyrd_app")
+            .execute(&owner)
+            .await
+            .expect("owner exposes the catalog");
+        assert!(matches!(
+            fixture.vala_postgres().validate_schema(operator).await,
+            Err(SqlError::SchemaNotReady { ref detail }) if detail.contains("iceberg_catalog")
+        ));
+        sqlx::query("REVOKE USAGE ON SCHEMA iceberg_catalog FROM wyrd_app")
+            .execute(&owner)
+            .await
+            .expect("owner hides the catalog again");
+
+        fixture
+            .wyrd_postgres()
+            .validate_schema()
+            .await
+            .expect("restored Wyrd schema validates");
+        fixture
+            .vala_postgres()
+            .validate_schema(operator)
+            .await
+            .expect("restored Vala schema validates");
+        let mut conn = fixture
+            .wyrd_postgres()
+            .tenant_conn(fixture.data_tenant_id())
+            .await
+            .expect("tenant transaction opens");
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM wyrd.cards")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("tenant work runs after restore");
+        drop(conn);
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM platform.tenants")
+            .fetch_one(operator.pool())
+            .await
+            .expect("platform work runs after restore");
+
+        sqlx::query(
+            "UPDATE wyrd._sqlx_migrations SET checksum = '\\x00'::bytea \
+             WHERE version = (SELECT max(version) FROM wyrd._sqlx_migrations)",
+        )
+        .execute(&owner)
+        .await
+        .expect("owner corrupts a Wyrd checksum");
+        assert!(matches!(
+            fixture.wyrd_postgres().validate_schema().await,
+            Err(SqlError::MigrateChecksum { .. })
+        ));
+
+        sqlx::query(
+            "DELETE FROM vala._sqlx_migrations \
+             WHERE version = (SELECT max(version) FROM vala._sqlx_migrations)",
+        )
+        .execute(&owner)
+        .await
+        .expect("owner removes a Vala ledger row");
+        assert!(matches!(
+            fixture.vala_postgres().validate_schema(operator).await,
+            Err(SqlError::SchemaNotReady { ref detail }) if detail.contains("is not applied")
+        ));
+    }
+
+    /// Serving readiness refuses a serving DSN that logs in as any role other
+    /// than the one its pool is for — a grant-capable app login and an
+    /// owner-equivalent BYPASSRLS platform login alike.
+    #[tokio::test]
+    async fn validate_schema_refuses_substituted_serving_logins() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let owner = fixture.superuser_pool().await.expect("owner pool");
+        let suffix = fixture._test_db.name.clone();
+        let app_imposter = format!("wyrd_app_imposter_{suffix}");
+        let platform_imposter = format!("wyrd_platform_imposter_{suffix}");
+        for (role, attributes) in [
+            (&app_imposter, "NOBYPASSRLS"),
+            (&platform_imposter, "BYPASSRLS"),
+        ] {
+            sqlx::query(AssertSqlSafe(format!(
+                "CREATE ROLE {role} LOGIN {attributes} PASSWORD 'imposter'"
+            )))
+            .execute(&owner)
+            .await
+            .expect("owner creates an imposter login");
+        }
+
+        let dsns = fixture._test_db.resolved_dsns().expect("serving DSNs");
+        for (dsns, pool) in [
+            (
+                ResolvedDsns {
+                    app: login_as(&dsns.app, &app_imposter),
+                    platform_admin: dsns.platform_admin.clone(),
+                },
+                "app",
+            ),
+            (
+                ResolvedDsns {
+                    app: dsns.app.clone(),
+                    platform_admin: login_as(&dsns.platform_admin, &platform_imposter),
+                },
+                "platform",
+            ),
+        ] {
+            let wyrd = WyrdPostgres::connect_from_dsns(&dsns)
+                .await
+                .expect("imposter pools build");
+            assert!(
+                matches!(
+                    wyrd.validate_schema().await,
+                    Err(SqlError::SchemaNotReady { ref detail }) if detail.contains("imposter")
+                ),
+                "{pool} imposter passed readiness"
+            );
+            if pool == "app" {
+                let vala = ValaPostgres::connect_from_dsns(&dsns)
+                    .await
+                    .expect("imposter Vala pool builds");
+                assert!(matches!(
+                    vala.validate_schema(fixture.operator_pool()).await,
+                    Err(SqlError::SchemaNotReady { ref detail }) if detail.contains("imposter")
+                ));
+            }
+        }
+
+        for role in [&app_imposter, &platform_imposter] {
+            sqlx::query(AssertSqlSafe(format!("DROP ROLE {role}")))
+                .execute(&owner)
+                .await
+                .expect("owner drops the imposter login");
+        }
+        fixture
+            .wyrd_postgres()
+            .validate_schema()
+            .await
+            .expect("named serving logins still validate");
+    }
+
+    /// Rewrites a serving DSN to log in as `role` with the imposter password.
+    fn login_as(dsn: &SecretString, role: &str) -> SecretString {
+        let mut url = url::Url::parse(dsn.expose_secret()).expect("serving DSN parses");
+        url.set_username(role).expect("DSN accepts a username");
+        url.set_password(Some("imposter"))
+            .expect("DSN accepts a password");
+        SecretString::from(url.to_string())
     }
 
     #[tokio::test]
@@ -694,7 +912,7 @@ mod pg_tests {
             .await
             .expect("table-owner assertion probe");
 
-            assert_eq!(current_user, "wyrd_migrator");
+            assert_eq!(current_user, "wyrd_test_admin");
             assert!(bypasses_rls);
             assert_eq!(observed, expected);
             drop(assertion_pool);
@@ -721,7 +939,7 @@ mod pg_tests {
         .fetch_one(&first)
         .await
         .expect("first clone performs table-owner assertion");
-        assert_eq!(current_user, "wyrd_migrator");
+        assert_eq!(current_user, "wyrd_test_admin");
         assert!(bypasses_rls);
         let observed: i32 = sqlx::query_scalar("SELECT 1")
             .fetch_one(&second)
@@ -749,7 +967,7 @@ mod pg_tests {
         let rows: Vec<(String, bool)> = sqlx::query_as(
             "SELECT rolname, rolbypassrls
              FROM pg_roles
-             WHERE rolname IN ('wyrd_app', 'wyrd_migrator', 'wyrd_platform_admin')
+             WHERE rolname IN ('wyrd_app', 'wyrd_platform_admin')
              ORDER BY rolname",
         )
         .fetch_all(fixture.operator_pool().pool())
@@ -760,7 +978,6 @@ mod pg_tests {
             rows,
             vec![
                 ("wyrd_app".to_owned(), false),
-                ("wyrd_migrator".to_owned(), true),
                 ("wyrd_platform_admin".to_owned(), true),
             ]
         );

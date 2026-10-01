@@ -277,8 +277,7 @@ impl WyrdClient {
     ///
     /// This client's own credential is the actor: its current bearer is
     /// presented as `actor_token` alongside the inbound `subject_token`. The
-    /// server verifies both, asks the invoke policy whether the subject may be
-    /// served by this actor, and issues a short-lived token whose subject is
+    /// server verifies both and issues a short-lived token whose subject is
     /// the inbound principal, whose outer `act` is this client's principal, and
     /// whose permissions are the intersection of both. The first exchange runs
     /// here so a refusal surfaces at the call site; the returned client caches
@@ -311,6 +310,20 @@ impl WyrdClient {
     #[must_use]
     pub fn auth(&self) -> Arc<AuthMiddleware> {
         Arc::clone(&self.auth)
+    }
+
+    /// The effective HTTP server URL this client sends requests to.
+    #[must_use]
+    pub fn server_url(&self) -> &str {
+        self.http.base_url()
+    }
+
+    /// The effective gRPC endpoint [`Self::connect_grpc`] dials: the explicit
+    /// override when one was configured, else the server URL's host on the
+    /// public gRPC port.
+    #[must_use]
+    pub fn grpc_url(&self) -> &str {
+        &self.grpc_config.endpoint
     }
 
     /// Borrow the underlying [`HttpTransport`].

@@ -1,9 +1,9 @@
 //! Deterministic, IO-free Forge plan construction.
 //!
 //! Planning binds discovered candidates to the snapshot they were observed on
-//! and derives their durable identity. It carries no execution capacity: what
-//! a rewrite may run is decided by the worker's own admission queue against a
-//! per-plan estimate, so nothing here classifies, clamps, or refuses work.
+//! and derives their durable identity. It carries no execution capacity: the
+//! worker's queue admits by parallelism and execution charges the shared
+//! Bifrost memory root, so nothing here classifies, clamps, or refuses work.
 
 use sha2::{Digest, Sha256};
 use vala_sql::row_types::forge_tasks::{

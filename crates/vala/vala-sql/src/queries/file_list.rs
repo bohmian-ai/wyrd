@@ -14,12 +14,13 @@ pub struct HotFileCatalog {
     table_name: String,
 }
 
-/// Cut-aware scan membership and complete sealed lineage for one table.
+/// Cut-aware scan membership for one table.
 pub struct HotFileCut {
     /// Rows that remain unresolved and must be scanned as hot Parquet.
     pub hot_files: Vec<HotFileRow>,
-    /// Every sealed row retained for live-tail watermark derivation.
-    pub sealed_manifest: Vec<HotFileRow>,
+    /// Uncommitted rows already represented by the pinned snapshot's paths or
+    /// Forge operation, and therefore left out of `hot_files`.
+    pub represented: usize,
     /// Whether a legacy prepared row lacked safe publication evidence.
     pub ambiguous_publication: bool,
 }
@@ -97,8 +98,11 @@ impl HotFileCatalog {
 
     /// Reads tenant-scoped sealed files for exact pinned-snapshot subtraction.
     ///
-    /// Compacted transition rows remain visible because their committed
-    /// snapshot may be newer than Oracle's independently pinned snapshot.
+    /// Only rows without a committed snapshot are read: a committed row is
+    /// never hot, so the read stays bounded by unpublished work rather than by
+    /// every file the table has ever had. Compacted transition rows with no
+    /// committed snapshot remain visible, because their Forge operation may be
+    /// newer than Oracle's independently pinned snapshot.
     ///
     /// # Errors
     /// Returns [`SqlError`] when the RLS-bound transaction or manifest query fails.
@@ -109,7 +113,7 @@ impl HotFileCatalog {
         pinned_operation: Option<uuid::Uuid>,
     ) -> Result<HotFileCut, SqlError> {
         let rows = sqlx::query_as::<_, HotFileRow>(
-            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_ordinal, file_checksum, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, compacted, committed_snapshot_id, forge_publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_granularity, partition_start, created_at, file_ordinal, id",
+            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_ordinal, file_checksum, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, compacted, committed_snapshot_id, forge_publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND committed_snapshot_id IS NULL ORDER BY partition_granularity, partition_start, created_at, file_ordinal, id",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(&self.namespace)
@@ -117,18 +121,19 @@ impl HotFileCatalog {
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
+        let read = rows.len();
         let mut hot_files = Vec::new();
         let mut ambiguous_publication = false;
-        for row in &rows {
-            let (unresolved, ambiguous) = is_unresolved_hot(row, pinned_paths, pinned_operation);
+        for row in rows {
+            let (unresolved, ambiguous) = is_unresolved_hot(&row, pinned_paths, pinned_operation);
             ambiguous_publication |= ambiguous;
             if unresolved {
-                hot_files.push(row.clone());
+                hot_files.push(row);
             }
         }
         Ok(HotFileCut {
+            represented: read - hot_files.len(),
             hot_files,
-            sealed_manifest: rows,
             ambiguous_publication,
         })
     }
@@ -432,7 +437,8 @@ mod pg_tests {
     /// The tenant-scoped unresolved-hot read projects the durable
     /// `min_event_time`/`max_event_time` interval and row count alongside the
     /// identity columns, so Oracle can exclude a non-overlapping hot file
-    /// before it opens the object's footer.
+    /// before it opens the object's footer. A row already committed to an
+    /// Iceberg snapshot is not read at all.
     ///
     /// No migration is involved: both columns already exist on
     /// `vala.file_list`; only the query projection and row mapping change.
@@ -473,6 +479,28 @@ mod pg_tests {
         .execute(&pool)
         .await
         .expect("insert unresolved hot row");
+        sqlx::query(
+            r#"
+            INSERT INTO vala.file_list (
+                id, data_tenant_id, namespace, table_name, file_path,
+                file_size, row_count, min_event_time, max_event_time,
+                partition_granularity, partition_start, compacted,
+                committed_snapshot_id, node_id, writer_epoch,
+                wal_lsn_min, wal_lsn_max, promotion_record
+            ) VALUES (
+                $1, $2, 'vala.traces', 'spans', 'spans/committed.parquet',
+                4096, 64, $3, $3, 'hour', $3, true, 9,
+                $4, 1, 201, 300, '{"fixture": "committed"}'::jsonb
+            )
+            "#,
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(lower)
+        .bind(uuid::Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .expect("insert committed row");
 
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
@@ -483,6 +511,7 @@ mod pg_tests {
             .expect("unresolved hot cut reads");
 
         assert_eq!(cut.hot_files.len(), 1, "one unresolved hot row is returned");
+        assert_eq!(cut.represented, 0, "the committed row is never read");
         let row = &cut.hot_files[0];
         assert_eq!(row.min_event_time, Some(lower));
         assert_eq!(row.max_event_time, Some(upper));

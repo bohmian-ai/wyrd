@@ -271,10 +271,11 @@ pub(crate) async fn cancel_running_query(
           unacceptable credentials (WYRD_PERMISSION_403_DENIED_RBAC, \
           WYRD_VALA_403_QUERY_PEER_SECURITY)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "The Oracle role is unavailable, visibility could not be \
-          resolved, the decision could not be audited, or no verifier is configured for \
-          the access token (WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
+          resolved, the decision could not be audited, no verifier is configured for \
+          the access token, or the admitted query exhausted its execution memory and \
+          must not be retried unchanged (WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
           WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
-          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
+          WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
@@ -462,8 +463,12 @@ fn query_stream_response_with_fault(
 }
 
 /// Renders pre-stream query errors and marks unavailable roles retryable.
+///
+/// An admitted query that exhausted its execution memory is also 503 but gets
+/// no `Retry-After`: retrying it unchanged meets the same limit.
 pub(crate) fn query_error_response(error: WyrdError) -> Response {
-    let retryable = error.status() == 503;
+    let retryable = error.status() == 503
+        && error.code() != wyrd_spec::vala::error::BifrostError::QueryResourcesExhausted.code();
     let mut response = WyrdErrorResponse::from(error).into_response();
     if retryable {
         response.headers_mut().insert(
@@ -635,7 +640,7 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),
                 source_completion: Vec::new(),
@@ -683,6 +688,28 @@ mod tests {
         );
     }
 
+    /// Pre-stream execution-memory exhaustion is a 503 problem with its stable
+    /// code and no `Retry-After`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the status, code, or absent retry header differs.
+    #[tokio::test]
+    async fn resource_exhaustion_has_no_retry_after() {
+        let response = query_error_response(
+            wyrd_spec::vala::error::BifrostError::QueryResourcesExhausted.into(),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        let body = Body::new(response.into_body())
+            .collect()
+            .await
+            .expect("problem body")
+            .to_bytes();
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem json");
+        assert_eq!(problem["code"], "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED");
+    }
+
     /// Proves role mismatch is a typed retryable problem before any body stream.
     #[tokio::test]
     async fn oracle_role_unavailable_has_retry_after() {
@@ -715,7 +742,7 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
@@ -783,7 +810,7 @@ mod tests {
     async fn http_query_stream_preserves_late_failed_terminal() {
         let terminal = QueryStreamFrame::Terminal(QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+            query_class: wyrd_spec::vala::api::QueryClass::Interactive,
             row_count: 1,
             warnings: Vec::new(),
             source_completion: Vec::new(),

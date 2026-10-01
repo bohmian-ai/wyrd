@@ -29,7 +29,7 @@ wait "$one_pid"
 one_status=$?
 set -e
 test "$one_status" -ne 0
-PGPASSWORD=wyrd_migrator_pw psql "$two_url" -Atqc 'SELECT 1' | grep -qx 1
+PGPASSWORD=wyrd_test_admin_pw psql "$two_url" -Atqc 'SELECT 1' | grep -qx 1
 kill "$two_pid"
 set +e
 wait "$two_pid"

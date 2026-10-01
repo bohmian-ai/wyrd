@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use iceberg::spec::DataContentType;
+use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
 use vala_bifrost_redux::forge::{ForgeClock, ForgeError, ForgeObjectStore, ForgeUnsettledOutput};
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
@@ -232,7 +233,7 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
     );
     for path in &paths {
         assert!(
-            path.contains("/data/forge/v1/"),
+            path.contains(&format!("/data/forge/{FORGE_WRITER_RECIPE}/")),
             "a produced object carries the current writer recipe: {path}"
         );
         assert!(

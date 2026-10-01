@@ -1,0 +1,52 @@
+# Bounded read traffic for the autoscaling journey. Every second it starts
+# RATE small successful reads against the Oracle Service, never more than
+# MAX_INFLIGHT at once, and stops after DURATION_SECONDS. The Job deadline and
+# per-request timeout are hard backstops, and the script deletes the Job as
+# soon as the scale-up is observed or the journey fails.
+apiVersion: batch/v1
+kind: Job
+metadata: {name: wyrd-read-load, namespace: wyrd-kind}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load
+          image: curlimages/curl@sha256:83a505ba2ba62f208ed6e410c268b7b9aa48f0f7b403c8108b9773b44199dbba
+          env:
+            - {name: RATE, value: "14"}
+            - {name: MAX_INFLIGHT, value: "8"}
+            - {name: DURATION_SECONDS, value: "240"}
+            - name: TOKEN
+              valueFrom: {secretKeyRef: {name: wyrd-load, key: token}}
+            - name: BODY
+              valueFrom: {secretKeyRef: {name: wyrd-load, key: body}}
+          command:
+            - sh
+            - -c
+            - |
+              read_once() {
+                curl -sS -o /dev/null --max-time 5 -X POST \
+                  -H "x-wyrd-access-token: Bearer $TOKEN" -H 'content-type: application/json' \
+                  -d "$BODY" http://wyrd-oracle.wyrd-kind.svc:8080/v1/query || true
+              }
+              end=$(( $(date +%s) + DURATION_SECONDS ))
+              while [ "$(date +%s)" -lt "$end" ]; do
+                i=0
+                while [ "$i" -lt "$RATE" ]; do
+                  # Count in this shell: `$(jobs)` and a backgrounded `&&` list
+                  # run in a subshell that sees no jobs. The bare `jobs` reaps
+                  # finished reads so they stop holding a slot.
+                  jobs >/dev/null
+                  jobs -p >/tmp/inflight
+                  if [ "$(wc -l </tmp/inflight)" -lt "$MAX_INFLIGHT" ]; then read_once & fi
+                  i=$((i + 1))
+                  sleep 0.07
+                done
+              done
+              wait
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 500m, memory: 128Mi}

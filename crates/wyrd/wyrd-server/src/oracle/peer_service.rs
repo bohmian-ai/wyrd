@@ -1,12 +1,19 @@
-//! Authenticated generated-tonic adapter for private Oracle peer execution.
+//! Generated-tonic adapter for private Oracle peer execution.
+//!
+//! Mounted only on the mTLS peer listener, which admits cluster members by
+//! certificate. Each handler checks its typed context against this receiver's
+//! own identity, fence, clock, and received bytes before any decode or IO.
 
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use datafusion::error::DataFusionError;
 use futures_util::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::dispatcher::{
-    AttemptEncoder, DispatchError, EligibleSourceLossCause, PEER_PROTOCOL_VERSION, WorkerExecution,
+    AttemptEncoder, DispatchError, EligibleSourceLossCause, LiveFrame, NativeOutputTally,
+    OraclePeerTransport, PEER_PROTOCOL_VERSION, WorkerAttemptStream,
 };
 use vala_bifrost_redux::oracle::follower::{
     AuthenticatedFollowerContext, FollowerResolutionError, PhysicalPlanFollowerError,
@@ -28,12 +35,19 @@ use wyrd_tonic::wyrd::v1::{
     self as proto, ForwardQueryRequest, ReleaseNodeSlotsRequest, ReserveNodeSlotsRequest,
 };
 
-use crate::state::Bifrost;
+use crate::state::{Bifrost, Scribe};
 
 /// Private tonic service retaining one fenced worker runtime.
 pub struct OraclePeerGrpc {
     /// One published Bifrost facade owning every selectable peer capability.
     bifrost: Arc<Bifrost>,
+    /// The server's shutdown token; cancelling it ends open fragment streams.
+    ///
+    /// Graceful serving waits for in-flight streams, and a paused or slow
+    /// reader would otherwise hold a stopping pod's fragment open until the
+    /// leader's deadline. Ending it as unavailable lets the leader fail or
+    /// degrade the read at once, as it would for a pod that died.
+    shutdown: CancellationToken,
 }
 
 /// One fault a test-tier journey injects into the next Scribe fragment.
@@ -93,9 +107,12 @@ fn start_scribe_attempt(
 
 impl OraclePeerGrpc {
     /// Creates the adapter around the retained worker runtime.
+    ///
+    /// `shutdown` is the server's shutdown token: once cancelled, every open
+    /// fragment stream this adapter serves ends as unavailable.
     #[must_use]
-    pub const fn new(bifrost: Arc<Bifrost>) -> Self {
-        Self { bifrost }
+    pub const fn new(bifrost: Arc<Bifrost>, shutdown: CancellationToken) -> Self {
+        Self { bifrost, shutdown }
     }
 
     /// Returns the generated tonic server wrapper.
@@ -130,8 +147,8 @@ impl OraclePeerGrpc {
 
     /// Authorizes one reservation operation before any capacity state changes.
     ///
-    /// The ticket is detached from the request first, so the digest is taken
-    /// over exactly the encoding the leader signed: the request with its ticket
+    /// The context is detached from the request first, so the digest is taken
+    /// over exactly the encoding the leader bound: the request with its context
     /// field cleared. Everything the follower compares against — its own node
     /// identity, its own current fence, the leader identity the cluster
     /// confirmed live — is derived here rather than read from the message.
@@ -139,15 +156,15 @@ impl OraclePeerGrpc {
     /// # Errors
     ///
     /// Returns `FailedPrecondition` when no Oracle role owns this node's
-    /// reservation authority, `Unauthenticated` when no ticket is presented,
-    /// and `PermissionDenied` for a ticket that is malformed, misbound,
-    /// expired, or replayed. The refusal is durably audited before it returns;
+    /// reservation authority, `Unauthenticated` when no context is presented,
+    /// and `PermissionDenied` for a context that is malformed, misbound,
+    /// or expired. The refusal is durably audited before it returns;
     /// an audit that cannot commit surfaces as `Unavailable`.
     async fn authorize_reservation<T: Message>(
         &self,
         operation: ReservationOperationV1,
-        ticket_free: &T,
-        ticket: Option<proto::SignedPeerTicket>,
+        context_free: &T,
+        context: Option<proto::PeerContext>,
         leader_node_id: wyrd_spec::vala::api::NodeId,
         leader_fence: u64,
         query_id: uuid::Uuid,
@@ -156,15 +173,16 @@ impl OraclePeerGrpc {
             .bifrost
             .oracle()
             .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?;
-        let Some(ticket) = ticket else {
+        let Some(context) = context else {
             self.audit_denial(BifrostSecurityViolationKind::PeerSignature)
                 .await?;
             return Err(Status::unauthenticated(
-                "Bifrost peer reservation ticket is absent",
+                "Bifrost peer reservation context is absent",
             ));
         };
-        let ticket = wyrd_spec::vala::api::SignedPeerTicket::try_from(ticket)
-            .map_err(|_| Status::permission_denied("Bifrost peer reservation ticket is invalid"))?;
+        let context = wyrd_spec::vala::api::PeerContext::try_from(context).map_err(|_| {
+            Status::permission_denied("Bifrost peer reservation context is invalid")
+        })?;
         let registered = oracle.registered_role();
         let binding = ReservationBinding {
             operation,
@@ -178,9 +196,9 @@ impl OraclePeerGrpc {
             .peer()
             .authority()
             .verify_reservation(
-                &ticket,
+                &context,
                 &binding,
-                &ticket_free.encode_to_vec(),
+                &context_free.encode_to_vec(),
                 chrono::Utc::now(),
             )
             .await
@@ -192,16 +210,43 @@ impl OraclePeerGrpc {
                 _ => Status::permission_denied("Bifrost peer reservation is not authorized"),
             })
     }
+}
+
+/// In-process executor for fragments that target this process's own Scribe.
+///
+/// The private gRPC service and this process's own Oracle both run Scribe
+/// fragments through it, so the fence, context, and claims checks exist once.
+/// It yields Arrow batches and an in-process completion; only the gRPC
+/// service encodes them into attempt frames for a remote leader.
+pub struct ScribeFragmentExecutor {
+    /// Local Scribe owner whose fence, verifier, and resources serve fragments.
+    scribe: Arc<Scribe>,
+}
+
+impl ScribeFragmentExecutor {
+    /// Creates the executor over this process's Scribe owner.
+    #[must_use]
+    pub fn new(scribe: Arc<Scribe>) -> Self {
+        Self { scribe }
+    }
 
     /// Executes one Scribe-targeted physical fragment under Scribe's own fence and resources.
-    async fn execute_scribe_fragment(
+    ///
+    /// Checks the target fence, verifies the typed peer context, validates
+    /// its claims and assignment-authority digest against the request, then
+    /// charges a follower lease and returns the result schema with a stream
+    /// of the result batches, closed by one [`LiveFrame::Complete`] carrying
+    /// the authenticated plan fingerprint, the delivered row and native byte
+    /// totals, and the follower's scan evidence.
+    ///
+    /// # Errors
+    /// Returns [`DispatchError::Terminal`] for a fence, context, claims, or
+    /// preflight mismatch, and the follower's start classification otherwise.
+    pub async fn execute(
         &self,
         request: ExecuteFragmentRequest,
-    ) -> Result<WorkerExecution, DispatchError> {
-        let scribe = self.bifrost.scribe().ok_or_else(|| {
-            tracing::error!("Scribe fragment reached a process without the Scribe owner");
-            DispatchError::Terminal
-        })?;
+    ) -> Result<(SchemaRef, WorkerAttemptStream), DispatchError> {
+        let scribe = &self.scribe;
         let local_role = scribe.scribe_registered_role();
         if request.target_fence.role != ClusterRole::Scribe
             || request.target_fence.node_id != local_role.key.node_id
@@ -236,26 +281,25 @@ impl OraclePeerGrpc {
         let verifier: Arc<dyn PeerTicketVerifier> = scribe.fragment_verifier();
         let verified = verifier
             .verify_peer_ticket(
-                &request.ticket,
+                &request.context,
                 local_role.key.node_id,
                 local_role.fencing_token,
                 chrono::Utc::now(),
             )
             .await
             .map_err(|error| {
-                tracing::error!(?error, "Scribe peer ticket verification failed");
+                tracing::error!(?error, "Scribe peer context verification failed");
                 DispatchError::Terminal
             })?;
         let claims = PeerTicketClaims::decode(verified.0.as_slice()).map_err(|error| {
-            tracing::error!(?error, "Scribe peer ticket claims decode failed");
+            tracing::error!(?error, "Scribe peer context claims decode failed");
             DispatchError::Terminal
         })?;
         let tenant_id = uuid::Uuid::from_slice(&claims.tenant_id)
             .ok()
             .and_then(|tenant| wyrd_spec::DataTenantId::new(tenant).ok())
             .ok_or(DispatchError::Terminal)?;
-        let query_id =
-            uuid::Uuid::from_slice(&claims.query_id).map_err(|_| DispatchError::Terminal)?;
+        uuid::Uuid::from_slice(&claims.query_id).map_err(|_| DispatchError::Terminal)?;
         if claims.protocol_version != PEER_PROTOCOL_VERSION
             || claims.leader_node_id.as_slice() != request.leader_fence.node_id.as_uuid().as_bytes()
             || claims.leader_fence != request.leader_fence.fencing_token
@@ -277,10 +321,9 @@ impl OraclePeerGrpc {
             tracing::error!("Scribe peer physical claims validation failed");
             return Err(DispatchError::Terminal);
         }
-        // Recomputed last, before any provider or tail I/O: a valid
-        // signature only proves the claims were not tampered with in
-        // transit, not that the signed closed-predicate/projection closure
-        // matches what this Scribe worker actually received.
+        // Recomputed last, before any provider or tail I/O: the context names
+        // the closed-predicate/projection closure the leader intended, and
+        // this proves it matches what this Scribe worker actually received.
         match vala_bifrost_redux::oracle::peer::assignment_authority_digest_for(
             &request.assignments,
         ) {
@@ -306,26 +349,20 @@ impl OraclePeerGrpc {
             tracing::error!(?error, "Scribe physical follower rejected the request");
             DispatchError::Terminal
         })?;
-        let request_id = wyrd_spec::request_id::RequestId::parse(&query_id.to_string())
-            .map_err(|_| DispatchError::Terminal)?;
-        let lease = scribe
+        // The Scribe follower runs the local partition count its own pod plan
+        // derives, under its pool ceiling. Bytes are charged only as it grows.
+        // It never spills: a Scribe node owns no governed Oracle spill
+        // directory.
+        let follower = scribe
             .resources()
-            .try_acquire_follower(
-                &request_id,
-                vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
-            )
-            .map_err(|_| DispatchError::Capacity)?;
-        // The Scribe follower is shaped by the lease this node just charged:
-        // one partition, because a hot-tail fragment is a single sequential
-        // cut, and the batch size the granted bytes support.
-        let sessions = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
-            lease.memory_pool(),
-            lease.memory_bytes(),
-            1,
-        );
+            .follower_execution(vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES)
+            .map_err(|error| {
+                tracing::error!(%error, "Scribe follower execution could not be built");
+                DispatchError::Terminal
+            })?;
         let execution = scribe
             .fragment_follower()
-            .execute(&request, authenticated, &sessions)
+            .execute(&request, authenticated, &follower)
             .await
             .map_err(|error| {
                 tracing::warn!(?error, "Scribe physical follower could not start");
@@ -334,22 +371,12 @@ impl OraclePeerGrpc {
         scribe.record_fragment_execution();
         // Split now, finalize after drain: the scan counters are written during
         // execution, and the leader has no physical scan of its own to report.
-        let (mut batches, scan_evidence, reader_protection) = execution.split();
-        let plan_fingerprint = request.plan_fingerprint;
+        let (mut batches, scan_evidence) = execution.split();
+        let schema = batches.schema();
         let scribe_owner = Arc::clone(scribe);
-        let output = async_stream::stream! {
-            let _lease = lease;
-            // Retained through the whole attempt so a Scribe fragment that
-            // happens to name a snapshot keeps it protected until it is done.
-            let _reader_protection = reader_protection;
-            let mut encoder = AttemptEncoder::default();
-            match start_scribe_attempt(&mut encoder, batches.schema()) {
-                Ok(schema) => yield Ok(schema),
-                Err(_) => {
-                    yield Err(DispatchError::Terminal);
-                    return;
-                }
-            }
+        let plan_fingerprint = request.plan_fingerprint;
+        let output = async_stream::try_stream! {
+            let mut tally = NativeOutputTally::default();
             while let Some(batch) = batches.next().await {
                 let batch = batch.map_err(|error| {
                     // The classification below keeps only a closed outcome, so
@@ -360,53 +387,63 @@ impl OraclePeerGrpc {
                     tracing::warn!(?error, "Scribe follower execution stream failed");
                     scribe_stream_error(&error)
                 })?;
-                let (schema, batch) = encoder.encode(&batch).map_err(|_| DispatchError::Terminal)?;
-                if let Some(schema) = schema {
-                    yield Ok(schema);
-                }
-                yield Ok(batch);
+                tally.record(&batch)?;
+                yield LiveFrame::Batch(batch);
                 #[cfg(feature = "test-support")]
                 if fault == Some(ScribeFragmentFault::UnavailableAfterFirstBatch) {
-                    yield Err(DispatchError::Unavailable);
-                    return;
+                    Err(DispatchError::Unavailable)?;
                 }
             }
             #[cfg(feature = "test-support")]
             if fault == Some(ScribeFragmentFault::OmitFooter) {
                 return;
             }
-            let footer = encoder
-                .finish_physical(&plan_fingerprint, scan_evidence.finalize())
-                .map_err(|_| DispatchError::Terminal);
-            if footer.is_ok() {
-                scribe_owner.record_fragment_footer();
-            }
-            yield footer;
+            scribe_owner.record_fragment_footer();
+            yield tally.complete(plan_fingerprint, scan_evidence.finalize());
         };
-        Ok(WorkerExecution {
-            stream: Box::pin(output),
-        })
+        Ok((schema, Box::pin(output)))
     }
 }
 
-/// Reads the peer identity the authentication layer established for a request.
-///
-/// The layer runs before the body is polled, so an admitted handler always
-/// finds this present. Its absence means the service was mounted outside the
-/// peer boundary, which is refused rather than reconstructed here: a handler
-/// that could rebuild identity from metadata would be a second authentication
-/// path, and the plane is required to have exactly one.
-///
-/// # Errors
-///
-/// Returns `Unauthenticated` when no context is attached.
-fn peer_context<T>(
-    request: &Request<T>,
-) -> Result<&vala_bifrost_redux::oracle::peer::AuthenticatedPeerContext, Status> {
-    request
-        .extensions()
-        .get::<vala_bifrost_redux::oracle::peer::AuthenticatedPeerContext>()
-        .ok_or_else(|| Status::unauthenticated("Bifrost peer identity is absent"))
+#[async_trait::async_trait]
+impl OraclePeerTransport for ScribeFragmentExecutor {
+    /// Scribe fragments are never reserved; the leader skips reservation.
+    ///
+    /// # Errors
+    /// Always returns [`DispatchError::Terminal`].
+    async fn reserve(
+        &self,
+        _worker: wyrd_spec::vala::api::NodeId,
+        _request: wyrd_spec::vala::api::ReserveNodeSlotsRequest,
+    ) -> Result<wyrd_spec::vala::api::ReserveNodeSlotsResponse, DispatchError> {
+        Err(DispatchError::Terminal)
+    }
+
+    /// Nothing is reserved, so release is a no-op.
+    ///
+    /// # Errors
+    /// Never fails.
+    async fn release(
+        &self,
+        _worker: wyrd_spec::vala::api::NodeId,
+        _request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
+    ) -> Result<(), DispatchError> {
+        Ok(())
+    }
+
+    /// Executes the fragment in-process through [`Self::execute`].
+    ///
+    /// # Errors
+    /// Returns the same failures as [`Self::execute`].
+    async fn execute(
+        &self,
+        _worker: wyrd_spec::vala::api::NodeId,
+        request: ExecuteFragmentRequest,
+    ) -> Result<WorkerAttemptStream, DispatchError> {
+        ScribeFragmentExecutor::execute(self, request)
+            .await
+            .map(|(_, stream)| stream)
+    }
 }
 
 #[wyrd_tonic::tonic::async_trait]
@@ -414,23 +451,22 @@ impl OraclePeerService for OraclePeerGrpc {
     /// Worker attempt stream retaining the running slot until EOF or cancellation.
     type ExecuteFragmentStream =
         Pin<Box<dyn Stream<Item = Result<proto::WorkerAttemptFrame, Status>> + Send>>;
-    /// Authenticated public-query frames proxied from the selected local Oracle.
+    /// Public-query frames proxied from the selected local Oracle.
     type ForwardQueryStream = crate::grpc::query::QueryGrpcStream;
 
-    /// Reserves one bounded pending slot after workload authentication.
+    /// Reserves one bounded pending slot after its context is checked.
     ///
     /// # Errors
-    /// Returns an authentication, conversion, or worker rejection status.
+    /// Returns a context, conversion, or worker rejection status.
     async fn reserve_slots(
         &self,
         request: Request<ReserveNodeSlotsRequest>,
     ) -> Result<Response<proto::ReserveNodeSlotsResponse>, Status> {
-        peer_context(&request)?;
         let mut wire = request.into_inner();
-        let ticket = wire.ticket.take();
+        let context = wire.context.take();
         let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(wire.clone())
             .map_err(conversion_status)?;
-        // Fence liveness first, then the purpose ticket, and only then any
+        // Fence liveness first, then the typed context, and only then any
         // capacity change: an unauthorized reserve must not charge the
         // follower even transiently.
         if self
@@ -449,7 +485,7 @@ impl OraclePeerService for OraclePeerGrpc {
         self.authorize_reservation(
             ReservationOperationV1::ReserveSlots,
             &wire,
-            ticket,
+            context,
             request.leader_node_id,
             request.leader_fencing_token,
             request.query_id.as_uuid(),
@@ -460,20 +496,19 @@ impl OraclePeerService for OraclePeerGrpc {
             .oracle_peer_service()
             .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?
             .worker();
-        Ok(Response::new(worker.reserve(&request).await.into()))
+        Ok(Response::new(worker.reserve(&request).into()))
     }
 
-    /// Releases one matching reservation idempotently after workload authentication.
+    /// Releases one matching reservation idempotently after its context is checked.
     ///
     /// # Errors
-    /// Returns an authentication or conversion status.
+    /// Returns a context or conversion status.
     async fn release_slots(
         &self,
         request: Request<ReleaseNodeSlotsRequest>,
     ) -> Result<Response<proto::ReleaseNodeSlotsResponse>, Status> {
-        peer_context(&request)?;
         let mut wire = request.into_inner();
-        let ticket = wire.ticket.take();
+        let context = wire.context.take();
         let request = wyrd_spec::vala::api::ReleaseNodeSlotsRequest::try_from(wire.clone())
             .map_err(conversion_status)?;
         // A release is state-changing, so it is authorized on exactly the same
@@ -482,7 +517,7 @@ impl OraclePeerService for OraclePeerGrpc {
         self.authorize_reservation(
             ReservationOperationV1::ReleaseSlots,
             &wire,
-            ticket,
+            context,
             request.leader_node_id,
             request.leader_fencing_token,
             request.query_id.as_uuid(),
@@ -496,52 +531,94 @@ impl OraclePeerService for OraclePeerGrpc {
         Ok(Response::new(proto::ReleaseNodeSlotsResponse {}))
     }
 
-    /// Executes verified immutable work and streams a footer-terminated attempt.
+    /// Executes one verified Scribe fragment and streams a footer-terminated attempt.
+    ///
+    /// Only Scribe owns fragment work: Oracle peers exchange Analytical stages,
+    /// so an Oracle-target fragment is refused before any decode. The
+    /// executor's batches are encoded here, and only here, into Arrow IPC
+    /// attempt frames: the schema first, each batch in order, then the footer
+    /// built from the in-process completion. Server shutdown ends an open
+    /// stream with an unavailable status instead of waiting for its reader.
     ///
     /// # Errors
-    /// Returns an authentication, conversion, security, or execution status.
+    /// Returns a conversion, security, or execution status, and a
+    /// permission-denied status for an Oracle-target fragment.
     async fn execute_fragment(
         &self,
         request: Request<proto::ExecuteFragmentRequest>,
     ) -> Result<Response<Self::ExecuteFragmentStream>, Status> {
-        peer_context(&request)?;
         let request =
             ExecuteFragmentRequest::try_from(request.into_inner()).map_err(conversion_status)?;
-        let WorkerExecution { mut stream } = match request.target_fence.role {
-            ClusterRole::Oracle => match self.bifrost.oracle_peer_service() {
-                Some(peer) => peer.worker().execute(request).await,
-                None => Err(DispatchError::Terminal),
+        let plan_fingerprint = request.plan_fingerprint.clone();
+        let (schema, mut stream) = match request.target_fence.role {
+            // Oracle peers exchange Analytical stages, never fragments.
+            ClusterRole::Oracle => {
+                tracing::warn!("Oracle-target fragment refused: Oracle peers run no fragments");
+                Err(DispatchError::Terminal)
+            }
+            ClusterRole::Scribe => match self.bifrost.scribe() {
+                Some(scribe) => {
+                    ScribeFragmentExecutor::new(Arc::clone(scribe))
+                        .execute(request)
+                        .await
+                }
+                None => {
+                    tracing::error!("Scribe fragment reached a process without the Scribe owner");
+                    Err(DispatchError::Terminal)
+                }
             },
-            ClusterRole::Scribe => self.execute_scribe_fragment(request).await,
         }
         .map_err(dispatch_status)?;
-        let output = async_stream::stream! {
-            while let Some(frame) = stream.next().await {
-                yield frame.map(Into::into).map_err(dispatch_status);
+        let shutdown = self.shutdown.clone();
+        let output = async_stream::try_stream! {
+            let mut encoder = AttemptEncoder::default();
+            yield start_scribe_attempt(&mut encoder, schema).map_err(dispatch_status)?.into();
+            loop {
+                let next = tokio::select! {
+                    () = shutdown.cancelled() => None,
+                    frame = stream.next() => Some(frame),
+                };
+                let frame = next.ok_or_else(|| dispatch_status(DispatchError::Unavailable))?;
+                let Some(frame) = frame else { break };
+                match frame.map_err(dispatch_status)? {
+                    LiveFrame::Batch(batch) => {
+                        let (schema, batch) = encoder
+                            .encode(&batch)
+                            .map_err(|_| dispatch_status(DispatchError::Terminal))?;
+                        if let Some(schema) = schema {
+                            yield schema.into();
+                        }
+                        yield batch.into();
+                    }
+                    LiveFrame::Complete(completion) => {
+                        yield encoder
+                            .finish_physical(&plan_fingerprint, completion.scan_stats)
+                            .map_err(|_| dispatch_status(DispatchError::Terminal))?
+                            .into();
+                        return;
+                    }
+                    LiveFrame::Wire(_) => Err(dispatch_status(DispatchError::Terminal))?,
+                }
             }
         };
         Ok(Response::new(Box::pin(output)))
     }
 
-    /// Verifies one authenticated forwarding envelope and executes its exact local leader cut.
+    /// Checks one forwarding context and executes its exact local leader cut.
     ///
     /// # Errors
-    /// Returns authentication, signature, policy, fence, deadline, or query status before a
+    /// Returns context, policy, fence, deadline, or query status before a
     /// response stream is published.
     async fn forward_query(
         &self,
         request: Request<ForwardQueryRequest>,
     ) -> Result<Response<Self::ForwardQueryStream>, Status> {
-        peer_context(&request)?;
-        let envelope = request
+        let context = request
             .into_inner()
-            .envelope
-            .ok_or_else(|| Status::invalid_argument("forwarding envelope is required"))?;
-        let ticket = wyrd_spec::vala::api::SignedPeerTicket {
-            key_id: envelope.key_id,
-            claims_bytes: envelope.claims_bytes,
-            signature: envelope.signature,
-        };
+            .context
+            .ok_or_else(|| Status::invalid_argument("forwarding context is required"))?;
+        let context = wyrd_spec::vala::api::PeerContext::try_from(context)
+            .map_err(|_| Status::invalid_argument("forwarding context is invalid"))?;
         self.bifrost
             .gate()
             .ensure_query_open()
@@ -554,7 +631,7 @@ impl OraclePeerService for OraclePeerGrpc {
         #[cfg(feature = "test-support")]
         forwarder.silent_peer_for_test().hold_if_armed().await;
         let stream = forwarder
-            .accept(ticket)
+            .accept(context)
             .await
             .map_err(|error| crate::grpc::query::query_status(error.into()))?;
         Ok(crate::grpc::query::query_stream_response(stream))
@@ -569,7 +646,6 @@ fn conversion_status(error: PrivateConversionError) -> Status {
 /// Maps peer pressure, retryable failures, and terminal contract failures separately.
 fn dispatch_status(error: DispatchError) -> Status {
     match error {
-        DispatchError::Partial { .. } => Status::deadline_exceeded(error.to_string()),
         DispatchError::Unavailable => Status::unavailable(error.to_string()),
         DispatchError::EligibleSourceLoss { .. } => Status::failed_precondition(error.to_string()),
         DispatchError::Capacity => Status::resource_exhausted(error.to_string()),
@@ -586,9 +662,9 @@ fn dispatch_status(error: DispatchError) -> Status {
 /// Maps a Scribe follower failure before its stream exists to its dispatch outcome.
 ///
 /// Only a source gone from this incarnation is live-source loss, which the
-/// leader may degrade before rows. A local bound refusal is capacity. Schema,
-/// projection, predicate, integrity, preflight, decode, and local execution
-/// faults are terminal and fail the query.
+/// leader may degrade before rows. Schema, projection, predicate, integrity,
+/// preflight, decode, and local execution faults are terminal and fail the
+/// query.
 fn scribe_start_error(error: &PhysicalPlanFollowerError) -> DispatchError {
     match error {
         PhysicalPlanFollowerError::Resolution(FollowerResolutionError::SourceLoss(_)) => {
@@ -596,14 +672,10 @@ fn scribe_start_error(error: &PhysicalPlanFollowerError) -> DispatchError {
                 cause: EligibleSourceLossCause::ProviderResolution,
             }
         }
-        PhysicalPlanFollowerError::Resolution(FollowerResolutionError::Capacity(_)) => {
-            DispatchError::Capacity
-        }
         PhysicalPlanFollowerError::Resolution(FollowerResolutionError::Fault(_))
         | PhysicalPlanFollowerError::Execution(_)
         | PhysicalPlanFollowerError::Preflight(_)
-        | PhysicalPlanFollowerError::PostResolutionDecode(_)
-        | PhysicalPlanFollowerError::AuthorityAlreadyInstalled => DispatchError::Terminal,
+        | PhysicalPlanFollowerError::PostResolutionDecode(_) => DispatchError::Terminal,
     }
 }
 
@@ -626,13 +698,11 @@ fn scribe_stream_error(error: &DataFusionError) -> DispatchError {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use vala_bifrost_redux::oracle::attempt::AttemptBuffer;
 
     /// Only source loss degrades a Scribe fragment; every other cause fails.
     ///
     /// Resolution classes decided at the Scribe open survive to the dispatch
-    /// outcome: a changed incarnation is eligible source loss, a bounded
-    /// snapshot refusal is capacity, and a schema, projection, or local
+    /// outcome: a changed incarnation is eligible source loss, and a schema, projection, or local
     /// execution fault is terminal. A failure inside the open local stream is
     /// terminal rather than unavailable.
     ///
@@ -645,10 +715,6 @@ mod tests {
         assert!(matches!(
             resolution(FollowerResolutionError::SourceLoss("gone".to_owned())),
             DispatchError::EligibleSourceLoss { .. }
-        ));
-        assert!(matches!(
-            resolution(FollowerResolutionError::Capacity("bound".to_owned())),
-            DispatchError::Capacity
         ));
         assert!(matches!(
             resolution(FollowerResolutionError::Fault("schema".to_owned())),
@@ -664,50 +730,6 @@ mod tests {
         ));
     }
 
-    /// The Scribe follower session is shaped by the lease this node charged.
-    ///
-    /// A hot-tail fragment runs under the Scribe follower lease acquired above,
-    /// so its session comes from that lease's granted bytes and the single
-    /// partition a sequential cut offers — never from a fixed batch size or a
-    /// value the leader supplied in the request.
-    #[test]
-    fn scribe_follower_session_shape_contract() {
-        let granted = vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES;
-        let sessions = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
-            std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                granted,
-            )),
-            granted,
-            1,
-        );
-        let expected = vala_bifrost_redux::resources::OracleSessionShape::for_grant(granted, 1, 1);
-
-        assert_eq!(sessions.shape(1), expected);
-        assert_eq!(
-            expected.target_partitions,
-            vala_bifrost_redux::resources::oracle_partitions_for_work(1, 1),
-            "a hot-tail cut is one sequential scan target under the shared floor"
-        );
-        assert_ne!(
-            expected.batch_size, 1_024,
-            "the removed fixed batch size is not the admitted shape"
-        );
-
-        let narrow = vala_bifrost_redux::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES;
-        let smaller = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
-            std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                narrow,
-            )),
-            narrow,
-            1,
-        );
-        assert_ne!(
-            smaller.shape(1).batch_size,
-            expected.batch_size,
-            "a smaller lease produces a smaller batch size"
-        );
-    }
-
     /// Proves the private tonic boundary preserves only stale-object failures as not-found.
     #[test]
     fn stale_object_dispatch_status_is_not_found() {
@@ -718,7 +740,7 @@ mod tests {
         assert_eq!(outage.code(), wyrd_tonic::tonic::Code::Unavailable);
     }
 
-    /// An explicit-empty Scribe result still emits schema then a validated complete footer.
+    /// An explicit-empty Scribe result still emits schema then a complete zero-row footer.
     #[test]
     fn empty_scribe_attempt_emits_schema_and_complete_footer() {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -743,12 +765,5 @@ mod tests {
             wyrd_spec::vala::api::WorkerAttemptFrame::Footer(footer)
                 if footer.completed && footer.row_count == 0
         ));
-
-        let mut attempt = AttemptBuffer::new(16 * 1_024);
-        attempt.push(schema_frame).expect("schema is first");
-        attempt.push(footer_frame).expect("footer is last");
-        let validated = attempt.finish().expect("zero-row footer validates");
-        assert_eq!(validated.footer.row_count, 0);
-        assert_eq!(validated.batches.count(), 0);
     }
 }

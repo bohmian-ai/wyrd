@@ -38,8 +38,6 @@ pub struct StorageSettings {
     pub part_size_bytes: u64,
     /// Object size at or above which cloud backends switch to multipart upload.
     pub multipart_threshold_bytes: u64,
-    /// Public server base URL used by local-mode routes.
-    pub public_base_url: Option<String>,
 }
 
 /// Backend-specific storage configuration.
@@ -217,21 +215,12 @@ pub fn from_env() -> Result<StorageSettings, StorageError> {
         crate::plan::MAX_OBJECT_SIZE_BYTES,
     )?;
 
-    let public_base_url = env_optional("WYRD_PUBLIC_BASE_URL")?;
-    if matches!(backend, BackendConfig::Local { .. }) && public_base_url.is_none() {
-        return config_err(
-            "WYRD_PUBLIC_BASE_URL",
-            ConfigParseError::MissingEnv(std::env::VarError::NotPresent),
-        );
-    }
-
     Ok(StorageSettings {
         backend,
         require_encryption,
         presign_ttl: Duration::from_secs(u64::from(presign_ttl_secs)),
         part_size_bytes,
         multipart_threshold_bytes,
-        public_base_url,
     })
 }
 
@@ -360,7 +349,6 @@ mod tests {
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_APPLICATION_CREDENTIALS_JSON",
         "GOOGLE_ACCOUNT_JSON_BASE64",
-        "WYRD_PUBLIC_BASE_URL",
     ];
 
     /// Every accepted storage URL maps to its backend, and every forbidden
@@ -462,10 +450,6 @@ mod tests {
                 u64::from(DEFAULT_PRESIGN_TTL_SECS)
             );
             assert_eq!(settings.part_size_bytes, DEFAULT_PART_SIZE_BYTES);
-            assert_eq!(
-                settings.public_base_url.as_deref(),
-                Some("https://wyrd.test")
-            );
         });
     }
 
@@ -562,19 +546,6 @@ mod tests {
         });
     }
 
-    /// Local storage needs a public base URL for its download routes.
-    #[test]
-    fn local_requires_public_base_url() {
-        let root = tempfile::tempdir().expect("temp dir");
-        with_clean_env(
-            vec![("WYRD_STORAGE_URL", Some(file_url(root.path())))],
-            || {
-                let err = from_env().expect_err("missing public base url");
-                assert_config_var(&err, "WYRD_PUBLIC_BASE_URL");
-            },
-        );
-    }
-
     /// A well-formed local URL whose root does not exist is an invalid path.
     #[test]
     fn rejects_nonexistent_local_root_with_exact_var() {
@@ -632,10 +603,7 @@ mod tests {
 
     /// Minimal environment for a local backend rooted at `root`.
     fn local_vars(root: &Path) -> Vec<(&'static str, Option<String>)> {
-        vec![
-            ("WYRD_STORAGE_URL", Some(file_url(root))),
-            ("WYRD_PUBLIC_BASE_URL", Some("https://wyrd.test".to_owned())),
-        ]
+        vec![("WYRD_STORAGE_URL", Some(file_url(root)))]
     }
 
     /// Run `f` with `vars` set and every other storage variable cleared.

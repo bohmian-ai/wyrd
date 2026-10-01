@@ -49,6 +49,8 @@ pub enum ProbeReason {
     Warmup,
     /// Scribe WAL recovery or downstream publication has not completed.
     ScribeRecovery,
+    /// The Scribe WAL faulted; the role is withdrawn until a restart replays it.
+    ScribeWalFaulted,
     /// Oracle role registration, coordination, or worker startup has not completed.
     OracleStartup,
     /// This target must serve the private Bifrost peer listener and does not.
@@ -80,6 +82,14 @@ pub struct ReadinessSnapshot {
     pub forge_worker: Option<ProbeOutcome>,
     /// Verification runtime readiness, present only when it was composed.
     pub verification: Option<ProbeOutcome>,
+    /// Whether a Scribe WAL fault is role-local rather than target-fatal.
+    ///
+    /// True when this target also serves Oracle or Forge, which stay available
+    /// while Scribe is withdrawn. The verification runtime does not count: it
+    /// is composed on every API target, including a Scribe-only one. Startup
+    /// recovery still gates every target, so replay finishes before ready.
+    #[serde(skip)]
+    pub scribe_fault_is_role_local: bool,
 }
 
 /// Per-dependency probe result.
@@ -127,15 +137,22 @@ impl ReadinessSnapshot {
             forge_coordinator: None,
             forge_worker: None,
             verification: None,
+            scribe_fault_is_role_local: false,
         }
     }
 
     /// True when all probes passed in the most recent tick.
+    ///
+    /// A Scribe WAL fault is excused only on a target that serves another
+    /// role; the body still reports Scribe unready.
     #[must_use]
     pub fn all_ok(&self) -> bool {
+        let scribe_ok = self.scribe.ok
+            || (self.scribe_fault_is_role_local
+                && self.scribe.reason == ProbeReason::ScribeWalFaulted);
         self.postgres.ok
             && self.storage.ok
-            && self.scribe.ok
+            && scribe_ok
             && self.oracle.ok
             && self.peer.ok
             && self.forge_coordinator.as_ref().is_none_or(|probe| probe.ok)
@@ -176,6 +193,8 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
         forge_coordinator: probe_forge_coordinator(state),
         forge_worker: probe_forge_worker(state),
         verification: probe_verification(state),
+        scribe_fault_is_role_local: state.bifrost.oracle().is_some()
+            || state.bifrost.forge().is_some(),
     }
 }
 
@@ -306,6 +325,11 @@ fn probe_scribe(state: &AppState) -> ProbeOutcome {
             reason: ProbeReason::Ok,
             elapsed_ms: 0,
         },
+        Some(runtime) if runtime.wal_faulted() => ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::ScribeWalFaulted,
+            elapsed_ms: 0,
+        },
         Some(_) => ProbeOutcome {
             ok: false,
             reason: ProbeReason::ScribeRecovery,
@@ -325,6 +349,12 @@ fn probe_scribe(state: &AppState) -> ProbeOutcome {
     outcome
 }
 
+/// Checks Postgres readiness by acquiring an app-pool connection and running
+/// `SELECT 1` within `probe_timeout`.
+///
+/// A failure is logged at `warn` with its class and the driver's full error
+/// text, so an operator can see why `/readyz` failed; the HTTP report carries
+/// only the coarse [`ProbeReason`].
 async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutcome {
     let started = std::time::Instant::now();
     let result = timeout(probe_timeout, async {
@@ -351,6 +381,7 @@ async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutco
             tracing::warn!(
                 reason = ?reason,
                 error_class = sqlx_error_class(&error),
+                error = %error,
                 elapsed_ms,
                 "readiness: postgres probe failed"
             );
@@ -394,6 +425,12 @@ fn sqlx_error_class(error: &sqlx::Error) -> &'static str {
     }
 }
 
+/// Checks object-storage readiness through the storage handle's health probe
+/// within `probe_timeout`.
+///
+/// A failure is logged at `warn` with its class and the backend's full error
+/// text, so an operator can see why `/readyz` failed; the HTTP report carries
+/// only the coarse [`ProbeReason`].
 async fn probe_storage(state: &AppState, probe_timeout: Duration) -> ProbeOutcome {
     let started = std::time::Instant::now();
     let result = timeout(probe_timeout, state.storage.health_probe()).await;
@@ -408,6 +445,7 @@ async fn probe_storage(state: &AppState, probe_timeout: Duration) -> ProbeOutcom
             tracing::warn!(
                 reason = ?ProbeReason::BackendError,
                 error_class = storage_health_error_class(&error),
+                error = %error,
                 elapsed_ms,
                 "readiness: storage probe failed"
             );
@@ -561,6 +599,7 @@ mod tests {
             forge_coordinator: None,
             forge_worker: None,
             verification: None,
+            scribe_fault_is_role_local: false,
         }
     }
 
@@ -594,6 +633,7 @@ mod tests {
             forge_coordinator: None,
             forge_worker: None,
             verification: None,
+            scribe_fault_is_role_local: false,
         }
     }
 
@@ -627,6 +667,22 @@ mod tests {
             reason: ProbeReason::ScribeRecovery,
             elapsed_ms: 0,
         };
+        assert!(!snapshot.all_ok());
+    }
+
+    /// A WAL fault fails only a Scribe-only target; startup recovery fails every target.
+    #[test]
+    fn scribe_wal_fault_is_role_local_on_combined_targets() {
+        let mut snapshot = all_ok_snapshot();
+        snapshot.scribe = ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::ScribeWalFaulted,
+            elapsed_ms: 0,
+        };
+        assert!(!snapshot.all_ok());
+        snapshot.scribe_fault_is_role_local = true;
+        assert!(snapshot.all_ok());
+        snapshot.scribe.reason = ProbeReason::ScribeRecovery;
         assert!(!snapshot.all_ok());
     }
 
@@ -682,5 +738,29 @@ mod pg_tests {
 
         let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
         assert!(result.is_ok(), "readiness_loop did not exit after cancel");
+    }
+
+    /// A Scribe-only target stays unready on a WAL fault even though the
+    /// verification runtime is composed on it: only Oracle or Forge make the
+    /// fault role-local.
+    #[tokio::test]
+    async fn scribe_only_wal_fault_is_unready_with_verification_composed() {
+        use crate::verification::health::RuntimeCapability;
+
+        let state = crate::test_support::test_app_state(
+            crate::test_support::test_server_postgres().await,
+            crate::test_support::test_storage().await,
+            crate::test_support::test_catalog().await,
+        );
+        state.verification.require(RuntimeCapability::Scheduler);
+
+        let mut snapshot = compute_snapshot(&state, Duration::from_millis(100)).await;
+        assert!(!snapshot.scribe_fault_is_role_local);
+        snapshot.scribe = ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::ScribeWalFaulted,
+            elapsed_ms: 0,
+        };
+        assert!(!snapshot.all_ok());
     }
 }

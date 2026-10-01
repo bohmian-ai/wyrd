@@ -811,6 +811,7 @@ impl BifrostStorageTelemetry {
     ///
     /// A poisoned totals lock yields the default view rather than unwinding: a
     /// lost observation must never fail the work being observed.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn snapshot(&self) -> MetadataCacheSnapshot {
         self.totals
             .lock()

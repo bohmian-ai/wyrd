@@ -6,8 +6,7 @@
 //! tests.
 
 use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    ArrayRef, FixedSizeBinaryBuilder, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -19,10 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::oracle::analytical::{
-    AnalyticalAttemptContext, AnalyticalLiveInspection, DataFusionQueryId, PublicQueryId,
-};
-use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties;
+use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
+use vala_bifrost_redux::parquet::footer::tenant_key_value;
+use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use vala_bifrost_redux::schema::with_managed_columns;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -124,19 +122,25 @@ pub(crate) async fn client_from_bootstrap(
 ///
 /// # Errors
 ///
-/// Returns the client configuration error.
+/// Returns a message when the pod serves no public listener, or the client
+/// configuration error.
 pub(crate) fn public_client(
-    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    node: &wyrd_testing::WyrdTestServer,
     api_key: &secrecy::SecretString,
 ) -> Result<WyrdClient, JourneyError> {
     Ok(WyrdClient::with_config(ClientConfig {
         grpc: GrpcConfig {
-            endpoint: format!("http://{}", node.grpc_addr()),
+            endpoint: node
+                .grpc_url()
+                .ok_or("the pod serves no public gRPC listener")?,
             connect_retries: 0,
             ..GrpcConfig::default()
         },
         http: HttpConfig {
-            base_url: format!("http://{}", node.http_addr()),
+            base_url: node
+                .base_url()
+                .ok_or("the pod serves no public HTTP listener")?
+                .to_owned(),
             ..HttpConfig::default()
         },
         credential: Some(api_key.clone()),
@@ -230,9 +234,11 @@ pub(crate) async fn writer_from_bootstrap(
     .await?)
 }
 
-/// Persist one foreign-tenant physical row beneath the production provider union.
+/// Persist one foreign-tenant physical file beneath the production provider union.
 ///
-/// The row is well formed in every respect except its tenancy, including the
+/// The file sits under `owner`'s prefix and file list but its footer records
+/// `foreign` as its tenant, the way a misrouted write would. It is well formed
+/// in every respect except that footer tenant, including the
 /// durable SHA-256 the Scribe file-list writer always publishes. That matters:
 /// the Oracle refuses a hot row whose checksum is not an identity before it
 /// signs a descriptor, so a checksumless row would fail closed for the wrong
@@ -271,12 +277,14 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_timezone("UTC")),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_001_i64]).with_timezone("UTC")),
             Arc::new(batch_ids.finish()),
-            Arc::new(Int32Array::from(vec![0])),
-            Arc::new(StringArray::from(vec![foreign.to_string()])),
         ],
     )?;
     let mut parquet = Vec::new();
-    let properties = bifrost_writer_properties(batch.num_rows(), &[]);
+    let properties = bifrost_writer_properties_with_metadata(
+        batch.num_rows(),
+        vec![tenant_key_value(foreign)],
+        &[],
+    );
     let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
     writer.write(&batch)?;
     writer.close()?;
@@ -348,8 +356,7 @@ pub(crate) async fn query_rows(client: &WyrdClient, table: &str) -> Result<u64, 
 }
 /// Builds one authenticated in-process query context for the fixture tenant.
 ///
-/// The public SDK cannot reach the inactive path, so the journey authenticates
-/// the same way the public query service does — a tenant-bound principal
+/// The journey drives Oracle in process, so it authenticates the same way the public query service does — a tenant-bound principal
 /// holding exactly `bifrost:query:read` — and hands Oracle the identical
 /// context its own gRPC surface would have built.
 pub(crate) fn query_context(
@@ -371,20 +378,6 @@ pub(crate) fn query_context(
         AuthMethod::Internal,
         permission,
     )?)
-}
-
-/// Allocates the per-query identities one inactive attempt is leased under.
-///
-/// The two query identities are allocated independently on purpose: a leaked
-/// public identity into the distributed graph, or the reverse, is exactly what
-/// the stage authority's identity isolation exists to refuse.
-pub(crate) fn attempt_context() -> AnalyticalAttemptContext {
-    AnalyticalAttemptContext {
-        public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
-        datafusion_query_id: DataFusionQueryId::from_uuid(uuid::Uuid::now_v7()),
-        snapshot_digest: format!("snapshot-{}", uuid::Uuid::now_v7().simple()),
-        permission_digest: format!("permission-{}", uuid::Uuid::now_v7().simple()),
-    }
 }
 
 /// Returns every Oracle node's live Analytical ownership, leader and follower
@@ -451,24 +444,19 @@ pub(crate) const ANALYTICAL_LEFT_ROWS: i64 = 400_000;
 /// Right-table rows in the qualified Analytical baseline workload.
 ///
 /// The join key range that actually matches, and therefore the result's row
-/// count. Sized so the output sort's input exceeds one Analytical grant.
+/// count.
 pub(crate) const ANALYTICAL_RIGHT_ROWS: i64 = 300_000;
 
 /// Digits the baseline query left-pads each id to.
 pub(crate) const ANALYTICAL_KEY_DIGITS: usize = 6;
 
-/// Filler characters appended to each key, making every key exactly 1 KiB.
-pub(crate) const ANALYTICAL_KEY_FILLER: usize = 1018;
-
 /// Builds the qualified Analytical baseline statement over two fixture tables.
 ///
-/// One equi-join, one fixed-width grouped aggregate, and one output sort over a
-/// key wide enough that the sort's input cannot fit an Analytical grant. Shared
-/// by the physical baseline and by the contention qualification that reuses the
-/// same admitted workload, so both are provably running one statement.
+/// One equi-join, one fixed-width grouped aggregate, and one output sort over
+/// the zero-padded id, so string order equals numeric order.
 pub(crate) fn analytical_baseline_sql(left: &str, right: &str) -> String {
     format!(
-        "SELECT LPAD(CAST(l.id AS VARCHAR), {ANALYTICAL_KEY_DIGITS}, '0') ||          REPEAT('x', {ANALYTICAL_KEY_FILLER}) AS filter_key, COUNT(*) AS matched          FROM vala.bifrost.{left} AS l          JOIN vala.bifrost.{right} AS r ON l.id = r.id          GROUP BY l.id ORDER BY filter_key"
+        "SELECT LPAD(CAST(l.id AS VARCHAR), {ANALYTICAL_KEY_DIGITS}, '0') AS filter_key, COUNT(*) AS matched          FROM vala.bifrost.{left} AS l          JOIN vala.bifrost.{right} AS r ON l.id = r.id          GROUP BY l.id ORDER BY filter_key"
     )
 }
 
@@ -480,10 +468,7 @@ pub(crate) fn analytical_baseline_sql(left: &str, right: &str) -> String {
 pub(crate) fn expected_analytical_digest() -> String {
     let mut digest = Sha256::new();
     for id in 0..ANALYTICAL_RIGHT_ROWS {
-        let key = format!(
-            "{id:0ANALYTICAL_KEY_DIGITS$}{filler}",
-            filler = "x".repeat(ANALYTICAL_KEY_FILLER)
-        );
+        let key = format!("{id:0ANALYTICAL_KEY_DIGITS$}");
         digest.update(u32::try_from(key.len()).unwrap_or(u32::MAX).to_le_bytes());
         digest.update(key.as_bytes());
         digest.update(1_i64.to_le_bytes());
@@ -684,19 +669,19 @@ pub(crate) const BASELINE_POLLS: usize = 50;
 ///
 /// # Errors
 ///
-/// Returns the control-protocol error, or a description of what the pod still
+/// Returns the ownership read failure, or a description of what the pod still
 /// retained when the bound expired.
 pub(crate) async fn await_baseline(
-    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    cluster: &crate::peer_cluster::PeerCluster,
     index: usize,
-    before: wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot,
+    before: crate::peer_cluster::OracleOwnershipSnapshot,
 ) -> Result<(), JourneyError> {
     for _ in 0..BASELINE_POLLS {
-        if cluster.nodes_mut()[index].ownership_snapshot()? == before {
+        if cluster.ownership_snapshot(index)? == before {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let after = cluster.nodes_mut()[index].ownership_snapshot()?;
+    let after = cluster.ownership_snapshot(index)?;
     Err(format!("pod {index} did not return to {before:?}, holds {after:?}").into())
 }

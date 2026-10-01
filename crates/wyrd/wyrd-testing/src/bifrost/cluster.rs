@@ -13,15 +13,11 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
-use vala_bifrost_redux::oracle::dispatcher::{
-    BifrostPeerTls, OraclePeerCredentials, TonicOraclePeerTransport,
-};
+use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
-#[cfg(test)]
-use wyrd_runtime::{Permission, PermissionSet};
 use wyrd_server::app::metrics::install_recorder;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_server::config::BifrostTarget;
@@ -34,7 +30,7 @@ use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
 use crate::bifrost::telemetry::BifrostTelemetryCapture;
 use crate::server::{
     OracleRuntimeInspection, TestBifrostPeerTls, WyrdTestServer, WyrdTestServerBuilder,
-    WyrdTestServerError, provision_oracle_peer_credentials, reserve_loopback_addr, test_catalog,
+    WyrdTestServerError, reserve_loopback_addr, test_catalog,
 };
 
 /// Supported role topology for a Bifrost cluster journey.
@@ -107,6 +103,10 @@ pub struct TestOracleResources {
     pub data_root_parent: Option<PathBuf>,
     /// Complete raw process observation retained across node restarts.
     pub system_resources: Option<SystemResourceSnapshot>,
+    /// Oracle query slot units the node admits with, replacing the count its
+    /// resource plan derives. `None` keeps the derived count; a journey sets
+    /// it only to saturate an admission class deterministically.
+    pub oracle_query_slot_limit: Option<usize>,
 }
 
 /// Concrete role and identity descriptor for one Bifrost pod.
@@ -118,9 +118,6 @@ pub struct BifrostNodeSpec {
     pub roles: BTreeSet<BifrostRuntimeRole>,
     /// Optional Oracle-local resource placement.
     pub oracle: Option<TestOracleResources>,
-    /// Forge compaction budget this pod admits plans against, when it is not
-    /// the harness default.
-    pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional accelerated role cadence applied only by test-support builders.
     pub role_timing: Option<RoleTiming>,
 }
@@ -328,6 +325,48 @@ impl BifrostClusterSpec {
         }
     }
 
+    /// Construct one node per public process target, in order.
+    ///
+    /// Node `n` (zero-based) gets the deterministic identity `n + 1` and
+    /// exactly the roles `target` selects, so a topology reads the way a
+    /// deployment's pod list does. Every node boots at the Bifrost pod floor —
+    /// [`vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES`] of memory,
+    /// four CPUs, and 4 GiB of scratch — so grants, partition counts, and
+    /// spill thresholds are the same numbers on every host rather than a
+    /// property of whichever machine ran the journey.
+    #[must_use]
+    pub fn for_targets(targets: &[BifrostTarget]) -> Self {
+        let pod_floor = SystemResourceSnapshot {
+            memory_limit_bytes: vala_bifrost_redux::resources::MIN_POD_MEMORY_BYTES,
+            effective_cpu: 4,
+            scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+            memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+            cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+        };
+        Self {
+            nodes: (1_u128..)
+                .zip(targets)
+                .map(|(id, target)| BifrostNodeSpec {
+                    node_id: NodeId::new(uuid::Uuid::from_u128(id)),
+                    roles: wyrd_server::config::BifrostRoles::for_target(*target)
+                        .iter()
+                        .copied()
+                        .collect(),
+                    oracle: Some(TestOracleResources {
+                        system_resources: Some(pod_floor),
+                        ..TestOracleResources::default()
+                    }),
+                    role_timing: None,
+                })
+                .collect(),
+            scribe_geometry_for_test: None,
+            scribe_persistence_faults_for_test: None,
+            storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+            oracle_runtime: None,
+        }
+    }
+
     /// Build `count` mixed nodes with deterministic identities.
     fn mixed(count: usize) -> Self {
         Self {
@@ -357,7 +396,6 @@ impl BifrostClusterSpec {
             node_id: NodeId::new(uuid::Uuid::from_u128(id)),
             roles: roles.into_iter().collect(),
             oracle: None,
-            forge_compaction_memory_limit_bytes: None,
             role_timing: None,
         }
     }
@@ -485,8 +523,6 @@ pub struct OracleInspection {
     pub spill_files: u64,
     /// Exact regular-file bytes beneath all running Oracle-owned scratch prefixes.
     pub spill_file_bytes: u64,
-    /// Peer pending reservations across Oracle pods.
-    pub peer_pending: u64,
     /// Peer running reservations across Oracle pods.
     pub peer_running: u64,
     /// Oracle audit outbox commits still in flight across pods.
@@ -728,6 +764,9 @@ struct NodeResources {
     http_addr: std::net::SocketAddr,
     /// Fixed private/public gRPC bind retained across a restart.
     grpc_addr: std::net::SocketAddr,
+    /// Private peer bind retained across a restart, so a restarted node comes
+    /// back at the address membership already published for it.
+    peer_addr: std::net::SocketAddr,
     /// Closed production process role derived from the component set.
     process_role: BifrostTarget,
 }
@@ -828,16 +867,11 @@ pub struct WyrdTestCluster {
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
     telemetry: BifrostTelemetryCapture,
-    /// Valid SYSTEM_OWNER Service credential retained across node restarts.
-    oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional retained TLS fixture directory and paths for real peer transport.
     oracle_peer_tls: Option<(Arc<tempfile::TempDir>, TestBifrostPeerTls)>,
-    /// Peer ticket keyring material every replica in this cluster loads.
-    ///
-    /// Peer tickets verify against a published manifest, so replicas that must
-    /// accept one another's tickets share one keyring; a per-node keyring would
-    /// make every east-west call an unknown-key refusal.
-    oracle_peer_keyring: Option<crate::bifrost::peer_keyring::TestPeerKeyringPaths>,
+    /// Authority every node's peer leaf chains to, retained so a journey can
+    /// mint member, foreign, expired, and misnamed identities against it.
+    peer_ca: crate::bifrost::peer_ca::BifrostPeerCa,
     /// Shared observer for supervised Forge worker completions.
     forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Shared uncertainty-injection catalog wrapper, when enabled.
@@ -982,10 +1016,10 @@ impl WyrdTestCluster {
     /// proves the two fences a replacement must advance before any assertion
     /// about replay can mean anything: the node is reachable only at addresses
     /// the terminated process never held, and a Scribe owner comes back at a
-    /// strictly greater writer epoch. Both addresses are reserved and compared
-    /// before the replacement boots, so a reused address leaves the node stopped
-    /// rather than running behind an error, and a boot failure restores the
-    /// addresses the node was configured with.
+    /// strictly greater writer epoch. The HTTP, gRPC, and peer addresses are
+    /// all reserved and compared before the replacement boots, so a reused
+    /// address leaves the node stopped rather than running behind an error, and
+    /// a boot failure restores the addresses the node was configured with.
     ///
     /// # Errors
     ///
@@ -1027,7 +1061,12 @@ impl WyrdTestCluster {
         // node must stay stopped rather than run behind this error.
         let http_addr = reserve_loopback_addr()?;
         let grpc_addr = reserve_loopback_addr()?;
-        if http_addr == previous_http_addr || grpc_addr == previous_grpc_addr {
+        let peer_addr = reserve_loopback_addr()?;
+        let previous_peer_addr = resources.peer_addr;
+        if http_addr == previous_http_addr
+            || grpc_addr == previous_grpc_addr
+            || peer_addr == previous_peer_addr
+        {
             return Err(ClusterError::Resource(
                 "replacement node did not advance its listener addresses".to_owned(),
             ));
@@ -1035,12 +1074,14 @@ impl WyrdTestCluster {
         let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
         resources.http_addr = http_addr;
         resources.grpc_addr = grpc_addr;
+        resources.peer_addr = peer_addr;
         let server = match self.build_node(node_id).await {
             Ok(server) => server,
             Err(error) => {
                 let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
                 resources.http_addr = previous_http_addr;
                 resources.grpc_addr = previous_grpc_addr;
+                resources.peer_addr = previous_peer_addr;
                 return Err(error);
             }
         };
@@ -1086,51 +1127,25 @@ impl WyrdTestCluster {
             .map_err(|error| ClusterError::Resource(error.to_string()))
     }
 
-    /// Return the cluster-owned least-privilege Oracle Service bearer.
+    /// Returns the authority every node's peer leaf chains to.
     ///
-    /// # Errors
-    /// Returns a resource error when token exchange fails.
-    pub async fn oracle_peer_bearer(&self, force_refresh: bool) -> Result<String, ClusterError> {
-        self.oracle_peer_credentials
-            .bearer(force_refresh)
-            .await
-            .map_err(|error| ClusterError::Resource(error.to_string()))
+    /// A peer-plane journey mints its own member, foreign, expired, and
+    /// misnamed client identities from it rather than borrowing a node's leaf.
+    #[must_use]
+    pub const fn peer_ca(&self) -> &crate::bifrost::peer_ca::BifrostPeerCa {
+        &self.peer_ca
     }
 
-    /// Builds the same registry-backed TLS peer transport used by server boot.
+    /// Returns the private peer address a configured node binds and advertises.
     ///
-    /// # Errors
-    /// Returns a resource error when TLS is disabled, the leader is absent, or
-    /// the retained CA fixture cannot be read.
-    pub fn oracle_peer_transport(
-        &self,
-        leader_index: usize,
-    ) -> Result<TonicOraclePeerTransport, ClusterError> {
-        let (_, tls) = self
-            .oracle_peer_tls
-            .as_ref()
-            .ok_or_else(|| ClusterError::Resource("Oracle peer TLS is not enabled".to_owned()))?;
-        let server = self
-            .server(leader_index)
-            .ok_or_else(|| ClusterError::Resource("Oracle leader is absent".to_owned()))?;
-        // The leader's own peer authority signs its reservation tickets, exactly
-        // as boot wires it, so a journey driving this transport exercises the
-        // production authorization path rather than an unticketed one.
-        let minter = server
-            .state()
-            .bifrost
-            .oracle_peer_service()
-            .ok_or_else(|| ClusterError::Resource("Oracle peer runtime is absent".to_owned()))?;
-        Ok(TonicOraclePeerTransport::with_credentials_and_tls(
-            server
-                .state()
-                .oracle_cluster()
-                .ok_or_else(|| ClusterError::Resource("Oracle cluster is absent".to_owned()))?,
-            Arc::clone(&self.oracle_peer_credentials),
-            peer_tls_from_paths(tls)?,
-        )
-        .with_reservation_minter(Arc::clone(minter.authority())
-            as Arc<dyn vala_bifrost_redux::oracle::peer::ReservationTicketMinter>))
+    /// Available for a stopped or not-yet-booted slot too, so a journey can
+    /// hold the socket before the node starts and prove boot refuses to serve
+    /// without its private listener.
+    #[must_use]
+    pub fn peer_addr(&self, node_id: NodeId) -> Option<std::net::SocketAddr> {
+        self.nodes
+            .get(&node_id)
+            .map(|resources| resources.peer_addr)
     }
 
     /// Refreshes every running node's authoritative immutable membership cut.
@@ -1584,14 +1599,14 @@ impl WyrdTestCluster {
         let process = process_telemetry()?;
         // `explicit_root` is the storage root to reuse (a shared or a
         // caller-declared dedicated root); `None` selects a temporary root.
-        let (fixture, shared_credentials, explicit_root) = match resource_source {
+        let (fixture, explicit_root) = match resource_source {
             ClusterResourceSource::Owned { dedicated_root } => {
                 let fixture = Arc::new(
                     PgFixture::start()
                         .await
                         .map_err(|error| ClusterError::Resource(error.to_string()))?,
                 );
-                (fixture, None, dedicated_root)
+                (fixture, dedicated_root)
             }
         };
         let tenant = fixture.data_tenant_id();
@@ -1630,22 +1645,8 @@ impl WyrdTestCluster {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
         };
-        // The filesystem service resumes a listing from `start_after` correctly
-        // but does not advertise the capability, and Forge workers refuse to
-        // start on a staging backend that cannot resume a bounded orphan scan.
-        // This shared cluster root stands in for a production object store, so
-        // it declares the support it actually has.
-        let operator = wyrd_storage::factory::build_operator(&storage_settings.backend)
-            .map_err(|error| ClusterError::Resource(error.to_string()))?
-            .layer(opendal::layers::CapabilityOverrideLayer::new(
-                |mut capability| {
-                    capability.list_with_start_after = true;
-                    capability
-                },
-            ));
-        let storage = StorageHandle::from_settings_with_operator(storage_settings, operator)
+        let storage = wyrd_storage::StorageHandle::from_settings(storage_settings)
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
         // Only the uncertainty wrapper needs a cluster-level catalog handle;
@@ -1659,37 +1660,21 @@ impl WyrdTestCluster {
                 Some(CommitUncertaintyCatalog::new(catalog.iceberg_catalog()))
             }
         };
-        // Reuse the once-provisioned shared credentials when booting over shared
-        // resources; their provisioning path is non-idempotent plain inserts, so
-        // a fresh provision only runs when this cluster owns its fixture.
-        let oracle_peer_credentials = match shared_credentials {
-            Some(credentials) => credentials,
-            None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
-        };
         // Every replica in one topology must chain to the same peer CA, so the
         // authority is minted once per cluster and shared. The peer plane is
         // mandatory for a Scribe- or Oracle-bearing target, so this is
         // unconditional rather than gated on a per-test flag.
+        let peer_ca =
+            crate::bifrost::peer_ca::BifrostPeerCa::generate(wyrd_server::config::PEER_SERVER_NAME)
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let oracle_peer_tls = {
             let root = Arc::new(
                 tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
             );
-            let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
-                .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            let tls = authority
+            let tls = peer_ca
                 .materialize(root.path(), "cluster")
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             Some((root, tls))
-        };
-        // Materialized beside the peer PEMs, in the same once-per-cluster root,
-        // for the same reason: one topology, one published peer authority.
-        let oracle_peer_keyring = match &oracle_peer_tls {
-            Some((root, _)) => Some(
-                crate::bifrost::peer_keyring::TestPeerKeyring::generate()
-                    .materialize(root.path(), "cluster")
-                    .map_err(|error| ClusterError::Resource(error.to_string()))?,
-            ),
-            None => None,
         };
         let topology = classify_topology(&spec);
         let scribe_admission_node =
@@ -1710,6 +1695,7 @@ impl WyrdTestCluster {
                     data_root,
                     http_addr: reserve_loopback_addr()?,
                     grpc_addr: reserve_loopback_addr()?,
+                    peer_addr: reserve_loopback_addr()?,
                     process_role,
                 },
             );
@@ -1735,9 +1721,8 @@ impl WyrdTestCluster {
             oracle_runtime,
             faults: OracleFaultController::default(),
             telemetry: process.forge_capture.clone(),
-            oracle_peer_credentials,
             oracle_peer_tls,
-            oracle_peer_keyring,
+            peer_ca,
             forge_completion_observer: options.completion_observer.clone(),
             commit_uncertainty_catalog: commit_uncertainty_catalog.clone(),
             forge_config: options.config.clone(),
@@ -1767,7 +1752,7 @@ impl WyrdTestCluster {
             .with_bifrost_node(node_id, resources.spec.roles.clone())
             .with_bifrost_data_dir(Some(Arc::clone(&resources.data_root)))
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
-            .with_oracle_peer_credentials(Arc::clone(&self.oracle_peer_credentials))
+            .with_peer_bind(resources.peer_addr)
             .with_bifrost_storage_io_for_test(self.storage_io)
             .with_telemetry(Arc::clone(&process_telemetry()?.guard));
         if let Some(timing) = resources.spec.role_timing {
@@ -1781,8 +1766,13 @@ impl WyrdTestCluster {
         {
             builder = builder.with_system_resources_for_test(snapshot);
         }
-        if let Some(bytes) = resources.spec.forge_compaction_memory_limit_bytes {
-            builder = builder.with_forge_compaction_memory_limit_for_test(bytes);
+        if let Some(slots) = resources
+            .spec
+            .oracle
+            .as_ref()
+            .and_then(|oracle| oracle.oracle_query_slot_limit)
+        {
+            builder = builder.with_oracle_query_slot_limit_for_test(slots);
         }
         if let Some(oracle) = self.oracle_runtime.clone() {
             builder = builder.with_oracle_runtime_for_test(oracle);
@@ -1811,9 +1801,6 @@ impl WyrdTestCluster {
         }
         if let Some((_, tls)) = &self.oracle_peer_tls {
             builder = builder.with_peer_tls(tls.clone());
-        }
-        if let Some(keyring) = &self.oracle_peer_keyring {
-            builder = builder.with_peer_keyring_paths(keyring.clone());
         }
         Ok(builder
             .start_with_resources(Arc::clone(&self.fixture), Arc::clone(&self.storage), None)
@@ -1948,7 +1935,6 @@ impl WyrdTestCluster {
                 runtime.reserved_memory_bytes = runtime
                     .reserved_memory_bytes
                     .saturating_add(snapshot.reserved_memory_bytes);
-                runtime.peer_pending = runtime.peer_pending.saturating_add(snapshot.peer_pending);
                 runtime.peer_running = runtime.peer_running.saturating_add(snapshot.peer_running);
                 runtime.audit_pending =
                     runtime.audit_pending.saturating_add(snapshot.audit_pending);
@@ -1969,7 +1955,6 @@ impl WyrdTestCluster {
             spill_directories: runtime.spill_directories,
             spill_files: runtime.spill_files,
             spill_file_bytes: runtime.spill_file_bytes,
-            peer_pending: runtime.peer_pending,
             peer_running: runtime.peer_running,
             audit_pending: runtime.audit_pending,
             forge_active_claims: u64::try_from(forge_active_claims)
@@ -2735,7 +2720,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_restart_rederives_same_plan_from_retained_snapshot() {
         let observation = SystemResourceSnapshot {
-            memory_limit_bytes: 1024 * 1024 * 1024,
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             effective_cpu: 3,
             scratch_capacity_bytes: 1280 * 1024 * 1024,
             scratch_available_bytes: 1280 * 1024 * 1024,
@@ -2777,39 +2762,8 @@ mod tests {
             .expect("restarted resource snapshot");
         assert_eq!(restarted_resources.plan, original_resources.plan);
         assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
-        assert_eq!(restarted_resources.elastic_memory_used_bytes, 0);
+        assert_eq!(restarted_resources.governed_memory_used_bytes, 0);
         assert!(!restarted_resources.oracle_query_active);
-        let mut system_conn = cluster
-            .fixture
-            .tenant_conn_for(DataTenantId::SYSTEM_OWNER)
-            .await
-            .expect("system tenant connection");
-        let assigned: Vec<(String, serde_json::Value)> = sqlx::query_as(
-            "SELECT r.name, r.permissions FROM wyrd.auth_service_accounts sa \
-             JOIN wyrd.auth_service_account_roles sar ON sar.data_tenant_id = sa.data_tenant_id AND sar.service_account_id = sa.id \
-             JOIN wyrd.auth_roles r ON r.data_tenant_id = sar.data_tenant_id AND r.id = sar.role_id \
-             WHERE sa.name = 'bifrost-peer' ORDER BY r.name",
-        )
-        .fetch_all(&mut **system_conn.transaction())
-        .await
-        .expect("Oracle peer role reads");
-        drop(system_conn);
-        assert_eq!(assigned.len(), 1);
-        assert_eq!(assigned[0].0, "bifrost_peer");
-        let stored_permissions: Vec<Permission> =
-            serde_json::from_value(assigned[0].1.clone()).expect("permissions decode");
-        let expected = vec![Permission::bifrost_peer_invoke()];
-        assert_eq!(stored_permissions, expected);
-        let bearer = cluster
-            .oracle_peer_credentials
-            .bearer(false)
-            .await
-            .expect("Oracle credential exchanges");
-        let effective = server
-            .oracle_peer_permissions_for_test(bearer)
-            .await
-            .expect("Oracle bearer verifies");
-        assert_eq!(effective, PermissionSet::from_iter(expected));
         cluster.shutdown().await.expect("cluster shuts down");
     }
 

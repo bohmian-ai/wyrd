@@ -65,8 +65,8 @@ pub struct AssembleRequest<'a> {
     pub runs: &'a ClaimRuns,
     /// Directory receiving the sealed objects before upload.
     pub scratch_dir: &'a Path,
-    /// Move-only footer memory child retained through sealed inspection.
-    pub footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Scribe capability that assembly charges materialized batches against.
+    pub memory: crate::resources::ScribeResources,
 }
 
 /// Owner of one pod's staged members, ready index, and claim lifecycle.
@@ -718,7 +718,8 @@ impl ScribeStagingRuntime {
             scratch_dir: request.scratch_dir,
             object_base: &object_base,
             target_object_bytes: self.target_object_bytes,
-            footer_reservation: request.footer_reservation,
+            memory: request.memory,
+            tenant: context.binding.tenant,
         })
     }
 
@@ -935,9 +936,7 @@ fn poisoned(owner: &'static str) -> ScribeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray,
-    };
+    use arrow::array::{FixedSizeBinaryArray, RecordBatch, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::ids::DataTenantId;
 
@@ -956,26 +955,21 @@ mod tests {
     /// Physical schema the fixture member is staged and merged under.
     fn runtime_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
             Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
-            Field::new("wyrd_row_ordinal", DataType::Int32, false),
         ]))
     }
 
     /// Freezes one bucket of `rows` rows for the fixture tenant and shard.
     fn frozen_member(tenant: DataTenantId, rows: i64, shard: u8) -> FrozenMemtable {
         let schema = runtime_schema();
-        let tenant_value = tenant.to_string();
-        let count = usize::try_from(rows).expect("fixture row count fits usize");
         let record = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(StringArray::from(vec![tenant_value.as_str(); count])),
                 Arc::new(TimestampMicrosecondArray::from_iter_values(
                     (0..rows).map(|row| row * 2 + i64::from(shard)),
                 )),
@@ -983,9 +977,6 @@ mod tests {
                     FixedSizeBinaryArray::try_from_iter((0..rows).map(|_| [shard; 16]))
                         .expect("fixture batch identity"),
                 ),
-                Arc::new(Int32Array::from_iter_values(
-                    (0..rows).map(|row| i32::try_from(row).unwrap_or(i32::MAX)),
-                )),
             ],
         )
         .expect("fixture member batch");
@@ -1082,7 +1073,7 @@ mod tests {
                         generation: 7,
                         wal: StagedLsnRange { min: 10, max: 19 },
                     },
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 },
                 ClaimContext {
                     schema: Arc::clone(&schema),
@@ -1118,7 +1109,7 @@ mod tests {
                 AssembleRequest {
                     runs: &runs,
                     scratch_dir: &scratch,
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 },
             )
             .expect("claim assembles under its staged context");
@@ -1177,7 +1168,7 @@ mod tests {
                         generation: 11,
                         wal: StagedLsnRange { min: 30, max: 39 },
                     },
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 },
                 ClaimContext {
                     schema: Arc::clone(&schema),
@@ -1222,8 +1213,8 @@ mod tests {
     }
 
     /// Members that reach neither target nor dwell are invisible to
-    /// [`ScribeStagingRuntime::take_claim`] but are exactly what drain must
-    /// settle, so every ready key is reachable as residue and each key stops
+    /// [`ScribeStagingRuntime::take_claim`] but are exactly what an explicit
+    /// flush must settle, so every ready key is reachable as residue and each key stops
     /// being ready once its residue is claimed.
     #[tokio::test]
     async fn drain_reaches_every_ready_key_target_and_dwell_would_hold() {
@@ -1267,8 +1258,7 @@ mod tests {
                                 max: u64::from(shard) * 10 + 9,
                             },
                         },
-                        footer_reservation:
-                            crate::scribe::memory::EncodedFooterReservation::for_test(),
+                        memory: crate::resources::ScribeResources::for_test(),
                     },
                     ClaimContext {
                         schema: Arc::clone(&schema),
@@ -1387,7 +1377,7 @@ mod tests {
                         generation: 7,
                         wal: StagedLsnRange { min: 10, max: 19 },
                     },
-                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    memory: crate::resources::ScribeResources::for_test(),
                 },
                 ClaimContext {
                     schema: Arc::clone(&schema),
@@ -1467,8 +1457,7 @@ mod tests {
                                 max: u64::from(shard) * 10 + 9,
                             },
                         },
-                        footer_reservation:
-                            crate::scribe::memory::EncodedFooterReservation::for_test(),
+                        memory: crate::resources::ScribeResources::for_test(),
                     },
                     ClaimContext {
                         schema: Arc::clone(schema),

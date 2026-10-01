@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryBuilder, Int32Builder, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, FixedSizeBinaryBuilder, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -20,7 +20,6 @@ use crate::resources::ScribeResources;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
 use crate::scribe::replay::ReplayedSealKey;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -32,8 +31,8 @@ use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
+    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
+    WYRD_REQUEST_ID,
 };
 
 #[cfg(test)]
@@ -282,7 +281,19 @@ impl ScribeIngressCpuPool {
         })?
     }
 
-    #[cfg(test)]
+    /// Runs one pre-ACK CPU job, such as preprocessing an admitted append, on
+    /// this lane.
+    ///
+    /// Request-path work stays here rather than on the persistence lane, so a
+    /// background staging encode or claim merge never queues ahead of a write.
+    /// The job is moved into the worker, so a cancelled caller still leaves the
+    /// job owning whatever memory it carries until it finishes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated,
+    /// the job's own error, or [`ScribeError::Internal`] when the worker panics
+    /// or drops its result.
     pub(crate) async fn run<T, F>(&self, job: F) -> Result<T, ScribeError>
     where
         T: Send + 'static,
@@ -386,8 +397,8 @@ impl ScribeIngressCpuPool {
 /// registered-schema fingerprint.
 ///
 /// All other managed columns (`wyrd_ingested_at`, `wyrd_batch_id`,
-/// `wyrd_row_ordinal`, `wyrd_request_id`, `data_tenant_id`, principal, and card
-/// columns) remain unconditionally server-owned and are rejected when supplied.
+/// `wyrd_request_id`, principal, and card columns) remain
+/// unconditionally server-owned and are rejected when supplied.
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] for malformed IPC, a reserved
@@ -438,7 +449,6 @@ fn decode(
             batch_id,
             window,
             receipt_micros: None,
-            start_row_ordinal: 0,
             definition,
         },
     )
@@ -448,9 +458,6 @@ fn decode(
 ///
 /// This entry point lets persistence preprocessing consume a native stream one
 /// source at a time without collecting or concatenating its record batches.
-/// `start_row_ordinal` is the request-wide cursor its caller advances, so every
-/// record batch of one Arrow stream receives a disjoint contiguous ordinal
-/// range rather than restarting at zero.
 ///
 /// # Errors
 ///
@@ -484,9 +491,9 @@ pub(crate) struct IngressDecodeInputs {
 
 /// Immutable validation and stamping context for one decoded batch.
 ///
-/// Native persistence preprocessing owns one of these per request and advances
-/// `start_row_ordinal` across the record batches of one Arrow stream, so the
-/// whole request shares one contiguous physical ordinal range.
+/// Native persistence preprocessing builds one of these per record batch of a
+/// request; every batch of one request stamps the same batch and request
+/// identity.
 pub(crate) struct DecodeContext<'a> {
     /// Authenticated principal used for scope checks and managed columns.
     pub(crate) principal: &'a Principal,
@@ -500,8 +507,6 @@ pub(crate) struct DecodeContext<'a> {
     pub(crate) window: EventTimeWindow,
     /// Fixed receipt time retained by current-only native production.
     pub(crate) receipt_micros: Option<i64>,
-    /// First physical row ordinal this batch stamps within its request.
-    pub(crate) start_row_ordinal: i32,
     /// Canonical built-in whose physical identity this decode must preserve.
     ///
     /// `Some` only for a canonical signal table. A dynamic or pre-declared
@@ -514,19 +519,13 @@ pub(crate) struct DecodeContext<'a> {
 ///
 /// # Errors
 ///
-/// Returns a stable Scribe refusal for row overflow, a duplicated column name,
-/// reserved columns, fingerprint mismatch, card-scope failure, invalid event
+/// Returns a stable Scribe refusal for a duplicated column name, reserved
+/// columns, fingerprint mismatch, card-scope failure, invalid event
 /// time, or managed column construction failure.
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
-    if rows.num_rows() >= i32::MAX as usize {
-        return Err(ScribeError::TooManyRows {
-            rows: rows.num_rows() as u64,
-            limit: (i32::MAX - 1) as u64,
-        });
-    }
     let mut seen = std::collections::HashSet::with_capacity(rows.schema().fields().len());
     for field in rows.schema().fields() {
         // Duplicate names are refused for every table kind — built-in, dynamic,
@@ -547,13 +546,7 @@ fn decode_rows(
         // one is a refusal rather than an override.
         if matches!(
             field.name().as_str(),
-            CARD_UID
-                | PRINCIPAL_ID
-                | DATA_TENANT_ID
-                | WYRD_BATCH_ID
-                | WYRD_ROW_ORDINAL
-                | WYRD_INGESTED_AT
-                | WYRD_REQUEST_ID
+            CARD_UID | PRINCIPAL_ID | WYRD_BATCH_ID | WYRD_INGESTED_AT | WYRD_REQUEST_ID
         ) {
             return Err(ScribeError::InvalidFrame);
         }
@@ -685,7 +678,7 @@ fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
         .filter(|field| {
             !matches!(
                 field.name().as_str(),
-                CARD_REF | CARD_UID | PRINCIPAL_ID | "run_id" | "data_tenant_id"
+                CARD_REF | CARD_UID | PRINCIPAL_ID | "run_id"
             ) && !field.name().starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())
@@ -1105,8 +1098,6 @@ fn server_owned_columns() -> Vec<&'static str> {
         WYRD_EVENT_TIME,
         WYRD_INGESTED_AT,
         WYRD_BATCH_ID,
-        WYRD_ROW_ORDINAL,
-        DATA_TENANT_ID,
         RUN_ID,
     ]
 }
@@ -1168,7 +1159,7 @@ fn user_columns(rows: &RecordBatch, server_owned: &[&str]) -> Vec<ArrayRef> {
 /// type, or when a row supplies a present reference and the principal carries
 /// no signed scope, the reference is malformed, its identity lies outside the
 /// signed scope, or the matching signed member carries no UID.
-fn resolve_card_uids(
+pub(crate) fn resolve_card_uids(
     rows: &RecordBatch,
     principal: &Principal,
     row_count: usize,
@@ -1233,7 +1224,7 @@ fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
 
 /// Appends the server-owned managed columns to a partially-stamped batch.
 ///
-/// The event time, receipt timestamp, batch id, row ordinal, and tenant are
+/// The event time, receipt timestamp, batch id, and tenant are
 /// appended unconditionally, values and all. The correlation envelope —
 /// `card_uid`, `wyrd_principal_id`, and `wyrd_request_id` — is conditional: its
 /// fields are declared here only when
@@ -1254,12 +1245,7 @@ fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
 /// # Errors
 /// Returns [`ScribeError::Internal`] when the system clock precedes the UNIX
 /// epoch, the receipt timestamp exceeds Arrow's range, or batch-id stamping
-/// fails, and [`ScribeError::TooManyRows`] when a row ordinal exceeds `i32`.
-///
-/// Row ordinals run `start_row_ordinal..start_row_ordinal + row_count`, so a
-/// caller streaming one request across several record batches passes its
-/// advancing cursor here and the request's rows carry one disjoint contiguous
-/// range.
+/// fails.
 fn append_managed_columns(
     fields: &mut Vec<Field>,
     columns: &mut Vec<ArrayRef>,
@@ -1269,7 +1255,6 @@ fn append_managed_columns(
     receipt_micros: i64,
 ) -> Result<(), ScribeError> {
     let batch_id = context.batch_id;
-    let start_row_ordinal = context.start_row_ordinal;
     if correlation_envelope_applies(context) {
         fields.extend([
             Field::new(CARD_UID, DataType::Utf8, true),
@@ -1289,8 +1274,6 @@ fn append_managed_columns(
             false,
         ),
         Field::new(WYRD_BATCH_ID, DataType::FixedSizeBinary(16), false),
-        Field::new(WYRD_ROW_ORDINAL, DataType::Int32, false),
-        Field::new(DATA_TENANT_ID, DataType::Utf8, false),
     ]);
     let timestamp_array = Arc::new(
         TimestampMicrosecondArray::from(vec![receipt_micros; row_count]).with_timezone("UTC"),
@@ -1308,32 +1291,12 @@ fn append_managed_columns(
             })?;
     }
     columns.push(Arc::new(batch_id_builder.finish()));
-    let mut ordinal_builder = Int32Builder::with_capacity(row_count);
-    for offset in 0..row_count {
-        let ordinal = i32::try_from(offset)
-            .ok()
-            .and_then(|offset| start_row_ordinal.checked_add(offset))
-            .ok_or(ScribeError::TooManyRows {
-                rows: u64::try_from(start_row_ordinal).unwrap_or_default() + row_count as u64,
-                limit: (i32::MAX - 1) as u64,
-            })?;
-        ordinal_builder.append_value(ordinal);
-    }
-    columns.push(Arc::new(ordinal_builder.finish()));
-    columns.push(Arc::new(StringArray::from(vec![
-        context
-            .principal
-            .tenant_id
-            .to_string();
-        row_count
-    ])));
     Ok(())
 }
 
 /// Closed set of CPU work permitted after admission has returned.
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuOp {
-    Preprocess(Box<AdmittedAppend>),
     /// Encode one frozen generation into durable staged runs.
     StageMember(Box<StageMemberOp>),
     /// Merge one claim's staged runs into rolling sealed objects.
@@ -1379,8 +1342,8 @@ pub(crate) struct StageMemberOp {
     pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
     /// Shard, epoch, node, and WAL facts describing where the rows came from.
     pub(crate) origin: crate::scribe::member_stager::StagedMemberOrigin,
-    /// Exact pre-writer footer child retained through sealed inspection.
-    pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Scribe capability charged for the batches the writer materializes.
+    pub(crate) memory: crate::resources::ScribeResources,
     /// Pod-level owner of the staged namespace the runs are written into.
     pub(crate) staging: std::sync::Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
 }
@@ -1398,8 +1361,8 @@ pub(crate) struct AssembleClaimOp {
     pub(crate) runs: Box<crate::scribe::claim_assembly::ClaimRuns>,
     /// Claim-owned output directory receiving the sealed objects.
     pub(crate) scratch_dir: std::path::PathBuf,
-    /// Exact pre-writer footer child retained through sealed inspection.
-    pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Scribe capability charged for the batches the writer materializes.
+    pub(crate) memory: crate::resources::ScribeResources,
     /// Pod-level owner holding the schema and layout the claim merges under.
     pub(crate) staging: std::sync::Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
 }
@@ -1407,7 +1370,6 @@ pub(crate) struct AssembleClaimOp {
 /// Results produced by [`ScribePersistenceCpuPool`].
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuResult {
-    Prepared(Box<PreparedAppend>),
     ReplayRestored(Box<FrozenMemtable>),
     MemberStaged(Box<crate::scribe::member_stager::StagedRuns>),
     ClaimAssembled(Box<crate::scribe::claim_assembly::AssembledClaim>),
@@ -1425,16 +1387,8 @@ pub(crate) enum ScribePersistenceCpuResult {
 /// test-synchronization error produced by the selected operation.
 fn execute_persistence_operation(
     operation: ScribePersistenceCpuOp,
-    preprocess_delay: std::time::Duration,
 ) -> Result<ScribePersistenceCpuResult, ScribeError> {
     match operation {
-        ScribePersistenceCpuOp::Preprocess(append) => {
-            if !preprocess_delay.is_zero() {
-                std::thread::sleep(preprocess_delay);
-            }
-            prepare_append(*append)
-                .map(|prepared| ScribePersistenceCpuResult::Prepared(Box::new(prepared)))
-        }
         ScribePersistenceCpuOp::StageMember(operation) => stage_member(*operation),
         ScribePersistenceCpuOp::AssembleClaim(operation) => assemble_claim(*operation),
         ScribePersistenceCpuOp::RestoreReplay { replayed } => {
@@ -1481,7 +1435,7 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
         binding,
         layout,
         origin,
-        footer_reservation,
+        memory,
         staging,
     } = operation;
     let context = crate::scribe::staging_runtime::ClaimContext {
@@ -1496,7 +1450,7 @@ fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, 
                 binding: &binding,
                 layout: &layout,
                 origin,
-                footer_reservation,
+                memory,
             },
             context,
         )
@@ -1515,7 +1469,7 @@ fn assemble_claim(operation: AssembleClaimOp) -> Result<ScribePersistenceCpuResu
         claim,
         runs,
         scratch_dir,
-        footer_reservation,
+        memory,
         staging,
     } = operation;
     staging
@@ -1524,7 +1478,7 @@ fn assemble_claim(operation: AssembleClaimOp) -> Result<ScribePersistenceCpuResu
             crate::scribe::staging_runtime::AssembleRequest {
                 runs: &runs,
                 scratch_dir: &scratch_dir,
-                footer_reservation,
+                memory,
             },
         )
         .map(|assembled| ScribePersistenceCpuResult::ClaimAssembled(Box::new(assembled)))
@@ -1542,7 +1496,6 @@ pub struct ScribePersistenceCpuPool {
     failed: Arc<AtomicU64>,
     saturation_events: Arc<AtomicU64>,
     drained: Arc<Notify>,
-    preprocess_delay: std::time::Duration,
     capacity: usize,
 }
 
@@ -1579,20 +1532,6 @@ impl ScribePersistenceCpuPool {
         worker_count: usize,
         capacity: usize,
     ) -> Result<Self, rayon::ThreadPoolBuildError> {
-        Self::with_capacity_and_delay(worker_count, capacity, std::time::Duration::ZERO)
-    }
-
-    /// Builds the bounded persistence pool with an optional test delay.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`rayon::ThreadPoolBuildError`] when Rayon cannot construct the
-    /// configured fixed worker pool.
-    fn with_capacity_and_delay(
-        worker_count: usize,
-        capacity: usize,
-        preprocess_delay: std::time::Duration,
-    ) -> Result<Self, rayon::ThreadPoolBuildError> {
         let capacity = capacity.max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
@@ -1609,7 +1548,6 @@ impl ScribePersistenceCpuPool {
             failed: Arc::new(AtomicU64::new(0)),
             saturation_events: Arc::new(AtomicU64::new(0)),
             drained: Arc::new(Notify::new()),
-            preprocess_delay,
             capacity,
         })
     }
@@ -1660,7 +1598,6 @@ impl ScribePersistenceCpuPool {
         let panics = Arc::clone(&self.panics);
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
-        let delay = self.preprocess_delay;
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_enqueued("persistence");
@@ -1670,7 +1607,7 @@ impl ScribePersistenceCpuPool {
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_started("persistence");
             let result = catch_unwind(AssertUnwindSafe(|| {
-                execute_persistence_operation(operation, delay)
+                execute_persistence_operation(operation)
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
@@ -2265,9 +2202,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use arrow::array::{
-        Array, ArrayRef, Int32Array, Int64Array, NullArray, StringArray, TimestampMicrosecondArray,
-    };
+    use arrow::array::{Array, ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
@@ -2278,8 +2213,8 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{
-        CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-        WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
+        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
+        WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2312,8 +2247,7 @@ mod tests {
     /// Build the default stamping context these unit cases decode under.
     ///
     /// Every field but the principal and request identity is the production
-    /// default, and the ordinal cursor starts at zero, which is what a
-    /// single-batch decode always passes.
+    /// default.
     fn stamping_context<'a>(
         principal: &'a Principal,
         request_id: &'a RequestId,
@@ -2326,7 +2260,6 @@ mod tests {
             batch_id: Uuid::now_v7(),
             window: EventTimeWindow::default(),
             receipt_micros: None,
-            start_row_ordinal: 0,
         }
     }
 
@@ -3035,115 +2968,12 @@ mod tests {
             None,
         )
         .expect("schema is valid");
-        assert!(decoded.schema().index_of(DATA_TENANT_ID).is_ok());
+        assert!(decoded.schema().index_of("data_tenant_id").is_err());
         assert!(decoded.schema().index_of(PRINCIPAL_ID).is_ok());
         assert!(decoded.schema().index_of(WYRD_BATCH_ID).is_ok());
         assert!(decoded.schema().index_of(WYRD_EVENT_TIME).is_ok());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
         assert!(decoded.schema().index_of(WYRD_REQUEST_ID).is_ok());
-    }
-
-    /// Assigns one stable zero-based physical ordinal to every row in an admitted batch.
-    #[test]
-    fn row_ordinal_is_zero_based_within_batch() {
-        let rows = batch(
-            vec![Field::new("value", DataType::Int64, false)],
-            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64, 3_i64]))],
-        );
-        let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
-                rows.clone(),
-            ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
-        )
-        .expect("schema is valid");
-        let ordinal = decoded
-            .column_by_name(WYRD_ROW_ORDINAL)
-            .expect("row ordinal is stamped")
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("row ordinal uses Int32");
-        assert_eq!(ordinal.values(), &[0, 1, 2]);
-    }
-
-    /// Carries the row identity as the required non-null Arrow `Int32` field.
-    #[test]
-    fn row_ordinal_uses_int32_physical_schema() {
-        let rows = batch(
-            vec![Field::new("value", DataType::Int64, false)],
-            vec![Arc::new(Int64Array::from(vec![1_i64]))],
-        );
-        let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
-                rows.clone(),
-            ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
-        )
-        .expect("schema is valid");
-        let schema = decoded.schema();
-        let field = schema
-            .field_with_name(WYRD_ROW_ORDINAL)
-            .expect("physical row ordinal exists");
-        assert_eq!(field.data_type(), &DataType::Int32);
-        assert!(!field.is_nullable());
-    }
-
-    /// Rejects an unrepresentable batch in the ingress CPU lane before WAL dispatch.
-    #[test]
-    fn oversized_batch_rejected_before_wal_append() {
-        let rows = batch(
-            vec![Field::new("value", DataType::Null, true)],
-            vec![Arc::new(NullArray::new(i32::MAX as usize))],
-        );
-        let error = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
-                rows.clone(),
-            ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
-        )
-        .expect_err("unrepresentable ordinal range fails before WAL dispatch");
-        assert!(matches!(
-            error,
-            ScribeError::TooManyRows { rows, limit }
-                if rows == i32::MAX as u64 && limit == (i32::MAX - 1) as u64
-        ));
-    }
-
-    /// Refuses a caller-supplied row ordinal before server preprocessing reaches WAL.
-    #[test]
-    fn caller_supplied_row_ordinal_is_rejected() {
-        let rows = batch(
-            vec![Field::new(WYRD_ROW_ORDINAL, DataType::Int32, false)],
-            vec![Arc::new(Int32Array::from(vec![0_i32]))],
-        );
-        let error = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
-                rows.clone(),
-            ])),
-            &principal(),
-            source_schema_fingerprint(rows.schema().as_ref()),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
-        )
-        .expect_err("row identity is server-owned");
-        assert!(matches!(error, ScribeError::InvalidFrame));
     }
 
     /// Builds a card-scoped service principal used by native ingest arms.
@@ -3925,12 +3755,7 @@ mod tests {
     #[test]
     fn native_other_reserved_columns_still_rejected() {
         let (principal, card) = scoped_service_principal();
-        for reserved in [
-            WYRD_INGESTED_AT,
-            WYRD_BATCH_ID,
-            WYRD_REQUEST_ID,
-            DATA_TENANT_ID,
-        ] {
+        for reserved in [WYRD_INGESTED_AT, WYRD_BATCH_ID, WYRD_REQUEST_ID] {
             let rows = batch(
                 vec![
                     Field::new(reserved, DataType::Utf8, false),

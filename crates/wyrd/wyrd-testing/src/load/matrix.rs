@@ -19,7 +19,6 @@ use tokio::sync::{Barrier, Notify};
 use tokio::task::JoinHandle;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, CollectedQueryLimits, CollectedQueryResult};
@@ -230,8 +229,6 @@ pub struct ClusterLoadProfile {
     pub scenario_deadline: Duration,
     /// Stable row and batch seed.
     pub seed: u64,
-    /// Tenant index receiving deterministic admission pressure, when enabled.
-    pub pressured_tenant: Option<usize>,
 }
 
 impl Serialize for ClusterLoadProfile {
@@ -243,7 +240,7 @@ impl Serialize for ClusterLoadProfile {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("ClusterLoadProfile", 11)?;
+        let mut state = serializer.serialize_struct("ClusterLoadProfile", 10)?;
         state.serialize_field("topology", topology_name(self.topology))?;
         state.serialize_field("tenants", &self.tenants)?;
         state.serialize_field("warmup_batches_per_tenant", &self.warmup_batches_per_tenant)?;
@@ -257,7 +254,6 @@ impl Serialize for ClusterLoadProfile {
         state.serialize_field("minimum_reads_per_tenant", &self.minimum_reads_per_tenant)?;
         state.serialize_field("scenario_deadline_ms", &self.scenario_deadline.as_millis())?;
         state.serialize_field("seed", &self.seed)?;
-        state.serialize_field("pressured_tenant", &self.pressured_tenant)?;
         state.end()
     }
 }
@@ -281,9 +277,6 @@ impl ClusterLoadProfile {
             || self.warmup_batches_per_tenant < 2
             || self.measured_batches_per_tenant < 8
             || self.scenario_deadline < Duration::from_millis(1)
-            || self
-                .pressured_tenant
-                .is_some_and(|tenant| tenant >= self.tenants)
         {
             return Err(ClusterLoadError::Profile(
                 "cluster load profile violates deterministic matrix bounds".to_owned(),
@@ -304,26 +297,10 @@ impl ClusterLoadProfile {
         Self::for_topology(BifrostTopology::OnePod, 8)
     }
 
-    /// Build the eight-tenant profile with tenant zero pressure enabled.
-    #[must_use]
-    pub const fn pressured_multi_tenant_single_pod() -> Self {
-        let mut profile = Self::multi_tenant_single_pod();
-        profile.pressured_tenant = Some(0);
-        profile
-    }
-
     /// Build the exact three-Server/three-ForgeWorker smoke profile.
     #[must_use]
     pub const fn multi_tenant_three_server_three_worker() -> Self {
         Self::for_topology(BifrostTopology::ThreeServersThreeForgeWorkers, 8)
-    }
-
-    /// Build the three-Server pressure profile with tenant zero on Server zero.
-    #[must_use]
-    pub const fn pressured_multi_tenant_three_server_three_worker() -> Self {
-        let mut profile = Self::multi_tenant_three_server_three_worker();
-        profile.pressured_tenant = Some(0);
-        profile
     }
 
     /// Construct the locked workload shared by each topology profile.
@@ -339,7 +316,6 @@ impl ClusterLoadProfile {
             minimum_reads_per_tenant: 2,
             scenario_deadline: DEFAULT_SCENARIO_DEADLINE,
             seed: 0xB1F0_57A5,
-            pressured_tenant: None,
         }
     }
 }
@@ -433,24 +409,10 @@ impl BifrostClusterLoad {
     /// when validation or role-complete startup fails.
     pub async fn start(profile: ClusterLoadProfile) -> Result<Self, ClusterLoadError> {
         profile.validate()?;
-        let cluster = if profile.pressured_tenant.is_some() {
-            WyrdTestCluster::start_spec_with_admission_and_forge_completion_observer_on_node(
-                profile.topology.spec_for_test(),
-                0,
-                AdmissionConfig {
-                    memory_limit_bytes: 1024 * 1024 * 1024,
-                    scribe_memory_limit_bytes: Some(256 * 1024),
-                    policy: vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy::default(),
-                    event_time_window: EventTimeWindow::default(),
-                },
-            )
-            .await
-        } else {
-            WyrdTestCluster::start_spec_with_forge_completion_observer(
-                profile.topology.spec_for_test(),
-            )
-            .await
-        }
+        let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+            profile.topology.spec_for_test(),
+        )
+        .await
         .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
         let telemetry = cluster.telemetry().clone();
         Ok(Self {
@@ -534,10 +496,7 @@ impl BifrostClusterLoad {
             .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
         let results =
             run_public_matrix(&self.telemetry, cluster, &self.profile, &tenants, &table).await?;
-        let fairness = jain_fairness(results.values().filter_map(|result| {
-            (self.profile.pressured_tenant != Some(result.tenant_index))
-                .then_some(result.acknowledged_rows)
-        }));
+        let fairness = jain_fairness(results.values().map(|result| result.acknowledged_rows));
         if fairness < 0.95 {
             return Err(ClusterLoadError::Assertion(format!(
                 "Jain fairness {fairness:.3} is below 0.95"
@@ -794,11 +753,7 @@ async fn run_public_matrix(
     let publish_tenants = || async {
         for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
             let node_count = cluster.ready_ingest_nodes().len().max(1);
-            let pressured = profile.pressured_tenant == Some(tenant_index);
-            let mut writer_index = tenant_index % node_count;
-            if !pressured && profile.pressured_tenant.is_some() && writer_index == 0 {
-                writer_index = 1 % node_count;
-            }
+            let writer_index = tenant_index % node_count;
             let writer = cluster.server(writer_index).ok_or_else(|| {
                 ClusterLoadError::Cluster("flush writer Server is absent".to_owned())
             })?;
@@ -845,19 +800,12 @@ async fn run_public_matrix(
             let barriers = Arc::new(TenantPhaseBarriers::new(tenants.len(), failed));
             for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
                 let node_count = cluster.ready_ingest_nodes().len().max(1);
-                let pressured = profile.pressured_tenant == Some(tenant_index);
-                let mut writer_index = tenant_index % node_count;
-                if !pressured && profile.pressured_tenant.is_some() && writer_index == 0 {
-                    writer_index = 1 % node_count;
-                }
-                let mut reader_index = if cluster.ready_query_nodes().len() > 1 {
+                let writer_index = tenant_index % node_count;
+                let reader_index = if cluster.ready_query_nodes().len() > 1 {
                     (writer_index + 1) % cluster.ready_query_nodes().len()
                 } else {
                     writer_index
                 };
-                if !pressured && profile.pressured_tenant.is_some() && reader_index == 0 {
-                    reader_index = 1 % cluster.ready_query_nodes().len().max(1);
-                }
                 let writer = cluster.server(writer_index).ok_or_else(|| {
                     ClusterLoadError::Cluster("writer Server is absent".to_owned())
                 })?;
@@ -954,32 +902,20 @@ async fn run_public_matrix(
     }, || async {
         for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
         let node_count = cluster.ready_ingest_nodes().len().max(1);
-        let pressured = profile.pressured_tenant == Some(tenant_index);
-        let mut writer_index = tenant_index % node_count;
-        if !pressured && profile.pressured_tenant.is_some() && writer_index == 0 {
-            writer_index = 1 % node_count;
-        }
-        let mut reader_index = if cluster.ready_query_nodes().len() > 1 {
+        let writer_index = tenant_index % node_count;
+        let reader_index = if cluster.ready_query_nodes().len() > 1 {
             (writer_index + 1) % cluster.ready_query_nodes().len()
         } else {
             writer_index
         };
-        if !pressured && profile.pressured_tenant.is_some() && reader_index == 0 {
-            reader_index = 1 % cluster.ready_query_nodes().len().max(1);
-        }
         let reader = cluster
             .server(reader_index)
             .ok_or_else(|| ClusterLoadError::Cluster("final reader Server is absent".to_owned()))?;
         let final_client =
             public_client(reader, tenant, &format!("load-final-{tenant_index}")).await?;
         let query = wyrd_client::Bifrost::query_only(&final_client);
-        let final_sql = if profile.pressured_tenant == Some(tenant_index) {
-            format!("SELECT id, tenant, batch FROM {table}")
-        } else {
-            format!(
-                "SELECT id, tenant, batch FROM {table} WHERE CAST(batch AS BIGINT) >= 2"
-            )
-        };
+        let final_sql =
+            format!("SELECT id, tenant, batch FROM {table} WHERE CAST(batch AS BIGINT) >= 2");
         // The stream names its own request before any row is taken, so the
         // audit row this read commits is joined by an identity the caller
         // already holds rather than by guessing at the newest staged row.
@@ -1072,39 +1008,13 @@ async fn run_public_matrix(
         }
         let admitted_rows = u64::from(profile.measured_batches_per_tenant)
             .saturating_mul(u64::from(profile.rows_per_batch));
-        let expected_rows = if profile.pressured_tenant == Some(tenant_index) {
-            if report.backpressure == 0 {
-                return Err(ClusterLoadError::Assertion(
-                    "pressured tenant observed no explicit backpressure".to_owned(),
-                ));
-            }
-            if report.measured_acknowledged_batches == 0 || report.completed_reads == 0 {
-                return Err(ClusterLoadError::Assertion(format!(
-                    "pressured tenant {tenant} made no measured write/read progress"
-                )));
-            }
-            let expected_rejections = profile
-                .measured_batches_per_tenant
-                .saturating_sub(report.acknowledged_batches);
-            if report.rejected_batches != expected_rejections {
-                return Err(ClusterLoadError::Assertion(format!(
-                    "pressured tenant {tenant} rejected {} batches; expected {expected_rejections}",
-                    report.rejected_batches
-                )));
-            }
-            report.acknowledged_rows.saturating_add(
-                u64::from(profile.warmup_batches_per_tenant)
-                    .saturating_mul(u64::from(profile.rows_per_batch)),
-            )
-        } else {
-            if report.acknowledged_rows != admitted_rows || report.progressed_phases != 2 {
-                return Err(ClusterLoadError::Assertion(format!(
-                    "tenant {tenant} lost admitted work: rows={} expected={admitted_rows} phases={}",
-                    report.acknowledged_rows, report.progressed_phases
-                )));
-            }
-            admitted_rows
-        };
+        if report.acknowledged_rows != admitted_rows || report.progressed_phases != 2 {
+            return Err(ClusterLoadError::Assertion(format!(
+                "tenant {tenant} lost admitted work: rows={} expected={admitted_rows} phases={}",
+                report.acknowledged_rows, report.progressed_phases
+            )));
+        }
+        let expected_rows = admitted_rows;
         if report.final_rows != expected_rows
             || report.final_schema_columns != 3
             || report.final_terminal_count != 1
@@ -1298,27 +1208,6 @@ fn reconcile_matrix_telemetry(
         .values()
         .map(|tenant| tenant.acknowledged_bytes)
         .sum::<u64>();
-    let measured_submitted_bytes = results
-        .keys()
-        .map(|tenant_name| {
-            let tenant = uuid::Uuid::parse_str(tenant_name)
-                .ok()
-                .and_then(|uuid| DataTenantId::new(uuid).ok())
-                .ok_or_else(|| {
-                    ClusterLoadError::Assertion(format!("invalid tenant identity {tenant_name}"))
-                })?;
-            (2..profile.measured_batches_per_tenant + 2)
-                .map(|batch| {
-                    ipc_payload(tenant, 0, batch, profile.rows_per_batch)
-                        .map(|bytes| bytes.len() as u64)
-                })
-                .try_fold(0_u64, |total, bytes| {
-                    bytes.map(|value| total.saturating_add(value))
-                })
-        })
-        .collect::<Result<Vec<_>, ClusterLoadError>>()?
-        .into_iter()
-        .sum::<u64>();
     let measured_successes = results
         .values()
         .map(|tenant| u64::from(tenant.acknowledged_batches) + u64::from(tenant.completed_reads))
@@ -1358,16 +1247,7 @@ fn reconcile_matrix_telemetry(
         warmup_rows / u64::from(profile.rows_per_batch),
     )?;
     assert_phase_counter("measured Gate rows", measured.gate_rows, measured_rows)?;
-    let expected_measured_bytes = if profile.pressured_tenant.is_some() {
-        measured_submitted_bytes
-    } else {
-        measured_bytes
-    };
-    assert_phase_counter(
-        "measured Gate bytes",
-        measured.gate_bytes,
-        expected_measured_bytes,
-    )?;
+    assert_phase_counter("measured Gate bytes", measured.gate_bytes, measured_bytes)?;
     assert_phase_counter("measured Scribe rows", measured.scribe_rows, measured_rows)?;
     assert_phase_counter(
         "measured Oracle stream rows",
@@ -1974,7 +1854,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                     Err(error) => return Err(ClusterLoadError::Client(error.to_string())),
                 }
             }
-            if result.completed_reads < target && profile.pressured_tenant != Some(tenant_index) {
+            if result.completed_reads < target {
                 return Err(ClusterLoadError::Assertion(format!(
                     "tenant {tenant} (index {tenant_index}) completed {} of {target} strict reads with {} retries",
                     result.completed_reads,

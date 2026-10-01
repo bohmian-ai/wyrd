@@ -92,6 +92,19 @@ pub enum BifrostError {
     )]
     QueryQueueFull,
 
+    /// An admitted query could not obtain the execution memory it needed.
+    ///
+    /// Not retryable as-is: the query failed inside its own ceiling and the
+    /// shared Bifrost cap, so an unchanged retry meets the same limit.
+    #[error("query resources exhausted")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED",
+        status = 503,
+        title = "Query resources exhausted",
+        remediation = "Narrow the query or add capacity; retrying unchanged will not succeed."
+    )]
+    QueryResourcesExhausted,
+
     /// One indivisible query memory request exceeds its governing ceiling.
     #[error("query memory request too large")]
     #[wyrd_error(
@@ -493,21 +506,6 @@ pub enum BifrostError {
         bytes: usize,
         /// Canonical transport byte ceiling enforced for this request.
         limit: usize,
-    },
-
-    /// The ingest request exceeded the aggregate row bound.
-    #[error("ingest request has too many rows ({rows} > {limit})")]
-    #[wyrd_error(
-        code = "WYRD_VALA_413_INGEST_OVERSIZED",
-        status = 413,
-        title = "Ingest request oversized",
-        remediation = "Reduce the number of rows in the request and retry."
-    )]
-    IngestOversized {
-        /// Number of rows observed in the request.
-        rows: u64,
-        /// Maximum rows allowed by the ingest contract.
-        limit: u64,
     },
 
     /// An unexpected internal Bifrost failure occurred.

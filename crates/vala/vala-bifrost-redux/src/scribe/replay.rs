@@ -89,12 +89,6 @@ pub struct ReplayChunk {
     pub(crate) memory: Option<ScribeMemoryLease>,
     /// Committed-identity memory loaned until synchronous shard settlement.
     pub(crate) identity_memory: Option<ScribeMemoryLease>,
-    /// Aggregate committed-identity ownership live across every shard stream.
-    ///
-    /// Persistence includes this complete replay-wide projection in the fixed
-    /// Parquet producer tuple, while `identity_memory` remains the move-only
-    /// lease belonging to this chunk's accumulator.
-    pub(crate) identity_owner_bytes: usize,
 }
 
 /// Synchronous settlement returned before the replay scanner advances.
@@ -260,20 +254,11 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             // WAL v6 may roll between a SLICE and its terminal COMMIT. Keep
             // that incomplete batch and its segment refs together, then emit
             // at the first later boundary where no batch crosses the cut.
-            if accumulator.pending_batches.is_empty() {
-                let identity_owner_bytes = replay_identity_owner_bytes(&accumulators)?;
-                let accumulator =
-                    accumulators
-                        .get_mut(&key)
-                        .ok_or_else(|| ScribeError::Internal {
-                            detail: "replay accumulator disappeared before boundary handoff"
-                                .to_owned(),
-                        })?;
-                if let Some(mut chunk) = accumulator.take_chunk()? {
-                    chunk.identity_owner_bytes = identity_owner_bytes;
-                    let settlement = emit(chunk)?;
-                    accumulator.identity_memory = settlement.identity_memory;
-                }
+            if accumulator.pending_batches.is_empty()
+                && let Some(chunk) = accumulator.take_chunk()?
+            {
+                let settlement = emit(chunk)?;
+                accumulator.identity_memory = settlement.identity_memory;
             }
         }
         let completed_unit = accumulators
@@ -283,14 +268,12 @@ pub(crate) fn replay_wal_directory_stream_accounted(
             })?
             .append(segment_path, &record, payload_memory)?;
         if completed_unit {
-            let identity_owner_bytes = replay_identity_owner_bytes(&accumulators)?;
             let accumulator = accumulators
                 .get_mut(&key)
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "replay accumulator disappeared before unit handoff".to_owned(),
                 })?;
-            if let Some(mut chunk) = accumulator.take_chunk()? {
-                chunk.identity_owner_bytes = identity_owner_bytes;
+            if let Some(chunk) = accumulator.take_chunk()? {
                 let settlement = emit(chunk)?;
                 accumulator.identity_memory = settlement.identity_memory;
             }
@@ -309,48 +292,18 @@ pub(crate) fn replay_wal_directory_stream_accounted(
                 detail: "WAL replay cancelled".to_owned(),
             });
         }
-        let identity_owner_bytes = replay_identity_owner_bytes(&accumulators)?;
         let accumulator = accumulators
             .get_mut(&key)
             .ok_or_else(|| ScribeError::Internal {
                 detail: "replay accumulator disappeared during final handoff".to_owned(),
             })?;
-        if let Some(mut chunk) = accumulator.take_chunk()? {
-            chunk.identity_owner_bytes = identity_owner_bytes;
+        if let Some(chunk) = accumulator.take_chunk()? {
             let settlement = emit(chunk)?;
             accumulator.identity_memory = settlement.identity_memory;
         }
     }
 
     Ok(())
-}
-
-/// Returns the complete identity ownership retained across replay accumulators.
-///
-/// This projection lets the active persistence producer subtract every live
-/// shard-stream identity byte from the fixed Scribe producer owner instead of
-/// assuming identities retained by sibling accumulators are free capacity.
-///
-/// # Errors
-///
-/// Returns an internal Scribe error when the aggregate cannot fit `usize`.
-fn replay_identity_owner_bytes(
-    accumulators: &HashMap<(StreamIdentity, u8), ReplayAccumulator<'_>>,
-) -> Result<usize, ScribeError> {
-    accumulators
-        .values()
-        .try_fold(0_usize, |total, accumulator| {
-            total
-                .checked_add(
-                    accumulator
-                        .identity_memory
-                        .as_ref()
-                        .map_or(0, ScribeMemoryLease::bytes),
-                )
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "replay-wide identity ownership overflowed".to_owned(),
-                })
-        })
 }
 
 /// Return the epoch-local directory containing one stream's manifest.
@@ -795,7 +748,6 @@ impl<'a> ReplayAccumulator<'a> {
             states: std::mem::take(&mut self.states),
             memory: self.memory.take(),
             identity_memory: self.identity_memory.take(),
-            identity_owner_bytes: 0,
         };
         self.memory = next_memory;
         self.memory_bytes = 0;
@@ -1226,17 +1178,14 @@ mod tests {
         )
     }
 
-    /// Decode failure releases ownership and replay-wide identities size one producer.
+    /// Decode failure releases the payload before the identity lease.
     ///
     /// # Panics
     ///
-    /// Panics if malformed replay unexpectedly decodes, ownership leaks after
-    /// failure, or sibling identity leases are omitted from exact-floor
-    /// producer admission.
+    /// Panics if malformed replay unexpectedly decodes or ownership leaks after
+    /// failure.
     #[test]
     fn replay_decode_failure_drops_payload_before_identity_lease() {
-        /// One mebibyte in bytes, used by every reservation in this test.
-        const MIB: usize = 1024 * 1024;
         let resources =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let baseline = resources.snapshot().expect("baseline snapshot");
@@ -1256,69 +1205,6 @@ mod tests {
             resources
                 .snapshot()
                 .expect("released snapshot")
-                .scribe_memory_used_bytes,
-            baseline.scribe_memory_used_bytes
-        );
-
-        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            832 * MIB,
-            512 * MIB as u64,
-            [
-                crate::resources::BifrostRole::Scribe,
-                crate::resources::BifrostRole::Oracle,
-                crate::resources::BifrostRole::Forge,
-            ],
-        );
-        let resources = roles.scribe().expect("exact-floor Scribe capability");
-        let baseline = resources.snapshot().expect("exact-floor baseline");
-        let first_stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
-        let second_stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
-        let mut first = ReplayAccumulator::new(first_stream, 0, HashMap::new(), Some(&resources))
-            .expect("first replay accumulator");
-        first
-            .identity_memory
-            .as_mut()
-            .expect("first identity owner")
-            .resize_ingress(MIB)
-            .expect("first identity bytes");
-        let mut second = ReplayAccumulator::new(second_stream, 1, HashMap::new(), Some(&resources))
-            .expect("second replay accumulator");
-        second
-            .identity_memory
-            .as_mut()
-            .expect("second identity owner")
-            .resize_ingress(2 * MIB)
-            .expect("second identity bytes");
-        let accumulators =
-            HashMap::from([((first_stream, 0), first), ((second_stream, 1), second)]);
-        let identity_bytes = replay_identity_owner_bytes(&accumulators)
-            .expect("aggregate replay identity ownership");
-        assert_eq!(identity_bytes, 3 * MIB);
-        // Identity and immutable ownership remain charged while the one
-        // incremental producer workspace is handed off under the root fence.
-        let generation_bytes = 61 * MIB;
-        let generation = resources
-            .try_reserve_maintenance(MemoryCategory::Immutable, generation_bytes)
-            .expect("replay generation ownership");
-        let producer_delta = crate::scribe::memory::parquet_candidate_incremental_bytes(24 * MIB)
-            .expect("candidate incremental workspace");
-        let producer = resources
-            .try_reserve_maintenance(MemoryCategory::Persistence, producer_delta)
-            .expect("aggregate identity projection preserves exact-floor admission");
-        assert_eq!(
-            resources
-                .snapshot()
-                .expect("full producer tuple")
-                .scribe_memory_used_bytes,
-            generation_bytes + identity_bytes + producer_delta
-        );
-        drop(producer);
-        drop(generation);
-        drop(accumulators);
-        assert_eq!(
-            resources
-                .snapshot()
-                .expect("released exact-floor ownership")
                 .scribe_memory_used_bytes,
             baseline.scribe_memory_used_bytes
         );
@@ -1720,7 +1606,6 @@ mod tests {
             .expect("append");
         let budget = crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig {
             memory_limit_bytes: 1,
-            scribe_memory_limit_bytes: Some(1),
             ..crate::scribe::AdmissionConfig::default()
         });
         let occupied = budget

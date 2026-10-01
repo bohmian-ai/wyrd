@@ -21,6 +21,25 @@ pub fn install_crypto_provider() -> Result<(), InstallError> {
     })
 }
 
+/// Reports whether an end-entity certificate carries `dns_name` as a SAN.
+///
+/// Checks the name alone. The caller must already have verified the chain,
+/// validity, and key usage — a private listener does that during the TLS
+/// handshake — so this only narrows an already-trusted leaf to one identity.
+/// A certificate that does not parse, or a name that is not a valid DNS name,
+/// is reported as not matching, so the check fails closed.
+#[must_use]
+pub fn certificate_has_dns_name(
+    certificate: &rustls::pki_types::CertificateDer<'_>,
+    dns_name: &str,
+) -> bool {
+    let Ok(parsed) = rustls::server::ParsedCertificate::try_from(certificate) else {
+        return false;
+    };
+    rustls::pki_types::ServerName::try_from(dns_name)
+        .is_ok_and(|name| rustls::client::verify_server_name(&parsed, &name).is_ok())
+}
+
 /// A conflicting Rustls provider was installed before Wyrd initialized TLS.
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("a conflicting Rustls crypto provider is already installed")]

@@ -4,35 +4,35 @@ mod pg_tests {
     //! Skipped automatically when Wyrd database env vars are unset so the default
     //! test suite remains credential-free.
 
-    use secrecy::ExposeSecret;
     use sha2::Digest;
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_sql::{MIGRATION_LEASE_WAIT, OperatorPool};
 
     /// Fresh Vala migrations apply repeatedly without schema drift.
     #[tokio::test]
     async fn vala_migrations_apply_and_are_idempotent() {
-        let Some(url) = std::env::var("WYRD_DATABASE_URL").ok() else {
+        let Some(owner_url) = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok() else {
             return;
         };
-        let _ = url;
+        let pool =
+            wyrd_sql::pool::build_pool(&owner_url, wyrd_sql::PoolConfig::migrator_defaults())
+                .await
+                .expect("owner pool");
 
-        let dsns = wyrd_sql::dsn::resolve_external_dsns_from_env()
-            .expect("dsn resolve")
-            .expect("WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD set");
-        let pool = wyrd_sql::pool::build_pool(
-            dsns.migrator.expose_secret(),
-            wyrd_sql::PoolConfig::migrator_defaults(),
-        )
-        .await
-        .expect("migrator pool");
-
-        wyrd_sql::migrate(&pool)
+        let mut lease = OperatorPool::from(pool.clone())
+            .migration_lease(MIGRATION_LEASE_WAIT)
+            .await
+            .expect("migration lease acquires");
+        wyrd_sql::migrate(&mut lease)
             .await
             .expect("wyrd migrate is idempotent");
-        vala_sql::migrate(&pool).await.expect("first vala migrate");
-        vala_sql::migrate(&pool)
+        vala_sql::migrate(&mut lease)
+            .await
+            .expect("first vala migrate");
+        vala_sql::migrate(&mut lease)
             .await
             .expect("second vala migrate is idempotent");
+        lease.release().await.expect("migration lease releases");
 
         for schema in vala_sql::OWNED_SCHEMAS {
             let exists: (bool,) =

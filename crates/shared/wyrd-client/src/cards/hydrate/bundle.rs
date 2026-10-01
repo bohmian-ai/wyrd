@@ -268,6 +268,10 @@ impl<'a> HydrationBundleWriter<'a> {
 
 /// Serializes one bounded hydration document and writes it below staging.
 ///
+/// The document passes through the JSON data model first, so an externally
+/// tagged enum such as a native Prompt's `response_type` is written as a
+/// mapping rather than a YAML tag the JSON-valued Card readers cannot decode.
+///
 /// # Errors
 ///
 /// Returns an error when the path has no parent, YAML serialization fails, or a local
@@ -280,10 +284,13 @@ fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), WyrdError> {
     fs::create_dir_all(parent)
         .map_err(RegistryEngineError::from)
         .map_err(WyrdError::from)?;
-    let yaml = serde_yaml::to_string(value).map_err(|error| WyrdError::Internal {
-        message: "failed to serialize hydrated bundle YAML".to_owned(),
-        details: serde_json::json!({ "path": path, "error": error.to_string() }),
-    })?;
+    let yaml = serde_json::to_value(value)
+        .map_err(|error| error.to_string())
+        .and_then(|value| serde_yaml::to_string(&value).map_err(|error| error.to_string()))
+        .map_err(|error| WyrdError::Internal {
+            message: "failed to serialize hydrated bundle YAML".to_owned(),
+            details: serde_json::json!({ "path": path, "error": error }),
+        })?;
     fs::write(path, yaml)
         .map_err(RegistryEngineError::from)
         .map_err(WyrdError::from)
@@ -340,7 +347,7 @@ mod tests {
         reference::CardRef,
     };
 
-    use super::validate_artifact_path;
+    use super::{validate_artifact_path, write_yaml};
 
     /// Artifact inventory paths remain relative even when payloads are not downloaded.
     #[test]
@@ -355,5 +362,21 @@ mod tests {
         assert!(validate_artifact_path("nested/file.bin", &card_ref).is_ok());
         assert!(validate_artifact_path("../escape", &card_ref).is_err());
         assert!(validate_artifact_path("nested/file name.bin", &card_ref).is_err());
+    }
+
+    /// A tagged enum is written as a mapping that reads back as JSON data.
+    #[test]
+    fn tagged_enums_are_written_as_mappings() {
+        let dir = tempfile::tempdir().expect("temp dir creates");
+        let path = dir.path().join("card.yaml");
+        let value = skald_spec::ResponseType::JsonSchema {
+            name: "judge".to_owned(),
+            schema: serde_json::json!({ "type": "object" }),
+        };
+        write_yaml(&path, &value).expect("the document writes");
+        let read: serde_json::Value =
+            serde_yaml::from_slice(&std::fs::read(&path).expect("the document reads"))
+                .expect("the document is JSON-model YAML");
+        assert_eq!(read["json_schema"]["name"], "judge");
     }
 }

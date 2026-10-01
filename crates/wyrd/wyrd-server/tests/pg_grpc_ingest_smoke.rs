@@ -154,16 +154,12 @@ fn tail_binding(tenant: DataTenantId) -> TenantTableBinding {
     }
 }
 
-/// Builds one raw authenticated `ListActiveStreams` request.
-fn list_request(binding: TenantTableBinding, bearer: &str) -> Request<ListActiveStreamsRequest> {
-    let mut request = Request::new(ListActiveStreamsRequest {
+/// Builds one raw `ListActiveStreams` request; the mTLS peer certificate is
+/// the only credential.
+fn list_request(binding: TenantTableBinding) -> Request<ListActiveStreamsRequest> {
+    Request::new(ListActiveStreamsRequest {
         binding: Some(binding.into()),
-    });
-    request.metadata_mut().insert(
-        "x-wyrd-access-token",
-        format!("Bearer {bearer}").parse().expect("metadata value"),
-    );
-    request
+    })
 }
 
 /// Creates the server-verified identity used to seed the embedded Scribe.
@@ -283,8 +279,10 @@ async fn serve_peer_grpc(
     CancellationToken,
     wyrd_testing::bifrost::peer_ca::BifrostPeerCa,
 ) {
-    let authority = wyrd_testing::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
-        .expect("peer certificate authority mints");
+    let authority = wyrd_testing::bifrost::peer_ca::BifrostPeerCa::generate(
+        wyrd_server::config::PEER_SERVER_NAME,
+    )
+    .expect("peer certificate authority mints");
     let leaf = authority
         .issue_leaf("peer-listener")
         .expect("peer leaf issues");
@@ -293,7 +291,7 @@ async fn serve_peer_grpc(
         leaf.private_key_pem().as_bytes(),
         authority.ca_certificate_pem().as_bytes(),
     );
-    let router = build_peer_grpc(state, tls, 1)
+    let router = build_peer_grpc(state, tls)
         .expect("peer router builds")
         .expect("an API-serving target mounts the peer plane");
     let bind = bind_free_loopback().await;
@@ -669,30 +667,7 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Rejects an unauthenticated private tail request before malformed input reaches lookup.
-///
-/// The dial carries a certificate from the listener's own authority, so the
-/// refusal is the workload boundary's and not TLS: a caller inside the peer
-/// trust domain still needs the one Service principal the listener admits.
-#[tokio::test]
-async fn scribe_tail_unauthenticated_is_rejected_before_lookup() {
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let (bind, shutdown, authority) = serve_peer_grpc(server.state()).await;
-
-    let mut client = ScribeTailServiceClient::new(connect_peer_channel(bind, &authority).await);
-    let status = client
-        .list_active_streams(Request::new(ListActiveStreamsRequest::default()))
-        .await
-        .expect_err("missing workload token must fail before request conversion");
-    shutdown.cancel();
-    assert_eq!(status.code(), Code::Unauthenticated);
-
-    server.shutdown().await.expect("server shuts down");
-}
-
-/// Lists the seeded live partition through the authenticated generated-tonic client.
+/// Lists the seeded live partition through the mTLS generated-tonic client.
 ///
 /// # Panics
 /// Panics if discovery fails or names another stream than the local Scribe.
@@ -711,11 +686,9 @@ async fn scribe_tail_tonic_lists_seeded_partition() {
         .stream();
 
     let (bind, shutdown, authority) = serve_peer_grpc(state).await;
-    let remote = TonicTailReadTransport::new(
-        ScribeTailServiceClient::new(connect_peer_channel(bind, &authority).await),
-        &server.peer_bearer().await.expect("peer bearer exchanges"),
-    )
-    .expect("peer bearer configures remote transport");
+    let remote = TonicTailReadTransport::new(ScribeTailServiceClient::new(
+        connect_peer_channel(bind, &authority).await,
+    ));
     let streams = remote
         .list_active_streams(tail_binding(tenant))
         .await
@@ -734,18 +707,16 @@ async fn scribe_tail_tonic_lists_seeded_partition() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Listing trusts the authenticated internal peer and is scoped to one table.
+/// Listing trusts the mTLS-authenticated internal peer and is scoped to one table.
 ///
-/// The peer plane admits one system-owner Service principal, which may list
+/// The peer certificate is the only credential, and any cluster peer may list
 /// any tenant's table: that is the accepted listing trust model, and no ticket
 /// is presented. What it lists is still exactly the named tenant table, so
 /// another tenant's live rows and another table of the same tenant never
-/// appear. A peer presenting an unverifiable bearer is refused before lookup.
+/// appear.
 ///
 /// # Panics
-/// Panics when an authorized listing fails or names another tenant's or
-/// table's partitions, or when the unverifiable bearer is not refused as
-/// `Unauthenticated`.
+/// Panics when a listing fails or names another tenant's or table's partitions.
 #[tokio::test]
 async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
     let server = WyrdTestServer::start_in_process()
@@ -760,10 +731,9 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
 
     let (bind, shutdown, authority) = serve_peer_grpc(state).await;
     let mut client = ScribeTailServiceClient::new(connect_peer_channel(bind, &authority).await);
-    let peer_bearer = server.peer_bearer().await.expect("peer bearer exchanges");
 
     let owner = client
-        .list_active_streams(list_request(tail_binding(owner_tenant), &peer_bearer))
+        .list_active_streams(list_request(tail_binding(owner_tenant)))
         .await
         .expect("the internal peer lists the owner's table")
         .into_inner();
@@ -774,7 +744,7 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
     );
 
     let other = client
-        .list_active_streams(list_request(tail_binding(other_tenant), &peer_bearer))
+        .list_active_streams(list_request(tail_binding(other_tenant)))
         .await
         .expect("the internal peer lists another tenant's table")
         .into_inner();
@@ -786,7 +756,7 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
     let mut other_table = tail_binding(owner_tenant);
     other_table.table = "tail_events_absent".to_owned();
     let absent = client
-        .list_active_streams(list_request(other_table, &peer_bearer))
+        .list_active_streams(list_request(other_table))
         .await
         .expect("the internal peer lists an idle table")
         .into_inner();
@@ -794,15 +764,6 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
         absent.streams.is_empty(),
         "another table never sees these rows"
     );
-
-    let refused = client
-        .list_active_streams(list_request(
-            tail_binding(owner_tenant),
-            "not-a-workload-token",
-        ))
-        .await
-        .expect_err("an unverifiable bearer is refused");
-    assert_eq!(refused.code(), Code::Unauthenticated);
     shutdown.cancel();
 
     server.shutdown().await.expect("server shuts down");

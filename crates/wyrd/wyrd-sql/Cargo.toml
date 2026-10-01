@@ -7,9 +7,6 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 
-[features]
-embedded-postgres = ["dep:pg-embed", "dep:rand", "dep:urlencoding"]
-
 [dependencies]
 blake3 = { workspace = true }
 chrono = { workspace = true }
@@ -32,18 +29,6 @@ wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-tls = { workspace = true }
-
-[dependencies.pg-embed]
-workspace = true
-optional = true
-
-[dependencies.rand]
-workspace = true
-optional = true
-
-[dependencies.urlencoding]
-workspace = true
-optional = true
 
 [dev-dependencies]
 workspace-hack.workspace = true

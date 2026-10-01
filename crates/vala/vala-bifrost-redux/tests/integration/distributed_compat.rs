@@ -62,7 +62,7 @@ impl WorkerResolver for NoWorkerCluster {
 /// is no longer shared.
 #[tokio::test]
 async fn oracle_session_shape_composes_with_the_distributed_planner_natively() {
-    let shape = OracleSessionShape::for_grant(512 * 1024 * 1024, 4, 4);
+    let shape = OracleSessionShape::new(4);
     let config = shape.session_config();
     let expected_partitions = config.options().execution.target_partitions;
     let expected_batch_size = config.options().execution.batch_size;

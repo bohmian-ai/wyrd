@@ -8,8 +8,7 @@ use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
 use wyrd_spec::vala::managed_columns::{
-    DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_ROW_ORDINAL,
-    is_reserved_managed_column,
+    WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_managed_column,
 };
 
 pub mod audit;
@@ -307,14 +306,7 @@ pub fn reject_reserved_domain_fields(
     let appended = policy.appended_correlation_columns();
     for name in user_fields {
         if is_reserved_managed_column(name)
-            || [
-                WYRD_EVENT_TIME,
-                WYRD_INGESTED_AT,
-                WYRD_BATCH_ID,
-                WYRD_ROW_ORDINAL,
-                DATA_TENANT_ID,
-            ]
-            .contains(name)
+            || [WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_BATCH_ID].contains(name)
             || appended.contains(name)
         {
             return Err(TableError::Internal(format!("reserved column: {name}")));
@@ -888,7 +880,7 @@ mod tests {
             assert_eq!(fingerprint, fingerprint_fields(&fields));
             let schema = (definition.schema)();
             assert!(schema.field_with_name(WYRD_EVENT_TIME).is_ok());
-            assert!(schema.field_with_name(DATA_TENANT_ID).is_ok());
+            assert!(schema.field_with_name("data_tenant_id").is_err());
             // Continuous high-rate OTel signals and gateway calls partition hourly. Retained
             // audit history and the five verification tables partition daily:
             // both are low-rate, both are read over date ranges rather than a
@@ -1126,8 +1118,7 @@ mod tests {
     /// path: every built-in plus each dynamic declaration class.
     ///
     /// Built-ins and dynamic tables run the same single resolution entry point,
-    /// so this proves in one place that the system injects no sort key, that
-    /// `data_tenant_id` appears in neither canonical list, that the managed
+    /// so this proves in one place that the system injects no sort key, that the managed
     /// Bloom floor is always present for schema-present columns, that the
     /// declared order is otherwise preserved, that omission and an explicit
     /// empty declaration resolve identically, and that every invalid class is
@@ -1140,7 +1131,6 @@ mod tests {
                 DataType::Timestamp(ArrowTimeUnit::Microsecond, None),
                 false,
             ),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
             Field::new(RUN_ID, DataType::Utf8, true),
             Field::new(CARD_UID, DataType::Utf8, true),
             Field::new(PRINCIPAL_ID, DataType::Utf8, true),
@@ -1159,8 +1149,7 @@ mod tests {
     /// Each built-in must resolve through the same
     /// [`crate::catalog::layout::PhysicalLayout::resolve`] entry point a caller
     /// uses, carry the managed Bloom floor for every column its schema actually
-    /// has, name only columns that exist, and name `data_tenant_id` in neither
-    /// canonical list. Re-resolving the stored wire form must reproduce it byte
+    /// has, and name only columns that exist. Re-resolving the stored wire form must reproduce it byte
     /// for byte, which is what proves the floor is unioned once rather than
     /// accreted on every load.
     ///
@@ -1208,12 +1197,6 @@ mod tests {
                     );
                 }
             }
-            assert!(
-                !canonical
-                    .bloom_columns()
-                    .contains(&DATA_TENANT_ID.to_owned()),
-                "{fqn} Blooms a per-file constant"
-            );
             for column in canonical.bloom_columns() {
                 assert!(
                     schema.field_with_name(column).is_ok(),
@@ -1221,11 +1204,6 @@ mod tests {
                 );
             }
             for key in canonical.sort_keys() {
-                assert_ne!(
-                    key.column(),
-                    DATA_TENANT_ID,
-                    "{fqn} sorts on a per-file constant"
-                );
                 assert!(
                     schema.field_with_name(key.column()).is_ok(),
                     "{fqn} sort column {} is absent from its schema",
@@ -1324,11 +1302,6 @@ mod tests {
             vec!["customer".to_owned(), WYRD_EVENT_TIME.to_owned()]
         );
         assert!(resolved.bloom_columns().contains(&"customer".to_owned()));
-        assert!(
-            !resolved
-                .bloom_columns()
-                .contains(&DATA_TENANT_ID.to_owned())
-        );
         for column in crate::catalog::layout::MANAGED_BLOOM_FLOOR {
             assert!(resolved.bloom_columns().contains(&column.to_owned()));
         }
@@ -1371,8 +1344,8 @@ mod tests {
                     partition_granularity: TimeGranularityWire::Hour,
                     sort_keys: vec![
                         sort_asc(WYRD_EVENT_TIME),
-                        sort_asc(DATA_TENANT_ID),
                         sort_asc(RUN_ID),
+                        sort_asc("customer"),
                         sort_asc(CARD_UID),
                         sort_asc(PRINCIPAL_ID),
                     ],
@@ -2049,7 +2022,7 @@ mod tests {
         let reserved = physical
             .fields()
             .iter()
-            .find(|field| field.name() == WYRD_ROW_ORDINAL)
+            .find(|field| field.name() == WYRD_BATCH_ID)
             .expect("the physical schema carries the reserved envelope")
             .clone();
         duplicated.push(reserved);

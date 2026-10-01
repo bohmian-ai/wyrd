@@ -100,6 +100,58 @@ mod pg_tests {
             );
         }
 
+        /// A batch chains its rows exactly like single appends: one gapless
+        /// sequence whose every `prev_hash` links the row before it, continued
+        /// seamlessly by the next single append, with the head on the last row.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture, append, commit, or read fails, or the chain
+        /// is not gapless and linked.
+        #[tokio::test]
+        async fn batch_append_continues_one_gapless_chain() {
+            let (fixture, superuser, tenant) = setup().await;
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let head = vala_sql::queries::audit_staging::append_audit_batch(
+                &mut conn,
+                &[event("op.a"), event("op.b"), event("op.c")],
+            )
+            .await
+            .unwrap();
+            conn.commit().await.unwrap();
+            assert_eq!(head, 3, "the head is the last batched row");
+            assert_eq!(append(fixture.app_pool(), tenant, "op.d").await, 4);
+
+            let rows: Vec<(i64, String, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+                "SELECT seq, operation, prev_hash, entry_hash FROM vala.audit_staging
+              WHERE data_tenant_id = $1 ORDER BY seq",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_all(&superuser)
+            .await
+            .unwrap();
+            let operations: Vec<&str> = rows.iter().map(|row| row.1.as_str()).collect();
+            assert_eq!(operations, ["op.a", "op.b", "op.c", "op.d"]);
+            assert_eq!(rows[0].2, ZERO_HASH, "row 1 prev_hash is 32 zero bytes");
+            for pair in rows.windows(2) {
+                assert_eq!(pair[1].0, pair[0].0 + 1, "sequence is gapless");
+                assert_eq!(pair[1].2, pair[0].3, "prev_hash links the row before");
+            }
+            let head_hash: Vec<u8> = sqlx::query_scalar(
+                "SELECT head_hash FROM vala.audit_chain_head WHERE data_tenant_id = $1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(&superuser)
+            .await
+            .unwrap();
+            assert_eq!(
+                head_hash, rows[3].3,
+                "head_hash tracks the latest entry_hash"
+            );
+        }
+
         /// The internal verification-result writer's admission decisions stage
         /// under the `system` principal kind.
         ///

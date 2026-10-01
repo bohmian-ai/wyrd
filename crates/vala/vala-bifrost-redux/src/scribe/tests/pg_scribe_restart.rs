@@ -6,7 +6,7 @@ use crate::scribe::ScribeImpl;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::NodeId;
 use crate::scribe::wal::{WalConfig, WalWriter};
-use arrow::array::{Int32Array, Int64Array};
+use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -16,18 +16,16 @@ use tempfile::TempDir;
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
-/// Encode a one-row replay payload with the required persisted row identity.
+/// Encode a one-row replay payload.
 fn batch_bytes(value: i64) -> Vec<u8> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("value", DataType::Int64, false),
-        Field::new("wyrd_row_ordinal", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![value])),
-            Arc::new(Int32Array::from(vec![0_i32])),
-        ],
+        vec![Arc::new(Int64Array::from(vec![value]))],
     )
     .expect("test batch");
     let mut bytes = Vec::new();
@@ -37,18 +35,16 @@ fn batch_bytes(value: i64) -> Vec<u8> {
     bytes
 }
 
-/// Encode a large replay payload with production-equivalent row ordinals.
+/// Encode a large replay payload.
 fn large_batch_bytes(value: i64) -> Vec<u8> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("value", DataType::Int64, false),
-        Field::new("wyrd_row_ordinal", DataType::Int32, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![value; 700_000])),
-            Arc::new(Int32Array::from_iter_values(0_i32..700_000_i32)),
-        ],
+        vec![Arc::new(Int64Array::from(vec![value; 700_000]))],
     )
     .expect("large test batch");
     let mut bytes = Vec::new();

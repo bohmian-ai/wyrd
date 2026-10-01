@@ -17,7 +17,6 @@ service BifrostQueryService {
 
 enum QueryTerminalOutcome { QUERY_TERMINAL_OUTCOME_UNSPECIFIED = 0; QUERY_TERMINAL_OUTCOME_SUCCESS = 1; QUERY_TERMINAL_OUTCOME_DEGRADED = 2; QUERY_TERMINAL_OUTCOME_FAILED = 3; }
 enum RunningQueryLifecycleState { RUNNING_QUERY_LIFECYCLE_STATE_UNSPECIFIED = 0; RUNNING_QUERY_LIFECYCLE_STATE_ADMITTED = 1; RUNNING_QUERY_LIFECYCLE_STATE_RUNNING = 2; RUNNING_QUERY_LIFECYCLE_STATE_CANCELLING = 3; }
-enum QueryExecutionPath { QUERY_EXECUTION_PATH_UNSPECIFIED = 0; QUERY_EXECUTION_PATH_INTERACTIVE = 1; QUERY_EXECUTION_PATH_ANALYTICAL = 2; }
 enum QuerySource { QUERY_SOURCE_UNSPECIFIED = 0; QUERY_SOURCE_ICEBERG = 1; QUERY_SOURCE_HOT_SEALED = 2; QUERY_SOURCE_LIVE_TAIL = 3; }
 enum SourceCompletionOutcome { SOURCE_COMPLETION_OUTCOME_UNSPECIFIED = 0; SOURCE_COMPLETION_OUTCOME_COMPLETE = 1; SOURCE_COMPLETION_OUTCOME_UNAVAILABLE = 2; }
 enum QueryWarning { QUERY_WARNING_UNSPECIFIED = 0; QUERY_WARNING_LIVE_TAIL_UNAVAILABLE = 1; QUERY_WARNING_STALE_CUT_REPLANNED = 2; }
@@ -32,6 +31,7 @@ enum QueryTerminalErrorCode {
   QUERY_TERMINAL_ERROR_CODE_CATALOG_UNREACHABLE = 7;
   QUERY_TERMINAL_ERROR_CODE_STORAGE_UNREACHABLE = 8;
   QUERY_TERMINAL_ERROR_CODE_QUERY_EXECUTION_FAILED = 9;
+  QUERY_TERMINAL_ERROR_CODE_QUERY_RESOURCES_EXHAUSTED = 10;
 }
 message BifrostQueryRequest {
   string sql = 1; optional uint64 deadline_ms = 4;
@@ -51,8 +51,9 @@ message QueryTerminalFrame {
   // Arrow IPC end-of-stream delta closing the query's single IPC stream.
   // Required on success/degraded, and empty on failure.
   bytes arrow_ipc_eos = 7;
-  // Server-selected execution path. Never a request field.
-  QueryExecutionPath execution_path = 8;
+  // Server-derived query class, which is also the path that ran. Never a
+  // request field.
+  QueryClass query_class = 8;
 }
 message QueryStreamFrame {
   oneof frame { QuerySchemaFrame schema = 1; QueryBatchFrame batch = 2; QueryTerminalFrame terminal = 3; }
@@ -105,13 +106,13 @@ message CancelOracleLifecycleRequest { string tenant_id = 1; string request_id =
 message CancelOracleLifecycleResponse { string request_id = 1; bool cancellation_started = 2; }
 message ReserveNodeSlotsRequest {
   bytes query_id = 1; string leader_node_id = 2; uint64 leader_fencing_token = 3;
-  QueryClass query_class = 4; uint32 slot_units = 5; uint64 expires_at_unix_ms = 6;
-  // Single-use reservation purpose ticket. The follower verifies it over the
-  // encoded request with this field cleared, before any capacity changes.
-  SignedPeerTicket ticket = 7;
-  // Present only when the reservation is taken for one distributed Analytical
-  // graph. Absent for a fragment reservation, which charges a worker quantum
-  // rather than a whole query envelope.
+  reserved 4, 5;
+  uint64 expires_at_unix_ms = 6;
+  // Typed reservation context. The follower checks it against the encoded
+  // request with this field cleared, before any capacity changes.
+  PeerContext context = 7;
+  // Required: the one distributed Analytical graph this reservation is taken
+  // for. Every reservation charges one query envelope on the follower.
   AnalyticalGraphRef graph = 8;
 }
 // Two-identity name of one distributed Analytical graph.
@@ -121,13 +122,14 @@ message PendingNodeReservation { bytes reservation_id = 1; uint64 expires_at_uni
 message ReservationRejected { uint32 retry_after_ms = 1; }
 message ReleaseNodeSlotsRequest {
   bytes reservation_id = 1; bytes query_id = 2; string leader_node_id = 3; uint64 leader_fencing_token = 4;
-  // Single-use release purpose ticket, verified exactly as the reserve ticket
-  // is and under its own distinct signing domain.
-  SignedPeerTicket ticket = 5;
+  // Typed release context, checked exactly as the reserve context is.
+  PeerContext context = 5;
 }
 message ReleaseNodeSlotsResponse {}
-message SignedPeerTicket { string key_id = 1; bytes claims_bytes = 2; bytes signature = 3; }
-message ForwardQueryRequest { SignedPeerTicket envelope = 1; }
+// Unsigned typed operation context on the mTLS-authenticated private plane.
+// The receiver validates every field against its own trusted state.
+message PeerContext { reserved 1, 3; reserved "key_id", "signature"; bytes claims_bytes = 2; }
+message ForwardQueryRequest { PeerContext context = 1; }
 message PersistedFileAssignment {
   reserved 1;
   reserved "files";
@@ -147,10 +149,9 @@ message IcebergFileDescriptor {
 }
 message ScribeProviderCut {
   uint64 writer_epoch = 1; TimePartition start_partition = 2; TimePartition end_partition = 3;
-  reserved 4, 5, 6;
-  reserved "required_columns", "persisted_cursor", "persisted_ranges";
-  uint32 maximum_batch_count = 7;
-  uint64 maximum_retained_bytes = 8;
+  reserved 4, 5, 6, 7, 8;
+  reserved "required_columns", "persisted_cursor", "persisted_ranges",
+    "maximum_batch_count", "maximum_retained_bytes";
 }
 enum ScanPredicateOp {
   SCAN_PREDICATE_OP_UNSPECIFIED = 0;
@@ -190,7 +191,7 @@ message FollowerScanAssignment {
   FollowerReaderCut reader_cut = 8;
 }
 message ExecuteFragmentRequest {
-  SignedPeerTicket ticket = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;
+  PeerContext context = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;
   OracleRoleFence leader_fence = 4; OracleRoleFence target_fence = 5;
   repeated FollowerScanAssignment assignments = 6; string plan_fingerprint = 7;
 }

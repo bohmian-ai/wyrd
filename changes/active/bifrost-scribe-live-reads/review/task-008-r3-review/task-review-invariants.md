@@ -1,0 +1,65 @@
+# Independent invariant review
+
+Result: **FAIL**, one proposed documentation finding. No new runtime invariant defect established. **FIND-007-4 is closed at the two residual declarations.**
+
+## Subject, authority, and limits
+
+Candidate `2f188cb6185061a43db36122aad68b5e253308d1`; remediation parent `9c3d7ecb982435919924dfa8e6930352b27a9b7e`; cumulative TASK-007 base `a7582db587c6170a290760f1741673125612b797`; TASK-008 base `f7bebf704d6f3b1dd20d041e70c6ca512c0da307`. HEAD was checked and remains the candidate.
+
+Inputs: subject.md, cumulative and final Git differences, approved spec revision 20 REQ-014/015 and associated invariants/AC-016/017, original TASK-007/008, prior final verdict and R3 remediation, TASK-006 benchmark diagnosis. Repository rules: supplied AGENTS.md, architecture/agent-rules.md, spec-driven-development, maintainer-style, applicable Wyrd design/doctrine, Bifrost design and DataFusion/OLAP references. No CodeGraph index. No current sibling discovery report was read.
+
+Current user authority supersedes earlier snapshot-size obligations: there is no live-read batch or byte cap. FIND-007-3, Postgres tenant columns, the accepted QueryTenantInvariant code, and benchmark qualification remain excluded as instructed. This review neither questions cap deletion nor proposes restoration. Static only: no cargo, nextest, mise, build, test, benchmark, commit or source edits. Supplied executed results are evidence attributed to the task author, not new proof by this reviewer.
+
+## Producer-to-consumer and lifecycle coverage
+
+- Authenticated assignment → Scribe ticket claims → v6 assignment digest → authenticated_preflight → tenant-qualified catalog schema/closure → FetchLiveTailRequest → shard snapshot. Removal of the two size fields does not remove writer epoch, partition validation, tenant binding, closure fingerprint or signed predicate authority. Proto field numbers and names 7/8 are reserved; conversions and digest encoding agree with the domain cut.
+- SealKey tenant/table/partition → writable/frozen memtable selection → projected shallow batches. Both maps remain locked during collection, durable generations are skipped, and remaining immutable generations retain their serving identity. FetchLiveTailService resolves staged sources after the memory cut and excludes already served generations. Cap deletion leaves these ownership/interlock decisions intact.
+- Returned memory rows → session-sized MemorySourceConfig; staged run references → shared HotParquetExec with the Scribe session pool and staged lease → shared predicate filter. The scan runs at the Scribe owner. No leader-side opening of a remote pod's staged path was introduced.
+- Authenticated table binding → writer ArtifactPlan/assembly request → BifrostFooterIdentity; Forge table binding → both to_core_config callers → rewrite writer properties. Footers include tenant alongside existing writer identity. PublishedFooterLoader and hot/staged tenant_proven_reader_metadata invoke the shared footer proof before constructing a decoding reader. Cache hits are proven again against the authenticated tenant. Missing/duplicated/foreign tenant is refused; no row-level check or missing-footer compatibility path remains.
+- Scribe follower output → NativeOutputTally → native completion or remote AttemptEncoder → LiveFrameDecoder → scan accumulator/query terminal. Fingerprint, row count, byte count, terminal requirement and single completion fold survive; local Arrow does not acquire IPC/hash work. Tenant refusal remains classified and audited once by the leader's existing nonblocking security append.
+- Configured data directory → BifrostDataRoot::prepare absolute(root) → locked/probed BifrostVolumeRoots → WAL identity, staged namespace, scratch and spill. The standard-library operation preserves filesystem identity and existing lock/probe/cleanup order. Staged run recovery derives paths from the recovered member directory plus validated file names (hot_stage.rs run_paths), so the absolute root reaches recovered as well as new run paths. No user table string is introduced into root/path resolution.
+- AppState shutdown token → build_peer_grpc → OraclePeerGrpc → select while pulling WorkerAttemptStream. Shutdown produces Unavailable instead of a successful footer; dropping that stream drops follower execution/source leases. Existing transport classification and leader terminal policy remain authoritative. Published Analytical stages use their separate graph lifecycle; this fragment change does not add retries or bypass tenant verification. The supplied remote-live-Scribe shutdown journey is relevant evidence, but does not establish transport backpressure behavior for every paused HTTP/2 consumer; no new universal immediate-termination claim is made here.
+- TASK-006 intersections: native/wire scan evidence is finalized after stream drain and accepted only with validated completion; process harness removal leaves production PeerCluster and real-server journeys; client URL/schema/example default corrections do not change tenant or query contracts. Their complete benchmark acceptance is outside this confirmation.
+
+## Acceptance matrix
+
+| Obligation | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| TASK-007 R1 / REQ-014: one staged/published Parquet scan, pruning, custom decoder removed | follower.rs live_leaf → HotParquetExec; exec.rs shared metadata/pruning; deleted staged_tail.rs and per-batch compilation | Retained scribe_staged_scan_prunes_non_matching_row_groups proof; supplied focused module/journey results | PASS |
+| TASK-007 R2/R3: memory engine source, signed pushdown, session partitions | follower.rs:775–864 MemorySourceConfig/session groups/common filter; live leaf target partitions and follower resource owner | Retained projection/filter/session-shape tests; supplied follower/live module results | PASS |
+| TASK-007 R4: native Arrow and unchanged terminal totals; remote encoding remains at boundary | dispatcher.rs NativeOutputTally; live.rs:735–758 native validation; peer_service.rs remote AttemptEncoder | Retained native reconciliation/terminal tests and peer service tests | PASS |
+| TASK-007 R5 / INV-004/006: role-local IO, grants and source lifetimes | follower.rs:815–844 staged reader/pool/lease; HotParquetExec lease ownership; signed preflight before source IO | Retained staged lease-drop/publication overlap and distributed live/published journeys | PASS |
+| TASK-008 R1: remove row tenant from schemas, writes, projections | managed_columns owners, writer/execution lane removal, OracleScanProjection and deleted tenant filter/tripwire/codec | Retained schema/writer assertions, no-row-tenant query closure journey | PASS |
+| TASK-008 R2: authenticated footer tenant, including Forge rewrites | footer.rs tenant field/value proof; writer/assembly identity; Forge managed executor both callers and policy writer properties | Retained writer/assembly footer tests and Forge recovery/promotion journeys | PASS |
+| TASK-008 R3/R6: absent/foreign footer refuses before file rows; no compatibility fallback | exec.rs:978–1049 PublishedFooterLoader; exec.rs:1115–1152 shared hot/staged proof; cache hit still verified | Retained foreign/missing unit proofs; supplied local/distributed count(*) refusal journey | PASS |
+| TASK-008 R4/R5: deleted per-row machinery; memory retains seal-bound authority | removed provider/tenant_filter and tripwire codec; memtable.rs:905–946 tenant/table/partition selection | Retained schema/codec/follower and write/flush/read results | PASS |
+| Tenant refusal and audit semantics preserved | oracle/mod.rs:2484–2520 first-refusal audit and is_tenant_refusal; QueryTenantInvariant reaches structured terminal | Retained tenant-isolation/journey results; static call tracing | PASS |
+| R3 / FIND-007-4: exact types through imported names | bifrost_catalog.rs top-level IcebergError alias and provider_error; oracle/mod.rs existing DataFusionError and is_tenant_refusal | Final diff shows declaration/import spelling only | PASS, CLOSED |
+| Approved cap deletion: no residual executable cap, no signed wire mismatch | memtable Vec collector; shards merge; tail request/cut deleted fields; proto reserved names; v6 digest shorter by 12 bytes | Supplied spec 897/897, conversion 14/14, focused redux 105/105 and distributed 7/7; static removed-name search | PASS |
+| Deleted-cap references in governing architecture accurately describe current behavior | bifrost-design.md:311–313 still claims retained-byte and batch-count enforcement in live-fragment path | Static comparison with removed collector/request/cut fields; no runtime test needed | FAIL, proposal INV-R3-1 |
+| Absolute staged paths from one root, restart/lock semantics retained | data_root.rs:96–109 absolute before child derivation; boot/mod.rs prepare/volume injection; hot_stage.rs:530 run_paths | Supplied relative-root RED/GREEN test; static new/recovered path trace | PASS |
+| Shutdown fragment cancellation fails without a successful footer and releases execution | grpc/mod.rs:417–425 same shutdown token; peer_service.rs:572–599 select/unavailable; native completion remains conditional on drain | Supplied remote_live_scribe_drop_releases_query 12.5s result; existing failure classes | PASS for reviewed pull-stream path |
+| INV-001, ownership and adjacent service boundaries | No ACK/WAL/publication fence/retirement change in cap/root/shutdown delta; root lock retained; typed failure remains stream-scoped | Static cumulative owners and final diff | PASS |
+| Non-goals and immutable/static constraints | No cap restoration, PG migration demand, FIND-007-3 reopening or benchmark-completion claim | Read-only source inspection; unchanged HEAD | PASS |
+
+PASS reflects source plus supplied verification; capacity acceptance remains caller-owned. Generic references to a “bounded snapshot” in tail_rpc.rs/shards.rs are not independently proposed defects: tenant/time/source scope and source/query lifetime remain finite. The concrete false count/byte enforcement statement below is distinguishable from those generic bounds.
+
+## Proposed finding
+
+### INV-R3-1 — deleted live snapshot cap still advertised by active Bifrost authority
+
+Classification: **INCORRECT** documentation / incomplete follow-on correction. Governing obligation: current user explicitly requests checking leftover references to the deleted cap; active architecture must reflect approved behavior (AGENTS.md §§1–2 and completion authority).
+
+Location: `architecture/bifrost-design.md:311–313`, “Projection, signed predicate, physical partition, retained bytes, batch count, deadline, and cancellation are enforced.” This is the paragraph describing Scribe's active/immutable/staged live fragment path.
+
+Evidence: the producer no longer carries count/byte limits (`ScribeProviderCut`, FetchLiveTailRequest and ProviderCut); the collector and shard merger no longer check snapshot count/retained bytes; the only count/byte field occurrences remaining in executable contract searches are their reserved proto names. The query memory pool governs execution retention, while NativeOutputTally/LiveFrameDecoder count delivered bytes/rows for terminal reconciliation; neither mechanism is the deleted snapshot admission cap or a snapshot batch-count ceiling. Thus the listed retained-byte/batch enforcement cannot be read as still implemented snapshot admission.
+
+Consequence: the governing live-fragment architecture falsely promises the cap the maintainer explicitly deleted, inviting a future implementation or review to restore that behavior and reproduce the diagnosed 503. This is a concrete current-source/document contract disagreement, not a request for new memory accounting or cap reinstatement.
+
+Smallest correction: update this existing paragraph to describe shallow, uncapped snapshots and query-pool execution retention, preserving tenant/projection/partition/deadline/cancellation/source-lifetime assertions. Do not add a new mechanism or cap. Generic “bounded snapshot” phrases alone need not be removed when they describe range/source scope rather than numerical limits.
+
+Focused closure proof: static comparison of the revised paragraph with the existing cut/request/collector and follower memory-pool ownership; remove numerical snapshot-cap promises and preserve remaining invariants. No new test/harness is needed for this prose correction; ordinary docs verification can remain in the separately authorized execution workflow.
+
+## Prior closures and outcome
+
+FIND-007-4 closes: module-level IcebergError import preserves the catalog error type, and is_tenant_refusal reuses the existing imported DataFusionError. Earlier declared runtime corrections (partition shape, native reconciliation, lease retention, evidence attribution) remain in the cumulative source; R2 whitespace normalization is not undone. No new runtime finding is proposed. The only proposed failure is the concrete deleted-cap architecture leftover, subject to fresh independent validation.

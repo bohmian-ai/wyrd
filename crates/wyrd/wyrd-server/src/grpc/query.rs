@@ -6,6 +6,7 @@ use futures_util::Stream;
 use vala_bifrost_redux::oracle::OracleQueryStream;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::BifrostError;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::bifrost_query_service_server::{
     BifrostQueryService, BifrostQueryServiceServer,
@@ -252,10 +253,17 @@ pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response<Query
 }
 
 /// Converts a public Wyrd error to its closest tonic status class.
+///
+/// `retry-after-ms` rides only on retryable overload (429) and readiness (503)
+/// classes. An admitted query that exhausted its execution memory is also 503
+/// but carries no hint: retrying it unchanged meets the same limit.
 pub(crate) fn query_status(error: WyrdError) -> Status {
-    // Retryability is read before the error moves: only the transient capacity
-    // and readiness classes this surface already retried keep the hint.
-    let retryable = matches!(error.status(), 429 | 503);
+    // Retryability is read before the error moves.
+    let retryable = match error.status() {
+        429 => true,
+        503 => error.code() != BifrostError::QueryResourcesExhausted.code(),
+        _ => false,
+    };
     let mut status = wyrd_tonic::error::wyrd_error_to_status(error, None);
     if retryable {
         status.metadata_mut().insert(
@@ -467,6 +475,36 @@ mod tests {
         }
     }
 
+    /// Admitted-query memory exhaustion is gRPC `UNAVAILABLE` with its stable
+    /// code and no retry hint, while readiness 503s keep theirs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the resource failure maps to another class, carries a retry
+    /// hint, or loses its stable code, or when readiness loses its hint.
+    #[test]
+    fn resource_failure_has_no_retry_hint() {
+        let status = query_status(BifrostError::QueryResourcesExhausted.into());
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(status.metadata().get("retry-after-ms").is_none());
+        let bytes = status
+            .metadata()
+            .get_bin(wyrd_tonic::error::WYRD_ERROR_HEADER)
+            .expect("query problem envelope")
+            .to_bytes()
+            .expect("decodable problem envelope");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("problem json document");
+        assert_eq!(body["code"], "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED");
+        assert!(
+            query_status(BifrostError::OracleRoleUnavailable.into())
+                .metadata()
+                .get("retry-after-ms")
+                .is_some(),
+            "readiness unavailability stays retryable"
+        );
+    }
+
     /// The canonical Wyrd problem envelope carries every public query error.
     ///
     /// Stable capacity and poison codes are read from the same `wyrd-error-bin`
@@ -503,7 +541,7 @@ mod tests {
             schema_frame(),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
@@ -542,7 +580,7 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 1,
                 warnings: vec![QueryWarning::LiveTailUnavailable],
                 source_completion: degraded_sources,
@@ -557,7 +595,7 @@ mod tests {
             }),
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Failed,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
+                query_class: wyrd_spec::vala::api::QueryClass::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),

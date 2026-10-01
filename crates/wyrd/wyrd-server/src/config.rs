@@ -14,7 +14,6 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use url::Url;
-use vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_auth_oidc::{AddressPolicy, ScreenedHttp};
 use wyrd_crypt::SecretKey;
@@ -202,15 +201,13 @@ impl BifrostTarget {
         matches!(self, Self::All | Self::Server | Self::Oracle | Self::Scribe)
     }
 
-    /// Returns whether this target must open the private Bifrost peer listener.
+    /// Returns whether this target owns only part of the Scribe/Oracle pair.
     ///
-    /// Peer-listener activation follows selected roles, never the transport
-    /// `ServeMode`: any Scribe- or Oracle-bearing target participates in the
-    /// peer plane and must be dialable by its peers, while a Forge worker keeps
-    /// using its durable assignment path and opens no peer socket.
+    /// A split target cannot reach its counterpart in-process, so it runs only
+    /// in explicit peer mode.
     #[must_use]
-    pub fn serves_peer(self) -> bool {
-        matches!(self, Self::All | Self::Server | Self::Oracle | Self::Scribe)
+    pub fn requires_peer(self) -> bool {
+        matches!(self, Self::Oracle | Self::Scribe)
     }
 }
 
@@ -497,9 +494,10 @@ pub struct OracleRuntimeConfig {
     /// Calibration profile path.
     #[serde(default)]
     pub calibration_profile: PathBuf,
-    /// Whether development may start Oracle from an absent or candidate profile.
+    /// Whether development may start Oracle from a candidate profile.
     ///
-    /// Production ignores this switch and always requires an approved profile.
+    /// Production ignores this switch and always requires a supplied profile
+    /// to be approved.
     #[serde(default)]
     pub allow_unapproved_profile: bool,
 }
@@ -694,28 +692,19 @@ fn translate_oracle_calibration(
         profile.class.analytical.minimum_slots,
         "class.analytical.minimum_slots",
     )?;
-    let interactive = checked_floor_u32(
+    let interactive_slots = checked_floor_u32(
         f64::from(usable) * profile.class.interactive.share,
         "interactive class allocation",
     )?
     .max(interactive_minimum)
     .max(1);
-    let analytical_allocation = checked_floor_u32(
+    // Every query holds one slot unit, so any positive Analytical allocation
+    // admits at least one query and zero disables the class.
+    let analytical_slots = checked_floor_u32(
         f64::from(usable) * profile.class.analytical.share,
         "analytical class allocation",
     )?
     .max(analytical_minimum);
-    // An Analytical maximum below one query's cost can never admit a query, so
-    // it is not a small class — it is no class. Fold the remainder into the
-    // Interactive floor rather than advertising capacity that always refuses.
-    let analytical_slots = if analytical_allocation < ANALYTICAL_QUERY_SLOT_UNITS {
-        0
-    } else {
-        analytical_allocation
-    };
-    let interactive_slots = interactive
-        .checked_add(analytical_allocation - analytical_slots)
-        .ok_or_else(|| "Oracle interactive allocation exceeds u32".to_owned())?;
     let allocation_sum = interactive_slots
         .checked_add(analytical_slots)
         .ok_or_else(|| "Oracle class allocation sum exceeds u32".to_owned())?;
@@ -725,8 +714,7 @@ fn translate_oracle_calibration(
         ));
     }
     let interactive_limit = proposal_u32(&profile.proposal, "tenant.interactive_slot_limit")?;
-    let analytical_limit =
-        proposal_u32_allowing_zero(&profile.proposal, "tenant.analytical_slot_limit")?;
+    let analytical_limit = proposal_u32(&profile.proposal, "tenant.analytical_slot_limit")?;
     // Interactive may borrow the whole local total, so its tenant cap is bounded
     // by that total rather than by the protected floor. A cap outside its class
     // bounds is rejected: silently rewriting it would run a capacity contract
@@ -736,16 +724,11 @@ fn translate_oracle_calibration(
             "tenant.interactive_slot_limit {interactive_limit} must be between 1 and {allocation_sum}"
         ));
     }
-    if analytical_slots == 0 {
-        if analytical_limit != 0 {
-            return Err(format!(
-                "tenant.analytical_slot_limit {analytical_limit} must be 0 when Analytical is disabled"
-            ));
-        }
-    } else if !(ANALYTICAL_QUERY_SLOT_UNITS..=analytical_slots).contains(&analytical_limit) {
+    // The class minimum is positive, so a calibrated split always admits
+    // Analytical work and its tenant cap is positive too.
+    if analytical_limit > analytical_slots {
         return Err(format!(
-            "tenant.analytical_slot_limit {analytical_limit} must be between \
-             {ANALYTICAL_QUERY_SLOT_UNITS} and {analytical_slots}"
+            "tenant.analytical_slot_limit {analytical_limit} must be between 1 and {analytical_slots}"
         ));
     }
     Ok(OracleAdmissionTranslation {
@@ -825,25 +808,6 @@ fn proposal_u64(table: &toml::Table, path: &str) -> Result<u64, String> {
 fn proposal_u32(table: &toml::Table, path: &str) -> Result<u32, String> {
     u32::try_from(proposal_u64(table, path)?)
         .map_err(|_| format!("proposal.{path}.value exceeds u32"))
-}
-
-/// Reads one calibration proposal capacity leaf that may legitimately be zero.
-///
-/// The Analytical per-tenant slot cap is zero exactly when the local split
-/// disables the class, so it cannot share the positive-only reader every other
-/// capacity leaf uses.
-///
-/// # Errors
-/// Returns an error when the leaf is missing, non-numeric, negative, or exceeds
-/// `u32`.
-fn proposal_u32_allowing_zero(table: &toml::Table, path: &str) -> Result<u32, String> {
-    let value = calibration_evidence_value(table, path)?;
-    let raw = value
-        .as_integer()
-        .or_else(|| value.as_float().map(|value| value as i64))
-        .filter(|value| *value >= 0)
-        .ok_or_else(|| format!("proposal.{path}.value must be non-negative"))?;
-    u32::try_from(raw).map_err(|_| format!("proposal.{path}.value exceeds u32"))
 }
 
 /// Closed activation status accepted from an Oracle calibration profile.
@@ -1127,142 +1091,138 @@ impl BifrostRuntimeConfig {
     }
 }
 
-/// Signing and verification material for the independent peer-ticket keyring.
+/// Explicit peer mode: the private Bifrost listener and its mTLS transport.
 ///
-/// Peer purpose tickets are signed with a key that is deliberately separate
-/// from the north-south workload/JWT signing key, so a user or API token can
-/// never be minted into peer authority. All three inputs are file paths;
-/// inline private-key values are prohibited.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PeerTicketKeyringConfig {
-    /// Key ID stamped into every ticket this process issues.
-    #[serde(default)]
-    pub active_key_id: Option<String>,
-    /// PKCS#8 PEM Ed25519 private key used for issuance.
-    #[serde(default)]
-    pub signing_key_path: Option<PathBuf>,
-    /// Versioned JSON manifest of accepted verification keys.
-    #[serde(default)]
-    pub verifying_keyring_path: Option<PathBuf>,
-}
-
-impl PeerTicketKeyringConfig {
-    /// Reports whether every keyring input is present.
-    #[must_use]
-    pub(crate) fn is_complete(&self) -> bool {
-        self.active_key_id
-            .as_ref()
-            .is_some_and(|value| !value.trim().is_empty())
-            && self.signing_key_path.is_some()
-            && self.verifying_keyring_path.is_some()
-    }
-
-    /// Reports whether no keyring input is present.
-    #[must_use]
-    fn is_absent(&self) -> bool {
-        self.active_key_id.is_none()
-            && self.signing_key_path.is_none()
-            && self.verifying_keyring_path.is_none()
-    }
-}
-
-/// Role-neutral configuration for the private Bifrost peer listener and transport.
-///
-/// One `wyrd-server` process owns exactly one peer plane. The same certificate,
-/// trust root, workload credential, and ticket keyring serve both directions:
-/// the private listener presents them to accept inbound peer traffic, and the
-/// outbound transport presents them when dialing another replica. Nothing here
-/// is Oracle- or Scribe-specific.
+/// Absent by default. A process without it runs its co-located Scribe,
+/// Oracle, and Forge in-process and opens no private socket. Peer mode is
+/// enabled by supplying both `address` and `tls_dir`, even for the first of
+/// several replicas; each replica publishes its own address through the
+/// existing fenced `vala.cluster_nodes` membership.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostPeerConfig {
     /// Socket address the private peer listener binds.
     #[serde(default = "default_peer_bind")]
     pub bind: SocketAddr,
-    /// Exact peer URI this replica publishes into role membership.
+    /// Runtime-supplied `host:port` peers dial this replica at.
+    ///
+    /// Published as `https://{address}`; never inferred from `bind`.
     #[serde(default)]
-    pub advertise_addr: Option<String>,
-    /// Dedicated Bifrost peer certificate authority trust root.
+    pub address: Option<String>,
+    /// Directory holding the cluster bundle: `ca.crt`, `tls.crt`, `tls.key`.
     #[serde(default)]
-    pub ca_certificate_path: Option<PathBuf>,
-    /// Dual-EKU leaf chain presented as both server and client identity.
-    #[serde(default)]
-    pub certificate_chain_path: Option<PathBuf>,
-    /// Private key paired with `certificate_chain_path`.
-    #[serde(default)]
-    pub private_key_path: Option<PathBuf>,
-    /// DNS SAN every peer certificate must carry and every dial verifies.
-    #[serde(default)]
-    pub server_name: Option<String>,
-    /// Workload API key authenticating this process as the peer Service principal.
-    #[serde(default, skip_serializing)]
-    pub api_key: Option<String>,
-    /// Independent peer-ticket signing and verification material.
-    #[serde(default)]
-    pub ticket: PeerTicketKeyringConfig,
-    /// Maximum concurrent canonical denial-audit records for refused peer traffic.
-    #[serde(default = "default_peer_denial_audit_concurrency")]
-    pub denial_audit_concurrency: usize,
+    pub tls_dir: Option<PathBuf>,
 }
 
 impl Default for BifrostPeerConfig {
-    /// Produces the unconfigured peer plane used by non-peer targets and tests.
+    /// Produces the disabled peer plane of the default single-process target.
     fn default() -> Self {
         Self {
             bind: default_peer_bind(),
-            advertise_addr: None,
-            ca_certificate_path: None,
-            certificate_chain_path: None,
-            private_key_path: None,
-            server_name: None,
-            api_key: None,
-            ticket: PeerTicketKeyringConfig::default(),
-            denial_audit_concurrency: default_peer_denial_audit_concurrency(),
+            address: None,
+            tls_dir: None,
         }
     }
 }
 
 impl BifrostPeerConfig {
-    /// Reports whether every mandatory peer input is present.
-    ///
-    /// A peer-bearing target requires all of them; a partially configured peer
-    /// plane is a boot failure rather than a silently degraded listener.
+    /// Reports whether any peer-mode input was supplied.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        self.ca_certificate_path.is_some()
-            && self.certificate_chain_path.is_some()
-            && self.private_key_path.is_some()
-            && self
-                .server_name
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
-            && self
-                .advertise_addr
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
-            && self
-                .api_key
-                .as_ref()
-                .is_some_and(|value| !value.trim().is_empty())
-            && self.ticket.is_complete()
+    pub fn is_enabled(&self) -> bool {
+        self.address.is_some() || self.tls_dir.is_some()
     }
 
-    /// Reports whether no peer input at all is present.
-    ///
-    /// Used to distinguish "this deployment has not configured the peer plane"
-    /// from "this deployment configured it incompletely"; only the latter is
-    /// reported as a partial-configuration error.
+    /// Returns the membership URI for a validated peer address.
     #[must_use]
-    fn is_absent(&self) -> bool {
-        self.ca_certificate_path.is_none()
-            && self.certificate_chain_path.is_none()
-            && self.private_key_path.is_none()
-            && self.server_name.is_none()
-            && self.advertise_addr.is_none()
-            && self.api_key.is_none()
-            && self.ticket.is_absent()
+    pub fn advertised_uri(&self) -> Option<String> {
+        self.address
+            .as_ref()
+            .map(|address| format!("https://{address}"))
     }
+
+    /// Reads the cluster bundle when peer mode is enabled.
+    ///
+    /// Returns `Ok(None)` for the default in-process deployment, which reads no
+    /// certificate files and opens no peer socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the file when any of `ca.crt`, `tls.crt`, or
+    /// `tls.key` cannot be read, or when the key is not UTF-8 PEM text.
+    pub fn read_bundle(&self) -> Result<Option<PeerTlsBundle>, String> {
+        let Some(dir) = self.tls_dir.as_deref().filter(|_| self.is_enabled()) else {
+            return Ok(None);
+        };
+        let read = |name: &str| {
+            let path = dir.join(name);
+            std::fs::read(&path)
+                .map_err(|error| format!("failed to read peer TLS {}: {error}", path.display()))
+        };
+        let private_key = String::from_utf8(read("tls.key")?)
+            .map_err(|_| "peer TLS tls.key is not PEM text".to_owned())?;
+        Ok(Some(PeerTlsBundle {
+            ca_certificate: read("ca.crt")?,
+            certificate_chain: read("tls.crt")?,
+            private_key: secrecy::SecretString::from(private_key),
+        }))
+    }
+
+    /// Validates the explicit peer-mode inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Invalid`] when only one of `address` and
+    /// `tls_dir` is supplied, or when `address` is not a bare `host:port`.
+    fn validate(&self) -> Result<(), ConfigError> {
+        let (address, tls_dir) = match (&self.address, &self.tls_dir) {
+            (None, None) => return Ok(()),
+            (Some(address), Some(tls_dir)) => (address, tls_dir),
+            _ => {
+                return Err(ConfigError::Invalid {
+                    message: "peer mode requires both WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR"
+                        .to_owned(),
+                });
+            }
+        };
+        if tls_dir.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid {
+                message: "WYRD_PEER_TLS_DIR must name a directory".to_owned(),
+            });
+        }
+        let parsed = url::Url::parse(&format!("https://{address}")).ok();
+        let bare_host_port = parsed.as_ref().is_some_and(|url| {
+            url.host_str().is_some_and(|host| !host.is_empty())
+                && url.port().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && !address.ends_with('/')
+        });
+        if !bare_host_port {
+            return Err(ConfigError::Invalid {
+                message: format!("WYRD_PEER_ADDRESS must be host:port, got {address:?}"),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Fixed DNS identity every peer leaf certificate carries and every peer dials.
+///
+/// The dedicated cluster CA plus this one name is the whole peer trust model:
+/// it admits a trusted cluster process, never a tenant.
+pub const PEER_SERVER_NAME: &str = "wyrd-peer";
+
+/// The PEM cluster bundle read from [`BifrostPeerConfig::tls_dir`].
+pub struct PeerTlsBundle {
+    /// Dedicated cluster CA certificate (`ca.crt`).
+    pub ca_certificate: Vec<u8>,
+    /// This replica's leaf certificate chain (`tls.crt`).
+    pub certificate_chain: Vec<u8>,
+    /// This replica's private key (`tls.key`).
+    pub private_key: secrecy::SecretString,
 }
 
 /// Canonical deployed private peer port.
@@ -1273,12 +1233,14 @@ fn default_peer_bind() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 50052))
 }
 
-/// Default bound on concurrent canonical denial-audit work for refused peers.
+/// Reports whether two listener binds would contend for the same socket.
 ///
-/// Invalid peer traffic must not amplify into unbounded audit tasks, so the
-/// refusal path is capped well below normal request concurrency.
-fn default_peer_denial_audit_concurrency() -> usize {
-    16
+/// Equal ports collide when the addresses are equal or either one is the
+/// unspecified wildcard, because a wildcard listener also claims the port on
+/// every specific address (`0.0.0.0:50052` against `127.0.0.1:50052`).
+fn binds_overlap(left: SocketAddr, right: SocketAddr) -> bool {
+    left.port() == right.port()
+        && (left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified())
 }
 
 /// Optional storage I/O bounds for this node's one Bifrost storage owner.
@@ -1331,28 +1293,26 @@ impl BifrostStorageIoConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostResourceConfig {
-    /// Optional process memory cap; detection may select a tighter bound.
+    /// Optional lower cap on the one shared Bifrost memory budget.
+    ///
+    /// Unset, the cap is the detected process memory limit less
+    /// [`Self::server_memory_min_bytes`]. A value may only lower that figure;
+    /// boot refuses zero or anything above it rather than clamping.
     #[serde(default)]
     pub memory_limit_bytes: Option<usize>,
-    /// Optional unmanaged process reserve, never below 256 MiB.
+    /// Minimum process memory left to non-Bifrost server work, in bytes.
+    ///
+    /// Defaults to 1 GiB and may only rise. It is accounting headroom, not a
+    /// reservation or a server cap; boot refuses a value below the default or
+    /// one that leaves Bifrost no memory.
     #[serde(default)]
-    pub unmanaged_reserve_bytes: Option<usize>,
+    pub server_memory_min_bytes: Option<usize>,
     /// Optional disposable scratch cap; filesystem availability may be tighter.
     #[serde(default)]
     pub scratch_limit_bytes: Option<u64>,
     /// Optional effective CPU cap; process/cgroup affinity may be tighter.
     #[serde(default)]
     pub effective_cpu: Option<usize>,
-    /// Optional explicit Forge compaction memory budget for this node, in bytes.
-    ///
-    /// When unset the plan derives four fifths of the resolved process memory
-    /// limit. An explicit value replaces that default outright: it is a capacity
-    /// decision, not a detected bound, so it may raise as well as lower the
-    /// derived figure. Boot refuses a Forge-enabled process whose selected
-    /// budget is zero or exceeds the memory left by the protected Scribe and
-    /// Oracle floors; there is no clamp.
-    #[serde(default)]
-    pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional Oracle query slot-unit concurrency limit for this node.
     ///
     /// Unlike the caps above this is a capacity decision rather than a detected
@@ -1360,6 +1320,33 @@ pub struct BifrostResourceConfig {
     /// derives twice effective CPU, never below the portable slot-unit floor.
     #[serde(default)]
     pub oracle_query_slot_limit: Option<usize>,
+}
+
+impl BifrostResourceConfig {
+    /// Projects these operator settings onto the checked resource policy.
+    ///
+    /// This is the only translation from server configuration to Bifrost
+    /// resource planning, so boot and tests resolve the same shared cap from
+    /// the same fields. Validation happens where the policy meets an
+    /// observation, never here.
+    #[must_use]
+    pub fn policy(
+        &self,
+        roles: std::collections::BTreeSet<vala_bifrost_redux::resources::BifrostRole>,
+        scratch_root: Option<PathBuf>,
+        volume_roots: Option<vala_bifrost_redux::resources::BifrostVolumeRoots>,
+    ) -> vala_bifrost_redux::resources::BifrostResourcePolicy {
+        vala_bifrost_redux::resources::BifrostResourcePolicy {
+            roles,
+            server_memory_min_bytes: self.server_memory_min_bytes,
+            bifrost_memory_limit_bytes: self.memory_limit_bytes,
+            scratch_limit_bytes: self.scratch_limit_bytes,
+            effective_cpu: self.effective_cpu,
+            oracle_query_slot_limit: self.oracle_query_slot_limit,
+            scratch_root,
+            volume_roots,
+        }
+    }
 }
 
 /// Derives the dedicated Scribe coordination-runtime worker count.
@@ -1579,11 +1566,6 @@ impl ScribeRuntimeConfig {
             self.seal_key_early_seal_bytes,
             self.seal_key_max_age_secs.map(Duration::from_secs),
             on_disk_bytes.min(forge_target_file_size_bytes),
-            self.ingest_request_bytes,
-            vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
-            vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
-            vala_bifrost_redux::scribe::geometry::DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
-            vala_bifrost_redux::scribe::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
         )
     }
 
@@ -1792,12 +1774,6 @@ pub struct GrpcConfig {
     /// Whether to expose gRPC server reflection.
     #[serde(default)]
     pub reflection_enabled: bool,
-    /// PEM certificate chain served by the gRPC listener.
-    #[serde(default)]
-    pub certificate_chain_path: Option<PathBuf>,
-    /// PEM private key paired with `certificate_chain_path`.
-    #[serde(default)]
-    pub private_key_path: Option<PathBuf>,
 }
 
 /// Database connection pool configuration.
@@ -2395,8 +2371,6 @@ impl Default for GrpcConfig {
         Self {
             bind: default_grpc_bind(),
             reflection_enabled: false,
-            certificate_chain_path: None,
-            private_key_path: None,
         }
     }
 }
@@ -2541,9 +2515,9 @@ impl WyrdServerConfig {
             "WYRD_BIFROST_MEMORY_LIMIT_BYTES",
             self.bifrost.resources.memory_limit_bytes,
         )?;
-        self.bifrost.resources.unmanaged_reserve_bytes = parse_optional_env(
-            "WYRD_BIFROST_UNMANAGED_RESERVE_BYTES",
-            self.bifrost.resources.unmanaged_reserve_bytes,
+        self.bifrost.resources.server_memory_min_bytes = parse_optional_env(
+            "WYRD_SERVER_MEMORY_MIN_BYTES",
+            self.bifrost.resources.server_memory_min_bytes,
         )?;
         self.bifrost.resources.scratch_limit_bytes = parse_optional_env(
             "WYRD_BIFROST_SCRATCH_LIMIT_BYTES",
@@ -2556,10 +2530,6 @@ impl WyrdServerConfig {
         self.bifrost.resources.oracle_query_slot_limit = parse_optional_env(
             "WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT",
             self.bifrost.resources.oracle_query_slot_limit,
-        )?;
-        self.bifrost.resources.forge_compaction_memory_limit_bytes = parse_optional_env(
-            "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
-            self.bifrost.resources.forge_compaction_memory_limit_bytes,
         )?;
         self.forge.target_file_size_bytes = parse_optional_env(
             "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
@@ -2638,12 +2608,6 @@ impl WyrdServerConfig {
         if let Some(val) = env_opt("WYRD_GRPC_REFLECTION")? {
             self.grpc.reflection_enabled = parse_flag(&val, "WYRD_GRPC_REFLECTION")?;
         }
-        if let Some(val) = env_opt("WYRD_GRPC_CERTIFICATE_CHAIN_FILE")? {
-            self.grpc.certificate_chain_path = Some(PathBuf::from(val));
-        }
-        if let Some(val) = env_opt("WYRD_GRPC_PRIVATE_KEY_FILE")? {
-            self.grpc.private_key_path = Some(PathBuf::from(val));
-        }
         if let Some(val) = env_opt("WYRD_BIFROST_PEER_BIND_ADDR")? {
             self.bifrost.peer.bind =
                 val.parse::<SocketAddr>()
@@ -2653,32 +2617,11 @@ impl WyrdServerConfig {
                         ),
                     })?;
         }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_ADVERTISE_ADDR")? {
-            self.bifrost.peer.advertise_addr = Some(val);
+        if let Some(val) = env_opt("WYRD_PEER_ADDRESS")? {
+            self.bifrost.peer.address = Some(val);
         }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_CA_CERTIFICATE_PATH")? {
-            self.bifrost.peer.ca_certificate_path = Some(PathBuf::from(val));
-        }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_CERTIFICATE_CHAIN_PATH")? {
-            self.bifrost.peer.certificate_chain_path = Some(PathBuf::from(val));
-        }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_PRIVATE_KEY_PATH")? {
-            self.bifrost.peer.private_key_path = Some(PathBuf::from(val));
-        }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_SERVER_NAME")? {
-            self.bifrost.peer.server_name = Some(val);
-        }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_API_KEY")? {
-            self.bifrost.peer.api_key = Some(val);
-        }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_TICKET_ACTIVE_KEY_ID")? {
-            self.bifrost.peer.ticket.active_key_id = Some(val);
-        }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_TICKET_SIGNING_KEY_PATH")? {
-            self.bifrost.peer.ticket.signing_key_path = Some(PathBuf::from(val));
-        }
-        if let Some(val) = env_opt("WYRD_BIFROST_PEER_TICKET_VERIFYING_KEYRING_PATH")? {
-            self.bifrost.peer.ticket.verifying_keyring_path = Some(PathBuf::from(val));
+        if let Some(val) = env_opt("WYRD_PEER_TLS_DIR")? {
+            self.bifrost.peer.tls_dir = Some(PathBuf::from(val));
         }
 
         // telemetry.endpoint
@@ -2907,36 +2850,30 @@ impl WyrdServerConfig {
                 .validate()
                 .map_err(|message| ConfigError::Invalid { message })?;
             self.validate_oracle_calibration()?;
-
-            if self.grpc.certificate_chain_path.is_some() != self.grpc.private_key_path.is_some() {
-                return Err(ConfigError::Invalid {
-                    message: "grpc certificate_chain_path and private_key_path must be configured together"
-                        .to_owned(),
-                });
-            }
         }
 
-        // The private peer plane is one all-or-nothing contract. A peer-bearing
-        // target that configured it partially would otherwise boot a listener
-        // that cannot verify, dial, or authorize, so a partial state fails here
-        // rather than at first peer contact.
-        if !self.bifrost.peer.is_absent() && !self.bifrost.peer.is_complete() {
+        // Peer mode is explicit and all-or-nothing. A split Scribe or Oracle
+        // target cannot reach its counterpart in-process and needs it; a Forge
+        // worker keeps its durable assignment path and never opens the socket.
+        self.bifrost.peer.validate()?;
+        if self.role.requires_peer() && !self.bifrost.peer.is_enabled() {
             return Err(ConfigError::Invalid {
-                message: "bifrost.peer requires ca_certificate_path, certificate_chain_path, \
-                          private_key_path, server_name, advertise_addr, api_key, and a complete \
-                          ticket keyring to be configured together"
+                message: "split oracle and scribe targets require peer mode \
+                          (WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR)"
                     .to_owned(),
             });
         }
-        if self.role.serves_peer() && self.bifrost.peer.denial_audit_concurrency == 0 {
+        if !serves_api && self.bifrost.peer.is_enabled() {
             return Err(ConfigError::Invalid {
-                message: "bifrost.peer.denial_audit_concurrency must be positive".to_owned(),
+                message: "the forge-worker target serves no peer listener; \
+                          unset WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR"
+                    .to_owned(),
             });
         }
-        if self.role.serves_peer()
+        if self.bifrost.peer.is_enabled()
             && serves_api
-            && (self.bifrost.peer.bind == self.http.bind
-                || self.bifrost.peer.bind == self.grpc.bind)
+            && (binds_overlap(self.bifrost.peer.bind, self.http.bind)
+                || binds_overlap(self.bifrost.peer.bind, self.grpc.bind))
         {
             return Err(ConfigError::BindCollision {
                 bind: self.bifrost.peer.bind,
@@ -3061,48 +2998,10 @@ impl WyrdServerConfig {
         }
 
         // 10. Production profile hardening.
-        if serves_api && self.deployment_profile.is_production() {
-            if self.grpc.reflection_enabled {
-                return Err(ConfigError::Invalid {
-                    message: "grpc.reflection_enabled must be false in production profile"
-                        .to_string(),
-                });
-            }
-            if self.role.serves_peer() {
-                match (
-                    &self.grpc.certificate_chain_path,
-                    &self.grpc.private_key_path,
-                ) {
-                    (Some(certificate), Some(key))
-                        if !certificate.as_os_str().is_empty() && !key.as_os_str().is_empty() => {}
-                    _ => {
-                        return Err(ConfigError::Invalid {
-                            message: "production peer-bearing targets require grpc \
-                                      certificate_chain_path and private_key_path"
-                                .to_owned(),
-                        });
-                    }
-                }
-                if !self.bifrost.peer.is_complete() {
-                    return Err(ConfigError::Invalid {
-                        message: "production peer-bearing targets require the complete \
-                                  bifrost.peer identity, credential, and ticket keyring"
-                            .to_owned(),
-                    });
-                }
-                if !self
-                    .bifrost
-                    .peer
-                    .advertise_addr
-                    .as_ref()
-                    .is_some_and(|value| value.starts_with("https://"))
-                {
-                    return Err(ConfigError::Invalid {
-                        message: "production bifrost.peer.advertise_addr must use https://"
-                            .to_owned(),
-                    });
-                }
-            }
+        if serves_api && self.deployment_profile.is_production() && self.grpc.reflection_enabled {
+            return Err(ConfigError::Invalid {
+                message: "grpc.reflection_enabled must be false in production profile".to_string(),
+            });
         }
 
         // 13. telemetry.service_name, when Some, must be non-empty.
@@ -3217,18 +3116,19 @@ impl WyrdServerConfig {
         Ok(())
     }
 
-    /// Validates the activation profile for a configured Oracle role.
+    /// Validates the optional activation profile for a configured Oracle role.
     ///
-    /// Production accepts only a present schema-v1 profile whose status is
-    /// `approved`. Development requires an explicit opt-in before it may use an
-    /// absent or candidate profile, which prevents test defaults from silently
-    /// diverging from production activation policy.
+    /// No profile is the default: boot derives the admission split from the
+    /// node's own resource plan, so a single `all` process starts without
+    /// calibration evidence. A supplied profile must be complete schema-v1
+    /// evidence; production accepts only `approved`, and development requires
+    /// an explicit opt-in before it may use a candidate.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Invalid`] when the profile is missing, malformed,
-    /// unsupported, unapproved in production, or unapproved without the
-    /// development opt-in.
+    /// Returns [`ConfigError::Invalid`] when a supplied profile is unreadable,
+    /// malformed, unsupported, unapproved in production, or unapproved without
+    /// the development opt-in.
     fn validate_oracle_calibration(&self) -> Result<(), ConfigError> {
         if !self.bifrost_roles().contains(&BifrostRuntimeRole::Oracle) {
             return Ok(());
@@ -3240,16 +3140,7 @@ impl WyrdServerConfig {
             .as_os_str()
             .is_empty()
         {
-            if !self.deployment_profile.is_production()
-                && self.bifrost.oracle.allow_unapproved_profile
-            {
-                return Ok(());
-            }
-            return Err(ConfigError::Invalid {
-                message: "configured Oracle requires bifrost.oracle.calibration_profile; \
-                          development may set allow_unapproved_profile=true explicitly"
-                    .to_owned(),
-            });
+            return Ok(());
         }
         let path = &self.bifrost.oracle.calibration_profile;
         let contents = std::fs::read_to_string(path).map_err(|error| ConfigError::Invalid {
@@ -3460,11 +3351,11 @@ mod tests {
 
     #[test]
     fn default_config_validates() {
-        let mut cfg = WyrdServerConfig::default();
+        let cfg = WyrdServerConfig::default();
         assert_eq!(cfg.role, BifrostTarget::All);
         assert_eq!(cfg.bifrost_roles().len(), 4);
-        cfg.bifrost.oracle.allow_unapproved_profile = true;
-        cfg.validate().expect("default config must be valid");
+        cfg.validate()
+            .expect("default all-in-one config validates without a calibration profile");
     }
 
     /// Proves the closed public role derives the internal Bifrost topology.
@@ -3496,7 +3387,6 @@ mod tests {
         config.bifrost.scribe.coordination_threads = 0;
         config.bifrost.oracle.admission_waiters = 0;
         config.bifrost.oracle.calibration_profile = PathBuf::from("/\0malformed");
-        config.grpc.certificate_chain_path = Some(PathBuf::from("certificate.pem"));
         config.http.bind = config.grpc.bind;
         config.grpc.reflection_enabled = true;
         config.limits.body_bytes = 0;
@@ -3521,7 +3411,6 @@ mod tests {
                 ..WyrdServerConfig::default()
             };
             config.bifrost.scribe.coordination_threads = 0;
-            config.grpc.certificate_chain_path = Some(PathBuf::from("certificate.pem"));
             config.grpc.reflection_enabled = true;
             config.limits.body_bytes = 0;
             config.limits.timeout_ms = 0;
@@ -3534,6 +3423,26 @@ mod tests {
                 config.validate().is_err(),
                 "{role:?} must reject malformed API-owned settings"
             );
+        }
+    }
+
+    /// Proves a production peer pod validates with no public gRPC certificate:
+    /// public TLS terminates at the edge, the official image's nginx speaks
+    /// plaintext gRPC to the server, and peer mTLS uses `WYRD_PEER_TLS_DIR`.
+    #[test]
+    fn production_peer_target_needs_no_public_grpc_certificate() {
+        for role in [BifrostTarget::All, BifrostTarget::Oracle] {
+            let mut config = WyrdServerConfig {
+                deployment_profile: DeploymentProfile::Production,
+                role,
+                ..WyrdServerConfig::default()
+            };
+            config.bifrost.peer.address = Some("wyrd-core-0.wyrd-core:50052".to_owned());
+            config.bifrost.peer.tls_dir = Some(PathBuf::from("/etc/wyrd/peer"));
+
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{role:?} peer pod must validate: {error}"));
         }
     }
 
@@ -3592,66 +3501,126 @@ maintenance_interval_secs = 45
         assert!(from_toml_str_with_dev_oracle_opt_in(toml).is_err());
     }
 
-    /// The optional Forge compaction memory budget replaces the deleted
-    /// per-worker executor concurrency knob completely.
+    /// The server memory minimum and the shared Bifrost cap resolve to one
+    /// boot plan or one boot error, and the removed settings have no alias.
     ///
-    /// Three facts travel together because they are one operator-visible
-    /// change. Local compaction parallelism is now the worker's own queue,
-    /// bounded by the node's compaction memory budget, so the budget is what an
-    /// operator sets and that knob no longer exists in any surface:
-    /// not the struct, not TOML, not the environment. `per_tenant_active_cap`
-    /// therefore has nothing to alias and defaults directly to one.
+    /// An 8-GiB observation yields 1-GiB server headroom and a 7-GiB cap by
+    /// default; the file and `WYRD_SERVER_MEMORY_MIN_BYTES` raise the minimum,
+    /// `WYRD_BIFROST_MEMORY_LIMIT_BYTES` lowers the cap, and an impossible
+    /// combination refuses. The deleted unmanaged-reserve and Forge-budget
+    /// settings are rejected by `deny_unknown_fields`, and their environment
+    /// variables change nothing.
     ///
     /// # Panics
     ///
-    /// Panics when the budget does not parse from file or environment, when the
-    /// removed executor knob is still accepted, or when the per-tenant cap does
-    /// not default to one.
+    /// Panics when a combination resolves differently, an impossible one is
+    /// accepted, or a removed setting is still honoured.
     #[test]
-    fn forge_compaction_budget_config_replaces_worker_concurrency() {
+    fn server_memory_minimum_rejects_impossible_plan() {
+        use vala_bifrost_redux::resources::{
+            BifrostResourceError, BifrostRole, BifrostRuntimeResources, ResourceSource,
+            SystemResourceSnapshot,
+        };
+        const GIB: usize = 1024 * 1024 * 1024;
         let _guard = ENV_LOCK.lock().expect("environment test lock");
+        let resolve = |config: &WyrdServerConfig| {
+            BifrostRuntimeResources::from_snapshot(
+                SystemResourceSnapshot {
+                    memory_limit_bytes: 8 * GIB,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: 64 * GIB as u64,
+                    scratch_available_bytes: 64 * GIB as u64,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                },
+                config.bifrost.resources.policy(
+                    [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge]
+                        .into_iter()
+                        .collect(),
+                    None,
+                    None,
+                ),
+            )
+            .map(|runtime| {
+                let plan = runtime.plan();
+                (plan.server_memory_min_bytes, plan.managed_memory_bytes)
+            })
+        };
 
-        // Unset: the plan derives the budget, and fairness defaults to one.
         let bare = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
+        assert_eq!(resolve(&bare).expect("default plan"), (GIB, 7 * GIB));
+        let raised = from_toml_str_with_dev_oracle_opt_in(
+            "[bifrost.resources]\nserver_memory_min_bytes = 2147483648\n",
+        )
+        .expect("the minimum parses from the resource section");
         assert_eq!(
-            bare.bifrost.resources.forge_compaction_memory_limit_bytes, None,
-            "an unset budget leaves the derived default to resource planning"
+            resolve(&raised).expect("raised minimum"),
+            (2 * GIB, 6 * GIB)
         );
+
+        temp_env::with_vars(
+            [
+                ("WYRD_SERVER_MEMORY_MIN_BYTES", Some("3221225472")),
+                ("WYRD_BIFROST_MEMORY_LIMIT_BYTES", Some("4294967296")),
+                ("WYRD_BIFROST_UNMANAGED_RESERVE_BYTES", Some("1")),
+                (
+                    "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
+                    Some("1"),
+                ),
+            ],
+            || {
+                let mut config = raised.clone();
+                config
+                    .apply_env_overrides()
+                    .expect("the documented overrides apply and removed ones are inert");
+                assert_eq!(resolve(&config).expect("env plan"), (3 * GIB, 4 * GIB));
+            },
+        );
+
+        for impossible in [
+            "server_memory_min_bytes = 1073741823",
+            "server_memory_min_bytes = 8589934592",
+            "memory_limit_bytes = 0",
+            "memory_limit_bytes = 7516192769",
+        ] {
+            let config = from_toml_str_with_dev_oracle_opt_in(&format!(
+                "[bifrost.resources]\n{impossible}\n"
+            ))
+            .expect("an impossible value still parses");
+            assert!(
+                matches!(
+                    resolve(&config),
+                    Err(BifrostResourceError::InvalidPlan { .. })
+                ),
+                "{impossible} must refuse boot"
+            );
+        }
+        for removed in [
+            "unmanaged_reserve_bytes = 268435456",
+            "forge_compaction_memory_limit_bytes = 268435456",
+        ] {
+            assert!(
+                from_toml_str_with_dev_oracle_opt_in(&format!("[bifrost.resources]\n{removed}\n"))
+                    .is_err(),
+                "{removed} has no alias"
+            );
+        }
+    }
+
+    /// The deleted per-worker executor concurrency knob stays deleted and the
+    /// per-tenant fairness cap defaults directly to one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the removed executor knob is still accepted or the
+    /// per-tenant cap does not default to one.
+    #[test]
+    fn forge_worker_concurrency_knob_stays_removed() {
+        let bare = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
         assert_eq!(
             bare.forge.resolved_per_tenant_active_cap(),
             1,
             "the fairness cap no longer tracks a deleted executor count"
-        );
-
-        // File: the budget is an ordinary optional resource field.
-        let configured = from_toml_str_with_dev_oracle_opt_in(
-            "[bifrost.resources]\nforge_compaction_memory_limit_bytes = 268435456\n",
-        )
-        .expect("the budget parses from the resource section");
-        assert_eq!(
-            configured
-                .bifrost
-                .resources
-                .forge_compaction_memory_limit_bytes,
-            Some(268_435_456)
-        );
-
-        // Environment: the documented override wins over the file value.
-        temp_env::with_vars(
-            [(
-                "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
-                Some("134217728"),
-            )],
-            || {
-                let mut config = configured.clone();
-                config
-                    .apply_env_overrides()
-                    .expect("the budget environment override applies");
-                assert_eq!(
-                    config.bifrost.resources.forge_compaction_memory_limit_bytes,
-                    Some(134_217_728)
-                );
-            },
         );
 
         // The deleted executor knob is not silently tolerated anywhere.
@@ -3943,19 +3912,6 @@ minimum_slots = 2
             ..WyrdServerConfig::default()
         };
         config.bifrost.oracle.calibration_profile = path.clone();
-        config.grpc.certificate_chain_path = Some(directory.path().join("server.pem"));
-        config.grpc.private_key_path = Some(directory.path().join("server-key.pem"));
-        config.bifrost.peer.ca_certificate_path = Some(directory.path().join("peer-ca.pem"));
-        config.bifrost.peer.certificate_chain_path = Some(directory.path().join("peer.pem"));
-        config.bifrost.peer.private_key_path = Some(directory.path().join("peer-key.pem"));
-        config.bifrost.peer.server_name = Some("bifrost-peer.test".to_owned());
-        config.bifrost.peer.advertise_addr = Some("https://oracle-0.peers.svc:50052".to_owned());
-        config.bifrost.peer.api_key = Some("peer-api-key".to_owned());
-        config.bifrost.peer.ticket.active_key_id = Some("peer-2026-09".to_owned());
-        config.bifrost.peer.ticket.signing_key_path =
-            Some(directory.path().join("peer-ticket-signing.pem"));
-        config.bifrost.peer.ticket.verifying_keyring_path =
-            Some(directory.path().join("peer-ticket-keyring.json"));
         assert!(config.validate().is_err());
 
         std::fs::write(&path, complete_oracle_calibration("approved"))
@@ -3965,61 +3921,70 @@ minimum_slots = 2
             .expect("approved production calibration validates");
     }
 
-    /// Proves the production peer plane is complete, mutual, and HTTPS-only.
+    /// Proves peer mode is explicit, all-or-nothing, and address-validated.
     ///
-    /// Public gRPC TLS and the private peer identity are separate requirements:
-    /// a peer-bearing target needs both, and an incompletely configured peer
-    /// plane fails boot rather than starting a listener that cannot verify.
+    /// The default target needs no peer input. A split target without peer
+    /// mode, half of the peer inputs, a URI-shaped or portless address, a
+    /// loopback gRPC bind on the wildcard peer port, and a Forge worker with
+    /// peer inputs are each refused before boot.
     #[test]
-    fn peer_production_requires_complete_tls() {
-        let directory = tempfile::tempdir().expect("calibration temp directory");
-        let calibration = directory.path().join("oracle-calibration.toml");
-        std::fs::write(&calibration, complete_oracle_calibration("approved"))
-            .expect("approved profile writes");
-        let mut config = WyrdServerConfig {
-            deployment_profile: DeploymentProfile::Production,
-            ..WyrdServerConfig::default()
+    fn peer_mode_is_explicit_and_validated() {
+        let peer = |address: &str| BifrostPeerConfig {
+            address: Some(address.to_owned()),
+            tls_dir: Some(PathBuf::from("/etc/wyrd/peer")),
+            ..BifrostPeerConfig::default()
         };
-        config.bifrost.oracle.calibration_profile = calibration;
-        assert!(config.validate().is_err());
-
-        config.grpc.certificate_chain_path = Some(directory.path().join("server.pem"));
-        assert!(config.validate().is_err());
-        config.grpc.private_key_path = Some(directory.path().join("server-key.pem"));
-        assert!(config.validate().is_err());
-        config.bifrost.peer.ca_certificate_path = Some(directory.path().join("peer-ca.pem"));
-        assert!(config.validate().is_err());
-        config.bifrost.peer.certificate_chain_path = Some(directory.path().join("peer.pem"));
-        assert!(config.validate().is_err());
-        config.bifrost.peer.private_key_path = Some(directory.path().join("peer-key.pem"));
-        assert!(config.validate().is_err());
-        config.bifrost.peer.server_name = Some("bifrost-peer.test".to_owned());
-        assert!(config.validate().is_err());
-        config.bifrost.peer.api_key = Some("peer-api-key".to_owned());
-        assert!(config.validate().is_err());
-        config.bifrost.peer.ticket.active_key_id = Some("peer-2026-09".to_owned());
-        config.bifrost.peer.ticket.signing_key_path =
-            Some(directory.path().join("peer-ticket-signing.pem"));
-        config.bifrost.peer.ticket.verifying_keyring_path =
-            Some(directory.path().join("peer-ticket-keyring.json"));
-        assert!(config.validate().is_err());
-        config.bifrost.peer.advertise_addr = Some("http://oracle-0.peers.svc:50052".to_owned());
-        assert!(
-            config.validate().is_err(),
-            "a plaintext advertisement is unroutable for a mutually authenticated peer plane"
-        );
-        config.bifrost.peer.advertise_addr = Some("https://oracle-0.peers.svc:50052".to_owned());
+        let mut config = WyrdServerConfig::default();
         config
             .validate()
-            .expect("complete production peer configuration validates");
+            .expect("the default target needs no peer mode");
+
+        config.role = BifrostTarget::Oracle;
+        assert!(config.validate().is_err(), "a split target needs peer mode");
+        config.bifrost.peer = peer("oracle-0.peers.svc:50052");
+        config.validate().expect("a complete split peer validates");
+        assert_eq!(
+            config.bifrost.peer.advertised_uri().as_deref(),
+            Some("https://oracle-0.peers.svc:50052")
+        );
+
+        for invalid in [
+            "https://oracle-0.peers.svc:50052",
+            "oracle-0.peers.svc",
+            "oracle-0.peers.svc:50052/path",
+            "user@oracle-0.peers.svc:50052",
+            "",
+        ] {
+            config.bifrost.peer = peer(invalid);
+            assert!(config.validate().is_err(), "{invalid:?} must be refused");
+        }
+
+        config.bifrost.peer = BifrostPeerConfig {
+            address: Some("oracle-0.peers.svc:50052".to_owned()),
+            ..BifrostPeerConfig::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "an address without TLS is refused"
+        );
+
+        config.bifrost.peer = peer("oracle-0.peers.svc:50052");
+        config.grpc.bind = SocketAddr::from(([127, 0, 0, 1], 50052));
+        assert!(
+            matches!(config.validate(), Err(ConfigError::BindCollision { .. })),
+            "a loopback gRPC bind on the wildcard peer port collides"
+        );
+        config.grpc.bind = WyrdServerConfig::default().grpc.bind;
+
+        config.role = BifrostTarget::ForgeWorker;
+        config.bifrost.peer = peer("worker-0.peers.svc:50052");
+        assert!(
+            config.validate().is_err(),
+            "a Forge worker opens no peer socket"
+        );
     }
 
     /// Proves the canonical peer environment names land on the validated fields.
-    ///
-    /// The advertisement is published into `vala.cluster_nodes` and later dialed
-    /// through `Endpoint::from_shared`, which rejects a schemeless authority, so
-    /// routing every peer input through `apply_env_overrides` keeps one
-    /// validated source of truth instead of unvalidated reads at boot.
     #[test]
     fn peer_environment_names_land_on_validated_fields() {
         assert_eq!(
@@ -4032,33 +3997,8 @@ minimum_slots = 2
         temp_env::with_vars(
             [
                 ("WYRD_BIFROST_PEER_BIND_ADDR", Some("127.0.0.1:50152")),
-                (
-                    "WYRD_BIFROST_PEER_ADVERTISE_ADDR",
-                    Some("https://oracle-0.peers.svc:50052"),
-                ),
-                (
-                    "WYRD_BIFROST_PEER_CA_CERTIFICATE_PATH",
-                    Some("/peer/ca.pem"),
-                ),
-                (
-                    "WYRD_BIFROST_PEER_CERTIFICATE_CHAIN_PATH",
-                    Some("/peer/cert.pem"),
-                ),
-                ("WYRD_BIFROST_PEER_PRIVATE_KEY_PATH", Some("/peer/key.pem")),
-                ("WYRD_BIFROST_PEER_SERVER_NAME", Some("bifrost-peer.test")),
-                ("WYRD_BIFROST_PEER_API_KEY", Some("peer-api-key")),
-                (
-                    "WYRD_BIFROST_PEER_TICKET_ACTIVE_KEY_ID",
-                    Some("peer-2026-09"),
-                ),
-                (
-                    "WYRD_BIFROST_PEER_TICKET_SIGNING_KEY_PATH",
-                    Some("/peer/ticket-signing.pem"),
-                ),
-                (
-                    "WYRD_BIFROST_PEER_TICKET_VERIFYING_KEYRING_PATH",
-                    Some("/peer/ticket-keyring.json"),
-                ),
+                ("WYRD_PEER_ADDRESS", Some("oracle-0.peers.svc:50052")),
+                ("WYRD_PEER_TLS_DIR", Some("/etc/wyrd/peer")),
             ],
             || {
                 let mut config = WyrdServerConfig::default();
@@ -4070,12 +4010,9 @@ minimum_slots = 2
                         .parse::<std::net::SocketAddr>()
                         .expect("literal bind address parses")
                 );
-                assert_eq!(
-                    peer.advertise_addr.as_deref(),
-                    Some("https://oracle-0.peers.svc:50052")
-                );
-                assert_eq!(peer.server_name.as_deref(), Some("bifrost-peer.test"));
-                assert!(peer.is_complete());
+                assert_eq!(peer.address.as_deref(), Some("oracle-0.peers.svc:50052"));
+                assert_eq!(peer.tls_dir.as_deref(), Some(Path::new("/etc/wyrd/peer")));
+                assert!(peer.is_enabled());
             },
         );
     }
@@ -5010,12 +4947,11 @@ minimum_slots = 2
             memory_limit_bytes: oracle_bytes * 2,
             effective_cpu,
             oracle_query_slot_limit: limit,
-            unmanaged_reserve_bytes: 0,
+            server_memory_min_bytes: oracle_bytes,
             managed_memory_bytes: oracle_bytes,
-            scribe_floor_bytes: 0,
-            oracle_floor_bytes: oracle_bytes,
-            forge_compaction_memory_limit_bytes: 0,
-            elastic_memory_bytes: 0,
+            scribe_enabled: false,
+            oracle_enabled: true,
+            forge_enabled: false,
             scratch_limit_bytes: 0,
         };
         // Memory is generous, so CPU is what bounds concurrency; the ratio is
@@ -5191,7 +5127,7 @@ minimum_slots = 2
         for (interactive, analytical, expected) in [
             (0, 2, "tenant.interactive_slot_limit.value must be positive"),
             (7, 2, "tenant.interactive_slot_limit 7"),
-            (6, 1, "tenant.analytical_slot_limit 1"),
+            (6, 0, "tenant.analytical_slot_limit.value must be positive"),
             (6, 4, "tenant.analytical_slot_limit 4"),
         ] {
             profile
@@ -5205,26 +5141,6 @@ minimum_slots = 2
             );
         }
 
-        // Analytical below one query's cost disables the class, so its tenant
-        // cap must be zero rather than a value the class can never grant.
-        profile.class.analytical.share = 0.0;
-        profile
-            .proposal
-            .insert("tenant".to_owned(), tenant_caps(4, 2));
-        assert!(
-            translate_oracle_calibration(&profile, &runtime, 8)
-                .expect_err("a nonzero cap on a disabled class must fail closed")
-                .contains("must be 0 when Analytical is disabled")
-        );
-        profile
-            .proposal
-            .insert("tenant".to_owned(), tenant_caps(4, 0));
-        let disabled = translate_oracle_calibration(&profile, &runtime, 8)
-            .expect("a zero cap matches the disabled class");
-        assert_eq!(disabled.analytical_slots, 0);
-        assert_eq!(disabled.tenant_analytical_slots, 0);
-        assert_eq!(disabled.tenant_interactive_slots, 4);
-        profile.class.analytical.share = 0.5;
         profile
             .proposal
             .insert("tenant".to_owned(), tenant_caps(6, 2));

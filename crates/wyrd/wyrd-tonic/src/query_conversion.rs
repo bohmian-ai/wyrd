@@ -285,13 +285,9 @@ impl From<domain::QueryStreamFrame> for proto::QueryStreamFrame {
                         .collect(),
                     error: value.error.map(proto_terminal_error),
                     arrow_ipc_eos: value.arrow_ipc_eos,
-                    execution_path: match value.execution_path {
-                        domain::QueryExecutionPath::Interactive => {
-                            proto::QueryExecutionPath::Interactive as i32
-                        }
-                        domain::QueryExecutionPath::Analytical => {
-                            proto::QueryExecutionPath::Analytical as i32
-                        }
+                    query_class: match value.query_class {
+                        domain::QueryClass::Interactive => proto::QueryClass::Interactive as i32,
+                        domain::QueryClass::Analytical => proto::QueryClass::Analytical as i32,
                     },
                 })
             }
@@ -481,13 +477,13 @@ fn terminal(
             .collect::<Result<_, _>>()?,
         error: value.error.map(terminal_error).transpose()?,
         arrow_ipc_eos: value.arrow_ipc_eos,
-        execution_path: match proto::QueryExecutionPath::try_from(value.execution_path)
-            .map_err(|_| QueryConversionError::RequiredEnum("execution_path"))?
+        query_class: match proto::QueryClass::try_from(value.query_class)
+            .map_err(|_| QueryConversionError::RequiredEnum("query_class"))?
         {
-            proto::QueryExecutionPath::Interactive => domain::QueryExecutionPath::Interactive,
-            proto::QueryExecutionPath::Analytical => domain::QueryExecutionPath::Analytical,
-            proto::QueryExecutionPath::Unspecified => {
-                return Err(QueryConversionError::RequiredEnum("execution_path"))
+            proto::QueryClass::Interactive => domain::QueryClass::Interactive,
+            proto::QueryClass::Analytical => domain::QueryClass::Analytical,
+            proto::QueryClass::Unspecified => {
+                return Err(QueryConversionError::RequiredEnum("query_class"))
             }
         },
     };
@@ -540,6 +536,7 @@ fn proto_terminal_error(value: domain::QueryTerminalError) -> proto::QueryTermin
             D::CatalogUnreachable => P::CatalogUnreachable as i32,
             D::StorageUnreachable => P::StorageUnreachable as i32,
             D::QueryExecutionFailed => P::QueryExecutionFailed as i32,
+            D::QueryResourcesExhausted => P::QueryResourcesExhausted as i32,
         },
         detail: value.detail.map(|detail| detail.as_str().to_owned()),
     }
@@ -609,6 +606,7 @@ fn terminal_error(
         P::CatalogUnreachable => D::CatalogUnreachable,
         P::StorageUnreachable => D::StorageUnreachable,
         P::QueryExecutionFailed => D::QueryExecutionFailed,
+        P::QueryResourcesExhausted => D::QueryResourcesExhausted,
         P::Unspecified => return Err(QueryConversionError::RequiredEnum("error_code")),
     };
     Ok(domain::QueryTerminalError {
@@ -703,7 +701,7 @@ mod tests {
         let frame = proto::QueryStreamFrame {
             frame: Some(proto::query_stream_frame::Frame::Terminal(
                 proto::QueryTerminalFrame {
-                    execution_path: proto::QueryExecutionPath::Interactive as i32,
+                    query_class: proto::QueryClass::Interactive as i32,
                     outcome: 0,
                     row_count: 0,
                     warnings: vec![],
@@ -769,7 +767,7 @@ mod tests {
         unavailable_live[2].outcome = proto::SourceCompletionOutcome::Unavailable as i32;
         for terminal in [
             proto::QueryTerminalFrame {
-                execution_path: proto::QueryExecutionPath::Interactive as i32,
+                query_class: proto::QueryClass::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Failed as i32,
                 row_count: 0,
                 warnings: vec![],
@@ -778,7 +776,7 @@ mod tests {
                 arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
-                execution_path: proto::QueryExecutionPath::Interactive as i32,
+                query_class: proto::QueryClass::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Success as i32,
                 row_count: 0,
                 warnings: vec![proto::QueryWarning::LiveTailUnavailable as i32],
@@ -787,7 +785,7 @@ mod tests {
                 arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
-                execution_path: proto::QueryExecutionPath::Interactive as i32,
+                query_class: proto::QueryClass::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Success as i32,
                 row_count: 0,
                 warnings: vec![proto::QueryWarning::LiveTailUnavailable as i32],
@@ -862,7 +860,7 @@ mod tests {
         proto::QueryStreamFrame {
             frame: Some(proto::query_stream_frame::Frame::Terminal(
                 proto::QueryTerminalFrame {
-                    execution_path: proto::QueryExecutionPath::Interactive as i32,
+                    query_class: proto::QueryClass::Interactive as i32,
                     outcome: proto::QueryTerminalOutcome::Success as i32,
                     row_count,
                     warnings: vec![],

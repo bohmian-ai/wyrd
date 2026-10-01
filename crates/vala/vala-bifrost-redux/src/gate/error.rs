@@ -84,14 +84,6 @@ pub enum IngestError {
         /// Configured wire or derived expanded-data limit.
         limit: u64,
     },
-    /// The request exceeded the aggregate row bound.
-    #[error("ingest request has too many rows ({rows} > {limit})")]
-    TooManyRows {
-        /// Observed running row total when the bound tripped.
-        rows: u64,
-        /// The configured row limit.
-        limit: u64,
-    },
     /// The ingest coordinator stopped before the commit completed.
     #[error("ingest coordinator closed")]
     IngressClosed,
@@ -178,10 +170,9 @@ impl IngestError {
             | Self::CardScopeDenied { .. }
             | Self::CardUnresolved { .. } => "permission",
             Self::PayloadTooLarge { .. } => "payload_limit",
-            Self::RequestValidation(_)
-            | Self::Decode(_)
-            | Self::EventTimeOutOfRange { .. }
-            | Self::TooManyRows { .. } => "validation",
+            Self::RequestValidation(_) | Self::Decode(_) | Self::EventTimeOutOfRange { .. } => {
+                "validation"
+            }
             Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
             Self::IngressClosed => "role_unavailable",
             Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
@@ -251,11 +242,6 @@ impl IngestError {
                 limit: usize::try_from(*limit).unwrap_or(usize::MAX),
             }
             .into(),
-            Self::TooManyRows { rows, limit } => BifrostError::IngestOversized {
-                rows: *rows,
-                limit: *limit,
-            }
-            .into(),
             Self::IngressClosed => BifrostError::WriterUnavailable {
                 table: fallback_table(),
             }
@@ -310,9 +296,6 @@ impl IngestError {
                 Self::SchemaMismatch { table }
             }
             crate::contracts::ScribeError::TableNotFound { table } => Self::TableNotFound { table },
-            crate::contracts::ScribeError::TooManyRows { rows, limit } => {
-                Self::TooManyRows { rows, limit }
-            }
             crate::contracts::ScribeError::InvalidFrame => {
                 Self::Decode("ingest frame validation failed".to_owned())
             }
@@ -556,12 +539,6 @@ mod tests {
                 Code::ResourceExhausted,
             ),
             (
-                IngestError::TooManyRows { rows: 2, limit: 1 },
-                "WYRD_VALA_413_INGEST_OVERSIZED",
-                413,
-                Code::ResourceExhausted,
-            ),
-            (
                 IngestError::WalDiskFull,
                 "WYRD_VALA_507_WAL_DISK_FULL",
                 507,
@@ -709,11 +686,6 @@ mod tests {
                 },
                 "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
                 "vala.bifrost.missing",
-            ),
-            (
-                ScribeError::TooManyRows { rows: 2, limit: 1 },
-                "WYRD_VALA_413_INGEST_OVERSIZED",
-                "vala.traces.spans",
             ),
             (
                 ScribeError::InvalidFrame,

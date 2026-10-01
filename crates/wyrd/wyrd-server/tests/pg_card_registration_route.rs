@@ -11,7 +11,6 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use sha2::Digest;
 use tokio::time::sleep;
-use url::Url;
 use uuid::Uuid;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
@@ -394,7 +393,6 @@ async fn client_registration_saga_returns_active_receipt() {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some(String::new()),
         })
         .start_bound()
         .await
@@ -1408,7 +1406,6 @@ async fn heavy_registration_initializes_upload_after_commit() {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some(String::new()),
         })
         .start_bound()
         .await
@@ -1485,8 +1482,8 @@ async fn heavy_registration_initializes_upload_after_commit() {
     let upload_url = body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
         .as_str()
         .expect("local upload plan contains a URL");
-    let upload_path =
-        Url::parse(upload_url).map_or_else(|_| upload_url.to_owned(), |url| url.path().to_owned());
+    assert!(upload_url.starts_with("/v1/cards/upload/local/"));
+    let upload_path = upload_url.to_owned();
     let upload = Request::builder()
         .method(Method::PUT)
         .uri(upload_path.clone())
@@ -1564,7 +1561,6 @@ async fn card_reconciler_recovers_after_storage_retry() {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some(String::new()),
         })
         .start_bound()
         .await
@@ -1590,8 +1586,8 @@ async fn card_reconciler_recovers_after_storage_retry() {
 
     wait_for_reconciliation_state(&server, &card_uid, 1, "pending").await;
 
-    let upload_path =
-        Url::parse(upload_url).map_or_else(|_| upload_url.to_owned(), |url| url.path().to_owned());
+    assert!(upload_url.starts_with("/v1/cards/upload/local/"));
+    let upload_path = upload_url.to_owned();
     let upload = Request::builder()
         .method(Method::PUT)
         .uri(upload_path)
@@ -1648,7 +1644,6 @@ async fn card_reconciler_dead_letters_after_three_failures() {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some(String::new()),
         })
         .start_bound()
         .await
@@ -1762,14 +1757,11 @@ async fn completion_audit_failure_keeps_card_pending() {
     let body = response_json(response).await;
     let card_uid: CardUid = serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
         .expect("response contains card UID");
-    let upload_path = Url::parse(
-        body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
-            .as_str()
-            .expect("local upload plan contains a URL"),
-    )
-    .expect("upload URL parses")
-    .path()
-    .to_owned();
+    let upload_path = body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
+        .as_str()
+        .expect("local upload plan contains a URL")
+        .to_owned();
+    assert!(upload_path.starts_with("/v1/cards/upload/local/"));
     let upload = Request::builder()
         .method(Method::PUT)
         .uri(upload_path)
@@ -1970,7 +1962,6 @@ async fn delete_storage_failure_preserves_cleanup_state() {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some(String::new()),
         })
         .start_bound()
         .await
@@ -2048,7 +2039,6 @@ async fn blob_storage_failure_leaves_durable_failure_state() {
             presign_ttl: Duration::from_secs(600),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some(String::new()),
         })
         .start_bound()
         .await

@@ -20,6 +20,7 @@ use wyrd_spec::vala::eval::{
 use wyrd_spec::vala::ids::RunId;
 
 use crate::error::EvalExecError;
+use crate::executor::{EvalReport, TaskRunOutcome};
 
 /// Canonical key used to look up a subject in result maps.
 ///
@@ -306,11 +307,12 @@ pub fn aggregate_run(input: AggregationInput) -> Result<EvalResults, EvalExecErr
         .map(|(key, accumulator)| (key, accumulator.finalize()))
         .collect();
     let metrics = compute_run_metrics(&scenarios, &subjects);
-    let pass_gate_verdict = input
-        .config
-        .pass_gate
-        .as_ref()
-        .map(|gate| evaluate_pass_gate(gate, &metrics, &subjects));
+    let pass_gate_verdict = input.config.pass_gate.as_ref().map(|gate| {
+        let per_subject_task_rates = subjects
+            .values()
+            .map(|subject| &subject.metrics.per_task_pass_rate);
+        evaluate_pass_gate(gate, &metrics, per_subject_task_rates)
+    });
 
     Ok(EvalResults {
         identity: input.identity,
@@ -346,6 +348,63 @@ pub fn apply_context_capture(
             result.actual = None;
             Ok(result)
         }
+    }
+}
+
+impl EvalReport {
+    /// Apply `capture` (absent means `full`) to every executed result.
+    ///
+    /// This is the single capture point for a continuous record: it runs
+    /// before any result crosses a persistence or public boundary and changes
+    /// only the stored `actual` evidence, never pass/fail or skip outcomes.
+    ///
+    /// # Errors
+    /// Returns `ContextHashFailed` if hashing cannot serialize an actual value.
+    pub fn captured(self, capture: Option<EvalContextCapture>) -> Result<Self, EvalExecError> {
+        let capture = capture.unwrap_or(EvalContextCapture::Full);
+        let outcomes = self
+            .outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                TaskRunOutcome::Ran(result) => apply_context_capture(*result, capture)
+                    .map(|r| TaskRunOutcome::Ran(Box::new(r))),
+                skipped @ TaskRunOutcome::Skipped { .. } => Ok(skipped),
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { outcomes })
+    }
+
+    /// Apply `gate` to this one-record report as a single-subject, single-scenario run.
+    ///
+    /// Uses the same gate evaluation as [`aggregate_run`], including its
+    /// `all_pass` failure when nothing attested; mapping zero attestation to an
+    /// inconclusive verdict is the consumer's decision, not the engine's.
+    #[must_use]
+    pub fn pass_gate(&self, gate: &EvalPassGate) -> PassGateVerdict {
+        let mut per_task: BTreeMap<TaskId, (usize, usize)> = BTreeMap::new();
+        for result in self.ran() {
+            let counts = per_task.entry(result.task_id.clone()).or_default();
+            counts.0 += 1;
+            counts.1 += usize::from(result.passed);
+        }
+        let total_tasks = per_task.values().map(|(total, _)| total).sum();
+        let passed_tasks = per_task.values().map(|(_, passed)| passed).sum();
+        let per_task_pass_rate: BTreeMap<TaskId, f64> = per_task
+            .into_iter()
+            .map(|(task_id, (total, passed))| (task_id, rate(passed, total)))
+            .collect();
+        let passed_scenarios = usize::from(total_tasks > 0 && passed_tasks == total_tasks);
+        let metrics = EvalMetrics {
+            total_tasks,
+            passed_tasks,
+            pass_rate: rate(passed_tasks, total_tasks),
+            per_task_pass_rate,
+            per_subject_pass_rate: BTreeMap::new(),
+            total_scenarios: 1,
+            passed_scenarios,
+            scenario_pass_rate: rate(passed_scenarios, 1),
+        };
+        evaluate_pass_gate(gate, &metrics, std::iter::once(&metrics.per_task_pass_rate))
     }
 }
 
@@ -462,10 +521,15 @@ fn scenario_passed_from_views(
     (mechanic_total == 0 || mechanic_all_passed) && (passenger_total == 0 || passenger_all_passed)
 }
 
-fn evaluate_pass_gate(
+/// Apply `gate` to run-level `metrics`.
+///
+/// `per_subject_task_rates` yields each subject's per-task pass rates; the
+/// per-judge gate takes the minimum across all of them. This is the one gate
+/// implementation shared by [`aggregate_run`] and [`EvalReport::pass_gate`].
+fn evaluate_pass_gate<'a>(
     gate: &EvalPassGate,
     metrics: &EvalMetrics,
-    subjects: &BTreeMap<SubjectKey, SubjectResults>,
+    per_subject_task_rates: impl Iterator<Item = &'a BTreeMap<TaskId, f64>>,
 ) -> PassGateVerdict {
     match gate {
         EvalPassGate::OverallPassRate { threshold } => {
@@ -484,9 +548,8 @@ fn evaluate_pass_gate(
             }
         }
         EvalPassGate::PerJudgePassRate { threshold } => {
-            let observed = subjects
-                .values()
-                .flat_map(|subject| subject.metrics.per_task_pass_rate.values().copied())
+            let observed = per_subject_task_rates
+                .flat_map(|rates| rates.values().copied())
                 .fold(f64::INFINITY, f64::min);
             let observed = if observed.is_finite() { observed } else { 0.0 };
             let passed = observed >= *threshold;
@@ -993,5 +1056,70 @@ mod results_aggregation {
 
         let table = output.as_table();
         assert!(table.contains("EvalRun run-test"));
+    }
+
+    /// Build a one-record report from `(task, passed, actual)` rows plus one skip.
+    fn report(rows: &[(&str, bool)]) -> crate::EvalReport {
+        let mut outcomes: Vec<crate::TaskRunOutcome> = rows
+            .iter()
+            .map(|(task, passed)| {
+                crate::TaskRunOutcome::Ran(Box::new(assertion(task, *passed, Some(json!("pii")))))
+            })
+            .collect();
+        outcomes.push(crate::TaskRunOutcome::Skipped {
+            task_id: TaskId::new("skipped").expect("static task id is valid"),
+            reason: crate::SkipReason::ConditionFalse,
+        });
+        crate::EvalReport { outcomes }
+    }
+
+    /// A report's gate uses the shared gate logic; skips never enter the denominator.
+    #[test]
+    fn report_pass_gate_matches_shared_gate_semantics() {
+        let mixed = report(&[("a", true), ("b", false)]);
+        assert!(!mixed.pass_gate(&EvalPassGate::AllPass).passed);
+        assert!(
+            mixed
+                .pass_gate(&EvalPassGate::OverallPassRate { threshold: 0.5 })
+                .passed
+        );
+        assert!(
+            !mixed
+                .pass_gate(&EvalPassGate::PerJudgePassRate { threshold: 0.5 })
+                .passed
+        );
+        assert!(
+            report(&[("a", true)])
+                .pass_gate(&EvalPassGate::AllPass)
+                .passed
+        );
+        assert!(!report(&[]).pass_gate(&EvalPassGate::AllPass).passed);
+    }
+
+    /// Capture rewrites only `actual` on executed results and keeps every outcome.
+    #[test]
+    fn report_capture_changes_evidence_only() {
+        let original = report(&[("a", true), ("b", false)]);
+        for (capture, expect) in [
+            (None, Some(json!("pii"))),
+            (Some(EvalContextCapture::Full), Some(json!("pii"))),
+            (Some(EvalContextCapture::Redact), None),
+        ] {
+            let captured = original.clone().captured(capture).expect("capture applies");
+            assert_eq!(captured.outcomes.len(), original.outcomes.len());
+            assert_eq!(
+                captured.ran().map(|r| r.passed).collect::<Vec<_>>(),
+                vec![true, false]
+            );
+            assert!(captured.ran().all(|r| r.actual == expect), "{capture:?}");
+        }
+        let hashed = original
+            .captured(Some(EvalContextCapture::Hash))
+            .expect("capture applies");
+        assert!(
+            hashed
+                .ran()
+                .all(|r| r.actual.as_ref().is_some_and(|a| a != &json!("pii")))
+        );
     }
 }

@@ -13,12 +13,14 @@ use wyrd_spec::vala::eval::{EvalSpec, ScenarioId};
 use crate::tasks::{
     AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, MediaBindings, TraceTaskExecutor,
 };
+use wyrd_spec::vala::ids::RunId;
+
 use crate::{
-    AggregationInput, EvalResults, Executors, InMemoryTraceSource, JudgeInvoker,
-    MechanicSubjectInput, RecordTaskResult, RecordWithMedia, ResultsConfig, RunIdentity,
-    ScenarioAggregationInput, ScenarioExecutionInputs, ScenarioExecutionResults, SubjectKey,
-    TaskRegistry, TaskRunOutcome, TaskSummary, TraceSource, aggregate_run, execute_plan,
-    execute_scenario,
+    AggregationInput, EvalExecError, EvalReport, EvalResults, Executors, InMemoryTraceSource,
+    JudgeInvoker, MechanicSubjectInput, RecordTaskResult, RecordWithMedia, ResultsConfig,
+    RunIdentity, ScenarioAggregationInput, ScenarioExecutionInputs, ScenarioExecutionResults,
+    SubjectKey, TaskRegistry, TaskRunOutcome, TaskSummary, TraceSource, aggregate_run,
+    execute_plan, execute_scenario,
 };
 
 use super::{OrchestratorError, ScenarioCursor};
@@ -162,6 +164,41 @@ impl ScenarioScoring {
         })?)
     }
 
+    /// Execute the task DAG over one committed record.
+    ///
+    /// The record's named media descriptors become the snapshot's
+    /// [`MediaBindings`] so the judge invoker can bind them natively, and its
+    /// trace id is attached for trace tasks. This is the one record execution
+    /// path shared by continuous verification and batch replay; it returns
+    /// every `Ran` and `Skipped` outcome and never aggregates or captures.
+    ///
+    /// # Errors
+    /// Returns the [`EvalExecError`] of the first task that could not produce
+    /// a result; an error is never recorded as a failed assertion.
+    pub async fn score_record(
+        &self,
+        run_id: RunId,
+        scenario_id: Option<ScenarioId>,
+        record: &EvalRecordObservation,
+    ) -> Result<EvalReport, EvalExecError> {
+        let media = MediaBindings::from_refs(record.media.iter().flatten().cloned());
+        let snapshot = crate::ContextSnapshot::new(
+            Arc::new(record.context.clone()),
+            crate::RecordIdentity {
+                run_id,
+                record_id: record.record_id.clone(),
+                scenario_id,
+            },
+        )
+        .with_media(media, Vec::new());
+        let snapshot = match record.trace_id {
+            Some(trace_id) => snapshot.with_trace_id(trace_id),
+            None => snapshot,
+        };
+        let context = crate::ExecutionContext::from_snapshot(Arc::new(snapshot));
+        execute_plan(&self.plan, &context, &self.registry, &self.executors).await
+    }
+
     /// Score a batch of pre-collected eval records without driving scenarios.
     ///
     /// This is the degenerate replay path used by `wyrd eval run --records`.
@@ -184,30 +221,9 @@ impl ScenarioScoring {
         let mut mechanic = Vec::new();
 
         for record in records {
-            let record_with_media = RecordWithMedia {
-                record_id: record.record_id.clone(),
-                trace_id: record.trace_id,
-                context: record.context.clone(),
-                media: MediaBindings::new(),
-                required_media: Vec::new(),
-            };
-            let snapshot = crate::ContextSnapshot::new(
-                Arc::new(record_with_media.context.clone()),
-                crate::RecordIdentity {
-                    run_id: identity.run_id.clone(),
-                    record_id: record_with_media.record_id.clone(),
-                    scenario_id: Some(scenario_id.clone()),
-                },
-            )
-            .with_media(record_with_media.media, record_with_media.required_media);
-            let snapshot = if let Some(trace_id) = record_with_media.trace_id {
-                snapshot.with_trace_id(trace_id)
-            } else {
-                snapshot
-            };
-            let context = crate::ExecutionContext::from_snapshot(Arc::new(snapshot));
-            let report =
-                execute_plan(&self.plan, &context, &self.registry, &self.executors).await?;
+            let report = self
+                .score_record(identity.run_id.clone(), Some(scenario_id.clone()), record)
+                .await?;
             for outcome in report.outcomes {
                 if let TaskRunOutcome::Ran(result) = outcome {
                     mechanic.push(RecordTaskResult {

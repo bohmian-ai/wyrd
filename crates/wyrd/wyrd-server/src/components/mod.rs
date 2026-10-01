@@ -2,7 +2,6 @@
 
 pub mod admin;
 pub mod auth;
-pub mod authz;
 pub mod cards;
 pub mod gateway;
 pub mod health;

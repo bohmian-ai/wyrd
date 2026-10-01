@@ -30,8 +30,15 @@ errors, retry non-idempotent writes, or buffer an unbounded query stream.
   transport boundary.
 - Gateway-to-server transport is authenticated and encrypted. Forwarded client
   identity metadata is advisory; the Wyrd token remains authoritative.
-- Replica-to-replica Bifrost traffic uses mutually authenticated TLS and the
-  signed peer-ticket contract in `../wyrd-security-posture.md`.
+- Replica-to-replica Bifrost traffic uses mutual TLS from one dedicated
+  cluster CA with the fixed `wyrd-peer` identity, and every private operation
+  is checked against the receiver's own state, per
+  `../wyrd-security-posture.md`. The CA private key never enters a pod; pods
+  mount only `ca.crt` and the shared `tls.crt`/`tls.key` at
+  `WYRD_PEER_TLS_DIR`. Each replica publishes its own route through
+  `WYRD_PEER_ADDRESS` (in Kubernetes, `$(POD_IP):50052` from
+  `status.podIP`), and network policy admits the private port only from other
+  Wyrd peer pods. Peer TLS grants no tenant identity.
 - Postgres, object storage, secret providers, OIDC/JWKS endpoints, and audit
   anchors use certificate verification and explicit trust roots.
 - Network policy restricts data-plane pods to required peers and dependencies.
@@ -67,14 +74,15 @@ Configuration follows these rules:
    never silently clamps a value or falls back from a production provider to a
    local emulator.
 
-The canonical Postgres application DSN is `WYRD_DATABASE_URL`. Role passwords
-are supplied through `WYRD_DATABASE_MIGRATOR_PASSWORD` and, when operator work
-is enabled, `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD`. Production never boots an
-embedded database because a DSN is absent.
+A serving process receives exactly two Postgres DSNs: `WYRD_DATABASE_URL`
+(`wyrd_app`) and `WYRD_PLATFORM_DATABASE_URL` (`wyrd_platform_admin`). Both are
+required. The one-off `wyrd-server migrate` process instead reads the
+database-owner DSN from `WYRD_DATABASE_URL`; the owner credential is never part
+of a serving environment. There is no embedded database.
 
 Unsuffixed `WYRD_DB_*` variables tune the `wyrd_app` pool. `_MIGRATOR` and
-`_PLATFORM_ADMIN` suffixes tune the boot-only migrator and privileged operator
-pools. Missing suffixed values use that role's typed defaults; they do not
+`_PLATFORM_ADMIN` suffixes tune the one-off migration pool and the platform
+pool. Missing suffixed values use that role's typed defaults; they do not
 inherit the application value.
 
 ## Database roles and connection budget
@@ -82,8 +90,8 @@ inherit the application value.
 | Role | Lifetime | Purpose |
 |---|---|---|
 | `wyrd_app` | Runtime | Tenant-scoped RLS traffic through `TenantConn` |
-| `wyrd_migrator` | Migration only | DDL for Wyrd and Vala schemas; closed before normal serving |
-| `wyrd_platform_admin` | Runtime only where required | Named, audited, cross-tenant operator capabilities through `OperatorPool` |
+| `wyrd_platform_admin` | Runtime | Named, audited, cross-tenant operator capabilities through `OperatorPool`; Bifrost Iceberg catalog owner |
+| database owner | `wyrd-server migrate` only | DDL for Wyrd and Vala schemas; never held by a serving process |
 
 The deployment connection budget is:
 
@@ -127,8 +135,8 @@ transaction-pooled path.
 ## Migration contract
 
 Migrations are immutable, ordered, idempotent where re-entry is required, and
-executed with the dedicated migrator role. Runtime handlers never receive the
-migrator pool.
+executed by `wyrd-server migrate` with the database-owner login. Serving
+processes never receive that login and never run DDL.
 
 The deployment migration lease is one Postgres advisory lock for the physical
 migration domain: the connected Postgres cluster/database plus the fixed
@@ -149,7 +157,8 @@ The release pipeline must:
 4. Apply Wyrd and Vala migrations in their declared order.
 5. Verify schema invariants, RLS policies, role grants, required sentinels, and
    migration checksums.
-6. Close all migrator connections before application replicas become ready.
+6. Exit the migrate process. Application replicas re-verify migration
+   versions, checksums, login posture, and forced RLS before becoming ready.
 
 Schema changes use expand-and-contract when old and new replicas overlap.
 During the overlap window, writers emit a representation readable by both
@@ -166,7 +175,7 @@ Destructive best-effort SQL is not rollback.
 ## Rollout and version skew
 
 Every build publishes an immutable version and contract fingerprint covering
-wire protocols, durable schemas, Bifrost internal RPCs, peer-ticket claims,
+wire protocols, durable schemas, Bifrost internal RPCs and peer contexts,
 storage formats, and configuration schema.
 
 The signed release manifest uses this versioned envelope:
@@ -184,7 +193,7 @@ closed. The manifest is stored beside the immutable artifact and contains:
 - public schema/stub digest;
 - ordered Wyrd and Vala migration-registry digests;
 - configuration-schema digest;
-- Bifrost RPC, peer-ticket, WAL, staged-manifest, Parquet-layout, and Iceberg
+- Bifrost RPC, peer-context, WAL, staged-manifest, Parquet-layout, and Iceberg
   operation versions;
 - minimum and maximum compatible peer/application versions for each contract;
 - irreversible-format boundary; and
@@ -196,6 +205,12 @@ database migration digests, live peer versions, configured role set, and every
 declared compatibility interval before surge starts. Overlap is permitted only
 when both manifests mutually accept the other version for every shared
 contract. Missing or one-sided compatibility fails closed.
+
+No Wyrd image has been published yet. Until the first release, image
+acceptance builds the official recipe (`docker/official/Dockerfile`) from the
+reviewed commit and pins that exact build by its immutable local image ID,
+recording the ID and source commit. The first release repeats the same image
+journeys against the published registry digest named in its manifest.
 
 - The gateway and peers reject protocol versions outside their declared
   compatibility set before payload decoding.

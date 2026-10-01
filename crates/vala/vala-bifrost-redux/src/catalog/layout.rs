@@ -34,9 +34,9 @@ use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation
 /// column, so a table without a correlation policy does not claim Blooms it
 /// cannot write.
 ///
-/// `data_tenant_id` is deliberately absent. Every tenant owns its own Iceberg
-/// namespace and object prefix, so the column is constant within any single
-/// file and a Bloom filter over it can never prune one.
+/// No tenant column exists to Bloom: every tenant owns its own Iceberg
+/// namespace and object prefix, and each file proves its tenant in footer
+/// metadata.
 pub const MANAGED_BLOOM_FLOOR: [&str; 3] = [RUN_ID, CARD_UID, PRINCIPAL_ID];
 
 /// Largest number of sort keys one declaration may carry.
@@ -256,7 +256,7 @@ pub const WRITE_DATA_PATH_PROPERTY: &str = "write.data.path";
 /// recipe is reselected while an output produced under the current one is not.
 /// Advancing the recipe is therefore a deliberate act — bump this constant and
 /// every previously written object becomes obsolete by construction.
-pub const FORGE_WRITER_RECIPE: &str = "v1";
+pub const FORGE_WRITER_RECIPE: &str = "v2";
 
 /// Path segment separating recipe-tagged rewrite outputs from the data root.
 ///
@@ -1037,16 +1037,14 @@ mod tests {
     use wyrd_spec::vala::api::{
         NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
     };
-    use wyrd_spec::vala::managed_columns::{
-        CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME,
-    };
+    use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME};
     use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
     /// Canonical fully-qualified name every case in this module resolves under.
     const TABLE: &str = "vala.datasets.layout";
 
-    /// Builds the fixture physical schema: the full managed floor, the tenant
-    /// column, and two user columns to declare against.
+    /// Builds the fixture physical schema: the full managed floor and two
+    /// user columns to declare against.
     fn fixture_schema() -> Schema {
         Schema::new(vec![
             Field::new(
@@ -1054,7 +1052,6 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
             Field::new(RUN_ID, DataType::Utf8, true),
             Field::new(CARD_UID, DataType::Utf8, true),
             Field::new(PRINCIPAL_ID, DataType::Utf8, true),
@@ -1118,14 +1115,14 @@ mod tests {
     ///
     /// Covers an omitted declaration, an explicit-empty declaration,
     /// `wyrd_event_time` declared explicitly, managed columns on both lists,
-    /// floor-union dedupe, the absence of `data_tenant_id` from both canonical
-    /// lists, and the canonical form's fixed point through the stored wire.
+    /// floor-union dedupe, and the canonical form's fixed point through the
+    /// stored wire.
     #[test]
     fn canonical_layout_accepts_declared_shapes() {
         let schema = fixture_schema();
 
         // An omitted declaration resolves to hourly, one event-time key, and
-        // the schema-present managed floor — with no tenant column anywhere.
+        // the schema-present managed floor.
         let omitted =
             PhysicalLayout::resolve(TABLE, &schema, None).expect("an omitted declaration resolves");
         assert_eq!(omitted.granularity(), TimeGranularity::Hour);
@@ -1140,8 +1137,6 @@ mod tests {
                 .collect::<Vec<_>>()
                 .as_slice()
         );
-        assert!(!omitted.bloom_columns().contains(&DATA_TENANT_ID.to_owned()));
-        assert!(!sort_columns(&omitted).contains(&DATA_TENANT_ID.to_owned()));
 
         // An explicit empty declaration means exactly what omission means,
         // because the system injects nothing of its own.
@@ -1166,8 +1161,8 @@ mod tests {
             "the declaration replaces the descending default"
         );
 
-        // Every other managed column is legal too, including data_tenant_id if
-        // a caller insists: nothing is stripped, and nothing is prepended.
+        // Every other managed column is legal too: nothing is stripped, and
+        // nothing is prepended.
         let managed = PhysicalLayout::resolve(
             TABLE,
             &schema,
@@ -1276,7 +1271,6 @@ mod tests {
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
-            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
             Field::new(PRINCIPAL_ID, DataType::Utf8, true),
         ]);
         let resolved = PhysicalLayout::resolve(TABLE, &schema, None)

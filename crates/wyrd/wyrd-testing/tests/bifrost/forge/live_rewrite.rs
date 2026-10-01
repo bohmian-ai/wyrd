@@ -1119,7 +1119,7 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
 /// The customer oracle is the public read, and it is exact: at every one of the
 /// four cuts — before promotion, after promotion, across the uncertain commit,
 /// and after recovery — each tenant's public read must return the exact
-/// `(batch_id, row_ordinal, value)` multiset it acknowledged, with the matching
+/// `(batch_id, value)` multiset it acknowledged, with the matching
 /// canonical digest, and the neighbouring tenant's identically named table must
 /// be neither read, rewritten, nor disturbed.
 ///
@@ -2047,4 +2047,141 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
         );
         assert_public_rows(&client, table, &expected[&table.name], "after compaction").await;
     }
+}
+
+/// A Forge rewrite attempt refused by a full shared memory root fails only that
+/// attempt, and the durable task retries once memory returns and publishes one
+/// complete rewrite snapshot, never a partial one.
+///
+/// Two flushed public appends are promoted by the pod's own Forge. The shared
+/// Bifrost root is then filled exactly through a Forge view, so the rewrite the
+/// next pass plans is refused its governed growth and returns a failure. While
+/// the root is full the table's live cut, rewrite snapshots, and committed
+/// rewrites are unchanged. Once the occupant drops, the same pod's Forge
+/// retries and its committed groups consume every promoted input exactly once,
+/// each landing one complete snapshot, and the public read returns exactly the
+/// acknowledged rows.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, a public call fails, the full root does
+/// not fail a rewrite attempt, the failed attempt publishes anything, or the
+/// retry does not consume every promoted input exactly once with exact rows.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn failed_memory_attempt_retries_without_partial_publication() {
+    let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let table = register_table(server, tenant, &unique_table("memory_retry")).await;
+    let client = tenant_client(server, tenant).await;
+    let mut expected = Vec::new();
+    for half in 0..2_i64 {
+        let values: Vec<i64> = (half * 8..half * 8 + 8).collect();
+        expected.extend(append_values(&client, &table.qualified, Uuid::now_v7(), &values).await);
+        server
+            .flush_bifrost()
+            .await
+            .expect("the pod publishes its staged rows");
+    }
+    let expected = canonical_order(expected);
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    assert!(
+        rewrite_targets(&cluster, &table.binding).await.is_empty(),
+        "promotion alone committed no rewrite yet"
+    );
+    let promoted = live_cut(&cluster, &table.binding).await;
+    let snapshots_before = rewrite_snapshots(&cluster, &table.binding).await.len();
+
+    let occupant = server
+        .state()
+        .bifrost_resources()
+        .and_then(|resources| resources.forge())
+        .expect("the embedded pod hosts Forge")
+        .occupy_root_for_test();
+    let errors_before = observer.returned_errors().len();
+    for _ in 0..DRAIN_PASS_BUDGET {
+        if observer.returned_errors().len() > errors_before {
+            break;
+        }
+        let target = observer.attempts().saturating_add(1);
+        if pending_tasks(&cluster).await == 0 {
+            cluster.request_forge_scheduler_pass_for_test();
+        }
+        let _ =
+            tokio::time::timeout(ATTEMPT_BOUND, observer.wait_for_attempts_at_least(target)).await;
+    }
+    let failures = observer.returned_errors()[errors_before..].to_vec();
+    assert!(
+        !failures.is_empty(),
+        "a full shared root failed no Forge rewrite attempt"
+    );
+    assert_eq!(
+        live_cut(&cluster, &table.binding).await,
+        promoted,
+        "the refused attempt published nothing: {failures:?}"
+    );
+    assert_eq!(
+        rewrite_snapshots(&cluster, &table.binding).await.len(),
+        snapshots_before,
+        "the refused attempt landed no rewrite snapshot"
+    );
+    assert!(
+        rewrite_targets(&cluster, &table.binding).await.is_empty(),
+        "the refused attempt committed no rewrite"
+    );
+
+    drop(occupant);
+    await_committed_rewrites(&cluster, &observer, &[&table.binding]).await;
+    // The retry may pack the promoted inputs as several independent groups,
+    // each committing its own complete snapshot; completeness is that every
+    // promoted input is consumed by exactly one committed group.
+    let committed: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT current_detail FROM vala.forge_operation_state \
+         WHERE data_tenant_id = $1 AND resource = $2 AND family = 'iceberg_rewrite' \
+           AND phase = 'committed'",
+    )
+    .bind(tenant.as_uuid())
+    .bind(forge_audit_resource(&table.binding))
+    .fetch_all(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge committed-operation inspection");
+    let mut consumed = Vec::new();
+    for detail in &committed {
+        for input in detail["input_paths"].as_array().expect("recorded inputs") {
+            consumed.push(canonical_path(
+                input.as_str().expect("an input path"),
+                &table.binding,
+            ));
+        }
+    }
+    let consumed_set: BTreeSet<String> = consumed.iter().cloned().collect();
+    assert!(
+        !committed.is_empty()
+            && consumed.len() == consumed_set.len()
+            && consumed_set == promoted.data,
+        "the retry consumed every promoted input exactly once: {committed:#?}"
+    );
+    assert_eq!(
+        rewrite_snapshots(&cluster, &table.binding).await.len(),
+        snapshots_before + committed.len(),
+        "each committed group landed exactly one rewrite snapshot"
+    );
+    assert!(
+        live_cut(&cluster, &table.binding)
+            .await
+            .data
+            .is_disjoint(&promoted.data),
+        "no promoted input survives beside the rewrite outputs"
+    );
+    assert_public_rows(&client, &table, &expected, "after the retried rewrite").await;
 }

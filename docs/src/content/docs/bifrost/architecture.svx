@@ -55,7 +55,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
 5. **Seal trigger:** 50k rows | 1s | 128 MiB | 5s inactivity.
 6. **Seal state machine:**
    - Freeze memtable into an immutable Arrow snapshot.
-   - Encode Parquet (sorted by `data_tenant_id`, `wyrd_event_time`; bloom filters, page index).
+   - Encode Parquet (sorted by `wyrd_event_time`; tenant recorded in the footer; bloom filters, page index).
    - PUT to object store: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`.
    - Atomic Postgres transaction: INSERT the `vala.file_list` row. A batch commit evaluates no principal permission, so its durable record is that lineage row, never an audit event.
    - On commit, truncate WAL and retire manifest.
@@ -89,7 +89,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
    - **IcebergTableScan** (compacted data, tenant-qualified and partition-pruned by `Day(event_time)`)
    - **FileListScan** (`SELECT vala.file_list WHERE NOT compacted`, un-compacted Parquet files)
    - **Scribe live scans** on relevant online owners of active or staged rows
-4. Union, then `FilterExec(data_tenant_id = $tenant)` applied (non-removable via `TenantPredicateRule`).
+4. Union the sources; every opened file's footer tenant is proven against the authenticated tenant before any row is read.
 5. Execute plan, return Arrow IPC stream.
 
 Oracle chooses Interactive or Analytical automatically from the physical plan;
@@ -255,13 +255,13 @@ All categories flow through unified Bifrost schema:
 
 | Category | Table | Partitioning | Isolation |
 |----------|-------|--------------|-----------|
-| **Agent traces** | `vala.dev.agent_traces` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **Traces (spans, incl. nested events/links and promoted GenAI attributes)** | `vala.traces.spans` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **Metrics** | `vala.metrics.points` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **Logs** | `vala.logs.records` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **Evaluations** | `vala.eval.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **Drift** | `vala.drift.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **User datasets** | `vala.datasets.<name>` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Agent traces** | `vala.dev.agent_traces` | `Day(event_time)` | Tenant-qualified namespace + footer tenant proof |
+| **Traces (spans, incl. nested events/links and promoted GenAI attributes)** | `vala.traces.spans` | `Day(event_time)` | Tenant-qualified namespace + footer tenant proof |
+| **Metrics** | `vala.metrics.points` | `Day(event_time)` | Tenant-qualified namespace + footer tenant proof |
+| **Logs** | `vala.logs.records` | `Day(event_time)` | Tenant-qualified namespace + footer tenant proof |
+| **Evaluations** | `vala.eval.*` | `Day(event_time)` | Tenant-qualified namespace + footer tenant proof |
+| **Drift** | `vala.drift.*` | `Day(event_time)` | Tenant-qualified namespace + footer tenant proof |
+| **User datasets** | `vala.datasets.<name>` | `Day(event_time)` | Tenant-qualified namespace + footer tenant proof |
 
 Every logical table has an independent tenant-qualified physical table. The logical namespace and FQN remain stable while the physical path is rooted at `tenants/<tenant_uuid>/`.
 
@@ -292,7 +292,6 @@ Every domain table appends system columns that are not part of the user-declared
 
 | Column | Type | Stamped by |
 |---|---|---|
-| `data_tenant_id` | `Utf8` | Gate (from authenticated principal) |
 | `wyrd_event_time` | `Timestamp(Microseconds, UTC)` | Gate (first observation timestamp in batch) |
 | `wyrd_ingested_at` | `Timestamp(Microseconds, UTC)` | Scribe (wall-clock seal time) |
 | `wyrd_batch_id` | `FixedSizeBinary(16)` | Gate (UUIDv7, unique per batch) |
@@ -307,11 +306,9 @@ Every domain table appends system columns that are not part of the user-declared
 
 `CorrelationPolicy::None` tables (e.g., `system.audit_log`) receive no correlation columns: ingest honours the registered policy and appends nothing, so the row carries exactly the identity its own content declares. Such a table still names its identity columns out of the reserved set — `audit_principal_id`, `audit_card_ref`. `CorrelationPolicy::CodeAxis` tables (e.g., `dev.agent_traces`) own `run_id` as a content column and do not receive the universal correlation `run_id`.
 
-## Tenant isolation: TenantPredicateRule
+## Tenant isolation: per-file footer proof
 
-The `TenantPredicateRule` is a DataFusion `AnalyzerRule` registered on every `SessionContext` created by `wyrd_session_context(tenant_id)`. It walks every `TableScan` node in the plan, identifies any `WyrdTableProvider` source (all domain tables use this provider), and prepends a filter `data_tenant_id = $tenant` as a non-removable predicate. The rule runs at analysis time, before optimization and before execution, so a plan that reaches execution is guaranteed to carry the predicate.
-
-The predicate cannot be elided by a DataFusion optimizer pass because the rule is re-run after every optimization cycle.
+Tenancy is a property of the physical table, of each Parquet file, and of each in-memory Scribe bucket, never a row column. Every staged and published Parquet file records its tenant in the `wyrd.bifrost.tenant` footer key-value, taken from the authenticated binding that wrote it; Forge rewrites carry it forward. When Oracle opens a file it compares that footer tenant with the caller's authenticated tenant once, before decoding any row. A missing, duplicated, or foreign footer tenant fails the query closed with `WYRD_VALA_500_QUERY_TENANT_INVARIANT` and one security audit event.
 
 ## Audit data
 

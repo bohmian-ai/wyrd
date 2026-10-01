@@ -2443,11 +2443,11 @@ mod tests {
             ),
             (
                 format!(
-                    "{prefix}{FORGE_DATA_MARKER}v2/{}-00000-{}.parquet",
+                    "{prefix}{FORGE_DATA_MARKER}v1/{}-00000-{}.parquet",
                     Uuid::now_v7(),
                     Uuid::now_v7()
                 ),
-                "another recipe root is outside this collector's reach",
+                "the retired recipe root is outside this collector's reach",
             ),
             (
                 format!("{prefix}/data/pod-a-01JABC.parquet"),

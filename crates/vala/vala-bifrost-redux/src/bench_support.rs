@@ -35,16 +35,19 @@ pub struct OracleTelemetryLabelDomains {
 pub const fn oracle_telemetry_label_domains() -> OracleTelemetryLabelDomains {
     use crate::oracle::telemetry::{
         FragmentOutcome, OracleAdmissionOutcome, OracleAdmissionReason, OracleCancellationReason,
-        OracleQueryClassLabel,
+        query_class_label,
     };
+    use wyrd_spec::vala::api::QueryClass;
 
-    let classes = OracleQueryClassLabel::ALL;
     let outcomes = OracleAdmissionOutcome::ALL;
     let reasons = OracleAdmissionReason::ALL;
     let cancellation_reasons = OracleCancellationReason::ALL;
     let fragment_outcomes = FragmentOutcome::ALL;
     OracleTelemetryLabelDomains {
-        classes: [classes[0].as_str(), classes[1].as_str()],
+        classes: [
+            query_class_label(QueryClass::Interactive),
+            query_class_label(QueryClass::Analytical),
+        ],
         outcomes: [outcomes[0].as_str(), outcomes[1].as_str()],
         reasons: [
             reasons[0].as_str(),

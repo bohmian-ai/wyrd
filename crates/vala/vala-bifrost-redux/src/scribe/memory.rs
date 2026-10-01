@@ -12,7 +12,6 @@ use crate::contracts::ScribeError;
 
 #[cfg(test)]
 thread_local! {
-    static CGROUP_CURRENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// One-shot terminal identity return failure used by replay settlement tests.
     static FAIL_REPLAY_IDENTITY_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -23,14 +22,6 @@ pub(crate) fn arm_replay_identity_return_failure_for_test() {
     FAIL_REPLAY_IDENTITY_RETURN.with(|failure| failure.set(true));
 }
 
-/// Minimum managed memory accepted by the checked Scribe/Oracle ledger.
-///
-/// The root resource plan removes the unmanaged process reserve before
-/// constructing this ledger. A combined process therefore needs exactly two
-/// 256 MiB role floors beneath this 512 MiB managed minimum.
-pub const MIN_MEMORY_BYTES: usize = 256 * 1024 * 1024;
-/// Exact encoded-footer child held from before writer creation through inspection.
-pub(crate) const PARQUET_FOOTER_CHILD_BYTES: usize = 8 * 1024 * 1024;
 /// Bounded transfer buffer held while `OpenDAL` owns one payload copy.
 pub(crate) const PARQUET_TRANSFER_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Number of bounded lifecycle memory categories.
@@ -82,115 +73,6 @@ fn retained_array_bytes(
     data.child_data().iter().fold(total, |total, child| {
         total.saturating_add(retained_array_bytes(child, charged))
     })
-}
-
-/// Returns the checked incremental workspace for one whole-batch candidate.
-///
-/// The immutable Arrow input remains charged to its existing owner. The
-/// producer root lease covers one merge/sort copy, one codec-output copy, the
-/// retained footer child, and both caller/OpenDAL transfer buffers.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::Internal`] when the exact incremental projection
-/// cannot be represented by the current platform.
-pub(crate) fn parquet_candidate_incremental_bytes(
-    candidate_bytes: usize,
-) -> Result<usize, ScribeError> {
-    candidate_bytes
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(PARQUET_FOOTER_CHILD_BYTES))
-        .and_then(|bytes| bytes.checked_add(PARQUET_TRANSFER_BUFFER_BYTES))
-        .and_then(|bytes| bytes.checked_add(PARQUET_TRANSFER_BUFFER_BYTES))
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "Parquet candidate incremental workspace overflowed".to_owned(),
-        })
-}
-
-/// Move-only encoded-footer child split from the complete producer owner.
-///
-/// Carrying this token into the CPU lane proves the exact eight-mebibyte
-/// allowance remains charged from before encoder construction until every
-/// sealed footer has been inspected. Dropping it restores those bytes to the
-/// remaining producer reservation without changing aggregate accounting.
-#[derive(Debug)]
-pub struct EncodedFooterReservation {
-    /// Exact checked memory reservation backing the footer child.
-    reservation: Option<crate::resources::ScribeMemoryLease>,
-}
-
-impl EncodedFooterReservation {
-    /// Splits the exact footer child from an already-admitted producer owner.
-    ///
-    /// # Errors
-    /// Returns an internal error when the producer owner cannot supply the
-    /// exact eight-mebibyte child.
-    pub(crate) fn split_from(
-        owner: &mut crate::resources::ScribeMemoryLease,
-    ) -> Result<Self, ScribeError> {
-        Ok(Self {
-            reservation: Some(owner.split(PARQUET_FOOTER_CHILD_BYTES).map_err(|error| {
-                ScribeError::Internal {
-                    detail: error.to_string(),
-                }
-            })?),
-        })
-    }
-
-    /// Transfers the footer child from the complete producer ownership tuple.
-    ///
-    /// The checked delta supplies the child when it owns at least eight MiB.
-    /// Larger immutable generations already carry that memory, so the token
-    /// records a category transition without double charging the governor.
-    ///
-    /// # Errors
-    /// Returns an internal error only when neither reservation nor immutable
-    /// ownership can cover the exact footer child.
-    pub(crate) fn transfer_from(
-        owner: &mut crate::resources::ScribeMemoryLease,
-        immutable_bytes: usize,
-    ) -> Result<Self, ScribeError> {
-        if owner.bytes() >= PARQUET_FOOTER_CHILD_BYTES {
-            return Self::split_from(owner);
-        }
-        if immutable_bytes >= PARQUET_FOOTER_CHILD_BYTES {
-            return Ok(Self { reservation: None });
-        }
-        Err(ScribeError::Internal {
-            detail: "complete producer owner cannot supply its encoded-footer child".to_owned(),
-        })
-    }
-
-    /// Returns the exact bytes retained by this child.
-    #[must_use]
-    pub(crate) fn bytes(&self) -> usize {
-        self.reservation.as_ref().map_or(
-            PARQUET_FOOTER_CHILD_BYTES,
-            crate::resources::ScribeMemoryLease::bytes,
-        )
-    }
-
-    /// Constructs an isolated exact footer child for pure encoder tests.
-    ///
-    /// # Panics
-    /// Panics only if the fixed test governor cannot admit its exact footer
-    /// child, which would mean the production memory invariant regressed.
-    #[cfg(test)]
-    pub(crate) fn for_test() -> Self {
-        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * 1024 * 1024,
-            512 * 1024 * 1024,
-            [crate::resources::BifrostRole::Scribe],
-        );
-        let reservation = roles
-            .scribe()
-            .expect("footer test Scribe capability")
-            .try_reserve_maintenance(MemoryCategory::Persistence, PARQUET_FOOTER_CHILD_BYTES)
-            .expect("footer test child must fit the production floor");
-        Self {
-            reservation: Some(reservation),
-        }
-    }
 }
 
 /// Memory categories charged by the Scribe lifecycle.
@@ -458,17 +340,9 @@ pub struct ScribeOwnership {
 pub(crate) struct ReplayIdentityOwnership {
     /// Exact root-backed lease loaned by the replay scanner.
     lease: Option<crate::resources::ScribeMemoryLease>,
-    /// Stable byte count used in the complete Parquet producer tuple.
-    bytes: usize,
 }
 
 impl ReplayIdentityOwnership {
-    /// Returns the exact identity bytes retained by this guard.
-    #[must_use]
-    pub(crate) const fn bytes(&self) -> usize {
-        self.bytes
-    }
-
     /// Returns the same root-backed lease to Decode ownership.
     ///
     /// # Errors
@@ -559,10 +433,9 @@ impl ScribeOwnership {
     /// Adopts a replay scanner's committed-identity lease without admission.
     ///
     /// The same root-backed lease moves from Decode to Immutable, so the
-    /// operation is net-zero at the role ceiling. `producer_owner_bytes`
-    /// carries the complete replay-wide identity projection used to size the
-    /// producer delta; the returned guard restores only its move-only lease to
-    /// Decode attribution on rollback or terminal settlement.
+    /// operation is net-zero at the role ceiling. The returned guard restores
+    /// its move-only lease to Decode attribution on rollback or terminal
+    /// settlement.
     ///
     /// # Errors
     ///
@@ -571,16 +444,12 @@ impl ScribeOwnership {
     pub(crate) fn adopt_replay_identity(
         &self,
         mut lease: crate::resources::ScribeMemoryLease,
-        producer_owner_bytes: usize,
     ) -> Result<ReplayIdentityOwnership, ScribeError> {
         drop(self.immutable.lock().map_err(|_| ScribeError::Internal {
             detail: "immutable memory ledger lock poisoned".to_owned(),
         })?);
         lease.transfer_category(MemoryCategory::Immutable)?;
-        Ok(ReplayIdentityOwnership {
-            lease: Some(lease),
-            bytes: producer_owner_bytes,
-        })
+        Ok(ReplayIdentityOwnership { lease: Some(lease) })
     }
 
     /// Adopts a replay chunk's decoded lease as immutable Arrow ownership.
@@ -950,41 +819,6 @@ impl ScribeOwnership {
     }
 }
 
-pub(crate) fn read_cgroup_limit() -> Option<usize> {
-    [
-        "/sys/fs/cgroup/memory.max",
-        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    ]
-    .into_iter()
-    .find_map(read_memory_limit)
-}
-
-pub(crate) fn read_cgroup_current() -> Option<usize> {
-    #[cfg(test)]
-    CGROUP_CURRENT_READS.with(|count| count.set(count.get() + 1));
-    [
-        "/sys/fs/cgroup/memory.current",
-        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
-    ]
-    .into_iter()
-    .find_map(|path| {
-        std::fs::read_to_string(path)
-            .ok()?
-            .trim()
-            .parse::<usize>()
-            .ok()
-    })
-}
-
-fn read_memory_limit(path: &str) -> Option<usize> {
-    let value = std::fs::read_to_string(path).ok()?;
-    let value = value.trim();
-    if value == "max" {
-        return None;
-    }
-    value.parse::<usize>().ok().filter(|value| *value > 0)
-}
-
 #[cfg(test)]
 /// Focused ownership and lifecycle reconciliation proofs.
 mod tests {
@@ -1126,9 +960,8 @@ mod tests {
             .expect("replay identity lease");
         let admitted = resources.snapshot().expect("admitted snapshot");
         let identity = ownership
-            .adopt_replay_identity(lease, 96)
+            .adopt_replay_identity(lease)
             .expect("identity adoption");
-        assert_eq!(identity.bytes(), 96);
         assert_eq!(
             resources
                 .snapshot()

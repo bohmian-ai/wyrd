@@ -50,7 +50,6 @@ pub(crate) fn projected_source_schema_fingerprint(
                     | wyrd_spec::vala::CARD_UID
                     | wyrd_spec::vala::PRINCIPAL_ID
                     | "run_id"
-                    | "data_tenant_id"
             ) && !field.name().starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())
@@ -208,18 +207,12 @@ impl OtlpDecodeOwner {
         Ok(OtlpDecodeScratch { _memory: memory })
     }
 
-    /// Atomically grows the decode child into Scribe's one complete root.
+    /// Transfers the decode lease into Scribe without a second admission.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] without losing this owner when root capacity
-    /// cannot cover the immutable material plan.
-    pub(crate) fn complete(
-        mut self,
-        root_bytes: usize,
-    ) -> Result<crate::resources::ScribeMemoryLease, ScribeError> {
-        self.memory.resize_ingress(root_bytes)?;
-        Ok(self.memory)
+    /// Scribe resizes the returned lease to the bytes it actually holds once
+    /// the projected Arrow is adopted; the decode charge is never counted twice.
+    pub(crate) fn complete(self) -> crate::resources::ScribeMemoryLease {
+        self.memory
     }
 }
 
@@ -230,6 +223,16 @@ pub struct FrameAdmission {
     pub batch_id: uuid::Uuid,
     /// Number of rows durably admitted into the active ingest pipeline.
     pub rows_accepted: u64,
+    /// Server receipt instant, in epoch microseconds, Scribe stamped as
+    /// `wyrd_event_time` on every row whose caller supplied none.
+    pub receipt_micros: i64,
+    /// Whether this attempt is the one that made the batch query-visible.
+    ///
+    /// `false` for a replay Scribe suppressed because the same batch identity
+    /// was already committed: the ACK is an idempotent success, but its
+    /// `receipt_micros` is not the instant stamped on the stored rows, so
+    /// post-ACK consumers must act only on the first commit.
+    pub first_commit: bool,
 }
 
 /// Scribe-layer errors per CONTRACTS §10.
@@ -273,9 +276,6 @@ pub enum ScribeError {
         /// Fully-qualified logical table requested by the authenticated writer.
         table: String,
     },
-
-    #[error("ingest request has too many rows: {rows} > {limit}")]
-    TooManyRows { rows: u64, limit: u64 },
 
     #[error("ingest frame validation failed")]
     InvalidFrame,
@@ -347,10 +347,6 @@ impl ScribeError {
             },
             Self::TableNotFound { table } => Self::TableNotFound {
                 table: table.clone(),
-            },
-            Self::TooManyRows { rows, limit } => Self::TooManyRows {
-                rows: *rows,
-                limit: *limit,
             },
             Self::InvalidFrame => Self::InvalidFrame,
             Self::EventTimeOutOfRange {

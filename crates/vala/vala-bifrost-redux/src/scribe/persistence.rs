@@ -1,7 +1,6 @@
 //! Bounded immutable-generation persistence for Scribe.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
@@ -19,15 +18,13 @@ use crate::maintenance::StagingFilePublisher;
 use crate::parquet::object_uploader::{
     BifrostParquetUploader, BifrostUploadRole, ParquetObjectIdentity, VerifiedParquetObject,
 };
-use crate::resources::{ScribeMemoryLease, ScribeResources};
+use crate::resources::ScribeResources;
 use crate::scribe::execution_lanes::{
     ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult, ScribeWalIoOp,
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
-use crate::scribe::memory::{
-    MemoryCategory, PARQUET_TRANSFER_BUFFER_BYTES, parquet_candidate_incremental_bytes,
-};
+use crate::scribe::memory::{MemoryCategory, PARQUET_TRANSFER_BUFFER_BYTES};
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::BoundedParquetArtifactSet;
 use crate::scribe::seal_key::SealKey;
@@ -35,9 +32,6 @@ use crate::scribe::staging::{
     RecoveredPublication, ScribeStaging, StageElection, StagedArtifactClaim,
 };
 use crate::scribe::stream_identity::StreamIdentity;
-use crate::scribe::telemetry::{
-    ProducerLifecycleEvent, ProducerLifecycleIdentity, record_producer_lifecycle,
-};
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
 
 /// Publishes the unlabeled persistence queue gauges before workers accept jobs.
@@ -115,11 +109,11 @@ pub struct PersistenceFaults {
     sql_commit: Arc<std::sync::atomic::AtomicBool>,
     post_commit_client_error: Arc<std::sync::atomic::AtomicBool>,
     manifest_publication: Arc<std::sync::atomic::AtomicBool>,
-    object_write_delay_ms: Arc<AtomicU64>,
+    object_write_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     object_write_delays_ms: Arc<Mutex<Vec<u64>>>,
     object_write_active: Arc<AtomicUsize>,
     max_object_write_active: Arc<AtomicUsize>,
-    encode_delay_ms: Arc<AtomicU64>,
+    encode_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     encode_active: Arc<AtomicUsize>,
     max_encode_active: Arc<AtomicUsize>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -572,9 +566,6 @@ pub struct PersistenceRuntime {
     abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     /// Operator-backed owner for caller-commit ambiguity reconciliation.
     reconciler: Option<ScribePublicationReconciler>,
-    /// Bounded ownership-transfer seam for already-admitted ambiguous attempts.
-    /// Arrival-ordered exact-byte producer admission shared by every worker.
-    producer_admission: Option<ProducerAdmission>,
     /// WAL-root stage owner used for pre-readiness publication recovery.
     recovery_wal: Option<Arc<WalWriter>>,
     /// Durable object store used for pre-readiness upload convergence.
@@ -629,7 +620,6 @@ impl PersistenceRuntime {
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
             reconciler: None,
-            producer_admission: None,
             recovery_wal: None,
             recovery_operator: None,
             recovery_memory: None,
@@ -649,7 +639,6 @@ impl PersistenceRuntime {
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
             reconciler: None,
-            producer_admission: None,
             recovery_wal: None,
             recovery_operator: None,
             recovery_memory: None,
@@ -760,7 +749,6 @@ impl PersistenceRuntime {
                 config.faults.clone(),
             )
         });
-        let producer_admission = ProducerAdmission::new(context.memory.clone());
         let recovery_wal = Arc::clone(&context.wal);
         let recovery_operator = (*context.operator).clone();
         let recovery_memory = context.memory.clone();
@@ -772,7 +760,6 @@ impl PersistenceRuntime {
             Arc::clone(&failures),
             context,
             output_scratch,
-            producer_admission.clone(),
             staging,
         ));
         let runtime_state = Arc::new(Self {
@@ -783,7 +770,6 @@ impl PersistenceRuntime {
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
             reconciler,
-            producer_admission: Some(producer_admission),
             recovery_wal: Some(recovery_wal),
             recovery_operator: Some(recovery_operator),
             recovery_memory: Some(recovery_memory),
@@ -913,9 +899,6 @@ impl PersistenceRuntime {
         if let Ok(mut sender) = self.sender.lock() {
             sender.take();
         }
-        if let Some(admission) = &self.producer_admission {
-            admission.close();
-        }
         self.drained.notify_waiters();
     }
 
@@ -962,6 +945,35 @@ impl PersistenceRuntime {
             return Ok(0);
         }
         worker.publish_residue(cause).await
+    }
+
+    /// Publishes every staged claim that target or dwell has made due.
+    ///
+    /// This is the only path that publishes target and dwell claims. The
+    /// server's lifecycle scanner calls it on its tick, so target publication
+    /// waits at most one tick and dwell is a wall-clock bound that holds
+    /// without new data. A pod without a persistence worker or a
+    /// staging volume publishes nothing and reports zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a due claim cannot be gathered, admitted,
+    /// merged, or published. The claim stays outstanding and its members stay
+    /// durable, so a later tick or startup recovery retries it.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future stops between claims or leaves one claim in
+    /// flight; its uploaded objects and publication manifest converge on retry
+    /// and its rows stay authoritative in the WAL.
+    pub(crate) async fn publish_due(&self) -> Result<usize, ScribeError> {
+        let Some(worker) = &self.worker else {
+            return Ok(0);
+        };
+        if worker.staging.is_none() {
+            return Ok(0);
+        }
+        Ok(worker.publish_due_claims().await?.len())
     }
 
     /// Publishes only the staged residue belonging to one physical partition.
@@ -1148,7 +1160,7 @@ impl PersistenceRuntime {
         let claims = staging.resumable_claims()?;
         let mut resumed = 0_usize;
         for claim in claims {
-            worker.publish_claim(staging, &claim, None).await?;
+            worker.publish_claim(staging, &claim).await?;
             resumed = resumed
                 .checked_add(1)
                 .ok_or_else(|| ScribeError::Internal {
@@ -1177,6 +1189,12 @@ struct PersistenceWorker {
     wal: Arc<WalWriter>,
     /// Bounded CPU lane used for Parquet encoding.
     persistence_cpu: ScribePersistenceCpuPool,
+    /// One-thread lane that runs claim merges.
+    ///
+    /// A merge can take tens of seconds; on its own thread it never queues
+    /// generation staging, so ingest and shutdown's final flush do not wait on
+    /// it. Claims publish one at a time, so one thread is the whole demand.
+    assembly_cpu: ScribePersistenceCpuPool,
     /// Bounded filesystem lane used for manifest advancement.
     wal_io: ScribeWalIoPool,
     /// Scribe memory budget for persistence workspace reservations.
@@ -1190,61 +1208,12 @@ struct PersistenceWorker {
     faults: PersistenceFaults,
     /// Serializes manifest publication after SQL commit.
     manifest_guard: Arc<tokio::sync::Mutex<()>>,
-    /// Fair exact-byte admission owner shared by live and replay persistence.
-    producer_admission: ProducerAdmission,
     /// Pod-level owner of staged members and their assembly claims.
     ///
     /// `None` only when this pod was provisioned without a staging volume or
     /// without the operator capability publication requires; such a worker
     /// refuses durable work rather than persisting through a second path.
     staging: Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>>,
-}
-
-/// What one settled generation left behind on the staging volume.
-///
-/// A generation completes at the staged boundary, not at publication: its
-/// member is durable and servable, and the claims listed here are the ones that
-/// happened to become due while it settled. An empty list is the normal steady
-/// state for a key that is still filling toward its object target.
-#[derive(Debug)]
-pub(crate) struct StagedGenerationOutcome {
-    /// Identity of the durable member this generation became.
-    pub(crate) member: crate::scribe::assembly::StagedMemberId,
-    /// Commit keys of every claim published while this generation settled.
-    pub(crate) published: Vec<FileListCommitKey>,
-}
-
-/// Estimates the Arrow bytes one claim's bounded merge holds at once.
-///
-/// The merge decodes one bounded batch per member rather than a whole member,
-/// so the footprint is derived from what the members measured: their encoded
-/// bytes per row, scaled by the rows the merge can hold at once.
-/// [`parquet_candidate_incremental_bytes`] then adds the writer's own footer
-/// and transfer children on top of it.
-fn claim_merge_bytes(claim: &crate::scribe::assembly::StagingClaim) -> usize {
-    merge_window_bytes(
-        claim.encoded_bytes(),
-        claim.rows(),
-        claim.members().len() as u64,
-    )
-}
-
-/// Bytes a merge of `members` holds at once, given their total `encoded_bytes`
-/// over `rows`.
-///
-/// Each member contributes one batch of at most
-/// [`MERGE_BATCH_ROWS`](crate::scribe::claim_assembly::MERGE_BATCH_ROWS) rows,
-/// and no batch holds more rows than its member has, so the rows held at once
-/// are the lesser of the claim's rows and one full window per member. Bounding
-/// by the claim's own rows keeps a claim of many small, wide members from
-/// requesting a window it can never fill — a request that exceeds the pod's
-/// Scribe memory ceiling would otherwise wait for admission forever.
-fn merge_window_bytes(encoded_bytes: u64, rows: u64, members: u64) -> usize {
-    let rows = rows.max(1);
-    let bytes_per_row = encoded_bytes.div_ceil(rows);
-    let window = crate::scribe::claim_assembly::MERGE_BATCH_ROWS as u64;
-    let held_rows = rows.min(window.saturating_mul(members));
-    usize::try_from(bytes_per_row.saturating_mul(held_rows)).unwrap_or(usize::MAX)
 }
 
 /// Separate Scribe mover that uploads finalized stages but owns no catalog decision.
@@ -1428,13 +1397,8 @@ impl ScribeStageMover {
         // Namespace-wide orphan classification and winner completion belong
         // only to startup recovery. Live workers perform per-identity election
         // so they cannot race recovery against another active attempt.
-        let transfer_bytes = PARQUET_TRANSFER_BUFFER_BYTES
-            .checked_mul(2)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "Scribe recovery transfer reservation overflowed".to_owned(),
-            })?;
-        let _transfer_owner =
-            memory.try_reserve_maintenance(MemoryCategory::Persistence, transfer_bytes)?;
+        let _transfer_owner = memory
+            .try_reserve_maintenance(MemoryCategory::Persistence, PARQUET_TRANSFER_BUFFER_BYTES)?;
         let mut recovered = 0_usize;
         let mut chunk = vec![0_u8; PARQUET_TRANSFER_BUFFER_BYTES];
         let _recovered_stages = self.staging.recover(&mut chunk).await?;
@@ -1507,22 +1471,6 @@ impl ScribeStageMover {
     }
 }
 
-/// Arrival-ordered waiter metadata; root leases remain the only byte ledger.
-#[derive(Debug, Clone, Copy)]
-struct ProducerWaiter {
-    /// Monotonic identity used for cancellation-safe removal.
-    id: u64,
-    /// Exact workspace requested from the root when this waiter reaches head.
-    workspace_bytes: usize,
-}
-
-/// Mutable queue state protected independently from root resource accounting.
-#[derive(Debug, Default)]
-struct ProducerAdmissionState {
-    /// FIFO of accepted waiters.
-    waiters: VecDeque<ProducerWaiter>,
-}
-
 /// Move-owned terminal guard for one durable Scribe visibility publication.
 #[derive(Debug)]
 pub(crate) struct VisibilityPublishGuard {
@@ -1583,400 +1531,6 @@ impl Drop for VisibilityPublishGuard {
         if !self.terminal {
             self.span.record("outcome", self.drop_outcome);
             self.terminal = true;
-        }
-    }
-}
-
-/// Dependency-owning FIFO admission for concurrent byte-weighted producers.
-#[derive(Debug, Clone)]
-pub struct ProducerAdmission {
-    /// Sole authority for exact persistence byte ownership.
-    resources: ScribeResources,
-    /// Arrival-ordered waiter queue containing no aggregate byte state.
-    state: Arc<Mutex<ProducerAdmissionState>>,
-    /// Wakes the new head after grants, cancellation, or shutdown.
-    changed: Arc<Notify>,
-    /// Rejects new waiters and releases queued waiters during shutdown.
-    closed: Arc<AtomicBool>,
-    /// Process-local monotonic waiter identity.
-    next_id: Arc<AtomicU64>,
-}
-
-impl ProducerAdmission {
-    /// Creates an open admission owner over the authoritative root capability.
-    #[must_use]
-    pub(crate) fn new(resources: ScribeResources) -> Self {
-        Self {
-            resources,
-            state: Arc::new(Mutex::new(ProducerAdmissionState::default())),
-            changed: Arc::new(Notify::new()),
-            closed: Arc::new(AtomicBool::new(false)),
-            next_id: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
-    /// Acquires the exact root workspace once this waiter reaches queue head.
-    ///
-    /// Only the head attempts root admission. Temporary occupation waits on the
-    /// root epoch; later arrivals therefore cannot starve an older large request.
-    /// Dropping this future removes its waiter through `ProducerWaiterGuard`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal error after shutdown or poisoned queue state, and
-    /// propagates non-capacity root failures unchanged.
-    pub async fn acquire(&self, workspace_bytes: usize) -> Result<ScribeMemoryLease, ScribeError> {
-        self.acquire_inner(workspace_bytes, false, None).await
-    }
-
-    /// Acquires for a job accepted before runtime shutdown began.
-    ///
-    /// Graceful drain closes admission before its residue claims publish, but
-    /// every member in those claims was admitted while the runtime was open and
-    /// is already durable. Refusing their merge workspace would strand durable
-    /// rows on the staging volume, so this admission ignores the closed flag
-    /// while still queueing behind the same fair waiter order.
-    ///
-    /// # Errors
-    /// Returns root admission failures or poisoned queue state.
-    pub(crate) async fn acquire_accepted(
-        &self,
-        workspace_bytes: usize,
-    ) -> Result<ScribeMemoryLease, ScribeError> {
-        self.acquire_inner(workspace_bytes, true, None).await
-    }
-
-    /// Acquires production work while retaining its immutable producer identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns root admission failures or poisoned queue state. Every emitted
-    /// lifecycle event carries `identity` as tracing fields, never metric labels.
-    pub(crate) async fn acquire_with_identity(
-        &self,
-        workspace_bytes: usize,
-        identity: ProducerLifecycleIdentity,
-    ) -> Result<ScribeMemoryLease, ScribeError> {
-        self.acquire_inner(workspace_bytes, false, Some(identity))
-            .await
-    }
-
-    /// Implements FIFO admission for new or already-accepted work.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal error when admission is closed, queue state is
-    /// poisoned, or memory-change notification fails, and propagates non-capacity
-    /// root reservation failures.
-    ///
-    /// # Cancellation
-    ///
-    /// Dropping a waiting future removes its waiter through the guard without
-    /// acquiring memory. Once a lease is returned, its owner controls release.
-    async fn acquire_inner(
-        &self,
-        workspace_bytes: usize,
-        accepted: bool,
-        identity: Option<ProducerLifecycleIdentity>,
-    ) -> Result<ScribeMemoryLease, ScribeError> {
-        self.ensure_open(accepted, workspace_bytes, identity.as_ref())?;
-        let (id, queue_position) = match self.enqueue(workspace_bytes, accepted) {
-            Ok(waiter) => waiter,
-            Err(error) => {
-                self.record_refusal(
-                    workspace_bytes,
-                    self.queue_len(),
-                    identity.as_ref(),
-                    "closed",
-                    "runtime_shutdown",
-                );
-                return Err(error);
-            }
-        };
-        let mut guard =
-            ProducerWaiterGuard::new(self, id, workspace_bytes, queue_position, identity);
-        let mut waited = false;
-        loop {
-            if !accepted && self.closed.load(Ordering::Acquire) {
-                guard.refuse("closed", "runtime_shutdown");
-                return Err(Self::closed_error());
-            }
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let is_head = match self.waiter_is_head(id, workspace_bytes) {
-                Ok(is_head) => is_head,
-                Err(error) => {
-                    guard.refuse("refused", "queue_state_error");
-                    return Err(error);
-                }
-            };
-            if !is_head {
-                waited = true;
-                notified.await;
-                continue;
-            }
-            let epoch = self.resources.memory_epoch();
-            match self.resources.try_reserve_maintenance(
-                crate::scribe::memory::MemoryCategory::Persistence,
-                workspace_bytes,
-            ) {
-                Ok(lease) => {
-                    record_producer_lifecycle(
-                        ProducerLifecycleEvent {
-                            workspace_bytes,
-                            queue_position,
-                            queue_count: self.queue_len(),
-                            resource_epoch: epoch,
-                            operation: "admission",
-                            stage: "grant",
-                            outcome: "granted",
-                            reason: if waited { "waited" } else { "immediate" },
-                        },
-                        guard.identity(),
-                    );
-                    guard.settle();
-                    return Ok(lease);
-                }
-                Err(ScribeError::IngestBusy { .. }) => {
-                    waited = true;
-                    record_producer_lifecycle(
-                        ProducerLifecycleEvent {
-                            workspace_bytes,
-                            queue_position,
-                            queue_count: self.queue_len(),
-                            resource_epoch: epoch,
-                            operation: "admission",
-                            stage: "wait",
-                            outcome: "pending",
-                            reason: "occupied",
-                        },
-                        guard.identity(),
-                    );
-                    tokio::select! {
-                        result = self.resources.wait_for_memory_change(epoch) => {
-                            if let Err(error) = result {
-                                guard.refuse("refused", "memory_change_error");
-                                return Err(ScribeError::Internal { detail: error.to_string() });
-                            }
-                        }
-                        () = notified => {}
-                    }
-                }
-                Err(error) => {
-                    guard.refuse("refused", "root_error");
-                    return Err(error);
-                }
-            }
-        }
-    }
-
-    /// Rejects new work that arrives after producer admission closes.
-    ///
-    /// # Errors
-    ///
-    /// Returns the stable runtime-shutdown error after emitting an
-    /// identity-bearing refusal; already-accepted work remains eligible.
-    fn ensure_open(
-        &self,
-        accepted: bool,
-        workspace_bytes: usize,
-        identity: Option<&ProducerLifecycleIdentity>,
-    ) -> Result<(), ScribeError> {
-        if accepted || !self.closed.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.record_refusal(
-            workspace_bytes,
-            self.queue_len(),
-            identity,
-            "closed",
-            "runtime_shutdown",
-        );
-        Err(Self::closed_error())
-    }
-
-    /// Reports whether one exact waiter currently owns the FIFO queue head.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal Scribe error when the admission queue is poisoned.
-    fn waiter_is_head(&self, id: u64, workspace_bytes: usize) -> Result<bool, ScribeError> {
-        let state = self.state.lock().map_err(|_| ScribeError::Internal {
-            detail: "Scribe producer admission queue is poisoned".to_owned(),
-        })?;
-        Ok(state
-            .waiters
-            .front()
-            .is_some_and(|waiter| waiter.id == id && waiter.workspace_bytes == workspace_bytes))
-    }
-
-    /// Appends one waiter after rechecking shutdown under the queue lock.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal error when the queue lock is poisoned or new work
-    /// races with admission closure.
-    fn enqueue(&self, workspace_bytes: usize, accepted: bool) -> Result<(u64, usize), ScribeError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut state = self.state.lock().map_err(|_| ScribeError::Internal {
-            detail: "Scribe producer admission queue is poisoned".to_owned(),
-        })?;
-        if !accepted && self.closed.load(Ordering::Acquire) {
-            return Err(Self::closed_error());
-        }
-        let position = state.waiters.len();
-        state.waiters.push_back(ProducerWaiter {
-            id,
-            workspace_bytes,
-        });
-        Ok((id, position))
-    }
-
-    /// Closes admission and wakes every queued future to observe shutdown.
-    pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.changed.notify_waiters();
-    }
-
-    /// Returns the current waiter count for bounded telemetry and tests.
-    pub(crate) fn queue_len(&self) -> usize {
-        self.state.lock().map_or(0, |state| state.waiters.len())
-    }
-
-    /// Builds the stable internal shutdown projection.
-    fn closed_error() -> ScribeError {
-        ScribeError::Internal {
-            detail: "Scribe producer admission closed".to_owned(),
-        }
-    }
-
-    /// Emits one refusal before this producer can acquire a queue waiter.
-    fn record_refusal(
-        &self,
-        workspace_bytes: usize,
-        queue_position: usize,
-        identity: Option<&ProducerLifecycleIdentity>,
-        outcome: &'static str,
-        reason: &'static str,
-    ) {
-        record_producer_lifecycle(
-            ProducerLifecycleEvent {
-                workspace_bytes,
-                queue_position,
-                queue_count: self.queue_len(),
-                resource_epoch: self.resources.memory_epoch(),
-                operation: "admission",
-                stage: "refusal",
-                outcome,
-                reason,
-            },
-            identity,
-        );
-    }
-}
-
-/// Cancellation guard that removes exactly one queued waiter without bytes.
-struct ProducerWaiterGuard {
-    /// Shared queue state containing this guard's waiter while armed.
-    state: Arc<Mutex<ProducerAdmissionState>>,
-    /// Queue notification used after head removal.
-    changed: Arc<Notify>,
-    /// Root capability retained only to read the cancellation epoch.
-    resources: ScribeResources,
-    /// Trace-only immutable identity emitted if this waiter is cancelled.
-    identity: Option<ProducerLifecycleIdentity>,
-    /// Exact producer workspace requested by this waiter.
-    workspace_bytes: usize,
-    /// Arrival position observed when this waiter entered the queue.
-    queue_position: usize,
-    /// Waiter identity, cleared after a successful explicit removal.
-    id: Option<u64>,
-}
-
-impl ProducerWaiterGuard {
-    /// Arms cancellation cleanup for one enqueued waiter.
-    fn new(
-        admission: &ProducerAdmission,
-        id: u64,
-        workspace_bytes: usize,
-        queue_position: usize,
-        identity: Option<ProducerLifecycleIdentity>,
-    ) -> Self {
-        Self {
-            state: Arc::clone(&admission.state),
-            changed: Arc::clone(&admission.changed),
-            resources: admission.resources.clone(),
-            identity,
-            workspace_bytes,
-            queue_position,
-            id: Some(id),
-        }
-    }
-
-    /// Returns the trace identity retained by this queued waiter.
-    fn identity(&self) -> Option<&ProducerLifecycleIdentity> {
-        self.identity.as_ref()
-    }
-
-    /// Removes a waiter after a non-cancellation terminal transition.
-    fn settle(&mut self) {
-        self.identity = None;
-        self.remove();
-    }
-
-    /// Emits one terminal admission refusal before removing this waiter.
-    ///
-    /// A refusal is a production result, unlike a future drop, so this clears
-    /// the guard after emitting the refusal and cannot subsequently report a
-    /// cancellation for the same waiter.
-    fn refuse(&mut self, outcome: &'static str, reason: &'static str) {
-        record_producer_lifecycle(
-            ProducerLifecycleEvent {
-                workspace_bytes: self.workspace_bytes,
-                queue_position: self.queue_position,
-                queue_count: self.state.lock().map_or(0, |state| state.waiters.len()),
-                resource_epoch: self.resources.memory_epoch(),
-                operation: "admission",
-                stage: "refusal",
-                outcome,
-                reason,
-            },
-            self.identity(),
-        );
-        self.settle();
-    }
-
-    /// Removes this waiter after grant or terminal refusal.
-    fn remove(&mut self) {
-        let Some(id) = self.id.take() else { return };
-        if let Ok(mut state) = self.state.lock()
-            && let Some(index) = state.waiters.iter().position(|waiter| waiter.id == id)
-        {
-            state.waiters.remove(index);
-        }
-        self.changed.notify_waiters();
-    }
-}
-
-impl Drop for ProducerWaiterGuard {
-    fn drop(&mut self) {
-        let identity = self.identity.take();
-        self.remove();
-        if let Some(identity) = identity {
-            record_producer_lifecycle(
-                ProducerLifecycleEvent {
-                    workspace_bytes: self.workspace_bytes,
-                    queue_position: self.queue_position,
-                    queue_count: self.state.lock().map_or(0, |state| state.waiters.len()),
-                    resource_epoch: self.resources.memory_epoch(),
-                    operation: "admission",
-                    stage: "cancel",
-                    outcome: "cancelled",
-                    reason: "future_dropped",
-                },
-                Some(&identity),
-            );
         }
     }
 }
@@ -2061,25 +1615,26 @@ impl ScribePublicationReconciler {
 
 impl PersistenceWorker {
     /// Reports whether the test fault injector refuses the next SQL commit.
+    ///
+    /// Compiled only for tests and `test-support`; production has no injector.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     fn fail_before_sql_commit(&self) -> bool {
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            self.faults.take_sql_commit()
-        }
-        #[cfg(not(any(test, feature = "test-support")))]
-        {
-            false
-        }
+        self.faults.take_sql_commit()
     }
 
     /// Builds a persistence worker from its complete durable dependencies.
+    ///
+    /// Also starts the worker's own claim-merge lane.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the claim-merge thread cannot be started.
     fn new(
         operator_pool: Option<vala_sql::OperatorPool>,
         failures: Arc<Mutex<Vec<String>>>,
         context: PersistenceRuntimeContext,
         output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
-        producer_admission: ProducerAdmission,
         staging: Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>>,
     ) -> Self {
         Self {
@@ -2088,6 +1643,7 @@ impl PersistenceWorker {
             actor_stream: context.actor_stream,
             wal: context.wal,
             persistence_cpu: context.persistence_cpu,
+            assembly_cpu: ScribePersistenceCpuPool::new_with_capacity(1, 1),
             wal_io: context.wal_io,
             memory: context.memory,
             staging_file_publisher: context.staging_file_publisher,
@@ -2095,16 +1651,14 @@ impl PersistenceWorker {
             #[cfg(any(test, feature = "test-support"))]
             faults: context.faults,
             manifest_guard: Arc::new(tokio::sync::Mutex::new(())),
-            producer_admission,
             staging,
         }
     }
 
     /// Processes one queued generation and reports completion to its shard.
     ///
-    /// The method reserves the shared generation-derived workspace, performs
-    /// the ordered persistence stages, and always sends a completion outcome
-    /// back to the owning shard.
+    /// The method performs the ordered persistence stages and always sends a
+    /// completion outcome back to the owning shard.
     /// A failed stage leaves the immutable generation retained for retry; an
     /// interrupted task may have already written an idempotent object or SQL
     /// row and is reconciled by replay.
@@ -2187,9 +1741,9 @@ impl PersistenceWorker {
             .ok()
             .and_then(|mut identity| identity.take());
         let completion = match result {
-            Ok(outcome) => PersistenceCompletion {
+            Ok(member) => PersistenceCompletion {
                 generation_id: generation.generation_id,
-                staged: Some(Self::record_published_claims(&generation, &outcome)),
+                staged: Some(member),
                 wal_segments: generation.wal_segments.clone(),
                 wal: generation.wal.clone(),
                 arrow_bytes: generation.arrow_bytes,
@@ -2210,77 +1764,18 @@ impl PersistenceWorker {
             .await;
     }
 
-    /// Reserves the exact producer delta and persists one immutable generation.
-    ///
-    /// Replay identity bytes participate in the producer tuple while the
-    /// existing footer transfer consumes that same complete owned-byte value.
+    /// Persists one immutable generation through the durable staging owner.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] for ownership overflow, producer admission, or
-    /// any persistence-stage failure.
+    /// Returns [`ScribeError`] for any persistence-stage failure.
     async fn persist_generation(
         &self,
         generation: &Arc<ImmutableGeneration>,
         job: &PersistenceJob,
-    ) -> Result<StagedGenerationOutcome, ScribeError> {
-        let producer_identity = ProducerLifecycleIdentity {
-            seal_key: generation.seal_key.clone(),
-            shard_id: generation.shard_id,
-            writer_epoch: generation.stream.writer_epoch.as_i64(),
-            shard_generation: generation.wal_lsn_min.as_u64(),
-            cohort_id: generation
-                .wal_segments
-                .first()
-                .map(|segment| segment.path.clone()),
-            member_generation: generation.generation_id.0,
-        };
-        let identity_bytes = generation
-            .replay_identity
-            .lock()
-            .map(|identity| {
-                identity
-                    .as_ref()
-                    .map_or(0, super::memory::ReplayIdentityOwnership::bytes)
-            })
-            .unwrap_or_default();
-        let owned_bytes = generation
-            .arrow_bytes
-            .checked_add(identity_bytes)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "replay producer ownership overflowed".to_owned(),
-            })?;
-        self.persist_once(
-            generation,
-            &job.binding,
-            job.defer_manifest_advance,
-            owned_bytes,
-            &producer_identity,
-        )
-        .await
-    }
-
-    /// Records the claims one settled generation published and returns its member.
-    ///
-    /// Publishing is decoupled from staging, so the count belongs to the
-    /// generation that happened to make those claims due rather than to any one
-    /// of their members. Zero is the normal steady state for a key still
-    /// filling toward its object target.
-    fn record_published_claims(
-        generation: &ImmutableGeneration,
-        outcome: &StagedGenerationOutcome,
-    ) -> crate::scribe::assembly::StagedMemberId {
-        metrics::counter!("bifrost_scribe_staging_claims_published_total")
-            .increment(outcome.published.len() as u64);
-        if !outcome.published.is_empty() {
-            tracing::info!(
-                shard_id = generation.shard_id,
-                member_generation = generation.generation_id.0,
-                claims = outcome.published.len(),
-                "Scribe staged members published as hot objects"
-            );
-        }
-        outcome.member
+    ) -> Result<crate::scribe::assembly::StagedMemberId, ScribeError> {
+        self.persist_once(generation, &job.binding, job.defer_manifest_advance)
+            .await
     }
 
     /// Delivers one completion to the owning shard and resolves its visibility span.
@@ -2337,54 +1832,16 @@ impl PersistenceWorker {
         tracing::debug!(generation_id, "persistence job finished");
     }
 
-    /// Emits one candidate terminal or release event under its typed identity.
-    fn record_candidate_settlement(
-        &self,
-        identity: &ProducerLifecycleIdentity,
-        workspace_bytes: usize,
-        stage: &'static str,
-        succeeded: bool,
-    ) {
-        record_producer_lifecycle(
-            ProducerLifecycleEvent {
-                workspace_bytes,
-                queue_position: 0,
-                queue_count: self.producer_admission.queue_len(),
-                resource_epoch: self.memory.memory_epoch(),
-                operation: "persistence",
-                stage,
-                outcome: if stage == "release" {
-                    "released"
-                } else if succeeded {
-                    "candidate_ready"
-                } else {
-                    "failed"
-                },
-                reason: if stage == "release" {
-                    if succeeded {
-                        "candidate_ready"
-                    } else {
-                        "failed"
-                    }
-                } else if succeeded {
-                    "durable_candidate_released"
-                } else {
-                    "stage_error"
-                },
-            },
-            Some(identity),
-        );
-    }
-
-    /// Stages one generation durably, then publishes whatever claim it completes.
+    /// Stages one generation durably and returns the member it became.
     ///
     /// The ordering is the durable contract. The generation's rows are sorted,
     /// encoded, fsynced and preflighted onto the staging volume, the staged
     /// record that makes them a query source is published, and only then does
     /// the stream manifest advance — which is what allows the WAL behind those
-    /// rows to be retired. Assembly and fenced publication happen after that
-    /// boundary and may span several generations, so a member whose claim has
-    /// not yet filled is durable, servable, and WAL-free while it waits.
+    /// rows to be retired. Assembly and fenced publication are not part of this
+    /// path: the server's publisher tick publishes due claims through
+    /// [`PersistenceRuntime::publish_due`], so a claim merge never holds a
+    /// generation, its shard, or shutdown's final flush.
     ///
     /// Each costed stage records its elapsed time into
     /// `bifrost_scribe_persist_stage_seconds{stage}` via [`record_persist_stage`]
@@ -2395,59 +1852,23 @@ impl PersistenceWorker {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when this pod owns no staging capability, when
-    /// the recipe cannot be resolved, when staging, record publication, or
-    /// manifest advancement fails, or when a due claim cannot be merged or
-    /// published.
+    /// the recipe cannot be resolved, or when staging, record publication, or
+    /// manifest advancement fails.
     ///
     /// # Cancellation
     ///
     /// Cancellation before the staged record leaves a member directory that
     /// startup cleanup removes. Cancellation after it leaves a durable member
-    /// that a later claim publishes. Cancellation during publication leaves
-    /// uploaded objects and a publication manifest that a retry converges on.
+    /// that a later claim publishes.
     async fn persist_once(
         &self,
         generation: &Arc<ImmutableGeneration>,
         binding: &TenantTableBinding,
         defer_manifest_advance: bool,
-        generation_owned_bytes: usize,
-        producer_identity: &ProducerLifecycleIdentity,
-    ) -> Result<StagedGenerationOutcome, ScribeError> {
+    ) -> Result<crate::scribe::assembly::StagedMemberId, ScribeError> {
         let generation_id = generation.generation_id.0;
         let frozen = generation.frozen_snapshot();
-        let workspace_bytes = parquet_candidate_incremental_bytes(frozen.arrow_bytes)?;
-        let mut reservation = self
-            .producer_admission
-            .acquire_with_identity(workspace_bytes, producer_identity.clone())
-            .await?;
-        reservation
-            .attach_shard(generation.shard_id)
-            .map_err(|error| ScribeError::Internal {
-                detail: error.to_string(),
-            })?;
-        let mut owner = Some(reservation);
-        let staged = self
-            .stage_member(
-                generation,
-                binding,
-                &frozen,
-                &mut owner,
-                generation_owned_bytes,
-            )
-            .await;
-        self.record_candidate_settlement(
-            producer_identity,
-            workspace_bytes,
-            "terminal",
-            staged.is_ok(),
-        );
-        drop(owner.take());
-        self.record_candidate_settlement(
-            producer_identity,
-            workspace_bytes,
-            "release",
-            staged.is_ok(),
-        );
+        let staged = self.stage_member(generation, binding, &frozen).await;
         let member = staged?;
         if defer_manifest_advance {
             tracing::debug!(
@@ -2458,8 +1879,7 @@ impl PersistenceWorker {
             self.advance_manifest(generation).await?;
         }
         tracing::debug!(generation_id, "generation is durable on the staging volume");
-        let published = self.publish_due_claims(producer_identity).await?;
-        Ok(StagedGenerationOutcome { member, published })
+        Ok(member)
     }
 
     /// Encodes and registers one frozen generation as a durable staged member.
@@ -2467,16 +1887,13 @@ impl PersistenceWorker {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the staging capability or the write recipe
-    /// is unavailable, when the footer child cannot be split from the admitted
-    /// producer owner, when the lane returns the wrong result, or when the runs
+    /// is unavailable, when the sorted candidate cannot be charged, when the lane returns the wrong result, or when the runs
     /// or their record cannot be made durable.
     async fn stage_member(
         &self,
         generation: &Arc<ImmutableGeneration>,
         binding: &TenantTableBinding,
         frozen: &FrozenMemtable,
-        owner: &mut Option<ScribeMemoryLease>,
-        generation_owned_bytes: usize,
     ) -> Result<crate::scribe::assembly::StagedMemberId, ScribeError> {
         let staging = self.staging()?;
         let layout = crate::scribe::write_recipe::resolve_write_recipe(
@@ -2490,12 +1907,6 @@ impl PersistenceWorker {
             &frozen.schema,
         )
         .await?;
-        let footer_reservation = crate::scribe::memory::EncodedFooterReservation::transfer_from(
-            owner.as_mut().ok_or_else(|| ScribeError::Internal {
-                detail: "producer reservation was transferred before staging".to_owned(),
-            })?,
-            generation_owned_bytes,
-        )?;
         tracing::debug!(
             generation_id = generation.generation_id.0,
             stage = "stage_member",
@@ -2526,15 +1937,14 @@ impl PersistenceWorker {
                             max: generation.wal_lsn_max.as_u64(),
                         },
                     },
-                    footer_reservation,
+                    memory: self.memory.clone(),
                     staging: Arc::clone(&staging),
                 },
             )))
             .await?
         {
             ScribePersistenceCpuResult::MemberStaged(staged) => *staged,
-            ScribePersistenceCpuResult::Prepared(_)
-            | ScribePersistenceCpuResult::ClaimAssembled(_)
+            ScribePersistenceCpuResult::ClaimAssembled(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
                     detail: "persistence lane returned the wrong staging result".to_owned(),
@@ -2551,42 +1961,37 @@ impl PersistenceWorker {
         Ok(member)
     }
 
-    /// Publishes every claim that is due after this generation became durable.
+    /// Publishes every claim that target or dwell has made due.
     ///
-    /// Draining the assembler here rather than on a separate timer keeps the
-    /// pod's publication rate tied to its ingest rate: a key that has reached
-    /// target publishes as soon as the member that completed it is durable, and
-    /// a key that has not stays staged at no cost to this worker.
+    /// Runs from [`PersistenceRuntime::publish_due`] on the server's lifecycle
+    /// tick, so a key that reached target publishes within one tick and a key
+    /// whose writes stopped still publishes once its dwell expires. Concurrent
+    /// callers are safe: the assembler hands each due claim to
+    /// exactly one caller. Every published claim counts once in
+    /// `bifrost_scribe_staging_claims_published_total`.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when a due claim cannot be gathered, admitted,
     /// merged, or published. The claim stays outstanding and its members stay
     /// durable, so the failure retries rather than losing rows.
-    async fn publish_due_claims(
-        &self,
-        producer_identity: &ProducerLifecycleIdentity,
-    ) -> Result<Vec<FileListCommitKey>, ScribeError> {
+    async fn publish_due_claims(&self) -> Result<Vec<FileListCommitKey>, ScribeError> {
         let staging = self.staging()?;
         let mut published = Vec::new();
         while let Some(claim) = staging.take_claim(chrono::Utc::now())? {
-            published.push(
-                self.publish_claim(&staging, &claim, Some(producer_identity))
-                    .await?,
-            );
+            published.push(self.publish_claim(&staging, &claim).await?);
+            metrics::counter!("bifrost_scribe_staging_claims_published_total").increment(1);
         }
         Ok(published)
     }
 
     /// Publishes every staged member that target and dwell would still hold.
     ///
-    /// Drain is the one point where waiting costs more than publishing: no
-    /// further member will arrive to complete a partial key, and its dwell
-    /// would expire against a runtime that is gone. Sweeping every ready key as
-    /// residue therefore settles the staging volume instead of leaving durable
-    /// members for the next process to rediscover. Publication is still the
-    /// same fenced transaction, so a member that cannot publish stays durable
-    /// and staged rather than being dropped.
+    /// This is the explicit flush: it sweeps every ready key as residue rather
+    /// than waiting for target or dwell. Shutdown does not call it; staged
+    /// members survive a restart. Publication is still the same fenced
+    /// transaction, so a member that cannot publish stays durable and staged
+    /// rather than being dropped.
     ///
     /// Returns the number of claims published.
     ///
@@ -2612,12 +2017,12 @@ impl PersistenceWorker {
         // retryable inside one process instead of only after a restart, and it
         // reuses the original claim identity rather than inventing a new one.
         for claim in staging.retryable_claims().await? {
-            self.publish_claim(&staging, &claim, None).await?;
+            self.publish_claim(&staging, &claim).await?;
             published += 1;
         }
         for key in staging.ready_keys()? {
             while let Some(claim) = staging.take_residue(&key, cause)? {
-                self.publish_claim(&staging, &claim, None).await?;
+                self.publish_claim(&staging, &claim).await?;
                 published += 1;
             }
         }
@@ -2659,7 +2064,7 @@ impl PersistenceWorker {
             while let Some(claim) =
                 staging.take_residue(&key, crate::scribe::assembly::ClaimCause::Drain)?
             {
-                self.publish_claim(&staging, &claim, None).await?;
+                self.publish_claim(&staging, &claim).await?;
                 published += 1;
             }
         }
@@ -2671,31 +2076,15 @@ impl PersistenceWorker {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the claim's runs no longer match their
-    /// records, when merge workspace or output scratch cannot be admitted, when
-    /// the lane returns the wrong result, or when the fenced publication is
+    /// records, when output scratch cannot be created, when a merged batch or
+    /// the upload chunk cannot be charged to the shared root, when the lane returns the wrong result, or when the fenced publication is
     /// refused or uncertain.
     async fn publish_claim(
         &self,
         staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
         claim: &crate::scribe::assembly::StagingClaim,
-        producer_identity: Option<&ProducerLifecycleIdentity>,
     ) -> Result<FileListCommitKey, ScribeError> {
         let runs = staging.gather(claim).await?;
-        let workspace_bytes = parquet_candidate_incremental_bytes(claim_merge_bytes(claim))?;
-        let mut reservation = match producer_identity {
-            Some(identity) => {
-                self.producer_admission
-                    .acquire_with_identity(workspace_bytes, identity.clone())
-                    .await?
-            }
-            None => {
-                self.producer_admission
-                    .acquire_accepted(workspace_bytes)
-                    .await?
-            }
-        };
-        let footer_reservation =
-            crate::scribe::memory::EncodedFooterReservation::split_from(&mut reservation)?;
         let scratch = self
             .output_scratch
             .as_ref()
@@ -2709,7 +2098,7 @@ impl PersistenceWorker {
         #[cfg(any(test, feature = "test-support"))]
         let _object_write_guard = self.faults.begin_object_write().await;
         let mut assembled = match self
-            .assemble_claim_output(staging, claim, &runs, scratch.path(), footer_reservation)
+            .assemble_claim_output(staging, claim, &runs, scratch.path())
             .await
         {
             Ok(assembled) => assembled,
@@ -2723,9 +2112,18 @@ impl PersistenceWorker {
             }
         };
         assembled.artifacts.attach_scratch(scratch)?;
-        let published = staging
-            .publish(claim, &runs, &assembled, self.actor_stream)
-            .await;
+        // The upload's one transfer chunk is the only buffer publication owns.
+        let transfer = self
+            .memory
+            .try_reserve_maintenance(MemoryCategory::Persistence, PARQUET_TRANSFER_BUFFER_BYTES);
+        let published = match transfer {
+            Ok(_transfer) => {
+                staging
+                    .publish(claim, &runs, &assembled, self.actor_stream)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         if let Err(error) = &published {
             tracing::warn!(
                 operation = "scribe_claim_publication",
@@ -2745,7 +2143,6 @@ impl PersistenceWorker {
         // instead of poisoning volume health through the artifact set's drop.
         assembled.artifacts.cleanup().await?;
         let published = published?;
-        drop(reservation);
         self.publish_staging_hint(claim.key());
         if let Some(detail) = published.unacknowledged {
             let error = ScribeError::Internal { detail };
@@ -2775,8 +2172,8 @@ impl PersistenceWorker {
         claim: &crate::scribe::assembly::StagingClaim,
         runs: &crate::scribe::claim_assembly::ClaimRuns,
         scratch_dir: &std::path::Path,
-        footer_reservation: crate::scribe::memory::EncodedFooterReservation,
     ) -> Result<crate::scribe::claim_assembly::AssembledClaim, ScribeError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.fail_before_sql_commit() {
             return Err(ScribeError::Internal {
                 detail: "test SQL failure before the first COMMIT attempt".to_owned(),
@@ -2791,21 +2188,20 @@ impl PersistenceWorker {
         tracing::debug!(claim = %claim.id(), stage = "assemble_claim", "persist stage start");
         let assemble_started = std::time::Instant::now();
         let assembled = match self
-            .persistence_cpu
+            .assembly_cpu
             .submit(ScribePersistenceCpuOp::AssembleClaim(Box::new(
                 crate::scribe::execution_lanes::AssembleClaimOp {
                     claim: Box::new(claim.clone()),
                     runs: Box::new(runs.clone()),
                     scratch_dir: scratch_dir.to_path_buf(),
-                    footer_reservation,
+                    memory: self.memory.clone(),
                     staging: Arc::clone(staging),
                 },
             )))
             .await?
         {
             ScribePersistenceCpuResult::ClaimAssembled(assembled) => *assembled,
-            ScribePersistenceCpuResult::Prepared(_)
-            | ScribePersistenceCpuResult::MemberStaged(_)
+            ScribePersistenceCpuResult::MemberStaged(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
                     detail: "persistence lane returned the wrong assembly result".to_owned(),
@@ -2921,187 +2317,7 @@ mod tests {
     use std::panic::AssertUnwindSafe;
     use std::task::{Context, Poll};
 
-    use crate::catalog::TableRef;
-
-    use crate::namespaces::BifrostNamespace;
-    use crate::scribe::telemetry::producer_lifecycle_tests::{EventCaptureSubscriber, field};
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
-
-    /// Builds one immutable producer identity for admission lifecycle proof.
-    fn producer_identity_for_test() -> ProducerLifecycleIdentity {
-        ProducerLifecycleIdentity {
-            seal_key: SealKey::new(
-                crate::test_support::tenant(),
-                TableRef::new(BifrostNamespace::Bifrost, "producer_lifecycle"),
-                crate::test_support::day_partition(2026, 8, 19),
-            ),
-            shard_id: 3,
-            writer_epoch: 41,
-            shard_generation: 9001,
-            cohort_id: Some(std::path::PathBuf::from("wal/shard-3/segment-9001")),
-            member_generation: 77,
-        }
-    }
-
-    /// A claim of many one-row, wide members sizes its merge to the rows it
-    /// holds, not to one full window per member, while a claim larger than
-    /// its members' windows stays bounded by those windows.
-    ///
-    /// # Panics
-    ///
-    /// Panics when either estimate differs from the held rows times bytes per
-    /// row.
-    #[test]
-    fn merge_window_bytes_is_bounded_by_the_rows_a_claim_holds() {
-        let window = crate::scribe::claim_assembly::MERGE_BATCH_ROWS as u64;
-        let row = 27_000_u64;
-        assert_eq!(merge_window_bytes(7 * row, 7, 7), 7 * 27_000);
-        assert_eq!(
-            merge_window_bytes(10 * window * 100, 10 * window, 2),
-            usize::try_from(2 * window * 100).expect("fits usize")
-        );
-        assert_eq!(merge_window_bytes(0, 0, 0), 0);
-    }
-
-    /// A production producer refusal retains identity and cannot fall through as cancellation.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a closed production admission does not produce one
-    /// identity-bearing refusal.
-    #[tokio::test]
-    async fn production_producer_refusal_retains_identity_without_cancellation() {
-        const MIB: usize = 1024 * 1024;
-        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * MIB,
-            512 * MIB as u64,
-            [crate::resources::BifrostRole::Scribe],
-        );
-        let resources = roles.scribe().expect("Scribe capability");
-        let admission = ProducerAdmission::new(resources.clone());
-        let subscriber = EventCaptureSubscriber::default();
-        let events = Arc::clone(&subscriber.events);
-        admission.close();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
-        admission
-            .acquire_with_identity(MIB, producer_identity_for_test())
-            .await
-            .expect_err("closed admission refuses production producer");
-        let events = events.lock().expect("event capture");
-        let refusal = events
-            .iter()
-            .find(|event| field(event, "stage") == "refusal")
-            .expect("identity-bearing producer refusal");
-        assert_eq!(field(refusal, "outcome"), "closed");
-        assert_eq!(field(refusal, "reason"), "runtime_shutdown");
-        assert_eq!(field(refusal, "shard_id"), "3");
-        assert_eq!(field(refusal, "writer_epoch"), "41");
-        assert_eq!(field(refusal, "shard_generation"), "9001");
-        assert_eq!(field(refusal, "member_generation"), "77");
-        assert!(
-            events.iter().all(|event| field(event, "stage") != "cancel"),
-            "a terminal refusal must not also emit cancellation"
-        );
-    }
-
-    /// FIFO producer admission removes cancellation and never mirrors byte totals.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a second producer enters concurrently or cancellation/drop of
-    /// either the waiting future or acquired permit prevents later progress.
-    #[tokio::test]
-    async fn producer_admission_is_fifo_cancellation_safe_and_starvation_free() {
-        const MIB: usize = 1024 * 1024;
-        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * MIB,
-            512 * MIB as u64,
-            [crate::resources::BifrostRole::Scribe],
-        );
-        let resources = roles.scribe().expect("Scribe capability");
-        let admission = ProducerAdmission::new(resources.clone());
-        let blocker = admission.acquire(500 * MIB).await.expect("initial owner");
-        let large = tokio::spawn({
-            let admission = admission.clone();
-            async move { admission.acquire(32 * MIB).await }
-        });
-        tokio::task::yield_now().await;
-        let cancelled = tokio::spawn({
-            let admission = admission.clone();
-            async move { admission.acquire(MIB).await }
-        });
-        tokio::task::yield_now().await;
-        cancelled.abort();
-        let small = (0..16)
-            .map(|_| {
-                tokio::spawn({
-                    let admission = admission.clone();
-                    async move { admission.acquire(MIB).await }
-                })
-            })
-            .collect::<Vec<_>>();
-        tokio::task::yield_now().await;
-        assert_eq!(admission.queue_len(), 17);
-        drop(blocker);
-        let large_lease = tokio::time::timeout(Duration::from_secs(1), large)
-            .await
-            .expect("large head progresses")
-            .expect("large task")
-            .expect("large lease");
-        let mut small_leases = Vec::new();
-        for waiter in small {
-            small_leases.push(
-                tokio::time::timeout(Duration::from_secs(1), waiter)
-                    .await
-                    .expect("continuous small follower progresses")
-                    .expect("small task")
-                    .expect("small lease"),
-            );
-        }
-        assert_eq!(admission.queue_len(), 0);
-        drop((large_lease, small_leases));
-        admission.close();
-        assert!(admission.acquire(1).await.is_err());
-        let accepted = admission
-            .acquire_accepted(1)
-            .await
-            .expect("accepted work drains after close");
-        drop(accepted);
-    }
-
-    /// Two fitting producer workspaces coexist while a larger FIFO head waits.
-    ///
-    /// # Panics
-    ///
-    /// Panics if exact root leases serialize fitting work or admit an oversized
-    /// follower before earlier ownership releases.
-    #[tokio::test]
-    async fn two_candidate_encodes_overlap_and_large_candidate_waits() {
-        const MIB: usize = 1024 * 1024;
-        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
-            768 * MIB,
-            512 * MIB as u64,
-            [crate::resources::BifrostRole::Scribe],
-        );
-        let admission = ProducerAdmission::new(roles.scribe().expect("Scribe capability"));
-        let first = admission.acquire(64 * MIB).await.expect("first workspace");
-        let second = admission.acquire(64 * MIB).await.expect("second workspace");
-        let large = tokio::spawn({
-            let admission = admission.clone();
-            async move { admission.acquire(448 * MIB).await }
-        });
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert!(!large.is_finished());
-        drop(first);
-        assert!(!large.is_finished());
-        drop(second);
-        let lease = tokio::time::timeout(Duration::from_secs(1), large)
-            .await
-            .expect("large workspace wakes")
-            .expect("large task")
-            .expect("large lease");
-        drop(lease);
-    }
 
     /// Builds a persistence owner with empty queues for finalizer-only tests.
     fn test_runtime() -> PersistenceRuntime {
@@ -3114,7 +2330,6 @@ mod tests {
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
             reconciler: None,
-            producer_admission: None,
             recovery_wal: None,
             recovery_operator: None,
             recovery_memory: None,
@@ -3295,7 +2510,7 @@ mod tests {
         ) -> crate::resources::BifrostRuntimeResources {
             crate::resources::BifrostRuntimeResources::from_snapshot(
                 crate::resources::SystemResourceSnapshot {
-                    memory_limit_bytes: 1024 * 1024 * 1024,
+                    memory_limit_bytes: 2 * 1024 * 1024 * 1024,
                     effective_cpu: 2,
                     scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
                     scratch_available_bytes: 2 * 1024 * 1024 * 1024,
@@ -3306,13 +2521,12 @@ mod tests {
                     roles: std::collections::BTreeSet::from([
                         crate::resources::BifrostRole::Scribe,
                     ]),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
+                    server_memory_min_bytes: None,
+                    bifrost_memory_limit_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: None,
-                    forge_compaction_memory_limit_bytes: None,
-                    scratch_root: scratch_root.to_owned(),
+                    scratch_root: Some(scratch_root.to_owned()),
                     volume_roots: Some(crate::resources::BifrostVolumeRoots {
                         wal: wal_root.to_owned(),
                         scribe_stage,
@@ -3471,11 +2685,6 @@ mod tests {
         fn fixture_schema() -> Arc<arrow::datatypes::Schema> {
             Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(
-                    wyrd_spec::vala::managed_columns::DATA_TENANT_ID,
-                    arrow::datatypes::DataType::Utf8,
-                    false,
-                ),
-                arrow::datatypes::Field::new(
                     wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
                     arrow::datatypes::DataType::Timestamp(
                         arrow::datatypes::TimeUnit::Microsecond,
@@ -3545,9 +2754,6 @@ mod tests {
                 arrow::record_batch::RecordBatch::try_new(
                     Arc::clone(&schema),
                     vec![
-                        Arc::new(arrow::array::StringArray::from(vec![
-                            self.tenant.to_string(),
-                        ])),
                         Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
                             1_767_225_600_000_000_i64,
                         ])),

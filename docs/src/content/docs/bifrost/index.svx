@@ -36,7 +36,7 @@ Rows written through the `Bifrost` client are durably acknowledged via write-ahe
 Key properties:
 
 - **Typed tables.** Pre-declared `DomainTable` schemas define every column, type, and nullability at registration time. The schema fingerprint is stored and enforced. A write with a mismatched schema is rejected before durable commit.
-- **Tenant isolation.** Every row carries a server-stamped `data_tenant_id`. DataFusion's `TenantPredicateRule` analyzer injects a `data_tenant_id = $tenant` predicate into every scan. This predicate is non-removable; it is re-injected at the analysis stage of every plan execution.
+- **Tenant isolation.** Every tenant writes to its own tenant-qualified physical table. Every Parquet file records its tenant once in its footer, taken from the authenticated principal, and Oracle proves that footer tenant before it reads any row. A missing or foreign footer tenant fails the query with `WYRD_VALA_500_QUERY_TENANT_INVARIANT`. There is no per-row tenant column.
 - **Payload governance.** Sensitive columns (span attributes, log body, GenAI messages, agent-trace payloads) are projected away at the plan stage unless the caller holds the matching payload read permission.
 - **Time-bounded scans.** SQL queries over domain tables are required to carry a time predicate.
 

@@ -136,6 +136,7 @@ mod pg_tests {
             "file_list_group_idx",
             "file_list_tenant_idx",
             "file_list_live_tail_watermark_idx",
+            "file_list_unpublished_idx",
         ] {
             let definition: String = sqlx::query_scalar(
                 "SELECT indexdef FROM pg_indexes WHERE schemaname = 'vala' AND indexname = $1",

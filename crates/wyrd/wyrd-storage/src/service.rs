@@ -706,7 +706,7 @@ async fn download_url(
     ttl_secs: u32,
 ) -> Result<String, WyrdError> {
     if state.storage.backend() == StorageBackendKind::Local {
-        return local_download_url(state.storage, validated);
+        return Ok(local_download_url(validated));
     }
 
     state
@@ -723,24 +723,12 @@ async fn download_url(
 /// `path` query value of the documented `GET /v1/cards/download/local`
 /// operation rather than as a path tail the `OpenAPI` document cannot express.
 ///
-/// An empty base yields a same-origin relative URL, which the client resolves
-/// against its own server.
-///
-/// # Errors
-/// Returns an internal error when no public base URL is bound.
-fn local_download_url(
-    storage: &StorageHandle,
-    validated: &ValidatedPath,
-) -> Result<String, WyrdError> {
-    let base = storage.public_base_url().ok_or_else(|| {
-        internal_error(
-            "local storage requires WYRD_PUBLIC_BASE_URL to mint download URLs",
-            serde_json::json!({ "backend": StorageBackendKind::Local }),
-        )
-    })?;
-    let base = normalize_base_url(base);
+/// The URL is root-relative: the client resolves it against the Wyrd endpoint
+/// it is already configured for, so no public base URL is configured here and
+/// credentials never leave that origin.
+fn local_download_url(validated: &ValidatedPath) -> String {
     let path: String = byte_serialize(validated.full.as_bytes()).collect();
-    Ok(format!("{base}/v1/cards/download/local?path={path}"))
+    format!("/v1/cards/download/local?path={path}")
 }
 
 async fn open_local_blob(
@@ -889,7 +877,7 @@ async fn drive_backend_init(
     match planned {
         PlannedUpload::SinglePut => {
             let plan = if state.storage.backend() == StorageBackendKind::Local {
-                local_single_put_plan(state.storage, upload_id)?
+                local_single_put_plan(state.storage, upload_id)
             } else {
                 state
                     .storage
@@ -952,21 +940,15 @@ async fn drive_backend_init_or_mark_failed(
     }
 }
 
-fn local_single_put_plan(
-    storage: &StorageHandle,
-    upload_id: &UploadId,
-) -> Result<UploadPlan, WyrdError> {
-    let base = storage.public_base_url().ok_or_else(|| {
-        internal_error(
-            "local storage requires WYRD_PUBLIC_BASE_URL to mint upload URLs",
-            serde_json::json!({ "backend": StorageBackendKind::Local }),
-        )
-    })?;
-    let base = normalize_base_url(base);
-    Ok(UploadPlan::LocalFs {
-        put_url: format!("{base}/v1/cards/upload/local/{upload_id}"),
+/// Mint the local backend's single-PUT upload plan for one upload id.
+///
+/// Like [`local_download_url`], the target is the root-relative authenticated
+/// upload route; the client resolves it against its configured Wyrd endpoint.
+fn local_single_put_plan(storage: &StorageHandle, upload_id: &UploadId) -> UploadPlan {
+    UploadPlan::LocalFs {
+        put_url: format!("/v1/cards/upload/local/{upload_id}"),
         ttl_secs: storage.presign_ttl_secs(),
-    })
+    }
 }
 
 /// Move one freshly initialized upload into `pending`, keeping the backend id.
@@ -1307,10 +1289,6 @@ pub fn invalid_upload_id(error: &UploadIdParseError) -> WyrdError {
     .into()
 }
 
-fn normalize_base_url(base: &str) -> &str {
-    base.strip_suffix('/').unwrap_or(base)
-}
-
 fn map_tenant_path(error: TenantPathError) -> WyrdError {
     match error {
         TenantPathError::TenantMismatch { prefix, caller } => {
@@ -1347,6 +1325,7 @@ pub fn map_sql_error(error: &wyrd_sql::SqlError) -> WyrdError {
         wyrd_sql::SqlError::Connect(_)
         | wyrd_sql::SqlError::Migrate(_)
         | wyrd_sql::SqlError::MigrateChecksum { .. }
+        | wyrd_sql::SqlError::SchemaNotReady { .. }
         | wyrd_sql::SqlError::Query(_)
         | wyrd_sql::SqlError::InvariantViolation { .. }
         | wyrd_sql::SqlError::TxFailed(_)
@@ -1478,6 +1457,7 @@ mod tests {
         assert_eq!(json["protocol"], "single_put");
     }
 
+    /// A local upload plan targets the root-relative mounted blob route.
     #[tokio::test]
     async fn local_single_put_plan_uses_mounted_http_blob_route() {
         let root = tempfile::tempdir().expect("temp dir");
@@ -1489,7 +1469,6 @@ mod tests {
             presign_ttl: Duration::from_mins(10),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test/".to_owned()),
         })
         .await
         .expect("local storage handle");
@@ -1497,14 +1476,14 @@ mod tests {
             Uuid::parse_str("018f0000-0000-7000-8000-000000000001").expect("upload UUID"),
         );
 
-        let plan = local_single_put_plan(&storage, &upload_id).expect("local plan");
+        let plan = local_single_put_plan(&storage, &upload_id);
 
         let UploadPlan::LocalFs { put_url, ttl_secs } = plan else {
             panic!("expected local_fs plan");
         };
         assert_eq!(
             put_url,
-            "https://wyrd.test/v1/cards/upload/local/wyu_018f0000-0000-7000-8000-000000000001"
+            "/v1/cards/upload/local/wyu_018f0000-0000-7000-8000-000000000001"
         );
         assert_eq!(ttl_secs, 600);
     }
@@ -1531,21 +1510,9 @@ mod tests {
         assert_eq!(compute_download_ttl(&body, 600), 3600);
     }
 
-    #[tokio::test]
-    async fn local_download_url_uses_mounted_http_blob_route() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let storage = StorageHandle::from_settings(StorageSettings {
-            backend: BackendConfig::Local {
-                root: root.path().to_path_buf(),
-            },
-            require_encryption: false,
-            presign_ttl: Duration::from_mins(15),
-            part_size_bytes: 16 * 1024 * 1024,
-            multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test/".to_owned()),
-        })
-        .await
-        .expect("local storage handle");
+    /// A local download URL is the root-relative mounted blob route.
+    #[test]
+    fn local_download_url_uses_mounted_http_blob_route() {
         let tenant = DataTenantId::new_v7();
         let validated = ValidatedPath {
             full: format!("{tenant}/cards/018f0000-0000-7000-8000-000000000000/model.bin"),
@@ -1554,12 +1521,12 @@ mod tests {
             relative_path: "model.bin".to_owned(),
         };
 
-        let url = local_download_url(&storage, &validated).expect("download URL");
+        let url = local_download_url(&validated);
 
         assert_eq!(
             url,
             format!(
-                "https://wyrd.test/v1/cards/download/local?path={}",
+                "/v1/cards/download/local?path={}",
                 validated.full.replace('/', "%2F")
             )
         );
@@ -1576,7 +1543,6 @@ mod tests {
             presign_ttl: Duration::from_mins(15),
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await
         .expect("local storage handle");

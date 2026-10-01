@@ -1,6 +1,6 @@
 ---
 title: Database
-description: Postgres setup for the server. External and embedded modes, the roles the server needs, and migrations.
+description: Postgres setup for the server. The two serving roles, the one-off migrate step, and readiness checks.
 pillar: wyrd
 group: Self-hosting
 order: 5
@@ -8,66 +8,58 @@ order: 5
 
 # Database
 
-The server runs on PostgreSQL. It uses several roles with different privileges, not one superuser connection, because tenant isolation is enforced at the database layer with row-level security. There are two ways to provide Postgres: point the server at an external cluster, or let it run an embedded one for local development.
+The server runs on PostgreSQL. Tenant isolation is enforced at the database layer with row-level security, so the server never serves traffic with one all-powerful login. You provide an external Postgres, migrate it once per release with the database-owner login, and then run the server with two narrower serving logins.
 
-## Two modes
+## Roles
 
-The mode is chosen by presence. Set the database variables and you get external mode. Leave all of them unset and you get embedded mode. Mixing the two (some set, some unset) is a configuration error, not a fallback.
-
-| Mode | When | Use it for |
-| --- | --- | --- |
-| External | `WYRD_DATABASE_URL` and the role passwords are set | Staging and production. Any real deployment. |
-| Embedded | all database variables unset | Local development only. The server provisions and manages its own Postgres. |
-
-## External Postgres
-
-`WYRD_DATABASE_URL` is the canonical connection string, and it carries the `wyrd_app` user. The server synthesizes the other role DSNs by swapping the userinfo in that URL with each role's password. So you supply one URL plus a password per role.
-
-| Variable | Role | Required | Purpose |
-| --- | --- | --- | --- |
-| `WYRD_DATABASE_URL` | `wyrd_app` | yes | Canonical DSN. Runtime traffic runs as `wyrd_app` under RLS. |
-| `WYRD_DATABASE_MIGRATOR_PASSWORD` | `wyrd_migrator` | yes | Runs migrations at boot. The pool is closed once migrations finish. |
-| `WYRD_DATABASE_CATALOG_APP_PASSWORD` | `wyrd_catalog_app` | yes | The Bifrost Iceberg catalog connects with this role. |
-| `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD` | `wyrd_platform_admin` | no | Audited cross-tenant admin. Set it only if you use that capability. |
-
-```bash
-export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
-export WYRD_DATABASE_MIGRATOR_PASSWORD="migrator-pw"
-export WYRD_DATABASE_CATALOG_APP_PASSWORD="catalog-pw"
-# Optional:
-export WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD="admin-pw"
-```
-
-### Roles
-
-The server splits privileges across four roles so runtime request handling never
-holds more power than it needs. Row-level security is enforced for `wyrd_app`,
-which is the only role that serves request traffic. `wyrd_catalog_app` connects
-the Bifrost Iceberg catalog. [Architecture](/self-hosting/architecture/)
-explains how those pieces fit.
+Create the two serving roles before you migrate. `crates/wyrd/wyrd-sql/bootstrap/roles.sql` is the bootstrap template; run it with `psql` 15 or later as the database owner, passing both passwords in the environment variables `WYRD_APP_PASSWORD` and `WYRD_PLATFORM_ADMIN_PASSWORD` and the owner's in `PGPASSWORD`, never as command-line arguments.
 
 | Role | Row-level security | What it does |
 | --- | --- | --- |
-| `wyrd_app` | enforced | All runtime request traffic. Sees only its tenant's rows. |
-| `wyrd_migrator` | not applicable | Applies migrations at boot. Boot-only, closed afterward. |
-| `wyrd_catalog_app` | not applicable | Bifrost Iceberg catalog access with a catalog search path. |
-| `wyrd_platform_admin` | bypasses RLS | Optional audited cross-tenant administration. |
+| `wyrd_app` | enforced | All request traffic. Sees only its tenant's rows. |
+| `wyrd_platform_admin` | bypasses RLS | Audited cross-tenant platform work and the Bifrost Iceberg catalog. |
 
-These roles must exist in your cluster, with the privileges in the table above and the passwords you supply, before the server boots. The row-level security policies themselves are created by the migrations that run at boot, so you provision the roles and the server sets up the policies. In embedded mode the server provisions the roles for you; external mode expects them to already exist.
-
-### Pool tuning
-
-Both modes share the same pool settings, covered in [Configuration](/self-hosting/configuration/): `WYRD_PG_POOL_MAX` (default 32) and `WYRD_PG_POOL_ACQUIRE_MS` (default 5000). The ceiling applies across the app, catalog, and optional platform-admin pools, so size your cluster's `max_connections` above the sum you expect across replicas.
-
-## Embedded Postgres
-
-Leave every database variable unset and the server provisions its own PostgreSQL for you: it creates the cluster, bootstraps the four roles with generated passwords, persists those credentials under your local data directory, and runs migrations. This is the zero-setup path behind `mise run dev:backend`.
-
-Embedded mode is for development. It is not a supported production deployment. When you move to staging or production, switch to external Postgres by setting the variables above.
+Neither serving role can create or drop databases or run migrations. The owner login you migrate with needs `BYPASSRLS` (or superuser) and must never be given to a serving process.
 
 ## Migrations
 
-Migrations run automatically at boot, driven by the `wyrd_migrator` role. The migrator pool is opened, migrations are applied, and the pool is closed before the runtime pools start serving, so the elevated migrator connection never survives into request handling. You do not run a separate migration command.
+Migrations are a separate one-off step, not part of server boot. Run it with `WYRD_DATABASE_URL` set to the database-owner login before starting or upgrading servers:
+
+```bash
+WYRD_DATABASE_URL="postgresql://owner:owner-pw@db.internal:5432/wyrd" wyrd-server migrate
+```
+
+It applies every Wyrd and Vala migration, validates the result, and exits. It is idempotent, so rerunning it after a partial failure is safe.
+
+### When a migration fails
+
+Take and verify a database backup before every upgrade; that verified backup is your recovery point. If `wyrd-server migrate` exits nonzero:
+
+1. Stop the rollout. Servers that are still running keep serving, and new servers refuse to become ready against the incomplete schema.
+2. Fix the cause the error names (permissions, disk, connectivity, or a conflicting object) and rerun `wyrd-server migrate`. Completed migrations are skipped and the failed one is retried.
+3. If the database cannot be repaired, restore the verified backup and rerun the migration.
+
+Wyrd has no down migrations and never restores automatically.
+
+## Serving
+
+A serving process receives exactly two URLs:
+
+| Variable | Role | Purpose |
+| --- | --- | --- |
+| `WYRD_DATABASE_URL` | `wyrd_app` | Request traffic under row-level security. |
+| `WYRD_PLATFORM_DATABASE_URL` | `wyrd_platform_admin` | Cross-tenant platform work and the Iceberg catalog. |
+
+```bash
+export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
+export WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform_admin:admin-pw@db.internal:5432/wyrd"
+```
+
+The server never runs DDL. Before it reports ready it checks that every migration it embeds is applied with a matching checksum, that each serving login has exactly its expected row-level-security posture, and that every tenant table forces row-level security. If any check fails, boot stops with `WYRD_SQL_503_SCHEMA_NOT_READY`; run `wyrd-server migrate` and start again.
+
+### Pool tuning
+
+Pool settings are covered in [Configuration](/self-hosting/configuration/): `WYRD_PG_POOL_MAX` (default 32) and `WYRD_PG_POOL_ACQUIRE_MS` (default 5000). Size your cluster's `max_connections` above the sum of the app, Vala, and platform-admin pools across replicas.
 
 ## Related
 

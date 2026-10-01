@@ -54,14 +54,6 @@ pub enum ConfigParseError {
 /// Top-level error returned by storage operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    /// An embedding server attempted to replace an already-bound public URL.
-    #[error("public base URL is already bound to `{existing}`, not `{requested}`")]
-    PublicBaseUrlConflict {
-        /// URL retained by the storage handle.
-        existing: String,
-        /// Conflicting URL requested by the caller.
-        requested: String,
-    },
     /// Process-wide Rustls provider ownership conflicts with Wyrd.
     #[error(transparent)]
     CryptoProvider(#[from] wyrd_tls::InstallError),
@@ -293,14 +285,6 @@ impl LocalError {
 impl From<StorageError> for WyrdStorageError {
     fn from(error: StorageError) -> Self {
         match error {
-            StorageError::PublicBaseUrlConflict {
-                existing,
-                requested,
-            } => Self::Backend {
-                detail: format!(
-                    "public base URL conflict: existing `{existing}`, requested `{requested}`"
-                ),
-            },
             StorageError::CryptoProvider(error) => Self::Backend {
                 detail: error.to_string(),
             },

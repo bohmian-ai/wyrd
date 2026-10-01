@@ -5,7 +5,6 @@ pub mod assembly;
 pub mod claim_assembly;
 pub mod claim_merge;
 pub mod claim_publication;
-pub mod contention;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
@@ -28,7 +27,6 @@ pub mod replay;
 pub mod routing;
 pub mod seal_key;
 pub mod shards;
-pub(crate) mod staged_tail;
 pub(crate) mod staging;
 pub mod staging_runtime;
 pub mod stream_identity;
@@ -66,20 +64,6 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::FetchLiveTailService;
 pub use crate::scribe::tail_rpc::TonicTailReadTransport;
 
-/// Derives the largest replayable Scribe envelope admitted by configured limits.
-///
-/// Server boot compares this intrinsic requirement with the detected root
-/// capability before accepting traffic or starting WAL replay.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::DecodedPayloadTooLarge`] when configured bound
-/// arithmetic cannot be represented on this platform.
-pub fn configured_maximum_envelope_bytes(
-    limits: crate::gate::limits::IngestLimits,
-) -> Result<usize, ScribeError> {
-    material_plan::configured_maximum_envelope_bytes(limits)
-}
 use crate::scribe::telemetry::{
     ScribeBucketMemorySnapshot, ScribeIngressLifecycle, ScribeInspectionSnapshot,
     ScribeRuntimeSnapshot,
@@ -334,6 +318,11 @@ pub struct ScribeImpl {
     /// zero selects the production active-bucket target.
     #[cfg(any(test, feature = "test-support"))]
     decoded_request_limit_for_test: AtomicUsize,
+    /// Microseconds added to every later transport-frame receipt instant, so a
+    /// bounded test can replay a batch on a later receipt day; zero in
+    /// production construction.
+    #[cfg(any(test, feature = "test-support"))]
+    receipt_offset_micros_for_test: std::sync::atomic::AtomicI64,
 }
 
 /// Scribe is accepting work and no shutdown owner exists.
@@ -604,21 +593,19 @@ pub struct ScribeEmbeddedConfig {
 }
 
 impl ScribeEmbeddedConfig {
-    /// Derives the geometry an embedded Scribe runs under.
+    /// Derives the default geometry an embedded Scribe runs under.
     ///
     /// The WAL segment target is read back from the already-constructed writer
     /// rather than re-declared, so an embedded Scribe can never rotate its
-    /// shards against a segment size the writer does not actually use.
+    /// shards against a segment size the writer does not actually use. Test
+    /// builds let `geometry_for_test` replace the result at the
+    /// embedded constructors.
     ///
     /// # Panics
     ///
     /// Panics when the embedded default rotation targets are not a coherent
     /// geometry, which is a construction invariant rather than an input.
-    fn geometry(&self, wal: &wal::WalWriter) -> geometry::ScribeGeometry {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(geometry) = self.geometry_for_test {
-            return geometry;
-        }
+    fn default_geometry(wal: &wal::WalWriter) -> geometry::ScribeGeometry {
         geometry::ScribeGeometry::for_uniform_shard_rotation(
             wal.segment_bytes(),
             memtable::MEMTABLE_ROTATION_BYTES,
@@ -632,36 +619,36 @@ impl ScribeEmbeddedConfig {
 ///
 /// # Panics
 ///
-/// Panics when the embedded admission configuration cannot cover the protected
-/// unmanaged reserve and Scribe floor, which is a construction invariant.
+/// Panics when the embedded admission configuration cannot form a shared cap
+/// above the default server headroom, which is a construction invariant.
 fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::ScribeResources {
-    let memory_limit_bytes = config.memory_limit_bytes.max(
-        crate::resources::MIN_UNMANAGED_RESERVE_BYTES + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
-    );
-    let runtime = crate::resources::BifrostRuntimeResources::from_snapshot(
-        crate::resources::SystemResourceSnapshot {
-            memory_limit_bytes,
-            effective_cpu: 1,
-            scratch_capacity_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
-            scratch_available_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
-            memory_source: crate::resources::ResourceSource::Injected,
-            cpu_source: crate::resources::ResourceSource::Injected,
-        },
-        crate::resources::BifrostResourcePolicy {
-            roles: [crate::resources::BifrostRole::Scribe]
-                .into_iter()
-                .collect(),
-            memory_limit_bytes: None,
-            unmanaged_reserve_bytes: None,
-            scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
-            forge_compaction_memory_limit_bytes: None,
-            effective_cpu: None,
-            oracle_query_slot_limit: None,
-            scratch_root: std::path::PathBuf::new(),
-            volume_roots: None,
-        },
-    )
-    .expect("embedded Scribe resource policy must satisfy its configured floor");
+    let cap = config.memory_limit_bytes.max(1);
+    let memory_limit_bytes = cap.saturating_add(crate::resources::DEFAULT_SERVER_MEMORY_MIN_BYTES);
+    let runtime =
+        crate::resources::BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
+            crate::resources::SystemResourceSnapshot {
+                memory_limit_bytes,
+                effective_cpu: 1,
+                scratch_capacity_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
+                scratch_available_bytes: 2 * crate::resources::MIN_SCRATCH_FREE_BYTES,
+                memory_source: crate::resources::ResourceSource::Injected,
+                cpu_source: crate::resources::ResourceSource::Injected,
+            },
+            crate::resources::BifrostResourcePolicy {
+                roles: [crate::resources::BifrostRole::Scribe]
+                    .into_iter()
+                    .collect(),
+                server_memory_min_bytes: None,
+                bifrost_memory_limit_bytes: None,
+                scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
+                effective_cpu: None,
+                oracle_query_slot_limit: None,
+                scratch_root: None,
+                volume_roots: None,
+            },
+            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES.min(cap),
+        )
+        .expect("embedded Scribe resource policy must form a shared cap");
     runtime
         .compose_roles()
         .expect("embedded Scribe root must remain healthy")
@@ -868,7 +855,9 @@ impl ScribeImpl {
         sync_delay: std::time::Duration,
         config: ScribeEmbeddedConfig,
     ) -> Result<Self, String> {
-        let geometry = config.geometry(&wal);
+        let geometry = ScribeEmbeddedConfig::default_geometry(&wal);
+        #[cfg(any(test, feature = "test-support"))]
+        let geometry = config.geometry_for_test.unwrap_or(geometry);
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(
                 config.lane_config.ingress_cpu_threads,
@@ -893,7 +882,7 @@ impl ScribeImpl {
             ),
             stream_identity::WriterEpoch::new(writer_epoch),
         );
-        Self::new_with_execution_pools(ScribeBuildConfig {
+        Ok(Self::new_with_execution_pools(ScribeBuildConfig {
             catalog: config.catalog,
             operator,
             wal,
@@ -906,8 +895,7 @@ impl ScribeImpl {
             ingest_limits: crate::gate::limits::IngestLimits::default(),
             geometry,
             staging_file_publisher: None,
-        })
-        .map_err(|error| error.to_string())
+        }))
     }
 
     /// Construct a Scribe using an explicitly owned Tokio coordination runtime.
@@ -1002,11 +990,7 @@ impl ScribeImpl {
     /// # Panics
     ///
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity,
-    /// when the fixed Scribe ownership graph cannot be initialized, or when the
-    /// supplied admission budget cannot hold its own configured guaranteed
-    /// contention width. Server deployments take the fallible
-    /// [`Self::new_with_execution_pools`] instead so that last case becomes a
-    /// typed boot refusal rather than a panic.
+    /// or when the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config_and_admission_and_memory(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
@@ -1014,7 +998,9 @@ impl ScribeImpl {
         writer_epoch: i64,
         config: ScribeEmbeddedConfig,
     ) -> Self {
-        let geometry = config.geometry(&wal);
+        let geometry = ScribeEmbeddedConfig::default_geometry(&wal);
+        #[cfg(any(test, feature = "test-support"))]
+        let geometry = config.geometry_for_test.unwrap_or(geometry);
         let stream = stream_identity::StreamIdentity::new(
             stream_identity::NodeId::new(
                 uuid::Uuid::parse_str(node_id).expect("embedded Scribe node_id must be a UUID"),
@@ -1045,20 +1031,16 @@ impl ScribeImpl {
             geometry,
             staging_file_publisher: config.staging_file_publisher,
         })
-        .expect("the embedded Scribe budget completes at least one table lifecycle")
     }
 
     /// Construct Scribe from execution lanes provisioned by server boot.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns [`geometry::ScribeGeometryError`] when the node's Scribe memory
-    /// budget and staging volume cannot hold the configured guaranteed
-    /// contention width, so boot fails with the shortfall named instead of
-    /// reporting ready.
-    pub fn new_with_execution_pools(
-        config: ScribeBuildConfig,
-    ) -> Result<Self, geometry::ScribeGeometryError> {
+    /// Panics only if the fixed zero-sized Scribe ownership graph cannot be
+    /// initialized, which is a construction invariant.
+    #[must_use]
+    pub fn new_with_execution_pools(config: ScribeBuildConfig) -> Self {
         Self::build(config)
     }
 
@@ -1132,23 +1114,16 @@ impl ScribeImpl {
     /// owners so every child receives the same lanes, WAL identity, memory
     /// ledger, and coordination runtime.
     ///
-    /// # Errors
-    ///
-    /// Returns [`geometry::ScribeGeometryError`] when the pod cannot hold every
-    /// guaranteed contention reserve vector. Scribe refuses to exist on a node
-    /// it cannot serve its configured width on, so this check happens here,
-    /// before any owner is built.
-    ///
     /// # Panics
     ///
     /// Panics only if the configured fallback memory governor cannot represent
     /// the fixed one-gibibyte invariant or a shard WAL handle cannot be built.
-    fn build(config: ScribeBuildConfig) -> Result<Self, geometry::ScribeGeometryError> {
+    fn build(config: ScribeBuildConfig) -> Self {
         let memory = config.resources.clone();
         let memory_ownership =
             memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
         let admission =
-            AdmissionController::with_config_and_memory(config.admission, memory.clone())?;
+            AdmissionController::with_config_and_memory(config.admission, memory.clone());
         let ScribeBuildConfig {
             catalog,
             operator,
@@ -1157,11 +1132,10 @@ impl ScribeImpl {
             coordination_runtime,
             execution_pools,
             persistence: persistence_config,
-            admission: _,
-            resources: _,
             ingest_limits,
             geometry,
             staging_file_publisher,
+            ..
         } = config;
         let seal_max_age = geometry.generation_max_age();
         let ScribeExecutionPools {
@@ -1186,14 +1160,13 @@ impl ScribeImpl {
                     staging_file_publisher: staging_file_publisher.clone(),
                     geometry,
                     hot_sources: Arc::clone(&hot_sources),
-                    telemetry: admission.contention().telemetry_handle(),
+                    telemetry: admission.telemetry_handle(),
                 },
                 &coordination_runtime,
             )
         });
         let shards = shards::ScribeShardRuntime::start(
             shards::ScribeShardStartConfig {
-                admission: admission.clone(),
                 geometry,
                 seal_max_age,
                 wal: Arc::clone(&wal),
@@ -1208,7 +1181,7 @@ impl ScribeImpl {
             &coordination_runtime,
         );
         Self::install_boot_metrics();
-        Ok(Self {
+        Self {
             catalog,
             wal,
             node_id: stream.node_id.to_string(),
@@ -1239,7 +1212,9 @@ impl ScribeImpl {
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             decoded_request_limit_for_test: AtomicUsize::new(0),
-        })
+            #[cfg(any(test, feature = "test-support"))]
+            receipt_offset_micros_for_test: std::sync::atomic::AtomicI64::new(0),
+        }
     }
 
     /// Publish the zero-initialized Scribe boot telemetry.
@@ -1329,7 +1304,6 @@ impl ScribeImpl {
             geometry,
             staging_file_publisher: None,
         })
-        .expect("the fixed test Scribe geometry fits its embedded governor")
     }
 
     /// Stop accepting new shard work and drain execution lanes until `deadline`.
@@ -1391,13 +1365,9 @@ impl ScribeImpl {
         if graceful && let Some(persistence) = &self.persistence {
             graceful = await_shutdown_phase(deadline, persistence.drain()).await;
         }
-        // Every accepted generation is now durable on the staging volume, but a
-        // key that never reached its object target would sit there waiting for
-        // a dwell this process will not outlive. Publish that residue while the
-        // CPU, WAL, and object lanes are still open.
-        if graceful {
-            graceful = Box::pin(self.publish_staged_residue(deadline)).await;
-        }
+        // Every accepted generation is now durable on the staging volume. Staged
+        // members below their object target stay staged: startup restores them
+        // and the publish tick settles them, so shutdown re-encodes nothing.
         self.close_lanes();
         if graceful {
             graceful = await_shutdown_phase(deadline, self.shards.shutdown(deadline)).await;
@@ -1493,33 +1463,24 @@ impl ScribeImpl {
         self.shutdown_notify.notify_waiters();
     }
 
-    /// Publishes the staged members graceful drain would otherwise strand.
+    /// Publishes every staged claim whose target or dwell has made it due.
     ///
-    /// Runs after the persistence queue is empty, so every accepted generation
-    /// is already durable and the only members left are the ones target and
-    /// dwell were still holding. Returns whether the sweep completed within the
-    /// deadline; a pod without staging publishes nothing and succeeds. A member
-    /// that fails to publish stays durable and staged, so reporting the failure
-    /// downgrades shutdown to non-graceful rather than losing rows.
-    async fn publish_staged_residue(&self, deadline: std::time::Instant) -> bool {
-        let Some(persistence) = &self.persistence else {
-            return true;
-        };
-        match timed_shutdown_phase(
-            deadline,
-            Box::pin(persistence.publish_residue(crate::scribe::assembly::ClaimCause::Drain)),
-        )
-        .await
-        {
-            Some(Ok(published)) => {
-                tracing::info!(published, "Scribe drain published its staged residue");
-                true
-            }
-            Some(Err(error)) => {
-                tracing::warn!(%error, "Scribe drain left staged members unpublished");
-                false
-            }
-            None => false,
+    /// The server's publisher calls this once per tick, in its own loop beside
+    /// the [`Self::check_age`] scanner so a long claim merge never delays age
+    /// or pressure seals. A staged key whose writes stopped still publishes
+    /// once its dwell expires instead of waiting for another durable
+    /// generation or for shutdown. Returns the number of claims published; a
+    /// Scribe without persistence or staging publishes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a due claim cannot be published. Its
+    /// members stay durable and staged, and the WAL stays authoritative for
+    /// their rows, so the next tick retries.
+    pub async fn publish_due(&self) -> Result<usize, ScribeError> {
+        match &self.persistence {
+            Some(persistence) => persistence.publish_due().await,
+            None => Ok(0),
         }
     }
 
@@ -1570,9 +1531,23 @@ impl ScribeImpl {
     }
 
     /// Return whether Scribe has completed recovery and still accepts writes.
+    ///
+    /// A faulted WAL makes Scribe unready immediately, so Gate and ingress
+    /// refuse new writes before any acknowledgment.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        !self.closed.load(Ordering::Acquire) && self.recovery_ready.load(Ordering::Acquire)
+        !self.closed.load(Ordering::Acquire)
+            && self.recovery_ready.load(Ordering::Acquire)
+            && !self.wal.is_faulted()
+    }
+
+    /// Returns the signal cancelled when this Scribe's WAL faults.
+    ///
+    /// The owning role awaits it to withdraw readiness and its cluster fence;
+    /// the fault never reaches process health.
+    #[must_use]
+    pub fn wal_fault(&self) -> tokio_util::sync::CancellationToken {
+        self.wal.fault_signal()
     }
 
     /// Drain shard work after the pod lifecycle scanner's tick.
@@ -1870,7 +1845,6 @@ impl Scribe for ScribeImpl {
                     }
                     ScribeError::PayloadTooLarge { .. }
                     | ScribeError::DecodedPayloadTooLarge { .. }
-                    | ScribeError::TooManyRows { .. }
                     | ScribeError::InvalidFrame
                     | ScribeError::EventTimeOutOfRange { .. }
                     | ScribeError::FingerprintMismatch { .. }
@@ -2011,33 +1985,6 @@ mod constructor_rotation_tests {
         scribe
             .shutdown(std::time::Instant::now() + Duration::from_secs(1))
             .await;
-    }
-
-    /// Reading memtable statistics leaves admission reservations untouched.
-    ///
-    /// A slice reserves active bytes before its WAL write and enters the
-    /// memtable only after the durable fence, so an inspection taken in between
-    /// sees no writable bytes. If the read reconciled admission from that view
-    /// it would erase the reservation, and the slice's later release (the
-    /// duplicate-batch discard path) would underflow and poison the pod.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the reservation or statistics read fails, or when the read
-    /// changes the reserved active bytes.
-    #[tokio::test]
-    async fn memtable_stats_preserves_pre_insertion_active_reservations() {
-        let scribe = ScribeImpl::new();
-        scribe
-            .admission
-            .try_reserve_active("pre-insertion", 64)
-            .expect("active reservation");
-        scribe.memtable_stats().expect("memtable stats");
-        assert_eq!(scribe.admission_snapshot().active_bytes, 64);
-        scribe
-            .admission
-            .release_active(64)
-            .expect("the reservation is still owned and releases exactly");
     }
 
     /// Embedded construction applies every explicitly selected test-tier
@@ -2276,40 +2223,17 @@ mod telemetry_tests {
 }
 
 impl ScribeImpl {
-    /// Reports the pod's closed contention registry totals.
-    ///
-    /// The registry is the production observation owner for admission,
-    /// activation, borrowing, and demand transitions, so a fairness case reads
-    /// its totals rather than installing a parallel counter. Read-only: nothing
-    /// here moves capacity or changes a scheduling decision.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn contention_totals_for_test(&self) -> crate::scribe::telemetry::ScribeTelemetrySnapshot {
-        self.admission.contention().telemetry_totals()
-    }
-
     /// Reports the pod's closed staged-member and claim registry totals.
     ///
-    /// The same retained observation owner that records admission also records
-    /// the durability half of the pod, so a reconciliation case reads staged
+    /// The pod's one retained observation owner records the durability half of
+    /// the pod, so a reconciliation case reads staged
     /// minus retired members and claims taken minus claims closed from here
     /// rather than inferring a durable transition from a published object.
     /// Read-only: nothing here stages, claims, publishes, or retires.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn staging_totals_for_test(&self) -> crate::scribe::telemetry::ScribeStagingSnapshot {
-        self.admission.contention().staging_totals()
-    }
-
-    /// Reports how many complete lifecycle vectors this pod's capacity completes.
-    ///
-    /// Derived once at startup from measured capacity, so a case that has to
-    /// place real contention reads the pod's own ceiling instead of recomputing
-    /// it from configuration.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn ownership_ceiling_for_test(&self) -> usize {
-        self.admission.contention().ownership_ceiling()
+        self.admission.telemetry_handle().staging_snapshot()
     }
 
     /// Install a one-shot test barrier at the public write seam.
@@ -2474,6 +2398,15 @@ impl ScribeImpl {
         self.wal.set_device_full_for_test(false);
     }
 
+    /// Fails the next WAL sync after its record bytes are written.
+    ///
+    /// Durability of those bytes is then unknown, so the WAL faults: the
+    /// write gets no ACK and Scribe stays unready until restart replay.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn trip_wal_sync_fault_for_test(&self) {
+        self.wal.trip_sync_failure_for_test();
+    }
+
     /// Returns the bounded CPU pool used by Scribe's ingest materialization.
     #[must_use]
     pub fn ingress_cpu_pool(&self) -> ScribeIngressCpuPool {
@@ -2592,9 +2525,7 @@ impl ScribeImpl {
                 restored,
                 retirement_high_water,
             }) => {
-                let stats = self.memtable_stats()?;
-                self.admission
-                    .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
+                self.memtable_stats()?;
                 tracing::info!(
                     restored,
                     retirement_high_water,

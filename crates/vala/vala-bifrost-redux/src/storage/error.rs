@@ -143,8 +143,10 @@ impl BifrostStorageError {
     /// Maps one Parquet decode failure into this closed vocabulary.
     ///
     /// Everything Parquet reports at this boundary is either a range read that
-    /// already failed and was wrapped, or bytes that are not valid metadata;
-    /// both are definite for an immutable object, so neither retries. The
+    /// already failed and was wrapped, or bytes that are not valid metadata.
+    /// A wrapped read whose cause chain says the object is gone is
+    /// [`Self::NotFound`], so a caller can tell a vanished pinned object from
+    /// an outage. The
     /// detail is a fixed phrase rather than the error's own message so no
     /// object path can reach a log line through this path.
     #[must_use]
@@ -156,6 +158,13 @@ impl BifrostStorageError {
         // else as invalid data is what stops the owner retrying a footer that
         // will never decode.
         match error {
+            parquet::errors::ParquetError::External(source)
+                if error_chain_contains_not_found(source.as_ref()) =>
+            {
+                Self::NotFound {
+                    detail: "the parquet object was not found".to_owned(),
+                }
+            }
             parquet::errors::ParquetError::External(_) => Self::Backend {
                 detail: "the object store failed a parquet metadata range read".to_owned(),
             },
@@ -170,4 +179,33 @@ impl BifrostStorageError {
             },
         }
     }
+}
+
+/// Returns whether an error chain contains an exact filesystem, `OpenDAL`, or
+/// storage-owner not-found cause.
+///
+/// Object-store backends report a vanished object through their own typed
+/// error, wrapped an arbitrary number of times by Iceberg, Parquet, and
+/// `DataFusion`. Walking the whole chain and downcasting is the only way to
+/// separate a pinned object that disappeared after cut selection from a
+/// genuine storage outage, which the caller must classify differently.
+pub(crate) fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            || source
+                .downcast_ref::<opendal::Error>()
+                .is_some_and(|error| error.kind() == opendal::ErrorKind::NotFound)
+            || matches!(
+                source.downcast_ref::<BifrostStorageError>(),
+                Some(BifrostStorageError::NotFound { .. })
+            )
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
 }

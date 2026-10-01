@@ -1,5 +1,6 @@
 //! Construction-time client configuration resolution.
 
+use crate::GlobalConfig;
 use crate::WyrdClient;
 use crate::config::ClientConfig;
 use crate::error::WyrdClientError;
@@ -22,17 +23,15 @@ pub(crate) fn load(
     server_url: Option<&str>,
     credential: Option<SecretString>,
 ) -> Result<WyrdClient, RegistryEngineError> {
-    let mut client_config = ClientConfig::from_global()?;
-    if let Some(server_url) = server_url {
-        if server_url.is_empty() {
-            return Err(WyrdClientError::Config {
-                field: "server_url".to_owned(),
-                reason: "must not be empty".to_owned(),
-            }
-            .into());
+    if server_url.is_some_and(str::is_empty) {
+        return Err(WyrdClientError::Config {
+            field: "server_url".to_owned(),
+            reason: "must not be empty".to_owned(),
         }
-        client_config.http.base_url = server_url.to_owned();
+        .into());
     }
+    let mut client_config =
+        ClientConfig::from_global_with_overrides(&GlobalConfig::load()?, server_url, None);
     if credential.is_some() {
         client_config.credential = credential;
     }

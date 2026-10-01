@@ -53,6 +53,19 @@ impl PyWyrdClient {
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))
     }
 
+    /// The effective HTTP server URL this client sends requests to.
+    #[getter]
+    fn server_url(&self) -> &str {
+        self.inner.server_url()
+    }
+
+    /// The effective gRPC endpoint: the explicit `grpc_url` when one was given,
+    /// else the server URL's scheme and host on the public gRPC port `50051`.
+    #[getter]
+    fn grpc_url(&self) -> &str {
+        self.inner.grpc_url()
+    }
+
     /// Return a client that acts for the holder of `subject_token`.
     ///
     /// This client's credential is the actor. The first RFC 8693 exchange runs

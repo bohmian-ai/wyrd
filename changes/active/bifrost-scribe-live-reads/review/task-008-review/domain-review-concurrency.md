@@ -1,0 +1,37 @@
+# Concurrency and native stream lifecycle review
+
+Result: **PASS** for this domain. No material proposed findings.
+
+## Subject, authority and limits
+
+Independent review of candidate `6e7add054e33701ca5ecb52a5c859948b15161a3`, TASK-008/R1 diff from `f7bebf704d6f3b1dd20d041e70c6ca512c0da307`, and cumulative original TASK-007 paths from `a7582db587c6170a290760f1741673125612b797`. Authority: approved revision 20 REQ-014/015, AC-016/017, INV-004/005/006/008; original TASK-007, TASK-007-R1, prior verdict; repository agent rules and maintainer/spec-driven-development references; Bifrost architecture's query-source/terminal and Scribe staged-source ownership rules. The supplied navigation map was a starting point; current source and caller searches supplied the evidence below.
+
+Static review only. No tests, Postgres wrappers, full lanes, commits or production edits. Recorded task results are not independently rerun evidence. FIND-007-3 is accepted unchanged under the maintainer's explicit disposition; this review does not prescribe new retained-Arrow accounting or reopen that decision. Unrelated TASK-006 work is excluded.
+
+## Reviewed boundary and source coverage
+
+| Boundary | Source and caller evidence | Assessment |
+|---|---|---|
+| Session partitions and exact-once source assignment | `oracle/follower.rs:780-861` `ScribeTailResolver::live_leaf`; `oracle/live.rs:205-228,356-395` `LiveScribeExec`; `PhysicalPlanFollower::execute` at `follower.rs:1437-1474` | Memory groups are exactly the session target including sparse and empty cuts, with each batch dealt once by modulo. Staged leaf gets the same partition count and disjoint byte ranges. Mixed UnionExec enumerates both children without adding a new repartition policy. Source substitution preserves the source shape. |
+| Scribe-local staged leases | `scribe/tail_rpc.rs:563-585` bounded snapshot/served-generation exclusion/lease; `LiveTailBatches::into_parts` at `:353-365`; `scribe/hot_source.rs:242-263`; `exec.rs:2733-2735,2889-2900` | The existing lease moves into the staged scan, shared by plan and all streams. Failures while constructing the scan drop the local lease; stream/plan final drop releases it. Metadata cancellation guard remains stream-owned. No leader path acquires another pod's staged filename. |
+| Native output completion producer | `dispatcher.rs:607-658` NativeCompletion/NativeOutputTally; sole production tally caller `wyrd-server/src/oracle/peer_service.rs:363-392` | Existing authenticated Scribe executor counts rows and `get_array_memory_size` bytes with checked conversions/addition, then emits matching authenticated request fingerprint and finalized scan stats only after drain. An output error ends the stream without successful completion. Tally state is per fragment, not shared across requests. |
+| Native output completion consumer | `oracle/live.rs:718-845` LiveFrameDecoder and `:488-599` LiveFragmentRead | Decoder independently counts native rows/bytes and compares totals/fingerprint before successful completion. Missing completion at EOF fails; repeated/trailing items fail; early caller drop owes no footer. Cancel/deadline branches end only the owning partition/fragment. No new terminal state machine, hashing or serialization appears on the native path. |
+| Remote sibling | `peer_service.rs:545-585` gRPC encoding of executor output; `LiveFrameDecoder::accept` wire branch at `live.rs:773-824`; all LiveFrame completion consumers located by repository search | gRPC retains AttemptEncoder wire totals/hash/footer and feeds completion scan evidence into the existing wire footer. Native byte accounting does not replace or reinterpret the remote encoded-byte convention. |
+| Shared scan concurrency and refusal | `exec.rs:972-1047` PublishedFooterLoader; `:1109-1148` common footer proof; `:2922-2982` hot/staged metadata load, proof, row-group selection | Metadata loads keep existing storage-cache/single-flight and cancellation ownership; checks read immutable retained footer metadata and do not add mutable global state or IO. Every partition piece validates before decoding; proof failure follows the existing typed failure path rather than terminating the process or treating foreign files as degraded availability. |
+
+The hot/staged scan checks the file footer in each partition piece that opens it. This is fixed work per file piece and independent of rows; it introduces no shared check-state, synchronization, or row-level work. Whether the task's wording requires stricter once-per-logical-file accounting belongs to the task acceptance/tenancy review; no concurrency correction is warranted here.
+
+## Failure and recovery assessment
+
+A dropped live read drops its active dispatch stream. The native executor owns the follower output stream inside its async stream, so cancellation releases that stream and its source plan/lease; DataFusion's existing partition task cancellation governs coalesced producer teardown. A failed metadata load, footer proof, projection, checked tally, or source stream returns an error for its query. No changed branch crashes the shared Scribe/Oracle process or retries a tenant-invariant refusal on another worker. Publication can retire staged authority while the leased files remain protected until readers stop; the existing lease owner, not a new footer-specific owner, handles that race.
+
+Live availability behavior is preserved: only the existing closed availability classes before any delivered row become degradation. Once rows were delivered, source loss fails. Native completed output is accepted only when its counters and signed fingerprint reconcile; abandoning an unnecessary child (such as LIMIT) remains a permitted early drop. A normal remote completion still undergoes the original wire validation.
+
+## Proof assessment and prior-finding closure
+
+- FIND-007-1: source construction now fixes both the sparse and empty cases. `scribe_live_sources_keep_the_session_partition_count` covers one filtered batch, empty cut and mixed memory/staged sources at four partitions, draining results to check exact-once assignment.
+- FIND-007-2: the actual production tally is wired into ScribeFragmentExecutor. `native_completion_reconciles_the_delivered_output` exercises that shared tally through the decoder for empty/nonempty output and contradictory rows, bytes and fingerprint, plus repeated/trailing completion behavior. The older incremental/footer test retains wire coverage. Server's existing empty-fragment test covers executor completion; nonempty executor-to-decoder integration is inferred from the single production path, not independently executed here.
+- FIND-007-3: intentionally unchanged under current user authority. Not a finding in this report.
+- Lease/cancellation regression proof remains `a_dropped_staged_scan_releases_its_lease_immediately` and `an_open_live_read_keeps_staged_runs_across_publication`. The immediate-drop test deliberately uses one partition; it does not claim immediate synchronous teardown of spawned coalescing tasks. Source ownership supports multi-partition eventual teardown without a new lifecycle policy.
+
+No additional concurrency or lifecycle machinery beyond the existing scan ownership and the bounded native output tally is required. Domain result: **PASS**, subject to the stated static-verification limits and the orchestrator's independently assessed remaining domains.

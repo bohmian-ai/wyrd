@@ -8,7 +8,6 @@ use crate::namespaces::BifrostNamespace;
 use crate::scribe::ScribeImpl;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::geometry::DEFAULT_SHARD_COUNT;
-use crate::scribe::staged_tail::tests::unbounded_pool;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
 use crate::scribe::wal::{WalConfig, WalWriter};
@@ -182,21 +181,21 @@ fn ipc_stream(batches: &[RecordBatch]) -> Vec<u8> {
 
 /// Read every stamped row of one frame, keyed by its batch id.
 ///
+/// Rows are returned as `(metric_name, rendered quantile_values)` sorted by
+/// value: the layout sort interleaves the two frames' rows, and a stored row
+/// carries no position within its batch, so the comparison is between the
+/// frames' row multisets.
+///
 /// # Panics
 ///
-/// Panics when a managed column is absent or carries the wrong Arrow type.
-fn stamped_rows(
-    batches: &[RecordBatch],
-    batch_id: Uuid,
-) -> Vec<(i32, String, arrow::array::ArrayRef)> {
-    use arrow::array::{Array, FixedSizeBinaryArray, Int32Array, StringArray};
+/// Panics when a managed column is absent, carries the wrong Arrow type, or a
+/// quantile value cannot be rendered.
+fn stamped_rows(batches: &[RecordBatch], batch_id: Uuid) -> Vec<(String, String)> {
+    use arrow::array::{Array, FixedSizeBinaryArray, StringArray};
+    use arrow::util::display::array_value_to_string;
 
     let mut rows = Vec::new();
     for batch in batches {
-        let ordinals = batch
-            .column_by_name("wyrd_row_ordinal")
-            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
-            .expect("wyrd_row_ordinal is Int32");
         let ids = batch
             .column_by_name("wyrd_batch_id")
             .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
@@ -208,27 +207,26 @@ fn stamped_rows(
         let quantiles = batch
             .column_by_name("quantile_values")
             .expect("the nested canonical column survives the managed WAL path");
-        for row in 0..batch.num_rows() {
+        for row in 0..ids.len() {
             if ids.value(row) != batch_id.as_bytes() {
                 continue;
             }
             rows.push((
-                ordinals.value(row),
                 names.value(row).to_owned(),
-                quantiles.slice(row, 1),
+                array_value_to_string(quantiles, row).expect("quantile value renders"),
             ));
         }
     }
-    rows.sort_by_key(|(ordinal, _, _)| *ordinal);
+    rows.sort();
     rows
 }
 
-/// Assert both payload modes stamped one contiguous range and the same rows.
+/// Assert both payload modes stored every row and the same rows.
 ///
 /// # Panics
 ///
-/// Panics when either frame's ordinals are not `0..total_rows` in input order,
-/// or when the two frames do not read back identical user columns.
+/// Panics when either frame did not store exactly `total_rows` rows, or when
+/// the two frames do not read back identical user columns.
 fn assert_payload_modes_agree(
     stored: &[RecordBatch],
     canonical_batch_id: Uuid,
@@ -237,34 +235,19 @@ fn assert_payload_modes_agree(
 ) {
     let canonical_rows = stamped_rows(stored, canonical_batch_id);
     let arrow_rows = stamped_rows(stored, arrow_batch_id);
-    let expected_ordinals: Vec<i32> =
-        (0..i32::try_from(total_rows).expect("row count fits i32")).collect();
     assert_eq!(
-        canonical_rows
-            .iter()
-            .map(|(ordinal, _, _)| *ordinal)
-            .collect::<Vec<_>>(),
-        expected_ordinals,
-        "one canonical batch stamps one contiguous ordinal range"
+        canonical_rows.len(),
+        total_rows,
+        "one canonical batch stores every row"
     );
     assert_eq!(
-        arrow_rows
-            .iter()
-            .map(|(ordinal, _, _)| *ordinal)
-            .collect::<Vec<_>>(),
-        expected_ordinals,
-        "one Arrow IPC stream stamps one contiguous ordinal range across every record batch"
+        arrow_rows.len(),
+        total_rows,
+        "one Arrow IPC stream stores every row across every record batch"
     );
     assert_eq!(
-        canonical_rows
-            .iter()
-            .map(|(_, name, quantiles)| (name.clone(), quantiles.to_data()))
-            .collect::<Vec<_>>(),
-        arrow_rows
-            .iter()
-            .map(|(_, name, quantiles)| (name.clone(), quantiles.to_data()))
-            .collect::<Vec<_>>(),
-        "both payload modes read back identical user columns in input order"
+        canonical_rows, arrow_rows,
+        "both payload modes read back identical user columns"
     );
 }
 
@@ -277,8 +260,6 @@ const MANAGED_COLUMNS: &[&str] = &[
     "wyrd_event_time",
     "wyrd_ingested_at",
     "wyrd_batch_id",
-    "wyrd_row_ordinal",
-    "data_tenant_id",
 ];
 
 /// Assert every stored managed column is the table's own `Field` and value.
@@ -291,9 +272,9 @@ const MANAGED_COLUMNS: &[&str] = &[
 /// # Panics
 ///
 /// Panics when a managed column is absent from the stored projection, when its
-/// stored `Field` differs from the table-owned physical field, or when the
-/// tenant isolation key does not carry the authenticated tenant.
-fn assert_managed_columns_are_table_owned(stored: &[RecordBatch], tenant: DataTenantId) {
+/// stored `Field` differs from the table-owned physical field, or when a
+/// per-row tenant column reappears.
+fn assert_managed_columns_are_table_owned(stored: &[RecordBatch]) {
     let definition =
         crate::tables::builtin_table("metrics", "points").expect("the points built-in resolves");
     let physical = (definition.schema)();
@@ -312,23 +293,10 @@ fn assert_managed_columns_are_table_owned(stored: &[RecordBatch], tenant: DataTe
                 "{name} is stored as the table-owned physical field"
             );
         }
-        let tenants = batch
-            .column(
-                batch
-                    .schema()
-                    .index_of("data_tenant_id")
-                    .expect("tenant column"),
-            )
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("the tenant key is the declared Utf8 column");
-        for row in 0..tenants.len() {
-            assert_eq!(
-                tenants.value(row),
-                tenant.to_string(),
-                "every stored row carries the authenticated tenant"
-            );
-        }
+        assert!(
+            batch.schema().index_of("data_tenant_id").is_err(),
+            "tenant ownership is proved by the file footer, never a row column"
+        );
     }
 }
 
@@ -427,7 +395,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let binding = TenantTableBinding::resolve((tenant, table)).expect("binding");
     let stored = live_rows(
         &scribe,
-        FetchLiveTailRequest {
+        &FetchLiveTailRequest {
             binding,
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -437,16 +405,12 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
                 .map(|name| (*name).to_owned())
                 .chain(["metric_name".to_owned(), "quantile_values".to_owned()])
                 .collect(),
-            predicates: Vec::new(),
-            max_batches: 64,
-            max_retained_bytes: 64 * 1024 * 1024,
         },
         "hot snapshot",
-    )
-    .await;
+    );
 
     assert_payload_modes_agree(&stored, canonical_batch_id, arrow_batch_id, total_rows);
-    assert_managed_columns_are_table_owned(&stored, tenant);
+    assert_managed_columns_are_table_owned(&stored);
 
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
@@ -527,11 +491,8 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         start_partition: day,
         end_partition: day,
         required_columns: vec!["value".to_owned()],
-        predicates: Vec::new(),
-        max_batches: 64,
-        max_retained_bytes: 64 * 1024 * 1024,
     };
-    let hot = live_rows(&scribe, request.clone(), "hot snapshot").await;
+    let hot = live_rows(&scribe, &request, "hot snapshot");
     assert_eq!(hot.len(), 1);
     assert_eq!(hot[0].schema().fields().len(), 1);
     assert_eq!(hot[0].schema().field(0).name(), "value");
@@ -597,8 +558,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         day_one,
         &source_value,
         stream,
-    )
-    .await;
+    );
 
     let cross_day = cross_day_batch(source.schema(), day_one, day_two);
     let cross_day_principal = principal(tenant);
@@ -623,15 +583,15 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     .await
     .expect("cross-day append");
     assert_eq!(cross_day_admission.rows_accepted, 2);
-    assert_cross_day_materialization(&scribe, tenant, &day_table, day_one, day_two, stream).await;
-    assert_other_tenant_isolated(&scribe, &pointer_table, day_one, stream).await;
+    assert_cross_day_materialization(&scribe, tenant, &day_table, day_one, day_two, stream);
+    assert_other_tenant_isolated(&scribe, &pointer_table, day_one, stream);
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;
 }
 
 /// Assert a returned hot batch shares the expected Arrow allocation.
-async fn assert_pointer_identity(
+fn assert_pointer_identity(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
@@ -641,19 +601,15 @@ async fn assert_pointer_identity(
 ) {
     let hot = live_rows(
         scribe,
-        FetchLiveTailRequest {
+        &FetchLiveTailRequest {
             binding: TenantTableBinding::resolve((tenant, table.clone())).expect("pointer binding"),
             target_stream: stream,
             start_partition: day,
             end_partition: day,
             required_columns: vec!["value".to_owned()],
-            predicates: Vec::new(),
-            max_batches: 64,
-            max_retained_bytes: 64 * 1024 * 1024,
         },
         "pointer hot snapshot",
-    )
-    .await;
+    );
     assert_eq!(hot.len(), 1);
     assert!(Arc::ptr_eq(source_value, hot[0].column(0)));
 }
@@ -684,7 +640,7 @@ fn cross_day_batch(
 }
 
 /// Assert cross-day materialization preserves row ownership and ordering.
-async fn assert_cross_day_materialization(
+fn assert_cross_day_materialization(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
@@ -698,12 +654,9 @@ async fn assert_cross_day_materialization(
         start_partition: day,
         end_partition: day,
         required_columns: vec!["value".to_owned()],
-        predicates: Vec::new(),
-        max_batches: 64,
-        max_retained_bytes: 64 * 1024 * 1024,
     };
-    let day_one_hot = live_rows(scribe, read_day(day_one), "day one snapshot").await;
-    let day_two_hot = live_rows(scribe, read_day(day_two), "day two snapshot").await;
+    let day_one_hot = live_rows(scribe, &read_day(day_one), "day one snapshot");
+    let day_two_hot = live_rows(scribe, &read_day(day_two), "day two snapshot");
     assert_eq!(day_one_hot.len(), 1);
     assert_eq!(day_two_hot.len(), 1);
     assert_eq!(day_one_hot[0].num_rows(), 1);
@@ -712,26 +665,26 @@ async fn assert_cross_day_materialization(
     assert_eq!(hot_value(&day_two_hot[0]), 202);
 }
 
-/// Opens one live read on `scribe` and drains every batch it produces.
+/// Opens one live read on `scribe` and returns its memtable rows.
+///
+/// These fixtures never stage a generation, so the memtable cut is the whole
+/// read.
 ///
 /// # Panics
-/// Panics with `context` when the read cannot open or a batch fails.
-async fn live_rows(
+/// Panics with `context` when the read cannot open or names a staged run.
+fn live_rows(
     scribe: &ScribeImpl,
-    request: FetchLiveTailRequest,
+    request: &FetchLiveTailRequest,
     context: &str,
 ) -> Vec<RecordBatch> {
-    futures_util::TryStreamExt::try_collect(
-        scribe
-            .tail_service()
-            .expect("tail service")
-            .open_live_batches(request)
-            .await
-            .expect(context)
-            .into_stream(unbounded_pool()),
-    )
-    .await
-    .expect(context)
+    let (rows, runs, _lease) = scribe
+        .tail_service()
+        .expect("tail service")
+        .open_live_batches(request)
+        .expect(context)
+        .into_parts();
+    assert!(runs.is_empty(), "{context}: the fixture staged no run");
+    rows
 }
 
 /// Read the fixture's single hot value.
@@ -747,7 +700,7 @@ fn hot_value(rows: &RecordBatch) -> i64 {
 }
 
 /// Assert a distinct tenant cannot observe the retained hot batch.
-async fn assert_other_tenant_isolated(
+fn assert_other_tenant_isolated(
     scribe: &ScribeImpl,
     table: &TableRef,
     day: crate::catalog::layout::TimePartition,
@@ -755,20 +708,16 @@ async fn assert_other_tenant_isolated(
 ) {
     let other = live_rows(
         scribe,
-        FetchLiveTailRequest {
+        &FetchLiveTailRequest {
             binding: TenantTableBinding::resolve((DataTenantId::new_v7(), table.clone()))
                 .expect("other tenant binding"),
             target_stream: stream,
             start_partition: day,
             end_partition: day,
             required_columns: vec!["value".to_owned()],
-            predicates: Vec::new(),
-            max_batches: 64,
-            max_retained_bytes: 64 * 1024 * 1024,
         },
         "other tenant snapshot",
-    )
-    .await;
+    );
     assert!(other.is_empty(), "hot snapshots must be tenant isolated");
 }
 

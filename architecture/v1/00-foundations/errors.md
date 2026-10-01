@@ -16,6 +16,7 @@ query.
 | `WYRD_SQL_500_CONNECT` | 500 | Database connection or migration bootstrap SQL failed. |
 | `WYRD_SQL_500_MIGRATE` | 500 | Migration execution failed for a reason other than checksum drift. |
 | `WYRD_SQL_500_MIGRATE_CHECKSUM` | 500 | A previously-applied migration was modified. |
+| `WYRD_SQL_503_SCHEMA_NOT_READY` | 503 | Serving boot found the schema unmigrated or a serving login misprovisioned; run `wyrd-server migrate`. |
 | `WYRD_SQL_500_QUERY` | 500 | Generic database query failure. |
 | `WYRD_SQL_404_NO_ROWS` | 404 | A query expected a row and none was returned. |
 | `WYRD_SQL_409_UNIQUE_VIOLATION` | 409 | PostgreSQL SQLSTATE `23505`. |

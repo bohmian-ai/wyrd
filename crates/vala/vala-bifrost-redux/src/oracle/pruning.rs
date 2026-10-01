@@ -10,7 +10,7 @@
 //!
 //! This is a strict optimization layered under the existing execution
 //! guarantees. Pushdown stays `Inexact`, `DataFusion` keeps its residual filter,
-//! the hidden tenant column and `TenantTripwireExec` are untouched, and any
+//! every opened file still proves its footer tenant, and any
 //! file whose statistics are absent, undecodable, or contradictory is retained.
 //! The only files this module removes are ones the query provably cannot read a
 //! row from.

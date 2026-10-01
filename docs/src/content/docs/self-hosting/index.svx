@@ -28,24 +28,25 @@ Wyrd is multi-tenant. One server serves many tenants, isolated in the database, 
 
 ## Start here
 
-The fastest way to see the server run is local development. Leave the database variables unset and it provisions its own Postgres. Skip the signing key and it mints an ephemeral one. You only have to point it at a storage directory.
+The fastest way to see the server run is `mise run dev:backend`. It starts a throwaway Docker Postgres that is deleted when the server exits, runs `wyrd-server migrate`, and serves with the two serving database URLs. Skip the signing key and it mints an ephemeral one. You only have to point it at a storage directory.
 
 ```bash
 mkdir -p .wyrd-dev/storage
 export WYRD_STORAGE_URL="file://$PWD/.wyrd-dev/storage"
-export WYRD_PUBLIC_BASE_URL=http://localhost:8080
 
 mise run dev:backend
 ```
 
-That configuration is development-only. It is not safe for staging or production, and the server refuses to boot a production profile without a real signing key. See [Local development](/self-hosting/local-development/) for the walkthrough, then [Configuration](/self-hosting/configuration/) for the full env var surface a real deployment needs.
+That configuration is development-only. It is not safe for staging or production, and the server refuses to boot a production profile without a real signing key. See [Local development](/self-hosting/local-development/) for a durable setup, then [Configuration](/self-hosting/configuration/) for the full env var surface a real deployment needs.
 
 ## Deployment targets
 
 | Target | Use it for | Status |
 | --- | --- | --- |
-| [Local development](/self-hosting/local-development/) | A working server on your laptop with zero external dependencies. | Documented |
-| [Docker](/self-hosting/docker/) | Running the OSS image against your own Postgres and bucket. | Placeholder |
+| [Local development](/self-hosting/local-development/) | A durable server on your laptop against a local Postgres container and storage directory. | Documented |
+| [Development server on Kubernetes](/self-hosting/kubernetes-development/) | One `all` replica on a shared cluster with external Postgres. | Documented |
+| [Production server on Kubernetes](/self-hosting/kubernetes-production/) | The hardened profile with a fixed anchor, an autoscaled Scribe template, and peer mTLS. | Documented |
+| [Docker](/self-hosting/docker/) | Running a locally built official image against your own Postgres and bucket. | Documented |
 | [Binary](/self-hosting/binary/) | Deploying the compiled server to a host or VM. | Placeholder |
 | [Enterprise](/self-hosting/enterprise/) | Multi-tenant SaaS with custom policy, audit, and identity. | Placeholder |
 

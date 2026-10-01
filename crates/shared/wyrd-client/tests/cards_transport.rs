@@ -280,7 +280,7 @@ fn client_debug_redacts_constructor_secret() {
     let config = ClientConfig {
         credential: Some(SecretString::from("wyrd_sk_private")),
         http: HttpConfig {
-            base_url: "http://localhost:50050".to_owned(),
+            base_url: "http://localhost:8080".to_owned(),
             ..HttpConfig::default()
         },
         ..ClientConfig::default()

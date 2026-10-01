@@ -67,14 +67,15 @@ coarse admission for the object decision.
 ## Policy Plane
 
 CEL and ABAC do not live behind this trait. Policy evaluation belongs to the
-Policy plane and its `/v1/authz/check` surface, which has its own decision
-shape. `PermissionDenyReason` intentionally has no ABAC variant.
+Policy plane's card-state actions (`classify`, `gate`); there is no runtime
+cross-service invoke policy surface. `PermissionDenyReason` intentionally has
+no ABAC variant.
 
 ## Delegated Requests
 
-Token exchange adds no RBAC check of its own; the invoke policy gates it. A
+Token exchange adds no RBAC check of its own and consults no policy. A
 delegated token's principal is the subject being acted for and its
 `permissions` claim is already the intersection of the actor's and the
 subject's, so every later request runs this same checker against that
-principal and set. The `act` chain is attribution for audit and policy only
-and never confers authority.
+principal and set. The `act` chain is attribution for audit only and never
+confers authority.

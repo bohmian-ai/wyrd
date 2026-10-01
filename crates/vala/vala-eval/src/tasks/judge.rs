@@ -15,7 +15,7 @@ use crate::executor::TaskExecutor;
 use crate::judge::{JudgeError, JudgeInvoker};
 use crate::operators;
 use crate::store::JudgeOutcome;
-use crate::tasks::media::{MediaBindings, bindings_as_context};
+use crate::tasks::media::MediaBindings;
 
 /// Executor for Agent-backed LLM judge tasks.
 pub struct JudgeTaskExecutor {
@@ -62,9 +62,13 @@ impl TaskExecutor for JudgeTaskExecutor {
             Some(path) => extract_required_jsonpath_from(&view, path, &judge.id)?,
             None => view,
         };
-        let context_for_invoker = embed_media(narrowed, &snapshot.media);
-        let parsed =
-            invoke_with_retries(self.invoker.as_ref(), judge, context_for_invoker.clone()).await?;
+        let parsed = invoke_with_retries(
+            self.invoker.as_ref(),
+            judge,
+            narrowed.clone(),
+            &snapshot.media,
+        )
+        .await?;
 
         let started_at = Utc::now();
         let verdict = operators::evaluate_operator(&parsed, &judge.operator, &judge.expected)
@@ -86,7 +90,7 @@ impl TaskExecutor for JudgeTaskExecutor {
             duration_ms: elapsed_ms(started_at),
         };
         let outcome = JudgeOutcome {
-            raw: context_for_invoker,
+            raw: narrowed,
             parsed,
             judge_ref: judge.judge_ref.as_card_ref().cloned(),
         };
@@ -97,28 +101,11 @@ impl TaskExecutor for JudgeTaskExecutor {
     }
 }
 
-fn embed_media(context: Value, bindings: &MediaBindings) -> Value {
-    if bindings.is_empty() {
-        return context;
-    }
-
-    let media_value = bindings_as_context(bindings);
-    match context {
-        Value::Object(mut map) => {
-            map.insert("media".to_owned(), media_value);
-            Value::Object(map)
-        }
-        other => serde_json::json!({
-            "context": other,
-            "media": media_value,
-        }),
-    }
-}
-
 async fn invoke_with_retries(
     invoker: &dyn JudgeInvoker,
     task: &LlmJudgeTask,
     context: Value,
+    media: &MediaBindings,
 ) -> Result<Value, EvalExecError> {
     if matches!(
         &task.judge_ref,
@@ -134,7 +121,10 @@ async fn invoke_with_retries(
     let mut last_error = String::from("no attempt made");
 
     for attempt in 0..max_attempts {
-        match invoker.invoke(&task.judge_ref, context.clone()).await {
+        match invoker
+            .invoke(&task.judge_ref, context.clone(), media)
+            .await
+        {
             Ok(value) => return Ok(value),
             Err(error) if error.is_retryable() && attempt + 1 < max_attempts => {
                 last_error = error.to_string();
@@ -282,12 +272,23 @@ mod llm_judge_executor {
         )
     }
 
+    /// Drive `spec` to completion, panicking on an execution error.
     async fn drive(spec: EvalSpec, base: Value, mock: Arc<MockJudgeInvoker>) -> EvalReport {
+        try_drive(spec, base, mock).await.expect("plan executes")
+    }
+
+    /// Drive `spec` over `base` with the scripted judge `mock`.
+    ///
+    /// # Errors
+    /// Returns whatever execution error the driver propagates.
+    async fn try_drive(
+        spec: EvalSpec,
+        base: Value,
+        mock: Arc<MockJudgeInvoker>,
+    ) -> Result<EvalReport, crate::EvalExecError> {
         let plan = spec.execution_plan().expect("test spec has valid DAG");
         let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry builds");
-        execute_plan(&plan, &context(base), &registry, &executors(mock))
-            .await
-            .expect("plan executes")
+        execute_plan(&plan, &context(base), &registry, &executors(mock)).await
     }
 
     fn result<'a>(report: &'a EvalReport, id: &str) -> &'a wyrd_spec::vala::eval::AssertionResult {
@@ -360,6 +361,7 @@ mod llm_judge_executor {
         assert_eq!(mock.calls().await.len(), 3);
     }
 
+    /// An exhausted retry budget is an execution error, not a subject failure.
     #[tokio::test]
     async fn retry_budget_exhausted_errors() {
         let mock = MockJudgeInvoker::new([
@@ -377,19 +379,14 @@ mod llm_judge_executor {
             &[],
             1,
         )]);
-        let report = drive(spec, json!({"response": "ok"}), Arc::clone(&mock)).await;
-        let result = result(&report, "judge");
-        assert!(!result.passed);
+        let error = try_drive(spec, json!({"response": "ok"}), Arc::clone(&mock))
+            .await
+            .expect_err("an exhausted judge must not produce a result");
         assert_eq!(mock.calls().await.len(), 2);
-        assert!(
-            result
-                .message
-                .as_deref()
-                .unwrap_or("")
-                .contains("judge failed after 2 attempt")
-        );
+        assert!(error.to_string().contains("judge failed after 2 attempt"));
     }
 
+    /// Invalid judge output is an execution error and is never retried.
     #[tokio::test]
     async fn invalid_structured_output_short_circuits() {
         let mock = MockJudgeInvoker::new([Err(JudgeError::InvalidStructuredOutput {
@@ -402,17 +399,11 @@ mod llm_judge_executor {
             &[],
             3,
         )]);
-        let report = drive(spec, json!({"response": "ok"}), Arc::clone(&mock)).await;
-        let result = result(&report, "judge");
-        assert!(!result.passed);
+        let error = try_drive(spec, json!({"response": "ok"}), Arc::clone(&mock))
+            .await
+            .expect_err("invalid judge output must not produce a result");
         assert_eq!(mock.calls().await.len(), 1);
-        assert!(
-            result
-                .message
-                .as_deref()
-                .unwrap_or("")
-                .contains("missing verdict")
-        );
+        assert!(error.to_string().contains("missing verdict"));
     }
 
     #[tokio::test]

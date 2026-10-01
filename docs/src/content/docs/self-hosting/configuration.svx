@@ -28,11 +28,11 @@ Field names and variable names refer to the same settings. Other pages name the 
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `APP_ENV` | `development` | `development`, `staging`, or `production`. The hardened profile requires a signing key, a real policy hook and audit writer, and gRPC reflection off. |
+| `APP_ENV` | `development` | `development`, `staging`, or `production`. The hardened profile requires a signing key and gRPC reflection off. |
 
 <Aside title="The hardened profile needs more than env vars">
 
-A production or staging profile requires a real authorization policy hook and audit writer. The open-source server ships development stubs for both, and `production_validate` rejects them at boot. There is no environment variable that swaps in real implementations: they are injected in code through the `StateOverrides` seam by a downstream build (see [Architecture](/self-hosting/architecture/#extension-seams)). Running the plain OSS server in a production profile fails validation until those are provided. Development profile has no such requirement.
+A production or staging profile requires a real signing key; the open-source server ships a development-only ephemeral key, and `production_validate` rejects it at boot. Development profile has no such requirement.
 
 </Aside>
 
@@ -46,6 +46,28 @@ A production or staging profile requires a real authorization policy hook and au
 | `WYRD_SERVE_MODE` | `both` | `both`, `http`, or `grpc`. Overridden by `--mode`. |
 | `WYRD_METRICS_ENABLED` | `true` | Serve the Prometheus `/metrics` endpoint. |
 | `WYRD_METRICS_BIND` | auto | Defaults to `127.0.0.1` on the HTTP port plus one, so `/metrics` is not public unless you set this. |
+
+## Peer mode
+
+One process runs every Bifrost role in-process and needs no peer settings. To run several replicas against the same Postgres and object storage, set both variables below on every replica. Replicas find each other through Postgres membership, so they need no list of addresses. Split `oracle` and `scribe` targets require peer mode.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WYRD_PEER_ADDRESS` | none | `host:port` other replicas dial to reach this one, such as the pod IP and peer port. |
+| `WYRD_PEER_TLS_DIR` | none | Directory holding `ca.crt`, `tls.crt`, and `tls.key`: a dedicated cluster CA and one leaf certificate shared by every replica, with DNS name `wyrd-peer`. Keep the CA private key off the replicas. |
+| `WYRD_BIFROST_PEER_BIND_ADDR` | `0.0.0.0:50052` | Private peer listener. Must differ from the HTTP and gRPC binds. Expose it only on the workload network. |
+
+In Kubernetes, give every replica its own address from the shared pod template with the Downward API, never a per-pod value you write by hand:
+
+```yaml
+env:
+  - name: POD_IP
+    valueFrom: {fieldRef: {fieldPath: status.podIP}}
+  - {name: WYRD_PEER_ADDRESS, value: "$(POD_IP):50052"}
+  - {name: WYRD_PEER_TLS_DIR, value: /etc/wyrd/peer}
+```
+
+The peer listener accepts only mutual TLS from that CA. A valid certificate identifies a cluster process, not a tenant: each receiver still checks the tenant, query, fence, and deadline of every call against its own state.
 
 ## Authentication
 
@@ -160,7 +182,7 @@ On shutdown the runtime stops claiming work immediately, gives in-flight runs up
 
 These are documented in full on their own pages. In brief:
 
-- Database: set `WYRD_DATABASE_URL` plus the per-role passwords to run against external Postgres, or leave all of them unset to use embedded Postgres in development. See [Database](/self-hosting/database/).
+- Database: set `WYRD_DATABASE_URL` (`wyrd_app`) and `WYRD_PLATFORM_DATABASE_URL` (`wyrd_platform_admin`) after running `wyrd-server migrate` with the owner login. See [Database](/self-hosting/database/).
 - Storage: set `WYRD_STORAGE_URL` (`file:///path`, `s3://bucket`, `gs://bucket`, or `az://account/container`). See [Storage](/self-hosting/storage/).
 
 ## Config file
@@ -194,16 +216,15 @@ tenant_slug = "acme"
 
 ## A complete production environment
 
-Each page above documents one slice. Here is the full set of variables a production deployment against external Postgres and an S3 bucket sets, in one place. Provision the four database roles and mount the signing key as a secret first.
+Each page above documents one slice. Here is the full set of variables a production deployment against external Postgres and an S3 bucket sets, in one place. Provision the two serving roles, run `wyrd-server migrate` with the owner login, and mount the signing key as a secret first.
 
 ```bash
 # Profile
 export APP_ENV=production
 
-# Database (external). The four roles must already exist in the cluster.
+# Database. Both roles exist and `wyrd-server migrate` has run.
 export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
-export WYRD_DATABASE_MIGRATOR_PASSWORD="migrator-pw"
-export WYRD_DATABASE_CATALOG_APP_PASSWORD="catalog-pw"
+export WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform_admin:admin-pw@db.internal:5432/wyrd"
 
 # Storage (S3). AWS credentials resolve via the default SDK chain.
 export WYRD_STORAGE_URL=s3://wyrd-artifacts
@@ -217,7 +238,7 @@ export WYRD_OTLP_ENDPOINT=http://otel-collector:4317
 export WYRD_SERVICE_NAME=wyrd
 ```
 
-This boots only if the deployment also provides a real policy hook and audit writer, per the note above. `WYRD_PUBLIC_BASE_URL` is not needed for S3; it is required only for the local storage backend.
+This boots only if the deployment also provides a real signing key, per the note above.
 
 ## Validation rules
 
@@ -225,7 +246,7 @@ Boot rejects a configuration that breaks any of these:
 
 - HTTP and gRPC must bind different addresses, and the metrics bind must not collide with either.
 - Pool, limit, readiness, and shutdown values must fall in the ranges above.
-- A production profile requires a signing key, a real policy hook and audit writer, and gRPC reflection off.
+- A production profile requires a signing key and gRPC reflection off.
 - Any trusted issuer or workload binding requires `WYRD_SERVER_TENANT_SLUG`.
 - `WYRD_OTLP_ENDPOINT`, if set, must be a valid URL with an `http`, `https`, or `grpc` scheme.
 

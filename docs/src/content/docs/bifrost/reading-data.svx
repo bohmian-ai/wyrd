@@ -163,7 +163,7 @@ The `bifrost.query` read tool accepts the same SQL and returns
 one bounded structured result: `{columns, rows, terminal}`. `columns` is an
 ordered array of descriptors with `name`, `data_type`, and `nullable`; each row
 is a positional array in that same order, preserving duplicate column names.
-The terminal contains `outcome`, `execution_path`, `row_count`,
+The terminal contains `outcome`, `query_class`, `row_count`,
 `warnings`, and `source_completion`.
 
 A query failure or result-ceiling refusal returns a structured Wyrd error with

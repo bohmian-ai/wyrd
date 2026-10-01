@@ -1,24 +1,19 @@
-//! Per-record media bindings for LLM judge context.
+//! Per-record named media bindings for LLM judges.
+//!
+//! A binding is the committed Eval [`MediaRef`] descriptor — never bytes and
+//! never provider-facing text. The judge invoker resolves each descriptor to
+//! authorized bytes at call time and binds them into the judge Prompt's
+//! matching `${media:id}` placeholder as provider-native content.
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use wyrd_spec::vala::eval::media::MediaRef;
 
-/// One opaque media payload bound to a record.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EvalMediaBinding {
-    /// Media identifier referenced by the judge prompt.
-    pub id: String,
-    /// Opaque payload for the eventual provider-specific renderer.
-    pub payload: Value,
-}
-
-/// Engine-owned collection of per-record media bindings.
+/// Engine-owned collection of one record's media descriptors, keyed by binding id.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct MediaBindings {
-    by_id: BTreeMap<String, EvalMediaBinding>,
+    /// Descriptors keyed by their `${media:id}` binding id.
+    by_id: BTreeMap<String, MediaRef>,
 }
 
 impl MediaBindings {
@@ -28,15 +23,25 @@ impl MediaBindings {
         Self::default()
     }
 
+    /// Bind every descriptor of one record; a repeated id keeps the last one.
+    #[must_use]
+    pub fn from_refs(refs: impl IntoIterator<Item = MediaRef>) -> Self {
+        let mut bindings = Self::new();
+        for media in refs {
+            bindings.insert(media);
+        }
+        bindings
+    }
+
     /// Borrow a binding by id.
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<&EvalMediaBinding> {
+    pub fn get(&self, id: &str) -> Option<&MediaRef> {
         self.by_id.get(id)
     }
 
     /// Insert or replace a binding by its id.
-    pub fn insert(&mut self, binding: EvalMediaBinding) {
-        self.by_id.insert(binding.id.clone(), binding);
+    pub fn insert(&mut self, media: MediaRef) {
+        self.by_id.insert(media.id.as_str().to_owned(), media);
     }
 
     /// Iterate binding ids in stable order.
@@ -44,26 +49,16 @@ impl MediaBindings {
         self.by_id.keys().map(String::as_str)
     }
 
+    /// Iterate descriptors in stable binding-id order.
+    pub fn iter(&self) -> impl Iterator<Item = &MediaRef> {
+        self.by_id.values()
+    }
+
     /// True when no bindings are present.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
-}
-
-/// Project media bindings into the context shape seen by a judge.
-#[must_use]
-pub fn bindings_as_context(bindings: &MediaBindings) -> Value {
-    let mut root = Map::new();
-    for id in bindings.ids() {
-        if let Some(binding) = bindings.get(id) {
-            root.insert(
-                id.to_owned(),
-                serde_json::json!({ "payload": binding.payload }),
-            );
-        }
-    }
-    Value::Object(root)
 }
 
 #[cfg(test)]
@@ -76,8 +71,8 @@ mod media_binding {
     use crate::executor::{EvalReport, Executors, TaskRunOutcome, execute_plan};
     use crate::store::TaskRegistry;
     use crate::tasks::{
-        AgentTaskExecutor, AssertionTaskExecutor, EvalMediaBinding, JudgeTaskExecutor,
-        MediaBindings, TraceTaskExecutor,
+        AgentTaskExecutor, AssertionTaskExecutor, JudgeTaskExecutor, MediaBindings,
+        TraceTaskExecutor,
     };
     use crate::{InMemoryTraceSource, MockJudgeInvoker};
     use serde_json::{Value, json};
@@ -144,13 +139,17 @@ mod media_binding {
         }
     }
 
+    /// Drive `spec` over `base` with bound `media` and the scripted judge `mock`.
+    ///
+    /// # Errors
+    /// Returns whatever execution error the driver propagates.
     async fn drive(
         spec: EvalSpec,
         base: Value,
         media: MediaBindings,
         required_media: Vec<String>,
         mock: Arc<MockJudgeInvoker>,
-    ) -> EvalReport {
+    ) -> Result<EvalReport, crate::EvalExecError> {
         let plan = spec.execution_plan().expect("test spec has valid DAG");
         let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry builds");
         let cx = ExecutionContext::new(
@@ -160,9 +159,7 @@ mod media_binding {
             None,
         )
         .with_media(media, required_media);
-        execute_plan(&plan, &cx, &registry, &executors(mock))
-            .await
-            .expect("plan executes")
+        execute_plan(&plan, &cx, &registry, &executors(mock)).await
     }
 
     fn result<'a>(report: &'a EvalReport, id: &str) -> &'a wyrd_spec::vala::eval::AssertionResult {
@@ -176,16 +173,17 @@ mod media_binding {
             .expect("task result exists")
     }
 
+    /// Named media reaches the invoker as a typed binding, never as context text.
     #[tokio::test]
-    async fn bound_media_appears_in_invoker_context_under_media_key() {
-        let mut media = MediaBindings::new();
-        media.insert(EvalMediaBinding {
-            id: "image_under_review".to_owned(),
-            payload: json!({
-                "kind": "image",
-                "url": "file:///tmp/example.png",
-            }),
-        });
+    async fn bound_media_reaches_invoker_as_binding_not_context_text() {
+        let descriptor = wyrd_spec::vala::eval::media::MediaRef {
+            id: wyrd_spec::ids::MediaBindingId::new("image_under_review")
+                .expect("static binding id is valid"),
+            kind: wyrd_spec::vala::eval::media::MediaKind::Image,
+            uri: "file:///tmp/example.png".to_owned(),
+            media_type: Some("image/png".to_owned()),
+        };
+        let media = MediaBindings::from_refs([descriptor.clone()]);
         let mock = MockJudgeInvoker::new([Ok(json!("pass"))]);
         let report = drive(
             spec_of(vec![judge_task()]),
@@ -194,36 +192,33 @@ mod media_binding {
             Vec::new(),
             Arc::clone(&mock),
         )
-        .await;
+        .await
+        .expect("plan executes");
         assert!(result(&report, "judge").passed);
         let calls = mock.calls().await;
         assert_eq!(calls.len(), 1);
-        assert_eq!(
-            calls[0].1["media"]["image_under_review"]["payload"]["url"],
-            json!("file:///tmp/example.png")
+        assert!(
+            !calls[0].1.to_string().contains("file:///tmp/example.png"),
+            "the private URI must not become judge context text"
         );
+        let media_calls = mock.media_calls().await;
+        assert_eq!(media_calls[0].get("image_under_review"), Some(&descriptor));
     }
 
+    /// Unbound required media is an execution error and never invokes the judge.
     #[tokio::test]
     async fn required_media_id_unbound_errors_without_invoking_judge() {
         let mock = MockJudgeInvoker::new([Ok(json!("pass"))]);
-        let report = drive(
+        let error = drive(
             spec_of(vec![judge_task()]),
             json!({"response": "look at this"}),
             MediaBindings::new(),
             vec!["image_under_review".to_owned()],
             Arc::clone(&mock),
         )
-        .await;
-        let result = result(&report, "judge");
-        assert!(!result.passed);
-        assert!(
-            result
-                .message
-                .as_deref()
-                .unwrap_or("")
-                .contains("required media id")
-        );
+        .await
+        .expect_err("unbound required media must not produce a result");
+        assert!(error.to_string().contains("required media id"), "{error}");
         assert_eq!(mock.calls().await.len(), 0);
     }
 }

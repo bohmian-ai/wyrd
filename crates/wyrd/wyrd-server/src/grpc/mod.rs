@@ -16,11 +16,8 @@ mod otlp;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub use otlp::{OtlpCodecActivity, reset_otlp_codec_activity, snapshot_otlp_codec_activity};
-mod peer_auth;
 pub(crate) mod query;
 mod scribe_tail;
-
-pub use peer_auth::{PeerWorkloadAuth, PeerWorkloadAuthLayer, PeerWorkloadIdentity};
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -37,6 +34,7 @@ use wyrd_tonic::tonic::body::Body;
 use wyrd_tonic::tonic::codegen::http::{Request, Response};
 use wyrd_tonic::tonic::server::NamedService;
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
+use wyrd_tonic::tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
 
 use crate::AppState;
@@ -113,10 +111,9 @@ impl GrpcFirstFrame {
     /// Returns the first message's declared payload size, when it is knowable.
     ///
     /// `None` means the body ended before a complete header, which is a legal
-    /// empty body, or the message is compressed. A compressed frame declares
-    /// its *compressed* length, which would under-bound the decompressed body,
-    /// so it is treated as unknown rather than admitted against a lease that is
-    /// too small.
+    /// empty body. A compressed frame declares its encoded length, which is
+    /// exactly the transport bytes this edge retains; decompression is bounded
+    /// separately by tonic's decode limit.
     ///
     /// # Errors
     ///
@@ -127,8 +124,7 @@ impl GrpcFirstFrame {
             return Ok(None);
         }
         match self.header[0] {
-            0 => {}
-            1 => return Ok(None),
+            0 | 1 => {}
             _ => return Err(FirstFrameError::MalformedFlag),
         }
         let length: [u8; 4] = self.header[1..GRPC_FRAME_HEADER_BYTES]
@@ -158,6 +154,29 @@ enum TransportPlane {
 }
 
 impl TransportPlane {
+    /// Reports whether this plane admits the connection that carried `request`.
+    ///
+    /// The public plane has no transport identity to check. The peer listener's
+    /// handshake has already verified the client leaf's chain to the dedicated
+    /// cluster CA, its validity, and its usage; this narrows that leaf to the
+    /// fixed [`crate::config::PEER_SERVER_NAME`] identity, so another leaf the
+    /// same CA issued never reaches a body. A request with no recorded peer
+    /// certificate is refused, keeping the check fail-closed.
+    fn admits<B>(self, request: &Request<B>) -> bool {
+        if self == Self::Public {
+            return true;
+        }
+        request
+            .extensions()
+            .get::<TlsConnectInfo<TcpConnectInfo>>()
+            .and_then(TlsConnectInfo::peer_certs)
+            .is_some_and(|chain| {
+                chain.first().is_some_and(|leaf| {
+                    wyrd_tls::certificate_has_dns_name(leaf, crate::config::PEER_SERVER_NAME)
+                })
+            })
+    }
+
     /// Records one private-plane body poll for multi-process probes.
     ///
     /// The counter exists only in test-support builds; a production binary
@@ -250,6 +269,14 @@ where
         let admission = self.admission.clone();
         let plane = self.plane;
         let mut inner = self.inner.clone();
+        if !plane.admits(&request) {
+            return Box::pin(async {
+                Ok(
+                    Status::unauthenticated("peer certificate identity is not admitted")
+                        .into_http(),
+                )
+            });
+        }
         Box::pin(async move {
             let (parts, mut body) = request.into_parts();
             plane.record_body_poll();
@@ -280,11 +307,7 @@ where
                 .into_status()
                 .into_http());
             }
-            let lease = declared.map_or_else(
-                || admission.try_acquire_unknown(),
-                |bytes| admission.try_acquire(bytes),
-            );
-            let _lease = match lease {
+            let _lease = match admission.try_acquire(declared.unwrap_or(0)) {
                 Ok(lease) => lease,
                 Err(_) => {
                     return Ok(Status::resource_exhausted(
@@ -354,22 +377,6 @@ where
         .add_service(bifrost_query.into_server()))
 }
 
-/// Selects the role-owned peer security audit for this process.
-///
-/// Deliberately not an aggregate: a process owns exactly one peer plane, and
-/// whichever role composed it owns the record of what that plane refused.
-fn peer_security_audit(
-    state: &AppState,
-) -> Option<Arc<dyn vala_bifrost_redux::oracle::peer::PeerSecurityAudit>> {
-    if let Some(oracle) = state.bifrost.oracle() {
-        return Some(oracle.peer().security_audit());
-    }
-    state
-        .bifrost
-        .scribe()
-        .map(|scribe| scribe.fragment_security_audit())
-}
-
 /// Build the **private** Bifrost peer router served on the mutually
 /// authenticated peer listener.
 ///
@@ -379,18 +386,21 @@ fn peer_security_audit(
 /// deliberately mounts neither health nor reflection — a private listener
 /// advertises nothing to an unauthenticated caller.
 ///
+/// Transport admission is the dedicated cluster CA: a connection without a
+/// leaf that CA issued for the fixed peer identity never reaches a handler.
+/// That admits a trusted cluster process, not a tenant, so every mounted
+/// service checks its typed context against its own trusted state before any
+/// plan decode or storage IO.
+///
 /// Returns `Ok(None)` when this target selects no private service, which is the
 /// Forge-worker case: it keeps using its durable assignment path and opens no
 /// peer socket.
 ///
 /// # Errors
-/// Returns [`GrpcError::MissingTokenVerifier`] when the Oracle lifecycle
-/// service is selected without a configured token verifier, or
-/// [`GrpcError::Transport`] when tonic rejects the peer TLS material.
+/// Returns [`GrpcError::Transport`] when tonic rejects the peer TLS material.
 pub fn build_peer_grpc(
     state: &AppState,
     tls: wyrd_tonic::server::MutualTlsServerConfig,
-    denial_audit_concurrency: usize,
 ) -> Result<Option<TonicRouter>, GrpcError> {
     let serves_ingest = state.bifrost_ingest().is_some();
     let serves_query = state.bifrost_query().is_some();
@@ -398,34 +408,26 @@ pub fn build_peer_grpc(
         return Ok(None);
     }
     let transport = state.bifrost.transport_admission();
-    // One boundary, composed once and cloned into every mounted service, so no
-    // private adapter can acquire an authentication path of its own.
-    let auth = PeerWorkloadAuthLayer::new(
-        state.bifrost.shared_token_verifier(),
-        state
-            .bifrost
-            .peer_identity()
-            .cloned()
-            .ok_or(GrpcError::MissingPeerIdentity)?,
-        peer_security_audit(state).ok_or(GrpcError::MissingPeerIdentity)?,
-        denial_audit_concurrency,
-    );
     // `OraclePeerService` is the one adapter every peer-bearing target mounts:
     // a Scribe answers fragment operations on it and an Oracle answers query
     // control, so it anchors the router and later services extend it. The
     // protobuf service is never forked by role; an operation whose local
-    // capability is absent fails closed after authentication instead.
-    let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(auth.wrap(
+    // capability is absent fails closed instead.
+    let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(
         GrpcTransportAdmissionService::new_peer(
-            crate::oracle::OraclePeerGrpc::new(Arc::clone(&state.bifrost)).into_server(),
+            crate::oracle::OraclePeerGrpc::new(
+                Arc::clone(&state.bifrost),
+                state.shutdown_token.clone(),
+            )
+            .into_server(),
             transport.clone(),
         ),
-    ));
+    );
     let router = match state.bifrost_ingest() {
-        Some(scribe) => router.add_service(auth.wrap(GrpcTransportAdmissionService::new_peer(
-            scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_service()).into_server(),
+        Some(scribe) => router.add_service(GrpcTransportAdmissionService::new_peer(
+            scribe_tail::ScribeTailGrpc::new(scribe.tail_service()).into_server(),
             transport.clone(),
-        ))),
+        )),
         None => router,
     };
     let router = match state
@@ -442,31 +444,21 @@ pub fn build_peer_grpc(
                     Arc::clone(&ingress),
                     vala_bifrost_redux::oracle::analytical_transport::UpstreamWorker::into_worker_server,
                 );
-            router.add_service(auth.wrap(GrpcTransportAdmissionService::new_peer(
+            router.add_service(GrpcTransportAdmissionService::new_peer(
                 vala_bifrost_redux::oracle::analytical_transport::AnalyticalStageAuthLayer::new(
                     ingress,
                 )
                 .layer_service(workers),
                 transport.clone(),
-            )))
+            ))
         }
         None => router,
     };
     let router = match state.bifrost_query() {
-        Some(query) => router.add_service(
-            auth.wrap(GrpcTransportAdmissionService::new_peer(
-                crate::oracle::OracleLifecycleGrpc::new(
-                    state
-                        .auth
-                        .token_verifier
-                        .clone()
-                        .ok_or(GrpcError::MissingTokenVerifier)?,
-                    Arc::clone(query),
-                )
-                .into_server(),
-                transport,
-            )),
-        ),
+        Some(query) => router.add_service(GrpcTransportAdmissionService::new_peer(
+            crate::oracle::OracleLifecycleGrpc::new(Arc::clone(query)).into_server(),
+            transport,
+        )),
         None => router,
     };
     Ok(Some(router))
@@ -676,16 +668,16 @@ mod tests {
         assert_eq!(admission.used_bytes(), 0);
     }
 
-    /// A compressed first frame declares a compressed length, so it is unknown.
+    /// A compressed first frame is bounded by its encoded length.
     ///
-    /// Admitting it against its declared length would lease less capacity than
-    /// the decompressed message occupies.
+    /// Transport charges the encoded bytes it retains; decompression is bounded
+    /// separately by tonic's decode limit and the decoder's own charge.
     ///
     /// # Panics
     ///
-    /// Panics when a compressed frame is bounded by its compressed length.
+    /// Panics when a compressed frame is not bounded by its encoded length.
     #[tokio::test]
-    async fn a_compressed_first_frame_is_bounded_as_unknown() {
+    async fn a_compressed_first_frame_is_bounded_by_its_encoded_length() {
         let mut compressed = vec![1_u8];
         compressed.extend_from_slice(&4_u32.to_be_bytes());
         let mut body = chunked_body(vec![compressed]);
@@ -694,7 +686,7 @@ mod tests {
             .await
             .expect("test body never errors");
 
-        assert_eq!(head.declared(), Ok(None));
+        assert_eq!(head.declared(), Ok(Some(4)));
     }
 
     /// An empty body has no header to read and is admitted as unknown.

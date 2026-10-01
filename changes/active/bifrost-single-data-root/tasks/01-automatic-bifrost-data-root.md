@@ -186,29 +186,15 @@ Oracle or spill path that production operators cannot configure.
 
 ### Scenario 4 — One persistent mount per durable Kubernetes pod
 
-**Behavior.** Checked-in manifests express one automatic Bifrost root and one
-stable claim per durable replica. Covers REQ-004, REQ-006, AC-004.
+**Behavior.** The deployed manifests (`deploy/kubernetes/kind/wyrd.yaml` and
+the production guide) express one automatic Bifrost root: the anchor
+StatefulSet mounts a per-pod claim at `WYRD_BIFROST_DATA_DIR`, Oracle pods use
+an ephemeral root, and no manifest sets `WYRD_SCRIBE_WAL_DIR` or a
+subsystem-specific path. Covers REQ-004, REQ-006, AC-004 (spec revision 3).
 
-**RED.** Update both existing deployment-contract tests. The acceptance test
-requires current targets, `WYRD_BIFROST_DATA_DIR`, a matching mount, and
-per-pod persistent claims. The mutation test proves rejection of `emptyDir`, a
-mismatched root/mount, a shared claim, and `WYRD_SCRIBE_WAL_DIR`. They initially fail against the checked-in
-manifests and current parser.
-
-```bash
-mise exec -- cargo nextest run --locked -p wyrd-testing --lib \
-  -E 'test(=bifrost::deployment_contract::bifrost_deployment_contract_accepts_checked_in_manifests)'
-mise exec -- cargo nextest run --locked -p wyrd-testing --lib \
-  -E 'test(=bifrost::deployment_contract::bifrost_deployment_contract_rejects_broken_fixtures)'
-```
-
-**GREEN.** Update the semantic manifest projection/validation and all three
-checked-in manifests to the selected StatefulSet/root/claim design. Update
-authority documents in the same scenario so deployment and recovery prose
-describe the one-root contract without weakening purpose-specific ownership.
-
-**REFACTOR.** Manifest validation remains semantic rather than formatting
-sensitive and does not grow into a Kubernetes framework.
+**Proof.** `mise run test:server:kind` deploys the kind manifests and restarts
+the anchor; `mise run docs:check` covers the guide. No YAML contract parser is
+added.
 
 ## Cross-scenario decisions and invariants
 
@@ -230,14 +216,11 @@ sensitive and does not grow into a Kubernetes framework.
 - `crates/wyrd/wyrd-testing/src/server.rs`,
   `crates/wyrd/wyrd-testing/src/bifrost/cluster.rs`, and process-cluster child
   wiring — one injected/retained root across restart.
-- `crates/wyrd/wyrd-testing/src/bifrost/deployment_contract.rs` — one-root PVC
-  semantic validation.
 - `crates/wyrd/wyrd-testing/tests/bifrost/scribe/source_boundary_recovery.rs`
   — restart journey.
-- `deploy/kubernetes/bifrost/deployment-mixed.yaml`,
-  `deploy/kubernetes/bifrost/deployment-role-separated.yaml`, and
-  `deploy/kubernetes/bifrost/rollback-mixed.yaml` — current targets and one
-  persistent root per durable pod.
+- `deploy/kubernetes/kind/wyrd.yaml` and
+  `docs/src/content/docs/self-hosting/kubernetes-production.svx` — one
+  persistent root per durable pod, if either still deviates.
 - `architecture/bifrost-design.md`, `architecture/wyrd-security-posture.md`,
   and relevant `architecture/operations/` authorities — aligned deployment and
   recovery contract.
@@ -250,7 +233,7 @@ schema, generated artifact, or UI file belongs in the implementation diff.
 Run the named scenario commands sequentially, then:
 
 ```bash
-mise run check:bifrost-oracle-deploy
+mise run test:server:kind
 mise run test:bifrost:integration:server
 mise run test:bifrost:journey:scribe
 mise run verify:bifrost

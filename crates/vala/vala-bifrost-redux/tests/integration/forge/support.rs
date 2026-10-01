@@ -799,8 +799,10 @@ pub(crate) struct PromotionIntegrationFixture {
     pub(crate) binding: TenantTableBinding,
     /// Validated Forge limits every supervised pair is built with.
     pub(crate) config: ForgeConfig,
-    /// Boot resource plan every supervised Forge owner is built with.
-    resource_plan: vala_bifrost_redux::resources::ResourcePlan,
+    /// Forge capability every supervised Forge owner is built with.
+    forge_resources: vala_bifrost_redux::resources::ForgeResources,
+    /// Existing spill directory every supervised Forge owner leases.
+    forge_spill: std::path::PathBuf,
     /// Real Scribe retained so its owned WAL and workers outlive the seals,
     /// and reused by [`PromotionIntegrationFixture::seal_more`] to publish
     /// further hot objects through the same writer.
@@ -910,16 +912,7 @@ impl PromotionIntegrationFixture {
         let scratch_root = tempfile::tempdir().expect("scratch directory");
 
         let storage = local_storage_owner(warehouse.path());
-        // The filesystem service resumes a listing from `start_after` but does
-        // not advertise it, and a Forge worker refuses a staging backend that
-        // cannot resume a bounded orphan scan. The fixture stands in for a
-        // production object store, so it declares the support it actually has.
-        let staging = Arc::new(storage.operator().clone().layer(
-            opendal::layers::CapabilityOverrideLayer::new(|mut capability| {
-                capability.list_with_start_after = true;
-                capability
-            }),
-        ));
+        let staging = Arc::new(storage.operator().clone());
         let catalog = Arc::new(
             BifrostCatalog::new(
                 database.catalog_dsn().expose_secret(),
@@ -932,7 +925,9 @@ impl PromotionIntegrationFixture {
 
         let roles = fixture_roles(scratch_root.path(), wal_root.path());
         let scribe_resources = roles.scribe().expect("fixture Scribe capability");
-        let resource_plan = roles.plan();
+        let forge_resources = roles.forge().expect("fixture Forge capability");
+        let forge_spill = scratch_root.path().join("forge-spill");
+        std::fs::create_dir_all(&forge_spill).expect("fixture Forge spill root");
 
         let scribe = start_scribe(
             &database,
@@ -970,7 +965,8 @@ impl PromotionIntegrationFixture {
             tenant,
             binding,
             config: ForgeConfig::default(),
-            resource_plan,
+            forge_resources,
+            forge_spill,
             scribe,
             database,
             _warehouse: warehouse,
@@ -1058,20 +1054,17 @@ impl PromotionIntegrationFixture {
             staging_file_channel(self.config.max_hints_per_wake).expect("fixture hint capacity");
         Arc::new(
             Forge::new(ForgeBuildConfig {
-                resource_plan: self.resource_plan,
+                resources: self.forge_resources.clone(),
+                spill_root: self.forge_spill.clone(),
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
                 staging: Arc::clone(&self.staging),
-                staging_lists_by_cursor: self
-                    .staging
-                    .info()
-                    .full_capability()
-                    .list_with_start_after,
                 object_store,
                 hints,
                 config: self.config.clone(),
                 maintenance_interval,
+                scheduler_owner: Uuid::now_v7(),
                 clock,
                 completion_observer: Some(completion_observer),
                 scheduler_trigger: Some(scheduler_trigger),
@@ -2423,13 +2416,12 @@ fn fixture_roles(
             roles: [BifrostRole::Scribe, BifrostRole::Forge]
                 .into_iter()
                 .collect(),
-            memory_limit_bytes: None,
-            unmanaged_reserve_bytes: None,
+            server_memory_min_bytes: None,
+            bifrost_memory_limit_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
-            forge_compaction_memory_limit_bytes: None,
-            scratch_root: scratch_root.to_owned(),
+            scratch_root: Some(scratch_root.to_owned()),
             volume_roots: Some(BifrostVolumeRoots {
                 wal: wal_root.to_owned(),
                 scribe_stage,
@@ -2476,40 +2468,36 @@ async fn start_scribe(
         )
         .expect("fixture WAL writer"),
     );
-    Arc::new(
-        ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-            catalog: Some(catalog),
-            operator: staging,
-            wal,
-            stream: vala_bifrost_redux::scribe::stream_identity::StreamIdentity::new(
-                node_id,
-                vala_bifrost_redux::scribe::stream_identity::WriterEpoch::new(1),
-            ),
-            admission: AdmissionConfig::default(),
-            coordination_runtime: tokio::runtime::Handle::current(),
-            execution_pools: ScribeExecutionPools::new(
-                ScribeIngressCpuPool::new_with_capacity(2, 256),
-                ScribePersistenceCpuPool::new_with_capacity(2, 64),
-                ScribeWalIoPool::new_with_capacity(2, 256),
-            ),
-            persistence: Some(
-                ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 64, 2)
-                    .with_operator_pool(database.operator_pool().clone())
-                    .with_output_scratch(output_scratch),
-            ),
-            resources,
-            ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
-            geometry:
-                vala_bifrost_redux::scribe::geometry::ScribeGeometry::for_uniform_shard_rotation(
-                    WalConfig::default().segment_bytes,
-                    vala_bifrost_redux::scribe::memtable::MEMTABLE_ROTATION_BYTES,
-                    ScribePressureConfig::default().seal_max_age,
-                )
-                .expect("fixture Scribe geometry"),
-            staging_file_publisher: None,
-        })
-        .expect("fixture Scribe"),
-    )
+    Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+        catalog: Some(catalog),
+        operator: staging,
+        wal,
+        stream: vala_bifrost_redux::scribe::stream_identity::StreamIdentity::new(
+            node_id,
+            vala_bifrost_redux::scribe::stream_identity::WriterEpoch::new(1),
+        ),
+        admission: AdmissionConfig::default(),
+        coordination_runtime: tokio::runtime::Handle::current(),
+        execution_pools: ScribeExecutionPools::new(
+            ScribeIngressCpuPool::new_with_capacity(2, 256),
+            ScribePersistenceCpuPool::new_with_capacity(2, 64),
+            ScribeWalIoPool::new_with_capacity(2, 256),
+        ),
+        persistence: Some(
+            ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 64, 2)
+                .with_operator_pool(database.operator_pool().clone())
+                .with_output_scratch(output_scratch),
+        ),
+        resources,
+        ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
+        geometry: vala_bifrost_redux::scribe::geometry::ScribeGeometry::for_uniform_shard_rotation(
+            WalConfig::default().segment_bytes,
+            vala_bifrost_redux::scribe::memtable::MEMTABLE_ROTATION_BYTES,
+            ScribePressureConfig::default().seal_max_age,
+        )
+        .expect("fixture Scribe geometry"),
+        staging_file_publisher: None,
+    }))
 }
 
 /// Registers the cluster-node row Scribe's publication fence requires.

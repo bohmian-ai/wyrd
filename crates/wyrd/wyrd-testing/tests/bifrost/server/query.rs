@@ -10,7 +10,7 @@ use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryExecutionPath};
+use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest, QueryClass};
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
@@ -452,10 +452,10 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
     if scheduled.rows != FIXTURE_VALUES.len() as u64 {
         return Err(format!("the scheduled query returned {} rows", scheduled.rows).into());
     }
-    if scheduled.terminal.execution_path != path {
+    if scheduled.terminal.query_class != path {
         return Err(format!(
             "the scheduled query settled {:?} where the public query settled {path:?}",
-            scheduled.terminal.execution_path
+            scheduled.terminal.query_class
         )
         .into());
     }
@@ -530,7 +530,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
 /// Returns a status, decode, or missing-terminal error.
 async fn drain_grpc(
     mut frames: wyrd_tonic::tonic::Streaming<proto::QueryStreamFrame>,
-) -> Result<(usize, QueryExecutionPath), ServerJourneyError> {
+) -> Result<(usize, QueryClass), ServerJourneyError> {
     let mut decoder = QueryIpcDecoder::new();
     let mut rows = 0_usize;
     let mut path = None;
@@ -543,15 +543,13 @@ async fn drain_grpc(
                 rows += decoder.accept_batch(&batch.arrow_ipc_batch)?.num_rows();
             }
             Some(proto::query_stream_frame::Frame::Terminal(terminal)) => {
-                path = Some(
-                    match proto::QueryExecutionPath::try_from(terminal.execution_path)? {
-                        proto::QueryExecutionPath::Analytical => QueryExecutionPath::Analytical,
-                        proto::QueryExecutionPath::Interactive => QueryExecutionPath::Interactive,
-                        proto::QueryExecutionPath::Unspecified => {
-                            return Err("the terminal named no execution path".into());
-                        }
-                    },
-                );
+                path = Some(match proto::QueryClass::try_from(terminal.query_class)? {
+                    proto::QueryClass::Analytical => QueryClass::Analytical,
+                    proto::QueryClass::Interactive => QueryClass::Interactive,
+                    proto::QueryClass::Unspecified => {
+                        return Err("the terminal named no execution path".into());
+                    }
+                });
             }
             None => return Err("the gRPC stream carried an empty frame".into()),
         }
@@ -771,10 +769,7 @@ async fn prove_scheduled_analytical_completion(
         outcome.terminal.outcome,
         wyrd_spec::vala::api::QueryTerminalOutcome::Success
     );
-    assert_eq!(
-        outcome.terminal.execution_path,
-        QueryExecutionPath::Analytical
-    );
+    assert_eq!(outcome.terminal.query_class, QueryClass::Analytical);
     assert_eq!(outcome.rows, u64::try_from(FIXTURE_VALUES.len())?);
     assert_eq!(outcome.terminal.row_count, outcome.rows);
     assert_scheduled_owners_released(cluster)?;
@@ -867,7 +862,6 @@ fn assert_scheduled_owners_released(
                 .list(cluster.data_tenant_id())
                 .is_empty()
             || root.oracle_query_active
-            || root.oracle_query_slot_units != 0
             || root.oracle_query_memory_used_bytes != 0
         {
             return Err(format!("scheduled return retained ownership: {live:?}, {root:?}").into());
@@ -1122,17 +1116,14 @@ async fn prove_scoped_bearer_over_grpc(
 /// Service B acts for Service A against Bifrost and holds only A's authority.
 ///
 /// A holds read on one concrete table; B holds read on that table plus table
-/// definition read and write, record write, and dataset-schema read. The invoke policy allows
-/// exactly A-subject/B-actor, so the same two valid tokens submitted in reverse
-/// are refused with the stable policy denial, commit one denied `invoke`
-/// decision under B, and issue nothing. B, configured as an ordinary shared
+/// definition read and write, record write, and dataset-schema read. B, configured as an ordinary shared
 /// client, calls `on_behalf_of` with A's token: the delegated token names A as
 /// subject, B as the outer actor, and the Bifrost audience, and carries only
 /// the exact-table read. On the real Bifrost surface the read succeeds, while a
 /// table registration over HTTP and a native-ingest write are each refused
 /// before effect; B's own token then creates that table and writes the one row
 /// the table ends up holding. The exchange is audited under A with B as actor,
-/// `invoke` as its permission, the Bifrost audience, and B's credential; the
+/// the token-exchange operation as its permission, the Bifrost audience, and B's credential; the
 /// delegated read and refused native write are audited under A naming B, and
 /// B's direct write is audited under B with no attribution. The same token is
 /// refused on a non-Bifrost route.
@@ -1157,16 +1148,12 @@ async fn service_b_acts_for_service_a_with_only_a_table_authority() {
 /// # Panics
 ///
 /// Panics when the delegated token's claims are wrong (subject, single outer
-/// actor, audience, or permissions), the policy saw other questions, a refused
+/// actor, audience, or permissions), a refused
 /// call returns the wrong code, B's registration is not `Created`, the table
 /// holds other than B's one row, or an exchange, read, or native-write audit
 /// row names the wrong principal, actor, permission, credential, or outcome.
 async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> {
-    let policy = std::sync::Arc::new(DirectedInvokePolicy::default());
-    let server = WyrdTestServer::builder()
-        .with_policy_hook(policy.clone())
-        .start_bound()
-        .await?;
+    let server = WyrdTestServer::builder().start_bound().await?;
     let tenant = server.data_tenant_id();
     let catalog = server
         .state()
@@ -1227,34 +1214,6 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let a_token = server
         .exchange_api_key(a.api_key().ok_or("A carries no API key")?)
         .await?;
-    policy.allow_only(&a.id().to_string(), &b.id().to_string())?;
-
-    // The same two valid tokens in reverse ask a different, denied question.
-    let b_token = server
-        .exchange_api_key(b.api_key().ok_or("B carries no API key")?)
-        .await?;
-    match server
-        .delegate(&b_token, &a_token, wyrd_spec::auth::TokenAudience::Bifrost)
-        .await
-    {
-        Err(wyrd_testing::WyrdTestServerError::Http { status, code, .. })
-            if status.as_u16() == 403 && code == "WYRD_AUTHZ_403_POLICY_DENIED" => {}
-        other => {
-            return Err(format!(
-                "B-subject/A-actor must be refused by the invoke policy, got {other:?}"
-            )
-            .into());
-        }
-    }
-    let reverse = exchange_decisions(&server, tenant, &b.id().to_string()).await?;
-    if reverse != [("denied".to_owned(), "invoke".to_owned())] {
-        return Err(format!(
-            "the reverse exchange must commit exactly one denied invoke decision under B, \
-             got {reverse:?}"
-        )
-        .into());
-    }
-
     let b_client = client_for(&server, b.api_key().ok_or("B carries no API key")?)?;
 
     let delegated = b_client
@@ -1280,16 +1239,6 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         "exact-table read: {claims}"
     );
     assert!(!permissions.contains(&write), "no write: {claims}");
-
-    let asked = policy.asked()?;
-    assert_eq!(
-        asked,
-        [
-            (b.id().to_string(), a.id().to_string()),
-            (a.id().to_string(), b.id().to_string()),
-        ],
-        "the policy saw the denied reverse question, then the allowed A-to-B one"
-    );
 
     accepts(&delegated, TRACES_SQL).await?;
     let register = wyrd_spec::vala::api::RegisterTableRequest {
@@ -1442,17 +1391,20 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         )
         .await?;
     // The journey exchanges A's token more than once, and every allowed exchange
-    // must record the same decision: the `invoke` permission against B's
+    // must record the same decision: the token-exchange permission against B's
     // credential. Asserting the property across all of them stays exact without
     // depending on how many exchanges the journey happened to make.
-    let expected_exchange = [Some("invoke".to_owned()), Some(b_credential.to_string())];
+    let expected_exchange = [
+        Some("auth.token.exchange".to_owned()),
+        Some(b_credential.to_string()),
+    ];
     if exchange_rows.is_empty()
         || !exchange_rows
             .iter()
             .all(|row| row.as_slice() == expected_exchange)
     {
         return Err(format!(
-            "every allowed exchange records the invoke decision and B's credential, \
+            "every allowed exchange records the token-exchange decision and B's credential, \
              got {exchange_rows:?}"
         )
         .into());
@@ -1495,110 +1447,6 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
 
     server.shutdown().await?;
     Ok(())
-}
-
-/// Retained `(outcome, permission)` token-exchange decisions recorded under
-/// `principal`, oldest first.
-///
-/// Read from retained history rather than staging: these are the decisions the
-/// journey made earlier, and the publisher is entitled to have drained their
-/// staged rows by the time the assertion runs.
-///
-/// # Errors
-///
-/// Returns the publication-barrier or retained-history failure, or a row that
-/// does not carry both columns.
-async fn exchange_decisions(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    principal: &str,
-) -> Result<Vec<(String, String)>, ServerJourneyError> {
-    server.await_audit_published(tenant).await?;
-    server
-        .retained_audit_records(
-            tenant,
-            "outcome, permission",
-            &format!(
-                "audit_principal_id = '{principal}' AND operation = 'auth.token.exchange' \
-                 AND resource = 'bifrost'"
-            ),
-        )
-        .await?
-        .into_iter()
-        .map(|record| match record.as_slice() {
-            [Some(outcome), Some(permission)] => Ok((outcome.clone(), permission.clone())),
-            other => Err(format!("exchange decision is incomplete: {other:?}").into()),
-        })
-        .collect()
-}
-
-/// Invoke policy that allows exactly one directed subject/actor relation.
-///
-/// Production builds the invoke question with the subject token's principal
-/// as subject and the actor token's as actor; this hook answers it the way a
-/// real deployment's relation would, so a journey can prove A-to-B and B-to-A
-/// are different questions. It records every question it is asked as
-/// `(subject, actor)` principal ids. The relation is set once after the two
-/// principals exist; until then every question is denied.
-#[derive(Debug, Default)]
-struct DirectedInvokePolicy {
-    /// The one allowed `(subject, actor)` pair.
-    allowed: std::sync::OnceLock<(String, String)>,
-    /// Every `(subject, actor)` question asked, in order.
-    asked: std::sync::Mutex<Vec<(String, String)>>,
-}
-
-impl DirectedInvokePolicy {
-    /// Allow only `subject` acting through `actor`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a failure when the relation was already set.
-    fn allow_only(&self, subject: &str, actor: &str) -> Result<(), ServerJourneyError> {
-        self.allowed
-            .set((subject.to_owned(), actor.to_owned()))
-            .map_err(|_| "the directed relation is set once".into())
-    }
-
-    /// Every `(subject, actor)` question asked so far, in order.
-    ///
-    /// # Errors
-    ///
-    /// Returns a failure when the record lock is poisoned.
-    fn asked(&self) -> Result<Vec<(String, String)>, ServerJourneyError> {
-        Ok(self
-            .asked
-            .lock()
-            .map_err(|_| "the policy record lock is poisoned")?
-            .clone())
-    }
-}
-
-#[async_trait::async_trait]
-impl wyrd_auth_check::PolicyHook for DirectedInvokePolicy {
-    /// Records the question and allows it only for the configured relation.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the record lock is poisoned.
-    async fn evaluate(
-        &self,
-        ctx: &wyrd_auth_check::AuthzCheckContext,
-    ) -> wyrd_spec::card::policy::PolicyDecision {
-        let question = (ctx.subject.id.to_string(), ctx.actor.id.to_string());
-        let allowed = self.allowed.get() == Some(&question);
-        self.asked
-            .lock()
-            .expect("invariant: the policy record lock is never poisoned")
-            .push(question);
-        if allowed {
-            wyrd_spec::card::policy::PolicyDecision::Allow
-        } else {
-            wyrd_spec::card::policy::PolicyDecision::Deny {
-                reason: "no_directed_invoke_relation".to_owned(),
-            }
-        }
-    }
 }
 
 /// Decodes a JWT payload for contract assertions only; never verifies it.

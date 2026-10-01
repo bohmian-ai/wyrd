@@ -1,7 +1,9 @@
 -- Wyrd platform schema bootstrap.
 --
--- Cluster role creation is owned by infra bootstrap or embedded Postgres boot.
--- This migration validates those roles and grants object privileges only.
+-- Cluster role creation is owned by infra bootstrap (bootstrap/roles.sql).
+-- This migration runs as the database-owner login through the one-off
+-- `wyrd-server migrate` command, validates the two serving roles, and grants
+-- object privileges only.
 
 CREATE SCHEMA IF NOT EXISTS platform;
 CREATE SCHEMA IF NOT EXISTS wyrd;
@@ -10,10 +12,10 @@ DO $$
 BEGIN
     IF NOT EXISTS (
         SELECT 1 FROM pg_roles
-        WHERE rolname = 'wyrd_migrator' AND rolbypassrls = true
+        WHERE rolname = current_user AND (rolbypassrls OR rolsuper)
     ) THEN
         RAISE EXCEPTION
-            'role wyrd_migrator missing or lacks BYPASSRLS - infra bootstrap incomplete';
+            'migration login % lacks BYPASSRLS - run wyrd-server migrate as the database owner', current_user;
     END IF;
 
     IF NOT EXISTS (
@@ -35,14 +37,19 @@ END $$;
 
 GRANT USAGE ON SCHEMA platform, wyrd TO wyrd_app, wyrd_platform_admin;
 
-ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_migrator IN SCHEMA wyrd
+-- Default privileges apply to objects the migrating owner creates from here on.
+ALTER DEFAULT PRIVILEGES IN SCHEMA wyrd
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO wyrd_app;
-ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_migrator IN SCHEMA wyrd
+ALTER DEFAULT PRIVILEGES IN SCHEMA wyrd
     GRANT USAGE, SELECT ON SEQUENCES TO wyrd_app;
-ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_migrator IN SCHEMA platform, wyrd
+ALTER DEFAULT PRIVILEGES IN SCHEMA platform, wyrd
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO wyrd_platform_admin;
-ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_migrator IN SCHEMA platform, wyrd
+ALTER DEFAULT PRIVILEGES IN SCHEMA platform, wyrd
     GRANT USAGE, SELECT ON SEQUENCES TO wyrd_platform_admin;
+
+-- Serving boot proves the applied migrations match its binary; the ledger
+-- predates the default privileges above, so it is granted read-only here.
+GRANT SELECT ON TABLE wyrd._sqlx_migrations TO wyrd_app, wyrd_platform_admin;
 
 CREATE FUNCTION wyrd.current_tenant() RETURNS uuid
 LANGUAGE sql STABLE PARALLEL RESTRICTED AS $$

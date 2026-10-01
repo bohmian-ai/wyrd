@@ -14,7 +14,7 @@ use secrecy::SecretString;
 use crate::error::WyrdClientError;
 use crate::global_config::{GlobalConfig, TokenCacheKind};
 use crate::transport::{
-    config::{GRPC_DEFAULT_ENDPOINT, GrpcConfig, HTTP_DEFAULT_BASE_URL, HttpConfig},
+    config::{GrpcConfig, HTTP_DEFAULT_BASE_URL, HttpConfig, grpc_endpoint_for},
     credential::{CredentialChain, CredentialSource, ResolvedCredential},
 };
 
@@ -75,10 +75,10 @@ impl std::fmt::Debug for ClientConfig {
 impl ClientConfig {
     /// Build from environment variables and built-in defaults.
     ///
-    /// - `WYRD_GRPC_URL` overrides the gRPC endpoint (default:
-    ///   `http://localhost:50051`).
     /// - `WYRD_SERVER_URL` overrides the HTTP base URL (default:
-    ///   `http://localhost:50050`).
+    ///   `http://localhost:8080`).
+    /// - `WYRD_GRPC_URL` overrides the gRPC endpoint (default: the server
+    ///   URL's scheme and host on the public gRPC port `50051`).
     ///
     /// The [`ClientConfig::credential`] field is left `None`; set it
     /// explicitly after construction to make it the highest-priority
@@ -100,18 +100,31 @@ impl ClientConfig {
     /// Overlay global config values with environment values and defaults.
     #[must_use]
     pub fn from_global_with_env(global: &GlobalConfig) -> Self {
-        let grpc_endpoint = global
-            .client
-            .grpc_url
-            .clone()
-            .or_else(|| std::env::var("WYRD_GRPC_URL").ok())
-            .unwrap_or_else(|| GRPC_DEFAULT_ENDPOINT.to_string());
-        let http_base_url = global
-            .client
-            .http_url
-            .clone()
+        Self::from_global_with_overrides(global, None, None)
+    }
+
+    /// Overlay explicit endpoints over global config, environment, and defaults.
+    ///
+    /// Each endpoint resolves explicit value, then global config, then its
+    /// environment variable. The HTTP base URL then falls back to its default;
+    /// the gRPC endpoint falls back to [`grpc_endpoint_for`] of the *effective*
+    /// HTTP base URL, so re-pointing only `server_url` re-points gRPC with it.
+    #[must_use]
+    pub fn from_global_with_overrides(
+        global: &GlobalConfig,
+        server_url: Option<&str>,
+        grpc_url: Option<&str>,
+    ) -> Self {
+        let http_base_url = server_url
+            .map(|url| url.trim_end_matches('/').to_owned())
+            .or_else(|| global.client.http_url.clone())
             .or_else(|| std::env::var("WYRD_SERVER_URL").ok())
             .unwrap_or_else(|| HTTP_DEFAULT_BASE_URL.to_string());
+        let grpc_endpoint = grpc_url
+            .map(str::to_owned)
+            .or_else(|| global.client.grpc_url.clone())
+            .or_else(|| std::env::var("WYRD_GRPC_URL").ok())
+            .unwrap_or_else(|| grpc_endpoint_for(&http_base_url));
         let tenant = global
             .client
             .tenant
@@ -284,6 +297,38 @@ mod tests {
         }
 
         assert_eq!(cfg.grpc.endpoint, "https://grpc.example.com:443");
+    }
+
+    /// A client given only `server_url` dials gRPC on the same scheme and host
+    /// at the public port; an explicit gRPC URL still wins.
+    #[test]
+    fn grpc_endpoint_derives_from_server_url_unless_overridden() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
+        unsafe {
+            std::env::remove_var("WYRD_GRPC_URL");
+            std::env::remove_var("WYRD_SERVER_URL");
+        }
+        let global = GlobalConfig::default();
+
+        let derived = ClientConfig::from_global_with_overrides(
+            &global,
+            Some("https://wyrd.example.com/"),
+            None,
+        );
+        let overridden = ClientConfig::from_global_with_overrides(
+            &global,
+            Some("https://wyrd.example.com"),
+            Some("https://grpc.example.com:443"),
+        );
+
+        assert_eq!(derived.http.base_url, "https://wyrd.example.com");
+        assert_eq!(derived.grpc.endpoint, "https://wyrd.example.com:50051");
+        assert_eq!(overridden.grpc.endpoint, "https://grpc.example.com:443");
+        assert_eq!(
+            ClientConfig::from_env().grpc.endpoint,
+            GRPC_DEFAULT_ENDPOINT
+        );
     }
 
     #[test]

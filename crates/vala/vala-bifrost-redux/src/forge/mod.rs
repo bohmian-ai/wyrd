@@ -136,12 +136,15 @@ impl ForgeRoleReadiness {
 
 /// Construction-time dependency graph for one Forge maintenance handle.
 pub struct ForgeBuildConfig {
-    /// Immutable root resource plan this process booted with.
+    /// Forge capability issued by the one process resource composition.
     ///
-    /// Forge reads the plan rather than holding a live root lease: its only
-    /// dynamic memory accounting is the worker-local compaction queue, charged
-    /// against `forge_compaction_memory_limit_bytes`.
-    pub resource_plan: crate::resources::ResourcePlan,
+    /// Every rewrite attempt draws a fresh `DataFusion` pool view from it, so
+    /// rewrite memory is charged to the same shared Bifrost cap as every other
+    /// role rather than to a Forge-local budget.
+    pub resources: crate::resources::ForgeResources,
+    /// Existing directory rewrite operators spill into, the data root's
+    /// `forge-spill` child in production.
+    pub spill_root: std::path::PathBuf,
     /// SQL handle used by tenant-scoped durable Forge transitions.
     pub vala: vala_sql::ValaPostgres,
     /// Cross-tenant operator pool used by discovery and table leases.
@@ -150,13 +153,6 @@ pub struct ForgeBuildConfig {
     pub catalog: Arc<dyn Catalog>,
     /// Raw staging operator retained for table-owned producer fixtures.
     pub staging: Arc<opendal::Operator>,
-    /// Whether that staging operator advertises native `list_with_start_after`.
-    ///
-    /// Read once, from the concrete operator, before it is erased behind
-    /// [`ForgeObjectStore`]. Orphan collection resumes a bounded listing by
-    /// cursor, so a worker whose backend cannot do that natively must never
-    /// register, recover, publish ready, or claim.
-    pub staging_lists_by_cursor: bool,
     /// Object-store capability used by rewrites and garbage collection.
     pub object_store: Arc<dyn ForgeObjectStore>,
     /// Bounded advisory Scribe wake-up inbox.
@@ -165,6 +161,14 @@ pub struct ForgeBuildConfig {
     pub config: ForgeConfig,
     /// Delay between complete periodic maintenance ticks.
     pub maintenance_interval: Duration,
+    /// Durable process identity that owns the singleton scheduler fence.
+    ///
+    /// A restarted process that reclaims the same identity reclaims its own
+    /// live lease immediately instead of waiting out the lease TTL on standby,
+    /// which would leave a sole coordinator unready for that whole TTL. The
+    /// identity must never be shared by two live processes, the same
+    /// invariant the worker's claim owner already relies on.
+    pub scheduler_owner: uuid::Uuid,
     /// Concrete wall clock captured once by each Forge work batch.
     pub clock: ForgeClock,
     /// Optional test-only observer of successful supervised task completion.
@@ -189,8 +193,10 @@ pub struct Forge {
 
 /// Immutable dependency graph shared by one Forge owner.
 pub(crate) struct ForgeCore {
-    /// Immutable root resource plan this process booted with.
-    resource_plan: crate::resources::ResourcePlan,
+    /// Forge capability each rewrite attempt draws its governed pool from.
+    resources: crate::resources::ForgeResources,
+    /// Existing directory rewrite operators spill into.
+    spill_root: std::path::PathBuf,
     /// Vala SQL handle used by tenant-scoped transitions.
     vala: vala_sql::ValaPostgres,
     /// Operator pool used by discovery and lease operations.
@@ -199,14 +205,14 @@ pub(crate) struct ForgeCore {
     catalog: Arc<dyn Catalog>,
     /// Raw staging operator retained for the established Forge composition.
     staging: Arc<opendal::Operator>,
-    /// Whether the staging operator natively resumes a listing from a cursor.
-    staging_lists_by_cursor: bool,
     /// Narrow object-store seam used by rewrite and garbage-collection IO.
     object_store: Arc<dyn ForgeObjectStore>,
     /// Validated maintenance and rewrite limits.
     config: ForgeConfig,
     /// Delay between periodic scheduler ticks.
     maintenance_interval: Duration,
+    /// Durable process identity that owns the singleton scheduler fence.
+    scheduler_owner: uuid::Uuid,
     /// Wall clock shared by periodic and hinted maintenance batches.
     clock: ForgeClock,
     /// Optional observer notified only after a supervised worker returns success.
@@ -240,15 +246,16 @@ impl Forge {
         }
         build.config.validate()?;
         let core = ForgeCore {
-            resource_plan: build.resource_plan,
+            resources: build.resources,
+            spill_root: build.spill_root,
             vala: build.vala,
             operator_pool: build.operator_pool,
             catalog: build.catalog,
             staging: build.staging,
-            staging_lists_by_cursor: build.staging_lists_by_cursor,
             object_store: build.object_store,
             config: build.config,
             maintenance_interval: build.maintenance_interval,
+            scheduler_owner: build.scheduler_owner,
             clock: build.clock,
             #[cfg(feature = "test-support")]
             completion_observer: build.completion_observer,
@@ -272,17 +279,6 @@ impl Forge {
     #[must_use]
     pub fn clock_for_test(&self) -> ForgeClock {
         self.core.clock.clone()
-    }
-
-    /// Returns this Forge's narrow resource capability for lifecycle assertions.
-    ///
-    /// The plan is the same immutable calculation the worker admits against,
-    /// so a test can assert the composed Forge budget without gaining the
-    /// ability to construct a sibling governor or a raw pool.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn resource_plan_for_test(&self) -> crate::resources::ResourcePlan {
-        self.core.resource_plan
     }
 
     /// Returns deterministic controls for the expiry commit boundaries.

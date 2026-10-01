@@ -8,11 +8,12 @@
 //! claim owns is proportional to the number of runs rather than to the object
 //! it produces.
 //!
-//! Ordering is the layout's sort keys followed by `(wyrd_batch_id,
-//! wyrd_row_ordinal)`. The trailing pair is what makes the merge total: rows
-//! that tie on every layout key still have exactly one order, so re-running an
-//! interrupted claim over the same members reproduces the same objects rather
-//! than a permutation of them.
+//! Ordering is the layout's sort keys followed by `wyrd_batch_id`, then claim
+//! run order, then position within a run. That makes the merge total: rows
+//! that tie on every layout key and batch still have exactly one order, because
+//! a claim's members, and therefore its runs, are in durable claim order and
+//! each run is immutable. Re-running an interrupted claim over the same members
+//! reproduces the same objects rather than a permutation of them.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,12 +28,14 @@ use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::schema::SchemaFingerprint;
 
-/// Stable tie-breakers appended after every layout sort key.
+/// Stable tie-breaker appended after every layout sort key.
 ///
-/// These are managed columns, so they are present in every physical schema the
-/// staged writer produces; a run missing one is a corrupted member rather than
-/// a supported shape, and the merge refuses it.
-const STABLE_TIE_BREAKERS: [&str; 2] = ["wyrd_batch_id", "wyrd_row_ordinal"];
+/// A managed column, so it is present in every physical schema the staged
+/// writer produces; a run missing it is a corrupted member rather than a
+/// supported shape, and the merge refuses it. Rows still tied after it keep
+/// claim run order and in-run position, which [`StagedRunMerge::next_cursor`]
+/// preserves.
+const STABLE_TIE_BREAKER: &str = "wyrd_batch_id";
 
 /// One staged run positioned on the row it currently offers to the merge.
 ///
@@ -74,7 +77,7 @@ pub struct StagedRunMerge {
     schema: SchemaRef,
     /// Encoder turning sort-key columns into byte-comparable rows.
     converter: RowConverter,
-    /// Sort-key column indices in key order, tie-breakers last.
+    /// Sort-key column indices in key order, the stable tie-breaker last.
     key_columns: Vec<usize>,
     /// One cursor per staged run, in claim order.
     cursors: Vec<RunCursor>,
@@ -106,8 +109,7 @@ impl StagedRunMerge {
                 detail: "staged run merge requires a positive batch size".to_owned(),
             });
         }
-        let mut key_columns =
-            Vec::with_capacity(layout.sort_keys().len() + STABLE_TIE_BREAKERS.len());
+        let mut key_columns = Vec::with_capacity(layout.sort_keys().len() + 1);
         let mut fields = Vec::with_capacity(key_columns.capacity());
         for key in layout.sort_keys() {
             let index = column_index(&schema, key.column())?;
@@ -120,11 +122,9 @@ impl StagedRunMerge {
                 },
             ));
         }
-        for name in STABLE_TIE_BREAKERS {
-            let index = column_index(&schema, name)?;
-            key_columns.push(index);
-            fields.push(SortField::new(schema.field(index).data_type().clone()));
-        }
+        let index = column_index(&schema, STABLE_TIE_BREAKER)?;
+        key_columns.push(index);
+        fields.push(SortField::new(schema.field(index).data_type().clone()));
         let converter = RowConverter::new(fields).map_err(|error| ScribeError::Internal {
             detail: format!("build the staged merge row encoder: {error}"),
         })?;
@@ -195,6 +195,11 @@ impl StagedRunMerge {
     }
 
     /// Returns the cursor offering the smallest remaining row.
+    ///
+    /// An exact tie keeps the earliest cursor in claim order, and a cursor
+    /// offers its run's rows in position order, so rows equal on every key and
+    /// on `wyrd_batch_id` leave in claim run order, then run position. That is
+    /// the last level of the merge's total order.
     ///
     /// The scan is linear in the number of runs because a claim merges the
     /// members of one assembly key, which is bounded by the assembler's claim
@@ -425,6 +430,9 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
     /// Builds the physical schema every merge fixture run is written under.
+    ///
+    /// `value` is an ordinary payload column the fixtures use only to tell
+    /// otherwise-identical rows apart in the merged output.
     fn merge_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(
@@ -433,7 +441,7 @@ mod tests {
                 false,
             ),
             Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
-            Field::new("wyrd_row_ordinal", DataType::Int32, false),
+            Field::new("value", DataType::Int32, false),
         ]))
     }
 
@@ -452,18 +460,18 @@ mod tests {
 
     /// Writes one already sorted run and returns its path.
     ///
-    /// Rows are given as `(event_time, batch_id_byte, row_ordinal)` so a test
-    /// can place an exact tie on `wyrd_event_time` and state which side of it
-    /// the stable tie-breakers must order first.
+    /// Rows are given as `(event_time, batch_id_byte, value)` so a test can
+    /// place an exact tie on `wyrd_event_time`, with or without a tie on batch
+    /// identity, and name each row in the merged output by its `value`.
     fn write_run(directory: &Path, name: &str, rows: &[(i64, u8, i32)]) -> PathBuf {
         let schema = merge_schema();
         let times = TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.0));
         let batch_ids = FixedSizeBinaryArray::try_from_iter(rows.iter().map(|row| [row.1; 16]))
             .expect("fixture batch identity");
-        let ordinals = Int32Array::from_iter_values(rows.iter().map(|row| row.2));
+        let values = Int32Array::from_iter_values(rows.iter().map(|row| row.2));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(times), Arc::new(batch_ids), Arc::new(ordinals)],
+            vec![Arc::new(times), Arc::new(batch_ids), Arc::new(values)],
         )
         .expect("fixture run batch");
         let path = directory.join(name);
@@ -475,7 +483,7 @@ mod tests {
         path
     }
 
-    /// Drains a merge into the exact `(event_time, batch_id_byte, ordinal)` order it emitted.
+    /// Drains a merge into the exact `(event_time, batch_id_byte, value)` order it emitted.
     fn drain(merge: &mut StagedRunMerge) -> Vec<(i64, u8, i32)> {
         let mut merged = Vec::new();
         while let Some(batch) = merge.next_batch().expect("merged batch") {
@@ -489,38 +497,35 @@ mod tests {
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .expect("merged batch identity");
-            let ordinals = batch
+            let values = batch
                 .column(2)
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .expect("merged row ordinal");
+                .expect("merged value");
             for row in 0..batch.num_rows() {
-                merged.push((
-                    times.value(row),
-                    batch_ids.value(row)[0],
-                    ordinals.value(row),
-                ));
+                merged.push((times.value(row), batch_ids.value(row)[0], values.value(row)));
             }
         }
         merged
     }
 
-    /// The merge is total and deterministic: rows leave in layout order, exact
-    /// ties on every layout key are ordered by `(wyrd_batch_id,
-    /// wyrd_row_ordinal)`, no row is dropped or duplicated, and re-running the
-    /// same claim over the same runs reproduces the identical sequence.
+    /// The merge is total and deterministic: rows leave in layout order, an
+    /// exact layout tie is ordered by `wyrd_batch_id`, a tie on batch identity
+    /// too keeps claim run order and then run position, no row is dropped or
+    /// duplicated, and re-running the same claim over the same runs reproduces
+    /// the identical sequence.
     #[test]
     fn merged_runs_leave_in_one_total_deterministic_order() {
         let directory = tempfile::tempdir().expect("merge fixture root");
         let first = write_run(
             directory.path(),
             "run-0.parquet",
-            &[(10, 1, 0), (20, 1, 1), (30, 1, 2), (40, 1, 3)],
+            &[(10, 1, 0), (20, 1, 1), (25, 3, 10), (25, 3, 11), (40, 1, 3)],
         );
         let second = write_run(
             directory.path(),
             "run-1.parquet",
-            &[(15, 2, 0), (20, 2, 1), (50, 2, 2)],
+            &[(15, 2, 0), (20, 2, 1), (25, 3, 20), (50, 2, 2)],
         );
         let schema = merge_schema();
         let layout = merge_layout(schema.as_ref());
@@ -536,11 +541,14 @@ mod tests {
                 (15, 2, 0),
                 (20, 1, 1),
                 (20, 2, 1),
-                (30, 1, 2),
+                (25, 3, 20),
+                (25, 3, 10),
+                (25, 3, 11),
                 (40, 1, 3),
                 (50, 2, 2),
             ],
-            "the tie at 20 is broken by batch identity, not by claim order"
+            "the tie at 20 is broken by batch identity, not by claim order; the \
+             full tie at 25 keeps claim run order, then position within a run"
         );
 
         let mut replay =

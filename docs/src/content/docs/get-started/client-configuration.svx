@@ -55,7 +55,7 @@ is reported as a client configuration error.
 # $HOME/.config/wyrd/config.toml
 [client]
 grpc_url = "https://wyrd.example.com:50051"
-http_url = "https://wyrd.example.com:50050"
+http_url = "https://wyrd.example.com"
 tenant = "acme"
 
 [client.token_cache]
@@ -68,7 +68,7 @@ The supported fields are:
 | Field | Environment fallback | Built-in default |
 | --- | --- | --- |
 | `client.grpc_url` | `WYRD_GRPC_URL` | `http://localhost:50051` |
-| `client.http_url` | `WYRD_SERVER_URL` | `http://localhost:50050` |
+| `client.http_url` | `WYRD_SERVER_URL` | `http://localhost:8080` |
 | `client.tenant` | `WYRD_TENANT` | unset |
 | `client.token_cache.kind` | `WYRD_TOKEN_CACHE` | `in_memory` |
 | `client.token_cache.path` | `WYRD_TOKEN_CACHE_PATH` | `<config-dir>/tokens` |
@@ -93,7 +93,7 @@ use secrecy::SecretString;
 use wyrd_sdk::{config::ClientConfig, WyrdClient};
 
 let mut config = ClientConfig::from_global()?;
-config.http.base_url = "http://localhost:50050".to_owned();
+config.http.base_url = "http://localhost:8080".to_owned();
 config.api_key = Some(SecretString::from("wyrd_sk_example"));
 let client = WyrdClient::with_config(config)?;
 ```
@@ -168,7 +168,7 @@ that already has an access token, set only the endpoint and credential in its
 environment:
 
 ```bash
-export WYRD_SERVER_URL="https://wyrd.example.com:50050"
+export WYRD_SERVER_URL="https://wyrd.example.com"
 export WYRD_ACCESS_TOKEN="${WYRD_ACCESS_TOKEN:?set a token}"
 ```
 

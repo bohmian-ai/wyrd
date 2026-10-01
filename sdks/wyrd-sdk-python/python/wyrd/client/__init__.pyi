@@ -28,6 +28,20 @@ class WyrdClient:
         """
         ...
 
+    @property
+    def server_url(self) -> str:
+        """The effective HTTP server URL this client sends requests to."""
+        ...
+
+    @property
+    def grpc_url(self) -> str:
+        """The effective gRPC endpoint.
+
+        The explicit ``grpc_url`` when one was given, else the server URL's
+        scheme and host on the public gRPC port ``50051``.
+        """
+        ...
+
     def on_behalf_of(
         self,
         subject_token: str,

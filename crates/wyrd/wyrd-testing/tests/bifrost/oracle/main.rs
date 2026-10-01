@@ -27,10 +27,11 @@
 //! module first.
 
 mod analytical_activation;
-mod analytical_inactive;
+mod analytical_lifecycle;
 mod capacity;
 mod distributed;
 mod mcp;
+mod peer_cluster;
 mod peer_network;
 mod published;
 mod support;

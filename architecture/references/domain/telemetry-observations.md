@@ -28,8 +28,8 @@ scope. Token mint and refresh resolve the bounded scope to authoritative Card
 UIDs; ingest uses that verified in-memory mapping without a Card-registry
 Postgres or cache lookup. The server derives tenant, publisher, and request
 identity from verified authority and stamps physical storage columns such as
-`data_tenant_id`, `card_uid`, `principal_id`, `wyrd_batch_id`,
-`wyrd_row_ordinal`, and `wyrd_ingested_at`. Missing Card correlation leaves
+`data_tenant_id`, `card_uid`, `principal_id`, `wyrd_batch_id`, and
+`wyrd_ingested_at`. Missing Card correlation leaves
 `card_uid` null; it never erases the server-stamped publisher identity.
 
 OTLP table projection recognizes the exact record-level attributes
@@ -86,8 +86,8 @@ require a tenant-qualified table, bounded time range, explicit projection, and
 the permission associated with every sensitive column. Filter and project
 before collecting or decoding protected payloads.
 
-At-least-once delivery is made safe with deterministic batch identity and row
-ordinal. Do not claim end-to-end exactly-once when object-store and Postgres
+At-least-once delivery is made safe with deterministic batch identity and a
+payload digest. Do not claim end-to-end exactly-once when object-store and Postgres
 effects cannot share a transaction. Duplicate transport attempts must converge
 to one logical row set or a typed identity conflict.
 

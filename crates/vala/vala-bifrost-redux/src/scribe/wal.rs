@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -58,7 +58,7 @@ fn record_wal_fsync(result: &Result<(), ScribeError>, started: Instant) {
 }
 
 #[cfg(test)]
-static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static WAL_COUNT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
     /// Replay payload allocations observed on this thread.
@@ -1405,11 +1405,11 @@ pub struct WalSegmentRef {
 #[derive(Debug, Default)]
 struct WalFaults {
     /// Fails the next group sync before the durable acknowledgment boundary.
-    sync_failure: AtomicBool,
+    sync_failure: std::sync::atomic::AtomicBool,
     /// Fails the next step after sync and before memtable insertion.
-    post_sync_failure: AtomicBool,
+    post_sync_failure: std::sync::atomic::AtomicBool,
     /// Refuses every append as a full device until cleared.
-    storage_full: AtomicBool,
+    storage_full: std::sync::atomic::AtomicBool,
 }
 
 fn wal_io_error(context: &str, error: &io::Error) -> ScribeError {
@@ -1747,8 +1747,9 @@ pub struct WalWriter {
     /// failed; every later deletion pass retries it, so releasing the last
     /// reference never loses the only record that the file must be removed.
     deferred_deletes: Arc<Mutex<BTreeSet<PathBuf>>>,
-    /// Process health poisoned when a failed append cannot be rolled back.
-    health: Option<crate::resources::BifrostResourceHealth>,
+    /// Scribe-local fault raised when the WAL no longer matches what the
+    /// writer reported; shared by every handle and never reset in process.
+    fault: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Default)]
@@ -1918,8 +1919,8 @@ impl WalWriter {
     /// # Errors
     ///
     /// Returns the rollback or failed-segment removal error when physical state
-    /// cannot be restored to its pre-append boundary; process health is then
-    /// poisoned because the WAL no longer matches what was acknowledged.
+    /// cannot be restored to its pre-append boundary; the writer is then
+    /// faulted because the WAL no longer matches what it reported.
     fn rollback_prepared_append(
         &self,
         state: &mut WalState,
@@ -1928,9 +1929,7 @@ impl WalWriter {
         new_segment_bytes: u64,
     ) -> Result<(), ScribeError> {
         if let Err(error) = segment.rollback_failed_append(prior_file_len) {
-            if let Some(health) = &self.health {
-                health.poison(crate::resources::BifrostResourcePoisonReason::Volume);
-            }
+            self.mark_faulted(&error);
             return Err(error);
         }
         if new_segment_bytes == 0 {
@@ -1940,43 +1939,56 @@ impl WalWriter {
         state.current_segment_size = 0;
         state.current_segment_records = 0;
         if let Err(error) = remove_failed_segment(segment.path()) {
-            if let Some(health) = &self.health {
-                health.poison(crate::resources::BifrostResourcePoisonReason::Volume);
-            }
+            self.mark_faulted(&error);
             return Err(error);
         }
         Ok(())
     }
 
+    /// Faults this Scribe's WAL after an integrity or ambiguous-mutation error.
+    ///
+    /// The fault is role-local: it refuses every later append before any
+    /// acknowledgment, stops segment retirement so WAL files stay for replay,
+    /// and signals the owning role to withdraw readiness. It never touches
+    /// process health, and only a restart's replay clears it.
+    fn mark_faulted(&self, error: &ScribeError) {
+        if !self.fault.is_cancelled() {
+            tracing::error!(%error, "Scribe WAL faulted; Scribe is unready until restart replay");
+            metrics::counter!("bifrost_scribe_wal_fault_total").increment(1);
+        }
+        self.fault.cancel();
+    }
+
+    /// Reports whether this WAL has faulted and refuses further mutation.
+    #[must_use]
+    pub fn is_faulted(&self) -> bool {
+        self.fault.is_cancelled()
+    }
+
+    /// Returns the signal cancelled when this WAL faults.
+    #[must_use]
+    pub fn fault_signal(&self) -> tokio_util::sync::CancellationToken {
+        self.fault.clone()
+    }
+
     /// Create a new pod-local WAL writer.
     ///
     /// Segment sizing is explicit and validated before the writer is returned.
-    pub fn new(
-        base_dir: impl AsRef<Path>,
-        node_id: [u8; 16],
-        writer_epoch: i64,
-        config: WalConfig,
-    ) -> Result<Self, ScribeError> {
-        Self::new_with_shard_id_and_health(base_dir, node_id, writer_epoch, 0, config, None)
-    }
-
-    /// Creates a WAL writer that poisons process health on failed rollback.
     ///
     /// The WAL is not capacity-governed: a full device refuses the append as
     /// [`ScribeError::WalDiskFull`] through the write's own IO error.
     ///
     /// # Errors
     ///
-    /// Returns the same configuration, recovery, and filesystem errors as
-    /// [`Self::new`].
-    pub fn new_with_health(
+    /// Returns a [`ScribeError`] when `config` is invalid, or when the existing
+    /// stream under `base_dir` cannot be listed or read to recover its counters.
+    pub fn new(
         base_dir: impl AsRef<Path>,
         node_id: [u8; 16],
         writer_epoch: i64,
         config: WalConfig,
-        health: crate::resources::BifrostResourceHealth,
     ) -> Result<Self, ScribeError> {
-        Self::new_with_shard_id_and_health(base_dir, node_id, writer_epoch, 0, config, Some(health))
+        Self::new_with_shard_id(base_dir, node_id, writer_epoch, 0, config)
     }
 
     /// Create one fixed-shard WAL stream.
@@ -1986,18 +1998,6 @@ impl WalWriter {
         writer_epoch: i64,
         shard_id: u8,
         config: WalConfig,
-    ) -> Result<Self, ScribeError> {
-        Self::new_with_shard_id_and_health(base_dir, node_id, writer_epoch, shard_id, config, None)
-    }
-
-    /// Constructs one shard stream with an optional process health signal.
-    fn new_with_shard_id_and_health(
-        base_dir: impl AsRef<Path>,
-        node_id: [u8; 16],
-        writer_epoch: i64,
-        shard_id: u8,
-        config: WalConfig,
-        health: Option<crate::resources::BifrostResourceHealth>,
     ) -> Result<Self, ScribeError> {
         let config = WalConfig::new(config.segment_bytes)?;
         let base_dir = base_dir.as_ref().to_path_buf();
@@ -2017,7 +2017,7 @@ impl WalWriter {
             faults: Arc::default(),
             retirement_refs: Arc::new(Mutex::new(HashMap::new())),
             deferred_deletes: Arc::new(Mutex::new(BTreeSet::new())),
-            health,
+            fault: tokio_util::sync::CancellationToken::new(),
         };
         writer.initialize_existing_stream()?;
         Ok(writer)
@@ -2114,7 +2114,7 @@ impl WalWriter {
             faults: Arc::clone(&self.faults),
             retirement_refs: Arc::clone(&self.retirement_refs),
             deferred_deletes: Arc::clone(&self.deferred_deletes),
-            health: self.health.clone(),
+            fault: self.fault.clone(),
         }
     }
 
@@ -2229,6 +2229,9 @@ impl WalWriter {
         &self,
         mut prepared: PreparedWalAppend,
     ) -> Result<WalAppendResult, ScribeError> {
+        if self.is_faulted() {
+            return Err(ScribeError::IngressClosed);
+        }
         let encoded_bytes =
             u64::try_from(prepared.encoded_len()?).map_err(|_| ScribeError::Internal {
                 detail: "encoded WAL record length does not fit accounting".to_owned(),
@@ -2308,17 +2311,27 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Syncs appended segments, faulting the WAL when durability is unknown.
+    ///
+    /// A failed sync leaves written record bytes whose durability the writer
+    /// cannot state, so the WAL is faulted rather than retried in process.
+    ///
+    /// # Errors
+    ///
+    /// Returns the segment sync error, or the injected sync failure.
     fn sync_segments_with_fault(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
-        let _ = self;
         #[cfg(any(test, feature = "test-support"))]
         if self.faults.sync_failure.swap(false, Ordering::AcqRel) {
             let result = Err(ScribeError::Internal {
                 detail: "injected WAL sync failure".to_owned(),
             });
             record_wal_fsync(&result, Instant::now());
+            if let Err(error) = &result {
+                self.mark_faulted(error);
+            }
             return result;
         }
-        Self::sync_segments(segments)
+        Self::sync_segments(segments).inspect_err(|error| self.mark_faulted(error))
     }
 
     /// Return the configured segment size.
@@ -2612,6 +2625,17 @@ impl WalWriter {
     /// poisoned, or the first removal or directory-sync failure after every
     /// other deferred path has been attempted.
     fn delete_closed_segments(&self, segments: &[PathBuf]) -> Result<(), ScribeError> {
+        if self.is_faulted() {
+            // A faulted WAL keeps every file for the restart replay that
+            // decides what it holds; the paths stay deferred, not forgotten.
+            self.deferred_deletes
+                .lock()
+                .map_err(|_| ScribeError::Internal {
+                    detail: "WAL deferred deletion lock poisoned".to_owned(),
+                })?
+                .extend(segments.iter().cloned());
+            return Ok(());
+        }
         let pending = {
             let mut deferred = self
                 .deferred_deletes
@@ -4666,6 +4690,44 @@ mod tests {
                 .get("bifrost_scribe_wal_fsync_total{outcome=\"failed\"}"),
             Some(&1)
         );
+    }
+
+    /// A failed sync after the record is written faults only this WAL.
+    ///
+    /// Later appends are refused before mutation, the signal the owning role
+    /// watches fires, and retirement keeps every file for restart replay.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the WAL is not faulted, a later append is admitted, or a
+    /// retired segment file is deleted while faulted.
+    #[test]
+    fn sync_fault_is_sticky_and_keeps_files() {
+        let directory = TempDir::new().expect("temporary WAL directory");
+        let writer = WalWriter::new(directory.path(), [31; 16], 1, WalConfig::default())
+            .expect("WAL writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        let signal = writer.fault_signal();
+        writer.trip_sync_failure_for_test();
+        writer
+            .append_and_fsync_for_test(&key, [1; 16], b"data")
+            .expect_err("injected sync failure");
+        assert!(writer.is_faulted() && signal.is_cancelled());
+        let written = wal_file_bytes_for_test(directory.path());
+        assert!(written > 0, "the ambiguous record stays on disk");
+
+        let refused = writer
+            .append_and_fsync_for_test(&key, [2; 16], b"data")
+            .expect_err("faulted WAL refuses appends");
+        assert!(matches!(refused, ScribeError::IngressClosed), "{refused:?}");
+        let segments: Vec<PathBuf> = std::fs::read_dir(directory.path())
+            .expect("WAL directory")
+            .map(|entry| entry.expect("WAL entry").path())
+            .collect();
+        writer
+            .delete_closed_segments(&segments)
+            .expect("faulted retirement defers");
+        assert_eq!(wal_file_bytes_for_test(directory.path()), written);
     }
 
     /// A full device refuses the next append before WAL mutation, and appends

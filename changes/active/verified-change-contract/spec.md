@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 38
+revision: 44
 status: approved
 ---
 
@@ -17,6 +17,13 @@ and Workflows; those executors are not delivered by this change.
 A Verifier is a reusable Card that declares one typed implementation. The
 initial implementations are Drift and Eval; a Trigger activates a bound
 Verifier, and its result may dispatch configured Operators.
+
+TASK-006 also includes the server startup and distributed-peer remediation
+needed to run these journeys from the official image. The operator can start
+one Wyrd application container with external Postgres and durable storage,
+provision a first tenant through one setup command, and use a client. The same
+image supports a peer-enabled deployment whose Oracle read tier grows from one
+to two replicas without a manual peer list.
 
 ## Scope
 
@@ -35,6 +42,11 @@ Verifier, and its result may dispatch configured Operators.
 - Durable continuous Verifier runs, queryable results, and Notify/HTTP Operator
   delivery.
 - Tenant-managed Operator connections backed by encrypted Postgres state.
+- TASK-006 server startup, first-use setup, external Postgres migration and
+  serving-role simplification, public routing, local storage URLs, and peer
+  discovery/security across one-process and multi-replica deployments.
+- Removal of the unearned external authorization-check endpoint and policy-hook
+  extension from the server, token exchange, public contracts, and documentation.
 
 ## Non-goals
 
@@ -109,11 +121,13 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
   an executor/input failure is not.
 - **Internal SYSTEM result writer**: one server-only tenant principal, persisted
   in the existing tenant machine-principal store with `kind: system`, a
-  server-minted UUIDv7, and the fixed name `verification-results-writer`. It is
-  used only for two server-minted purposes, each in its own token: publishing
-  Verification Result batches and the fixed Drift observation read. It has no
-  public credential, Card, role grant, refresh, workload, delegation, or
-  principal-management path.
+  server-minted UUIDv7, and the fixed name `verification-results-writer`. It
+  has exactly three separately scoped uses: publishing Verification Result
+  batches under its exact-Verifier `bifrost_record:write` token, the fixed
+  Drift observation read under its own server-minted token, and reading
+  continuous Eval inputs under a separate server-minted, table-scoped
+  `bifrost_query:read` authority (REQ-086). It has no public credential, Card,
+  role grant, refresh, workload, delegation, or principal-management path.
 - **Operator connection**: one tenant-owned, provider-specific Postgres record
   containing nonsecret delivery coordinates and an encrypted credential. Cards
   carry only its provider-scoped name; connection reads never return secret
@@ -1046,6 +1060,22 @@ table on `(data_tenant_id, result_id)`.
   by every record-write admission, and a result-write token is refused by
   query admission.
 
+  Continuous Eval's own Bifrost reads of its inputs—the run's committed
+  `vala.eval.observations` record and its `vala.traces.spans` trace—run
+  in-process through Oracle as this same persisted tenant SYSTEM principal and
+  never as a fabricated user or other identity. Before each run's reads the
+  server resolves the principal's stable ID from tenant-owned state and mints,
+  without a token, a read authority separate from the result-write token:
+  `bifrost_query:read` scoped to exactly those two tables by their registered
+  UIDs, with no roles, credential, delegation, Card, or Verifier write scope.
+  It is not a general Bifrost query grant; every other table is refused.
+  Oracle authorizes and audits each read through its existing object decision
+  and canonical audit path, attributing allowed read decisions and object
+  denials to that principal. A missing or non-UUIDv7 SYSTEM principal, a
+  mismatched tenant, or insufficient table scope MUST fail closed before any
+  row is returned. This read use adds no identity store, principal kind, user,
+  public permission, token format, or public surface.
+
   Every non-empty required detail batch is written before the canonical
   summary batch, and each is separately acknowledged. A result with zero
   details—such as sampled-out Eval or pre-scoring inconclusive Drift—writes no
@@ -1441,6 +1471,135 @@ table on `(data_tenant_id, result_id)`.
   completed execution may produce `passed`, `failed`, or `inconclusive`.
   Cancelled, timed-out, and errored executions have no verdict.
 
+### TASK-006 server startup and peer remediation
+
+- **REQ-153**: The published Wyrd application image MUST serve the Rust API,
+  live Node BFF, and nginx HTTP routing as one application container. The
+  public router MUST pass the actual Rust API, auth, platform, MCP, OpenAPI,
+  and health paths without prefix rewriting and serve UI requests through the
+  BFF. Nginx MUST expose a working public gRPC listener on port `50051` and
+  forward it to the server's internal gRPC listener. `WyrdClient` MUST derive
+  the public gRPC host and scheme from its effective `server_url` (explicit
+  constructor argument, then `WYRD_SERVER_URL`, then the documented default)
+  and use port `50051` by default. Rust, Python, and TypeScript public SDKs
+  MUST expose the same resolution behavior. The existing optional `grpc_url`
+  argument or `WYRD_GRPC_URL` MAY override that address for deployments with
+  separate routing; neither is required for the standard journey. Nginx and
+  the Rust gRPC listener MUST use distinct internal bind addresses or ports.
+  Public TLS MUST terminate at the deployment edge; the server's internal
+  gRPC listener is plaintext and has no certificate inputs. Peer mTLS remains
+  separate.
+  The published server binary MUST be built with the workspace `dist` Cargo
+  profile (`release` plus fat LTO, one codegen unit, stripped symbols); local
+  image builds and test lanes MAY use `release`.
+- **REQ-154**: Wyrd MUST require an external PostgreSQL service for local and
+  production use. It MUST remove embedded PostgreSQL boot and download. The
+  local supported journey MUST provide durable Postgres separately and start
+  the same one-process Wyrd boot path used in production. Missing database or
+  durable-storage inputs MUST produce actionable startup failures.
+- **REQ-155**: A published image MUST provide one idempotent first-use setup
+  command that creates the initial platform administrator, tenant, and usable
+  client credential through existing Wyrd authority. A retry MUST NOT silently
+  mint a replacement credential. Credential disclosure MUST be confined to the
+  invoking terminal and remain valid across application restart.
+- **REQ-156**: Serving Wyrd processes MUST have exactly two PostgreSQL login
+  identities: an RLS-bound `wyrd_app` for tenant work via `WYRD_DATABASE_URL`
+  and a narrowly granted `wyrd_platform_admin` via
+  `WYRD_PLATFORM_DATABASE_URL` for explicit cross-tenant/platform and Iceberg
+  catalog work. The app role MUST NOT bypass RLS or read catalog metadata;
+  the platform role MUST NOT reach ordinary tenant request handlers or gain
+  cluster-role creation or unrestricted DDL. Tenant API principals MUST NOT
+  require individual PostgreSQL logins. The database-owner credential MUST
+  never be mounted in a serving process.
+- **REQ-157**: The image MUST expose `wyrd-server migrate` as a one-off mode
+  using an existing database-owner URL supplied through `WYRD_DATABASE_URL` to
+  that invocation only. Normal server boot MUST NOT run migrations; it MUST
+  verify applied Wyrd/Vala migration versions and checksums, RLS, and required
+  grants before readiness, failing closed on missing or incompatible state.
+  Local deployment MAY automate the one-off mode; production MAY run it through
+  its orchestration system or manually before serving the new image.
+- **REQ-158**: No Wyrd release has shipped, so the unshipped migration SQL and
+  role bootstrap MUST be revised directly for a fresh install with only
+  `wyrd_app` and `wyrd_platform_admin` serving logins. The migration owner
+  owns schema changes; the platform role owns Iceberg catalog objects; the
+  app role has no catalog access. `wyrd_migrator`, `wyrd_catalog_app`, and
+  `wyrd_catalog` MUST be removed rather than retained as compatibility roles.
+  Repository-managed development and test databases with obsolete migration
+  checksums MAY be reset. Once a release ships, future migration history MUST
+  remain checksum-stable. A failed production migration MUST stop rollout;
+  retry/repair or verified backup recovery MUST preserve accepted tenant data
+  and audit evidence. Wyrd MUST NOT offer an unproven generic down-migration
+  or automatic restore.
+- **REQ-159**: The default `all` target MUST run local Scribe, Oracle, and
+  Forge calls in-process without a private peer listener, certificate, peer
+  bearer token, ticket, or calibration profile. It MUST retain bounded normal
+  admission defaults. A deployment configured for future replicas MUST run
+  the peer listener and require its peer inputs even while it has one replica;
+  calls to components in that same process still stay local.
+- **REQ-160**: Remote peer transport MUST use mutual TLS alone for cluster
+  member authentication. Each peer-mode process MUST read one dedicated Wyrd
+  cluster CA certificate and one shared peer leaf certificate/private key from
+  `WYRD_PEER_TLS_DIR` (`ca.crt`, `tls.crt`, `tls.key`). The CA private key MUST
+  remain outside Wyrd processes. TLS MUST validate the CA chain, validity,
+  client/server usage, and fixed `wyrd-peer` peer identity; missing or invalid
+  inputs MUST prevent ready membership. Peer API keys, separate peer JWTs,
+  signed purpose tickets, ticket keyrings, and nonce replay state MUST be
+  retired. Public client authentication and authorization remain required.
+- **REQ-161**: Possession of the shared peer certificate MUST confer only
+  trusted-cluster-process identity, not tenant identity or a specific replica
+  identity. For every private operation—query forwarding, reservations,
+  stages/fragments, shuffle reads, and Scribe tail list/acquire/read—the
+  receiver MUST validate applicable typed tenant, table/object/snapshot,
+  query/assignment, target node and fence, deadline, and resource bounds
+  against its own trusted state before decoding executable plans or touching
+  tenant storage. A mismatched or unresolvable context MUST fail closed with
+  no cross-tenant result. This trust model does not promise protection against
+  a compromised cluster peer that holds the shared private key.
+- **REQ-162**: Peer-mode processes MUST publish their own reachable private
+  address through `WYRD_PEER_ADDRESS`, supplied per instance by the deployment
+  runtime. Wyrd MUST validate and register that route in the existing
+  `vala.cluster_nodes` role/fence/heartbeat registry; it MUST NOT infer a
+  reachable address from a wildcard bind, require a manual peer list, or add a
+  second discovery service. Existing membership polling MUST discover a newly
+  started replica without restarting peers. A remote failure MUST not return
+  partial query results. In Kubernetes, the shared pod template MUST inject
+  `status.podIP` into `POD_IP` through the Downward API, then set
+  `WYRD_PEER_ADDRESS` to `$(POD_IP):<peer-port>`. The pod UID is not a
+  routable address; replicas MUST NOT need individually authored addresses.
+- **REQ-163**: Peer-mode replicas MUST use one shared durable object store for
+  Card, artifact, and Bifrost/Iceberg objects; a process-local `file://`
+  backend MUST fail peer-mode startup. Each Scribe MUST retain a private
+  persistent `WYRD_BIFROST_DATA_DIR` for WAL, durable staging, and stable node
+  identity; Oracle spill may be disposable. Standalone mode MAY use a durable
+  local `file://` backend. Local file upload/download URLs MUST be
+  root-relative authenticated Wyrd routes resolved by clients against their
+  configured server endpoint, with no `WYRD_PUBLIC_BASE_URL` input; cloud
+  provider-presigned URLs remain absolute.
+- **REQ-164**: The unshipped private ticket protocol MUST be removed without a
+  compatibility shim or old/new peer rollout. After the first release, rolling
+  upgrades MAY overlap only when both release manifests declare mutual
+  compatibility for schema, object, wire, and peer contracts; incompatible
+  peers MUST refuse each other before payload decoding. Otherwise deployment
+  MUST drain old peers before replacing them.
+- **REQ-165**: The documented default configuration MUST name only inputs
+  required by the selected topology and feature. It MUST remove obsolete
+  embedded-Postgres, migrator/catalog password, peer API-key/ticket, manual
+  peer-identity, and public-base-URL inputs from startup parsing and examples.
+  Wyrd MUST NOT accept certificate inputs for its public HTTP or gRPC
+  listeners; hosting-platform TLS termination serves that traffic.
+  Storage-provider and OIDC sealing credentials remain
+  conditional on their selected providers/features. The owning security and
+  deployment architecture documents MUST be synchronized before completion.
+- **REQ-166**: Wyrd MUST remove `POST /v1/authz/check` and `PolicyHook` from
+  its server, shared authorization code, public contracts, client surfaces,
+  and documentation. The route MUST be absent from the router and OpenAPI;
+  requests to it MUST receive the normal unknown-route response, not a
+  disabled or allow-by-default decision. Delete the always-allow hook from
+  delegated token exchange, its policy-only branches, and the fake `invoke`
+  policy attribution in exchange audit. Existing token exchange and Wyrd API
+  authorization otherwise remain intact. No replacement policy gate is part
+  of this change.
+
 ## Invariants
 
 - **INV-001**: The shipped continuous user model is an existing Service/Agent
@@ -1480,6 +1639,14 @@ table on `(data_tenant_id, result_id)`.
   same semantics. Inline definitions remain part of the containing Card version
   and MUST NOT create hidden Cards. Referenced definitions retain their own Card
   identity and may be shared by multiple verification bindings.
+- **INV-016**: Local engine calls need no network credential. Remote peer
+  identity is cluster scoped; public principal authorization, tenant RLS,
+  receiver-side tenant/resource/fence checks, and canonical audit remain
+  separate mandatory boundaries.
+- **INV-017**: A serving process never receives the PostgreSQL owner
+  credential. No separate migrator or catalog role or password is required.
+- **INV-018**: A multi-replica Wyrd deployment shares one authoritative object
+  namespace while each Scribe owns its own durable WAL/staging identity.
 
 ## Acceptance obligations
 
@@ -1826,10 +1993,76 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   an unexpected worker exit MUST restart and be visible through health,
   tracing, and the required runtime metrics.
 
+For pre-release TASK-006 acceptance, AC-034, AC-037, and AC-038 use the
+official image recipe built from the reviewed commit, pinned and recorded by
+its immutable local image ID. No published image is required before the first
+release. The first release MUST repeat those image journeys against the
+published image pinned by an immutable registry digest before release.
+
+- **AC-034**: Starting from the pinned official image and a fresh external
+  Postgres database, the local deployment MUST run migration, start one
+  application container, execute the one setup command, and use a real client
+  to write and read through nginx. Restart MUST preserve credentials, Card and
+  artifact bytes, and acknowledged Bifrost data. The same boot contract MUST
+  work with production-supplied values. Rust, Python, and TypeScript journeys
+  MUST prove local relative upload/download paths; the Node BFF, actual Rust
+  routes, health, and MCP streaming MUST work through nginx. One-process boot
+  MUST require no peer credential or calibration profile and MUST not dial
+  itself for local Scribe reads. A real public Rust or Python SDK client,
+  configured only with `server_url` or `WYRD_SERVER_URL`, MUST complete a
+  public gRPC call through the official image's nginx listener, with no
+  explicit gRPC URL; an explicit gRPC URL override MUST still work. Rust,
+  Python, and TypeScript SDK contract checks MUST establish the same URL
+  resolution and override behavior through their public constructors.
+- **AC-035**: A fresh database MUST migrate with only the two serving roles
+  and the separate migration owner, with no migrator or catalog role. Tenant
+  requests MUST be RLS isolated and unable to
+  read catalog metadata; platform work MUST succeed without the owner URL in
+  serving environment or mounts. An unmigrated, checksum-mismatched, or
+  security-grant-deficient database MUST keep serving unready. A forced
+  recoverable migration failure and retry MUST preserve accepted data and
+  audit evidence.
+- **AC-036**: From one peer-enabled replica, start a second with the same
+  deployment template and its own runtime-assigned address. The first MUST
+  discover the second through existing membership without restart, and an
+  analytical query MUST dispatch real remote Oracle work over mTLS. Cross-pod
+  Scribe reads MUST also work. Tests MUST reject missing, expired,
+  wrong-identity, and unrelated-CA peer credentials; forged or cross-tenant
+  private contexts and stale fences MUST yield no tenant data. A dropped peer
+  or broken remote call MUST not produce partial results. Peer mode with
+  process-local file storage MUST fail before ready membership. No ticket
+  replay-capacity refusal or false replay audit may remain.
+- **AC-037**: A future upgrade rehearsal MUST reject incompatible peer
+  overlap and stop rollout on migration failure; it MUST NOT require an
+  unshipped ticket-protocol compatibility path. A documented production
+  recovery point MUST exist before upgrade. This remediation MUST also ship
+  and run one local kind/mise.local.toml journey using the pinned official
+  image: keep the fixed `all` anchor, start one ready Oracle-only replica,
+  send bounded analytical read traffic, and use a Kubernetes
+  HorizontalPodAutoscaler driven by successful Oracle-executed reads per second
+  on the Oracle workload to grow that workload from one to two replicas when
+  the rate exceeds about 10 reads per second. HTTP ingress counts, CPU, and
+  memory utilization MUST NOT be the scale trigger, and the test MUST NOT
+  change the replica count directly. The autoscaler MUST be capped at two
+  Oracle replicas; the traffic generator MUST have bounded rate, concurrency,
+  duration, and cleanup so the local test cannot run away. Then prove the new
+  Oracle replica registered its runtime address and executed a real analytical
+  query dispatched over mTLS using remote Scribe data. Missing metrics,
+  failure to scale, failure to join, or execution only on the anchor MUST fail
+  the journey. This local proof is required for this remediation but is not a
+  default CI gate. The separate two-process peer journey MUST remain runnable
+  without kind.
+- **AC-038**: The official image MUST boot in production without a policy
+  hook. `POST /v1/authz/check` MUST be absent from the served OpenAPI and
+  return the normal unknown-route response. A real Wyrd API request MUST
+  still reject insufficient permission and record its decision. Existing
+  delegated exchange MUST still work without `PolicyHook`, policy-only audit,
+  or unevaluated `invoke` attribution.
+
 ## Open material decisions
 
-None. Revision 36 was directed by the user on 2026-09-24 in the TASK-005 r1
-remediation plan.
+None. Revision 39 records the user's narrow deletion: remove the always-allow
+hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Material authority links
 
@@ -1843,6 +2076,8 @@ remediation plan.
 - `changes/active/verified-change-contract/architecture/logic/drift.md`
 - `changes/active/verified-change-contract/architecture/logic/table_schema.md`
 - `architecture/wyrd-security-posture.md`
+- `architecture/operations/deployment-and-release.md`
+- `changes/active/verified-change-contract/review/TASK-006-r2/TASK-006-R2-continuous-eval-closure.md`
 - `architecture/references/doctrine/positioning-and-vocabulary.md`
 - `architecture/references/domain/evaluation.md`
 - `architecture/references/languages/agent-harness.md`
@@ -2082,3 +2317,76 @@ remediation plan.
   hand-built SYSTEM principal. Stated that the token does not enforce
   subject, series, or window limits. This revision was directed by the user
   on 2026-09-24.
+- **Revision 36 SYSTEM Eval input reads (2026-09-23):** Resolved
+  FIND-TASK-006-7. Continuous Eval's observation and trace reads use the
+  existing persisted per-tenant SYSTEM principal with a narrow server-minted
+  `bifrost_query:read` authority scoped to exactly `vala.eval.observations` and
+  `vala.traces.spans`, kept separate from its exact-Verifier result-write
+  token, instead of a fabricated user. Missing identity, wrong tenant, and
+  insufficient scope fail closed before rows are returned. This revision was
+  explicitly approved by the user on 2026-09-23: "That is an anti-pattern why
+  are you creating a new user. If this is a server runtime/machinary that is
+  concstantly running and by the nature of its design, doesnt have a direct
+  principal, then it needs to use a system principal (per tenant)".
+- **Revision 37 TASK-006 server startup expansion (2026-09-24):** Added
+  the image-to-client first-use journey, external Postgres and one-off
+  migration with two serving logins and direct cleanup of unshipped role
+  migrations, in-process local engine calls, shared-cert peer mTLS with
+  receiver-side tenant and fence checks, existing Postgres discovery,
+  multi-replica shared object storage, public nginx/BFF routing, relative local
+  storage URLs, and removal of the unshipped peer-ticket protocol.
+  This revision was explicitly approved by the user on 2026-09-24: "I approve
+  the spec. revise the packet".
+- **Revision 38 external authz removal and public gRPC draft (2026-09-24):**
+  At the user's direction, removed the unearned `/v1/authz/check` and
+  `PolicyHook` surfaces from the target design while retaining delegated
+  token-exchange identity, permission intersection, tenancy, and truthful
+  audit boundaries. Made
+  one effective `server_url` sufficient for `WyrdClient` to reach HTTP and
+  the image's public gRPC port through nginx; the existing gRPC URL remains
+  an optional override. The user approved the revised contract on 2026-09-24
+  through "ok go ahead" and the explicit delegation-rule follow-up "agree".
+- **Revision 39 delegation correction (2026-09-24):** Removed revision 38's
+  invented delegation rule and extra journey. The change deletes the
+  always-allow `PolicyHook`, its policy-only branches, and false `invoke`
+  attribution while otherwise preserving token exchange. The user directed
+  this correction after clarifying that delegation was already settled.
+- **Revision 40 Kubernetes autoscaling proof (2026-09-24):** Made the
+  previously optional kind journey a required local proof for this remediation.
+  Fixed the per-pod Downward API address injection and required a
+  read-requests-per-second-driven HorizontalPodAutoscaler scale event, peer
+  registration, and remote Oracle work. The user explicitly required
+  autoscaling simulation with bounded local resource use.
+- **Revision 41 pre-release image proof (2026-09-25):** For TASK-006 acceptance,
+  the official-recipe image built from the reviewed commit is pinned by its
+  immutable local image ID for startup, kind, and production-profile journeys.
+  The first release repeats those journeys against the published image pinned
+  by an immutable registry digest. The user explicitly approved this decision
+  on 2026-09-25 after confirming no image has yet been published.
+- **Revision 42 Oracle autoscaling proof (2026-09-25):** Corrected the original
+  kind journey to scale its Oracle read tier from one to two replicas on
+  successful Oracle-executed reads per second. The prior Scribe HTTP-ingress
+  scale result does not satisfy AC-037. The production Kubernetes example
+  follows the same Oracle scaling model. The user explicitly directed this
+  correction and rejected adding a second kind test.
+- **Revision 43 edge-only public TLS (2026-09-25):** Removed the server's
+  public gRPC certificate inputs (`WYRD_GRPC_CERTIFICATE_CHAIN_FILE`,
+  `WYRD_GRPC_PRIVATE_KEY_FILE`). The official image's nginx forwards public
+  gRPC to the server in plaintext, so those inputs could only break it, and the
+  production rule requiring them whenever peer mode was on prevented any
+  production peer deployment from starting. Public TLS terminates at the edge;
+  peer mTLS is unchanged. The user explicitly approved this deletion and the
+  spec update on 2026-09-25.
+- **Revision 44 published release profile (2026-09-25):** Added a workspace
+  `dist` Cargo profile and required it for the published server binary that
+  the release workflow packages into the image. The workspace previously had
+  no release tuning, so published images shipped a default `release` build.
+  Local `docker:build` and test lanes keep `release` so iteration stays fast.
+  The user explicitly directed this addition and the spec update on
+  2026-09-25.
+- **Integration of parallel revision lines (2026-09-29):** Revisions 36–38
+  were approved on two parallel lines. The Drift line recorded the SYSTEM
+  Drift read token (36), conventional PSI/SPC (37), and the direct Drift input
+  boundary (38); the continuous Eval line recorded SYSTEM Eval input reads (36)
+  through the published release profile (44). This packet carries both lines'
+  approved content unchanged at revision 44; no requirement was redefined.

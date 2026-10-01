@@ -1,15 +1,20 @@
 //! Identity fields every Bifrost-written Parquet object carries in its footer.
 //!
-//! A sealed object names the exact Arrow schema it was written against and the
-//! committed object identity it was written for. Readers that hold that schema
-//! and identity — the staged writer re-inspecting its own output, and Forge
-//! promoting an object Scribe recorded — compare them before trusting the
-//! object's contents. Size and shape are not part of this contract: row-group
+//! A sealed object names the exact Arrow schema it was written against, the
+//! committed object identity it was written for, and the tenant whose
+//! authenticated binding wrote it. Readers that hold that schema and identity
+//! — the staged writer re-inspecting its own output, and Forge promoting an
+//! object Scribe recorded — compare them before trusting the object's
+//! contents. Every Oracle scan compares the footer tenant with the query's
+//! tenant once per opened file, which is what proves tenancy without a
+//! per-row column. Size and shape are not part of this contract: row-group
 //! and file sizes are soft writer targets, and standard Parquet parsing owns
 //! structural validity.
 
 use arrow::datatypes::Schema;
 use parquet::file::metadata::{FileMetaData, KeyValue};
+
+use wyrd_spec::DataTenantId;
 
 use crate::schema::SchemaFingerprint;
 
@@ -17,6 +22,36 @@ use crate::schema::SchemaFingerprint;
 pub const KEY_SCHEMA: &str = "wyrd.bifrost.schema_fingerprint";
 /// Footer key carrying the committed object identity an object was sealed for.
 pub const KEY_OBJECT: &str = "wyrd.bifrost.object_identity";
+/// Footer key carrying the tenant whose authenticated binding wrote the object.
+pub const KEY_TENANT: &str = "wyrd.bifrost.tenant";
+
+/// Returns the footer field that binds an object to `tenant`.
+///
+/// Every Bifrost producer — the Scribe writer and Forge rewrites — appends this
+/// field from the same authenticated table binding that chose the object's
+/// tenant-scoped location, so the stamped value can never disagree with the
+/// path it was written under.
+#[must_use]
+pub fn tenant_key_value(tenant: DataTenantId) -> KeyValue {
+    KeyValue::new(KEY_TENANT.to_owned(), tenant.to_string())
+}
+
+/// Checks that `footer` was written for `tenant`.
+///
+/// This is the per-file tenant proof every Oracle scan applies once when it
+/// opens an object, before any row of it is decoded. There is no fallback: an
+/// object whose footer names no tenant is refused exactly like one that names
+/// another tenant.
+///
+/// # Errors
+/// Returns a refusal when the tenant field is missing, duplicated, or names a
+/// different tenant.
+pub fn verify_footer_tenant(footer: &FileMetaData, tenant: DataTenantId) -> Result<(), String> {
+    if footer_value(footer, KEY_TENANT)? != tenant.to_string() {
+        return Err("Bifrost footer tenant does not match the reading tenant".to_owned());
+    }
+    Ok(())
+}
 
 /// Returns the exact schema fingerprint producers stamp and readers compare.
 #[must_use]
@@ -24,36 +59,43 @@ pub fn schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
     SchemaFingerprint::from_arrow_schema_exact(schema)
 }
 
-/// The schema and object an object's footer binds it to.
+/// The schema, object, and tenant an object's footer binds it to.
 ///
-/// Constructed by a writer from the Arrow schema and object identity it is
-/// sealing, then either stamped into the footer or compared against a footer a
-/// reader holds.
+/// Constructed by a writer from the Arrow schema, object identity, and
+/// authenticated tenant it is sealing, then either stamped into the footer or
+/// compared against a footer a reader holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BifrostFooterIdentity {
     /// Exact fingerprint of the Arrow schema the object was written against.
     schema_fingerprint: SchemaFingerprint,
     /// Committed object identity the object was written for.
     object_identity: String,
+    /// Tenant whose authenticated binding wrote the object.
+    tenant: DataTenantId,
 }
 
 impl BifrostFooterIdentity {
-    /// Binds `schema` to `object_identity`.
+    /// Binds `schema` and `tenant` to `object_identity`.
     ///
     /// # Errors
     /// Returns a refusal when `object_identity` is empty, since an object with
     /// no identity cannot be published or compared.
-    pub fn new(schema: &Schema, object_identity: &str) -> Result<Self, String> {
+    pub fn new(
+        schema: &Schema,
+        object_identity: &str,
+        tenant: DataTenantId,
+    ) -> Result<Self, String> {
         if object_identity.is_empty() {
             return Err("Bifrost footer identity requires an object identity".to_owned());
         }
         Ok(Self {
             schema_fingerprint: schema_fingerprint(schema),
             object_identity: object_identity.to_owned(),
+            tenant,
         })
     }
 
-    /// Returns the two footer fields a writer appends before closing the object.
+    /// Returns the three footer fields a writer appends before closing the object.
     #[must_use]
     pub fn key_values(&self) -> Vec<KeyValue> {
         vec![
@@ -62,14 +104,15 @@ impl BifrostFooterIdentity {
                 hex::encode(self.schema_fingerprint.0),
             ),
             KeyValue::new(KEY_OBJECT.to_owned(), self.object_identity.clone()),
+            tenant_key_value(self.tenant),
         ]
     }
 
     /// Checks that `footer` carries exactly this identity.
     ///
     /// # Errors
-    /// Returns a refusal when either field is missing, duplicated, or names a
-    /// different schema or object.
+    /// Returns a refusal when any field is missing, duplicated, or names a
+    /// different schema, object, or tenant.
     pub fn verify(&self, footer: &FileMetaData) -> Result<(), String> {
         if footer_value(footer, KEY_SCHEMA)? != hex::encode(self.schema_fingerprint.0) {
             return Err("Bifrost footer schema fingerprint does not match".to_owned());
@@ -77,7 +120,7 @@ impl BifrostFooterIdentity {
         if footer_value(footer, KEY_OBJECT)? != self.object_identity {
             return Err("Bifrost footer object identity does not match".to_owned());
         }
-        Ok(())
+        verify_footer_tenant(footer, self.tenant)
     }
 }
 
@@ -178,7 +221,8 @@ mod tests {
         )
         .expect("UTC batch");
         let object = "tenants/test/table/day=2026-08-17/source.parquet";
-        let identity = BifrostFooterIdentity::new(&utc_schema, object).expect("identity");
+        let tenant = DataTenantId::new_v7();
+        let identity = BifrostFooterIdentity::new(&utc_schema, object, tenant).expect("identity");
         let footer = footer_with_metadata(&batch, identity.key_values());
         let footer = footer.file_metadata();
 
@@ -191,7 +235,7 @@ mod tests {
             false,
         )]);
         assert!(
-            BifrostFooterIdentity::new(&offset, object)
+            BifrostFooterIdentity::new(&offset, object, tenant)
                 .expect("identity")
                 .verify(footer)
                 .is_err(),
@@ -200,19 +244,19 @@ mod tests {
         let rebuilt = Schema::new(vec![utc(false).with_metadata(
             std::collections::HashMap::from([("reader.note".to_owned(), "rebuilt".to_owned())]),
         )]);
-        BifrostFooterIdentity::new(&rebuilt, object)
+        BifrostFooterIdentity::new(&rebuilt, object, tenant)
             .expect("identity")
             .verify(footer)
             .expect("an independently rebuilt equivalent layout verifies");
         assert!(
-            BifrostFooterIdentity::new(&Schema::new(vec![utc(true)]), object)
+            BifrostFooterIdentity::new(&Schema::new(vec![utc(true)]), object, tenant)
                 .expect("identity")
                 .verify(footer)
                 .is_err(),
             "a nullability change is a layout change"
         );
         assert!(
-            BifrostFooterIdentity::new(&utc_schema, "another.parquet")
+            BifrostFooterIdentity::new(&utc_schema, "another.parquet", tenant)
                 .expect("identity")
                 .verify(footer)
                 .is_err(),
@@ -240,7 +284,9 @@ mod tests {
             vec![Arc::new(TimestampMicrosecondArray::from(vec![1]))],
         )
         .expect("batch");
-        let identity = BifrostFooterIdentity::new(&schema, "object.parquet").expect("identity");
+        let tenant = DataTenantId::new_v7();
+        let identity =
+            BifrostFooterIdentity::new(&schema, "object.parquet", tenant).expect("identity");
         let fields = identity.key_values();
 
         let missing = footer_with_metadata(&batch, fields[..1].to_vec());
@@ -249,6 +295,43 @@ mod tests {
         twice.push(fields[0].clone());
         let duplicated = footer_with_metadata(&batch, twice);
         assert!(identity.verify(duplicated.file_metadata()).is_err());
-        assert!(BifrostFooterIdentity::new(&schema, "").is_err());
+        assert!(BifrostFooterIdentity::new(&schema, "", tenant).is_err());
+    }
+
+    /// The per-file tenant proof accepts only the owning tenant's footer.
+    ///
+    /// A footer naming another tenant, naming none, or naming the tenant twice
+    /// is refused, so an object written without the tenant field can never be
+    /// read as if it belonged to the caller.
+    ///
+    /// # Panics
+    /// Panics when a foreign, missing, or ambiguous footer tenant verifies, or
+    /// the owning tenant's footer does not.
+    #[test]
+    fn footer_tenant_proof_refuses_missing_and_foreign_tenants() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![1]))],
+        )
+        .expect("batch");
+        let owner = DataTenantId::new_v7();
+        let owner_footer = footer_with_metadata(&batch, vec![tenant_key_value(owner)]);
+        verify_footer_tenant(owner_footer.file_metadata(), owner)
+            .expect("the owner's footer verifies");
+        assert!(
+            verify_footer_tenant(owner_footer.file_metadata(), DataTenantId::new_v7()).is_err()
+        );
+        let missing = footer_with_metadata(&batch, Vec::new());
+        assert!(verify_footer_tenant(missing.file_metadata(), owner).is_err());
+        let twice = footer_with_metadata(
+            &batch,
+            vec![tenant_key_value(owner), tenant_key_value(owner)],
+        );
+        assert!(verify_footer_tenant(twice.file_metadata(), owner).is_err());
     }
 }

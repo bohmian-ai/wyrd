@@ -111,10 +111,10 @@ For each bin Forge:
 
 1. Validates every input path against the tenant/table object prefix.
 2. Reads the Parquet batches from object storage.
-3. Requires every row's `data_tenant_id` to match the leased tenant.
+3. Records the leased tenant in the output file's footer, so the rewrite carries the same tenant proof as its inputs.
 4. Projects fields by name into the registered Iceberg schema. It does not rely
    on column position when the schemas differ.
-5. Sorts the output by tenant and `wyrd_event_time`.
+5. Sorts the output by `wyrd_event_time`.
 6. Writes one Parquet data file under the same table prefix and checks its row
    count and partition.
 

@@ -357,8 +357,8 @@ pub enum BifrostSecurityViolationKind {
     TenantBinding,
     /// Tenant-scoped object path mismatch.
     TenantPath,
-    /// Runtime row tenant mismatch.
-    TenantRow,
+    /// A scanned file's footer tenant is missing or foreign.
+    TenantFile,
     /// Invalid peer signature.
     PeerSignature,
     /// Unknown peer key identifier.
@@ -377,11 +377,11 @@ pub enum BifrostSecurityViolationKind {
     PeerFragment,
     /// Peer assignment-authority digest mismatch: the recomputed digest over
     /// the follower's actual dispatched assignments does not match the
-    /// digest signed into the ticket claims, so the closed predicate and
+    /// digest carried in the peer context claims, so the closed predicate and
     /// projection closure cannot be trusted.
     PeerAssignmentAuthority,
-    /// Private stage-operation binding mismatch: a signed Analytical stage
-    /// ticket did not match the receiving follower's own expectation for the
+    /// Private stage-operation binding mismatch: an Analytical stage context
+    /// did not match the receiving follower's own expectation for the
     /// operation, either query identity, the pinned snapshot, the stage, the
     /// task, the attempt, the reservation, or the authorized permissions, so
     /// the operation was refused before any plan decode, task-cache lookup,

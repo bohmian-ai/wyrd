@@ -78,13 +78,13 @@ registration spec-drift response looks like this:
 - Do not ignore `remediation` when it is present.
 - Do not infer error semantics from `detail`; it is instance-specific prose and is not stable across releases.
 
-## Policy and audit failures
+## Audit failures
 
-Policy and audit denials are decisions, not transport errors. A `403` with `code: WYRD_AUTHZ_403_POLICY_DENIED` means Wyrd evaluated the request against a named policy and rejected it. This is different from a missing credential or a malformed request.
-
-The `code` and `detail` identify the failing policy. The `details` map contains the denial reason and the card, run, or operation that triggered it (for example, `reason`, `card_id`, `policy_name`, `operation`). An agent must not retry a policy denial without first satisfying the stated condition in `remediation`.
-
-Audit failures follow the same shape. If a write is rejected because an audit record could not be committed, the `code` will identify the audit step and `remediation` will describe what the agent or operator needs to resolve before retrying.
+Audit denials are decisions, not transport errors. If a write is rejected
+because an audit record could not be committed, the `code` will identify the
+audit step and `remediation` will describe what the agent or operator needs to
+resolve before retrying. This is different from a missing credential or a
+malformed request.
 
 ## Authorization errors
 
@@ -99,7 +99,6 @@ Use the Wyrd `code` value, not HTTP status alone:
 | `WYRD_AUTH_400_UNSUPPORTED_GRANT_TYPE` | Check the Wyrd version and exact `grant_type` value. |
 | `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` | Verify the requested subject is a registered Service or Agent CardRef in the current tenant. User impersonation is not supported in this version. |
 | `WYRD_AUTH_401_API_KEY_INVALID` | Do not retry with the same key. Rotate credentials via `wyrd auth issue-key` and update the deployment secret store. |
-| `WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN` | Do not retry. The presented token is a direct token; re-authenticate using the delegation flow (`POST /auth/token` with `grant_type: urn:ietf:params:oauth:grant-type:token-exchange`). |
 | `WYRD_PERMISSION_403_DENIED_RBAC` | Do not retry. The caller lacks the required RBAC permission. Request the required role from a workspace admin. |
 
 ## Retry behavior
@@ -111,7 +110,7 @@ Retries are only safe for idempotent operations. The `code` field is the signal 
 - For `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID`, send a new non-empty opaque `Idempotency-Key` header.
 - For `WYRD_SPEC_400_DUPLICATE_SUBMISSION`, remove the repeated `(kind, space, name)` submission from the request.
 - For `WYRD_REGISTRY_410_OPERATION_EXPIRED`, start a new registration with a fresh idempotency key.
-- Not retryable: policy denials, audit failures, authorization errors. These require a corrective action before a retry will succeed.
+- Not retryable: audit failures, authorization errors. These require a corrective action before a retry will succeed.
 
 If the error response does not include a `code`, treat the operation as non-retryable until the cause is identified.
 

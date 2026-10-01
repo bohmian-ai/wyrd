@@ -30,9 +30,9 @@ use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
 use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, QueueCounts, RequestKey,
-    RetryOutcome, RunInput, RunOrigin, RunRequest, ScheduleOutcome, ScheduleSkip, Settlement,
-    TerminalStatus, VerifierRunQueue,
+    ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, ObservationOutcome,
+    QueueCounts, RequestKey, RetryOutcome, RunInput, RunOrigin, RunRequest, ScheduleOutcome,
+    ScheduleSkip, Settlement, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -750,6 +750,166 @@ async fn observation_runs_are_unique_per_input_record() {
     );
 }
 
+/// Wait until some backend of this fixture's own database is blocked behind
+/// another transaction's lock.
+///
+/// Clears the activity snapshot on every poll, because Postgres otherwise
+/// keeps the first read's backend list for the rest of `conn`'s transaction.
+///
+/// # Panics
+/// Panics when the probe query fails or nothing blocks within 30 seconds.
+async fn await_blocked_backend(conn: &mut TenantConn<'_>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        sqlx::query("SELECT pg_stat_clear_snapshot()")
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("snapshot clears");
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND cardinality(pg_blocking_pids(pid)) > 0",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("blocked backends count");
+        if blocked > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no backend blocked within 30 seconds"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Observation runs of one binding get their `every_nth` ordinal once, at
+/// enqueue: a later enqueue waits for an uncommitted earlier one, so the
+/// earlier record is always ordinal 1 and the later ordinal 2. That stored
+/// ordinal is what every attempt reads, before and after a restart, so the
+/// sampling decision cannot flip. Duplicate enqueues consume no ordinal.
+///
+/// # Panics
+/// Panics when the later enqueue does not wait, an ordinal is not the
+/// serialized position, a reclaim reads a different ordinal, or a duplicate
+/// consumes one.
+#[tokio::test]
+async fn observation_ordinal_is_fixed_at_serialized_enqueue() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierRunQueue::default();
+    let mut setup = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = register_service(&mut setup, &actor, "svc").await;
+    let verifier = register_verifier(&mut setup, &actor, "eval", eval()).await;
+    let binding = bind(
+        &mut setup,
+        &owner,
+        &verifier,
+        BindingActivation::ObservationsReady,
+        Vec::new(),
+    )
+    .await;
+    setup.commit().await.expect("setup commits");
+    let event_time = at(22, 11, 59);
+    let observation = |record: &str| RunRequest::Observation {
+        binding_id: binding,
+        record_id: record.to_owned(),
+        event_time,
+    };
+
+    let mut earlier = fixture.tenant_conn().await.expect("earlier opens");
+    let first = enqueued(
+        queue
+            .enqueue(&mut earlier, &observation("record-1"))
+            .await
+            .expect("earlier enqueues"),
+    );
+    let mut later = fixture.tenant_conn().await.expect("later opens");
+    let mut probe = fixture.tenant_conn().await.expect("probe opens");
+    let later_enqueue = async {
+        let run = enqueued(
+            queue
+                .enqueue(&mut later, &observation("record-2"))
+                .await
+                .expect("later enqueues"),
+        );
+        later.commit().await.expect("later commits");
+        run
+    };
+    tokio::pin!(later_enqueue);
+    let raced = tokio::select! {
+        run = &mut later_enqueue => Some(run),
+        () = await_blocked_backend(&mut probe) => None,
+    };
+    assert_eq!(
+        raced, None,
+        "a later enqueue for the binding waits for the uncommitted earlier one"
+    );
+    earlier.commit().await.expect("earlier commits");
+    let second = later_enqueue.await;
+    drop(probe);
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    for (record, run) in [("record-1", first), ("record-2", second)] {
+        assert_eq!(
+            queue
+                .enqueue(&mut conn, &observation(record))
+                .await
+                .expect("duplicate answers"),
+            EnqueueOutcome::AlreadyEnqueued(run)
+        );
+    }
+    let third = enqueued(
+        queue
+            .enqueue(&mut conn, &observation("record-3"))
+            .await
+            .expect("third record enqueues"),
+    );
+    let mut attempts = Vec::new();
+    for _ in 0..3 {
+        attempts.push(claim(&queue, &mut conn).await);
+    }
+    let ordinals: Vec<_> = attempts
+        .iter()
+        .map(|run| (run.lease.run_id, run.observation_ordinal))
+        .collect();
+    assert_eq!(
+        ordinals,
+        vec![(first, Some(1)), (second, Some(2)), (third, Some(3))],
+        "ordinals follow serialized enqueue and duplicates consume none"
+    );
+    assert_eq!(
+        queue
+            .release(&mut conn, attempts[1].lease, Duration::zero())
+            .await
+            .expect("release answers"),
+        Settlement::Applied
+    );
+    conn.commit().await.expect("first attempts commit");
+
+    let (restarted, _) = fixture
+        .fresh_runtime_handles()
+        .await
+        .expect("fresh handles open");
+    let mut conn = restarted
+        .tenant_conn(fixture.data_tenant_id())
+        .await
+        .expect("restarted runner opens");
+    let retried = claim(&queue, &mut conn).await;
+    assert_eq!(retried.lease.run_id, second);
+    assert_eq!(
+        retried.observation_ordinal,
+        Some(2),
+        "a restarted attempt reads the ordinal stored at enqueue, so `every_nth` cannot flip"
+    );
+}
+
 /// Two schedulers ticking the same due binding concurrently create exactly one
 /// run: the second skips the locked row. The committed cursor moves to the
 /// next future boundary, a restarted scheduler on fresh handles finds nothing
@@ -974,7 +1134,7 @@ async fn reclaimed_lease_fences_the_stale_token() {
     );
     assert_eq!(
         queue
-            .release(&mut conn, stale.lease)
+            .release(&mut conn, stale.lease, Duration::zero())
             .await
             .expect("stale release answers"),
         Settlement::StaleLease
@@ -1342,7 +1502,7 @@ async fn release_requeues_without_consuming_an_attempt() {
     let first = claim(&queue, &mut conn).await;
     assert_eq!(
         queue
-            .release(&mut conn, first.lease)
+            .release(&mut conn, first.lease, Duration::zero())
             .await
             .expect("release answers"),
         Settlement::Applied
@@ -1357,6 +1517,203 @@ async fn release_requeues_without_consuming_an_attempt() {
     assert_eq!(again.lease.run_id, run);
     assert_eq!(again.attempt, 1);
     assert_eq!(again.input, first.input);
+}
+
+/// A committed observation enqueues one run per active `observations_ready`
+/// binding of its subject: a replay finds the same run, a scheduled binding on
+/// the same subject is untouched, and an inactive owner creates nothing.
+///
+/// # Panics
+/// Panics when a non-observation binding enqueues, a replay creates a second
+/// run, or an inactive owner's binding enqueues.
+#[tokio::test]
+async fn observation_enqueue_targets_active_ready_bindings_once() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierRunQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
+    let drift = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
+    let (live_owner, live) = register_service(&mut conn, &actor, "live").await;
+    let ready = bind(
+        &mut conn,
+        &live_owner,
+        &verifier,
+        BindingActivation::ObservationsReady,
+        Vec::new(),
+    )
+    .await;
+    bind(&mut conn, &live_owner, &drift, daily(), Vec::new()).await;
+    record_machine_authentication(&mut conn, live)
+        .await
+        .expect("live activation records");
+    let (stale_owner, stale) = register_service(&mut conn, &actor, "stale").await;
+    let inactive = bind(
+        &mut conn,
+        &stale_owner,
+        &verifier,
+        BindingActivation::ObservationsReady,
+        Vec::new(),
+    )
+    .await;
+    record_machine_authentication(&mut conn, stale)
+        .await
+        .expect("stale activation records");
+    age_activity(&mut conn, stale, Duration::days(2)).await;
+    let event_time = at(22, 11, 59);
+
+    let first = queue
+        .enqueue_observation(&mut conn, &live_owner, "record-1", event_time)
+        .await
+        .expect("observation enqueues");
+    let [(binding, ObservationOutcome::Enqueue(outcome))] = first.as_slice() else {
+        panic!("expected exactly one enqueue, got {first:?}");
+    };
+    assert_eq!(*binding, ready);
+    let run = enqueued(*outcome);
+    assert_eq!(
+        queue
+            .enqueue_observation(&mut conn, &live_owner, "record-1", event_time)
+            .await
+            .expect("replay answers"),
+        vec![(
+            ready,
+            ObservationOutcome::Enqueue(EnqueueOutcome::AlreadyEnqueued(run))
+        )]
+    );
+    assert_eq!(
+        queue
+            .enqueue_observation(&mut conn, &stale_owner, "record-1", event_time)
+            .await
+            .expect("inactive answers"),
+        vec![(inactive, ObservationOutcome::Inactive)]
+    );
+    assert_eq!(run_count(&mut conn).await, 1);
+    let second = queue
+        .enqueue_observation(&mut conn, &live_owner, "record-2", event_time)
+        .await
+        .expect("second observation enqueues");
+    let [(_, ObservationOutcome::Enqueue(outcome))] = second.as_slice() else {
+        panic!("expected exactly one enqueue, got {second:?}");
+    };
+    let claimed = claim(&queue, &mut conn).await;
+    assert_eq!(
+        (claimed.lease.run_id, claimed.observation_ordinal),
+        (run, Some(1))
+    );
+    let claimed = claim(&queue, &mut conn).await;
+    assert_eq!(
+        (claimed.lease.run_id, claimed.observation_ordinal),
+        (enqueued(*outcome), Some(2))
+    );
+}
+
+/// Waiting for a trace refunds the attempt and requeues after the poll delay;
+/// once the fixed deadline measured from the run's creation passes, the run
+/// settles `timed_out` with no result, and a stale token changes nothing.
+///
+/// # Panics
+/// Panics when a wait consumes an attempt, the deadline does not time the run
+/// out, or a stale token settles.
+#[tokio::test]
+async fn trace_wait_requeues_until_deadline_then_times_out() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let actor = actor(fixture.data_tenant_id());
+    let queue = VerifierRunQueue::default();
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
+    let verifier = register_verifier(&mut conn, &actor, "eval", eval()).await;
+    let binding = bind(
+        &mut conn,
+        &owner,
+        &verifier,
+        BindingActivation::ObservationsReady,
+        Vec::new(),
+    )
+    .await;
+    let run = enqueued(
+        queue
+            .enqueue(
+                &mut conn,
+                &RunRequest::Observation {
+                    binding_id: binding,
+                    record_id: "record-1".to_owned(),
+                    event_time: at(22, 11, 59),
+                },
+            )
+            .await
+            .expect("observation enqueues"),
+    );
+    let waiting = VerificationError {
+        code: "trace_not_landed".to_owned(),
+        message: "the required trace has not landed".to_owned(),
+    };
+
+    let first = claim(&queue, &mut conn).await;
+    let TraceWaitOutcome::Requeued(due) = queue
+        .await_trace(
+            &mut conn,
+            first.lease,
+            Duration::seconds(5),
+            Duration::hours(1),
+            &waiting,
+        )
+        .await
+        .expect("wait answers")
+    else {
+        panic!("a run inside its deadline must requeue");
+    };
+    assert!(due > database_now(&mut conn).await);
+    expire_deadlines(&mut conn, run).await;
+    let second = claim(&queue, &mut conn).await;
+    assert_eq!(second.attempt, 1, "waiting must not consume an attempt");
+    assert_eq!(second.input, first.input);
+    assert_eq!(
+        queue
+            .await_trace(
+                &mut conn,
+                first.lease,
+                Duration::seconds(5),
+                Duration::hours(1),
+                &waiting
+            )
+            .await
+            .expect("stale wait answers"),
+        TraceWaitOutcome::StaleLease
+    );
+
+    sqlx::query("UPDATE wyrd.verifier_runs SET created_at = created_at - INTERVAL '2 hours' WHERE run_id = $1")
+        .bind(run.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("run ages");
+    assert_eq!(
+        queue
+            .await_trace(
+                &mut conn,
+                second.lease,
+                Duration::seconds(5),
+                Duration::hours(1),
+                &waiting
+            )
+            .await
+            .expect("deadline answers"),
+        TraceWaitOutcome::TimedOut
+    );
+    let status = queue
+        .run_status(&mut conn, run)
+        .await
+        .expect("status reads")
+        .expect("run exists");
+    assert_eq!(status.status, VerificationExecutionStatus::TimedOut);
+    assert_eq!(status.result_id, None);
+    assert_eq!(status.error, Some(waiting));
 }
 
 /// Runs, dispatches, and status reads are invisible to another tenant, which

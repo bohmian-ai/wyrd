@@ -49,7 +49,8 @@ const NOT_PORTABLE: &str =
 /// Iceberg's own storage implementations use for it; every other closed owner
 /// failure — admission, cancellation, the elapsed retry bound, a closed owner,
 /// or a backend class — is `Unexpected`, which Iceberg treats as retryable at
-/// its own layer.
+/// its own layer. The owner error is kept as the typed source so a vanished
+/// pinned object stays classifiable as stale above Iceberg and Parquet.
 fn owner_error(operation: &str, location: &str, error: &BifrostStorageError) -> IcebergError {
     let kind = if matches!(error, BifrostStorageError::NotFound { .. }) {
         IcebergErrorKind::DataInvalid
@@ -60,6 +61,7 @@ fn owner_error(operation: &str, location: &str, error: &BifrostStorageError) -> 
         kind,
         format!("Bifrost storage failed to {operation} {location}: {error}"),
     )
+    .with_source(error.clone())
 }
 
 /// Iceberg storage backed by this node's one Bifrost storage owner.

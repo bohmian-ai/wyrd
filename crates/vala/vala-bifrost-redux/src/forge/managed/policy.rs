@@ -19,6 +19,7 @@ use iceberg_compaction_core::config::{
 use iceberg_compaction_core::managed::{
     OpenPartitionPolicy, WriterRecipeResolver, WyrdSelectionPolicy,
 };
+use wyrd_spec::DataTenantId;
 
 use crate::catalog::layout::{FORGE_WRITER_RECIPE, forge_data_location};
 use crate::forge::compact::ForgeConfig;
@@ -100,10 +101,9 @@ impl ForgeTablePolicy {
     /// [`ForgeConfig::default_target_file_size_bytes`]. It is resolved here
     /// once; execution, publication, and audit all read this policy's value.
     ///
-    /// There is no admitted-memory term. Execution is unbounded and admission
-    /// happens against a per-plan estimate in the worker's queue, so a
-    /// row-group target can never be larger than a grant this policy was
-    /// checked against.
+    /// There is no admitted-memory term. Execution charges the shared Bifrost
+    /// memory root as it grows, so a row-group target is never checked
+    /// against a per-plan grant.
     ///
     /// # Errors
     ///
@@ -243,7 +243,8 @@ impl ForgeTablePolicy {
     /// Builds the complete core configuration one attempt executes under.
     ///
     /// `data_file_prefix` is the attempt identity, which is what makes every
-    /// object an attempt produced attributable to it by path alone.
+    /// object an attempt produced attributable to it by path alone. `tenant`
+    /// is the table binding's tenant, stamped into every output footer.
     /// Each selected group reaches one rolling stream, preserving the admitted
     /// writer working set and avoiding repeated undersized stream residues.
     ///
@@ -257,6 +258,7 @@ impl ForgeTablePolicy {
         data_file_prefix: String,
         bloom_columns: &[String],
         max_concurrent_closes: usize,
+        tenant: DataTenantId,
     ) -> Result<Arc<CompactionConfig>, ForgeError> {
         let execution: CompactionExecutionConfig = CompactionExecutionConfigBuilder::default()
             .target_file_size_bytes(self.target_file_size_bytes)
@@ -265,11 +267,12 @@ impl ForgeTablePolicy {
             .write_parquet_properties(crate::parquet::bifrost_rewrite_writer_properties(
                 self.row_group_target_bytes,
                 bloom_columns,
+                tenant,
             ))
             // One runner executes exactly one plan, so the core's own
             // multi-plan concurrency is never used. Memory and spill are left
-            // unset so the processor selects the unbounded pool and no disk
-            // manager, matching the Forge execution model.
+            // unset here because they come from the attempt's governed
+            // `ManagedExecutionContext`, not from this configuration.
             .max_concurrent_compaction_plans(1)
             .build()
             .map_err(|error| ForgeError::InvalidConfig {
@@ -338,7 +341,12 @@ mod tests {
         )
         .expect("valid production geometry");
         let config = policy
-            .to_core_config("attempt".to_owned(), &[], 2)
+            .to_core_config(
+                "attempt".to_owned(),
+                &[],
+                2,
+                wyrd_spec::DataTenantId::new_v7(),
+            )
             .expect("native configuration");
         for sizes_mib in [&[700_u64, 700][..], &[256, 256], &[2048]] {
             let files = sizes_mib
@@ -457,7 +465,12 @@ mod tests {
             "the declared target reaches selection unchanged"
         );
         let config = policy
-            .to_core_config("attempt".to_owned(), &["value".to_owned()], 2)
+            .to_core_config(
+                "attempt".to_owned(),
+                &["value".to_owned()],
+                2,
+                wyrd_spec::DataTenantId::new_v7(),
+            )
             .expect("core configuration builds");
         assert_eq!(
             config.execution.target_file_size_bytes, 268_435_456,

@@ -3,7 +3,7 @@
 //! `AppState::new` requires a live Redux catalog, and the catalog connects
 //! to Postgres at construction. The in-crate unit tests cannot go through the
 //! `wyrd-testing` harness (that would be a dependency cycle), so this module
-//! stands up one embedded-Postgres-backed catalog and shares it across every
+//! stands up one Postgres-backed catalog and shares it across every
 //! unit test that only needs a well-formed `AppState`.
 
 use std::sync::{Arc, OnceLock};
@@ -20,7 +20,7 @@ use wyrd_sql::WyrdPostgres;
 use wyrd_storage::StorageHandle;
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 
-/// Owns the embedded Postgres fixture and warehouse tempdir for the lifetime of
+/// Owns the repository-managed Postgres fixture and warehouse tempdir for the lifetime of
 /// the test process so the shared catalog's connections stay live.
 struct SharedCatalog {
     _fixture: PgFixture,
@@ -43,7 +43,7 @@ impl SharedCatalog {
 
 static SHARED: OnceLock<SharedCatalog> = OnceLock::new();
 
-/// Stand up the embedded-Postgres-backed catalog. Runs exactly once, driven by
+/// Stand up the Postgres-backed catalog. Runs exactly once, driven by
 /// [`shared`] on the process-wide persistent runtime.
 async fn build_shared() -> SharedCatalog {
     let fixture = PgFixture::start().await.expect("embedded fixture starts");
@@ -56,7 +56,6 @@ async fn build_shared() -> SharedCatalog {
         presign_ttl: std::time::Duration::from_secs(600),
         part_size_bytes: 16 * 1024 * 1024,
         multipart_threshold_bytes: 100 * 1024 * 1024,
-        public_base_url: Some("https://wyrd.test".to_owned()),
     })
     .await
     .expect("local storage handle");
@@ -77,7 +76,7 @@ async fn build_shared() -> SharedCatalog {
         fixture.vala_postgres().clone(),
     )
     .await
-    .expect("Redux catalog builds against embedded postgres");
+    .expect("Redux catalog builds against repository-managed Postgres");
 
     SharedCatalog {
         _fixture: fixture,
@@ -152,64 +151,6 @@ pub fn test_app_state(
         Bifrost::test_shell_with_catalog(verifier, catalog),
         shutdown,
     )
-}
-
-/// One process-lifetime peer identity for unit tests that compose a `WyrdServer`.
-///
-/// A default target is Scribe- and Oracle-bearing, so `WyrdServer::new` refuses
-/// to compose without a complete `bifrost.peer` identity. These unit tests
-/// compose no peer listener — the shell `Bifrost` serves no API, so
-/// `build_peer_grpc` returns nothing — but the identity must still be present
-/// and readable. It is minted once and kept alive with its material for the
-/// whole test binary.
-///
-/// `wyrd_testing::bifrost::peer_ca` mints the same shape for the harness, but
-/// `wyrd-testing` is a dev-dependency of this crate: linking it from the lib
-/// test target pulls in a second `wyrd-server`, so its types are not the ones
-/// this crate's `WyrdServerConfig` accepts.
-static PEER_IDENTITY: OnceLock<(TempDir, crate::config::BifrostPeerConfig)> = OnceLock::new();
-
-/// Returns the shared unit-test peer identity, minting it on first use.
-///
-/// # Panics
-///
-/// Panics when certificate material cannot be minted or written under the
-/// process-lifetime temporary directory.
-pub(crate) fn test_peer_config() -> crate::config::BifrostPeerConfig {
-    PEER_IDENTITY
-        .get_or_init(|| {
-            let root = tempfile::tempdir().expect("peer material tempdir");
-            let key = rcgen::KeyPair::generate().expect("peer key pair generates");
-            let certificate = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-                .expect("peer certificate parameters are valid")
-                .self_signed(&key)
-                .expect("peer certificate self-signs");
-            let certificate_path = root.path().join("peer-cert.pem");
-            let private_key_path = root.path().join("peer-key.pem");
-            let ca_path = root.path().join("peer-ca.pem");
-            // Self-signed: the same certificate is the presented leaf and the
-            // trust root, which is all a construction-time read requires.
-            std::fs::write(&certificate_path, certificate.pem()).expect("peer certificate writes");
-            std::fs::write(&ca_path, certificate.pem()).expect("peer CA writes");
-            std::fs::write(&private_key_path, key.serialize_pem()).expect("peer key writes");
-            let config = crate::config::BifrostPeerConfig {
-                advertise_addr: Some("https://127.0.0.1:8443".to_owned()),
-                ca_certificate_path: Some(ca_path),
-                certificate_chain_path: Some(certificate_path),
-                private_key_path: Some(private_key_path),
-                server_name: Some("localhost".to_owned()),
-                api_key: Some("unit-test-peer-api-key".to_owned()),
-                ticket: crate::config::PeerTicketKeyringConfig {
-                    active_key_id: Some("unit-test-peer-ticket".to_owned()),
-                    signing_key_path: Some(root.path().join("peer-ticket-key.pem")),
-                    verifying_keyring_path: Some(root.path().join("peer-ticket-keyring.json")),
-                },
-                ..crate::config::BifrostPeerConfig::default()
-            };
-            (root, config)
-        })
-        .1
-        .clone()
 }
 
 /// Return a server Postgres owner over the shared fixture's exact runtime handles.

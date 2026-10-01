@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-scribe-live-reads
-revision: 11
+revision: 24
 status: approved
 ---
 
@@ -70,9 +70,11 @@ DataFusion's residual predicates remain authoritative. Live fragments may run
 concurrently on multiple Scribes while Oracle combines them with published
 work. This change does not promise Scribe-side general aggregation or joins.
 
-The existing authenticated peer protocol, signed assignments, tenant and
-schema checks, Scribe resource admission, and per-query deadline/cancellation
-apply. A live stream validates frames as they arrive and requires a valid final
+The authenticated mTLS peer protocol and receiver-side typed tenant, table,
+query/assignment, target-node, fence, deadline, and resource checks in
+`SPEC-verified-change-contract` REQ-160/REQ-161 apply to remote work. Local
+work retains the same tenant, schema, resource, and query-lifetime rules
+without a network hop. A live stream validates frames as they arrive and requires a valid final
 footer when consumed to its natural end. When the completed DataFusion plan no
 longer needs an opened fragment, Oracle cancels and drops that child as ordinary
 query-owned cleanup; no footer is required from work the plan intentionally
@@ -100,8 +102,8 @@ release ownership. A fragment remains valid beyond 30 seconds while its query
 and stream remain active. Remove the acquire/page/release tail-fence protocol,
 its 30-second expiry, Oracle's full leader drain, and their obsolete bindings
 once the new path is the only public live reader. Keep authenticated active-
-stream discovery. Peer-ticket acceptance expiry remains an authentication
-replay control and does not impose a second lifetime on accepted work.
+stream discovery. A remote fragment's lifetime remains owned by its leader
+query after peer authentication; no ticket expiry imposes another lifetime.
 
 ### REQ-006 — Publication overlap is explicitly best effort
 
@@ -132,12 +134,18 @@ PublishedOnly are updated to exercise the one query behavior.
 ### REQ-008 — Measured read capacity on one modest node
 
 The one query service must be measured and improved through the public client
-on one locally launched Bifrost node limited by Linux to 4 CPUs and 8 GiB,
-using local NVMe. PostgreSQL and the load driver run outside that limit;
-Docker is used only by the repository-managed PostgreSQL setup. The benchmark
-must distinguish a published-only read from a read with selected live Scribe
-data, including a Scribe on another pod, and must actually hold the stated
-number of live readers throughout a mixed window. It must include concurrent
+on one locally launched Bifrost node limited by Linux to 8 CPUs and 16 GiB,
+using local NVMe, where the node is one real `wyrd-server` release-binary
+process started through the local-development journey (`migrate`, serve,
+`setup`) with only the storage URL the journey leaves to the operator; every
+other setting is the server's default. Server evidence comes only from what a
+deployment exposes: `/metrics`, the process's own cgroup, and the store the
+operator configured. No test harness process, injected resource snapshot, or
+private control channel may stand in for the server. PostgreSQL and the load
+driver run outside that limit; Docker is used only by the repository-managed
+PostgreSQL setup. Reads follow acknowledged writes with no publication wait,
+as an application's do. Multi-pod reads, including a Scribe on another pod,
+are measured on kind, not by this benchmark. It must include concurrent
 acknowledged writes rather than measuring writes only after reads stop.
 
 At minimum, report separate, correctly validated workloads for a
@@ -159,26 +167,26 @@ audit. An invalid workload must be reported as invalid rather than assigned a
 throughput result. These are engineering targets for this machine, not
 universal OLAP standards.
 
-On the 4-CPU/8-GiB node, selective reads must reach client p50 <2 ms, p95
-<5 ms, and p99 <10 ms while sustaining more than 1,000 successful reads per
-second at the same stated concurrency. Small filtered aggregates must sustain
-at least 100 successful queries per second with p95 <100 ms. Medium queries must
-sustain at least 20 per second with p95 <300 ms at the same concurrency; the
+On the 8-CPU/16-GiB node, selective reads must reach client p50 <7 ms, p95
+<10 ms, and p99 <10 ms at one client, and sustain at least 1,200 successful
+reads per second at the busiest point of the concurrency sweep. Small filtered aggregates must sustain
+at least 200 successful queries per second with p95 <100 ms. Medium queries must
+sustain at least 40 per second with p95 <300 ms at the same concurrency; the
 roughly 10-million-row case also has p95 <300 ms at one client. The large
 time-window aggregate and a roughly 100-million-row heavy scan must each
 complete in <2 seconds; the heavy scan
-must reach at least 500 MB/second in measured physical scan throughput at
+must reach at least 1,000 MB/second in measured physical scan throughput at
 one client. Higher concurrency points identify saturation; they need not
 meet the single-client heavy-scan latency target. Sustained batched ingest
-must durably acknowledge at least 100,000 rows per
+must durably acknowledge at least 200,000 rows per
 second and report p95 batch latency, written bytes per second, CPU, and memory.
 
-Under simultaneous sustained ingest of at least 100,000 acknowledged rows
-per second, the representative read mix must sustain at least 100 successful
+Under simultaneous sustained ingest of at least 200,000 acknowledged rows
+per second, the representative read mix must sustain at least 200 successful
 analytical queries per second. Small-query p95 remains <100 ms and medium-query
-p95 <300 ms. At the same read offer
-rate and client concurrency, each class's p95 may rise by less than 20%
-against its read-only baseline. Peak node memory stays below 7 GiB with no
+p95 <300 ms. Reads and writes share the node's CPU, so each class is
+judged against its own absolute target while writing, and its read-only p95
+is reported beside it rather than imposing a relative-rise limit. Peak node memory stays below 15 GiB with no
 OOM event. A 5,000/second selective rate is reported as a stretch result;
 it does not replace these required targets. CPU utilization is reported, not
 assigned an invented passing floor.
@@ -196,8 +204,7 @@ public queries through the configured object store, which is local by default.
 Its named workloads are a selective read, a small filtered aggregate, a
 one-million-row aggregate, a ten-million-row aggregate, a broad time-window
 aggregate, a full-table scan, batched ingest, and analytical reads during
-concurrent ingest. Include one valid live-reader case with a remote Scribe so
-the common distributed read path is measured. Keep the selective read as a
+concurrent ingest. Keep the selective read as a
 serving result, separate from the analytical results. Sweep only selective
 and small-aggregate client concurrency through 1, 4, 8, 16, 32, and 64;
 measure the one-million-row aggregate at eight clients and the larger reads
@@ -205,8 +212,7 @@ at one client. Report client p50/p95/p99, successful
 QPS at stated concurrency, physical scan bytes per second for scans, server
 CPU, peak memory, refusal and wrong-result counts, acknowledged ingest rows
 per second, and write-batch p95. Save raw samples, logs, and fixture geometry.
-Use the existing process-cluster harness, telemetry, public client, and one
-benchmark command. Do not add file-layout, cache-state, projection/predicate,
+Use the public client, server telemetry, and one benchmark command. Do not add file-layout, cache-state, projection/predicate,
 or fixed-offer cross-product benchmark suites. Those are focused diagnostics
 if a measured workload needs them. The standard run should give a result in
 about 10–15 minutes, excluding the release build; report actual setup and
@@ -248,13 +254,194 @@ role loss, a class the node cannot execute at all, and genuine resource or
 security faults remain distinct from temporary saturation. The same behavior
 is visible through HTTP, gRPC, and the first-class SDKs.
 
+### REQ-010 — Shared Bifrost memory and server headroom
+
+The process or pod memory limit comes from the operating system or deployment
+runtime. Wyrd leaves at least 1 GiB of that limit for `wyrd-server` work
+outside governed Bifrost memory by default; the operator may increase that
+minimum. It is accounting headroom, not preallocated memory or an upper limit
+on other server work. The shared Bifrost limit defaults to the detected limit
+minus the server minimum and may be configured lower. A configuration that
+cannot leave both the server minimum and a usable Bifrost budget fails
+startup. An 8-GiB pod therefore defaults to a 7-GiB Bifrost limit. Other
+server work may use any memory Bifrost has not consumed. The operator settings
+are WYRD_SERVER_MEMORY_MIN_BYTES for the minimum and
+WYRD_BIFROST_MEMORY_LIMIT_BYTES for an optional lower Bifrost cap. The old
+unmanaged-reserve setting has no compatibility alias.
+
+Scribe, Oracle, Forge, and in-flight Bifrost transport work share one governed
+memory budget and return their charges when ownership ends. An idle role
+reserves no fixed share. The per-request transport size, per-query execution
+ceiling, finite query queue, and Forge execution parallelism remain controls
+for their separate resources; none partitions the shared memory budget.
+Forge uses a bounded DataFusion memory pool with ordinary spill support. A
+resource failure cannot publish a partial compaction and remains retryable
+through its durable work lifecycle.
+
+A queued Oracle query owns no execution memory. A running query charges
+consumers as they grow. A fallible memory refusal or exhausted spill fails
+the requesting query, drains its child work, and returns its slot without
+failing siblings. An admitted query's resource exhaustion uses
+WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED before a stream opens or in its
+Failed terminal after streaming begins; it is never a query-queue refusal.
+First-class SDKs do not automatically retry that error. DataFusion's infallible `grow()` is
+accounted as headroom and released later; it does not trigger a second
+cancellation policy. Untracked allocations and one infallible growth can
+still exhaust an in-process pod. A separately deployed Oracle uses the
+existing server target, not a new execution process or query protocol.
+
+### REQ-011 — One capacity owner without speculative memory refusals
+
+The shared Bifrost governor is the only authority for the process's governed
+memory cap. It counts a buffer once while that buffer is held; transferring the
+buffer between transport, Scribe, Oracle, or Forge transfers its charge rather
+than charging it again. A request's predicted Arrow output, a future Parquet
+write, a table's future lifecycle, a queued query, and a fixed footer allowance
+hold no memory credit. Scribe has no separate 90-percent memory breaker or
+second global byte ledger. Tenant/table ingest scheduling and bounded work
+remain, without reserving future byte capacity for an active table.
+
+Before write ACK, the existing configurable wire-request ceiling and its
+derived expanded-data ceiling validate the request. Every buffer Wyrd creates
+is charged while held, and a failed fallible charge refuses the write before
+ACK. OTLP's opaque decoder is the sole narrow exception: its allocation-free
+preflight may temporarily charge the generated-request backing and decode
+scratch it is about to allocate internally. That same charge follows the
+decoded request into Scribe; scratch returns when decoding ends. It does not
+include projected future Arrow output. The exception does not create a second
+capacity owner or a new configurable limit. A size-valid request must not be
+ACKed if its materialization has failed. After ACK, a failed staging attempt
+retains queryable WAL authority and retries; an estimated future writer
+workspace cannot refuse or invalidate the acknowledged write.
+
+Scribe live followers use the receiving pod's shared governed DataFusion pool
+and the leader-owned stream lifetime without a separate follower permit or
+estimated memory pool. Oracle metadata reads hold no fixed 40-MiB memory slot;
+retained decoded metadata is charged by actual held bytes. Oracle peers keep
+the receiving pod's real running-slot reservation because several leaders can
+send work to one pod. The only work an Oracle peer reserves or runs is one
+distributed Analytical graph; there is no separate fragment-worker path or
+worker quantum. Every query holds exactly one slot unit on each node it runs
+on, whatever its class, so the class selects capacity rules and never the
+charge. They do not maintain another peer-waiter limit or poll
+for slots: a genuine pre-accept capacity refusal carries retry timing, and
+only the leader may retry it within the same query deadline. Ambiguous or
+accepted work is never retried as a capacity refusal.
+
+The existing node-wide storage-I/O concurrency bound remains a work bound,
+not a query admission or memory charge. A request waits for I/O capacity under
+its existing operation deadline and cancellation rather than failing
+immediately when every permit is occupied. No independent storage wait
+timeout, query queue, or memory reservation is added. A genuine deadline,
+cancellation, or backend failure retains its existing terminal semantics.
+
+### REQ-012 — Useful production telemetry without shadow state
+
+Scribe, Oracle, and Forge telemetry must let an operator, human maintainer, or
+agent follow a write, query, or maintenance attempt through its actual terminal
+outcome. Traces describe work that really occurred and span its real lifetime,
+including streamed query work and remote fragments. Normal high-rate internal
+transitions do not each produce production-level success events. A failure has
+one clear event with its reason and correlation context.
+
+Prometheus reports operational demand, backlog, active work, latency, physical
+data flow, and real failures from their production owners. Telemetry does not
+maintain a second resource, cache, staging, or query state machine merely to
+reconcile its own counters. Zero-only or no-op signals, impossible label
+combinations, duplicate measurements of one event, and work performed solely
+to manufacture a metric are removed. Tenant, table, query, task, and object
+identities remain out of metric labels and may appear only as scrubbed trace
+context. Keep Forge's earned closed metric catalog and existing tracing,
+Prometheus, and OTLP infrastructure; introduce no new exporter or sampler.
+Operational metrics remain usable when trace sampling is configured.
+
+### REQ-013 — CPU-derived query parallelism, memory-only grants
+
+Every Oracle leader,
+Oracle peer, and distributed stage session sets its `DataFusion` target
+partitions from the node's effective CPU and the pinned input's locality before physical planning:
+one partition per core for fully local input, rising linearly to four per core
+for fully remote input, never below two. Available memory, the admitted grant,
+and the pinned file count do not change the partition count. Batch size is the
+engine's fixed default rather than a memory-derived value, and the optimizer's
+join preference is the engine default.
+
+The admitted grant supplies only the query's memory limit; every other
+execution option, including the sort-merge reservation, is the engine
+default. Every query's memory
+limit is half the pod's managed Bifrost budget, never below 256 MiB and never
+above the budget. It is not divided by concurrent load: queries compete for
+the one shared pod pool, which refuses growth once concurrent queries fill it.
+Every query's spill share is half the pod's scratch limit. Planning happens
+once; admission does not reshape or rebuild the physical plan. The retired
+32-MiB minimum-grant planning shape has no replacement.
+
+Every Wyrd pod has at least 4 GiB of memory. Boot refuses a detected pod
+below that floor. Test and benchmark pod envelopes model that floor or more.
+
+Every session that can spill, whether an Oracle leader, a leader-local live
+fragment, or a remote Oracle follower, spills only into its node's governed
+Oracle spill directory, under its query's spill share. The leader and its
+live fragments share one query spill budget. A Scribe follower owns no Oracle
+spill directory and never spills. A memory refusal names the consumer that
+asked and reports the pod's largest current holders.
+
+Spill merges keep `DataFusion`'s default fan-in; the per-query memory limit
+is the only memory bound. A query whose sort or merge needs
+more non-spillable memory than that limit fails with the typed
+`QueryResourcesExhausted` error naming its largest consumers; Oracle does not
+estimate data shape to avoid it.
+
+Pinned published and hot scan leaves honor the session's partition count. The
+pinned files are laid end to end and divided into contiguous, equal byte
+ranges, one per partition; each row group is read by exactly the partition
+whose range contains its midpoint, so a single large file and many small files
+both use every partition and no row is read twice or skipped. Scan telemetry
+counts each file once however many partitions read it.
+
+### REQ-014 — One Parquet scan for staged and published data
+
+A Scribe reads its staged runs with the same Parquet scan Oracle uses for
+published and hot files: row-group statistics, bloom filters, page index, and
+predicate pushdown, divided across the session's partitions as REQ-013
+describes. The Scribe's in-memory rows are read through the engine's in-memory
+source with the same pushdown and partition count. There is no second
+staged-file decoder and no per-batch predicate compilation. The live leaf and
+the Scribe follower take their partition count from the session, never from
+the route count or a fixed value. A query whose predicate excludes every row
+group of a staged run does not decode that run.
+
+When Oracle and the Scribe share a process, live batches pass between them as
+Arrow in memory: no IPC encoding and no content hashing. Row and byte counts
+and the terminal footer rules are unchanged. Remote transport is unchanged.
+
+### REQ-015 — Tenant proven per file, not per row
+
+Physical storage already binds one tenant and table to one Iceberg table,
+namespace, and object-store prefix, one seal key, and one Oracle source. The
+per-row `data_tenant_id` column is deleted from the managed envelope, every
+write path, every file, and every scan. Every staged and published Parquet
+file records its tenant in its footer metadata, written from the same
+authenticated binding. Opening a file compares that value with the query's
+tenant once; a missing or different value fails closed with
+`WYRD_VALA_500_QUERY_TENANT_INVARIANT` before any row is returned. In-memory rows are
+bound by their seal key. The per-row tenant filter and per-row tripwire are
+deleted. There is no compatibility path: files without the footer tenant are
+refused, and existing local data is recreated.
+
+### REQ-016 — Publication runs on its own clock
+
+Seal age and staging dwell are wall-clock bounds. One Scribe lifecycle tick
+enforces both whether or not new writes arrive, so idle acknowledged rows
+publish within the configured retention of their last write.
+
 ## Invariants and boundaries
 
 - **INV-001:** Write acknowledgment, WAL durability, publication order, and
   Iceberg promotion are unchanged.
-- **INV-002:** Authenticated tenant authority, signed peer assignments,
-  authorized projection, tenant tripwire, and sensitive-column denial remain
-  effective before source IO and through execution.
+- **INV-002:** Authenticated tenant authority, typed peer assignments,
+  authorized projection, the per-file tenant tripwire, and sensitive-column
+  denial remain effective before source IO and through execution.
 - **INV-003:** One physical plan and the existing Interactive or Analytical
   selection remain authoritative; Oracle derives that class automatically
   from the returned DataFusion physical root. No caller chooses a query class
@@ -269,6 +456,19 @@ is visible through HTTP, gRPC, and the first-class SDKs.
   validation. A saturated query waits under its own deadline; a full finite
   queue or a genuine resource fault fails without taking down the node or
   corrupting another query's result.
+- **INV-007:** No idle Bifrost role reserves a fixed share of the shared
+  memory budget. Scribe, Oracle, Forge, and transport allocations compete
+  through one owner; resource failure releases only its owning work.
+- **INV-008:** Only held bytes count toward the shared memory cap, apart from
+  the one transferred, temporary OTLP decoder charge for allocations Wyrd
+  cannot observe before decoding. Work bounds never masquerade as memory
+  charges. Accepted peer reservations retain actual receiving-node slots;
+  storage-I/O waits and leader retries remain within the original operation
+  or query deadline. Write ACK and query terminal rules are unchanged.
+- **INV-009:** Removing telemetry cannot change authorization, durability,
+  capacity decisions, query results, cancellation, or maintenance settlement.
+  Traces and metrics observe actual owner state; they do not become a second
+  authority or an extra read, write, or queue on a hot path.
 
 ## Scope and non-goals
 
@@ -281,7 +481,8 @@ There is no Arrow Flight service, durable batch-owner index, replacement
 lease, second planner, new scheduler, Scribe analytical-stage worker role,
 general aggregate/join pushdown to Scribe, public source-selection field,
 verification-specific query path, or exact all-acknowledged-write promise.
-Do not add new persisted state or change write ACK timing.
+Do not add new persisted state or change write ACK timing, apart from
+REQ-015's removal of the tenant column and its footer tenant record.
 
 ## Acceptance criteria and evidence
 
@@ -328,7 +529,7 @@ Do not add new persisted state or change write ACK timing.
   report rules in REQ-008.
   Every required workload has a valid measured result or an explicit failure;
   no invalid run can satisfy a performance target.
-- **AC-010:** On the specified 4-CPU/8-GiB node, the measured required
+- **AC-010:** On the specified 8-CPU/16-GiB node, the measured required
   workloads meet the numeric targets in REQ-008. A missed target, a refused
   acknowledged read-back, or an unproven CPU or snapshot diagnosis prevents
   completion and is reported with its owning boundary and raw evidence.
@@ -340,12 +541,73 @@ Do not add new persisted state or change write ACK timing.
   limit. Execution uses the remaining total time. The 1,000th waiting query
   fits; the next receives queue-full overload. Cancellation and
   timeout free their places. HTTP and gRPC do not shed an otherwise queueable
-  authenticated query before Oracle. A 4-CPU/8-GiB process-cluster run with
+  authenticated query before Oracle. An 8-CPU/16-GiB real-server run with
   the full queue remains under the stated memory ceiling without OOM.
+- **AC-012:** An 8-GiB process limit with default configuration yields at
+  least 1 GiB of non-Bifrost server headroom and a 7-GiB shared Bifrost
+  limit. A lower operator cap and larger server minimum resolve predictably;
+  impossible values fail boot. Idle roles hold no fixed memory share.
+  Concurrent Scribe, Oracle, Forge, and transport work charge and return one
+  bounded total. Resource-exhausted queries fail without becoming queue-full
+  or corrupting siblings; failed compaction publishes nothing partial.
+  Focused tests, real-server journeys, and the standard mixed benchmark prove
+  these behaviors.
+- **AC-013:** A wire-valid, expanded-data-valid write is not refused by a
+  second Scribe percentage or future-lifecycle byte charge; every owned
+  request buffer is counted once and a failed materialization returns no ACK.
+  An acknowledged write remains readable and stageable across retry and
+  restart. Concurrent footer and storage reads do not fail solely because a
+  fixed footer slot or momentarily occupied I/O permit refused immediately.
+  Multiple leaders cannot exceed a receiving Oracle's running slots; a
+  pre-accept peer refusal is retried only by its leader within the unchanged
+  deadline, while ambiguous work is never replayed. Focused ownership tests,
+  real-server write/read and peer journeys, and the standard mixed benchmark
+  prove the rule.
+- **AC-014:** Captured success and failure traces for a Scribe write and
+  publication, an Oracle streamed local or peer query, and a Forge task show
+  the actual parent operation, relevant child work, one terminal outcome, and
+  the identities needed for human or agent diagnosis. Production metric
+  snapshots contain no zero-only, impossible, or duplicate series identified
+  by the telemetry audit. Scribe staging, shared storage, and Oracle pruning
+  do not keep or scan shadow state for telemetry. Existing journey results
+  and the standard read/write benchmark remain valid after the cleanup.
+
+- **AC-015:** A query's session partitions equal the CPU/locality formula
+  for its pinned input regardless of grant or file count. A single-file and a
+  many-file published scan, a hot scan, and a distributed query over split
+  leaves return exactly the same rows as the unsplit scan. Admission changes
+  only the memory ceiling. The heavy full scan uses
+  more than one core, and the standard and heavy benchmarks are re-run with a
+  full table. A query's memory limit is half the managed budget whatever the
+  concurrent load; a pod below 4 GiB is refused at boot; spill stays
+  confined to the governed directory; a query whose memory exceeds its limit
+  fails with typed `QueryResourcesExhausted`; and a memory refusal names the
+  requesting consumer and the top holders.
+- **AC-016:** A selective query over staged runs decodes only matching row
+  groups and pages, the live leaf and Scribe follower use the session's
+  partition count, and an in-process live read performs no IPC encode or
+  hash; the standard benchmark's live cases are re-run and reported.
+- **AC-017:** No Bifrost file, write path, Arrow/Parquet schema, or scan
+  contains the `data_tenant_id` row column (Postgres tenant columns are
+  unchanged); a file with a missing or foreign footer tenant fails with
+  `WYRD_VALA_500_QUERY_TENANT_INVARIANT` before returning rows; tenant-isolation
+  journeys pass.
+- **AC-018:** A real-server journey writes rows, goes idle, and observes them
+  published with no test hook forcing publication.
 
 ## Open material decisions
 
-None. Revision 3 was explicitly approved by the user on 2026-09-26. The user
+None. Revisions 22 through 24 were explicitly approved by the user on 2026-10-01.
+Revision 20 was explicitly approved by the user on 2026-09-30.
+Revision 17's single execution path and one-unit slot charge were
+explicitly approved by the user on 2026-09-30. Revision 16's per-query memory limit, 4 GiB pod floor, and governed
+follower spill were explicitly approved by the user on 2026-09-30.
+Revision 15's CPU-derived parallelism was explicitly approved by the
+user on 2026-09-29. Revision 14's telemetry simplification was explicitly approved by the
+user on 2026-09-29. Revision 13's capacity-owner clarification was explicitly approved by
+the user on 2026-09-29. Revision 12's memory redesign was explicitly approved by the user on
+2026-09-29. The peer wording follows approved `SPEC-verified-change-contract`
+revision 44. Revision 3 was explicitly approved by the user on 2026-09-26. The user
 explicitly accepted the performance work, supplied its numeric targets, and
 chose a finite 1,000-query queue and one timeout policy for both query classes
 on 2026-09-28.
@@ -394,6 +656,98 @@ on 2026-09-28.
   removes the file-layout and projection cross-products, and separates the
   100-million-row heavy-scan qualification from the quick capacity run.
   Approved by the user on 2026-09-28.
+- Revision 12 (2026-09-29): Records the maintainer-approved shared Bifrost
+  memory and server-headroom redesign, removes idle role partitions, and
+  aligns private-peer wording with the approved mTLS and typed-context
+  contract. Approved by the user on 2026-09-29.
+- Revision 13 (2026-09-29): Makes the single held-byte owner explicit,
+  removes speculative Scribe and footer memory refusals, retains only the
+  narrow opaque-decoder charge, and distinguishes receiving-node running
+  slots and storage-I/O backpressure from duplicate query admission.
+  Approved by the user on 2026-09-29.
+- Revision 14 (2026-09-29): Requires production telemetry to describe actual
+  owner state and operation lifetimes, removes duplicate and misleading
+  signals, and keeps traces readable by humans and agents. Approved by the
+  user on 2026-09-29.
+- Revision 15 (2026-09-29): Replaces the memory-derived 32-MiB, two-partition
+  planning shape with CPU/locality session partitions, a fixed
+  batch size, memory-only grants, and partition-honoring byte-range scan
+  leaves, after the heavy full scan measured about one core on a four-core
+  node. Approved by the user on 2026-09-29 ("I approve.").
+- Revision 16 (2026-09-30): Replaces the load-divided grant with
+  a fixed per-query limit (half the managed budget, 256 MiB floor),
+  sets the per-query spill share to half the scratch limit, removes any
+  memory term from partitions, adds the 4 GiB hard pod floor, routes every
+  spilling session through the governed spill directory, and requires
+  consumer-named memory refusals. After the 4 GiB spill journey showed four
+  merging partitions holding about 288 MB each and refusing the query, it
+  caps spill-merge fan-in per query from its memory limit and partition
+  count (user chose "Add cap" and required it to scale with pod size on
+  2026-09-30). Follows the diagnosis that the Analytical spill journey
+  failed because unbounded multi-level spill merges held non-spillable
+  reservations that starved sibling sorters, not because of fair vs greedy
+  pooling. Approved by the user on 2026-09-30 ("the hard requirement for
+  running wyrd/bifrost is to always use at minimum 4 Gib", "ok go ahead. do
+  not add the cap for now. address all other directives and findings").
+- Revision 17 (2026-09-30): Deletes the unused Oracle fragment-worker path
+  (its attempt buffer, worker grant, and worker quantum): an Oracle peer
+  reserves and runs only distributed Analytical graphs, and a peer
+  reservation must name its graph. Every query now charges one slot unit per
+  node regardless of class, replacing the two-unit Analytical weight; memory
+  remains bounded by the per-query grant and the shared root. Approved by the
+  user on 2026-09-30 ("roll this deletion in with all other consoldiation
+  work"; "yes. drop it. our aim is to simplify without degrading
+  performance").
+- Revision 18 (2026-09-30): Deletes the spill-merge fan-in cap that
+  revision 16 recorded and 1a6ec2554 implemented against the user's recorded
+  "do not add the cap for now". The cap turned a file count into bytes with a
+  fixed batch-size guess, which is wrong for data shapes Bifrost cannot know.
+  Spill runtimes use `DataFusion` defaults, bounded only by the
+  per-query memory limit. A query exceeding that limit fails with a typed
+  resource error. Approved by the user on 2026-09-30 ("agree on 1 and 2. and
+  for 3 the decision is "fail with a typed resource error"). The
+  grant-sized sort-merge reservation (`OracleSessionShape::for_grant`) is
+  deleted with it; the reservation is the `DataFusion` default ("delete"). AC-015
+  no longer requires an over-limit sort to complete; the peer baseline's
+  forced-spill fixture (6 KiB keys, sort-input lower bound, spill counters)
+  is deleted ("delete it"; "i want all invented complexity gone").
+- Revision 19 (2026-09-30): REQ-008's node is a real `wyrd-server`
+  release-binary process started through the local-development journey,
+  observed only through `/metrics`, its cgroup, and the configured store.
+  Reads follow writes with no publication wait; multi-pod and remote-Scribe
+  measurement moves to kind ("if i wanted a multi-pod bench, we would use
+  kind"; "Spawn it through its regular local dev journey"). The
+  multi-process test harness that stood in for the server is deleted.
+  Approved by the user on 2026-09-30 ("I want a REAL wyrd-server process",
+  "Benchmarks test actual production flow", "it gets done NOW").
+- Revision 20 (2026-09-30): Profiling showed live reads capped at ~25 qps by
+  full decode of staged runs (82% of CPU, no pruning, one partition). Staged
+  runs use the published Parquet scan (REQ-014), in-process live batches skip
+  IPC and hashing, and the live leaf and follower honor session partitions.
+  The redundant per-row `data_tenant_id` is deleted in favor of a per-file
+  footer tenant check (REQ-015). The idle-publication gap is closed by one
+  lifecycle tick (REQ-016). Approved by the user on 2026-09-30 ("I agree with
+  all recommendations"; "approved. roll it in to all other recommendations").
+- Revision 21 (2026-09-30): Raises the selective-read targets from p50 <2 ms
+  to <7 ms and p95 <5 ms to <10 ms. Every query pays Postgres round trips for its reader cut, which
+  2 ms cannot absorb on this node. Approved by the user on 2026-09-30 ("raise
+  the bar to 5 ms"; then "bump p50 up to 7ms"; "p95 should be 10 ms").
+- Revision 22 (2026-10-01): Drops the <20% read p95 rise while writing.
+  Reads and writes compete for the node's 4 CPUs, so the rise measures CPU
+  sharing, not interference; each class is judged against its absolute target
+  while writing. Approved by the user on 2026-10-01 ("Go with your
+  recommendations").
+- Revision 23 (2026-10-01): Selective latency is judged at one client and
+  its rate floor, lowered from 1,000 to 600 qps, at the sweep's busiest point.
+  One client reaches p50 6.9 ms at 143 qps; 4 CPUs saturate near 660 qps, so
+  no single concurrency can hold both. Approved by the user on 2026-10-01
+  ("A - continue and close out the remaining work").
+- Revision 24 (2026-10-01): The benchmark node doubles to 8 CPUs and 16 GiB,
+  replacing 4/8. Throughput floors double (selective 1,200 qps peak, small
+  aggregate 200, medium 40, heavy scan 1,000 MB/s, ingest 200,000 rows/s);
+  latency targets are unchanged; the memory ceiling is the limit less the
+  1-GiB default headroom (15 GiB). Approved by the user on 2026-10-01
+  ("Run 8/16 and replace 4/8. Scale benchmarks accordingly").
 - [Repository rules](../../../AGENTS.md),
   [agent rules](../../../architecture/agent-rules.md),
   [Wyrd design](../../../architecture/wyrd-design.md),

@@ -11,17 +11,16 @@
 //!     API key at the real `/auth/token` and mints a JWT. A success proves the
 //!     client's API-key → JWT path works against the live server.
 //!  2. **Data-plane header contract** — `client.request_json` (which sends
-//!     `x-wyrd-access-token`) to `/v1/authz/check` is *authenticated* and
-//!     rejected only at the delegation guard (`403 REQUIRES_DELEGATED_TOKEN`),
-//!     never `401`. The negative control re-sends the *same* JWT in
-//!     `Authorization` only and gets `401`, proving the server ignores it.
+//!     `x-wyrd-access-token`) to `GET /v1/cards` is *authenticated* and
+//!     rejected only at the permission check (`403 PERMISSION_403_DENIED_RBAC`,
+//!     the service holds no role), never `401`. The negative control re-sends
+//!     the *same* JWT in `Authorization` only and gets `401`, proving the
+//!     server ignores it.
 //!
-//! `/v1/authz/check` is used deliberately: it is the one `/v1` route that needs
-//! no storage backend or pre-created card, and its delegation guard runs right
-//! after authentication — so a `403` there is an unambiguous "auth passed"
-//! signal, while the `Authorization`-only control yields a clean `401`. (No
-//! plain `200` data route exists without standing up the storage harness, which
-//! would prove the same header contract at much higher cost.)
+//! A role-less principal on the card list is used deliberately: the route
+//! needs no pre-created card, and its permission check runs right after
+//! authentication — so a `403` there is an unambiguous "auth passed" signal,
+//! while the `Authorization`-only control yields a clean `401`.
 //!
 //! Ungated like `discovery_against_fixture.rs`: it runs in the Postgres test
 //! lane the fixture requires.
@@ -71,30 +70,27 @@ mod pg_tests {
             .expose()
             .to_owned();
 
-        let body = serde_json::json!({ "action": "card_write" });
-
         // (2) Data-plane: the request carries x-wyrd-access-token, so the server
-        // authenticates the principal and rejects only at the delegation guard.
+        // authenticates the principal and rejects only at the permission check.
         let err = client
             .request_json::<serde_json::Value, serde_json::Value>(
-                reqwest::Method::POST,
-                "/v1/authz/check",
-                Some(&body),
+                reqwest::Method::GET,
+                "/v1/cards",
+                None,
             )
             .await
-            .expect_err("a direct (non-delegated) token is authenticated, then guard-rejected");
+            .expect_err("a role-less token is authenticated, then permission-rejected");
         assert_eq!(
             err.code(),
-            "WYRD_AUTHZ_403_REQUIRES_DELEGATED_TOKEN",
-            "auth must succeed from x-wyrd-access-token (403 at the delegation guard), not fail at 401; got {err:?}"
+            "WYRD_PERMISSION_403_DENIED_RBAC",
+            "auth must succeed from x-wyrd-access-token (403 at the permission check), not fail at 401; got {err:?}"
         );
 
         // Negative control: the SAME JWT in Authorization only must be unauthenticated,
         // proving the server never reads Authorization for the data plane.
         let raw = reqwest::Client::new()
-            .post(format!("{base_url}/v1/authz/check"))
+            .get(format!("{base_url}/v1/cards"))
             .header("Authorization", format!("Bearer {jwt}"))
-            .json(&body)
             .send()
             .await
             .expect("control request sends");

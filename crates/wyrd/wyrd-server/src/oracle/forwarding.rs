@@ -1,4 +1,4 @@
-//! Authenticated ready-Oracle selection and private query forwarding.
+//! Ready-Oracle selection and private mTLS query forwarding.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -10,16 +10,15 @@ use futures_util::StreamExt;
 #[cfg(feature = "test-support")]
 use tokio::sync::watch::{Sender, error::RecvError};
 use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
-use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
+use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryStream, QueryIpcDecoder,
 };
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{BifrostQueryRequest, NodeId, QueryClass, SignedPeerTicket};
+use wyrd_spec::vala::api::{BifrostQueryRequest, NodeId, PeerContext, QueryClass};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::query_conversion::QueryStreamConverter;
-use wyrd_tonic::tonic::metadata::MetadataValue;
 use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::tonic::{Request, Status};
 use wyrd_tonic::wyrd::v1::ForwardQueryRequest;
@@ -27,7 +26,7 @@ use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
 use super::peer_authority::{ForwardQueryClaims, OraclePeerAuthority};
 
-/// Maximum time a signed forwarding envelope remains presentable to its selected peer.
+/// Maximum time a forwarding envelope remains presentable to its selected peer.
 const FORWARD_ENVELOPE_TTL: chrono::Duration = chrono::Duration::seconds(15);
 /// Maximum encoded query batch accepted from the private forwarding stream.
 const MAX_FORWARDED_BATCH_BYTES: usize = 64 * 1024 * 1024;
@@ -48,11 +47,9 @@ pub struct ReadyOracleForwarder {
     local_node_id: NodeId,
     /// Exact local Oracle fence, absent on non-Oracle replicas.
     local_fence: Option<u64>,
-    /// Private service credential owner; never contains the public bearer.
-    credentials: Arc<dyn OraclePeerCredentials>,
-    /// Optional production TLS trust policy.
+    /// Cluster mTLS identity; absent for a process-local node with no peers.
     tls: Option<BifrostPeerTls>,
-    /// Domain-separated signed-envelope authority.
+    /// Receiver-side envelope checks against this node's own fence and clock.
     authority: Arc<OraclePeerAuthority>,
     /// Side-effect-free ingress classification owner.
     planner: OraclePlanner,
@@ -138,7 +135,7 @@ impl SilentForwardPeer {
 /// Presents the cluster-aware forwarder as the Gate's one SQL dispatch seam.
 ///
 /// Gate owns authentication, admission closure, and request accounting; role
-/// selection, ticket minting, fencing, and peer transport stay here, on the
+/// selection, envelope construction, fencing, and peer transport stay here, on the
 /// server tier that owns Wyrd auth, tenancy, and audit.
 #[async_trait::async_trait]
 impl vala_bifrost_redux::contracts::OracleQueryDispatch for ReadyOracleForwarder {
@@ -167,11 +164,9 @@ pub struct ReadyOracleForwarderInputs {
     pub local_node_id: NodeId,
     /// Exact local Oracle fence, when selected.
     pub local_fence: Option<u64>,
-    /// Private service credential owner.
-    pub credentials: Arc<dyn OraclePeerCredentials>,
-    /// Optional production TLS trust policy.
+    /// Cluster mTLS identity; absent for a process-local node.
     pub tls: Option<BifrostPeerTls>,
-    /// Domain-separated signed-envelope authority.
+    /// Receiver-side envelope checks.
     pub authority: Arc<OraclePeerAuthority>,
     /// Query floor and classification configuration.
     pub config: OracleConfig,
@@ -186,7 +181,6 @@ impl ReadyOracleForwarder {
             local_oracle,
             local_node_id,
             local_fence,
-            credentials,
             tls,
             authority,
             config,
@@ -196,7 +190,6 @@ impl ReadyOracleForwarder {
             local_oracle,
             local_node_id,
             local_fence,
-            credentials,
             tls,
             authority,
             planner: OraclePlanner::new(config),
@@ -215,7 +208,7 @@ impl ReadyOracleForwarder {
     /// Routes one already-authenticated public query to an exact ready Oracle.
     ///
     /// Candidate connections are attempted before the immutable cut is created. Once a local
-    /// or connected remote leader is selected and signed, the request is delivered exactly once;
+    /// or connected remote leader is selected and addressed, the request is delivered exactly once;
     /// every delivery-time transport result is terminal and is never retried. The request's
     /// captured deadline also bounds remote delivery until the selected peer first responds.
     ///
@@ -244,6 +237,12 @@ impl ReadyOracleForwarder {
             now + chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
         let snapshot = self.cluster.snapshot();
         let mut candidates = eligible_oracle_candidates(&snapshot);
+        if candidates.is_empty() {
+            tracing::warn!(
+                live_oracles = snapshot.live_oracles().len(),
+                "no ready Oracle advertises both query classes; the query is unroutable"
+            );
+        }
         if let Some(local) = candidates.iter().find(|lease| {
             lease.key.node_id == self.local_node_id
                 && self
@@ -259,8 +258,8 @@ impl ReadyOracleForwarder {
                 wall_deadline,
             }
             .into_claims((local.key.node_id, local.fencing_token))?;
-            // Same process: the context is already verified here, so nothing is
-            // signed only to be verified again.
+            // Same process: the context is already authorized here, so it is not
+            // encoded only to be decoded again.
             return self.execute_local(claims).await;
         }
         let remote_candidates = candidates
@@ -284,32 +283,32 @@ impl ReadyOracleForwarder {
             },
             |_node_id, address| self.connect(address),
             |claims| {
-                self.authority
-                    .mint_forward_query(claims)
+                claims
+                    .to_context()
                     .map_err(|_| BifrostError::QueryPeerSecurity)
             },
-            |_leader, client, ticket| self.forward_remote(ConnectedOracle { client }, ticket),
+            |_leader, client, context| self.forward_remote(ConnectedOracle { client }, context),
         )
         .await
     }
 
-    /// Verifies and executes one signed envelope on this replica's local Oracle.
+    /// Checks and executes one forwarding envelope on this replica's local Oracle.
     ///
-    /// The ticket is the sole source of authorization. The elected leader pins
-    /// and plans the query itself, so no catalog snapshot travels beside it.
+    /// The envelope arrives over the cluster mTLS channel (or in-process) and
+    /// carries the ingress replica's already-authorized caller context. This
+    /// receiver checks audience, its own current fence, expiry, deadline, and
+    /// the carried policy projection before any planning. The elected leader
+    /// pins and plans the query itself, so no catalog snapshot travels beside it.
     ///
     /// # Errors
-    /// Returns a closed authentication, policy, role-fence, deadline, or query failure.
-    pub async fn accept(
-        &self,
-        ticket: SignedPeerTicket,
-    ) -> Result<OracleQueryStream, BifrostError> {
+    /// Returns a closed policy, role-fence, deadline, or query failure.
+    pub async fn accept(&self, context: PeerContext) -> Result<OracleQueryStream, BifrostError> {
         let fence = self
             .local_fence
             .ok_or(BifrostError::OracleRoleUnavailable)?;
         let claims = self
             .authority
-            .verify_forward_query(&ticket, self.local_node_id, fence, chrono::Utc::now())
+            .verify_forward_query(&context, self.local_node_id, fence, chrono::Utc::now())
             .await
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
         self.execute_local(claims).await
@@ -317,7 +316,7 @@ impl ReadyOracleForwarder {
 
     /// Runs already-authorized forwarding claims on this replica's local Oracle.
     ///
-    /// Both entries reach here: a remote envelope after signature verification,
+    /// Both entries reach here: a remote envelope after peer-context verification,
     /// and a same-process selection whose context this node verified itself.
     /// The claims are still checked against this Oracle's audience and fence.
     ///
@@ -338,13 +337,13 @@ impl ReadyOracleForwarder {
             .await
     }
 
-    /// Signs a shortened ingress budget and exercises ordinary ticket acceptance.
+    /// Encodes a shortened ingress budget and exercises ordinary acceptance.
     ///
-    /// Test-only callers supply an already authorized context; verification,
+    /// Test-only callers supply an already authorized context; envelope checks,
     /// fencing and Oracle preparation remain production code.
     ///
     /// # Errors
-    /// Returns role, signing, validation or query errors from normal acceptance.
+    /// Returns role, encoding, validation or query errors from normal acceptance.
     #[cfg(feature = "test-support")]
     pub(crate) async fn accept_with_deadline_for_test(
         &self,
@@ -364,11 +363,10 @@ impl ReadyOracleForwarder {
             self.local_fence
                 .ok_or(BifrostError::OracleRoleUnavailable)?,
         ))?;
-        let ticket = self
-            .authority
-            .mint_forward_query(&claims)
+        let context = claims
+            .to_context()
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
-        self.accept(ticket).await
+        self.accept(context).await
     }
 
     /// Connects one endpoint without sending any query envelope bytes.
@@ -399,31 +397,20 @@ impl ReadyOracleForwarder {
             .map_err(|_| BifrostError::OracleRoleUnavailable)
     }
 
-    /// Delivers one envelope exactly once over an already-connected authenticated channel.
+    /// Delivers one envelope exactly once over an already-connected mTLS channel.
     ///
     /// # Errors
-    /// Returns peer-security failures for invalid credentials or response metadata,
+    /// Returns peer-security failures for invalid response metadata,
     /// the leader's preparation timeout, or an execution failure for other
     /// delivery/stream failures. No delivery failure is retried.
     async fn forward_remote(
         &self,
         mut connected: ConnectedOracle,
-        ticket: SignedPeerTicket,
+        context: PeerContext,
     ) -> Result<OracleQueryStream, BifrostError> {
-        let bearer = self
-            .credentials
-            .bearer(false)
-            .await
-            .map_err(|_| BifrostError::QueryPeerSecurity)?;
-        let metadata: MetadataValue<_> = format!("Bearer {bearer}")
-            .parse()
-            .map_err(|_| BifrostError::QueryPeerSecurity)?;
-        let mut request = Request::new(ForwardQueryRequest {
-            envelope: Some(ticket.into()),
+        let request = Request::new(ForwardQueryRequest {
+            context: Some(context.into()),
         });
-        request
-            .metadata_mut()
-            .insert("x-wyrd-access-token", metadata);
         let response = connected
             .client
             .forward_query(request)
@@ -497,7 +484,7 @@ impl ReadyOracleForwarder {
         ))
     }
 
-    /// Validates the signed public-caller policy projection.
+    /// Validates the carried public-caller policy projection.
     fn validate_context(context: &AuthorizedQueryContext) -> Result<(), BifrostError> {
         if context.principal.tenant_id != context.data_tenant_id
             || context.permission != Permission::bifrost_query_read()
@@ -603,7 +590,7 @@ where
 /// The one monotonic query `deadline` captured at ingress bounds both candidate
 /// connection and the selected delivery through receipt of the peer's first
 /// response. On expiry the in-flight delivery future is dropped, cancelling its
-/// credential acquisition or pending peer call, and no successor is attempted.
+/// pending peer call, and no successor is attempted.
 ///
 /// # Errors
 /// Returns [`BifrostError::OracleRoleUnavailable`] when no candidate connects,
@@ -636,7 +623,7 @@ where
         .map_err(|_| BifrostError::QueryTimeout)?
 }
 
-/// The caller-supplied inputs one forwarding attempt signs into its envelope.
+/// The caller-supplied inputs one forwarding attempt encodes into its envelope.
 ///
 /// Every field is fixed before a leader is chosen, so they travel as one value
 /// through candidate connection and are consumed exactly once when the elected
@@ -654,7 +641,7 @@ pub(crate) struct ForwardingAttempt {
 }
 
 impl ForwardingAttempt {
-    /// Builds the one signed-envelope payload for the elected leader.
+    /// Builds the one envelope payload for the elected leader.
     ///
     /// The envelope binds authorization only: audience, leader fence, expiry,
     /// the authenticated context, the unchanged request body, and the absolute

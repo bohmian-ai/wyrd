@@ -2,12 +2,12 @@
 id: TASK-005
 title: Make Bifrost telemetry truthful, small, and readable
 kind: implementation
-status: ready
+status: proposed
 spec: SPEC-bifrost-scribe-live-reads
-spec_revision: 14
-requirements: [REQ-008, REQ-012]
+spec_revision: 24
+requirements: [REQ-012]
 invariants: [INV-001, INV-002, INV-004, INV-006, INV-009]
-acceptance: [AC-009, AC-010, AC-014]
+acceptance: [AC-014]
 depends_on: [TASK-004]
 ---
 
@@ -18,7 +18,7 @@ moving acknowledged data to published storage, and completing Forge work.
 The emitted metrics support two understandable dashboards: write progress
 from Gate through Scribe staging and Forge, and query demand through queue,
 execution, remote reads, and terminal result. Each plotted value has a stated
-owner and meaning. Aggregate metrics show
+owner and meaning that a real client journey proves. Aggregate metrics show
 rates and backlogs; correlated traces and durable records explain one
 particular batch or query.
 A human or agent can read one captured trace and follow the actual write,
@@ -85,9 +85,12 @@ existing operational question; default dashboards aggregate by pod.
 
 ### Dashboard questions and measurement contract
 
-Each retained series is emitted by the owner of the fact it measures and
-documented with its unit and whether it counts attempts, newly inserted
-work, current backlog, or committed outcomes.
+For every retained dashboard series, record in the task evidence its exact
+production family and bounded labels, emitting owner, event or owner state,
+unit, and whether it is an attempt, newly inserted work, current backlog,
+or committed outcome. Record the chart question it answers and the real
+journey assertion that proves its meaning. A family definition, synthetic
+metric sample, nonzero fixture value, or span name alone is not proof.
 
 The changed Scribe chart contract is fixed here; implementation may choose
 how the existing `StagingAssembler` exposes its snapshot, but may not create
@@ -113,7 +116,7 @@ decrement it on worker start and use existing `lane_active` for running jobs.
 The existing ACK histogram count means successful ACK attempts, including
 replays. No new ACK counter is needed.
 
-| Operator question | Measurements to retain | What it should match |
+| Operator question | Measurements to retain and verify | Independent journey fact |
 | --- | --- | --- |
 | Are writes arriving and getting durable responses? | Gate request rate, wire bytes, refusal, and duration; Scribe ACK-attempt count/latency and WAL append/fsync. These are request attempts, including idempotent retries. | Actual client responses and WAL-backed durable write behavior. |
 | Is new data entering a shard and moving out of memory? | Newly inserted live rows, active/immutable memtable occupancy, and waiting versus running staging work, sampled before and after freeze. Do not infer insertion from a replayed receipt. | Client readback plus the Scribe owner state at each transition. |
@@ -131,65 +134,248 @@ not metric labels.
 Server Gate latency omits the client's network and SDK time; do not label it
 client-to-client latency or expect it to equal the journey clock.
 
-## Work
+## Approach
 
-The goal is less telemetry code, not more test code. Delete first; correct
-only the misleading measurements listed above.
+1. Capture one current successful and failed write, local and remote query,
+   and Forge task using the existing production-shaped test telemetry.
+   Record metric families/series, their intended dashboard questions, and
+   `INFO` event counts. These are the comparison, not a reason to preserve
+   redundant output.
+2. Remove Scribe and shared-storage shadow state and routine emission.
+   Point test inspection at the production owner or durable state; keep the
+   useful operational metric at its actual transition.
+3. Make Oracle metrics represent real work, eliminate telemetry-only file
+   scanning, and attach query/peer spans to actual streamed lifetime.
+4. Keep Forge's metric catalog, trim duplicate successful tracing, and remove
+   the telemetry-only settlement read without changing durable outcome
+   authority.
+5. Update metric/report/doc consumers. Prove the dashboard measurements with
+   before/after scrapes and correlated traces from real client journeys,
+   including retry, restart, stall, Degraded, and queue transitions.
 
-1. **Scribe.** Delete the shadow snapshots, the ingress lifecycle ledger, and
-   the redundant signals in the owner table. Count newly inserted rows where
-   the insertion happens, rebuild staged backlog from staging ownership so it
-   includes restored members, and report waiting and active lane work
-   separately. Keep one operation trace per write. Delete the Gate
-   stage-event counter and the accepted-row series that counts retries.
-2. **Oracle.** Remove the duplicate `bifrost_query_duration_seconds` and move
-   its consumers to `oracle_query_duration_seconds` (the HPA metric). Delete
-   the zero-only families, no-op recorders, unused phase variants, and the
-   per-file loop that exists only for pruning telemetry. Count Degraded on its
-   own, count active work only after admission, and keep the query span alive
-   until the stream ends.
-3. **Shared storage.** Delete the reconciliation arrays, anomaly book, shadow
-   totals, per-effect debug event, and per-request gauge republishing. Keep
-   cache hit/miss, request latency/outcome, and retained bytes.
-4. **Forge.** Delete the duplicate claim/settlement `INFO` logs and the
-   telemetry-only Postgres read; take the outcome from the committed
-   settlement result. Keep the 17-family catalog.
-5. **Consumers.** Update every consumer of a deleted family, snapshot type, or
-   trace string: server metrics registration, `wyrd-testing` telemetry
-   capture and journeys, `docs/src/content/docs/bifrost/forge.svx`,
-   `docs/src/content/docs/self-hosting/kubernetes-production.svx`, and
-   `architecture/bifrost-design.md`. Delete tests and test-server inspection
-   APIs that exist only to check removed telemetry state; do not rebuild that
-   state in test support. Do not change Python, TypeScript, CLI, MCP, or
-   public wire contracts.
+## Ordered Implementation Scenarios
+
+### Scenario 1 — Scribe remains diagnosable without lifecycle mirrors
+
+**Behavior.** A client writes, receives a durable ACK, reads live rows,
+flushes and publishes, then reads the same rows. The trace identifies the
+request and generation, has one real operation lifetime and terminal
+outcome, and shows a clear failure reason when WAL or staging fails. Normal
+success does not emit a log for each internal transition. Metrics report ACK
+attempts and latency, newly inserted rows, WAL activity, real backlog and
+failures from their owners. A replayed batch has a successful receipt but
+does not claim a second insertion. Staged backlog survives restart; a
+stalled publication makes that backlog visible while acknowledged rows
+remain readable, then settles after recovery.
+
+**RED.** Update the existing
+`telemetry::scribe_hot_path_telemetry_reconciles` real-server journey to
+assert the durable outcome and captured trace instead of
+`ScribeStagingSnapshot` and the ingress lifecycle ledger. Include a
+controlled failure and assert one correlated failure event; assert that
+ordinary success emits no per-transition `INFO` series. Capture the installed
+production recorder before and after write, replay, freeze, and publication;
+compare emitted deltas with client receipts, owner state, and committed files.
+Add `scribe::staging_runtime::pg_tests::restored_stage_republishes_backlog`
+to prove restored staging appears in the backlog. Durably stage known members with
+their persisted byte counts and ready times, then construct a replacement
+`ScribeStagingRuntime` over the retained stage namespace. Install a fresh
+isolated metrics recorder before calling the actual async
+`ScribeStagingRuntime::restore` with repository-managed Postgres; the staged
+families must be absent before restore and present afterward with count,
+encoded bytes, oldest timestamp, and outstanding claims equal to the
+recovered durable members. Use a current-thread async test so the local
+recorder covers the awaited restore. `ScribeHotStage::recover` or
+`StagingAssembler::restore` alone does not prove Scribe startup emission.
+A test-injected metric cannot pass.
+Retain the existing write/read restart regression. Run:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(=telemetry::scribe_hot_path_telemetry_reconciles)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(=write_read::acknowledged_rows_survive_stage_pressure_and_restart)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::staging_runtime::pg_tests::restored_stage_republishes_backlog)'"
+```
+
+**GREEN.** Remove the shadow snapshots and redundant signals named above;
+measure new insertion at its actual owner, rebuild current backlog from
+staging ownership, correct waiting/active lane meaning, and retain one useful
+operation trace. Keep ACK-attempt measurements distinct from newly inserted
+data. Existing write/read journeys continue to pass.
+
+**REFACTOR.** Delete tests and test-server inspection APIs that exist only
+to reconcile removed telemetry state. Do not rebuild that state in test
+support. Delete the two seal metric claims without production recorders and
+the Gate stage-event and accepted-row measurements that duplicate or
+misstate physical work.
+
+### Scenario 2 — Oracle telemetry describes the query that actually ran
+
+**Behavior.** A local published query and a remote live query each have one
+query trace that lasts until success, failure, or client drop. Remote
+fragments appear as causal child work. Query duration and scan metrics
+reflect actual work; pruning telemetry does not rescan the pinned file list.
+Admission labels describe possible outcomes only, and resource failures are
+not disguised by a permanently zero metric. A queued query contributes to
+queue depth, not admitted active work; a Degraded terminal has its own
+outcome. Gate duration measures the server-side client-facing stream, while Oracle
+duration measures the later Oracle execution/stream boundary.
+
+**RED.** Extend
+`published::published_cache_pruning_and_shutdown_are_production_governed`
+and `peer_network::analytical::remote_live_scribe_drop_releases_query`
+to check trace lifetime and parentage, actual scanned files/bytes, and the
+absence of duplicate/zero-only families and telemetry-only pruning work.
+In the published journey, checkpoint the production recorder and a client
+clock before the public SDK query; after the stream opens but before it is
+consumed, require one successful Gate request-opening sample and no Gate
+stream-terminal sample. Consume the terminal, then require exactly one Gate
+stream outcome and one duration-histogram observation matching Success.
+Record the client-to-client elapsed time separately; require it to include
+the measured server-edge interval, without asserting that the two clocks are
+equal. The same distinction applies to the remote query and client-drop
+cases. Capture production metric deltas for Degraded, Failed, queue wait,
+and remote reads; compare each to the actual terminal frame and admission
+state. Extend `write_read::scribe_undialable_private_peer_degrades_live_coverage`
+and `capacity::saturated_query_waits_on_http_and_grpc` for the Degraded and
+queue transitions. The current constructor-only stream span, duplicate
+duration, Degraded-as-Success result, pre-admission active gauge, and shadow
+pruning pass fail. Run all exact selectors:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=published::published_cache_pruning_and_shutdown_are_production_governed)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=peer_network::analytical::remote_live_scribe_drop_releases_query)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(=write_read::scribe_undialable_private_peer_degrades_live_coverage)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=capacity::saturated_query_waits_on_http_and_grpc)'"
+```
+
+**GREEN.** Retain the production HPA's Oracle duration family; move the
+generic query report to it and remove the duplicate family. Delete dead
+families and no-op callers, constrain phase metrics to the named performance
+boundaries, use actual scan statistics, count Degraded independently, and
+measure active work only after admission. Keep the query span with the
+response stream until terminal cleanup. Retain both Gate server-edge and
+Oracle execution durations with their distinct meanings.
+
+**REFACTOR.** Remove obsolete phase variants and telemetry-only pruning tests;
+keep one contextual failure event and the existing query/result contract.
+
+### Scenario 3 — Shared storage reports its owner without copying it
+
+**Behavior.** A cache hit, miss, joined load, retry, failure, and cancellation
+leave the cache and request owners settled. Published metrics show real
+hit/miss, latency/outcome, retained bytes, and physical backend I/O distinct
+from logical cached requests. No separate telemetry
+reconciliation object or per-effect debug stream is required to prove
+settlement.
+
+**RED.** Update
+`storage::cache::tests::metadata_cache_reconciles_single_flight_identity_and_bypass`
+to assert real cache/request owner state and the retained useful metric
+series, without `MetadataCacheSnapshot` as an authority. Assert that a
+cache hit does not claim a backend read and a cache effect does not emit a
+duplicate lifecycle event. The current
+telemetry state machine fails. Run:
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=storage::cache::tests::metadata_cache_reconciles_single_flight_identity_and_bypass)'
+```
+
+**GREEN.** Remove the shadow ledger and publish only measurements attached
+to actual cache/request transitions. Preserve storage retry and close
+semantics.
+
+**REFACTOR.** Retire snapshot reconciliation consumers in the Oracle journey,
+test server, and workload capture; use the owning cache/request state for
+their assertions.
+
+### Scenario 4 — Forge keeps its catalog and loses redundant work
+
+**Behavior.** A claimed task settles against its committed durable state;
+the existing 17-family catalog and task/catalog-commit trace remain correct.
+Normal success has no duplicate claimed/settled `INFO` records or
+telemetry-only Postgres read. Failure and recovery remain explainable in
+one trace. Promotion/compaction backlog, outcome, and output files/bytes
+match the committed task and published files.
+
+**RED.** Extend
+`live_rewrite::forge_promoted_files_rewrite_and_remain_exact_across_recovery`
+to assert the committed outcome, one task operation trace, no duplicate
+success events, no extra state lookup solely for telemetry, and production
+metric deltas at claim and settlement. Compare them with committed task and
+file state; a zero-initialized family alone cannot pass. The current
+worker logs and lookup fail. Run:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test forge -P journey --run-ignored=all -E 'test(=live_rewrite::forge_promoted_files_rewrite_and_remain_exact_across_recovery)'"
+```
+
+**GREEN.** Remove repeated successful events and derive telemetry from the
+committed settlement result. Keep failure/recovery visibility and every
+earned metric family.
+
+**REFACTOR.** Delete trace-only tests of removed periodic-pass/per-hint
+events; leave durable task and public metric assertions intact.
 
 ## Acceptance Criteria
 
-1. The removals in the owner table are done, and no consumer references a
-   deleted family, snapshot type, or trace string.
-2. The four corrections hold: a replayed batch is not counted as a new
-   insertion, restored staging appears in backlog, waiting work is not shown
-   as active, and a Degraded query is not counted as Success.
-3. Forge's 17-family catalog and the Oracle HPA metric remain. No
-   high-cardinality labels are added.
-4. Write/read results, capacity, cancellation, and durable outcomes are
-   unchanged: the existing tests for the touched code still pass.
+1. AC-014's successful and failed write, local/remote streamed query, and
+   Forge trace can each be read in order by a person or agent; the top
+   operation spans the real work through terminal cleanup. Captured failures
+   retain reason and correlation identity exactly once.
+2. Scribe, Oracle, and shared-storage metrics report real owner facts.
+   Zero-only, impossible, duplicate, and shadow-pass measurements identified
+   above are gone; useful ACK, queue, query, scan, storage, and Forge metrics
+   remain. Forge's closed 17-family catalog and the Oracle HPA metric remain.
+   Gate request and stream outcomes retain their distinct meanings.
+   Idempotent replay does not appear as another newly inserted row; restored
+   staging appears in backlog; waiting work is not shown as active; and a
+   Degraded query is not shown as Success.
+3. No telemetry ledger, extra pruning walk, or telemetry-only settlement
+   read decides or delays production work. Write/read results, capacity,
+   cancellation, and durable outcomes remain unchanged.
+4. Existing write, query, and Forge journeys keep their results. The
+   standard benchmark is not run by this task; AC-014's benchmark clause is
+   checked by the caller's single benchmark run after the change.
+5. Every row in the dashboard measurement contract has a real production
+   family or trace/durable owner, a documented unit and boundary, and a
+   focused assertion that compares it with the client result or owner state.
+   The published Oracle journey proves that request opening precedes the
+   Gate stream terminal. Test-only metric values and zero-registered
+   families do not satisfy this criterion. No high-cardinality labels are
+   added.
 
-## Verification
+## Expected Write Set and Consumer Closure
 
-Run only what the change touches:
+The owner table gives likely production files. Also inspect and update
+`crates/wyrd/wyrd-server/src/app/metrics.rs`,
+`crates/wyrd/wyrd-testing/src/{bifrost/telemetry.rs,load/capacity/run.rs,server.rs}`,
+`crates/wyrd/wyrd-testing/tests/bifrost/{scribe,oracle,forge}`,
+`crates/vala/vala-bifrost-redux/src/gate/{mod,query_stream}.rs`,
+`docs/src/content/docs/bifrost/forge.svx`,
+`docs/src/content/docs/self-hosting/kubernetes-production.svx`, and
+`architecture/bifrost-design.md`. Search every consumer of a retired
+family, snapshot type, and trace name before deleting its definition.
+The paths guide closure; they are not an implementation allowlist. Do not
+change Python, TypeScript, CLI, MCP, or public wire contracts merely to
+remove private telemetry.
 
-- One small unit test at the owner for each of the four corrections in
-  acceptance criterion 2.
-- The existing unit tests of the touched `vala-bifrost-redux` modules.
-- The existing journeys that referenced removed telemetry, after updating
-  them, each by its exact nextest command (Postgres-backed ones through
-  `scripts/postgres/with-test-postgres.sh`).
-- `mise run fmt`, `mise run lints`, `mise run docs:check` if docs changed,
-  and `git diff --check`.
+## Verification and Evidence
 
-Do not run benchmarks or `mise run gate` for this task. Record each command
-and its result in a short evidence table below.
+Run the exact focused commands in Scenarios 1–4 after adding their
+assertions, then the unit tests of the touched `vala-bifrost-redux` modules.
+After a fix, re-run only what failed. Finish with `mise run fmt`,
+`mise run lints`, `mise run docs:check` if docs changed, and
+`git diff --check`.
+
+Do not run benchmarks, `mise run gate`, or whole journey lanes for this task.
+
+Append a compact dashboard table to this task: for each operator question
+above, the final production family and labels (or trace), its unit and
+meaning, and the focused test that checks it. Add one short captured success
+and failure trace per role (Scribe write, Oracle query, Forge task) so a
+reader can see the story the trace tells. Record that request attempts
+include retries and that process counters are not exact durable accounting
+after a restart.
 
 ## Material Stop Conditions
 
@@ -202,11 +388,11 @@ and its result in a short evidence table below.
 - Stop if Forge settlement cannot expose its committed outcome without a
   new durable write or changed task state; keep the current read and report
   the finding rather than infer an outcome.
-- Stop if a change alters result, ACK, terminal, or recovery semantics. Do not weaken an assertion solely to remove telemetry.
+- Stop if a journey changes result, ACK, terminal, or recovery semantics. Do not weaken an assertion solely to remove telemetry.
 
 ## Authority Links
 
-- Approved [Bifrost spec revision 14](../spec.md): REQ-012, INV-009, AC-014.
+- Approved [Bifrost spec revision 24](../spec.md): REQ-012, INV-009, AC-014.
 - [Bifrost telemetry architecture](../../../../architecture/bifrost-design.md).
 - [Repository rules](../../../../AGENTS.md), [agent rules](../../../../architecture/agent-rules.md),
   [testing workflows](../../../../architecture/references/languages/testing-workflows.md).

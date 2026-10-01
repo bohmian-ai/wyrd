@@ -7,9 +7,11 @@ mod pg_tests {
     //!   WYRD_TEST_DATABASE_ADMIN_URL=postgres://<owner>:<pw>@localhost/wyrd \
     //!   cargo test -p wyrd-sql --all-features --test migration_pg
 
+    use serde_json::Value;
     use sqlx::PgPool;
     use sqlx::types::Uuid;
     use std::time::Duration;
+    use wyrd_dev_fixtures::pg::UnmigratedDatabase;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::storage::{StorageBackendKind, UploadId, WireProtocol};
@@ -17,8 +19,8 @@ mod pg_tests {
     use wyrd_sql::queries::auth::{
         TrustedIssuerWrite, WorkloadBindingWrite, delete_trusted_issuer, delete_workload_binding,
         delete_workload_bindings_for_issuer, insert_user, trusted_issuer_by_url,
-        trusted_issuers_for_tenant, upsert_user_identity, user_by_email, user_by_id,
-        user_id_by_identity, workload_binding_by_key, workload_binding_by_subject,
+        trusted_issuers_for_tenant, upsert_user_identity, user_by_id, user_id_by_identity,
+        workload_binding_by_key, workload_binding_by_subject,
     };
     // `insert_trusted_issuer`/`insert_workload_binding` are referenced by full path
     // in `cloud_issuer_crud_write_path_conflict_and_cascade` because this test module
@@ -284,6 +286,384 @@ mod pg_tests {
         assert_eq!(owner.0, conflicting_tenant.as_uuid());
     }
 
+    /// Version immediately before the tenant human-connection migration.
+    const PRE_HUMAN_CONNECTION_VERSION: i64 = 20260924000002;
+
+    /// Version of the tenant human-connection migration under test.
+    const HUMAN_CONNECTION_VERSION: i64 = 20260925000000;
+
+    /// Create a fresh isolated database migrated exactly through
+    /// [`PRE_HUMAN_CONNECTION_VERSION`], the schema an upgrading deployment
+    /// holds when it first meets the human-connection migration.
+    ///
+    /// # Panics
+    /// Panics when the database cannot be created or partially migrated.
+    async fn pre_human_connection_database() -> UnmigratedDatabase {
+        let database = UnmigratedDatabase::create()
+            .await
+            .expect("empty database creates");
+        let mut conn = database
+            .migrator_pool()
+            .acquire()
+            .await
+            .expect("migrator connects");
+        for statement in [
+            "CREATE SCHEMA IF NOT EXISTS platform",
+            "CREATE SCHEMA IF NOT EXISTS wyrd",
+            "SET search_path TO wyrd, platform, public",
+        ] {
+            sqlx::query(statement)
+                .execute(&mut *conn)
+                .await
+                .expect("migration bootstrap runs");
+        }
+        sqlx::migrate!("./migrations")
+            .run_to(PRE_HUMAN_CONNECTION_VERSION, &mut *conn)
+            .await
+            .expect("migrates through the version before human connections");
+        conn.close().await.expect("bootstrap connection closes");
+        database
+    }
+
+    /// Insert one legacy Human trusted issuer as the previous release stored it.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    async fn insert_legacy_human_issuer(
+        pool: &PgPool,
+        tenant: DataTenantId,
+        issuer_url: &str,
+        client_auth: &str,
+        client_secret_enc: Option<&[u8]>,
+        default_roles: Value,
+    ) {
+        sqlx::query(
+            "INSERT INTO wyrd.auth_trusted_issuers
+             (data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
+              client_auth, claim_mapping, group_role_map, default_roles,
+              principal_kind, jwks_ttl_secs, client_secret_enc)
+         VALUES ($1, $2, $3, 'legacy-client', 'legacy-client', $4, $5, $6, $7,
+                 'Human', 42, $8)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(issuer_url)
+        .bind(format!("{issuer_url}/protocol/certs"))
+        .bind(client_auth)
+        .bind(serde_json::json!({"subject": "oid", "email": "upn", "groups": "roles"}))
+        .bind(serde_json::json!({"platform-admins": ["admin"]}))
+        .bind(default_roles)
+        .bind(client_secret_enc)
+        .execute(pool)
+        .await
+        .expect("legacy human issuer inserts");
+    }
+
+    /// Every trusted issuer row, as JSON, in a stable order.
+    ///
+    /// # Panics
+    /// Panics when the query fails.
+    async fn trusted_issuer_snapshot(pool: &PgPool) -> Vec<Value> {
+        sqlx::query_scalar(
+            "SELECT to_jsonb(t) FROM wyrd.auth_trusted_issuers t
+              ORDER BY data_tenant_id, issuer_url",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("trusted issuer snapshot reads")
+    }
+
+    /// Apply the human-connection migration to a staged database that must
+    /// fail preflight, and prove the refusal names the tenant and a repair
+    /// step, discloses no secret, and leaves the database unchanged.
+    ///
+    /// # Panics
+    /// Panics when the migration succeeds or any unchanged-state assertion
+    /// fails.
+    async fn assert_preflight_refuses(
+        pool: &PgPool,
+        tenant: DataTenantId,
+        secret: &[u8],
+        reason: &str,
+    ) {
+        let before = trusted_issuer_snapshot(pool).await;
+        let error = migrate_under_lease(pool)
+            .await
+            .expect_err("preflight refuses the upgrade");
+        let message = error.to_string();
+        assert!(
+            message.contains(&tenant.as_uuid().to_string()),
+            "refusal names the tenant: {message}"
+        );
+        assert!(
+            message.contains("Repair:"),
+            "refusal names a repair: {message}"
+        );
+        assert!(
+            message.contains(reason),
+            "refusal names the cause: {message}"
+        );
+        assert!(
+            !message.contains(&String::from_utf8_lossy(secret).into_owned()),
+            "refusal never carries the stored secret: {message}"
+        );
+        assert_eq!(
+            trusted_issuer_snapshot(pool).await,
+            before,
+            "issuers unchanged"
+        );
+        assert_regclass_exists(pool, "wyrd.auth_human_connections", false).await;
+        let applied: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM wyrd._sqlx_migrations WHERE version = $1")
+                .bind(HUMAN_CONNECTION_VERSION)
+                .fetch_one(pool)
+                .await
+                .expect("migration ledger reads");
+        assert_eq!(applied, 0, "the refused migration is not recorded");
+    }
+
+    /// Upgrading onto tenant human connections moves legacy Human issuers
+    /// exactly once, or refuses without changing anything.
+    ///
+    /// Each case runs on its own fresh database migrated only through the
+    /// version before the new migration:
+    ///   (a) a valid Human issuer with a custom claim mapping and JWKS TTL that
+    ///       a workload binding references, plus a second tenant's unbound
+    ///       `SecretPost` Human issuer: both become Active connections with
+    ///       mapping, TTL, JWKS URI, and sealed secret preserved; the bound row
+    ///       stays as a Workload issuer with its binding, the unbound row is
+    ///       removed, and the table then refuses any Human row;
+    ///   (b) a Human issuer with legacy default roles, and
+    ///   (c) two Human issuers in one tenant: each preflight fails naming the
+    ///       tenant and a repair step, leaking no secret, and leaving the old
+    ///       schema and rows untouched;
+    ///   (d) live legacy user and machine refresh rows: both stay live and
+    ///       unbound, so rotation refuses them (runtime renewal under a bound
+    ///       connection is covered by the refresh rotation tests).
+    #[tokio::test]
+    async fn human_connection_upgrade_preflight() {
+        let Some(_) = database_url() else {
+            return;
+        };
+        let secret: &[u8] = b"sealed-legacy-client-secret";
+
+        // (a) A valid upgrade.
+        {
+            let database = pre_human_connection_database().await;
+            let pool = database.migrator_pool();
+            let bound_tenant = DataTenantId::new_v7();
+            let secret_tenant = DataTenantId::new_v7();
+            insert_tenant(pool, bound_tenant, "upgrade-bound").await;
+            insert_tenant(pool, secret_tenant, "upgrade-secret").await;
+            let bound_issuer = "https://legacy-idp.example.com/bound";
+            let secret_issuer = "https://legacy-idp.example.com/secret";
+            insert_legacy_human_issuer(
+                pool,
+                bound_tenant,
+                bound_issuer,
+                "Public",
+                None,
+                serde_json::json!([]),
+            )
+            .await;
+            insert_workload_binding(
+                pool,
+                bound_tenant,
+                bound_issuer,
+                "workload-subject",
+                &serde_json::json!({
+                    "kind": "Service", "name": "svc", "version": "1.0.0", "space": "prod"
+                }),
+            )
+            .await;
+            insert_legacy_human_issuer(
+                pool,
+                secret_tenant,
+                secret_issuer,
+                "SecretPost",
+                Some(secret),
+                serde_json::json!([]),
+            )
+            .await;
+
+            migrate_under_lease(pool)
+                .await
+                .expect("valid upgrade applies");
+
+            let connections: Vec<wyrd_sql::row_types::auth::HumanConnectionRow> =
+                sqlx::query_as("SELECT * FROM wyrd.auth_human_connections ORDER BY issuer_url")
+                    .fetch_all(pool)
+                    .await
+                    .expect("connections read");
+            assert_eq!(
+                connections.len(),
+                2,
+                "each Human issuer becomes one connection"
+            );
+            for row in &connections {
+                assert_eq!(row.state, "Active");
+                assert_eq!(row.revision, 1);
+                assert_eq!(
+                    row.claim_mapping,
+                    serde_json::json!({"subject": "oid", "email": "upn", "groups": "roles"}),
+                    "claim mapping is preserved"
+                );
+                assert_eq!(
+                    row.group_role_map,
+                    serde_json::json!({"platform-admins": ["admin"]})
+                );
+                assert_eq!(row.jwks_ttl_secs, 42, "JWKS TTL is preserved");
+                assert_eq!(
+                    row.jwks_uri.as_deref(),
+                    Some(format!("{}/protocol/certs", row.issuer_url).as_str())
+                );
+                if row.data_tenant_id == bound_tenant.as_uuid() {
+                    assert_eq!(row.issuer_url, bound_issuer);
+                    assert_eq!(row.client_auth, "Public");
+                    assert!(row.client_secret_enc.is_none());
+                } else {
+                    assert_eq!(row.data_tenant_id, secret_tenant.as_uuid());
+                    assert_eq!(row.client_auth, "SecretPost");
+                    assert_eq!(
+                        row.client_secret_enc.as_deref(),
+                        Some(secret),
+                        "sealed secret moves intact"
+                    );
+                }
+            }
+
+            let issuers: Vec<(Uuid, String, String)> = sqlx::query_as(
+                "SELECT data_tenant_id, issuer_url, principal_kind
+                   FROM wyrd.auth_trusted_issuers ORDER BY issuer_url",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("issuers read");
+            assert_eq!(
+                issuers,
+                vec![(
+                    bound_tenant.as_uuid(),
+                    bound_issuer.to_owned(),
+                    "Workload".to_owned()
+                )],
+                "the bound issuer stays as Workload; the unbound one is removed"
+            );
+            let bindings: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM wyrd.auth_workload_bindings WHERE issuer_url = $1",
+            )
+            .bind(bound_issuer)
+            .fetch_one(pool)
+            .await
+            .expect("bindings read");
+            assert_eq!(bindings, 1, "the workload binding survives");
+            let refused =
+                sqlx::query("UPDATE wyrd.auth_trusted_issuers SET principal_kind = 'Human'")
+                    .execute(pool)
+                    .await;
+            assert!(refused.is_err(), "trusted issuers hold workload trust only");
+        }
+
+        // (b) Legacy default roles are refused.
+        {
+            let database = pre_human_connection_database().await;
+            let pool = database.migrator_pool();
+            let tenant = DataTenantId::new_v7();
+            insert_tenant(pool, tenant, "upgrade-default-roles").await;
+            insert_legacy_human_issuer(
+                pool,
+                tenant,
+                "https://legacy-idp.example.com/roles",
+                "SecretBasic",
+                Some(secret),
+                serde_json::json!(["writer"]),
+            )
+            .await;
+            assert_preflight_refuses(pool, tenant, secret, "default roles").await;
+        }
+
+        // (c) Two Human issuers in one tenant are refused.
+        {
+            let database = pre_human_connection_database().await;
+            let pool = database.migrator_pool();
+            let tenant = DataTenantId::new_v7();
+            insert_tenant(pool, tenant, "upgrade-two-humans").await;
+            for issuer in [
+                "https://legacy-idp.example.com/one",
+                "https://legacy-idp.example.com/two",
+            ] {
+                insert_legacy_human_issuer(
+                    pool,
+                    tenant,
+                    issuer,
+                    "SecretBasic",
+                    Some(secret),
+                    serde_json::json!([]),
+                )
+                .await;
+            }
+            assert_preflight_refuses(pool, tenant, secret, "2 Human trusted issuers").await;
+        }
+
+        // (d) A legacy user refresh row has no login-connection provenance, so
+        // the login-binding migration revokes it; a machine row stays live.
+        {
+            let database = pre_human_connection_database().await;
+            let pool = database.migrator_pool();
+            let tenant = DataTenantId::new_v7();
+            insert_tenant(pool, tenant, "upgrade-legacy-refresh").await;
+            insert_legacy_human_issuer(
+                pool,
+                tenant,
+                "https://legacy-idp.example.com/refresh",
+                "Public",
+                None,
+                serde_json::json!([]),
+            )
+            .await;
+            let user_id = Uuid::now_v7();
+            let (legacy_row, machine_row) = (Uuid::now_v7(), Uuid::now_v7());
+            for (id, kind, hash) in [
+                (legacy_row, "user", "legacy-user-hash"),
+                (machine_row, "service", "legacy-machine-hash"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO wyrd.auth_refresh_tokens
+                     (id, data_tenant_id, principal_kind, principal_id, token_hash, expires_at)
+                     VALUES ($1, $2, $3, $4, $5, now() + interval '1 hour')",
+                )
+                .bind(id)
+                .bind(tenant.as_uuid())
+                .bind(kind)
+                .bind(user_id)
+                .bind(hash)
+                .execute(pool)
+                .await
+                .expect("legacy refresh row inserts");
+            }
+
+            migrate_under_lease(pool).await.expect("upgrade applies");
+
+            let rows: Vec<(Uuid, Option<Uuid>, Option<String>)> = sqlx::query_as(
+                "SELECT id, human_connection_id, revoked_reason
+                   FROM wyrd.auth_refresh_tokens ORDER BY principal_kind DESC",
+            )
+            .fetch_all(pool)
+            .await
+            .expect("refresh rows read");
+            assert_eq!(
+                rows,
+                vec![
+                    (
+                        legacy_row,
+                        None,
+                        Some("login_connection_unbound".to_owned())
+                    ),
+                    (machine_row, None, None)
+                ],
+                "the unbound user row is revoked and the machine row stays live"
+            );
+        }
+    }
+
     #[tokio::test]
     /// The full migration set applies to an empty database and applying it
     /// again is a no-op, so a redeploy cannot half-apply schema.
@@ -325,6 +705,7 @@ mod pg_tests {
         assert_regclass_exists(pool, "wyrd.auth_refresh_tokens", true).await;
         assert_regclass_exists(pool, "wyrd.auth_trusted_issuers", true).await;
         assert_regclass_exists(pool, "wyrd.auth_workload_bindings", true).await;
+        assert_regclass_exists(pool, "wyrd.auth_human_connections", true).await;
 
         assert_platform_resolver_shape(pool).await;
         assert_current_tenant_parallel_restricted(pool).await;
@@ -333,6 +714,7 @@ mod pg_tests {
             "auth_%",
             &[
                 "auth_api_keys",
+                "auth_human_connections",
                 "auth_login_state",
                 "auth_refresh_tokens",
                 "auth_roles",
@@ -492,9 +874,9 @@ mod pg_tests {
         let mut conn = TenantConn::acquire(&app_pool, tenant)
             .await
             .expect("tenant conn acquired");
-        let row = user_by_email(&mut conn, "present@example.com")
+        let row = user_by_id(&mut conn, user_id)
             .await
-            .expect("email lookup succeeds")
+            .expect("user lookup succeeds")
             .expect("row exists");
         assert_eq!(row.id, user_id);
         assert_eq!(row.email.as_deref(), Some("present@example.com"));
@@ -954,7 +1336,7 @@ mod pg_tests {
         .expect("expired upload row inserts");
 
         let rows = storage::admin::multipart_uploads::expired_uploads_batch(
-            store.pool(),
+            &wyrd_sql::OperatorPool::from(store.pool().clone()),
             10,
             std::time::Duration::from_secs(30),
         )
@@ -1299,8 +1681,10 @@ mod pg_tests {
         insert_tenant(store.pool(), tenant_a, &format!("rp-a-{suffix}")).await;
         insert_tenant(store.pool(), tenant_b, &format!("rp-b-{suffix}")).await;
 
-        // Insert a Human issuer with populated group_role_map and client_secret_enc.
-        insert_human_issuer_with_secret(store.pool(), tenant_a, &issuer_url, &secret_bytes).await;
+        // Insert a secret-bearing Workload issuer with a populated
+        // group_role_map and client_secret_enc; human trust lives in
+        // auth_human_connections.
+        insert_secret_issuer(store.pool(), tenant_a, &issuer_url, &secret_bytes).await;
         insert_workload_binding(
             store.pool(),
             tenant_a,
@@ -1327,7 +1711,7 @@ mod pg_tests {
             assert_eq!(row.expected_audience, "audience-test");
             assert_eq!(row.client_id, "client-id-test");
             assert_eq!(row.client_auth, "SecretBasic");
-            assert_eq!(row.principal_kind, "Human");
+            assert_eq!(row.principal_kind, "Workload");
             assert_eq!(row.jwks_ttl_secs, 300);
             assert_eq!(
                 row.client_secret_enc.as_deref(),
@@ -1335,7 +1719,7 @@ mod pg_tests {
                 "client_secret_enc bytes must be identical — no decode or trim"
             );
 
-            // group_role_map must survive round-trip (Human issuer column).
+            // group_role_map must survive round-trip.
             let group_map = row
                 .group_role_map
                 .as_object()
@@ -1601,7 +1985,12 @@ mod pg_tests {
             .expect("tenant cleanup succeeds");
     }
 
-    async fn insert_human_issuer_with_secret(
+    /// Insert a secret-bearing `SecretBasic` Workload issuer through the
+    /// migrator pool, so read-path tests can assert byte-exact ciphertext.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    async fn insert_secret_issuer(
         pool: &PgPool,
         data_tenant_id: DataTenantId,
         issuer_url: &str,
@@ -1623,12 +2012,12 @@ mod pg_tests {
         .bind(serde_json::json!({"subject": "sub", "email": "email", "groups": "groups"}))
         .bind(serde_json::json!({"admins": ["admin-role"], "viewers": ["viewer-role"]}))
         .bind(serde_json::json!(["default-role"]))
-        .bind("Human")
+        .bind("Workload")
         .bind(300_i64)
         .bind(client_secret_enc)
         .execute(pool)
         .await
-        .expect("human issuer with secret inserts");
+        .expect("secret-bearing issuer inserts");
     }
 
     async fn insert_trusted_issuer(pool: &PgPool, data_tenant_id: DataTenantId, issuer_url: &str) {

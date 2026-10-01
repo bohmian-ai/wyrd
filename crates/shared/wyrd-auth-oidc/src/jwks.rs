@@ -10,7 +10,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::error::OidcError;
-use crate::screening::ScreenedHttp;
+use crate::screening::{ScreenedHttp, read_bounded_body};
 
 /// Key identifier extracted from a JWT header, scoped to OIDC key management.
 ///
@@ -136,7 +136,8 @@ fn decoding_key_from_jwk(
 /// # Errors
 /// Returns [`OidcError::JwksUnavailable`] when the screened client cannot be
 /// built for the URI, the request fails, the issuer answers with a non-success
-/// status, or the body does not decode as a JWKS document. Keys the decoder
+/// status, the body exceeds [`crate::screening::MAX_RESPONSE_BYTES`], or the
+/// body does not decode as a JWKS document. Keys the decoder
 /// does not recognize are skipped rather than failing the fetch.
 async fn fetch_jwks(
     issuer: &str,
@@ -171,13 +172,16 @@ async fn fetch_jwks(
         });
     }
 
-    let jwks: Jwks = response
-        .json()
+    let body = read_bounded_body(response)
         .await
         .map_err(|e| OidcError::JwksUnavailable {
             issuer: issuer.to_owned(),
-            message: format!("JWKS JSON parse failed: {e}"),
+            message: e.to_string(),
         })?;
+    let jwks: Jwks = serde_json::from_slice(&body).map_err(|e| OidcError::JwksUnavailable {
+        issuer: issuer.to_owned(),
+        message: format!("JWKS JSON parse failed: {e}"),
+    })?;
 
     let mut map = HashMap::new();
     for jwk in &jwks.keys {
@@ -195,6 +199,31 @@ async fn fetch_jwks(
 
     Ok(Arc::new(map))
 }
+
+/// Fetch `jwks_uri` once through `http` and count the keys Wyrd can verify
+/// with.
+///
+/// Connection qualification uses this to prove a provider's key set is usable
+/// before trusting it, through the same screened fetch and decoder the
+/// verification cache uses, so a key set the verifier would reject cannot
+/// qualify. Nothing is cached.
+///
+/// # Errors
+/// Returns [`OidcError::JwksUnavailable`] under the same conditions as the
+/// cache's fetch: a refused or unreachable URI, a non-success status, or a body
+/// that is not a JWKS document.
+pub async fn usable_jwks_keys(
+    issuer: &str,
+    jwks_uri: &Url,
+    http: ScreenedHttp,
+) -> Result<usize, OidcError> {
+    fetch_jwks(issuer, jwks_uri, http, PROBE_TIMEOUT)
+        .await
+        .map(|keys| keys.len())
+}
+
+/// Request timeout for a one-shot [`usable_jwks_keys`] probe.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // --------------------------------------------------------------------------
 // JwksCache

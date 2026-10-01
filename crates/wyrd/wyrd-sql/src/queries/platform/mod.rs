@@ -1,9 +1,10 @@
 //! Platform-scoped queries for `platform.*` tables.
 //!
-//! `tenant_resolver` is the runtime auth-boundary exception and runs on the
-//! `wyrd_app` pool through `platform.resolve_tenant_by_slug`. Other modules in
-//! this tree are for audited platform-admin reads and writes and take the
-//! platform-admin pool.
+//! `tenant_resolver` answers the pre-tenant slug lookup through
+//! `platform.resolve_tenant_by_slug` on the operator pool, reached only via
+//! `WyrdPostgres::resolve_tenant_slug`. Other modules in this tree are for
+//! audited platform-admin reads and writes and take the operator pool or its
+//! audited `TenantConn`.
 //!
 //! `principals`, `credentials`, and `principal_grants` own the deployment's
 //! administrative identity: a durable principal, the credentials that

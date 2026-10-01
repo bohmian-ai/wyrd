@@ -31,12 +31,13 @@ use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_spec::vala::audit_detail::CardScopeMintKind;
 use wyrd_sql::queries::auth::{
-    RoleRow, insert_refresh_token, insert_refresh_token_rotated, list_service_account_roles,
-    list_user_roles, refresh_issuance_instant, roles_by_name, service_account_by_id,
-    system_principal_id, user_by_id,
+    RoleRow, human_connection_is_active, insert_human_refresh_token, list_service_account_roles,
+    list_user_roles, lock_human_connection_slot, lock_refresh_family, refresh_issuance_instant,
+    roles_by_name, service_account_by_id, system_principal_id, user_by_id,
 };
 use wyrd_sql::queries::platform::tenant_resolver::tenant_admits_credentials;
 use wyrd_sql::queries::verification::record_machine_authentication;
+use wyrd_sql::row_types::auth::HumanConnectionBinding;
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
@@ -44,6 +45,7 @@ use crate::card_scope::{
     IssueErrorOrWyrd, MINT_KIND_API_KEY_EXCHANGE, MINT_KIND_JWT_BEARER, issue_scope_error,
     resolve_card_ref_scope, write_scope_mint_success_audit,
 };
+use crate::error::store_error;
 use crate::exchange_api_key::{principal_kind_wire, role_refs, token_hash};
 
 /// Canonical Bifrost table the SYSTEM Drift reader may read.
@@ -264,6 +266,10 @@ pub enum IssuanceError {
     /// returned a row that breaks a stored invariant.
     #[error("store operation failed")]
     Store(#[from] SqlError),
+    /// The human connection revision a session is bound to is no longer
+    /// Active, so no session may be issued or renewed through it.
+    #[error("human connection is no longer active")]
+    ConnectionInactive,
     /// A Card-scope or audit step failed with its own stable error.
     #[error("wyrd error")]
     Wyrd(#[from] WyrdError),
@@ -285,6 +291,10 @@ impl From<IssuanceError> for WyrdError {
                     details: json!({}),
                 }
             }
+            IssuanceError::ConnectionInactive => WyrdError::InvalidToken {
+                message: "the login connection is no longer active".to_owned(),
+                details: json!({}),
+            },
             IssuanceError::RoleCorrupt { role } => WyrdError::RoleCorrupt {
                 message: format!("role {role} has corrupt permissions"),
                 details: json!({ "role": role }),
@@ -603,25 +613,58 @@ impl TenantTokenIssuer {
     }
 
     /// Establish or renew a human session: an access token from [`Self::issue`]
-    /// plus a rotated refresh token.
+    /// plus a rotated refresh token bound to the connection it logged in through.
     ///
     /// `rotated_from` is absent at first login and carries the consumed refresh
     /// row on renewal; it is both the family back-link that makes reuse
     /// detectable and the credential attribution of the renewed access token.
-    /// Only human sessions get a refresh token — a machine re-exchanges its
-    /// durable credential instead.
+    /// `connection` is the exact human-connection id and revision the session
+    /// belongs to. Before anything is read or minted this takes the User's
+    /// tenant-qualified refresh-family lock — the lock rotation and
+    /// administrative User revocation hold through their commits — so first
+    /// login and renewal alike either commit before a revocation, whose family
+    /// snapshot then retires the new row, or wait for it and re-read the User
+    /// as suspended. The lock is transaction-scoped and held until the
+    /// caller's commit or rollback; rotation already holds it, and the owning
+    /// transaction reacquires it without waiting. It then takes the tenant's
+    /// connection slot lock — the lock every lifecycle mutation takes — and requires that
+    /// exact revision to still be Active, so replacement, deactivation, or
+    /// removal committed on any replica cuts the session off: once the mutation
+    /// commits no successor can be written, and a mutation waiting on the lock
+    /// commits only after this transaction does. The new refresh row carries
+    /// the same binding, so a rotation inherits it. Only human sessions get a
+    /// refresh token — a machine re-exchanges its durable credential instead.
     ///
     /// # Errors
-    /// Returns every [`Self::issue`] error, [`IssuanceError::Issue`] when the
-    /// refresh token cannot be signed, and [`IssuanceError::Database`] when
-    /// the refresh row cannot be written. Nothing is committed here.
+    /// Returns [`IssuanceError::ConnectionInactive`] when the bound connection
+    /// revision is no longer Active, every [`Self::issue`] error,
+    /// [`IssuanceError::Issue`] when the refresh token cannot be signed, and
+    /// [`IssuanceError::Database`] or [`IssuanceError::Wyrd`] when a lock or
+    /// store step fails. Nothing is committed here.
     pub async fn issue_human_session(
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
         rotated_from: Option<Uuid>,
+        connection: HumanConnectionBinding,
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
+        lock_refresh_family(conn, "user", principal_id)
+            .await
+            .map_err(store_error)?;
+        lock_human_connection_slot(conn)
+            .await
+            .map_err(store_error)?;
+        let active = human_connection_is_active(
+            conn,
+            connection.connection_id,
+            connection.connection_revision,
+        )
+        .await
+        .map_err(store_error)?;
+        if !active {
+            return Err(IssuanceError::ConnectionInactive);
+        }
         let grant = match rotated_from {
             Some(consumed) => TenantGrant::Refresh { consumed },
             None => TenantGrant::OidcLogin,
@@ -640,32 +683,16 @@ impl TenantTokenIssuer {
         )?;
         let refresh_expires_at = issued_at + self.settings.refresh_ttl;
         let hash = token_hash(&refresh_token);
-        let successor = Uuid::new_v4();
-        match rotated_from {
-            Some(predecessor) => {
-                insert_refresh_token_rotated(
-                    conn,
-                    successor,
-                    "user",
-                    principal_id,
-                    &hash,
-                    refresh_expires_at,
-                    predecessor,
-                )
-                .await?;
-            }
-            None => {
-                insert_refresh_token(
-                    conn,
-                    successor,
-                    "user",
-                    principal_id,
-                    &hash,
-                    refresh_expires_at,
-                )
-                .await?;
-            }
-        }
+        insert_human_refresh_token(
+            conn,
+            Uuid::new_v4(),
+            principal_id,
+            &hash,
+            refresh_expires_at,
+            rotated_from,
+            connection,
+        )
+        .await?;
         Ok(ExchangedToken {
             refresh_token: Some(SecretString::from(refresh_token)),
             ..access
@@ -682,7 +709,7 @@ impl TenantTokenIssuer {
 /// Returns [`IssuanceError::Database`] when the read fails and
 /// [`IssuanceError::RoleCorrupt`] when a stored permission document does not
 /// decode.
-async fn resolve_permissions(
+pub(crate) async fn resolve_permissions(
     conn: &mut TenantConn<'_>,
     roles: &[RoleRef],
 ) -> Result<PermissionSet, IssuanceError> {
@@ -942,7 +969,7 @@ mod pg_tests {
         Kid, TokenAudience, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings,
         public_key_from_pem,
     };
-    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId, PrincipalKind};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
@@ -960,8 +987,11 @@ mod pg_tests {
     use wyrd_sql::queries::verification::{
         BindingActivation, FrozenTarget, NewBinding, project_bindings,
     };
+    use wyrd_sql::row_types::auth::HumanConnectionBinding;
 
     use super::{IssuanceError, TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
+    use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
+    use crate::revoke::revoke_principal_in_conn;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -1333,8 +1363,12 @@ mod pg_tests {
             .await
             .expect("role grants");
 
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+
         let session = issuer()
-            .issue_human_session(&mut conn, user, None, "req-session")
+            .issue_human_session(&mut conn, user, None, binding, "req-session")
             .await
             .expect("session issues");
 
@@ -1555,12 +1589,152 @@ mod pg_tests {
                 "{label} must refuse the SYSTEM writer, got {result:?}"
             );
         }
+        let binding = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
         let session = issuer()
-            .issue_human_session(&mut conn, writer, None, "req-system-session")
+            .issue_human_session(&mut conn, writer, None, binding, "req-system-session")
             .await;
         assert!(
             matches!(session, Err(IssuanceError::PrincipalInactive)),
             "a human session cannot be opened for the writer: {session:?}"
+        );
+    }
+
+    /// A session bound to a connection revision that is no longer Active is
+    /// refused before any token or refresh row is minted.
+    #[tokio::test]
+    async fn a_human_session_bound_to_an_inactive_connection_is_refused() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let user = seed_user(&mut conn).await;
+        let active = seed_active_human_connection(&mut conn)
+            .await
+            .expect("connection seeds");
+        let stale = HumanConnectionBinding {
+            connection_revision: active.connection_revision + 1,
+            ..active
+        };
+
+        let result = issuer()
+            .issue_human_session(&mut conn, user, None, stale, "req-stale")
+            .await;
+
+        assert!(
+            matches!(result, Err(IssuanceError::ConnectionInactive)),
+            "a stale binding must refuse, got {result:?}"
+        );
+    }
+
+    /// Read backend `conn`'s process id so a peer can observe its lock waits.
+    ///
+    /// # Panics
+    /// Panics when the statement fails.
+    async fn backend_pid(conn: &mut TenantConn<'_>) -> i32 {
+        sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("backend pid reads")
+    }
+
+    /// Count `user`'s refresh rows in committed state, all and still active.
+    ///
+    /// # Panics
+    /// Panics when the connection or the count fails.
+    async fn committed_family(fixture: &PgFixture, user: Uuid) -> (i64, i64) {
+        let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
+        sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE revoked_at IS NULL)
+               FROM wyrd.auth_refresh_tokens
+              WHERE principal_kind = 'user' AND principal_id = $1",
+        )
+        .bind(user)
+        .fetch_one(&mut **fresh.transaction())
+        .await
+        .expect("family counts read")
+    }
+
+    /// First-login issuance and administrative User revocation serialize on
+    /// the User's refresh-family lock in both orders.
+    ///
+    /// Issuance first: with the session's row inserted and its transaction
+    /// open, revocation parks on the family lock, then retires the new row
+    /// once issuance commits, so no active family row survives. Revocation
+    /// first: with the User suspended and its transaction open, issuance parks
+    /// on the family lock before reading the User, then re-reads it as
+    /// suspended once revocation commits and refuses without writing a row.
+    ///
+    /// # Panics
+    /// Panics when either side fails to wait on the family lock, a transaction
+    /// fails, issuance is not refused after revocation, or any row is left
+    /// renewable.
+    #[tokio::test]
+    async fn initial_session_issuance_and_user_revocation_serialize() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
+        let early = seed_user(&mut setup).await;
+        let late = seed_user(&mut setup).await;
+        let binding = seed_active_human_connection(&mut setup)
+            .await
+            .expect("connection seeds");
+        setup.commit().await.expect("setup commits");
+
+        let mut issuing = fixture.tenant_conn().await.expect("issuing conn opens");
+        issuer()
+            .issue_human_session(&mut issuing, early, None, binding, "req-first-login")
+            .await
+            .expect("first login issues");
+        let mut revoking = fixture.tenant_conn().await.expect("revoking conn opens");
+        let revoke_pid = backend_pid(&mut revoking).await;
+        let (revoked, ()) = tokio::join!(
+            revoke_principal_in_conn(
+                &mut revoking,
+                PrincipalId::new(early),
+                PrincipalKindTag::User,
+                tenant,
+            ),
+            async {
+                wait_for_advisory_lock_wait(&fixture, revoke_pid).await;
+                issuing.commit().await.expect("issuance commits");
+            }
+        );
+        revoked.expect("revocation succeeds");
+        revoking.commit().await.expect("revocation commits");
+        assert_eq!(
+            committed_family(&fixture, early).await,
+            (1, 0),
+            "the first-login row exists and revocation retired it"
+        );
+
+        let mut revoking = fixture.tenant_conn().await.expect("revoking conn opens");
+        revoke_principal_in_conn(
+            &mut revoking,
+            PrincipalId::new(late),
+            PrincipalKindTag::User,
+            tenant,
+        )
+        .await
+        .expect("revocation succeeds");
+        let mut issuing = fixture.tenant_conn().await.expect("issuing conn opens");
+        let issue_pid = backend_pid(&mut issuing).await;
+        let late_issuer = issuer();
+        let (issued, ()) = tokio::join!(
+            late_issuer.issue_human_session(&mut issuing, late, None, binding, "req-late-login"),
+            async {
+                wait_for_advisory_lock_wait(&fixture, issue_pid).await;
+                revoking.commit().await.expect("revocation commits");
+            }
+        );
+        assert!(
+            matches!(issued, Err(IssuanceError::PrincipalInactive)),
+            "issuance after revocation re-reads the suspended User, got {issued:?}"
+        );
+        drop(issuing);
+        assert_eq!(
+            committed_family(&fixture, late).await,
+            (0, 0),
+            "a refused first login writes no refresh row"
         );
     }
 }

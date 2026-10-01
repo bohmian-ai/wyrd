@@ -7,8 +7,8 @@ use std::path::Path;
 use schemars::schema_for;
 use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
-    AbsoluteUrl, CallbackQuery, GatewayAccess, IssuerUrl, LoginInitResponse, PrincipalKindTag,
-    RevokePrincipalRequest, TokenRequest, TokenResponse,
+    AbsoluteUrl, BeginLogin, BeginLoginResponse, CallbackQuery, GatewayAccess, IssuerUrl,
+    LoginInitResponse, PrincipalKindTag, RevokePrincipalRequest, TokenRequest, TokenResponse,
 };
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::artifact::{ArtifactSpec, FrameworkAdapterRef};
@@ -26,7 +26,8 @@ use wyrd_spec::card::model::{
     TaskType, TfSaveFormat, TorchSaveFormat,
 };
 use wyrd_spec::card::operator::{
-    HttpAuth, HttpMethod, NotifyChannel, OperatorAction, OperatorBudget, OperatorSpec,
+    HttpAuth, HttpMethod, NotifyChannel, OperatorAction, OperatorBudget, OperatorFailureContext,
+    OperatorSpec, PagerDutySeverity,
 };
 use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
 use wyrd_spec::card::prompt::{ParameterName, PromptRef, PromptSpec};
@@ -48,6 +49,9 @@ use wyrd_spec::gateway::{
     GatewayCapturePolicy, GatewayCapturePolicyWrite, GatewayFallbackOverride,
     GatewayFallbackPolicy, GatewayGovernancePolicy, ProviderCredentialView,
     ProviderCredentialWrite, ProviderDeployment,
+};
+use wyrd_spec::operator_connection::{
+    CreateOperatorConnectionRequest, OperatorConnectionView, UpdateOperatorConnectionRequest,
 };
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
@@ -137,6 +141,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<HttpMethod>(out, golden, "http_method")?;
     write::<HttpAuth>(out, golden, "http_auth")?;
     write::<OperatorBudget>(out, golden, "operator_budget")?;
+    write::<PagerDutySeverity>(out, golden, "pager_duty_severity")?;
+    write::<OperatorFailureContext>(out, golden, "operator_failure_context")?;
     write::<SourceSpec>(out, golden, "source_spec")?;
     write::<SourceKind>(out, golden, "source_kind")?;
     write::<SqlConnection>(out, golden, "sql_connection")?;
@@ -200,6 +206,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<AbsoluteUrl>(out, golden, "auth_url")?;
     write::<IssuerUrl>(out, golden, "auth_issuer_url")?;
     write::<LoginInitResponse>(out, golden, "auth_login_init_response")?;
+    write::<BeginLogin>(out, golden, "auth_begin_login")?;
+    write::<BeginLoginResponse>(out, golden, "auth_begin_login_response")?;
     write::<CallbackQuery>(out, golden, "auth_callback_query")?;
     write::<PrincipalKindTag>(out, golden, "auth_principal_kind")?;
     write::<RevokePrincipalRequest>(out, golden, "auth_revoke_principal_request")?;
@@ -252,6 +260,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<StartVerificationRunResponse>(out, golden, "start_verification_run_response")?;
     write::<VerificationBindingStatus>(out, golden, "verification_binding_status")?;
     write::<VerificationRunStatus>(out, golden, "verification_run_status")?;
+    write::<CreateOperatorConnectionRequest>(out, golden, "create_operator_connection_request")?;
+    write::<UpdateOperatorConnectionRequest>(out, golden, "update_operator_connection_request")?;
+    write::<OperatorConnectionView>(out, golden, "operator_connection_view")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;

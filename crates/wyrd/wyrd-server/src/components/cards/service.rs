@@ -626,7 +626,7 @@ pub(crate) async fn record_allowed(
     allowed: &[AuditEvent],
 ) -> Result<(), WyrdError> {
     for event in allowed {
-        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, event).await?;
+        audit::record_audit(state.postgres.vala(), caller.data_tenant_id, event).await?;
     }
     Ok(())
 }
@@ -1971,7 +1971,7 @@ pub async fn delete_card_with_kind(
         Ok(delete_state)
     }
     .await;
-    let delete_state = record_unless_committed(state, caller, allowed, deleted).await?;
+    let delete_state = audit::record_unless_committed(state, caller, allowed, deleted).await?;
     finish_card_delete(state, caller, delete_state).await
 }
 
@@ -1999,28 +1999,8 @@ pub async fn delete_card_by_ref(
         Ok(delete_state)
     }
     .await;
-    let delete_state = record_unless_committed(state, caller, allowed, deleted).await?;
+    let delete_state = audit::record_unless_committed(state, caller, allowed, deleted).await?;
     finish_card_delete(state, caller, delete_state).await
-}
-
-/// Records the verdict standalone when its operation transaction did not commit.
-///
-/// Every error from a delete transaction means nothing committed, including the
-/// in-transaction append, so the verdict is recorded once here.
-///
-/// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when the standalone record fails,
-/// otherwise the transaction's own error.
-async fn record_unless_committed<T>(
-    state: &AppState,
-    caller: &Caller,
-    allowed: &AuditEvent,
-    result: Result<T, WyrdError>,
-) -> Result<T, WyrdError> {
-    if result.is_err() {
-        audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, allowed).await?;
-    }
-    result
 }
 
 async fn finish_card_delete(

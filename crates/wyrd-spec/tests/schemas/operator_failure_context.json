@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OperatorFailureContext",
+  "description": "The bounded, immutable context every Operator invocation renders from.\n\nFrozen on the dispatch row when a failed binding-created run settles, so every retry renders the same payload. It carries identities, the verdict, completion time, and a bounded summary only: no Eval context, media, Drift feature rows, result detail, or secret material. Template placeholder names are exactly [`OperatorFailureContext::FIELDS`].",
+  "type": "object",
+  "required": [
+    "binding_id",
+    "completed_at",
+    "dispatch_id",
+    "result_id",
+    "run_id",
+    "subject_ref",
+    "subject_uid",
+    "summary",
+    "verdict",
+    "verifier",
+    "verifier_ref",
+    "verifier_uid"
+  ],
+  "properties": {
+    "binding_id": {
+      "description": "The binding that configured this Operator.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "completed_at": {
+      "description": "When the run settled.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "dispatch_id": {
+      "description": "The dispatch being delivered.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "result_id": {
+      "description": "The run's canonical result.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "run_id": {
+      "description": "The failed run.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "subject_ref": {
+      "description": "Exact subject identity as `space/name@version`.",
+      "type": "string"
+    },
+    "subject_uid": {
+      "description": "Exact subject Card UID.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    },
+    "summary": {
+      "description": "Bounded human-readable result summary.",
+      "type": "string"
+    },
+    "verdict": {
+      "description": "Always `failed`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerificationVerdict"
+        }
+      ]
+    },
+    "verifier": {
+      "description": "Aggregate counts of the failed run's Verifier implementation.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerifierCounts"
+        }
+      ]
+    },
+    "verifier_ref": {
+      "description": "Exact Verifier identity as `space/name@version`.",
+      "type": "string"
+    },
+    "verifier_uid": {
+      "description": "Exact Verifier Card UID.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "VerificationVerdict": {
+      "description": "Common Verifier verdict of a completed run.\n\nCarried by the Bifrost result and used by settlement to decide Operator dispatch; Run GET never returns it.",
+      "oneOf": [
+        {
+          "description": "Expectations held.",
+          "type": "string",
+          "enum": [
+            "passed"
+          ]
+        },
+        {
+          "description": "Expectations were violated; a binding-created run dispatches Operators.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "No judgment could be made; never a pass.",
+          "type": "string",
+          "enum": [
+            "inconclusive"
+          ]
+        }
+      ]
+    },
+    "VerifierCounts": {
+      "description": "Aggregate, count-only numbers of one failed run, per Verifier implementation.\n\nFrozen into the failure context beside `summary` and derived from the same acknowledged result, so the two never disagree. Carries counts only: no feature names, feature rows, task inputs or outputs, or assertion detail. Templates reach these values as `drift.*` or `eval.*` fields, and a binding may only reference the block of its own Verifier implementation.",
+      "oneOf": [
+        {
+          "description": "Counts of a failed Drift run.",
+          "type": "object",
+          "required": [
+            "drifted_features",
+            "implementation",
+            "total_features"
+          ],
+          "properties": {
+            "drifted_features": {
+              "description": "Features whose own verdict is `drift`.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "implementation": {
+              "type": "string",
+              "enum": [
+                "drift"
+              ]
+            },
+            "total_features": {
+              "description": "Features scored in the report.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Counts of a failed Eval run.",
+          "type": "object",
+          "required": [
+            "failed_tasks",
+            "implementation",
+            "pass_rate_percent",
+            "passed_tasks",
+            "total_tasks"
+          ],
+          "properties": {
+            "failed_tasks": {
+              "description": "Tasks that ran and did not pass.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "implementation": {
+              "type": "string",
+              "enum": [
+                "eval"
+              ]
+            },
+            "pass_rate_percent": {
+              "description": "`floor(100 * passed / total)`, or `0` when no task ran.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "passed_tasks": {
+              "description": "Tasks that passed.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "total_tasks": {
+              "description": "Tasks that ran.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

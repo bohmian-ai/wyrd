@@ -10313,7 +10313,6 @@ dependencies = [
  "num-traits",
  "opendal 0.57.0",
  "parquet",
- "prost",
  "rand 0.8.7",
  "rayon",
  "rcgen",
@@ -11060,6 +11059,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_core",
+ "serde_derive",
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
@@ -11187,6 +11187,7 @@ dependencies = [
 name = "wyrd-auth-oidc"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "jsonwebtoken 9.3.1",
  "moka",
  "reqwest 0.13.4",
@@ -11390,6 +11391,7 @@ version = "0.0.1"
 dependencies = [
  "aes-gcm",
  "argon2",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "workspace-hack",
  "zeroize",
@@ -11451,6 +11453,7 @@ dependencies = [
  "wyrd-crypt",
  "wyrd-spec",
  "wyrd-tls",
+ "wyrd-vault",
  "zeroize",
 ]
 
@@ -11762,6 +11765,8 @@ dependencies = [
  "wyrd-testing",
  "wyrd-tls",
  "wyrd-tonic",
+ "wyrd-vault",
+ "zeroize",
 ]
 
 [[package]]
@@ -12019,6 +12024,21 @@ dependencies = [
  "workspace-hack",
  "wyrd-spec",
  "zstd",
+]
+
+[[package]]
+name = "wyrd-vault"
+version = "0.0.1"
+dependencies = [
+ "reqwest 0.13.4",
+ "secrecy",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "wiremock",
+ "workspace-hack",
+ "wyrd-tls",
 ]
 
 [[package]]

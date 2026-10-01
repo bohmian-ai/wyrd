@@ -109,8 +109,6 @@ pub fn build_auth_handles(
 mod tests {
     use super::*;
     use chrono::Duration as ChronoDuration;
-    use sqlx::PgPool;
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_auth_issue::AccessGrant;
     use wyrd_auth_verify::{TokenPrincipalRef, decode_kid};
     use wyrd_runtime::{Permission, PrincipalId};
@@ -119,9 +117,18 @@ mod tests {
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
-    /// A pool that never connects; the assembler must not touch the database.
-    fn lazy_pool() -> PgPool {
-        PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new())
+    /// An issuer resolver over a lazy pool that never connects.
+    ///
+    /// The assembler only stores the resolver and never queries the database,
+    /// so these tests need no Postgres; a query would fail rather than reach
+    /// one.
+    fn issuer_resolver() -> Arc<PgIssuerResolver> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy_with(sqlx::postgres::PgConnectOptions::new());
+        Arc::new(PgIssuerResolver::new(
+            wyrd_sql::WyrdPostgres::from_pools(pool, None),
+            None,
+        ))
     }
 
     /// The tenant the fixture token is minted for.
@@ -157,7 +164,7 @@ mod tests {
     async fn build_auth_handles_mints_tokens_the_request_verifier_accepts() {
         let handles = build_auth_handles(
             &SecretString::from(PRIVATE_KEY_PEM),
-            Arc::new(PgIssuerResolver::new(Arc::new(lazy_pool()), None)),
+            issuer_resolver(),
             ScreenedHttp::allowing_internal(),
         )
         .expect("auth handles assemble from the signing key");
@@ -199,7 +206,7 @@ mod tests {
     async fn build_auth_handles_rejects_an_invalid_signing_key() {
         let result = build_auth_handles(
             &SecretString::from("not a pem"),
-            Arc::new(PgIssuerResolver::new(Arc::new(lazy_pool()), None)),
+            issuer_resolver(),
             ScreenedHttp::allowing_internal(),
         );
         assert!(matches!(result, Err(ServerBootError::SigningKey(_))));

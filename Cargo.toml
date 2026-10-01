@@ -69,6 +69,7 @@ wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
 wyrd-testing = { path = "crates/wyrd/wyrd-testing", version = "0.0.1" }
 wyrd-tonic = { path = "crates/wyrd/wyrd-tonic", version = "0.0.1" }
 wyrd-tls = { path = "crates/shared/wyrd-tls", version = "0.0.1" }
+wyrd-vault = { path = "crates/shared/wyrd-vault", version = "0.0.1" }
 wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 # Hakari feature-unification crate; members take it as a path-only dev-dependency.
 workspace-hack = { path = "crates/shared/workspace-hack" }

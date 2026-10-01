@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CallbackQuery",
-  "description": "`GET /auth/callback` query.",
+  "description": "`GET /auth/callback` query: the provider's redirect back to the common callback. It carries no tenant selector.",
   "type": "object",
   "required": [
     "code",

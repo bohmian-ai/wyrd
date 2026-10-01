@@ -68,7 +68,6 @@ base64 = { workspace = true }
 secrecy = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
-prost = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 # The Iceberg SQL catalog opens its own Postgres pool on this sqlx; without a

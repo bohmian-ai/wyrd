@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BeginLogin",
+  "description": "`POST /auth/login` request: begin a tenant human SSO login.\n\nThe route key is pre-login routing context only; it never becomes tenant authority. Exactly one initiation binding is required: a browser login through the BFF sends the SHA-256 of its random flow id, and a CLI login sends its server-issued handoff id. The completed session is later redeemed only by that binding.",
+  "type": "object",
+  "required": [
+    "tenant_route_key"
+  ],
+  "properties": {
+    "browser_flow_hash": {
+      "description": "SHA-256 of the BFF's random browser flow id.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Sha256Hex"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "cli_handoff_id": {
+      "description": "Server-issued CLI login handoff id.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "uuid"
+    },
+    "tenant_route_key": {
+      "description": "The tenant's route key (its slug), as in `/t/{tenantKey}/login`.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TenantSlug"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Sha256Hex": {
+      "description": "SHA-256 digest as exactly 64 lowercase hexadecimal characters.",
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "TenantSlug": {
+      "description": "Human-visible tenant slug resolved to a DataTenantId at the auth boundary.",
+      "type": "string"
+    }
+  }
+}

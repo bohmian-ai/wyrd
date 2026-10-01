@@ -23,9 +23,9 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "test-support")]
 use tokio::sync::watch::Sender;
-use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::card::operator::VerifierCounts;
 use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::VerificationResultId;
@@ -33,20 +33,19 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, RetryOutcome, RunInput, Settlement, TerminalStatus, TraceWaitOutcome,
-    VerifierRunQueue,
+    ClaimedRun, RetryOutcome, RunInput, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
 };
-use wyrd_sql::{OperatorPool, SqlError, WyrdPostgres};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
 #[cfg(feature = "test-support")]
 use super::CapabilityCrash;
 use super::RuntimeLimits;
+use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::drift::DriftEngine;
 use super::engines::{EngineOutcome, VerifierReport};
 use super::eval::EvalEngine;
-#[cfg(feature = "test-support")]
 use super::health::RuntimeCapability;
-use super::permits::{VerifierPermit, VerifierPermits};
+use super::permits::VerifierPermits;
 use super::publisher::ResultPublisher;
 use super::results::{ResultPayloadBuilder, ResultRun};
 
@@ -60,9 +59,6 @@ pub const RESULT_INVALID: &str = "result_invalid";
 /// Stable error code when a completed result was not durably acknowledged.
 pub const RESULT_PUBLICATION_FAILED: &str = "result_publication_failed";
 
-/// Tenants examined per claim round, most overdue first.
-const TENANTS_PER_ROUND: i64 = 64;
-
 /// The single transition one claimed run ends in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transition {
@@ -72,6 +68,10 @@ pub enum Transition {
         result_id: VerificationResultId,
         /// Its verdict.
         verdict: VerificationVerdict,
+        /// Bounded human-readable summary frozen into failure dispatches.
+        summary: String,
+        /// The same result's counts frozen into failure dispatches.
+        counts: VerifierCounts,
     },
     /// Try the same run and input again within its attempt budget.
     Retry(VerificationError),
@@ -134,8 +134,8 @@ pub struct VerifierRunner {
     operator: OperatorPool,
     /// Queue policies and transitions.
     queue: VerifierRunQueue,
-    /// Global and per-tenant execution capacity.
-    permits: Arc<VerifierPermits>,
+    /// Shared claim loop owning execution capacity, admission, and drain.
+    claims: ClaimLoop,
     /// Remote result publication.
     publisher: ResultPublisher,
     /// The Drift and Eval arms a claimed run dispatches to.
@@ -145,9 +145,6 @@ pub struct VerifierRunner {
     /// Test-only scripted engine outcomes.
     #[cfg(feature = "test-support")]
     script: Option<EngineScript>,
-    /// Test-only crash switch.
-    #[cfg(feature = "test-support")]
-    crash: Option<CapabilityCrash>,
 }
 
 impl VerifierRunner {
@@ -168,17 +165,15 @@ impl VerifierRunner {
         limits: RuntimeLimits,
     ) -> Self {
         Self {
+            claims: ClaimLoop::new(postgres.clone(), permits, &limits),
             postgres,
             operator,
             queue,
-            permits,
             publisher,
             engines,
             limits,
             #[cfg(feature = "test-support")]
             script: None,
-            #[cfg(feature = "test-support")]
-            crash: None,
         }
     }
 
@@ -194,231 +189,26 @@ impl VerifierRunner {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn with_crash(mut self, crash: CapabilityCrash) -> Self {
-        self.crash = Some(crash);
+        self.claims.arm_crash(crash);
         self
     }
 
     /// Claim and execute runs until `stop` is cancelled, then drain.
     ///
-    /// Each turn claims one run per tenant with capacity, round-robin, and
-    /// spawns its execution; an empty round waits the poll interval or until
-    /// an execution finishes. On `stop` no further claim is admitted (an
-    /// uncommitted claim rolls back and a claim committed after `stop` is
-    /// released unexecuted), executions spawned before `stop` get the drain
-    /// grace to settle, and any still running are then cancelled and release
-    /// their leases before this returns.
+    /// Delegates to the shared [`ClaimLoop`]: each turn claims one run per
+    /// tenant with capacity, most overdue first, and spawns its execution; on
+    /// `stop` no further claim is admitted (an uncommitted claim rolls back
+    /// and a claim committed after `stop` is released unexecuted), executions
+    /// spawned before `stop` get the drain grace to settle, and any still
+    /// running are then cancelled and release their leases before this
+    /// returns.
     ///
     /// # Panics
     /// Panics under `test-support` when a test armed a runner crash. The
     /// in-flight executions are aborted with the task and keep their leases
     /// until expiry.
     pub async fn run(self: Arc<Self>, stop: CancellationToken) {
-        let abandon = CancellationToken::new();
-        let mut work = JoinSet::new();
-        while !stop.is_cancelled() {
-            #[cfg(feature = "test-support")]
-            if let Some(crash) = &self.crash {
-                crash.check(RuntimeCapability::Runner);
-            }
-            let claimed = match self.claim_round(&stop, &abandon, &mut work).await {
-                Ok(claimed) => claimed,
-                Err(error) => {
-                    tracing::warn!(%error, "verification claim round failed");
-                    0
-                }
-            };
-            while let Some(finished) = work.try_join_next() {
-                reap(finished);
-            }
-            self.record_active();
-            if claimed > 0 {
-                continue;
-            }
-            tokio::select! {
-                () = stop.cancelled() => {}
-                () = tokio::time::sleep(self.limits.poll_interval) => {}
-                Some(finished) = work.join_next(), if !work.is_empty() => reap(finished),
-            }
-        }
-        let drained = tokio::time::timeout(self.limits.drain_grace, async {
-            while let Some(finished) = work.join_next().await {
-                reap(finished);
-            }
-        })
-        .await;
-        if drained.is_err() {
-            tracing::warn!(
-                in_flight = work.len(),
-                "verification drain grace elapsed; releasing in-flight runs"
-            );
-            abandon.cancel();
-            while let Some(finished) = work.join_next().await {
-                reap(finished);
-            }
-        }
-        self.record_active();
-    }
-
-    /// Claim at most one run for each runnable tenant that has capacity.
-    ///
-    /// Tenants come most overdue first. A permit is taken before the claim
-    /// and dropped unused when the tenant had nothing claimable, so a
-    /// saturated tenant never blocks another and the global ceiling bounds
-    /// the process. Returns the number of runs claimed and spawned.
-    ///
-    /// `stop` closes admission at the durable boundary: a claim still in its
-    /// transaction when `stop` fires is rolled back, and a claim whose commit
-    /// completed after `stop` fired is immediately released with its attempt
-    /// refunded instead of being spawned. Only claims spawned before `stop`
-    /// fired are drained.
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] when the runnable-tenant list or a claim fails;
-    /// runs claimed earlier in the round are already spawned.
-    async fn claim_round(
-        self: &Arc<Self>,
-        stop: &CancellationToken,
-        abandon: &CancellationToken,
-        work: &mut JoinSet<()>,
-    ) -> Result<usize, SqlError> {
-        if self.permits.saturated() {
-            return Ok(0);
-        }
-        let tenants = tokio::select! {
-            biased;
-            () = stop.cancelled() => return Ok(0),
-            tenants = self
-                .queue
-                .tenants_with_runnable_runs(&self.operator, TENANTS_PER_ROUND) => tenants?,
-        };
-        let mut claimed = 0;
-        for tenant in tenants {
-            if stop.is_cancelled() || self.permits.saturated() {
-                break;
-            }
-            let Some(permit) = self.permits.try_acquire(tenant) else {
-                continue;
-            };
-            let Some(run) = self.claim(tenant, stop).await? else {
-                continue;
-            };
-            if stop.is_cancelled() {
-                self.refund_late_claim(tenant, &run).await;
-                break;
-            }
-            metrics::counter!(
-                crate::app::metrics::VERIFICATION_RUN_ATTEMPTS_TOTAL,
-                "implementation" => input_implementation(&run.input)
-            )
-            .increment(1);
-            claimed += 1;
-            work.spawn(Arc::clone(self).process(
-                tenant,
-                run,
-                permit,
-                stop.clone(),
-                abandon.clone(),
-            ));
-        }
-        Ok(claimed)
-    }
-
-    /// Claim the next runnable run of `tenant` under a fresh lease.
-    ///
-    /// Opening the tenant transaction and the queue claim race `stop`; when
-    /// `stop` wins, the uncommitted claim transaction is dropped, which rolls
-    /// it back, and `None` is returned. The commit itself is not raced, so
-    /// its outcome is always known: a claim that commits is returned even if
-    /// `stop` fired meanwhile, and the caller must then release it.
-    ///
-    /// # Errors
-    /// Returns [`SqlError`] when the tenant transaction or claim fails.
-    async fn claim(
-        &self,
-        tenant: DataTenantId,
-        stop: &CancellationToken,
-    ) -> Result<Option<ClaimedRun>, SqlError> {
-        let lease = chrono::Duration::from_std(self.limits.lease)
-            .unwrap_or_else(|_| chrono::Duration::minutes(10));
-        let uncommitted = async {
-            let mut conn = self.postgres.tenant_conn(tenant).await?;
-            let run = self.queue.claim(&mut conn, lease).await?;
-            Ok::<_, SqlError>((conn, run))
-        };
-        let (conn, run) = tokio::select! {
-            biased;
-            () = stop.cancelled() => return Ok(None),
-            claimed = uncommitted => claimed?,
-        };
-        conn.commit().await?;
-        Ok(run)
-    }
-
-    /// Release `run`, claimed by a commit that completed after shutdown
-    /// began, with its attempt refunded and without executing it.
-    ///
-    /// Uses the same fenced release transition as the drain. A failed release
-    /// is logged; the lease then expires into a reclaim.
-    async fn refund_late_claim(&self, tenant: DataTenantId, run: &ClaimedRun) {
-        match self.settle(tenant, run, Transition::Release).await {
-            Ok(outcome) => {
-                tracing::info!(run_id = %run.lease.run_id, outcome, "claim committed after shutdown began; released");
-            }
-            Err(error) => {
-                tracing::error!(run_id = %run.lease.run_id, %error, "releasing a claim committed after shutdown failed; the lease will expire");
-            }
-        }
-    }
-
-    /// Execute one claimed run and apply its single transition.
-    ///
-    /// Holds `permit` until settlement. Cancellation through `abandon`
-    /// (shutdown past its grace) stops the execution and releases the lease;
-    /// a retryable failure observed after `stop` is also released rather than
-    /// charged an attempt, since the process, not the run, failed.
-    async fn process(
-        self: Arc<Self>,
-        tenant: DataTenantId,
-        run: ClaimedRun,
-        permit: VerifierPermit,
-        stop: CancellationToken,
-        abandon: CancellationToken,
-    ) {
-        let _permit = permit;
-        let started = Instant::now();
-        let transition = tokio::select! {
-            () = abandon.cancelled() => Transition::Release,
-            transition = self.execute(tenant, &run) => transition,
-        };
-        let transition = match transition {
-            Transition::Retry(_) if stop.is_cancelled() => Transition::Release,
-            transition => transition,
-        };
-        let implementation = input_implementation(&run.input);
-        let outcome = match self.settle(tenant, &run, transition).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                tracing::error!(run_id = %run.lease.run_id, %error, "verification settlement failed; the lease will expire");
-                "settlement_failed"
-            }
-        };
-        if !matches!(
-            outcome,
-            "completed" | "released" | "awaiting_trace" | "deferred"
-        ) {
-            metrics::counter!(
-                crate::app::metrics::VERIFICATION_RUN_FAILURES_TOTAL,
-                "implementation" => implementation,
-                "outcome" => outcome
-            )
-            .increment(1);
-        }
-        metrics::histogram!(
-            crate::app::metrics::VERIFICATION_RUN_DURATION_SECONDS,
-            "implementation" => implementation,
-            "outcome" => outcome
-        )
-        .record(started.elapsed().as_secs_f64());
+        self.claims.run(&self, stop).await;
     }
 
     /// Load the Verifier, dispatch it, and publish a completed report.
@@ -581,6 +371,8 @@ impl VerifierRunner {
             Ok(Ok(())) => Transition::Complete {
                 result_id,
                 verdict: payload.verdict(),
+                summary: report.summary(),
+                counts: report.counts(),
             },
             Ok(Err(error)) => {
                 tracing::warn!(run_id = %run.lease.run_id, %error, "verification result publication failed");
@@ -615,9 +407,14 @@ impl VerifierRunner {
         let lease = run.lease;
         let mut conn = self.postgres.tenant_conn(tenant).await?;
         let outcome = match transition {
-            Transition::Complete { result_id, verdict } => settled(
+            Transition::Complete {
+                result_id,
+                verdict,
+                summary,
+                counts,
+            } => settled(
                 self.queue
-                    .complete(&mut conn, lease, result_id, verdict)
+                    .complete(&mut conn, lease, result_id, verdict, &summary, counts)
                     .await?,
                 "completed",
             ),
@@ -681,29 +478,103 @@ impl VerifierRunner {
         conn.commit().await?;
         Ok(outcome)
     }
-
-    /// Publish the active-execution gauge.
-    fn record_active(&self) {
-        metrics::gauge!(crate::app::metrics::VERIFICATION_ACTIVE_RUNS).set(f64::from(
-            u32::try_from(self.permits.active()).unwrap_or(u32::MAX),
-        ));
-    }
 }
 
-/// Log an execution task that panicked; its lease expires into a reclaim.
-fn reap(finished: Result<(), JoinError>) {
-    if let Err(error) = finished
-        && error.is_panic()
-    {
-        tracing::error!(%error, "verification execution panicked; its lease will expire");
-    }
-}
+impl LeasedWork for VerifierRunner {
+    type Claim = ClaimedRun;
 
-/// `label` when the settlement applied, otherwise `stale_lease`.
-const fn settled(settlement: Settlement, label: &'static str) -> &'static str {
-    match settlement {
-        Settlement::Applied => label,
-        Settlement::StaleLease => "stale_lease",
+    const CAPABILITY: RuntimeCapability = RuntimeCapability::Runner;
+    const ACTIVE_GAUGE: &'static str = crate::app::metrics::VERIFICATION_ACTIVE_RUNS;
+
+    /// Tenants with runnable runs, most overdue first.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the cross-tenant read fails.
+    async fn due_tenants(&self, limit: i64) -> Result<Vec<DataTenantId>, SqlError> {
+        Ok(self
+            .queue
+            .tenants_with_runnable_runs(&self.operator, limit)
+            .await?)
+    }
+
+    /// Claim the tenant's next runnable run under a fresh lease.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the claim fails.
+    async fn claim(&self, conn: &mut TenantConn<'_>) -> Result<Option<ClaimedRun>, SqlError> {
+        let lease = chrono::Duration::from_std(self.limits.lease)
+            .unwrap_or_else(|_| chrono::Duration::minutes(10));
+        Ok(self.queue.claim(conn, lease).await?)
+    }
+
+    /// Execute one claimed run and apply its single transition.
+    ///
+    /// The claim loop holds its permit until settlement. Cancellation through `abandon`
+    /// (shutdown past its grace) stops the execution and releases the lease;
+    /// a retryable failure observed after `stop` is also released rather than
+    /// charged an attempt, since the process, not the run, failed.
+    async fn process(
+        self: Arc<Self>,
+        tenant: DataTenantId,
+        run: ClaimedRun,
+        stop: CancellationToken,
+        abandon: CancellationToken,
+    ) {
+        let started = Instant::now();
+        let implementation = input_implementation(&run.input);
+        metrics::counter!(
+            crate::app::metrics::VERIFICATION_RUN_ATTEMPTS_TOTAL,
+            "implementation" => implementation
+        )
+        .increment(1);
+        let transition = tokio::select! {
+            () = abandon.cancelled() => Transition::Release,
+            transition = self.execute(tenant, &run) => transition,
+        };
+        let transition = match transition {
+            Transition::Retry(_) if stop.is_cancelled() => Transition::Release,
+            transition => transition,
+        };
+        let outcome = match self.settle(tenant, &run, transition).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                tracing::error!(run_id = %run.lease.run_id, %error, "verification settlement failed; the lease will expire");
+                "settlement_failed"
+            }
+        };
+        if !matches!(
+            outcome,
+            "completed" | "released" | "awaiting_trace" | "deferred"
+        ) {
+            metrics::counter!(
+                crate::app::metrics::VERIFICATION_RUN_FAILURES_TOTAL,
+                "implementation" => implementation,
+                "outcome" => outcome
+            )
+            .increment(1);
+        }
+        metrics::histogram!(
+            crate::app::metrics::VERIFICATION_RUN_DURATION_SECONDS,
+            "implementation" => implementation,
+            "outcome" => outcome
+        )
+        .record(started.elapsed().as_secs_f64());
+    }
+
+    /// Release a run claimed after shutdown began, with its attempt refunded
+    /// and without executing it.
+    ///
+    /// Uses the same fenced release transition as the drain. A failed release
+    /// is logged; the lease then expires into a reclaim.
+    async fn release_late(&self, tenant: DataTenantId, run: &ClaimedRun) {
+        match self.settle(tenant, run, Transition::Release).await {
+            Ok(outcome) => {
+                tracing::info!(run_id = %run.lease.run_id, outcome, "claim committed after shutdown began; released");
+            }
+            Err(error) => {
+                tracing::error!(run_id = %run.lease.run_id, %error, "releasing a claim committed after shutdown failed; the lease will expire");
+            }
+        }
     }
 }
 

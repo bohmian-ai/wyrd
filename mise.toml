@@ -139,6 +139,7 @@ cargo nextest run --locked -p wyrd-sql --test pg_platform_identity
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_authz::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_credentials::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_sessions::pg_tests::/)'
+cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^platform_login::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^issuance::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^exchange_api_key::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^revoke::pg_tests::/)'
@@ -578,7 +579,7 @@ description = """Stand up real OIDC providers (Keycloak + Dex), seed test users 
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
 Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
-env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:18080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:identity:journey:inner'"
 [tasks."test:identity:journey:inner"]
@@ -587,7 +588,7 @@ description = """Stand up real OIDC providers (Keycloak + Dex), seed test users 
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
 Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
 """
-env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
+env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:18080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 run = """
 set -e
 
@@ -607,7 +608,7 @@ docker compose up -d keycloak dex --wait
 uv run python - <<'PYEOF'
 import json, urllib.request, urllib.parse, time, sys
 
-BASE = "http://localhost:8080"
+BASE = "http://localhost:18080"
 REALM = "wyrd-test"
 
 def get_admin_token():
@@ -623,8 +624,8 @@ def get_admin_token():
     resp = json.loads(urllib.request.urlopen(req).read())
     return resp["access_token"]
 
-def api(method, path, body=None, token=None):
-    url = f"{BASE}/admin/realms/{REALM}{path}"
+def api(method, path, body=None, token=None, realm=REALM):
+    url = f"{BASE}/admin/realms/{realm}{path}"
     data = json.dumps(body).encode() if body else None
     headers = {"Content-Type": "application/json"}
     if token:
@@ -649,7 +650,7 @@ for attempt in range(30):
 else:
     sys.exit("Keycloak admin API not ready after 60s")
 
-def create_user(username, email, password, group_path):
+def create_user(username, email, password, group_path, realm=REALM):
     api("POST", "/users", {
         "username": username,
         "email": email,
@@ -658,8 +659,8 @@ def create_user(username, email, password, group_path):
         "emailVerified": True,
         "enabled": True,
         "requiredActions": [],
-    }, token)
-    users = api("GET", f"/users?username={username}", token=token) or []
+    }, token, realm)
+    users = api("GET", f"/users?username={username}", token=token, realm=realm) or []
     if not users:
         sys.exit(f"user {username} not found after creation")
     uid = users[0]["id"]
@@ -667,17 +668,50 @@ def create_user(username, email, password, group_path):
         "type": "password",
         "temporary": False,
         "value": password,
-    }, token)
-    groups = api("GET", f"/groups?search={group_path.lstrip('/')}", token=token) or []
+    }, token, realm)
+    groups = api("GET", f"/groups?search={group_path.lstrip('/')}", token=token, realm=realm) or []
     if groups:
-        api("PUT", f"/users/{uid}/groups/{groups[0]['id']}", token=token)
+        api("PUT", f"/users/{uid}/groups/{groups[0]['id']}", token=token, realm=realm)
 
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins")
 create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
+# The second provider's alice shares the first's email: a provider switch must
+# still make her a separate Wyrd user.
+create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="wyrd-test-2")
 print("Keycloak users seeded")
 PYEOF
 
-cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
+# WYRD_IDENTITY_TARGET selects the suite (only `server` exists);
+# WYRD_IDENTITY_FILTER selects one exact test and must select exactly one.
+# Unfiltered runs every identity journey, and first proves each named tenant
+# connection journey still selects exactly one test so a rename cannot
+# silently drop it.
+target="${WYRD_IDENTITY_TARGET:-server}"
+if [ "$target" != server ]; then
+  echo "unsupported WYRD_IDENTITY_TARGET=$target (supported: server)" >&2
+  exit 2
+fi
+selected_count() {
+  cargo nextest list --locked -p wyrd-server --test identity_e2e --run-ignored=all --message-format oneline -E "$1" | grep -c . || true
+}
+if [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
+  expr="test(=${WYRD_IDENTITY_FILTER})"
+  count="$(selected_count "$expr")"
+  if [ "$count" != 1 ]; then
+    echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count tests; expected exactly 1" >&2
+    exit 1
+  fi
+  cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1 -E "$expr"
+else
+  for required in tenant_connection_admin_journey tenant_connection_rotation_journey tenant_connection_session_cutoff_journey tenant_human_login_journey tenant_callback_refusal_journey tenant_provider_switch_journey tenant_machine_independence_journey; do
+    count="$(selected_count "test(=$required)")"
+    if [ "$count" != 1 ]; then
+      echo "identity journey $required selects $count tests; expected exactly 1" >&2
+      exit 1
+    fi
+  done
+  cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
+fi
 """
 
 [tasks."build:server"]
@@ -1067,7 +1101,7 @@ run = "uv run ruff check python/wyrd tests scripts"
 hide = true
 description = "Run ty over the generated Python stub surface"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py tests/unit/client/test_client.py"
+run = "uv run ty check --error unused-ignore-comment python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py tests/bifrost/test_public_typing.py tests/unit/gateway/test_gateway_typing.py tests/unit/client/test_client.py tests/unit/test_operator_connections_typing.py"
 
 [tasks."py:test:testing"]
 hide = true

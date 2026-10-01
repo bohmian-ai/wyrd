@@ -7,8 +7,14 @@ use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
 use schemars::schema::{InstanceType, Metadata, Schema, SchemaObject, StringValidation};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::Digest as _;
+#[cfg(feature = "server")]
+use utoipa::openapi::schema::{ObjectBuilder, Schema as OpenApiSchema, Type};
+use uuid::Uuid;
 
 use crate::auth::SecretBearer;
+use crate::error::WyrdError;
+use crate::ids::TenantSlug;
 
 /// Absolute URL used by auth contracts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -163,7 +169,11 @@ impl utoipa::PartialSchema for IssuerUrl {
 #[cfg(feature = "server")]
 impl utoipa::ToSchema for IssuerUrl {}
 
-/// `GET /auth/login` response.
+/// Platform-administrator login initiation response.
+///
+/// The platform plane posts the provider's `code` and `state` back itself, so
+/// it receives the state here. Tenant human login never does: its
+/// [`BeginLoginResponse`] carries only the authorization URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -174,7 +184,221 @@ pub struct LoginInitResponse {
     pub state: String,
 }
 
-/// `GET /auth/callback` query.
+/// A SHA-256 digest in its canonical wire form: exactly 64 lowercase
+/// hexadecimal characters.
+///
+/// Used where a caller proves possession of a secret it keeps to itself, such
+/// as the BFF's random login flow id: the server records only the digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sha256Hex([u8; 32]);
+
+impl Sha256Hex {
+    /// Parse a canonical digest.
+    ///
+    /// # Errors
+    /// Returns [`Sha256HexError`] when the value is not exactly 64 lowercase
+    /// hexadecimal characters. Uppercase is refused rather than normalized so
+    /// one digest has one wire form.
+    pub fn new(value: &str) -> Result<Self, Sha256HexError> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Sha256HexError);
+        }
+        let mut digest = [0_u8; 32];
+        hex::decode_to_slice(value, &mut digest).map_err(|_| Sha256HexError)?;
+        Ok(Self(digest))
+    }
+
+    /// Digest `bytes` with SHA-256.
+    #[must_use]
+    pub fn digest(bytes: &[u8]) -> Self {
+        Self(sha2::Sha256::digest(bytes).into())
+    }
+
+    /// The raw 32-byte digest.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for Sha256Hex {
+    /// Wrap an already-computed raw digest, such as one read back from storage.
+    fn from(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+}
+
+impl fmt::Display for Sha256Hex {
+    /// Write the canonical wire form: the 32 raw bytes as 64 lowercase
+    /// hexadecimal characters, the only form [`Sha256Hex::new`] accepts.
+    ///
+    /// # Errors
+    /// Returns [`fmt::Error`] only when the underlying formatter's writer
+    /// fails; encoding itself cannot fail.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(self.0))
+    }
+}
+
+impl Serialize for Sha256Hex {
+    /// Serialize as the canonical lowercase-hex string produced by
+    /// [`fmt::Display`], so the wire form round-trips through
+    /// [`Deserialize`].
+    ///
+    /// # Errors
+    /// Returns the serializer's error when it cannot accept a string.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Sha256Hex {
+    /// Deserialize from a string and validate it with [`Sha256Hex::new`], so
+    /// the wire accepts exactly the canonical lowercase-hex form.
+    ///
+    /// # Errors
+    /// Returns the deserializer's error when the input is not a string, and a
+    /// custom error carrying [`Sha256HexError`] when the string is not exactly
+    /// 64 lowercase hexadecimal characters.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for Sha256Hex {
+    /// Name the schema `Sha256Hex` so generated contracts reference one shared
+    /// definition.
+    fn schema_name() -> String {
+        "Sha256Hex".to_owned()
+    }
+
+    /// Describe the canonical wire form as a 64-character string constrained
+    /// by [`SHA256_HEX_PATTERN`], mirroring the validation in
+    /// [`Sha256Hex::new`] and the `OpenAPI` projection.
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        Schema::Object(SchemaObject {
+            metadata: Some(Box::new(Metadata {
+                description: Some(SHA256_HEX_DESCRIPTION.to_owned()),
+                ..Default::default()
+            })),
+            instance_type: Some(InstanceType::String.into()),
+            string: Some(Box::new(StringValidation {
+                min_length: Some(64),
+                max_length: Some(64),
+                pattern: Some(SHA256_HEX_PATTERN.to_owned()),
+            })),
+            ..Default::default()
+        })
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::PartialSchema for Sha256Hex {
+    /// Describe the canonical wire form for `OpenAPI` with the same length,
+    /// pattern, and description as the JSON Schema projection, so both
+    /// generated contracts agree with [`Sha256Hex::new`].
+    fn schema() -> utoipa::openapi::RefOr<OpenApiSchema> {
+        utoipa::openapi::RefOr::T(OpenApiSchema::Object(
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .min_length(Some(64))
+                .max_length(Some(64))
+                .pattern(Some(SHA256_HEX_PATTERN))
+                .description(Some(SHA256_HEX_DESCRIPTION))
+                .build(),
+        ))
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::ToSchema for Sha256Hex {}
+
+/// Description shared by the JSON Schema and `OpenAPI` projections of
+/// [`Sha256Hex`].
+const SHA256_HEX_DESCRIPTION: &str =
+    "SHA-256 digest as exactly 64 lowercase hexadecimal characters.";
+
+/// Pattern shared by the JSON Schema and `OpenAPI` projections of
+/// [`Sha256Hex`].
+const SHA256_HEX_PATTERN: &str = "^[0-9a-f]{64}$";
+
+/// A value that is not a canonical [`Sha256Hex`] digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("expected a SHA-256 digest as 64 lowercase hexadecimal characters")]
+pub struct Sha256HexError;
+
+/// `POST /auth/login` request: begin a tenant human SSO login.
+///
+/// The route key is pre-login routing context only; it never becomes tenant
+/// authority. Exactly one initiation binding is required: a browser login
+/// through the BFF sends the SHA-256 of its random flow id, and a CLI login
+/// sends its server-issued handoff id. The completed session is later redeemed
+/// only by that binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct BeginLogin {
+    /// The tenant's route key (its slug), as in `/t/{tenantKey}/login`.
+    pub tenant_route_key: TenantSlug,
+    /// SHA-256 of the BFF's random browser flow id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_flow_hash: Option<Sha256Hex>,
+    /// Server-issued CLI login handoff id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_handoff_id: Option<Uuid>,
+}
+
+/// How a tenant human login was initiated: the single binding its completed
+/// session is redeemed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginInitiation {
+    /// A browser login bound to the BFF's flow id hash.
+    Browser(Sha256Hex),
+    /// A CLI login bound to its handoff id.
+    Cli(Uuid),
+}
+
+impl BeginLogin {
+    /// The request's one initiation binding.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when both or neither of
+    /// `browser_flow_hash` and `cli_handoff_id` are present.
+    pub fn initiation(&self) -> Result<LoginInitiation, WyrdError> {
+        match (self.browser_flow_hash, self.cli_handoff_id) {
+            (Some(hash), None) => Ok(LoginInitiation::Browser(hash)),
+            (None, Some(handoff)) => Ok(LoginInitiation::Cli(handoff)),
+            _ => Err(WyrdError::Validation {
+                message: "exactly one of browser_flow_hash or cli_handoff_id is required"
+                    .to_owned(),
+                details: serde_json::json!({ "reason": "login_binding_required" }),
+            }),
+        }
+    }
+}
+
+/// `POST /auth/login` response.
+///
+/// Carries only the provider authorization URL. The login state is in that
+/// URL and nowhere else; the caller never needs it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct BeginLoginResponse {
+    /// Provider authorization URL to send the person's browser to.
+    pub authorization_url: AbsoluteUrl,
+}
+
+/// `GET /auth/callback` query: the provider's redirect back to the common
+/// callback. It carries no tenant selector.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -285,7 +509,10 @@ fn openapi_url_schema(
 
 #[cfg(test)]
 mod tests {
-    use super::{AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, UrlParseError};
+    use super::{
+        AbsoluteUrl, BeginLogin, CallbackQuery, IssuerUrl, LoginInitResponse, LoginInitiation,
+        Sha256Hex, UrlParseError,
+    };
 
     #[test]
     fn issuer_url_normalizes_trailing_slash() {
@@ -409,5 +636,60 @@ mod tests {
             "extra": true
         });
         assert!(serde_json::from_value::<CallbackQuery>(json).is_err());
+    }
+
+    /// A digest parses only in its canonical lowercase 64-hex form and
+    /// serializes back to it.
+    #[test]
+    fn sha256_hex_accepts_only_the_canonical_form() {
+        let digest = Sha256Hex::digest(b"flow");
+        let wire = digest.to_string();
+        assert_eq!(wire.len(), 64);
+        assert_eq!(Sha256Hex::new(&wire), Ok(digest));
+        assert!(Sha256Hex::new(&wire.to_uppercase()).is_err());
+        assert!(Sha256Hex::new(&wire[..63]).is_err());
+        assert!(Sha256Hex::new(&format!("{}g", &wire[..63])).is_err());
+        assert_eq!(
+            serde_json::to_value(digest).expect("serializes"),
+            serde_json::json!(wire)
+        );
+    }
+
+    /// Exactly one initiation binding is required; both or neither is a
+    /// validation error, and unknown fields are refused.
+    #[test]
+    fn begin_login_requires_exactly_one_binding() {
+        let hash = Sha256Hex::digest(b"flow").to_string();
+        let handoff = uuid::Uuid::now_v7();
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<BeginLogin>(value).expect("begin login parses")
+        };
+
+        let browser = parse(serde_json::json!({
+            "tenant_route_key": "acme", "browser_flow_hash": hash
+        }));
+        assert!(matches!(
+            browser.initiation(),
+            Ok(LoginInitiation::Browser(_))
+        ));
+        let cli = parse(serde_json::json!({
+            "tenant_route_key": "acme", "cli_handoff_id": handoff
+        }));
+        assert!(matches!(cli.initiation(), Ok(LoginInitiation::Cli(id)) if id == handoff));
+        for ambiguous in [
+            serde_json::json!({ "tenant_route_key": "acme" }),
+            serde_json::json!({
+                "tenant_route_key": "acme", "browser_flow_hash": hash, "cli_handoff_id": handoff
+            }),
+        ] {
+            let error = parse(ambiguous).initiation().expect_err("refused");
+            assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION");
+        }
+        assert!(
+            serde_json::from_value::<BeginLogin>(serde_json::json!({
+                "tenant_route_key": "acme", "browser_flow_hash": hash, "issuer": "x"
+            }))
+            .is_err()
+        );
     }
 }

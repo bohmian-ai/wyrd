@@ -779,6 +779,62 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A human-login trust write reached the workload trusted-issuer surface.
+    #[error("[WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_HUMAN_CONNECTION_REQUIRED",
+        status = 400,
+        title = "Human login uses the tenant OIDC connection",
+        remediation = "Trusted issuers and `[[trusted_issuers]]` accept only `principal_kind = workload`. Configure human sign-in through the tenant OIDC connection API: PUT /v1/identity/oidc/candidate, POST /v1/identity/oidc/candidate/test, then POST /v1/identity/oidc/candidate/activate."
+    )]
+    HumanConnectionRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A tenant OIDC connection mutation lost a revision, state, or recovery check.
+    #[error("[WYRD_AUTH_409_CONNECTION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_CONNECTION_CONFLICT",
+        status = 409,
+        title = "Tenant OIDC connection conflict",
+        remediation = "Re-read GET /v1/identity/oidc/connections and retry with the current `expected_revision`. Activation also requires a valid recovery API key for a headless principal of this tenant that holds `identity_connections:write`."
+    )]
+    ConnectionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Activation named a candidate without a current successful test.
+    #[error("[WYRD_AUTH_409_CONNECTION_NOT_TESTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_409_CONNECTION_NOT_TESTED",
+        status = 409,
+        title = "Tenant OIDC candidate is not freshly tested",
+        remediation = "Run POST /v1/identity/oidc/candidate/test against this exact candidate revision and activate within 15 minutes of a successful test."
+    )]
+    ConnectionNotTested {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A tenant OIDC connection named a client-authentication method Wyrd does not implement.
+    #[error("[WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH",
+        status = 400,
+        title = "Unsupported OIDC client authentication",
+        remediation = "Use `SecretBasic` or `SecretPost` with a client secret, or `Public` without one. `private_key_jwt` is not supported for tenant connections."
+    )]
+    UnsupportedClientAuth {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// A gateway administration document violates the gateway contract.
     #[error("[WYRD_GATEWAY_400_INVALID_CONFIGURATION] {message}")]
     #[wyrd_error(
@@ -1734,6 +1790,90 @@ pub enum WyrdError {
         message: String,
         /// Structured detail payload.
         details: serde_json::Value,
+    },
+    /// An Operator template, URL origin, or header violates the Operator contract.
+    #[error("[WYRD_SPEC_400_INVALID_OPERATOR] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_INVALID_OPERATOR",
+        status = 400,
+        title = "Invalid Operator",
+        remediation = "Reference only failure-context fields in {{field}} templates, keep the URL origin literal https, and do not author server-owned headers."
+    )]
+    SpecInvalidOperator {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// An Operator names a connection that is missing, disabled, of another provider, or of incompatible authority.
+    #[error("[WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE",
+        status = 400,
+        title = "Operator connection unavailable",
+        remediation = "Create or re-enable an active connection of the Operator's provider with this name in the tenant, whose HTTP origin and auth scheme match the Operator."
+    )]
+    SpecOperatorConnectionUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// No Operator connection with this identity is visible to the caller's tenant.
+    #[error("[WYRD_OPERATOR_404_CONNECTION_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_OPERATOR_404_CONNECTION_NOT_FOUND",
+        status = 404,
+        title = "Operator connection not found",
+        remediation = "List GET /v1/operator-connections in the same tenant and retry with one of those connection IDs."
+    )]
+    OperatorConnectionNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The tenant already has an Operator connection of this provider and name.
+    #[error("[WYRD_OPERATOR_409_CONNECTION_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_OPERATOR_409_CONNECTION_CONFLICT",
+        status = 409,
+        title = "Operator connection name conflict",
+        remediation = "Choose another name, or PATCH the existing connection to rotate its secret."
+    )]
+    OperatorConnectionConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// An Operator connection write is malformed or targets the wrong provider.
+    #[error("[WYRD_OPERATOR_400_INVALID_CONNECTION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_OPERATOR_400_INVALID_CONNECTION",
+        status = 400,
+        title = "Invalid Operator connection",
+        remediation = "Send the provider-tagged shape matching the connection's provider with a non-empty secret and a normalized https origin."
+    )]
+    OperatorConnectionInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The server has no usable key-encryption key for Operator connection secrets.
+    #[error("[WYRD_OPERATOR_503_KEY_UNAVAILABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_OPERATOR_503_KEY_UNAVAILABLE",
+        status = 503,
+        title = "Operator connection key unavailable",
+        remediation = "Restore the configured Operator key provider so it can supply the active key, then retry."
+    )]
+    OperatorKeyUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
     },
     /// A binding's effective Trigger activation cannot run its Verifier's implementation.
     #[error("[WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH] {message}")]
@@ -3556,6 +3696,10 @@ impl WyrdError {
             | Self::PrincipalNotFound { message, details }
             | Self::AdminConflict { message, details }
             | Self::AdminNotFound { message, details }
+            | Self::HumanConnectionRequired { message, details }
+            | Self::ConnectionConflict { message, details }
+            | Self::ConnectionNotTested { message, details }
+            | Self::UnsupportedClientAuth { message, details }
             | Self::GatewayInvalidConfiguration { message, details }
             | Self::GatewayResourceNotFound { message, details }
             | Self::GatewayResourceConflict { message, details }
@@ -3693,6 +3837,12 @@ impl WyrdError {
             | Self::VerificationInvalidWindow { message, details }
             | Self::VerificationNotReady { message, details }
             | Self::SpecUnsupportedOperatorAction { message, details }
+            | Self::SpecInvalidOperator { message, details }
+            | Self::SpecOperatorConnectionUnavailable { message, details }
+            | Self::OperatorConnectionNotFound { message, details }
+            | Self::OperatorConnectionConflict { message, details }
+            | Self::OperatorConnectionInvalid { message, details }
+            | Self::OperatorKeyUnavailable { message, details }
             | Self::SpecTriggerActivationMismatch { message, details }
             | Self::SpecInvalidServiceComponentKind { message, details }
             | Self::SpecUnboundVerifierPeer { message, details }

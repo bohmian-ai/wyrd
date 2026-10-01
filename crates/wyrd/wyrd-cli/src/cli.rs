@@ -6,6 +6,7 @@ use crate::auth::AuthCommand;
 use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
 use crate::eval::run::EvalCommand;
 use crate::gateway::GatewayCommand;
+use crate::operator_connection::OperatorConnectionCommand;
 use crate::platform::PlatformCommand;
 use crate::principal::PrincipalCommand;
 use crate::query::QueryCommand;
@@ -49,6 +50,9 @@ impl Cli {
             Command::Platform(command) => {
                 crate::platform::dispatch(command).await.map_err(Into::into)
             }
+            Command::OperatorConnection(command) => crate::operator_connection::dispatch(command)
+                .await
+                .map_err(Into::into),
             Command::Principal(command) => crate::principal::dispatch(command)
                 .await
                 .map_err(Into::into),
@@ -86,6 +90,9 @@ pub enum Command {
     /// Administer the platform control plane (credentials).
     #[command(subcommand)]
     Platform(PlatformCommand),
+    /// Manage the tenant's encrypted Operator provider connections.
+    #[command(subcommand)]
+    OperatorConnection(OperatorConnectionCommand),
     /// Manage Wyrd principals (revoke).
     #[command(subcommand)]
     Principal(PrincipalCommand),
@@ -177,7 +184,17 @@ mod tests {
     fn the_root_parser_refuses_every_former_secret_option_without_echo() {
         let secret = "wyrd-cli-sentinel-secret";
         let server = ["--server", "https://wyrd.example"];
-        let cases: [&[&str]; 12] = [
+        let cases: [&[&str]; 16] = [
+            &["operator-connection", "create", "--bot-token"],
+            &["operator-connection", "create", "--integration-key"],
+            &[
+                "operator-connection",
+                "update",
+                "--connection-id",
+                "0190d6a0-0000-7000-8000-000000000000",
+                "--token",
+            ],
+            &["operator-connection", "create", "--password"],
             &["auth", "issue-key", "--token"],
             &["auth", "trusted-issuer", "add", "--token"],
             &["auth", "trusted-issuer", "add", "--client-secret"],

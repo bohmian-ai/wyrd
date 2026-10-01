@@ -26,4 +26,11 @@ pub struct RefreshTokenRow {
     pub revoked_at: Option<DateTime<Utc>>,
     /// Human-readable revocation reason, for example `"rotated"` or `"reuse_detected"`.
     pub revoked_reason: Option<String>,
+    /// Tenant human connection a `user` session was established through;
+    /// `None` for machine rows. Rotation copies it to every successor, and
+    /// renewal is refused unless this exact connection is still Active.
+    pub human_connection_id: Option<Uuid>,
+    /// Revision of [`Self::human_connection_id`] at login; set exactly when
+    /// the id is.
+    pub human_connection_revision: Option<i64>,
 }

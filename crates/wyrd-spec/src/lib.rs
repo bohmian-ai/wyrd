@@ -20,6 +20,7 @@ pub mod graph;
 pub mod ids;
 pub mod intel;
 pub mod metadata;
+pub mod operator_connection;
 pub mod origin;
 pub mod query;
 pub mod redaction;

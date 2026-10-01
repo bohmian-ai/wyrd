@@ -2,7 +2,9 @@
 
 use secrecy::ExposeSecret;
 use sqlx::PgPool;
-use wyrd_spec::DataTenantId;
+use sqlx::types::Uuid;
+use wyrd_spec::auth::Sha256Hex;
+use wyrd_spec::{DataTenantId, TenantSlug};
 
 use crate::dsn::ResolvedDsns;
 use crate::dsn::WYRD_APP_ROLE;
@@ -173,6 +175,67 @@ impl WyrdPostgres {
         let result = TenantConn::acquire(&self.app, data_tenant_id).await;
         lifecycle.finish(&result);
         result
+    }
+
+    /// Resolve a URL tenant slug to its tenant id.
+    ///
+    /// This is the one slug resolver for tenant login, workload exchange, and
+    /// boot. A slug names no tenant yet, so the lookup runs on the audited
+    /// operator pool through
+    /// [`crate::queries::platform::tenant_resolver::resolve_by_slug`]; the
+    /// RLS app pool is never a fallback. Returns `None` when the slug is
+    /// unknown, suspended, or deleted.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::InsufficientPrivilege`] when no platform-admin
+    /// operator pool is configured, so pre-tenant resolution fails closed, and
+    /// otherwise the errors of
+    /// [`crate::queries::platform::tenant_resolver::resolve_by_slug`].
+    pub async fn resolve_tenant_slug(
+        &self,
+        slug: &TenantSlug,
+    ) -> Result<Option<DataTenantId>, SqlError> {
+        let operator = self
+            .operator_pool()
+            .ok_or_else(|| SqlError::InsufficientPrivilege {
+                detail: "tenant slug resolution requires the wyrd_platform_admin operator pool"
+                    .to_owned(),
+            })?;
+        crate::queries::platform::tenant_resolver::resolve_by_slug(&operator, slug).await
+    }
+
+    /// Resolve the tenant owning an unconsumed, unexpired login state.
+    ///
+    /// The common OIDC callback carries only the provider's `state`; it has no
+    /// tenant selector and never trusts `Host` or forwarded headers. The
+    /// SECURITY DEFINER function `wyrd.auth_login_state_tenant`, granted only
+    /// to the runtime `wyrd_app` role this handle's app pool connects as,
+    /// answers this one question across tenant RLS: the tenant id of the row
+    /// whose SHA-256 state hash is `state_hash`, or `None` when the state is
+    /// unknown, consumed, or expired. It exposes no other column, so the
+    /// caller learns only which tenant transaction to open.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when Postgres rejects the lookup and
+    /// [`SqlError::InvalidDataTenantId`] when the stored tenant id violates the
+    /// Wyrd tenant-id contract.
+    pub async fn login_state_tenant(
+        &self,
+        state_hash: &Sha256Hex,
+    ) -> Result<Option<DataTenantId>, SqlError> {
+        // Dynamic query is intentional: the definer function post-dates the
+        // SQLx offline bundle.
+        let tenant_uuid =
+            sqlx::query_scalar::<_, Option<Uuid>>("SELECT wyrd.auth_login_state_tenant($1)")
+                .bind(state_hash.as_bytes().as_slice())
+                .fetch_one(&self.app)
+                .await
+                .map_err(SqlError::from)?;
+
+        tenant_uuid
+            .map(DataTenantId::new)
+            .transpose()
+            .map_err(SqlError::InvalidDataTenantId)
     }
 }
 
@@ -357,5 +420,26 @@ mod telemetry_tests {
                 1
             );
         }
+    }
+
+    /// Without a platform-admin operator pool, slug resolution fails closed
+    /// before any IO rather than falling back to the RLS app pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_tenant_slug_without_operator_pool_fails_closed() {
+        let app = PgPoolOptions::new()
+            .connect_lazy("postgres://unused.invalid/none")
+            .expect("lazy pool builds without connecting");
+        let app_only = WyrdPostgres::from_pools(app, None);
+        let slug = wyrd_spec::TenantSlug::new("acme").expect("slug is valid");
+
+        let error = app_only
+            .resolve_tenant_slug(&slug)
+            .await
+            .expect_err("resolution must not fall back to the app pool");
+
+        assert!(matches!(
+            error,
+            crate::SqlError::InsufficientPrivilege { .. }
+        ));
     }
 }

@@ -1,9 +1,10 @@
-//! HTTP routes for the tenant auth surfaces: token exchange, OIDC callback,
-//! and Card-bound API key issuance.
+//! HTTP routes for the tenant auth surfaces: tenant human login initiation,
+//! token exchange, OIDC callback, and Card-bound API key issuance.
 
 use axum::Json;
 use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -12,7 +13,9 @@ use tower_governor::GovernorLayer;
 use tower_governor::governor::GovernorConfigBuilder;
 use uuid::Uuid;
 use wyrd_auth_verify::AccessTokenClaims;
-use wyrd_spec::auth::{CallbackQuery, IssueKeyRequest, TokenRequest, TokenResponse};
+use wyrd_spec::auth::{
+    CallbackQuery, IssueKeyRequest, LoginInitiation, TokenRequest, TokenResponse,
+};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::request_id::RequestId;
 
@@ -34,7 +37,19 @@ use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-/// Build auth routes.
+/// Build the tenant-plane auth router.
+///
+/// Mounts the four auth surfaces — human login initiation
+/// (`POST /auth/login`), the common OIDC provider callback
+/// (`GET /auth/callback`), credential exchange (`POST /auth/token`), and API
+/// key issuance (`POST /auth/issue-key`) — behind one shared per-peer-IP governor,
+/// so credential guessing and login-state churn draw on a single admission
+/// budget rather than one per route.
+///
+/// # Panics
+/// Panics when the static governor configuration is invalid (a zero period
+/// or burst). The values are compile-time constants, so this is an invariant
+/// rather than a runtime condition.
 pub fn auth_router() -> OpenApiRouter<AppState> {
     let auth_governor = Arc::new(
         GovernorConfigBuilder::default()
@@ -101,6 +116,7 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
     security(()),
     tag = "Auth"
 )]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -157,7 +173,7 @@ async fn token(
                 Err(error) => {
                     let wyrd = map_exchange_error_to_wyrd(&mut conn, &prefix, error).await;
                     audit_scope_mint_failure_best_effort(
-                        state.postgres.app_pool(),
+                        state.postgres.wyrd(),
                         parsed.tenant_id,
                         req_id,
                         MINT_KIND_API_KEY_EXCHANGE,
@@ -233,7 +249,7 @@ async fn token(
                     }
                     let wyrd = WyrdError::from(error);
                     audit_scope_mint_failure_best_effort(
-                        state.postgres.app_pool(),
+                        state.postgres.wyrd(),
                         tenant_id,
                         req_id,
                         MINT_KIND_REFRESH,
@@ -245,21 +261,6 @@ async fn token(
             };
             conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
-        }
-        TokenRequest::AuthorizationCode {
-            code,
-            state: login_state,
-        } => {
-            let request_id = req_id.to_owned();
-            let exchanged = exchange_authorization_code(
-                &state,
-                &headers,
-                code.into_secret_string(),
-                &login_state,
-                &request_id,
-            )
-            .await?;
-            Ok(Json(exchanged))
         }
         TokenRequest::JwtBearer { assertion, tenant } => {
             let exchanged = exchange_jwt_bearer(
@@ -275,11 +276,25 @@ async fn token(
     }
 }
 
-/// `GET /auth/callback` — complete an OIDC login and return the session.
+/// Static page a CLI-initiated login's browser tab shows once the callback
+/// has issued and stored the session. It carries no token, code, or state.
+const CLI_LOGIN_COMPLETE_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
+<title>Wyrd sign-in complete</title></head><body><p>Sign-in complete. You can return to your \
+terminal.</p></body></html>";
+
+/// `GET /auth/callback` — the common provider callback for tenant human login.
 ///
 /// Anonymous by construction: the caller is mid-login and has no Wyrd session
-/// yet. The opaque `state` generated at initiation is what binds the callback
-/// to that login, so a code presented without it is refused.
+/// yet. The opaque `state` generated at initiation is the only input that
+/// selects the tenant and connection; no header is consulted. On success the
+/// session is stored sealed for one-use redemption by the login's initiator,
+/// and the response carries neither a token nor the provider code: a browser
+/// login is redirected (`303`) to the fixed `{public_origin}/login/complete`
+/// route with no query string, and a CLI login receives a static page.
+///
+/// # Errors
+/// Returns problem JSON for every refusal of
+/// [`exchange_authorization_code`].
 #[utoipa::path(
     get,
     path = "/auth/callback",
@@ -288,23 +303,32 @@ async fn token(
         ("state" = String, Query, description = "Opaque login state Wyrd generated at initiation")
     ),
     responses(
-        (status = 200, description = "Login completed and a session issued", body = TokenResponse),
-        (status = 401, description = "The code or login state is not usable \
-          (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
-        (status = 503, description = "The identity provider or auth backend is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+        (status = 200, description = "A CLI-initiated login completed; the browser shows a static \
+          page and the CLI redeems the session", content_type = "text/html", body = String),
+        (status = 303, description = "A browser login completed; redirect to the fixed \
+          `/login/complete` route, which redeems the session with its flow cookie",
+          headers(("Location" = String, description = "`{public_origin}/login/complete`"))),
+        (status = 400, description = "The login state is unknown, expired, or replayed \
+          (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match \
+          (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no sealing key or public origin \
+          (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 401, description = "The code or ID token is not usable, or the login's \
+          connection changed (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
+        (status = 503, description = "The identity provider, auth backend, or audit path is \
+          unavailable (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE, \
+          WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
     // No session exists yet at this operation, so it clears the document-wide
     // requirement instead of inheriting it.
     security(()),
     tag = "Auth"
 )]
+#[tracing::instrument(level = "debug", skip_all)]
 async fn callback(
     State(state): State<AppState>,
-    headers: HeaderMap,
     request_id: Option<Extension<RequestId>>,
     Query(query): Query<CallbackQuery>,
-) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
+) -> Result<Response, WyrdErrorResponse> {
     let request_id_str;
     let req_id = match request_id.as_ref() {
         Some(Extension(id)) => id.as_str(),
@@ -313,15 +337,27 @@ async fn callback(
             &request_id_str
         }
     };
-    let exchanged = exchange_authorization_code(
+    let completed = exchange_authorization_code(
         &state,
-        &headers,
         query.code.into_secret_string(),
         &query.state,
         req_id,
     )
     .await?;
-    Ok(Json(exchanged))
+    match completed {
+        LoginInitiation::Browser(_) => {
+            let connections = state
+                .auth
+                .human_connections
+                .as_ref()
+                .ok_or_else(auth_not_configured)?;
+            let location = connections
+                .completion_url()
+                .map_err(WyrdErrorResponse::from)?;
+            Ok(Redirect::to(location.as_str()).into_response())
+        }
+        LoginInitiation::Cli(_) => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
+    }
 }
 
 /// `POST /auth/issue-key` — mint a Card-bound API key for an existing principal.

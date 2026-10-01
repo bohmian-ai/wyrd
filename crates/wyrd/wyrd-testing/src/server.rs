@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -43,6 +45,7 @@ use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
 use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
+use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -54,17 +57,18 @@ use wyrd_auth_verify::{
 };
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_crypt::SecretKey;
+use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::BuiltinEndpoints;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
-use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
+use wyrd_server::boot::{build_workload_bindings, rewrap_sealed_secrets};
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
-    GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, ServeMode, WorkloadBindingEntry,
+    GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, OperatorKeySource, OperatorKeysConfig,
+    ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -180,6 +184,8 @@ pub struct WyrdTestServer {
 
 struct WyrdTestServerInner {
     fixture: Arc<PgFixture>,
+    /// Lifetime guard of the generated Operator key directory, when used.
+    operator_keys_dir: Option<TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
     _storage_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
@@ -396,6 +402,10 @@ pub struct WyrdTestServerBuilder {
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
+    /// Provider-secret sealing keyring; `None` uses the deterministic test key.
+    sealing_keyring: Option<Arc<SealingKeyring>>,
+    /// Deployment public origin the human-connection callback URL derives from.
+    public_origin: Option<Url>,
     forge_interval: Duration,
     /// Executor slots composed into the production Forge worker.
     wal_sync_delay: Duration,
@@ -485,6 +495,8 @@ pub struct WyrdTestServerBuilder {
     mcp_context_probe: bool,
     /// Keep the server's audit publisher from retiring staged audit rows.
     audit_publication_disabled: bool,
+    /// Operator connection key source; `None` generates a file key.
+    operator_keys: Option<OperatorKeysConfig>,
 }
 
 /// Test-only file paths for one replica's Bifrost peer identity and trust root.
@@ -561,6 +573,8 @@ impl Default for WyrdTestServerBuilder {
             auth_verify_settings: None,
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
+            sealing_keyring: None,
+            public_origin: None,
             forge_interval: Duration::from_secs(60),
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
@@ -603,12 +617,35 @@ impl Default for WyrdTestServerBuilder {
             serve_task_panic_for_test: false,
             mcp_context_probe: false,
             audit_publication_disabled: false,
+            operator_keys: None,
         }
     }
 }
 
 /// Result of a fixture-path principal bootstrap.
 pub use crate::principal::Bootstrap;
+
+/// Write key version 1 as an owner-only file in a fresh directory and return
+/// the file-sourced Operator key config over it.
+///
+/// # Errors
+/// Returns [`WyrdTestServerError::Start`] when the directory or file cannot
+/// be created.
+fn generated_operator_keys() -> Result<(OperatorKeysConfig, Option<TempDir>), WyrdTestServerError> {
+    let start = |error: std::io::Error| WyrdTestServerError::Start(error.to_string());
+    let dir = tempfile::tempdir().map_err(start)?;
+    let mut key = [0_u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut key);
+    let path = dir.path().join("v1");
+    std::fs::write(&path, base64::engine::general_purpose::STANDARD.encode(key)).map_err(start)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(start)?;
+    let config = OperatorKeysConfig {
+        source: OperatorKeySource::File,
+        dir: Some(dir.path().to_path_buf()),
+        ..OperatorKeysConfig::default()
+    };
+    Ok((config, Some(dir)))
+}
 
 /// Test server errors.
 #[derive(Debug, Error)]
@@ -762,6 +799,30 @@ impl WyrdTestServer {
             .start_with_resources(fixture, storage, storage_root)
             .await?
             .bind()
+            .await
+    }
+
+    /// Start `builder` as a second in-process replica over this server's
+    /// Postgres fixture and artifact storage, leaving this server running.
+    ///
+    /// The replica builds its own application state, auth handles, and
+    /// sealing keyring from `builder`, so a journey can prove that durable
+    /// state written through one replica is served by another without a
+    /// restart, and that replicas holding different keyrings interoperate
+    /// during sealing-key rotation.
+    ///
+    /// # Errors
+    /// Returns an error when the replica fails to start.
+    pub async fn start_replica(
+        &self,
+        builder: WyrdTestServerBuilder,
+    ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        builder
+            .start_with_resources(
+                Arc::clone(&self.inner.fixture),
+                Arc::clone(&self.inner.state.storage),
+                self.inner._storage_root.clone(),
+            )
             .await
     }
 
@@ -2867,6 +2928,29 @@ impl WyrdTestServer {
         Ok(tenant_id)
     }
 
+    /// Return the raw sealed client secret of the tenant's human connection in
+    /// `state` (`Active` or `Candidate`).
+    ///
+    /// Reads the stored column byte-for-byte through a [`TenantConn`], so a
+    /// journey can assert ciphertext at rest and which sealing key a rotation
+    /// left it under. Returns `None` when no such connection exists or it
+    /// stores no secret.
+    ///
+    /// # Errors
+    /// Returns an error when the query fails.
+    pub async fn human_connection_secret_ciphertext(
+        &self,
+        tenant_id: DataTenantId,
+        state: &str,
+    ) -> Result<Option<Vec<u8>>, WyrdTestServerError> {
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        let row = wyrd_sql::queries::auth::human_connection_in_state(&mut conn, state)
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(row.and_then(|row| row.client_secret_enc))
+    }
+
     /// Return the raw `client_secret_enc` ciphertext for a trusted issuer.
     ///
     /// Opens a [`TenantConn`] on the supplied tenant and reads the stored
@@ -3364,6 +3448,13 @@ impl WyrdTestServer {
         Some(self.inner.bifrost_data_root.wal())
     }
 
+    /// Directory of the generated owner-only Operator key files (`v1`, ...),
+    /// or `None` when the builder supplied its own key source.
+    #[must_use]
+    pub fn operator_keys_dir_for_test(&self) -> Option<&Path> {
+        self.inner.operator_keys_dir.as_ref().map(TempDir::path)
+    }
+
     async fn raw_call(
         &self,
         mut req: Request<Body>,
@@ -3728,6 +3819,18 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Read Operator connection keys from `config` instead of the default
+    /// generated owner-only file key version 1.
+    ///
+    /// A multi-replica rotation journey points a second server at the first
+    /// server's [`WyrdTestServer::operator_keys_dir_for_test`] with a newer
+    /// active version.
+    #[must_use]
+    pub fn with_operator_keys_for_test(mut self, config: OperatorKeysConfig) -> Self {
+        self.operator_keys = Some(config);
+        self
+    }
+
     /// Keep the server's audit publisher from starting.
     ///
     /// A journey that asserts on `vala.audit_staging` rows opts in: the
@@ -3881,6 +3984,26 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_trusted_issuer_configs(mut self, configs: Vec<IssuerEntry>) -> Self {
         self.trusted_issuer_configs = configs;
+        self
+    }
+
+    /// Seal provider client secrets with `keyring` instead of the
+    /// deterministic test key.
+    ///
+    /// Start runs the production sealed-secret rewrap with this keyring, the
+    /// way a booting replica does, so a server started with a new write key
+    /// and the old key retained converges stored ciphertext onto the new key.
+    #[must_use]
+    pub fn with_sealing_keyring(mut self, keyring: Arc<SealingKeyring>) -> Self {
+        self.sealing_keyring = Some(keyring);
+        self
+    }
+
+    /// Configure the deployment public origin; the tenant human-connection
+    /// callback URL is `{origin}/auth/callback`.
+    #[must_use]
+    pub fn with_public_origin(mut self, origin: Url) -> Self {
+        self.public_origin = Some(origin);
         self
     }
 
@@ -4196,9 +4319,20 @@ impl WyrdTestServerBuilder {
         // client secret on write and decrypts it on read. The production Pg
         // resolvers then serve issuers/bindings per-request, including on the
         // verifier's external (foreign-OIDC) path.
-        let sealing_key = Arc::new(SecretKey::from_bytes([9_u8; 32]));
+        let sealing_key = self
+            .sealing_keyring
+            .clone()
+            .unwrap_or_else(|| Arc::new(SealingKeyring::new(SecretKey::from_bytes([9_u8; 32]))));
+        // The same boot step production runs: always rewrap, logging (not
+        // failing on) a rewrap error while a key is configured.
+        rewrap_sealed_secrets(
+            Some(fixture.operator_pool().clone()),
+            Some(Arc::clone(&sealing_key)),
+        )
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         seed_trusted_issuers(
-            runtime_wyrd.app_pool(),
+            &runtime_wyrd,
             tenant_id,
             &self.trusted_issuer_configs,
             Some(sealing_key.as_ref()),
@@ -4207,17 +4341,15 @@ impl WyrdTestServerBuilder {
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let bindings = build_workload_bindings(&self.workload_binding_configs, tenant_id)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        seed_workload_bindings(runtime_wyrd.app_pool(), tenant_id, &bindings)
+        seed_workload_bindings(&runtime_wyrd, tenant_id, &bindings)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
         let issuer_resolver = Arc::new(PgIssuerResolver::new(
-            Arc::new(runtime_wyrd.app_pool().clone()),
+            runtime_wyrd.clone(),
             Some(Arc::clone(&sealing_key)),
         ));
-        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
-            runtime_wyrd.app_pool().clone(),
-        )));
+        let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(runtime_wyrd.clone()));
 
         let verifier = Arc::new(TokenVerifier::new(
             decoding_keys,
@@ -4243,6 +4375,12 @@ impl WyrdTestServerBuilder {
             TokenExchangeSettings::default()
         };
 
+        let human_connections = HumanConnections::new(
+            runtime_wyrd.clone(),
+            Some(Arc::clone(&sealing_key)),
+            DeploymentProfile::Development.screened_http(),
+            self.public_origin.as_ref(),
+        );
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
         let resource_roles = self
             .bifrost_roles
@@ -4440,6 +4578,7 @@ impl WyrdTestServerBuilder {
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
+                human_connections: Some(human_connections),
             })
             .with_gateway(test_gateway_config(
                 fixture.data_tenant_id(),
@@ -4480,11 +4619,20 @@ impl WyrdTestServerBuilder {
         state.authz.permission_check = Arc::new(RbacCheck);
         let (forge_publisher, _forge_inbox) = staging_file_channel(16)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let (operator_keys, operator_keys_dir) = match self.operator_keys.take() {
+            Some(config) => (config, None),
+            None => generated_operator_keys()?,
+        };
+        state = state.with_operator_keys(
+            wyrd_server::components::operators::keys::OperatorKeys::new(operator_keys)
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
         let router = build_router(state.clone());
 
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
                 fixture,
+                operator_keys_dir,
                 _storage_root: storage_root,
                 _bifrost_data_dir: data_dir,
                 bifrost_data_root,

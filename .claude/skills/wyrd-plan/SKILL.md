@@ -97,6 +97,10 @@ guidance, not an implementation allowlist.
 ## Verification and Evidence
 
 The focused and broader repository-native checks that can prove completion.
+If `mise run gate` is the final aggregate, list it once instead of also
+listing its component `mise` lanes. Keep exact named-test commands for
+Red-Green iteration and identify a separate final lane only when `mise.toml`
+shows that the gate does not cover the required proof.
 
 ## Material Stop Conditions
 

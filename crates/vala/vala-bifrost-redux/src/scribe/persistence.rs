@@ -1839,7 +1839,7 @@ impl PersistenceWorker {
     /// record that makes them a query source is published, and only then does
     /// the stream manifest advance — which is what allows the WAL behind those
     /// rows to be retired. Assembly and fenced publication are not part of this
-    /// path: the lifecycle tick publishes due claims through
+    /// path: the server's publisher tick publishes due claims through
     /// [`PersistenceRuntime::publish_due`], so a claim merge never holds a
     /// generation, its shard, or shutdown's final flush.
     ///

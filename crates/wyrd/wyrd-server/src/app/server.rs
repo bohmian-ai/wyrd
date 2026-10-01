@@ -552,28 +552,42 @@ impl BoundServer {
             .bifrost_ingest()
             .map(|runtime| Arc::clone(runtime.scribe()))
         {
-            let shutdown = shutdown.clone();
+            let scanner_shutdown = shutdown.clone();
+            let scanner = Arc::clone(&scribe);
             set.spawn(worker_task(
                 TaskId::Worker("scribe_lifecycle_scanner"),
                 async move {
-                    // Seal age, object target, and staging dwell are all
-                    // enforced by this tick whether or not new writes arrive.
-                    // Shutdown stops a publication in flight: its claim and
-                    // members stay staged and restart publishes them.
+                    // Seal age and ingress pressure are enforced by this tick
+                    // whether or not new writes arrive. It never waits on a
+                    // publication, so a long claim merge cannot stop sealing.
+                    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+                    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tokio::select! {
+                            _ = scanner_shutdown.cancelled() => break,
+                            _ = ticks.tick() => scanner.check_age(std::time::Instant::now()),
+                        }
+                    }
+                },
+            ));
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("scribe_publisher"),
+                async move {
+                    // Object target and staging dwell are enforced by this
+                    // tick. Shutdown stops a publication in flight: its claim
+                    // and members stay staged and restart publishes them.
                     let mut ticks = tokio::time::interval(Duration::from_secs(1));
                     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
                             _ = shutdown.cancelled() => break,
-                            _ = ticks.tick() => {
-                                scribe.check_age(std::time::Instant::now());
-                                tokio::select! {
-                                    _ = shutdown.cancelled() => break,
-                                    result = scribe.publish_due() => if let Err(error) = result {
-                                        tracing::warn!(%error, "Scribe due publication failed; next tick retries");
-                                    },
-                                }
-                            }
+                            _ = ticks.tick() => tokio::select! {
+                                _ = shutdown.cancelled() => break,
+                                result = scribe.publish_due() => if let Err(error) = result {
+                                    tracing::warn!(%error, "Scribe due publication failed; next tick retries");
+                                },
+                            },
                         }
                     }
                 },

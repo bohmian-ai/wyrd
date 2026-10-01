@@ -1465,9 +1465,10 @@ impl ScribeImpl {
 
     /// Publishes every staged claim whose target or dwell has made it due.
     ///
-    /// The server's lifecycle scanner calls this once per tick, after
-    /// [`Self::check_age`], so a staged key whose writes stopped still
-    /// publishes once its dwell expires instead of waiting for another durable
+    /// The server's publisher calls this once per tick, in its own loop beside
+    /// the [`Self::check_age`] scanner so a long claim merge never delays age
+    /// or pressure seals. A staged key whose writes stopped still publishes
+    /// once its dwell expires instead of waiting for another durable
     /// generation or for shutdown. Returns the number of claims published; a
     /// Scribe without persistence or staging publishes nothing.
     ///

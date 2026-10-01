@@ -556,10 +556,10 @@ impl BoundServer {
             set.spawn(worker_task(
                 TaskId::Worker("scribe_lifecycle_scanner"),
                 async move {
-                    // Seal age and staging dwell are wall-clock bounds, so this
-                    // tick drives both whether or not new writes arrive. A
-                    // publication in flight finishes before the supervised
-                    // drain hands off to Scribe's own shutdown.
+                    // Seal age, object target, and staging dwell are all
+                    // enforced by this tick whether or not new writes arrive.
+                    // Shutdown stops a publication in flight: its claim and
+                    // members stay staged and restart publishes them.
                     let mut ticks = tokio::time::interval(Duration::from_secs(1));
                     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
@@ -567,8 +567,11 @@ impl BoundServer {
                             _ = shutdown.cancelled() => break,
                             _ = ticks.tick() => {
                                 scribe.check_age(std::time::Instant::now());
-                                if let Err(error) = scribe.publish_due().await {
-                                    tracing::warn!(%error, "Scribe due publication failed; next tick retries");
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => break,
+                                    result = scribe.publish_due() => if let Err(error) = result {
+                                        tracing::warn!(%error, "Scribe due publication failed; next tick retries");
+                                    },
                                 }
                             }
                         }

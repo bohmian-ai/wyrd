@@ -949,11 +949,10 @@ impl PersistenceRuntime {
 
     /// Publishes every staged claim that target or dwell has made due.
     ///
-    /// A generation becoming durable already publishes the claims it made due,
-    /// but a key that stops receiving writes never produces another durable
-    /// generation, so its dwell would never be re-evaluated. The server's
-    /// lifecycle scanner calls this on its tick so dwell is a wall-clock bound
-    /// that holds without new data. A pod without a persistence worker or a
+    /// This is the only path that publishes target and dwell claims. The
+    /// server's lifecycle scanner calls it on its tick, so target publication
+    /// waits at most one tick and dwell is a wall-clock bound that holds
+    /// without new data. A pod without a persistence worker or a
     /// staging volume publishes nothing and reports zero.
     ///
     /// # Errors
@@ -1190,6 +1189,12 @@ struct PersistenceWorker {
     wal: Arc<WalWriter>,
     /// Bounded CPU lane used for Parquet encoding.
     persistence_cpu: ScribePersistenceCpuPool,
+    /// One-thread lane that runs claim merges.
+    ///
+    /// A merge can take tens of seconds; on its own thread it never queues
+    /// generation staging, so ingest and shutdown's final flush do not wait on
+    /// it. Claims publish one at a time, so one thread is the whole demand.
+    assembly_cpu: ScribePersistenceCpuPool,
     /// Bounded filesystem lane used for manifest advancement.
     wal_io: ScribeWalIoPool,
     /// Scribe memory budget for persistence workspace reservations.
@@ -1209,20 +1214,6 @@ struct PersistenceWorker {
     /// without the operator capability publication requires; such a worker
     /// refuses durable work rather than persisting through a second path.
     staging: Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>>,
-}
-
-/// What one settled generation left behind on the staging volume.
-///
-/// A generation completes at the staged boundary, not at publication: its
-/// member is durable and servable, and the claims listed here are the ones that
-/// happened to become due while it settled. An empty list is the normal steady
-/// state for a key that is still filling toward its object target.
-#[derive(Debug)]
-pub(crate) struct StagedGenerationOutcome {
-    /// Identity of the durable member this generation became.
-    pub(crate) member: crate::scribe::assembly::StagedMemberId,
-    /// Commit keys of every claim published while this generation settled.
-    pub(crate) published: Vec<FileListCommitKey>,
 }
 
 /// Separate Scribe mover that uploads finalized stages but owns no catalog decision.
@@ -1633,6 +1624,12 @@ impl PersistenceWorker {
     }
 
     /// Builds a persistence worker from its complete durable dependencies.
+    ///
+    /// Also starts the worker's own claim-merge lane.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the claim-merge thread cannot be started.
     fn new(
         operator_pool: Option<vala_sql::OperatorPool>,
         failures: Arc<Mutex<Vec<String>>>,
@@ -1646,6 +1643,7 @@ impl PersistenceWorker {
             actor_stream: context.actor_stream,
             wal: context.wal,
             persistence_cpu: context.persistence_cpu,
+            assembly_cpu: ScribePersistenceCpuPool::new_with_capacity(1, 1),
             wal_io: context.wal_io,
             memory: context.memory,
             staging_file_publisher: context.staging_file_publisher,
@@ -1743,9 +1741,9 @@ impl PersistenceWorker {
             .ok()
             .and_then(|mut identity| identity.take());
         let completion = match result {
-            Ok(outcome) => PersistenceCompletion {
+            Ok(member) => PersistenceCompletion {
                 generation_id: generation.generation_id,
-                staged: Some(Self::record_published_claims(&generation, &outcome)),
+                staged: Some(member),
                 wal_segments: generation.wal_segments.clone(),
                 wal: generation.wal.clone(),
                 arrow_bytes: generation.arrow_bytes,
@@ -1775,31 +1773,9 @@ impl PersistenceWorker {
         &self,
         generation: &Arc<ImmutableGeneration>,
         job: &PersistenceJob,
-    ) -> Result<StagedGenerationOutcome, ScribeError> {
+    ) -> Result<crate::scribe::assembly::StagedMemberId, ScribeError> {
         self.persist_once(generation, &job.binding, job.defer_manifest_advance)
             .await
-    }
-
-    /// Logs the claims one settled generation published and returns its member.
-    ///
-    /// Publishing is decoupled from staging, so the log names the generation
-    /// that happened to make those claims due rather than any one of their
-    /// members. Zero is the normal steady state for a key still filling toward
-    /// its object target; the published-claims counter is recorded where each
-    /// claim publishes, in `publish_due_claims`.
-    fn record_published_claims(
-        generation: &ImmutableGeneration,
-        outcome: &StagedGenerationOutcome,
-    ) -> crate::scribe::assembly::StagedMemberId {
-        if !outcome.published.is_empty() {
-            tracing::info!(
-                shard_id = generation.shard_id,
-                member_generation = generation.generation_id.0,
-                claims = outcome.published.len(),
-                "Scribe staged members published as hot objects"
-            );
-        }
-        outcome.member
     }
 
     /// Delivers one completion to the owning shard and resolves its visibility span.
@@ -1856,15 +1832,16 @@ impl PersistenceWorker {
         tracing::debug!(generation_id, "persistence job finished");
     }
 
-    /// Stages one generation durably, then publishes whatever claim it completes.
+    /// Stages one generation durably and returns the member it became.
     ///
     /// The ordering is the durable contract. The generation's rows are sorted,
     /// encoded, fsynced and preflighted onto the staging volume, the staged
     /// record that makes them a query source is published, and only then does
     /// the stream manifest advance — which is what allows the WAL behind those
-    /// rows to be retired. Assembly and fenced publication happen after that
-    /// boundary and may span several generations, so a member whose claim has
-    /// not yet filled is durable, servable, and WAL-free while it waits.
+    /// rows to be retired. Assembly and fenced publication are not part of this
+    /// path: the lifecycle tick publishes due claims through
+    /// [`PersistenceRuntime::publish_due`], so a claim merge never holds a
+    /// generation, its shard, or shutdown's final flush.
     ///
     /// Each costed stage records its elapsed time into
     /// `bifrost_scribe_persist_stage_seconds{stage}` via [`record_persist_stage`]
@@ -1875,22 +1852,20 @@ impl PersistenceWorker {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when this pod owns no staging capability, when
-    /// the recipe cannot be resolved, when staging, record publication, or
-    /// manifest advancement fails, or when a due claim cannot be merged or
-    /// published.
+    /// the recipe cannot be resolved, or when staging, record publication, or
+    /// manifest advancement fails.
     ///
     /// # Cancellation
     ///
     /// Cancellation before the staged record leaves a member directory that
     /// startup cleanup removes. Cancellation after it leaves a durable member
-    /// that a later claim publishes. Cancellation during publication leaves
-    /// uploaded objects and a publication manifest that a retry converges on.
+    /// that a later claim publishes.
     async fn persist_once(
         &self,
         generation: &Arc<ImmutableGeneration>,
         binding: &TenantTableBinding,
         defer_manifest_advance: bool,
-    ) -> Result<StagedGenerationOutcome, ScribeError> {
+    ) -> Result<crate::scribe::assembly::StagedMemberId, ScribeError> {
         let generation_id = generation.generation_id.0;
         let frozen = generation.frozen_snapshot();
         let staged = self.stage_member(generation, binding, &frozen).await;
@@ -1904,8 +1879,7 @@ impl PersistenceWorker {
             self.advance_manifest(generation).await?;
         }
         tracing::debug!(generation_id, "generation is durable on the staging volume");
-        let published = self.publish_due_claims().await?;
-        Ok(StagedGenerationOutcome { member, published })
+        Ok(member)
     }
 
     /// Encodes and registers one frozen generation as a durable staged member.
@@ -1989,11 +1963,10 @@ impl PersistenceWorker {
 
     /// Publishes every claim that target or dwell has made due.
     ///
-    /// Runs after each generation becomes durable, so a key that has reached
-    /// target publishes as soon as the member that completed it is durable, and
-    /// from [`PersistenceRuntime::publish_due`] on the server's lifecycle tick,
-    /// so a key whose writes stopped still publishes once its dwell expires.
-    /// Concurrent callers are safe: the assembler hands each due claim to
+    /// Runs from [`PersistenceRuntime::publish_due`] on the server's lifecycle
+    /// tick, so a key that reached target publishes within one tick and a key
+    /// whose writes stopped still publishes once its dwell expires. Concurrent
+    /// callers are safe: the assembler hands each due claim to
     /// exactly one caller. Every published claim counts once in
     /// `bifrost_scribe_staging_claims_published_total`.
     ///
@@ -2215,7 +2188,7 @@ impl PersistenceWorker {
         tracing::debug!(claim = %claim.id(), stage = "assemble_claim", "persist stage start");
         let assemble_started = std::time::Instant::now();
         let assembled = match self
-            .persistence_cpu
+            .assembly_cpu
             .submit(ScribePersistenceCpuOp::AssembleClaim(Box::new(
                 crate::scribe::execution_lanes::AssembleClaimOp {
                     claim: Box::new(claim.clone()),

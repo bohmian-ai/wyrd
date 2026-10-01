@@ -1,6 +1,6 @@
 ---
 id: SPEC-opitimization-and-benchmarks
-revision: 2
+revision: 3
 status: draft
 ---
 
@@ -14,7 +14,7 @@ publication) have to perform like a real OLAP engine. Today we have one
 internal capacity benchmark and no comparison against an external reference.
 
 Bifrost is both an analytical store and an observability store, so this
-change measures it against ClickHouse in both roles. It does three things:
+change measures it in both roles. It does three things:
 
 1. It reproduces the ClickHouse benchmark (ClickBench) in full against the real
    production `wyrd-server`, with ClickHouse run on the same machine. The
@@ -22,10 +22,10 @@ change measures it against ClickHouse in both roles. It does three things:
    compare directly with ClickHouse's.
 2. It adds an observability benchmark that ClickBench does not cover: ingest
    rate per core (rows/s and MB/s), compression ratio, and query latency over
-   fixed time windows on logs, traces, and metrics. ClickHouse ingests and
-   queries the same data on the same machine.
-3. It optimizes Bifrost reads and writes until both benchmarks meet the target
-   ratios in this specification. Bifrost does not have to beat ClickHouse. It
+   fixed time windows on logs, traces, and metrics. This benchmark measures
+   Bifrost alone against absolute targets; ClickHouse is not run on it.
+3. It optimizes Bifrost reads and writes until both benchmarks meet the
+   targets in this specification. Bifrost does not have to beat ClickHouse. It
    has to come within the stated ratios.
 
 ClickBench deliberately leaves out concurrency, writes during reads, tail
@@ -87,9 +87,8 @@ rules, and dataset must match that commit.
 
 **REQ-002 — Query semantics.** Bifrost runs each query in its own SQL dialect,
 but every query must return the same answer as the ClickBench original. The
-harness takes a query's text from the pinned DataFusion ClickBench entry where
-one exists, and records every textual difference from the ClickHouse query. It
-compares each Bifrost result with ClickHouse's result on the same data. A
+harness translates each pinned ClickHouse query into Bifrost SQL and records
+every textual difference. It compares each Bifrost result with ClickHouse's result on the same data. A
 mismatch fails the run, with one exception: queries whose ClickBench text has
 no deterministic order or tie-break are compared as sets, and the harness lists
 every such query.
@@ -223,14 +222,13 @@ trees, and metric series, over a fixed time span. The dataset is either public
 or generated deterministically from a recorded seed (decision D-11). Its scale
 is fixed by decision D-12. Every run checks the dataset's row counts and
 checksum before loading. Bifrost receives it through its canonical observation
-tables (`vala.logs`, `vala.traces`, `vala.metrics`). ClickHouse receives it in
-the schema of the pinned ClickHouse OpenTelemetry exporter (`otel_logs`,
-`otel_traces`, `otel_metrics_*`). Both systems load the same records.
+tables (`vala.logs`, `vala.traces`, `vala.metrics`). Because the dataset is
+generated, the generator also produces the expected answer for every REQ-016
+query.
 
-**REQ-014 — Ingest rate per core.** The benchmark loads the dataset into each
-system in the REQ-004 envelope. Bifrost is loaded through the public client
-with default server settings (REQ-003). ClickHouse is loaded through the ingest
-path chosen in decision D-13. For each system and signal, the report gives:
+**REQ-014 — Ingest rate per core.** The benchmark loads the dataset into
+Bifrost in the REQ-004 envelope, through the public client with default server
+settings (REQ-003). For each signal, the report gives:
 
 - rows per second per core, which is rows divided by the server's CPU-seconds
   over the load, read from the server's cgroup;
@@ -238,17 +236,14 @@ path chosen in decision D-13. For each system and signal, the report gives:
 - wall-clock rows/s and MB/s;
 - peak server memory.
 
-Raw input bytes are the uncompressed size of the dataset in the one neutral
-encoding chosen in decision D-14. Both systems count the same bytes. Bifrost's
-server CPU includes its Postgres catalog. Client and load-generator CPU is
-excluded for both systems and reported separately. As in REQ-007, the load is
+Raw input bytes are the uncompressed size of the dataset in the encoding
+chosen in decision D-13. Server CPU includes the Postgres catalog. Client and
+load-generator CPU is excluded and reported separately. As in REQ-007, the load is
 complete when every row is acknowledged and visible in the published cut.
 
-**REQ-015 — Compression ratio.** For each system and signal, compression ratio
-is raw input bytes (REQ-014) divided by the bytes on disk once the data has
-settled. Bifrost bytes follow the REQ-008 accounting. ClickHouse bytes are the
-compressed size of the table's active parts from `system.parts`, measured
-after its merges settle.
+**REQ-015 — Compression ratio.** For each signal, compression ratio is raw
+input bytes (REQ-014) divided by the bytes on disk once compaction has
+settled, using the REQ-008 accounting.
 
 **REQ-016 — Fixed time-window queries.** A fixed, versioned query set runs
 over windows anchored at the dataset's end time: the last 5 minutes, 1 hour,
@@ -262,15 +257,15 @@ and 24 hours. The set covers the typical observability reads:
 
 Each query and window runs once cold (as in REQ-001) and then enough warm
 repetitions for stable percentiles; the default is 100. The report gives cold
-time and warm p50, p95, and p99 per query and window, for both systems. As in
-REQ-002, results must match ClickHouse's on the same data.
+time and warm p50, p95, and p99 per query and window. Every result must match
+the generator's expected answer (REQ-013).
 
 **REQ-017 — Observability output and invocation.** The observability
-benchmark meets REQ-003, REQ-004, REQ-005, and REQ-009 the same way ClickBench
-does: real production server, the same envelope, a pinned ClickHouse release,
-and one opt-in `mise` task that exits nonzero on a missed target or a wrong
-result. It writes a machine-readable result per system alongside the
-ClickBench outputs, plus the human-readable report.
+benchmark meets REQ-003, REQ-004, and REQ-009 the same way ClickBench does:
+real production server, the same envelope, and one opt-in `mise` task that
+exits nonzero on a missed target or a wrong result. It writes a
+machine-readable result alongside the ClickBench outputs, plus the
+human-readable report.
 
 ## Invariants
 
@@ -306,8 +301,9 @@ These hold whatever the architecture documents say:
 
 ## Expensive-to-reverse decisions fixed here
 
-- ClickHouse is measured in the same envelope, and the ratios are judged
-  against that run, not against published numbers (REQ-004, REQ-005).
+- ClickBench ratios are judged against ClickHouse measured in the same
+  envelope, not against published numbers (REQ-004, REQ-005). The
+  observability benchmark uses absolute targets and runs Bifrost only.
 - The benchmark uses only the public, default-configured server and public
   client surfaces (REQ-003, REQ-012).
 - Load time includes publication. Data size counts the published table
@@ -315,13 +311,13 @@ These hold whatever the architecture documents say:
 - The benchmark has three evidence classes, and each is required: ClickBench,
   the observability benchmark, and the internal capacity benchmark (REQ-010,
   REQ-013 to REQ-017).
-- Per-core ingest counts server CPU only. Raw bytes use one neutral encoding
-  shared by both systems (REQ-014).
+- Per-core ingest counts server CPU only (REQ-014).
 
 ## Acceptance criteria
 
-All ratios are Bifrost divided by ClickHouse from the same host and envelope,
-using the ClickBench `+0.01 s` scoring. The proposed targets need owner
+AC-2 to AC-6 are Bifrost divided by ClickHouse from the same host and
+envelope, using the ClickBench `+0.01 s` scoring. AC-8 to AC-12 are absolute
+targets on Bifrost alone, in the REQ-004 envelope. The proposed targets need owner
 confirmation (D-1).
 
 | ID | Criterion | Proposed target |
@@ -333,11 +329,11 @@ confirmation (D-1).
 | AC-5 | Load-time ratio (REQ-007) | ≤ 2.0× |
 | AC-6 | Data-size ratio (REQ-008) | ≤ 1.5× |
 | AC-7 | Internal capacity benchmark at 8 CPU/16 GiB: selective p50 at 1 client, ingest rows/s, and every existing row | p50 ≤ 2 ms, ingest ≥ 1.0M rows/s, no regression of other rows |
-| AC-8 | Observability ingest rows/s per core, Bifrost ÷ ClickHouse, per signal (REQ-014) | ≥ 0.5× |
-| AC-9 | Observability ingest MB/s per core, Bifrost ÷ ClickHouse, per signal (REQ-014) | ≥ 0.5× |
-| AC-10 | Compression ratio, Bifrost ÷ ClickHouse, per signal (REQ-015) | ≥ 0.67× (stored bytes ≤ 1.5×) |
-| AC-11 | Time-window warm p50 and p95 ratio, every query and window (REQ-016) | p50 ≤ 2.0×, p95 ≤ 2.5× |
-| AC-12 | Time-window warm p99 ratio, every query and window, with answers matching ClickHouse | p99 ≤ 3.0×; 100% of answers match |
+| AC-8 | Observability ingest rows/s per core, per signal (REQ-014) | logs ≥ 150k, spans ≥ 100k, metric points ≥ 300k |
+| AC-9 | Observability ingest MB/s per core, per signal (REQ-014) | ≥ 50 MB/s per core |
+| AC-10 | Compression ratio, per signal (REQ-015) | logs ≥ 10×, traces ≥ 8×, metrics ≥ 10× |
+| AC-11 | Time-window warm p50 and p95, every query (REQ-016) | 5 min: p95 ≤ 50 ms; 1 h: p95 ≤ 200 ms; 24 h: p95 ≤ 1 s; trace-id lookup p95 ≤ 20 ms at every window |
+| AC-12 | Time-window warm p99, every query, with answers matching the generator | p99 ≤ 2× the AC-11 p95 target; 100% of answers match |
 
 **Evidence classes.** For each AC, the evidence is:
 
@@ -350,9 +346,6 @@ confirmation (D-1).
 - the capacity-benchmark report;
 - the existing Bifrost journey and correctness lanes passing (INV-1 to INV-5).
 
-Unlike the ClickBench rows, AC-8 to AC-12 compare raw measurements, with no
-`+0.01 s` constant. For AC-11 and AC-12, a ClickHouse time under 1 ms is
-counted as 1 ms.
 
 ## Open decisions
 
@@ -361,11 +354,10 @@ default.
 
 1. **D-1 — Target ratios.** Confirm or change the AC-2 to AC-12 targets.
    Recommended: the values in the table. A 2× hot geomean puts Bifrost among
-   DataFusion-class engines on ClickBench. The cold target is looser because
-   Iceberg and object-store metadata cost the most on a cold start. Ingest is
-   held to 0.5× per core because Bifrost pays for durable acknowledgement and
-   publication (D-6). Compression matches AC-6. Window p99 is looser than p50
-   because Bifrost's catalog and live-read fan-out add tail latency.
+   the leading Parquet-based engines on ClickBench. The cold target is looser because
+   Iceberg and object-store metadata cost the most on a cold start. The AC-8 to
+   AC-12 absolute targets are starting proposals for an observability store on
+   one 16-vCPU node; confirm or change each.
 2. **D-2 — Hardware.** Use the 16-vCPU/32-GiB systemd envelope on the local
    Ryzen 9 9950X host (32 threads, 91 GiB, NVMe), or rent an actual
    c6a.4xlarge with 500 GB gp2. Recommended: the local envelope for iteration
@@ -418,12 +410,7 @@ default.
     100M metric points), so the 24-hour window covers about 140M rows and
     stays clear of cache effects. A smaller "standard" scale can serve for
     iteration but does not count toward the ACs.
-13. **D-13 — ClickHouse ingest path.** Load ClickHouse with native `INSERT`s
-    (Native or RowBinary format) into the exporter schema, or through an
-    OpenTelemetry Collector with the ClickHouse exporter. Recommended: native
-    `INSERT` with comparable batch sizes and parallelism. Per-core ingest then
-    measures the database, not a collector.
-14. **D-14 — Raw-byte encoding.** Choose the neutral encoding that defines raw
+13. **D-13 — Raw-byte encoding.** Choose the encoding that defines raw
     input bytes: uncompressed OTLP protobuf, or newline-delimited JSON of the
     same records. Recommended: uncompressed OTLP protobuf. It is the OTel wire
     form, and it does not inflate compression ratios the way JSON would.
@@ -442,6 +429,13 @@ default.
   capacity benchmark is now an explicitly required third evidence class
   covering what ClickBench leaves out (REQ-010). Draft; awaiting owner
   decisions D-1 to D-14.
+- Revision 3 (2026-10-01): Owner decisions. The observability benchmark runs
+  Bifrost only, against absolute targets (AC-8 to AC-12); ClickHouse is
+  compared on ClickBench alone, and the ClickHouse observability ingest
+  decision is removed. Expected answers come from the generator. ClickBench
+  query text is translated from the ClickHouse queries, with no other
+  engine's entry as a source. AC-7's 2 ms selective p50 is confirmed. Draft;
+  awaiting owner decisions D-1 to D-13.
 
 ## Authority and context
 

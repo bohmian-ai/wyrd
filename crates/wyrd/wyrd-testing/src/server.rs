@@ -41,6 +41,7 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::storage::StorageInspection;
 use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
 use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
 use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
@@ -249,7 +250,7 @@ pub struct ServerShutdownInspection {
     /// Captured after the bound production serve task joins and before the
     /// harness drops, so it is the state production teardown actually left
     /// rather than the state a test-invoked second shutdown produced.
-    pub storage: Option<vala_bifrost_redux::storage::StorageInspection>,
+    pub storage: Option<StorageInspection>,
 }
 
 /// Exact query-owned resources inspected by test-tier cancellation journeys.

@@ -1,7 +1,10 @@
 //! Closed-label peer, fragment, slot, and security telemetry.
 
+use std::any::Any;
 use std::time::Instant;
-use tracing::Instrument as _;
+
+use futures_util::future::BoxFuture;
+use tracing::{Instrument as _, Span};
 use wyrd_spec::vala::api::QueryClass;
 
 /// Carries the spawning task's span into every task `DataFusion` spawns.
@@ -16,17 +19,17 @@ impl datafusion::common::runtime::JoinSetTracer for QuerySpanJoinSetTracer {
     /// Instruments a spawned future with the span current at spawn time.
     fn trace_future(
         &self,
-        future: futures_util::future::BoxFuture<'static, Box<dyn std::any::Any + Send>>,
-    ) -> futures_util::future::BoxFuture<'static, Box<dyn std::any::Any + Send>> {
-        Box::pin(future.instrument(tracing::Span::current()))
+        future: BoxFuture<'static, Box<dyn Any + Send>>,
+    ) -> BoxFuture<'static, Box<dyn Any + Send>> {
+        Box::pin(future.instrument(Span::current()))
     }
 
     /// Runs a spawned blocking closure inside the span current at spawn time.
     fn trace_block(
         &self,
-        block: Box<dyn FnOnce() -> Box<dyn std::any::Any + Send> + Send>,
-    ) -> Box<dyn FnOnce() -> Box<dyn std::any::Any + Send> + Send> {
-        let span = tracing::Span::current();
+        block: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
+    ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
+        let span = Span::current();
         Box::new(move || span.in_scope(block))
     }
 }

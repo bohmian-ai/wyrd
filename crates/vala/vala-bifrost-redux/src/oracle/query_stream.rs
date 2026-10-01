@@ -3,6 +3,7 @@
 //! The stream retains local admission, cancellation, telemetry, and lazy
 //! physical batches until exactly one terminal outcome releases owned resources.
 
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::OnceLock;
@@ -10,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use tracing::Span;
 
 use super::telemetry::AnalyticalAttemptOutcome;
 
@@ -127,7 +129,7 @@ impl QueryStreamLifecycle {
 
     /// Returns the client-facing query span; Gate parents dispatch under it.
     #[must_use]
-    pub fn span(&self) -> &tracing::Span {
+    pub fn span(&self) -> &Span {
         &self.span
     }
 
@@ -202,9 +204,9 @@ impl OracleQueryStream {
 /// returned stream and every other holder drop it, which is after the
 /// terminal frame or client drop, never when the stream is constructed.
 fn polled_in_span(
-    mut frames: std::pin::Pin<Box<OracleFrameStream>>,
-    span: tracing::Span,
-) -> std::pin::Pin<Box<OracleFrameStream>> {
+    mut frames: Pin<Box<OracleFrameStream>>,
+    span: Span,
+) -> Pin<Box<OracleFrameStream>> {
     Box::pin(futures_util::stream::poll_fn(move |context| {
         let _entered = span.enter();
         frames.poll_next_unpin(context)

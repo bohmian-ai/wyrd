@@ -16,6 +16,7 @@ use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::storage::StorageInspection;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::app::metrics::install_recorder;
@@ -571,7 +572,7 @@ pub struct ClusterShutdownInspection {
     /// resource, and adding two nodes' counts together would turn a per-node
     /// reconciliation into a cluster-wide one that no single owner ever has to
     /// satisfy.
-    pub storage: Vec<vala_bifrost_redux::storage::StorageInspection>,
+    pub storage: Vec<StorageInspection>,
 }
 
 /// One parsed production Prometheus series.

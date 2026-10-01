@@ -10,7 +10,7 @@ use num_traits::ToPrimitive;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 use vala_sql::ValaPostgres;
 
 use crate::catalog::{TenantTableBinding, TenantTableKey};
@@ -1508,7 +1508,7 @@ impl VisibilityPublishGuard {
     }
 
     /// Returns the publication span so persistence work runs inside it.
-    fn span(&self) -> &tracing::Span {
+    fn span(&self) -> &Span {
         &self.span
     }
 

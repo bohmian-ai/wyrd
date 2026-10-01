@@ -10,10 +10,11 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, ScribeCacheMode, ScribeCheckpointNameV1, ScribeProductionEvidenceV1,
     ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeStorageDrainObservationV1,
-    WyrdTestCluster,
+    WyrdTestCluster, shared_process_telemetry_for_test,
 };
 
 use super::support::{
@@ -542,7 +543,9 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
 /// membership address with a concrete closed loopback endpoint and refreshes
 /// the production registry snapshot. The known Scribe is unreachable before
 /// any row, so the query ends `Degraded` with `LiveTailUnavailable` and returns
-/// none of the unreachable live rows; it is never reported as complete.
+/// none of the unreachable live rows; it is never reported as complete. The
+/// production metric window records that terminal as one Degraded Gate
+/// stream and one Degraded Oracle execution, with no Success sample.
 ///
 /// # Panics
 ///
@@ -555,6 +558,8 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
     // Peer mode, because only a peer-enabled node advertises a dialable
     // private address and reaches even its own Scribe through that transport;
     // a process-local node calls its Scribe in process and has nothing to break.
+    let (_telemetry_guard, telemetry) =
+        shared_process_telemetry_for_test().expect("process production telemetry");
     let peer_root = tempfile::tempdir().expect("peer TLS root");
     let peer_tls = wyrd_testing::bifrost::peer_ca::BifrostPeerCa::generate(
         wyrd_server::config::PEER_SERVER_NAME,
@@ -639,6 +644,7 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
         .await
         .expect("Oracle observes the undialable membership");
 
+    let window = telemetry.checkpoint().expect("query telemetry window");
     let mut stream = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
@@ -665,6 +671,36 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
     assert_eq!(
         terminal.warnings,
         vec![wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable]
+    );
+    // Both owners record their terminal before the terminal frame is yielded,
+    // so the window already holds them: the Degraded result is its own
+    // outcome on the Gate stream and on the Oracle execution, never Success.
+    let delta = telemetry.delta_since(&window).expect("query telemetry delta");
+    let outcomes = |family: &str, kind: BifrostMetricKind| -> Vec<(String, f64)> {
+        delta
+            .metrics
+            .iter()
+            .filter(|sample| sample.family == family && sample.kind == kind && sample.value != 0.0)
+            .map(|sample| {
+                (
+                    sample.labels.get("outcome").cloned().unwrap_or_default(),
+                    sample.value,
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        outcomes("bifrost_gate_query_streams_total", BifrostMetricKind::Counter),
+        vec![("degraded".to_owned(), 1.0)],
+        "the Gate stream terminal is exactly one Degraded outcome"
+    );
+    assert_eq!(
+        outcomes(
+            "oracle_query_duration_seconds",
+            BifrostMetricKind::HistogramCount
+        ),
+        vec![("degraded".to_owned(), 1.0)],
+        "the Oracle execution is exactly one Degraded observation"
     );
 
     server.shutdown().await.expect("the server drains cleanly");

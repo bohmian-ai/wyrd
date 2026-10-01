@@ -28,6 +28,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryStreamFrame, QueryTerminalOutcome};
 use wyrd_testing::WyrdTestServer;
+use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::telemetry::BifrostMetricSample;
 use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
 use wyrd_testing::bifrost::{
@@ -2363,11 +2364,19 @@ async fn saturated_query_waits_on_http_and_grpc() {
 /// held past [`QUEUED_HOLD`], and one unit is then released so both complete
 /// through the queue. The pod is then saturated again: a one-second total
 /// deadline and, separately, the configured queue limit under a longer total
-/// deadline must each end as the typed timeout on both transports.
+/// deadline must each end as the typed timeout on both transports. The
+/// production metrics agree with the owner at each step: waiters are queue
+/// depth and never active work, each grant records one queue wait, and each
+/// expiry records one queue-deadline refusal.
 ///
 /// # Errors
 ///
 /// Returns the first enqueue, wait, completion, or expiry claim that broke.
+///
+/// # Panics
+///
+/// Panics when a production queue, active, wait, or admission series
+/// disagrees with the admission owner or the queries' observed endings.
 async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::three_oracles_one_scribe()
@@ -2408,6 +2417,7 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
         );
     }
 
+    let queue_window = cluster.telemetry().checkpoint()?;
     let http = {
         let query = wyrd_client::Bifrost::query_only(&client);
         let sql = sql.clone();
@@ -2431,6 +2441,24 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
         )
         .into());
     }
+    // The waiting queries are queue depth, not active work: the active gauge
+    // equals the owner's admitted count, which is exactly the parked holds.
+    let waiting = cluster.telemetry().snapshot()?;
+    let gauge = |family: &str| -> f64 {
+        waiting
+            .iter()
+            .filter(|sample| sample.family == family)
+            .map(|sample| sample.value)
+            .sum()
+    };
+    let admitted = server.oracle_runtime_inspection()?.active_queries;
+    assert_eq!(gauge("oracle_queries_queued"), 2.0, "two waiters are queue depth");
+    assert_eq!(
+        gauge("oracle_queries_active"),
+        f64::from(u32::try_from(admitted)?),
+        "the active gauge is the owner's admitted work and excludes waiters"
+    );
+    assert_eq!(usize::try_from(admitted)?, QUEUE_HOLDS, "only the parked holds are admitted");
 
     let released = held.pop().ok_or("no held envelope to release")?;
     released.abort();
@@ -2450,7 +2478,51 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
         .into());
     }
 
+    // Both waiters were granted from the queue: each records one queue wait
+    // at least as long as the hold that kept it waiting, and one admission.
+    let granted = cluster.telemetry().delta_since(&queue_window)?;
+    assert_eq!(
+        metric_value(
+            &granted,
+            "oracle_admission_queue_duration_seconds",
+            BifrostMetricKind::HistogramCount,
+            &[],
+        ),
+        2.0,
+        "each granted waiter records one queue wait"
+    );
+    assert!(
+        metric_value(
+            &granted,
+            "oracle_admission_queue_duration_seconds",
+            BifrostMetricKind::HistogramSum,
+            &[],
+        ) >= 2.0 * QUEUED_HOLD.as_secs_f64(),
+        "each queue wait covers the hold that kept it waiting"
+    );
+    assert_eq!(
+        metric_value(
+            &granted,
+            "oracle_admission_total",
+            BifrostMetricKind::Counter,
+            &[("outcome", "admitted")],
+        ),
+        2.0,
+        "the two waiters are the window's only admissions"
+    );
+    assert_eq!(
+        metric_value(
+            &granted,
+            "oracle_admission_total",
+            BifrostMetricKind::Counter,
+            &[("outcome", "rejected")],
+        ),
+        0.0,
+        "a granted waiter is never counted as refused"
+    );
+
     held.push(hold_envelope(server, &client, &sql).await?);
+    let expiry_window = cluster.telemetry().checkpoint()?;
     let analytical = scheduling_analytical_sql(&table);
     for (limit, deadline_ms, statement) in [
         ("total deadline", SATURATED_QUERY_DEADLINE_MS, &sql),
@@ -2491,6 +2563,26 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     if server.oracle_runtime_inspection()?.queued_queries != 0 {
         return Err("an expired waiter retained its queue place".into());
     }
+    // Six expiries, three statements over two transports, each one refusal
+    // for the queue deadline and nothing left waiting.
+    let expired = cluster.telemetry().delta_since(&expiry_window)?;
+    assert_eq!(
+        metric_value(
+            &expired,
+            "oracle_admission_total",
+            BifrostMetricKind::Counter,
+            &[("outcome", "rejected"), ("reason", "queue_deadline")],
+        ),
+        6.0,
+        "every expired waiter is one queue-deadline refusal"
+    );
+    let still_queued: f64 = expired
+        .gauge_final
+        .iter()
+        .filter(|sample| sample.family == "oracle_queries_queued")
+        .map(|sample| sample.value)
+        .sum();
+    assert_eq!(still_queued, 0.0, "expired waiters leave no queue depth");
 
     for envelope in held {
         envelope.abort();

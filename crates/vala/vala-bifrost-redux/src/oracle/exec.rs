@@ -882,6 +882,9 @@ pub(crate) struct OracleIcebergScanExec {
     footers: Option<PublishedFooters>,
     /// Pinned file tasks, planned once and shared by every partition.
     planned: Arc<tokio::sync::OnceCell<Vec<FileScanTask>>>,
+    /// Iceberg reader built once and cloned by every partition, because
+    /// building one probes the host's CPU limits.
+    reader: Arc<tokio::sync::OnceCell<iceberg::arrow::ArrowReader>>,
 }
 
 /// What a pinned Iceberg scan needs to load data-file footers through the
@@ -1127,30 +1130,6 @@ fn verify_scanned_footer_tenant(
     )
 }
 
-/// Proves a hot object's retained footer names `tenant`, then wraps it for
-/// the Arrow reader.
-///
-/// The proof runs before the reader metadata exists, so a hot or staged object
-/// whose footer is missing or foreign yields no row group, page, or row.
-///
-/// # Errors
-///
-/// Returns an external [`BifrostError::QueryTenantInvariant`] when the footer
-/// does not prove `tenant`, or the Parquet error when the footer cannot be
-/// projected into Arrow reader metadata.
-fn tenant_proven_reader_metadata(
-    metadata: &Arc<ParquetMetaData>,
-    tenant: DataTenantId,
-) -> DataFusionResult<ArrowReaderMetadata> {
-    verify_scanned_footer_tenant(metadata, tenant)
-        .map_err(|error| DataFusionError::External(Box::new(error)))?;
-    parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new(
-        Arc::clone(metadata),
-        ArrowReaderOptions::new(),
-    )
-    .map_err(|error| DataFusionError::External(Box::new(error)))
-}
-
 /// Detects the footer tenant refusal anywhere in an execution error chain.
 ///
 /// [`verify_scanned_footer_tenant`] fails a scan with
@@ -1222,6 +1201,7 @@ impl OracleIcebergScanExec {
             metrics: Arc::new(OracleScanMetricsHandle::default()),
             footers: None,
             planned: Arc::default(),
+            reader: Arc::default(),
         })
     }
 
@@ -1412,7 +1392,10 @@ impl OracleIcebergScanExec {
     /// byte ranges [`partition_byte_ranges`] assigns it; the reader keeps each
     /// row group whose midpoint lies in a task's range. `footers` is the
     /// resolved governed footer loader the reader loads, and tenant-proves,
-    /// every data file's metadata through.
+    /// every data file's metadata through. The first partition to start
+    /// builds the one reader every partition clones, so its loader serves the
+    /// whole query; every partition of one execution resolves the same
+    /// admitted governance, so any partition's loader is equivalent.
     ///
     /// # Errors
     ///
@@ -1449,12 +1432,17 @@ impl OracleIcebergScanExec {
         // so a point lookup decodes the matching pages instead of every page
         // of each surviving row group. The reader defaults it off.
         let reader = self
-            .table
-            .reader_builder()
-            .with_row_selection_enabled(true)
-            .with_parquet_metadata_loader(footers);
+            .reader
+            .get_or_init(|| async {
+                self.table
+                    .reader_builder()
+                    .with_row_selection_enabled(true)
+                    .with_parquet_metadata_loader(footers)
+                    .build()
+            })
+            .await
+            .clone();
         let metrics = reader
-            .build()
             .read(Box::pin(tasks.map_ok({
                 let metrics = Arc::clone(&self.metrics);
                 move |task| retain_iceberg_task(task, &metrics)
@@ -2957,32 +2945,30 @@ fn hot_stream(
                 .map_err(|error| {
                     DataFusionError::External(Box::new((*error).clone()))
                 })?;
-            let metadata =
-                tenant_proven_reader_metadata(retained.metadata(), file.metadata_key.tenant_id())?;
+            let Some((metadata, retained_groups)) = hot_piece_metadata(
+                retained.metadata(),
+                file.metadata_key.tenant_id(),
+                &range,
+                &predicates,
+                &metrics,
+            )?
+            else {
+                continue;
+            };
             let builder =
                 ParquetRecordBatchStreamBuilder::new_with_metadata(build_reader(), metadata);
-            let owned = row_groups_in_byte_range(builder.metadata(), &range);
-            if owned.is_empty() {
-                continue;
-            }
-            let selection =
-                select_row_groups_for_predicates(builder.metadata(), owned, &predicates);
-            metrics.record_row_groups(&selection);
-            if selection.excludes_file() {
-                continue;
-            }
             // Selective decode: only the closure's leaves leave storage. The
             // post-decode `project_batch` below then normalizes exact order and
             // types; it is a normalizer, not the thing that avoids the IO.
             let mask = hot_projection_mask(builder.parquet_schema(), schema.as_ref());
             let pages =
-                select_pages_for_predicates(builder.metadata(), &selection.retained, &predicates);
+                select_pages_for_predicates(builder.metadata(), &retained_groups, &predicates);
             let builder = match pages {
                 Some(pages) => builder.with_row_selection(pages),
                 None => builder,
             };
             let mut batches = builder
-                .with_row_groups(selection.retained)
+                .with_row_groups(retained_groups)
                 .with_batch_size(batch_size)
                 .with_projection(mask)
                 .build()
@@ -2998,6 +2984,43 @@ fn hot_stream(
             }
         }
     }
+}
+
+/// Decides what one hot piece reads from its object's cached footer.
+///
+/// The tenant proof runs first, so a missing or foreign footer yields no row
+/// group, page, or row. Range ownership and predicate pruning then read only
+/// the cached footer, so a piece that owns or keeps no row group never pays the
+/// Arrow schema conversion; only a piece with surviving row groups builds its
+/// reader metadata. Pruning is recorded in `metrics` for every owning piece.
+///
+/// # Errors
+///
+/// Returns an external [`BifrostError::QueryTenantInvariant`] when the footer
+/// does not prove `tenant`, or the Parquet error when the footer cannot be
+/// projected into Arrow reader metadata.
+fn hot_piece_metadata(
+    metadata: &Arc<ParquetMetaData>,
+    tenant: DataTenantId,
+    range: &Range<u64>,
+    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    metrics: &OracleScanMetricsHandle,
+) -> DataFusionResult<Option<(ArrowReaderMetadata, Vec<usize>)>> {
+    verify_scanned_footer_tenant(metadata, tenant)
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let owned = row_groups_in_byte_range(metadata, range);
+    if owned.is_empty() {
+        return Ok(None);
+    }
+    let selection = select_row_groups_for_predicates(metadata, owned, predicates);
+    metrics.record_row_groups(&selection);
+    if selection.excludes_file() {
+        return Ok(None);
+    }
+    let reader_metadata =
+        ArrowReaderMetadata::try_new(Arc::clone(metadata), ArrowReaderOptions::new())
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    Ok(Some((reader_metadata, selection.retained)))
 }
 
 /// Derives the Parquet projection mask that decodes exactly `schema`'s columns.

@@ -2912,14 +2912,10 @@ fn browser_sessions(srv: &WyrdTestServer) -> wyrd_auth::browser_sessions::Browse
 /// # Panics
 /// Panics when the read fails or no session row exists.
 async fn session_envelopes(superuser: &PgPool, session_id: &SecretString) -> Vec<Vec<u8>> {
-    let row: (
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-        Option<Vec<u8>>,
-    ) = sqlx::query_as(
-        "SELECT access_token_sealed, refresh_token_sealed, api_key_sealed, csrf_token_sealed \
-             FROM wyrd.auth_browser_sessions WHERE id_hash = $1",
+    sqlx::query_scalar(
+        "SELECT array_remove(ARRAY[access_token_sealed, refresh_token_sealed, \
+                api_key_sealed, csrf_token_sealed], NULL) \
+         FROM wyrd.auth_browser_sessions WHERE id_hash = $1",
     )
     .bind(
         Sha256Hex::digest(session_id.expose_secret().as_bytes())
@@ -2928,8 +2924,7 @@ async fn session_envelopes(superuser: &PgPool, session_id: &SecretString) -> Vec
     )
     .fetch_one(superuser)
     .await
-    .expect("session row reads");
-    [row.0, row.1, row.2, row.3].into_iter().flatten().collect()
+    .expect("session row reads")
 }
 
 /// Make the stored access token of `session_id` stale so its next use renews

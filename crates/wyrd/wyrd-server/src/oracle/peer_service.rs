@@ -662,18 +662,15 @@ fn dispatch_status(error: DispatchError) -> Status {
 /// Maps a Scribe follower failure before its stream exists to its dispatch outcome.
 ///
 /// Only a source gone from this incarnation is live-source loss, which the
-/// leader may degrade before rows. A local bound refusal is capacity. Schema,
-/// projection, predicate, integrity, preflight, decode, and local execution
-/// faults are terminal and fail the query.
+/// leader may degrade before rows. Schema, projection, predicate, integrity,
+/// preflight, decode, and local execution faults are terminal and fail the
+/// query.
 fn scribe_start_error(error: &PhysicalPlanFollowerError) -> DispatchError {
     match error {
         PhysicalPlanFollowerError::Resolution(FollowerResolutionError::SourceLoss(_)) => {
             DispatchError::EligibleSourceLoss {
                 cause: EligibleSourceLossCause::ProviderResolution,
             }
-        }
-        PhysicalPlanFollowerError::Resolution(FollowerResolutionError::Capacity(_)) => {
-            DispatchError::Capacity
         }
         PhysicalPlanFollowerError::Resolution(FollowerResolutionError::Fault(_))
         | PhysicalPlanFollowerError::Execution(_)
@@ -705,8 +702,7 @@ mod tests {
     /// Only source loss degrades a Scribe fragment; every other cause fails.
     ///
     /// Resolution classes decided at the Scribe open survive to the dispatch
-    /// outcome: a changed incarnation is eligible source loss, a bounded
-    /// snapshot refusal is capacity, and a schema, projection, or local
+    /// outcome: a changed incarnation is eligible source loss, and a schema, projection, or local
     /// execution fault is terminal. A failure inside the open local stream is
     /// terminal rather than unavailable.
     ///
@@ -719,10 +715,6 @@ mod tests {
         assert!(matches!(
             resolution(FollowerResolutionError::SourceLoss("gone".to_owned())),
             DispatchError::EligibleSourceLoss { .. }
-        ));
-        assert!(matches!(
-            resolution(FollowerResolutionError::Capacity("bound".to_owned())),
-            DispatchError::Capacity
         ));
         assert!(matches!(
             resolution(FollowerResolutionError::Fault("schema".to_owned())),

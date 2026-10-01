@@ -566,17 +566,16 @@ impl FetchLiveTailService {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when stream/range validation fails, a shard
-    /// mailbox is full, the owning memtable/shard cannot produce the projection, or the staged registry is
+    /// Returns [`ScribeError`] when stream/range validation fails, the owning
+    /// memtable cannot produce the projection, or the staged registry is
     /// unavailable.
-    pub async fn open_live_batches(
+    pub fn open_live_batches(
         &self,
-        request: FetchLiveTailRequest,
+        request: &FetchLiveTailRequest,
     ) -> Result<LiveTailBatches, ScribeError> {
-        let staged_request = request.clone();
-        let memtable = self.memtable_batches(request).await?;
+        let memtable = self.memtable_batches(request)?;
         let served = Self::served_generations(&memtable);
-        let staged = self.staged_lease(&staged_request)?;
+        let staged = self.staged_lease(request)?;
         let unserved = staged
             .as_ref()
             .map(|lease| {
@@ -600,10 +599,10 @@ impl FetchLiveTailService {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the request names another stream or an
-    /// inverted range, a shard mailbox is full, or the owning memtable/shard cannot produce the projection.
-    async fn memtable_batches(
+    /// inverted range, or the owning memtable cannot produce the projection.
+    fn memtable_batches(
         &self,
-        request: FetchLiveTailRequest,
+        request: &FetchLiveTailRequest,
     ) -> Result<Vec<HotBatch>, ScribeError> {
         if request.target_stream != self.stream {
             return Err(ScribeError::StreamMismatch {
@@ -617,7 +616,7 @@ impl FetchLiveTailService {
             });
         }
         if let Some(shards) = &self.shards {
-            return shards.snapshot(request).await;
+            return shards.snapshot(request);
         }
         Ok(self
             .memtable
@@ -950,16 +949,11 @@ pub(crate) mod tests {
     ///
     /// # Panics
     /// Panics when the read cannot open or a staged run cannot be decoded.
-    async fn hot_values(
+    fn hot_values(
         service: &FetchLiveTailService,
-        request: super::FetchLiveTailRequest,
+        request: &super::FetchLiveTailRequest,
     ) -> Vec<i64> {
-        served_values(
-            service
-                .open_live_batches(request)
-                .await
-                .expect("live read opens"),
-        )
+        served_values(service.open_live_batches(request).expect("live read opens"))
     }
 
     /// One frozen generation whose rows are both in the memtable and in a
@@ -1108,8 +1102,8 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics when the fixture cannot be built or a read returns any row other
     /// than exactly once.
-    #[tokio::test]
-    async fn a_generation_staged_before_the_shard_settles_is_read_once() {
+    #[test]
+    fn a_generation_staged_before_the_shard_settles_is_read_once() {
         let StagedGenerationFixture {
             service,
             memtable,
@@ -1119,17 +1113,13 @@ pub(crate) mod tests {
             directory: _directory,
             ..
         } = staged_generation_fixture();
-        let read = || hot_values(&service, request.clone());
+        let read = || hot_values(&service, &request);
 
-        assert_eq!(read().await, vec![1, 2, 3], "staged but not yet durable");
+        assert_eq!(read(), vec![1, 2, 3], "staged but not yet durable");
         memtable
             .complete_staged(generation.get(), member)
             .expect("the shard marks the generation durable");
-        assert_eq!(
-            read().await,
-            vec![1, 2, 3],
-            "durable and served by its runs"
-        );
+        assert_eq!(read(), vec![1, 2, 3], "durable and served by its runs");
     }
 
     /// A live read opened over durable staged runs keeps them readable after
@@ -1139,8 +1129,8 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics when the fixture cannot be built, the leased run cannot be read
     /// after publication, or the lease does not follow the read.
-    #[tokio::test]
-    async fn an_open_live_read_keeps_staged_runs_across_publication() {
+    #[test]
+    fn an_open_live_read_keeps_staged_runs_across_publication() {
         let StagedGenerationFixture {
             service,
             memtable,
@@ -1155,8 +1145,7 @@ pub(crate) mod tests {
             .complete_staged(generation.get(), member)
             .expect("the shard marks the generation durable");
         let open = service
-            .open_live_batches(request.clone())
-            .await
+            .open_live_batches(&request)
             .expect("the live read opens");
         assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
         registry

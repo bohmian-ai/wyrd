@@ -64,17 +64,13 @@ pub enum PhysicalPlanFollowerError {
 /// The class is decided where the cause is known and carried unchanged to the
 /// role's dispatch mapping, which is the only place it becomes a wire
 /// outcome. A published follower treats every class as eligible source loss;
-/// a Scribe follower degrades only `SourceLoss`, refuses `Capacity` as
-/// capacity, and fails `Fault`.
+/// a Scribe follower degrades only `SourceLoss` and fails `Fault`.
 #[derive(Debug, Error)]
 pub enum FollowerResolutionError {
     /// Schema, projection, predicate, binding, integrity, or local execution
     /// fault. Every untyped resolver message is this class.
     #[error("{0}")]
     Fault(String),
-    /// A bounded local admission ceiling refused the read.
-    #[error("resolution refused for capacity: {0}")]
-    Capacity(String),
     /// The assigned source no longer exists at the signed incarnation.
     #[error("assigned source is gone: {0}")]
     SourceLoss(String),
@@ -649,15 +645,13 @@ impl LiveTailSource for FetchLiveTailService {
     ///
     /// # Errors
     /// Returns [`FollowerResolutionError::SourceLoss`] when the request names
-    /// another stream incarnation, [`FollowerResolutionError::Capacity`] when
-    /// a Scribe shard mailbox is full, and
-    /// [`FollowerResolutionError::Fault`] for every other open failure.
+    /// another stream incarnation and [`FollowerResolutionError::Fault`] for
+    /// every other open failure.
     async fn open(
         &self,
         request: FetchLiveTailRequest,
     ) -> Result<LiveTailBatches, FollowerResolutionError> {
-        self.open_live_batches(request)
-            .await
+        self.open_live_batches(&request)
             .map_err(|error| live_open_error(&error))
     }
 }
@@ -665,15 +659,11 @@ impl LiveTailSource for FetchLiveTailService {
 /// Classes one Scribe live-read open failure for the fragment's dispatch.
 ///
 /// A request for another stream incarnation means the assigned source is gone;
-/// a full Scribe shard mailbox is a capacity refusal; every other open
-/// failure is a fault. The Scribe detail is redacted.
+/// every other open failure is a fault. The Scribe detail is redacted.
 fn live_open_error(error: &ScribeError) -> FollowerResolutionError {
     match error {
         ScribeError::StreamMismatch { .. } => {
             FollowerResolutionError::SourceLoss("Scribe stream incarnation changed".to_owned())
-        }
-        ScribeError::IngestBusy { .. } => {
-            FollowerResolutionError::Capacity("Scribe live-tail snapshot is busy".to_owned())
         }
         _ => FollowerResolutionError::Fault("Scribe live-tail snapshot failed".to_owned()),
     }
@@ -2180,8 +2170,8 @@ pub(crate) mod tests {
     ///
     /// A cut for another writer epoch is source loss, a fingerprint that
     /// differs from the authenticated schema is a fault that never reaches the
-    /// tail, and live-read open failures keep their incarnation, capacity, or
-    /// fault class instead of collapsing into one message.
+    /// tail, and live-read open failures keep their incarnation or fault
+    /// class instead of collapsing into one message.
     ///
     /// # Panics
     /// Panics when a class differs or a refused assignment reaches the tail.
@@ -2238,7 +2228,6 @@ pub(crate) mod tests {
             {
                 Err(FollowerResolutionError::SourceLoss(_)) => "source loss",
                 Err(FollowerResolutionError::Fault(_)) => "fault",
-                Err(FollowerResolutionError::Capacity(_)) => "capacity",
                 Ok(_) => "resolved",
             };
             assert_eq!(class, expected);
@@ -2257,12 +2246,6 @@ pub(crate) mod tests {
                 actual: stream,
             }),
             FollowerResolutionError::SourceLoss(_)
-        ));
-        assert!(matches!(
-            live_open_error(&ScribeError::IngestBusy {
-                table: "records".to_owned(),
-            }),
-            FollowerResolutionError::Capacity(_)
         ));
         assert!(matches!(
             live_open_error(&ScribeError::Internal {

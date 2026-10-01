@@ -651,10 +651,6 @@ impl ShardItem for PreparedAppend {
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
     Append(Box<PreparedAppend>),
-    Snapshot {
-        request: FetchLiveTailRequest,
-        response: tokio::sync::oneshot::Sender<Result<Vec<HotBatch>, ScribeError>>,
-    },
     FlushExpired {
         now: std::time::Instant,
     },
@@ -761,8 +757,9 @@ struct ShardOwner {
     /// so the current group plus already-admitted scheduler entries remain the
     /// complete bounded ambiguity set until process restart.
     retained_commit_ambiguity: Option<GroupWalState>,
-    /// Mutable memtable owned exclusively by this shard task.
-    memtable: Memtable,
+    /// This shard's memtable. Only this task writes it; live reads share it
+    /// through [`ScribeShardRuntime::snapshot`] under the memtable's own locks.
+    memtable: Arc<Memtable>,
     /// Bounded CPU lane for replay and persistence preparation.
     persistence_cpu: ScribePersistenceCpuPool,
     /// Bounded WAL IO lane for append, sync, manifest, and retirement work.
@@ -806,6 +803,8 @@ pub(crate) struct ShardMemtableSnapshot {
 pub(crate) struct ScribeShardRuntime {
     /// Fixed owner mailboxes used for internal and admitted commands.
     senders: Vec<ScribeShard<ShardCommand>>,
+    /// Each owner's memtable, in shard order, read directly by live reads.
+    memtables: Vec<Arc<Memtable>>,
     /// Coalescing pressure channels paired with the fixed owners.
     pressure_senders: Vec<watch::Sender<Option<PressureSignal>>>,
     /// Last snapshots published by the fixed owners.
@@ -975,6 +974,7 @@ impl ScribeShardRuntime {
         let pending = Arc::new(AtomicUsize::new(0));
         let drained = Arc::new(Notify::new());
         let mut tasks = Vec::with_capacity(shard_count);
+        let mut memtables = Vec::with_capacity(shard_count);
         let abort_handles = Mutex::new(Vec::with_capacity(shard_count));
         let pressure_channels = (0..shard_count)
             .map(|_| watch::channel(None))
@@ -991,6 +991,11 @@ impl ScribeShardRuntime {
                 panic!("fixed shard WAL handle must be constructible: {error}")
             });
             let (_, pressure_receiver) = &pressure_channels[id];
+            let memtable = Arc::new(
+                Memtable::new_with_config(generation_rotation_bytes, seal_max_age)
+                    .with_hot_sources(id, Arc::clone(&hot_sources)),
+            );
+            memtables.push(Arc::clone(&memtable));
             let owner = ShardOwner {
                 id,
                 receiver,
@@ -1010,8 +1015,7 @@ impl ScribeShardRuntime {
                 seal_retry: HashSet::new(),
                 retained_generations: HashMap::new(),
                 retained_commit_ambiguity: None,
-                memtable: Memtable::new_with_config(generation_rotation_bytes, seal_max_age)
-                    .with_hot_sources(id, Arc::clone(&hot_sources)),
+                memtable: Arc::clone(&memtable),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
@@ -1027,15 +1031,15 @@ impl ScribeShardRuntime {
                 fail_next_retirement_release: false,
             };
             let task = runtime.spawn(owner.run());
-            if let Ok(mut handles) = abort_handles.lock() {
-                handles.push(task.abort_handle());
-            } else {
-                panic!("Scribe shard abort-handle registry must not be poisoned at startup");
-            }
+            abort_handles
+                .lock()
+                .expect("Scribe shard abort-handle registry must not be poisoned at startup")
+                .push(task.abort_handle());
             tasks.push(task);
         }
         Arc::new(Self {
             senders,
+            memtables,
             pressure_senders,
             snapshots,
             tasks: tokio::sync::Mutex::new(tasks),
@@ -1132,45 +1136,42 @@ impl ScribeShardRuntime {
         Ok(())
     }
 
-    /// Fan out a bounded hot snapshot to all shards and merge the results.
+    /// Reads every shard's readable memtable rows for one live-tail request.
     ///
-    /// Under batch-spread routing the live-tail data for one (tenant, table)
-    /// may be spread across all sixteen shard lanes. This method sends a
-    /// [`ShardCommand::Snapshot`] to every shard and merges the `HotBatch`
-    /// vectors. The existing `HotBatch` contract is preserved: the caller
-    /// receives a single flat list of per-partition-day batches.
+    /// Reads the memtables directly instead of asking the shard owners, so a
+    /// query never waits behind an owner's queued writes. Each memtable read
+    /// holds both of its maps for one consistent cut, and an owner inserts rows
+    /// before it acknowledges them, so every acknowledged row is visible. The
+    /// result is one flat list of per-partition-day batches in shard order.
     ///
     /// # Errors
     /// Returns [`ScribeError::IngressClosed`] when the runtime has shut down,
-    /// [`ScribeError::IngestBusy`] when a shard mailbox is full, or any
-    /// shard-level snapshot error.
-    pub(crate) async fn snapshot(
+    /// or the memtable error when a projection cannot be read.
+    pub(crate) fn snapshot(
         &self,
-        request: FetchLiveTailRequest,
+        request: &FetchLiveTailRequest,
     ) -> Result<Vec<HotBatch>, ScribeError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(ScribeError::IngressClosed);
         }
         let mut merged = Vec::new();
-        for sender in &self.senders {
-            let (response, result) = tokio::sync::oneshot::channel();
-            let command = ShardCommand::Snapshot {
-                request: request.clone(),
-                response,
-            };
-            tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                sender.sender.send(command),
-            )
-            .await
-            .map_err(|_| ScribeError::IngestBusy {
-                table: "live-tail".to_owned(),
-            })?
-            .map_err(|_| ScribeError::IngressClosed)?;
-            let batches = result.await.map_err(|_| ScribeError::Internal {
-                detail: "shard dropped live-tail snapshot response".to_owned(),
-            })??;
-            merged.extend(batches);
+        for memtable in &self.memtables {
+            merged.extend(
+                memtable
+                    .readable_batches_for_range(
+                        request.binding.tenant,
+                        &request.binding.table_ref,
+                        request.start_partition,
+                        request.end_partition,
+                        &request.required_columns,
+                    )?
+                    .into_iter()
+                    .map(|readable| HotBatch {
+                        partition_day: readable.partition_day,
+                        generation: readable.generation,
+                        rows: readable.batch,
+                    }),
+            );
         }
         Ok(merged)
     }
@@ -1433,9 +1434,6 @@ impl ShardOwner {
     async fn handle_command(&mut self, command: ShardCommand) -> bool {
         match command {
             ShardCommand::Append(append) => self.scheduler.push(*append),
-            ShardCommand::Snapshot { request, response } => {
-                let _ = response.send(self.snapshot_at(&request));
-            }
             ShardCommand::FlushExpired { now } => {
                 if let Err(error) = self.flush_expired(now) {
                     tracing::warn!(error = %error, shard = self.id, "age flush failed");
@@ -1469,31 +1467,6 @@ impl ShardOwner {
             ShardCommand::Shutdown => return true,
         }
         false
-    }
-
-    /// Builds a shallow live-tail projection from this owner's readable memtable rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when the requested range or projection cannot be read.
-    fn snapshot_at(&self, request: &FetchLiveTailRequest) -> Result<Vec<HotBatch>, ScribeError> {
-        let readable = self.memtable.readable_batches_for_provider_cut(
-            request.binding.tenant,
-            &request.binding.table_ref,
-            &crate::scribe::memtable::ProviderCut {
-                start_partition: request.start_partition,
-                end_partition: request.end_partition,
-                required_columns: &request.required_columns,
-            },
-        )?;
-        Ok(readable
-            .into_iter()
-            .map(|batch| HotBatch {
-                partition_day: batch.partition_day,
-                generation: batch.generation,
-                rows: batch.batch,
-            })
-            .collect())
     }
 
     /// Resolves and reconstructs every replay state in stable seal-key order.
@@ -6252,7 +6225,7 @@ mod tests {
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
             retained_commit_ambiguity: None,
-            memtable,
+            memtable: Arc::new(memtable),
             persistence_cpu: ScribePersistenceCpuPool::new(1),
             wal_io: ScribeWalIoPool::new(1),
             persistence: None,
@@ -7198,47 +7171,36 @@ mod tests {
         assert!(visibility_error.contains("generation"));
     }
 
-    /// Proves the staged generation left the owner's snapshot, then retires it.
+    /// Proves the staged generation left the live read, then retires it.
     ///
-    /// The snapshot goes through the real `Snapshot` mailbox command with a
-    /// narrow required-column projection, so this observes the owner's own
-    /// live-tail path rather than its internals. A generation whose persistence
-    /// completion carried a staged member has handed its rows to that member:
-    /// the staged source is their single authority from that moment, and an
-    /// owner that still served the retained Arrow copy would double every one
-    /// of those rows for any reader that consults both. Retirement and shutdown
-    /// then run as mailbox commands too, so the owner task must terminate on
-    /// its own.
+    /// The read goes through the same memtable cut live reads take, with a
+    /// narrow required-column projection, while the owner task runs. A
+    /// generation whose persistence completion carried a staged member has
+    /// handed its rows to that member: the staged source is their single
+    /// authority from that moment, and a live read that still served the
+    /// retained Arrow copy would double every one of those rows for any reader
+    /// that consults both. Retirement and shutdown then run as mailbox
+    /// commands, so the owner task must terminate on its own.
     ///
     /// # Panics
     ///
-    /// Panics if any mailbox send or response fails, if the owner still serves
-    /// the staged generation, or if the owner task does not join.
+    /// Panics if the cut fails, if a mailbox send or response fails, if the
+    /// live read still serves the staged generation, or if the owner task does
+    /// not join.
     async fn assert_visible_rows_then_retire_and_shutdown(
         key: &SealKey,
-        stream: StreamIdentity,
+        live: &Memtable,
         command_tx: &mpsc::Sender<ShardCommand>,
         task: tokio::task::JoinHandle<()>,
     ) {
-        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
-            .expect("owner binding");
-        let (snapshot_response, snapshot_rx) = tokio::sync::oneshot::channel();
-        command_tx
-            .send(ShardCommand::Snapshot {
-                request: FetchLiveTailRequest {
-                    binding,
-                    target_stream: stream,
-                    start_partition: key.partition,
-                    end_partition: key.partition,
-                    required_columns: vec!["value".to_owned()],
-                },
-                response: snapshot_response,
-            })
-            .await
-            .expect("visible snapshot command mailbox");
-        let visible = snapshot_rx
-            .await
-            .expect("snapshot response")
+        let visible = live
+            .readable_batches_for_range(
+                key.tenant,
+                &key.table,
+                key.partition,
+                key.partition,
+                &["value".to_owned()],
+            )
             .expect("visible owner rows");
         assert!(
             visible.is_empty(),
@@ -7304,6 +7266,7 @@ mod tests {
         let append = prepared_append_for_group_test(&budget);
         owner.pending.fetch_add(1, Ordering::AcqRel);
 
+        let live = Arc::clone(&owner.memtable);
         let task = tokio::spawn(owner.run());
         command_tx
             .send(ShardCommand::Append(Box::new(append)))
@@ -7346,7 +7309,7 @@ mod tests {
                 .has_active_records()
                 .expect("fresh WAL generation")
         );
-        assert_visible_rows_then_retire_and_shutdown(&key, stream, &command_tx, task).await;
+        assert_visible_rows_then_retire_and_shutdown(&key, &live, &command_tx, task).await;
     }
 
     #[test]

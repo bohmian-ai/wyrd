@@ -852,13 +852,25 @@ impl Memtable {
         selected
     }
 
-    /// Return writable and immutable append batches for one exact partition range.
+    /// Captures one atomic active-plus-immutable live-read cut for one exact
+    /// partition range.
     ///
-    /// Structural pruning happens while the memtable locks are held: tenant,
-    /// table, and time partition are compared against the exact request. The
-    /// selected columns are then projected before the detached snapshot is
-    /// returned, so a snapshot never exposes an unrelated bucket or an
-    /// unrequested Arrow column.
+    /// Both maps stay locked while the cut is selected, so the answer is one
+    /// consistent moment rather than two, and live reads may call this from any
+    /// task without the owning shard. Tenant, table, and time partition are
+    /// compared under the locks and only the requested columns are projected,
+    /// so a cut never exposes an unrelated bucket or an unrequested column.
+    ///
+    /// Publication is not decided here and is not inferred from WAL positions.
+    /// A generation already marked [`ImmutableState::Durable`] is skipped and
+    /// every other immutable batch is tagged with its generation. A member's
+    /// runs become readable before the shard marks its generation durable, so
+    /// the live reader resolves staged runs after this cut and skips the
+    /// generations it tagged. WAL records are numbered from one node-global
+    /// counter while generations are sealed per tenant, table, partition, and
+    /// shard, so a published member's bounds routinely enclose positions a live
+    /// generation owns; treating that containment as ownership would drop
+    /// acknowledged rows no object ever carried.
     ///
     /// # Errors
     ///
@@ -942,45 +954,6 @@ impl Memtable {
                 }
             }
         }
-        Ok(batches)
-    }
-
-    /// Captures one atomic active-plus-immutable provider cut.
-    ///
-    /// Both owner maps remain locked while the cut is selected, so the answer is
-    /// one consistent moment rather than two.
-    ///
-    /// Publication is not decided here and is not inferred from WAL positions.
-    /// The collector skips a generation already marked
-    /// [`ImmutableState::Durable`], and tags every other immutable batch with
-    /// its generation. A member's runs become readable before the shard marks
-    /// its generation durable, so the live-tail reader resolves staged runs
-    /// after this cut and skips the generations it tagged. WAL records are numbered from one node-global
-    /// counter while generations are sealed per tenant, table, partition, and
-    /// shard, so a published member's bounds routinely enclose positions a live
-    /// generation owns, and treating that containment as ownership would drop
-    /// acknowledged rows no object ever carried.
-    ///
-    /// This provider interlock is consumed by Oracle execution; it performs no
-    /// remote query and introduces no local-Parquet tier.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when the requested range, owner locks, or Arrow
-    /// projection is invalid.
-    pub(crate) fn readable_batches_for_provider_cut(
-        &self,
-        tenant: DataTenantId,
-        table: &crate::catalog::TableRef,
-        cut: &ProviderCut<'_>,
-    ) -> Result<Vec<ReadableBatch>, ScribeError> {
-        let batches = self.readable_batches_for_range(
-            tenant,
-            table,
-            cut.start_partition,
-            cut.end_partition,
-            cut.required_columns,
-        )?;
         Ok(batches)
     }
 
@@ -1571,16 +1544,6 @@ pub struct ReadableBatch {
     pub generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
 }
 
-/// Manifest-pinned bounds defining one atomic hot-provider query cut.
-pub(crate) struct ProviderCut<'a> {
-    /// First included event day.
-    pub(crate) start_partition: crate::catalog::layout::TimePartition,
-    /// Last included event day.
-    pub(crate) end_partition: crate::catalog::layout::TimePartition,
-    /// Requested projection in caller order.
-    pub(crate) required_columns: &'a [String],
-}
-
 /// Inclusive WAL range eligible for retirement after a committed sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalRange {
@@ -1907,14 +1870,12 @@ mod tests {
             .expect("active insert");
         let cut = |memtable: &Memtable| {
             memtable
-                .readable_batches_for_provider_cut(
+                .readable_batches_for_range(
                     key.tenant,
                     &key.table,
-                    &ProviderCut {
-                        start_partition: key.partition,
-                        end_partition: key.partition,
-                        required_columns: &[],
-                    },
+                    key.partition,
+                    key.partition,
+                    &[],
                 )
                 .expect("provider cut")
                 .iter()

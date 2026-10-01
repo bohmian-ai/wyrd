@@ -395,7 +395,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let binding = TenantTableBinding::resolve((tenant, table)).expect("binding");
     let stored = live_rows(
         &scribe,
-        FetchLiveTailRequest {
+        &FetchLiveTailRequest {
             binding,
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
@@ -407,8 +407,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
                 .collect(),
         },
         "hot snapshot",
-    )
-    .await;
+    );
 
     assert_payload_modes_agree(&stored, canonical_batch_id, arrow_batch_id, total_rows);
     assert_managed_columns_are_table_owned(&stored);
@@ -493,7 +492,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         end_partition: day,
         required_columns: vec!["value".to_owned()],
     };
-    let hot = live_rows(&scribe, request.clone(), "hot snapshot").await;
+    let hot = live_rows(&scribe, &request, "hot snapshot");
     assert_eq!(hot.len(), 1);
     assert_eq!(hot[0].schema().fields().len(), 1);
     assert_eq!(hot[0].schema().field(0).name(), "value");
@@ -559,8 +558,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         day_one,
         &source_value,
         stream,
-    )
-    .await;
+    );
 
     let cross_day = cross_day_batch(source.schema(), day_one, day_two);
     let cross_day_principal = principal(tenant);
@@ -585,15 +583,15 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     .await
     .expect("cross-day append");
     assert_eq!(cross_day_admission.rows_accepted, 2);
-    assert_cross_day_materialization(&scribe, tenant, &day_table, day_one, day_two, stream).await;
-    assert_other_tenant_isolated(&scribe, &pointer_table, day_one, stream).await;
+    assert_cross_day_materialization(&scribe, tenant, &day_table, day_one, day_two, stream);
+    assert_other_tenant_isolated(&scribe, &pointer_table, day_one, stream);
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
         .await;
 }
 
 /// Assert a returned hot batch shares the expected Arrow allocation.
-async fn assert_pointer_identity(
+fn assert_pointer_identity(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
@@ -603,7 +601,7 @@ async fn assert_pointer_identity(
 ) {
     let hot = live_rows(
         scribe,
-        FetchLiveTailRequest {
+        &FetchLiveTailRequest {
             binding: TenantTableBinding::resolve((tenant, table.clone())).expect("pointer binding"),
             target_stream: stream,
             start_partition: day,
@@ -611,8 +609,7 @@ async fn assert_pointer_identity(
             required_columns: vec!["value".to_owned()],
         },
         "pointer hot snapshot",
-    )
-    .await;
+    );
     assert_eq!(hot.len(), 1);
     assert!(Arc::ptr_eq(source_value, hot[0].column(0)));
 }
@@ -643,7 +640,7 @@ fn cross_day_batch(
 }
 
 /// Assert cross-day materialization preserves row ownership and ordering.
-async fn assert_cross_day_materialization(
+fn assert_cross_day_materialization(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
@@ -658,8 +655,8 @@ async fn assert_cross_day_materialization(
         end_partition: day,
         required_columns: vec!["value".to_owned()],
     };
-    let day_one_hot = live_rows(scribe, read_day(day_one), "day one snapshot").await;
-    let day_two_hot = live_rows(scribe, read_day(day_two), "day two snapshot").await;
+    let day_one_hot = live_rows(scribe, &read_day(day_one), "day one snapshot");
+    let day_two_hot = live_rows(scribe, &read_day(day_two), "day two snapshot");
     assert_eq!(day_one_hot.len(), 1);
     assert_eq!(day_two_hot.len(), 1);
     assert_eq!(day_one_hot[0].num_rows(), 1);
@@ -675,16 +672,15 @@ async fn assert_cross_day_materialization(
 ///
 /// # Panics
 /// Panics with `context` when the read cannot open or names a staged run.
-async fn live_rows(
+fn live_rows(
     scribe: &ScribeImpl,
-    request: FetchLiveTailRequest,
+    request: &FetchLiveTailRequest,
     context: &str,
 ) -> Vec<RecordBatch> {
     let (rows, runs, _lease) = scribe
         .tail_service()
         .expect("tail service")
         .open_live_batches(request)
-        .await
         .expect(context)
         .into_parts();
     assert!(runs.is_empty(), "{context}: the fixture staged no run");
@@ -704,7 +700,7 @@ fn hot_value(rows: &RecordBatch) -> i64 {
 }
 
 /// Assert a distinct tenant cannot observe the retained hot batch.
-async fn assert_other_tenant_isolated(
+fn assert_other_tenant_isolated(
     scribe: &ScribeImpl,
     table: &TableRef,
     day: crate::catalog::layout::TimePartition,
@@ -712,7 +708,7 @@ async fn assert_other_tenant_isolated(
 ) {
     let other = live_rows(
         scribe,
-        FetchLiveTailRequest {
+        &FetchLiveTailRequest {
             binding: TenantTableBinding::resolve((DataTenantId::new_v7(), table.clone()))
                 .expect("other tenant binding"),
             target_stream: stream,
@@ -721,8 +717,7 @@ async fn assert_other_tenant_isolated(
             required_columns: vec!["value".to_owned()],
         },
         "other tenant snapshot",
-    )
-    .await;
+    );
     assert!(other.is_empty(), "hot snapshots must be tenant isolated");
 }
 

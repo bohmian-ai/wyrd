@@ -337,11 +337,19 @@ impl BrowserSessions {
                 .iter()
                 .map(|role| role.as_str().to_owned())
                 .collect(),
+            // `resource:action` labels; a composite `AnyOf` grant has no
+            // label (its `Display` errors) and is left out of this projection.
             permissions: verified
                 .principal
                 .effective_permissions
                 .iter()
-                .map(ToString::to_string)
+                .filter_map(|permission| {
+                    Some(format!(
+                        "{}:{}",
+                        permission.resource.as_str()?,
+                        permission.action.as_str()?
+                    ))
+                })
                 .collect(),
             expires_at,
             csrf_token,

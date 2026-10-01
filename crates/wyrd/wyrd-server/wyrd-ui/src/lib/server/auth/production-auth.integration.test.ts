@@ -166,7 +166,8 @@ async function expectNoSecrets(browser: Browser, tenant: string, sessionId: stri
   for (const path of [`/t/${tenant}`, `/t/${tenant}/__data.json`, `/t/${tenant}/settings`]) {
     for (const replica of [0, 1] as const) {
       const response = await browser.go(replica, path);
-      expect(response.status, path).toBe(200);
+      // Served to the session (a reader may be denied a page), never sent to sign-in.
+      expect([200, 403], path).toContain(response.status);
       const body = await response.text();
       expect(body).not.toContain(sessionId);
       expect(body).not.toMatch(jwt);

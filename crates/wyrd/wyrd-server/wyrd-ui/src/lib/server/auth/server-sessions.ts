@@ -14,6 +14,8 @@ const tenantKeyPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 /** Safe projection of a server-owned browser session; never holds the session id or a token. */
 export type ServerSession = {
   tenantKey: string;
+  /** Server-owned tenant UUID; server-only state, never page data. */
+  tenantId: string;
   tenantName: string;
   principalId: string;
   roles: string[];
@@ -25,6 +27,7 @@ export type ServerSession = {
 type Created = { session_id: string; tenant_key: string; expires_at: string };
 type Read = {
   tenant_key: string;
+  tenant_id: string;
   tenant_name: string;
   principal_id: string;
   roles: string[];
@@ -203,6 +206,7 @@ export class ServerSessions {
     }
     return {
       tenantKey: read.tenant_key,
+      tenantId: read.tenant_id,
       tenantName: read.tenant_name,
       principalId: read.principal_id,
       roles: read.roles,
@@ -218,7 +222,7 @@ export class ServerSessions {
       tenant: {
         key: session.tenantKey,
         name: session.tenantName,
-        tenantId: '',
+        tenantId: session.tenantId,
         permissions: session.permissions
       },
       subject: { id: session.principalId, name: session.principalId },
@@ -276,22 +280,29 @@ export class ServerSessions {
     return (await this.read(target, cookies)) ? base : `${base}/login`;
   }
 
-  /** Safe page metadata: current tenant plus the tenant keys this browser holds sessions for. */
-  metadata(session: ServerSession, cookies: Cookies): SessionMetadata {
-    const others = cookies
-      .getAll()
-      .filter(({ name }) => name.startsWith(sessionPrefix))
-      .map(({ name }) => name.slice(sessionPrefix.length))
-      .filter((key) => key !== session.tenantKey && tenantKeyPattern.test(key));
+  /**
+   * Safe page metadata: the current tenant plus every other tenant whose
+   * session the server still honours for this browser. Session-cookie names
+   * are only lookup hints: each distinct hinted tenant is resolved through
+   * `read`, which clears unknown, expired, and mismatched cookies, and only the
+   * server-returned key and name are rendered.
+   */
+  async metadata(session: ServerSession, cookies: Cookies): Promise<SessionMetadata> {
+    const hints = new Set(
+      cookies
+        .getAll()
+        .filter(({ name }) => name.startsWith(sessionPrefix))
+        .map(({ name }) => name.slice(sessionPrefix.length))
+        .filter((key) => key !== session.tenantKey && tenantKeyPattern.test(key))
+    );
+    const others = await Promise.all([...hints].map((key) => this.read(key, cookies)));
     return {
       subject: { id: session.principalId, name: session.principalId },
       expiresAt: session.expiresAt,
       csrf: session.csrf,
-      // Other keys are only this browser's cookie hints; switching re-reads each through the server.
-      tenants: [
-        { key: session.tenantKey, name: session.tenantName },
-        ...[...new Set(others)].map((key) => ({ key, name: key }))
-      ]
+      tenants: [session, ...others]
+        .filter((verified) => verified !== null)
+        .map(({ tenantKey, tenantName }) => ({ key: tenantKey, name: tenantName }))
     };
   }
 
@@ -348,7 +359,10 @@ export function checkAction(
 }
 
 /** Safe page metadata for whichever session boundary this request carries. */
-export function sessionMetadata(locals: App.Locals, cookies: Cookies): SessionMetadata {
+export async function sessionMetadata(
+  locals: App.Locals,
+  cookies: Cookies
+): Promise<SessionMetadata> {
   if (locals.session) return localSessions.metadata(locals.session);
   if (locals.serverSession) return serverSessions.metadata(locals.serverSession, cookies);
   reject('unauthenticated');

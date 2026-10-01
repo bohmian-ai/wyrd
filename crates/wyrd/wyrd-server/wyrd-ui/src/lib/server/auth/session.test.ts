@@ -94,10 +94,16 @@ function jar(initial: Record<string, string> = {}) {
 
 const sessionId = 'a'.repeat(64);
 const csrf = 'c'.repeat(64);
-const read = (tenantKey: string, expiresAt = new Date(Date.now() + 60_000).toISOString()) =>
+const tenantId = '01990000-0000-7000-8000-000000000002';
+const read = (
+  tenantKey: string,
+  expiresAt = new Date(Date.now() + 60_000).toISOString(),
+  tenantName = 'Acme'
+) =>
   Response.json({
     tenant_key: tenantKey,
-    tenant_name: 'Acme',
+    tenant_id: tenantId,
+    tenant_name: tenantName,
     principal_id: '01990000-0000-7000-8000-000000000001',
     roles: ['admin'],
     permissions: ['identity_connections:write'],
@@ -181,4 +187,87 @@ test('production session expires and logs out', async () => {
   // Logging out again is a no-op that still leaves no cookie.
   await sessions.logout('acme', live, action(), csrf);
   expect(paths.filter((path) => path.endsWith('/logout'))).toHaveLength(1);
+});
+
+/** Fetcher answering `sessions/read` per session id; unknown ids are refused like the server does. */
+function readsBySession(byId: Record<string, () => Response>) {
+  const seen: string[] = [];
+  const fetcher = vi.fn(async (_url: URL | RequestInfo, init?: RequestInit) => {
+    const { session_id } = JSON.parse(String(init!.body)) as { session_id: string };
+    seen.push(session_id);
+    return byId[session_id]?.() ?? new Response(null, { status: 401 });
+  }) as unknown as typeof fetch;
+  return { fetcher, seen };
+}
+
+test('production chooser lists only server-verified tenant sessions', async () => {
+  const research = 'b'.repeat(64);
+  const { fetcher } = readsBySession({
+    [sessionId]: () => read('acme'),
+    [research]: () => read('research', undefined, 'Research Lab')
+  });
+  const sessions = new ServerSessions(fetcher);
+  const cookies = jar({ wyrd_session_acme: sessionId, wyrd_session_research: research });
+  const current = (await sessions.read('acme', cookies))!;
+
+  const metadata = await sessions.metadata(current, cookies);
+  // Names come from the server, never from the cookie suffix.
+  expect(metadata.tenants).toEqual([
+    { key: 'acme', name: 'Acme' },
+    { key: 'research', name: 'Research Lab' }
+  ]);
+  expect(cookies.values.has('wyrd_session_research')).toBe(true);
+});
+
+test('production chooser clears forged, expired, duplicate and mismatched hints', async () => {
+  const forged = 'd'.repeat(64);
+  const expired = 'e'.repeat(64);
+  const mismatched = 'f'.repeat(64);
+  const research = 'b'.repeat(64);
+  const { fetcher, seen } = readsBySession({
+    [mismatched]: () => read('acme'),
+    [research]: () => read('research', undefined, 'Research Lab')
+  });
+  const sessions = new ServerSessions(fetcher);
+  const cookies = jar({
+    wyrd_session_acme: sessionId,
+    wyrd_session_victim: forged,
+    wyrd_session_stale: expired,
+    wyrd_session_other: mismatched,
+    wyrd_session_research: research,
+    'wyrd_session_../x': research
+  });
+  // A browser may send one name twice (e.g. different paths); it is one hint.
+  const getAll = cookies.getAll;
+  cookies.getAll = () => [...getAll(), { name: 'wyrd_session_research', value: research }];
+  const current = {
+    tenantKey: 'acme',
+    tenantId,
+    tenantName: 'Acme',
+    principalId: 'p',
+    roles: [],
+    permissions: [],
+    expiresAt: Date.now() + 60_000,
+    csrf
+  };
+
+  const metadata = await sessions.metadata(current, cookies);
+  expect(metadata.tenants).toEqual([
+    { key: 'acme', name: 'Acme' },
+    { key: 'research', name: 'Research Lab' }
+  ]);
+  for (const name of ['wyrd_session_victim', 'wyrd_session_stale', 'wyrd_session_other'])
+    expect(cookies.values.has(name)).toBe(false);
+  // The current tenant is not re-read, the duplicate is read once, and a non-slug never reaches the server.
+  expect(seen.sort()).toEqual([forged, expired, mismatched, research].sort());
+});
+
+test('production tenant context carries the server tenant id outside page metadata', async () => {
+  const sessions = new ServerSessions(vi.fn(async () => read('acme')) as unknown as typeof fetch);
+  const cookies = jar({ wyrd_session_acme: sessionId });
+  const session = (await sessions.read('acme', cookies))!;
+
+  expect(sessions.context(session).tenant.tenantId).toBe(tenantId);
+  const metadata = await sessions.metadata(session, cookies);
+  expect(JSON.stringify(metadata)).not.toContain(tenantId);
 });

@@ -745,7 +745,7 @@ impl AccessTokenSource for SavedLoginSource {
 /// Only a consistency check on a token the server just issued over TLS: the
 /// server still verifies every token it receives. `None` when the token is
 /// not a decodable JWT with that claim.
-pub(crate) fn access_token_tenant(token: &SecretBearer) -> Option<DataTenantId> {
+fn access_token_tenant(token: &SecretBearer) -> Option<DataTenantId> {
     /// The one claim this check reads.
     #[derive(Deserialize)]
     struct Claims {

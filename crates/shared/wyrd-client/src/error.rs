@@ -72,9 +72,7 @@ pub enum WyrdClientError {
     /// The saved user login for this server and tenant cannot be used:
     /// selection is ambiguous or names another tenant, the local store is
     /// unsafe, corrupt, or locked, the login was logged out, or its renewal
-    /// cannot complete safely. Also the `tenant_mismatch` refusal of any
-    /// credential that does not act in the client's selected tenant. Never
-    /// falls through to another credential.
+    /// cannot complete safely. Never falls through to another credential.
     /// Maps to `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` at the public boundary.
     #[error("saved user login cannot be used ({reason}): {message}")]
     SavedLogin {

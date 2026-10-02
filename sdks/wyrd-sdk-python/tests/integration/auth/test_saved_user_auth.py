@@ -65,9 +65,7 @@ def test_saved_user_auth_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         assert server.saved_login_generation(tmp_path, FIXTURE_TENANT) == before + 1
 
         # An explicit machine credential overrides the saved reader.
-        Cards(server_url=url, credential=server.api_key, tenant=server.tenant_id).register(
-            _prompt()
-        )
+        Cards(server_url=url, credential=server.api_key, tenant=FIXTURE_TENANT).register(_prompt())
 
         # Once the chain is revoked the login fails closed and is never retried.
         server.revoke_saved_login(tmp_path, FIXTURE_TENANT)

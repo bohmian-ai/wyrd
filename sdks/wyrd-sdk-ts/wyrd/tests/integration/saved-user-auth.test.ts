@@ -67,7 +67,7 @@ describe("saved user login", () => {
     const server = startTestServer(undefined, undefined, undefined, true);
     try {
       const serverUrl = server.baseUrl;
-      const first = server.activateHumanSso();
+      server.activateHumanSso();
       const second = server.activateHumanSso(SECOND_TENANT);
       server.saveHumanLogin(config, FIXTURE_TENANT, "bob", "wyrd-test");
       server.saveHumanLogin(config, SECOND_TENANT, "alice", "alice-password");
@@ -93,7 +93,7 @@ describe("saved user login", () => {
       await Cards.connect({
         serverUrl,
         credential: server.apiKey,
-        tenant: first,
+        tenant: FIXTURE_TENANT,
       }).registerFromPath(prompt);
 
       // Once the chain is revoked the login fails closed and is never retried.

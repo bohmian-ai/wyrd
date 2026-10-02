@@ -406,14 +406,84 @@ impl Report {
         self.checks().iter().all(|check| check.passed)
     }
 
-    /// Writes the rendered report into `output/report.md`.
+    /// Writes the rendered report into `output/report.md` and its
+    /// machine-readable counts and verdicts into `output/report.json`.
     ///
     /// # Errors
     ///
-    /// Returns the file write failure.
+    /// Returns the serialization or file write failure.
     pub fn write_to(&self, output: &Path) -> Result<()> {
         std::fs::write(output.join("report.md"), self.render())?;
+        std::fs::write(
+            output.join("report.json"),
+            serde_json::to_vec_pretty(&self.summary())?,
+        )?;
         Ok(())
+    }
+
+    /// The offered profile, per-tenant accounting, capacity line, and every
+    /// check as JSON.
+    fn summary(&self) -> serde_json::Value {
+        let phases: Vec<serde_json::Value> = self
+            .phases
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "phase": record.phase.name,
+                    "offered_per_second": record.phase.rate,
+                    "seconds": record.seconds,
+                    "planned": record.load.planned,
+                    "submitted": record.load.submitted,
+                    "late": record.load.late,
+                    "errors": record.load.errors,
+                    "peak_memory_bytes": record.peak_memory,
+                })
+            })
+            .collect();
+        let tenants: Vec<serde_json::Value> = self
+            .tenants
+            .iter()
+            .map(|tenant| {
+                serde_json::json!({
+                    "tenant": tenant.slug,
+                    "offered": tenant.offered,
+                    "submitted": tenant.submitted,
+                    "eval_acknowledged": tenant.acked.eval,
+                    "eval_stored": tenant.stored.eval,
+                    "activated": tenant.created("observation"),
+                    "settled": tenant.runs_in("observation", &TERMINAL),
+                    "backlog": tenant.runs_in("observation", &BACKLOG),
+                    "results": tenant.results,
+                    "failed_verdicts": tenant.stored.failing_eval,
+                    "dispatches": tenant.dispatches,
+                    "operator_received": tenant.operator_posts,
+                    "scheduled_drift": tenant.created("schedule"),
+                    "manual_drift": tenant.created("manual"),
+                })
+            })
+            .collect();
+        let checks: Vec<serde_json::Value> = self
+            .checks()
+            .into_iter()
+            .map(|check| {
+                serde_json::json!({
+                    "check": check.name,
+                    "passed": check.passed,
+                    "detail": check.detail,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "setup_seconds": self.setup_seconds,
+            "tenants_count": self.shape.0,
+            "clients": self.shape.1,
+            "phases": phases,
+            "tenants": tenants,
+            "enqueue_failures": self.totals.enqueue_failures,
+            "capacity": self.capacity(),
+            "passed": self.passed(),
+            "checks": checks,
+        })
     }
 
     /// The capacity line for the steady phase, labelled from its settled

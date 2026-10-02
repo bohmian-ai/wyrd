@@ -11621,6 +11621,7 @@ dependencies = [
  "chrono",
  "hex",
  "parquet",
+ "reqwest 0.13.4",
  "secrecy",
  "serde",
  "serde_json",

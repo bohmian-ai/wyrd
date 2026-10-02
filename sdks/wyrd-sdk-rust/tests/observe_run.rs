@@ -654,7 +654,7 @@ async fn scoped_run_emits_drift_eval_and_generic_rows() {
     register_dataset_table(&connect(&server, &admin), &dataset_b).await;
 
     let receipt = hydrate_bundle(&connect(&server, &admin), root.path(), &service, &bundle).await;
-    let credential = card_bound_key(&server, &receipt, &["admin"]).await;
+    let credential = card_bound_key(&server, &receipt, &[]).await;
 
     let state = WyrdState::from_path(&bundle).expect("complete bundle loads offline");
     let client = connect(&server, &credential);
@@ -740,5 +740,175 @@ async fn scoped_run_emits_drift_eval_and_generic_rows() {
     export_explicit_span(&server, &token).await;
     server.flush_bifrost().await.expect("flush server Scribe");
     assert_eval_joins_span(&connect(&server, &admin), &run_id).await;
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// The one field of `POST /auth/issue-key`'s response this journey reads.
+#[derive(Deserialize)]
+struct IssuedKey {
+    /// Plaintext API key, returned exactly once.
+    key: String,
+}
+
+/// Issue an API key for a registered Service over the public HTTP route.
+///
+/// No harness SQL is involved: the principal's authority is whatever
+/// registration projected for it.
+///
+/// # Panics
+/// Panics when the route refuses the issuance.
+async fn issue_key(admin: &WyrdClient, receipt: &RegistrationReceipt) -> String {
+    let issued: IssuedKey = admin
+        .request_json(
+            reqwest::Method::POST,
+            "/auth/issue-key",
+            Some(&serde_json::json!({
+                "card_ref": receipt.root,
+                "label": "workload-journey",
+            })),
+        )
+        .await
+        .expect("the registered Service's key is issued");
+    issued.key
+}
+
+/// Write a second, unrelated Service whose only component is its own Model.
+///
+/// # Panics
+/// Panics when a fixture file cannot be written.
+fn write_outside_graph(root: &Path) -> PathBuf {
+    std::fs::write(
+        root.join("outside-model.yaml"),
+        "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: outside-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Custom\n    meta:\n      framework_version: 0.1.0\n      loader_module: fixture\n      loader_class: TinyModel\n      extra: {}\n  task_type: Other\n  signature:\n    inputs:\n      - name: input\n        dtype: float64\n    outputs:\n      - name: output\n        dtype: float64\n  card_refs: []\n",
+    )
+    .expect("outside model card writes");
+    let service = root.join("outside-service.yaml");
+    std::fs::write(
+        &service,
+        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: outside-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: model\n      ref: ./outside-model.yaml\n",
+    )
+    .expect("outside service card writes");
+    service
+}
+
+/// Read every row of `table` with `client`, ordered by value.
+///
+/// # Panics
+/// Panics when the query is refused.
+async fn dataset_rows(client: &WyrdClient, table: &str) -> Vec<DatasetRow> {
+    Bifrost::query_only(client)
+        .sql_as(&format!(
+            "SELECT value, run_id, card_uid FROM {table} ORDER BY value"
+        ))
+        .await
+        .expect("the workload key queries its evidence")
+}
+
+/// A Service key issued over public HTTP writes and queries evidence with
+/// only the `workload` role registration granted, and its Card scope still
+/// refuses a write for another Service's Card.
+///
+/// # Panics
+/// Panics when any journey step or the scope refusal differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn issued_card_key_writes_and_queries_within_its_scope_only() {
+    let root = tempfile::tempdir().expect("fixture root creates");
+    let service = write_service_graph(root.path());
+    let outside = write_outside_graph(root.path());
+    let server = Box::pin(WyrdTestServer::builder().start_bound())
+        .await
+        .expect("test server starts");
+    let admin = connect(
+        &server,
+        &machine_key(&server, "rust_workload_admin", &["admin"]).await,
+    );
+    let dataset = format!("vala.datasets.workload_{}", uuid::Uuid::now_v7().simple());
+    register_dataset_table(&admin, &dataset).await;
+    let receipt = hydrate_bundle(&admin, root.path(), &service, &root.path().join("bundle")).await;
+    let cards = Cards::with_client(WyrdClient::clone(&admin));
+    let outside_receipt = Box::pin(cards.register_from_path(&outside))
+        .await
+        .expect("outside service registers");
+    Box::pin(
+        CardGraphHydrator::new(cards.registry_context()).hydrate(
+            &CardSelector::exact(outside_receipt.root.clone()),
+            &root.path().join("outside-bundle"),
+            HydrationMode::Complete,
+        ),
+    )
+    .await
+    .expect("outside bundle hydrates");
+
+    let key = issue_key(&admin, &receipt).await;
+    let workload = connect(&server, &key);
+    let state =
+        WyrdState::from_path(&root.path().join("bundle")).expect("complete bundle loads offline");
+    state
+        .start_bifrost_with_config(&workload, None, QueueConfig::default())
+        .await
+        .expect("the workload key starts a Bifrost lifetime");
+    let run = state.run();
+    let model = run.for_card("model").expect("model view resolves");
+    model
+        .observe()
+        .record(&dataset, &serde_json::json!({ "value": 1 }))
+        .await
+        .expect("the workload key writes a record");
+    state.shutdown().await.expect("the write drains");
+    server.flush_bifrost().await.expect("flush server Scribe");
+    let model_uid = model
+        .card_ref()
+        .uid
+        .clone()
+        .expect("hydrated Card carries its UID")
+        .to_string();
+    let rows = dataset_rows(&workload, &dataset).await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.value, row.card_uid.as_deref()))
+            .collect::<Vec<_>>(),
+        [(1, Some(model_uid.as_str()))],
+        "the workload key reads back its own row: {rows:?}"
+    );
+
+    let outside_state = WyrdState::from_path(&root.path().join("outside-bundle"))
+        .expect("outside bundle loads offline");
+    outside_state
+        .start_bifrost_with_config(&workload, None, QueueConfig::default())
+        .await
+        .expect("the workload key starts a second lifetime");
+    let written = outside_state
+        .run()
+        .for_card("model")
+        .expect("outside model view resolves")
+        .observe()
+        .record(&dataset, &serde_json::json!({ "value": 2 }))
+        .await;
+    let refusal = match written {
+        Err(error) => error,
+        Ok(()) => outside_state
+            .shutdown()
+            .await
+            .expect_err("a record for a Card outside the key's scope is refused"),
+    };
+    let code = match &refusal {
+        wyrd_sdk::verification::WyrdError::UpstreamFailure { details, .. } => details
+            .get("original_code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        other => other.code().to_owned(),
+    };
+    assert_eq!(
+        code, "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+        "the refusal is the typed scope denial: {refusal:?}"
+    );
+    server.flush_bifrost().await.expect("flush server Scribe");
+    assert_eq!(
+        dataset_rows(&workload, &dataset).await.len(),
+        1,
+        "the refused write left no row behind"
+    );
     server.shutdown().await.expect("test server shuts down");
 }

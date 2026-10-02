@@ -8,7 +8,8 @@
 -- they keep exactly the roles an administrator gave them.
 INSERT INTO wyrd.auth_roles (id, data_tenant_id, name, permissions, builtin)
 SELECT gen_random_uuid(), data_tenant_id, 'workload',
-       '[{"resource":"bifrost_record","action":"write","scope":"all"},
+       '[{"resource":"bifrost_table","action":"read","scope":"all"},
+         {"resource":"bifrost_record","action":"write","scope":"all"},
          {"resource":"bifrost_query","action":"read","scope":"all"}]'::jsonb,
        TRUE
   FROM wyrd.auth_roles

@@ -78,7 +78,7 @@ The resolution path:
     ['reader', 'cards:read, artifacts:read, audit:read'],
     ['agent', 'cards:read, cards:write, artifacts:read, artifacts:write, operators:invoke, evals:run'],
     ['runtime_admin', 'service_accounts:write'],
-    ['workload', 'bifrost_record:write, bifrost_query:read']
+    ['workload', 'bifrost_table:read, bifrost_record:write, bifrost_query:read']
   ]}
 />
 

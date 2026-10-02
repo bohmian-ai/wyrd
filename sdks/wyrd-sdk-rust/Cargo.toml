@@ -22,6 +22,8 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 parquet = { workspace = true, features = ["arrow"] }
+# The workload-role journey issues its Service key over the public HTTP route.
+reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

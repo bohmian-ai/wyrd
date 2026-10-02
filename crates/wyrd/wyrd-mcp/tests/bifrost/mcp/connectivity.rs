@@ -258,6 +258,7 @@ mod pg_tests {
                 "gateway.delete_governance_policy",
                 "principals.revoke_credential",
                 "verification.start_run",
+                "verification.execute",
                 "operator_connections.create",
                 "operator_connections.update",
                 "operator_connections.disable",

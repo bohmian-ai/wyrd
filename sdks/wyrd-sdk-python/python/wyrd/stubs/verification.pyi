@@ -8,7 +8,8 @@ class Verification:
     """Tenant-scoped Verification control-plane handle.
 
     Every call blocks with the GIL released until the server answers. A started
-    run is durably enqueued, not finished; poll ``get_run``.
+    run is durably enqueued, not finished; poll ``get_run``. A direct
+    execution returns its judgment and enqueues nothing.
     """
 
     def __init__(self, server_url: str | None = None, credential: str | None = None) -> None:
@@ -55,6 +56,35 @@ class Verification:
                 ``WYRD_VERIFICATION_409_VERIFIER_NOT_READY``, and
                 ``WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`` when the key was used
                 for a different request.
+        """
+        ...
+
+    def execute(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """Judge supplied input with one exact Verifier and return its judgment.
+
+        ``request`` is the ``ExecuteVerificationRequest`` wire object:
+        ``verifier_uid``, ``subject_card_uid``, and an ``input`` of
+        ``{"kind": "drift_samples", "columns": {name: [value | None, ...]}}``
+        or ``{"kind": "eval_record", "context": {...}, "media": [...]}``.
+        Returns the ``ExecuteVerificationResponse`` wire object:
+        ``execution_id``, exact ``verifier`` and ``subject`` references,
+        ``kind``, ``verdict``, ``summary``, ``counts``, and ``detail``. A
+        ``failed`` verdict is a successful return; nothing is enqueued,
+        published, or dispatched, and the request is never replayed.
+
+        Raises:
+            WyrdError: ``WYRD_VERIFICATION_400_INPUT_INVALID`` for a malformed
+                request, ``WYRD_VERIFICATION_413_INPUT_TOO_LARGE`` for an
+                exceeded bound, ``WYRD_PERMISSION_403_DENIED_RBAC`` without
+                ``evals:run`` or subject scope,
+                ``WYRD_VERIFICATION_404_TARGET_NOT_FOUND`` for an unknown
+                Card, ``WYRD_VERIFICATION_409_BASELINE_NOT_READY`` or
+                ``WYRD_VERIFICATION_409_BASELINE_LEGACY`` for an unusable
+                baseline, ``WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE`` or
+                ``WYRD_VERIFICATION_422_INPUT_UNSUPPORTED`` for input the
+                Verifier cannot judge, ``WYRD_VERIFICATION_502_DEPENDENCY_FAILED``
+                when the judge provider fails, and
+                ``WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`` past the deadline.
         """
         ...
 

@@ -9,6 +9,9 @@
 //! On a runtime-enabled server the same Service starts a direct Verifier run
 //! over its own emitted Drift observations, polls it to a terminal status, and
 //! reads the persisted result and feature rows through `bifrost.query`.
+//!
+//! Through `verification.execute` the Service also judges supplied samples
+//! inline and receives the verdict in the tool result.
 
 /// The Postgres-backed half of the verification journey.
 mod pg_tests {
@@ -39,6 +42,9 @@ mod pg_tests {
 
     /// The run status read tool.
     const GET_RUN: &str = "verification.get_run";
+
+    /// The direct execution write tool, offered only with `evals:run`.
+    const EXECUTE: &str = "verification.execute";
 
     /// The existing Bifrost read tool verdicts are read through.
     const QUERY: &str = "bifrost.query";
@@ -581,6 +587,88 @@ mod pg_tests {
         assert!(
             foreign_query.contains("WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"),
             "no result crosses tenants: {foreign_query}"
+        );
+        foreign_client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// A bound Service judges supplied samples with its Verifier over MCP.
+    ///
+    /// The tool result carries the exact Verifier and subject, the `passed`
+    /// or `failed` verdict, and the Drift detail; nothing is enqueued. A
+    /// reader is refused with the RBAC code, and another tenant's
+    /// administrator cannot resolve this tenant's Cards.
+    ///
+    /// # Errors
+    ///
+    /// Returns server startup, bootstrap, registration, MCP transport, or
+    /// tool-call failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any verdict, identity, or refusal expectation fails.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn an_agent_executes_a_verifier_on_supplied_samples() -> Result<(), McpJourneyError> {
+        let server = Box::pin(WyrdTestServer::start_bound()).await?;
+        let admin = server
+            .bootstrap_service("mcp-execute-admin", &["admin"])
+            .await?;
+        let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+        let fixture = register_fixture(&cards).await?;
+        let agent = server
+            .credential_registered_service(&fixture.service_ref, &["writer"])
+            .await?;
+        let agent_client =
+            ().serve_with_lifecycle(transport(&server, api_key(&agent)?, None)?, discover())
+                .await?;
+        let request = |score: f64| {
+            serde_json::json!({
+                "verifier_uid": fixture.verifier_uid,
+                "subject_card_uid": fixture.service_uid,
+                "input": { "kind": "drift_samples", "columns": { "score": [score] } },
+            })
+        };
+        for (score, verdict) in [(1.2, "passed"), (3.0, "failed")] {
+            let judged = structured(
+                agent_client
+                    .call_tool(call(EXECUTE, request(score))?)
+                    .await?,
+            )?;
+            assert_eq!(judged["verdict"], verdict, "{judged}");
+            assert_eq!(judged["kind"], "drift_custom", "{judged}");
+            assert_eq!(text(&judged, "/verifier/uid")?, fixture.verifier_uid);
+            assert_eq!(text(&judged, "/subject/uid")?, fixture.service_uid);
+            assert!(judged["detail"]["drift"].is_object(), "{judged}");
+        }
+        agent_client.cancel().await?;
+
+        let reader = server
+            .bootstrap_service("mcp-execute-reader", &["reader"])
+            .await?;
+        let reader_client =
+            ().serve_with_lifecycle(transport(&server, api_key(&reader)?, None)?, discover())
+                .await?;
+        let denied = refusal(reader_client.call_tool(call(EXECUTE, request(1.0))?).await)?;
+        assert!(
+            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "a caller without evals:run is refused: {denied}"
+        );
+        reader_client.cancel().await?;
+
+        let other_tenant = server.seed_tenant("mcp-execute-other").await?;
+        let foreign = server
+            .bootstrap_service_in_tenant(other_tenant, "mcp-execute-foreign", &["admin"])
+            .await?;
+        let foreign_client =
+            ().serve_with_lifecycle(transport(&server, api_key(&foreign)?, None)?, discover())
+                .await?;
+        let foreign_execute =
+            refusal(foreign_client.call_tool(call(EXECUTE, request(1.0))?).await)?;
+        assert!(
+            foreign_execute.contains("WYRD_VERIFICATION_404_TARGET_NOT_FOUND"),
+            "another tenant cannot execute this tenant's Verifier: {foreign_execute}"
         );
         foreign_client.cancel().await?;
         server.shutdown().await?;

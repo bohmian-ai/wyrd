@@ -533,6 +533,19 @@ export declare class NativeVerification {
    */
   startRun(requestJson: string, idempotencyKey?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
+   * Judges supplied input with one exact Verifier and returns the judgment.
+   *
+   * `request_json` is one serialized `ExecuteVerificationRequest`, decoded
+   * by the shared wire owner so a malformed request carries the server's
+   * code. Nothing is enqueued; a `failed` verdict is a successful result.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed request or server refusal is returned in the result.
+   */
+  execute(requestJson: string): Promise<NativeLifecycleResult>
+  /**
    * Reads one run's status, requester, result pointer, and dispatches.
    *
    * # Errors

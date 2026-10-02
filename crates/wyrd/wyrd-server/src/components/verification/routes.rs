@@ -20,7 +20,7 @@ use wyrd_spec::verification::{
     VerificationRunStatus,
 };
 
-use super::service::{VerificationControl, decode_execute_request, decode_start_request};
+use super::service::{VerificationControl, decode_start_request};
 use crate::components::auth::Caller;
 use crate::components::storage::routes::extract_idempotency_key;
 use crate::http::error::{WyrdErrorResponse, path_rejection};
@@ -248,7 +248,7 @@ async fn execute(
             message: format!("request body is not JSON: {error}"),
             details: serde_json::json!({}),
         })?;
-    let request = decode_execute_request(body)?;
+    let request = ExecuteVerificationRequest::decode(body)?;
     Ok(Json(
         VerificationControl::new(&state)
             .execute(&caller, &request)

@@ -7,8 +7,8 @@
 use napi::Result;
 use napi_derive::napi;
 use wyrd_client::verification::{
-    BindingId, StartVerificationRunRequest, StartVerificationRunResponse, Verification,
-    VerificationRunId,
+    BindingId, ExecuteVerificationRequest, StartVerificationRunRequest,
+    StartVerificationRunResponse, Verification, VerificationRunId,
 };
 use wyrd_spec::error::WyrdError;
 
@@ -102,6 +102,31 @@ impl NativeVerification {
                 .start_run(&request, idempotency_key.as_deref())
                 .await
                 .map(|run_id| StartVerificationRunResponse { run_id }),
+            Err(error) => Err(error),
+        };
+        NativeLifecycleResult::outcome(result)
+    }
+
+    /// Judges supplied input with one exact Verifier and returns the judgment.
+    ///
+    /// `request_json` is one serialized `ExecuteVerificationRequest`, decoded
+    /// by the shared wire owner so a malformed request carries the server's
+    /// code. Nothing is enqueued; a `failed` verdict is a successful result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the response cannot be serialized; a
+    /// malformed request or server refusal is returned in the result.
+    #[napi]
+    pub async fn execute(&self, request_json: String) -> Result<NativeLifecycleResult> {
+        let request = serde_json::from_str(&request_json)
+            .map_err(|error| WyrdError::VerificationInputInvalid {
+                message: format!("verification execute request is invalid: {error}"),
+                details: serde_json::json!({}),
+            })
+            .and_then(ExecuteVerificationRequest::decode);
+        let result = match request {
+            Ok(request) => self.verification.execute(&request).await,
             Err(error) => Err(error),
         };
         NativeLifecycleResult::outcome(result)

@@ -109,22 +109,6 @@ pub(crate) fn decode_start_request(
     })
 }
 
-/// Decode a direct execution request body.
-///
-/// HTTP and MCP both decode through here so they refuse the same body
-/// identically.
-///
-/// # Errors
-/// Returns [`WyrdError::VerificationInputInvalid`] for any malformed body.
-pub(crate) fn decode_execute_request(
-    body: JsonValue,
-) -> Result<ExecuteVerificationRequest, WyrdError> {
-    serde_json::from_value(body).map_err(|error| WyrdError::VerificationInputInvalid {
-        message: format!("verification execute request is invalid: {error}"),
-        details: serde_json::json!({}),
-    })
-}
-
 /// Audit resource naming one manual run target.
 fn target_resource(target: &VerificationRunTarget) -> String {
     match target {

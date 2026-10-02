@@ -300,6 +300,13 @@ impl ServerHandler for WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
+            verification::EXECUTE => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                // Authorized and audited by the operation, like a manual run.
+                self.mcp_execute(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
             name if gateway::TOOLS.contains(&name) => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.gateway_tool(name, caller, request.arguments).await

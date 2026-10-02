@@ -2,11 +2,12 @@
 //!
 //! Typed projections of the same server operations HTTP serves:
 //! `cards.get` reads a Card (including `card.status.verification`), and the
-//! three `verification.*` tools read binding and run status and request a
-//! manual Drift run. Authorization, audit, tenancy, idempotency, and error
+//! four `verification.*` tools read binding and run status, request a manual
+//! Drift run, and judge supplied input directly. Authorization, audit, tenancy, idempotency, and error
 //! mapping stay with [`VerificationControl`] and the Cards read path, so this
-//! module only parses arguments and projects answers. Verdicts are read with
-//! the existing `bifrost.query` tool by `result_id`.
+//! module only parses arguments and projects answers. Queued verdicts are
+//! read with the existing `bifrost.query` tool by `result_id`; a direct
+//! execution returns its verdict.
 
 use rmcp::model::{CallToolResult, Tool};
 use schemars::JsonSchema;
@@ -18,8 +19,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, IdempotencyKey, VerificationRunId};
 use wyrd_spec::registry::GetCardResponse;
 use wyrd_spec::verification::{
-    StartVerificationRunResponse, VerificationBindingStatus, VerificationRunInput,
-    VerificationRunStatus, VerificationRunTarget,
+    ExecuteVerificationRequest, ExecuteVerificationResponse, StartVerificationRunResponse,
+    VerificationBindingStatus, VerificationRunInput, VerificationRunStatus, VerificationRunTarget,
 };
 
 use super::principals::{parse_args, tool};
@@ -39,6 +40,9 @@ pub(super) const START_RUN: &str = "verification.start_run";
 
 /// Wire name of the run status read.
 pub(super) const GET_RUN: &str = "verification.get_run";
+
+/// Wire name of the direct execution.
+pub(super) const EXECUTE: &str = "verification.execute";
 
 /// Arguments of `cards.get`.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -119,15 +123,28 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
 /// authorizes and audits the same permission when the tool is named directly.
 #[must_use]
 pub(super) fn write_descriptors() -> Vec<Tool> {
-    vec![tool::<StartRunArgs, StartVerificationRunResponse>(
-        START_RUN,
-        "Start a manual verification run",
-        "Durably enqueue one manual Drift run over a bounded UTC window [start, end) for a \
-         binding or a direct Verifier/subject pair, and return its run_id without waiting for \
-         scoring. Poll verification.get_run. Requires evals:run and, for a Card-bound caller, \
-         Card scope over the subject.",
-        false,
-    )]
+    vec![
+        tool::<StartRunArgs, StartVerificationRunResponse>(
+            START_RUN,
+            "Start a manual verification run",
+            "Durably enqueue one manual Drift run over a bounded UTC window [start, end) for a \
+             binding or a direct Verifier/subject pair, and return its run_id without waiting \
+             for scoring. Poll verification.get_run. Requires evals:run and, for a Card-bound \
+             caller, Card scope over the subject.",
+            false,
+        ),
+        tool::<ExecuteVerificationRequest, ExecuteVerificationResponse>(
+            EXECUTE,
+            "Execute a Verifier on supplied input",
+            "Judge supplied drift_samples or one eval_record with one exact Verifier about one \
+             subject Card and return the verdict, counts, and detail in this response, within a \
+             60-second deadline. Nothing is enqueued, published, or dispatched; a failed verdict \
+             is a successful result. PSI/SPC Verifiers need a ready fitted baseline; Eval trace \
+             and agent assertions are unsupported. Requires evals:run and, for a Card-bound \
+             caller, Card scope over the subject.",
+            false,
+        ),
+    ]
 }
 
 /// Whether this caller's token carries `evals:run`.
@@ -185,6 +202,27 @@ impl WyrdMcpHandler {
         structured(
             &VerificationControl::new(&self.state)
                 .get_run(&caller, args.run_id)
+                .await?,
+        )
+    }
+
+    /// Judge supplied input with one exact Verifier.
+    ///
+    /// Decodes the arguments exactly as the HTTP body.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationInputInvalid`] for absent or malformed
+    /// arguments, and every error of [`VerificationControl::execute`].
+    pub(super) async fn mcp_execute(
+        &self,
+        caller: Caller,
+        arguments: Option<JsonMap<String, JsonValue>>,
+    ) -> Result<CallToolResult, WyrdError> {
+        let request =
+            ExecuteVerificationRequest::decode(JsonValue::Object(arguments.unwrap_or_default()))?;
+        structured(
+            &VerificationControl::new(&self.state)
+                .execute(&caller, &request)
                 .await?,
         )
     }

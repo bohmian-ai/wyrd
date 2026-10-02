@@ -510,6 +510,22 @@ pub struct ExecuteVerificationRequest {
 }
 
 impl ExecuteVerificationRequest {
+    /// Decode one direct execution request from its JSON wire value.
+    ///
+    /// HTTP, MCP, and every language binding decode through here, so a
+    /// malformed request is refused with the same stable code on every
+    /// surface.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationInputInvalid`] for any value that does
+    /// not match the wire contract.
+    pub fn decode(body: serde_json::Value) -> Result<Self, WyrdError> {
+        serde_json::from_value(body).map_err(|error| WyrdError::VerificationInputInvalid {
+            message: format!("verification execute request is invalid: {error}"),
+            details: serde_json::json!({}),
+        })
+    }
+
     /// Check the input bounds decidable without IO.
     ///
     /// # Errors

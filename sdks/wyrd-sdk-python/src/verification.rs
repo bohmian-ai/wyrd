@@ -10,17 +10,20 @@ use pyo3::types::PyModule;
 use serde_json::Value;
 use wyrd_client::bifrost::client_from_options;
 use wyrd_client::verification::{
-    BindingId, StartVerificationRunRequest, Verification as NativeVerification, VerificationRunId,
+    BindingId, ExecuteVerificationRequest, StartVerificationRunRequest,
+    Verification as NativeVerification, VerificationRunId,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, pyobject_to_json};
 
 use crate::operators::{decode, to_python};
 
-/// Python-facing Verification handle: binding status, manual runs, run status.
+/// Python-facing Verification handle: binding status, manual runs, run
+/// status, and direct execution.
 ///
 /// Every call blocks the calling thread with the GIL released and returns once
-/// the server answers; a started run is enqueued, not finished.
+/// the server answers; a started run is enqueued, not finished, while a direct
+/// execution returns its judgment.
 #[pyclass(module = "wyrd._wyrd.verification", name = "Verification")]
 pub struct Verification {
     /// The shared native handle every call delegates to.
@@ -80,6 +83,22 @@ impl Verification {
             wyrd_runtime::runtime().block_on(self.inner.start_run(&request, idempotency_key))
         })?;
         Ok(run_id.to_string())
+    }
+
+    /// Judge supplied input with one exact Verifier and return the judgment as a dict.
+    ///
+    /// `request` is the `ExecuteVerificationRequest` wire shape, decoded by
+    /// the shared wire owner so a malformed request raises the server's code.
+    /// Nothing is enqueued; a `failed` verdict is a successful return.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when `request` does not match the wire contract or
+    /// the server refuses the execution.
+    fn execute(&self, py: Python<'_>, request: &Bound<'_, PyAny>) -> WyrdPyResult<Py<PyAny>> {
+        let request = ExecuteVerificationRequest::decode(pyobject_to_json(request)?)?;
+        let response =
+            py.detach(|| wyrd_runtime::runtime().block_on(self.inner.execute(&request)))?;
+        to_python(py, &response)
     }
 
     /// Read one run's status, requester, result pointer, and dispatches as a dict.

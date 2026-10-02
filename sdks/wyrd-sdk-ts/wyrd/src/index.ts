@@ -1248,11 +1248,66 @@ export interface VerificationRunStatus {
   readonly dispatches: readonly OperatorDispatchState[];
 }
 
+/** Supplied input one direct execution judges, in its wire shape. */
+export type DirectVerificationInput =
+  | {
+      readonly kind: "drift_samples";
+      /** Named columns; `null` marks a missing sample, which leaves Drift unscored. */
+      readonly columns: Readonly<Record<string, readonly (number | string | null)[]>>;
+    }
+  | {
+      readonly kind: "eval_record";
+      readonly context: Readonly<Record<string, unknown>>;
+      readonly media?: readonly {
+        readonly id: string;
+        readonly kind: "image" | "document";
+        readonly uri: string;
+        readonly media_type?: string;
+      }[];
+    };
+
+/** A direct execution: one exact Verifier judging supplied input about one subject. */
+export interface ExecuteVerificationRequest {
+  readonly verifier_uid: string;
+  readonly subject_card_uid: string;
+  readonly input: DirectVerificationInput;
+}
+
+/** The judgment of one direct execution, returned in the same response. */
+export interface ExecuteVerificationResponse {
+  /** Transient identity found only in this response, the audit row, and the trace. */
+  readonly execution_id: string;
+  readonly verifier: CardRef;
+  readonly subject: CardRef;
+  readonly kind:
+    | "drift_psi"
+    | "drift_spc"
+    | "drift_custom"
+    | "eval_assertion"
+    | "eval_llm_judge"
+    | "eval_other"
+    | "unknown";
+  readonly verdict: "passed" | "failed" | "inconclusive";
+  readonly summary: string;
+  readonly counts:
+    | { readonly implementation: "drift"; readonly drifted_features: number; readonly total_features: number }
+    | {
+        readonly implementation: "eval";
+        readonly passed_tasks: number;
+        readonly failed_tasks: number;
+        readonly total_tasks: number;
+        readonly pass_rate_percent: number;
+      };
+  /** `{ drift: DriftReport }` or `{ eval: { results, skipped } }`. */
+  readonly detail: { readonly drift: unknown } | { readonly eval: unknown };
+}
+
 /**
  * Tenant-scoped Verification control-plane client over the shared Rust handle.
  *
  * The server decides readiness, authorizes and audits each request, and
- * enqueues runs; failures throw a structured {@link WyrdError}. Binding IDs
+ * enqueues runs or judges supplied input inline; failures throw a structured
+ * {@link WyrdError}. Binding IDs
  * come from a Card's `status.verification.binding_ids`; verdicts are read from
  * Bifrost by the run's `result_id`.
  */
@@ -1303,6 +1358,21 @@ export class Verification {
         options.idempotencyKey,
       ),
     ).run_id;
+  }
+
+  /**
+   * Judge supplied input with one exact Verifier and return its judgment.
+   *
+   * Nothing is enqueued, published, or dispatched, and a `failed` verdict
+   * resolves normally. The request is never replayed after an ambiguous
+   * transport failure, so a judge call is never silently repeated.
+   */
+  async execute(
+    request: ExecuteVerificationRequest,
+  ): Promise<ExecuteVerificationResponse> {
+    return lifecycleValue<ExecuteVerificationResponse>(
+      await this.#native.execute(JSON.stringify(request)),
+    );
   }
 
   /** Read one run's execution status, requester, result pointer, and dispatches. */

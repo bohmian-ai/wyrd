@@ -1,9 +1,11 @@
-//! Verification binding status, manual Verifier runs, and run status.
+//! Verification binding status, manual Verifier runs, run status, and direct
+//! execution.
 //!
 //! The shared implementation every first-class SDK projects. It owns no
 //! durable state and no analysis engine: the server decides readiness,
 //! authorizes and audits each request, enqueues runs, and reports their
-//! status. Verdicts and Drift/Eval details are read through
+//! status, or judges supplied input inline. Queued verdicts and Drift/Eval
+//! details are read through
 //! [`Bifrost`](crate::Bifrost) queries by `result_id`; baseline status and
 //! binding IDs are read through [`Cards`](crate::cards::Cards).
 
@@ -17,12 +19,16 @@ use crate::client::WyrdClient;
 // The wire contract this handle speaks, re-exported so an SDK user reaches one
 // module for the capability and its types.
 pub use wyrd_spec::error::WyrdError;
-pub use wyrd_spec::ids::{BindingId, VerificationResultId, VerificationRunId};
+pub use wyrd_spec::ids::{
+    BindingId, VerificationExecutionId, VerificationResultId, VerificationRunId,
+};
 pub use wyrd_spec::verification::{
-    DriftWindow, OperatorDispatchState, OperatorDispatchStatus, StartVerificationRunRequest,
-    StartVerificationRunResponse, VerificationBindingStatus, VerificationError,
-    VerificationExecutionStatus, VerificationRunInput, VerificationRunStatus,
-    VerificationRunTarget, VerifierReadiness,
+    DirectVerificationInput, DriftSample, DriftWindow, ExecuteVerificationRequest,
+    ExecuteVerificationResponse, OperatorDispatchState, OperatorDispatchStatus,
+    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
+    VerificationError, VerificationExecutionDetail, VerificationExecutionStatus,
+    VerificationRunInput, VerificationRunStatus, VerificationRunTarget, VerificationVerdict,
+    VerifierKind, VerifierReadiness,
 };
 
 /// Cheap-to-clone, tenant-scoped Verification control-plane handle.
@@ -120,6 +126,29 @@ impl Verification {
             }
         };
         Ok(response.run_id)
+    }
+
+    /// Judge supplied input with one exact Verifier and return its judgment.
+    ///
+    /// The server authorizes, audits, and executes the Verifier inline within
+    /// its deadline; nothing is enqueued, published, or dispatched. A `failed`
+    /// verdict is a successful response. The request carries no
+    /// `Idempotency-Key`, so an ambiguous transport failure is surfaced rather
+    /// than replayed: a judge call is never silently repeated.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the input is malformed, oversized,
+    /// incompatible, or unsupported, the caller lacks `evals:run` or scope
+    /// over the subject, either Card is unknown, the fitted baseline is not
+    /// ready or legacy, the judge provider fails, the deadline elapses, or the
+    /// request fails.
+    pub async fn execute(
+        &self,
+        request: &ExecuteVerificationRequest,
+    ) -> Result<ExecuteVerificationResponse, WyrdError> {
+        self.client
+            .request_json(Method::POST, "/v1/verification/execute", Some(request))
+            .await
     }
 
     /// Read one run's execution status, requester, result pointer, and dispatches.

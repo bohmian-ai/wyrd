@@ -170,16 +170,11 @@ def build_wyrd_error(
     """
     ...
 
-def _init() -> None:
-    """Initialize the native Wyrd extension."""
-    ...
-
 ### GLOBAL EXPORTS ###
 __all__ = [
     "AgentError",
     "SessionError",
     "ToolError",
     "WyrdError",
-    "_init",
     "build_wyrd_error",
 ]

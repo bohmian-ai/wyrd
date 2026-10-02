@@ -176,12 +176,6 @@ def assemble_root_stub() -> None:
         final_content.append(text_to_append.strip())
         final_content.append("")
 
-    final_content.append("def _init() -> None:")
-    final_content.append('    """Initialize the native Wyrd extension."""')
-    final_content.append("    ...")
-    final_content.append("")
-    master_all.append("_init")
-
     final_content.append("### GLOBAL EXPORTS ###")
     final_content.append("__all__ = [")
     for item in sorted(set(master_all)):

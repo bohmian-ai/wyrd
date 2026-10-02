@@ -3,7 +3,7 @@
 from typing import Protocol
 
 from . import cards, client, config, data, model, prompt, state
-from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
+from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
     Agent,
     AgentRun,
@@ -55,8 +55,6 @@ class Card(Protocol):
 
 
 cards.Card = Card
-
-_init()
 
 __all__ = [
     "Agent",

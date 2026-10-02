@@ -11311,8 +11311,6 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
- "skald-agent",
- "skald-prompt",
  "skald-providers",
  "skald-runtime",
  "skald-spec",

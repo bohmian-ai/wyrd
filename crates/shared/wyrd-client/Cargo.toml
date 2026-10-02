@@ -38,8 +38,6 @@ serde_jcs = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
-skald-agent = { workspace = true }
-skald-prompt = { workspace = true }
 skald-spec = { workspace = true }
 skald-tool = { workspace = true }
 skald-workflow = { workspace = true }

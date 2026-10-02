@@ -382,8 +382,8 @@ impl Workflow {
     /// durable-card lookup; this crate performs no filesystem or network IO.
     /// A referenced step without a resolver, or an unresolved `Path`, stays
     /// unhydrated and fails [`Self::validate`] and every run.
-    /// `wyrd_client::WorkflowLoader` is the shared composition that supplies
-    /// already-fetched exact bodies through this seam.
+    /// [`Self::from_card_bodies`] supplies already-fetched exact bodies
+    /// through this seam.
     ///
     /// # Errors
     /// Returns Workflow contract validation errors, or prompt, tool, or agent
@@ -451,10 +451,10 @@ impl Workflow {
     /// Parse a workflow from one canonical wire-form envelope YAML document.
     ///
     /// This parses a single document only: inline Agent steps hydrate, but
-    /// authored `path`/`inline` keyed forms, sibling bundles, and Card
+    /// local `path` dependencies, sibling bundles, and Card
     /// references are not resolved here. Load a bundle or a registered
-    /// Workflow through `wyrd_client::WorkflowLoader`, which feeds
-    /// [`Self::from_card_with_agent_resolver`].
+    /// Workflow through the shared client, which feeds
+    /// [`Self::from_card_bodies`].
     ///
     /// # Errors
     /// Returns parse, prompt resolution, or agent resolution errors.

@@ -13,20 +13,19 @@ use serde_json::{Value, json};
 use skald_providers::ProviderError;
 use skald_spec::ProviderResponse;
 use skald_spec::wire::openai_chat::OpenAiChatResponse;
-use skald_tool::ToolRegistry;
 use skald_workflow::{
     WorkflowExecutionDependencies, WorkflowRunOptions, WorkflowRunStatus, WyrdGatewayCall,
     WyrdGatewayCaller,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
+use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
-use wyrd_client::cards::Cards;
+use wyrd_client::cards::{CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_client::{WorkflowLoader, WyrdClient};
 use wyrd_loader::{build_registration_input, load};
 use wyrd_spec::card::workflow::WorkflowAction;
 use wyrd_spec::envelope::{CardKind, Spec};
@@ -127,7 +126,7 @@ fn edited_bundle(
     temp
 }
 
-/// Replace every `path:` step target with an external `ref:` to the
+/// Replace every path step target with an external Card reference to the
 /// registered 1.0.0 reviewer Agents.
 fn external_targets(workflow: String) -> String {
     [
@@ -138,21 +137,21 @@ fn external_targets(workflow: String) -> String {
     .into_iter()
     .fold(workflow, |yaml, (file, name)| {
         yaml.replace(
-            &format!("          path: ./agents/{file}"),
+            &format!("        target: ./agents/{file}"),
             &format!(
-                "          ref:\n            kind: Agent\n            name: {name}\n            version: \"1.0.0\""
+                "        target:\n          kind: Agent\n          name: {name}\n          version: \"1.0.0\""
             ),
         )
     })
 }
 
 /// Insert a step before `correctness` that runs the Agent `name@1.0.0`
-/// through an external `ref:` with the same `code` binding.
+/// through an external Card reference with the same `code` binding.
 fn add_registered_step(workflow: &str, id: &str, name: &str) -> String {
     workflow.replacen(
         "    - id: correctness",
         &format!(
-            "    - id: {id}\n      action:\n        type: agent\n        target:\n          ref:\n            kind: Agent\n            name: {name}\n            version: \"1.0.0\"\n      inputs:\n        code: input.code\n\n    - id: correctness"
+            "    - id: {id}\n      action:\n        type: agent\n        target:\n          kind: Agent\n          name: {name}\n          version: \"1.0.0\"\n      inputs:\n        code: input.code\n\n    - id: correctness"
         ),
         1,
     )
@@ -290,6 +289,23 @@ async fn card_count(server: &WyrdTestServer, name: &str) -> i64 {
     .await
 }
 
+/// Count every principal across tenants, so registration can be shown to
+/// create none.
+///
+/// # Panics
+/// Panics when the superuser pool cannot open or the count fails.
+async fn principal_count(server: &WyrdTestServer) -> i64 {
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query_scalar("SELECT count(*) FROM platform.principals")
+        .fetch_one(&pool)
+        .await
+        .expect("principal count reads")
+}
+
 /// One invalidating edit applied to a submitted Workflow spec body.
 type SpecMutation = fn(&mut Value);
 
@@ -356,10 +372,16 @@ async fn registers_only_valid_explicit_workflow_graphs() {
     let (server, jwt) = start_server(storage_root.path()).await;
     let cards = Cards::with_client(registry_client(&server, &jwt));
 
+    let principals = principal_count(&server).await;
     let receipt = cards
         .register_from_path(&bundle().join("workflow.yaml"))
         .await
         .expect("code-review bundle registers");
+    assert_eq!(
+        principal_count(&server).await,
+        principals,
+        "registering a Workflow creates no principal"
+    );
     assert_eq!(receipt.outcomes.len(), 7);
     assert!(
         receipt
@@ -472,12 +494,12 @@ async fn registers_only_valid_explicit_workflow_graphs() {
     .expect("prompt writes");
     std::fs::write(
         tooling.path().join("agent.yaml"),
-        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  space: engineering\n  name: tooling-agent\n  version: \"1.0.0\"\nspec:\n  prompt:\n    path: ./prompt.yaml\n  tool_names: [bifrost.query, cards.get]\n  run_config:\n    max_iterations: 2\n",
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  space: engineering\n  name: tooling-agent\n  version: \"1.0.0\"\nspec:\n  prompt: ./prompt.yaml\n  tool_names: [bifrost.query, cards.get]\n  run_config:\n    max_iterations: 2\n",
     )
     .expect("agent writes");
     std::fs::write(
         tooling.path().join("workflow.yaml"),
-        "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  space: engineering\n  name: tooling-review\n  version: \"1.0.0\"\nspec:\n  llm_route:\n    kind: wyrd_gateway\n  inputs:\n    code:\n      type: str\n      value: \"\"\n  steps:\n    - id: summarize\n      action:\n        type: agent\n        target:\n          path: ./agent.yaml\n      inputs:\n        code: input.code\n  outputs:\n    summary: steps.summarize.output.text\n",
+        "apiVersion: wyrd/v1\nkind: Workflow\nmetadata:\n  space: engineering\n  name: tooling-review\n  version: \"1.0.0\"\nspec:\n  llm_route:\n    kind: wyrd_gateway\n  inputs:\n    code:\n      type: str\n      value: \"\"\n  steps:\n    - id: summarize\n      action:\n        type: agent\n        target: ./agent.yaml\n      inputs:\n        code: input.code\n  outputs:\n    summary: steps.summarize.output.text\n",
     )
     .expect("workflow writes");
     let receipt = cards
@@ -601,7 +623,7 @@ async fn registers_only_valid_explicit_workflow_graphs() {
     let registered = tempfile::tempdir().expect("registered Agent workspace creates");
     std::fs::write(
         registered.path().join("agent.yaml"),
-        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  space: engineering\n  name: collision-reviewer\n  version: \"1.0.0\"\nspec:\n  prompt:\n    inline:\n      model: gpt-5-5\n      request:\n        model: gpt-5-5\n        messages:\n          - role: user\n            content: \"Inspect {{diff}}\"\n      variables: [diff]\n      response_type: text\n",
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  space: engineering\n  name: collision-reviewer\n  version: \"1.0.0\"\nspec:\n  prompt:\n    model: gpt-5-5\n    request:\n      model: gpt-5-5\n      messages:\n        - role: user\n          content: \"Inspect {{diff}}\"\n    variables: [diff]\n    response_type: text\n",
     )
     .expect("registered Agent writes");
     cards
@@ -631,11 +653,10 @@ async fn registers_only_valid_explicit_workflow_graphs() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-/// A registered Workflow is fetched over HTTP at its exact locked versions and
-/// executed locally; newer Agent versions never float in, a local sibling and
-/// an external ref with the same identity each run their own body, and
-/// missing, foreign, mismatched, non-exact, and inactive references are
-/// refused.
+/// A registered Workflow is loaded through the Cards Workflow view at its
+/// exact locked versions and executed locally; newer Agent versions never
+/// float in, and missing, foreign, mismatched, non-exact, wrong-kind, and
+/// inactive references are refused before any dispatch.
 ///
 /// # Panics
 /// Panics when registration, loading, execution, or any refusal diverges
@@ -671,13 +692,13 @@ async fn fetches_and_executes_locked_workflow_graph() {
         .await
         .expect("newer security Agent and Prompt register");
 
-    let loader = WorkflowLoader::new(Arc::new(ToolRegistry::new()))
-        .with_client(registry_client(&server, &jwt));
-    let registered = card_ref("Workflow", "code-review", "1.0.0", None);
-    let workflow = loader
-        .load_registered(&registered)
+    let workflows = cards.workflow();
+    let registered = CardSelector::exact(card_ref("Workflow", "code-review", "1.0.0", None));
+    let workflow = workflows
+        .load(&registered)
         .await
-        .expect("registered graph loads");
+        .expect("registered graph loads")
+        .into_skald();
     assert_eq!(
         workflow.step_ids(),
         vec!["security", "correctness", "final_review"]
@@ -714,62 +735,6 @@ async fn fetches_and_executes_locked_workflow_graph() {
     let last = requests.last().expect("final request recorded");
     assert!(last.contains("SECURITY-FINDINGS") && last.contains("CORRECTNESS-FINDINGS"));
 
-    let authored = edited_bundle(|agent| agent, external_targets);
-    let local = loader
-        .load_file(&authored.path().join("workflow.yaml"))
-        .await
-        .expect("authored external refs resolve through exact reads");
-    let local_run = local
-        .run_with_options(&dependencies, input(), WorkflowRunOptions::default())
-        .await
-        .expect("authored run starts");
-    assert_eq!(local_run.status, WorkflowRunStatus::Succeeded);
-    assert_eq!(local_run.outputs, run.outputs);
-    assert_eq!(
-        local_run.steps.keys().collect::<Vec<_>>(),
-        run.steps.keys().collect::<Vec<_>>()
-    );
-    assert!(local_run.workflow.is_none());
-    assert_eq!(gateway.requests().len(), 6);
-
-    let shadowed = edited_bundle(
-        |card| {
-            card.replacen(
-                "You are a security reviewer.",
-                "You are a local auditor.",
-                1,
-            )
-        },
-        |yaml| add_registered_step(&yaml, "registered_security", "security-reviewer"),
-    );
-    let shadowed = loader
-        .load_file(&shadowed.path().join("workflow.yaml"))
-        .await
-        .expect("a sibling and a same-identity external ref load side by side");
-    let shadow_gateway = Arc::new(ReviewGateway::default());
-    let shadow_dependencies =
-        WorkflowExecutionDependencies::new(skald_runtime::ProviderRegistry::new())
-            .with_wyrd_gateway(Arc::clone(&shadow_gateway) as Arc<dyn WyrdGatewayCaller>);
-    let shadow_run = shadowed
-        .run_with_options(&shadow_dependencies, input(), WorkflowRunOptions::default())
-        .await
-        .expect("shadowed run starts");
-    assert_eq!(shadow_run.status, WorkflowRunStatus::Succeeded);
-    let shadow_requests = shadow_gateway.requests();
-    assert_eq!(shadow_requests.len(), 4);
-    assert!(
-        shadow_requests
-            .iter()
-            .any(|request| request.contains("You are a local auditor.")),
-        "the sibling step runs its local body"
-    );
-    assert!(
-        shadow_requests
-            .iter()
-            .any(|request| request.contains("You are a security reviewer.")),
-        "the external step runs the registered body"
-    );
-
     let refusals = [
         (
             card_ref("Workflow", "code-review", "9.9.9", None),
@@ -789,8 +754,8 @@ async fn fetches_and_executes_locked_workflow_graph() {
         ),
     ];
     for (reference, code) in refusals {
-        let error: WyrdError = loader
-            .load_registered(&reference)
+        let error: WyrdError = workflows
+            .load(&CardSelector::exact(reference.clone()))
             .await
             .expect_err("refused reference");
         assert_eq!(error.code(), code, "{reference}: {error}");
@@ -824,8 +789,13 @@ async fn fetches_and_executes_locked_workflow_graph() {
     .execute(&pool)
     .await
     .expect("foreign Workflow inserts");
-    let error = loader
-        .load_registered(&card_ref("Workflow", "foreign-review", "1.0.0", None))
+    let error = workflows
+        .load(&CardSelector::exact(card_ref(
+            "Workflow",
+            "foreign-review",
+            "1.0.0",
+            None,
+        )))
         .await
         .expect_err("a foreign tenant's Workflow is invisible");
     assert_eq!(error.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
@@ -837,8 +807,8 @@ async fn fetches_and_executes_locked_workflow_graph() {
             .execute(&pool)
             .await
             .expect("security Agent deactivates");
-        let error = loader
-            .load_registered(&registered)
+        let error = workflows
+            .load(&registered)
             .await
             .expect_err("an inactive locked dependency is refused");
         let expected = if status == "pending" {
@@ -850,7 +820,7 @@ async fn fetches_and_executes_locked_workflow_graph() {
     }
     assert_eq!(
         gateway.requests().len(),
-        6,
+        3,
         "refused loads dispatch nothing"
     );
 

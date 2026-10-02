@@ -3,10 +3,9 @@
 //! This crate owns client transport configuration, credential resolution,
 //! authentication, and the composed client capabilities — [`cards::Cards`],
 //! [`storage::WyrdStorageClient`], [`state::WyrdState`], and [`Bifrost`] —
-//! that the Rust, Python, and TypeScript SDKs project. [`WorkflowLoader`]
-//! composes local bundles and registered Workflow graphs into the Skald
-//! runtime. Durable
-//! shared security refs live in `wyrd-spec`.
+//! that the Rust, Python, and TypeScript SDKs project. [`Workflow`] loads
+//! authored Workflow files and registered Workflow Cards into the Skald
+//! runtime. Durable shared security refs live in `wyrd-spec`.
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -28,7 +27,7 @@ pub mod state;
 pub mod storage;
 pub mod transport;
 pub mod verification;
-pub mod workflow_loader;
+pub mod workflow;
 
 pub use bifrost::{Bifrost, QueueConfig};
 pub use client::WyrdClient;
@@ -38,7 +37,7 @@ pub use operator_connections::OperatorConnections;
 pub use platform::Platform;
 pub use principals::Principals;
 pub use verification::Verification;
-pub use workflow_loader::{WorkflowGraph, WorkflowLoader};
+pub use workflow::{Workflow, WorkflowCards};
 
 /// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`
 /// environment variables. `ClientConfig::from_env` and

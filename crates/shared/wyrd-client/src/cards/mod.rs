@@ -16,11 +16,14 @@ mod saga;
 
 pub use engine::RegistryContext;
 pub use handle::{CardSelector, Cards, LoadedCard};
+pub(crate) use hydrate::WorkflowBodies;
 pub use hydrate::{
     CardGraphHydrator, HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest,
     HydrationMode, HydrationSummary,
 };
 pub use progress::{RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink};
+pub use wyrd_spec::envelope::CardKind;
+pub use wyrd_spec::reference::CardRef;
 pub use wyrd_spec::registry::{
     CardSummary, ListCardsRequest, ListCardsResponse, RegistrationReceipt,
 };

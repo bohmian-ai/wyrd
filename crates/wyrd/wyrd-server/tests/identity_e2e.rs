@@ -3419,9 +3419,10 @@ async fn assert_refresh_cut_off(srv: &WyrdTestServer, session: &Value, label: &s
 ///   2. B replaces the Active connection, and A refuses the old session;
 ///   3. B deactivates, and A refuses the session minted by the replacement;
 ///   4. B removes a freshly activated connection, and A refuses its session;
-///   5. a callback paused after provider authentication — held before
-///      issuance by a lock on the user-role table — fails once B's
-///      deactivation commits, and inserts no refresh row.
+///   5. a callback paused after provider authentication — held by a lock on
+///      the user-role table while B's deactivation commits — hands the client
+///      a code that redeems to `invalid_grant` and inserts no refresh row,
+///      because sessions are minted only at redemption.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
@@ -3486,7 +3487,8 @@ async fn tenant_connection_session_cutoff_journey() {
     assert_eq!(status, StatusCode::NO_CONTENT, "B removes: {body}");
     assert_refresh_cut_off(&replica_a, &third, "removal").await;
 
-    // 5. A callback paused after provider IO fails once deactivation commits.
+    // 5. A login paused after provider IO redeems nothing once deactivation
+    // commits.
     activate_keycloak_connection(&replica_b, &admin, PUBLIC_HUMAN_CLIENT, "Public", None).await;
     let principal = principal_id_of(
         sign_in().await["access_token"]
@@ -3540,23 +3542,27 @@ async fn tenant_connection_session_cutoff_journey() {
         );
         hold.commit().await.expect("hold releases");
     };
-    let (refusal, ()) = tokio::join!(
-        refused_login(
+    let (reply, ()) = tokio::join!(
+        callback_reply(
             &replica_a,
             &provider.code,
             &provider.state,
             provider.iss.as_deref(),
+            "test-tenant-1.wyrd.test",
         ),
         release
     );
+    let code = authorized_code(&reply, &provider.code);
+    let (status, body) = redeem(&replica_a, &code, &provider.verifier).await;
     assert_eq!(
-        refusal, "access_denied",
-        "the in-flight callback is refused"
+        (status, &body["error"]),
+        (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_grant")),
+        "the in-flight login's code redeems nothing: {body}"
     );
     assert_eq!(
         refresh_rows(&replica_a, &principal).await,
         before,
-        "the in-flight callback issued no session"
+        "the in-flight login issued no session"
     );
 
     replica_b.shutdown().await.expect("replica B shuts down");
@@ -4792,13 +4798,12 @@ async fn tenant_connection_test_sign_in_journey() {
         .await
         .expect("superuser pool opens");
     let issued = || async {
-        sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        sqlx::query_as::<_, (i64, i64, i64, i64)>(
             "SELECT (SELECT count(*) FROM wyrd.auth_users WHERE auth_type = 'oidc'),
                     (SELECT count(*) FROM wyrd.auth_refresh_tokens),
                     (SELECT count(*) FROM wyrd.auth_api_keys),
-                    (SELECT count(*) FROM wyrd.auth_browser_sessions),
                     (SELECT count(*) FROM wyrd.auth_login_state
-                      WHERE completion_sealed IS NOT NULL)",
+                      WHERE code_hash IS NOT NULL)",
         )
         .fetch_one(&superuser)
         .await
@@ -4864,7 +4869,7 @@ async fn tenant_connection_test_sign_in_journey() {
     assert_eq!(
         issued().await,
         before,
-        "a test issues no User, credential, session, or completion"
+        "a test issues no User, credential, session, or authorization code"
     );
 
     // 4. Replay: the consumed test state is refused.

@@ -36,7 +36,7 @@ use wyrd_sql::queries::auth::{
 };
 
 use crate::audit::{
-    append_auth_audit, auth_event, auth_failure_code, principal_event,
+    append_auth_audit, auth_event, auth_failure_code, principal_event, principal_kind_tag,
     record_auth_audit_best_effort,
 };
 use crate::connections::HumanConnections;
@@ -48,6 +48,9 @@ use crate::refresh::tenant_from_refresh_jwt;
 /// Operation for a CLI handoff claim that handed out, or was refused, a
 /// login's credential.
 pub const CLI_HANDOFF_CLAIM_OPERATION: &str = "auth.cli_handoff.claim";
+
+/// Operation for a CLI logout that revoked one login's refresh chain.
+pub const CLI_LOGOUT_OPERATION: &str = "auth.cli_login.logout";
 
 /// Lifetime of a CLI handoff: the person must finish the browser sign-in and
 /// the CLI must claim it within this window. The table refuses longer.
@@ -324,13 +327,22 @@ impl CliLogins {
     /// lookup under tenant RLS is the authority. Under the User's
     /// refresh-family lock, the presented row and every row rotated from it
     /// are revoked, so the presented token and any successor stop renewing,
-    /// while the User's other logins stay valid. A malformed, unknown, or
-    /// already revoked token revokes nothing.
+    /// while the User's other logins stay valid. One allowed
+    /// `auth.cli_login.logout` audit event naming the row's principal, and no
+    /// token, is appended on that same transaction under `request_id`, so the
+    /// revocation commits exactly when its audit row does. A malformed or
+    /// unknown token revokes and records nothing (RFC 7009); an already
+    /// revoked one revokes nothing but is still recorded.
     ///
     /// # Errors
-    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails;
-    /// nothing is committed then.
-    pub async fn end(&self, refresh_token: &SecretBearer) -> Result<(), WyrdError> {
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails and
+    /// [`WyrdError::AuditUnavailable`] when the audit append fails; nothing is
+    /// committed then.
+    pub async fn end(
+        &self,
+        refresh_token: &SecretBearer,
+        request_id: &str,
+    ) -> Result<(), WyrdError> {
         let Ok(tenant) = tenant_from_refresh_jwt(refresh_token.expose()) else {
             return Ok(());
         };
@@ -352,6 +364,15 @@ impl CliLogins {
         revoke_refresh_chain(&mut conn, row.id, "cli_logout")
             .await
             .map_err(store_error)?;
+        let event = principal_event(
+            request_id,
+            CLI_LOGOUT_OPERATION,
+            PrincipalId::new(row.principal_id),
+            principal_kind_tag(&row.principal_kind),
+            None,
+            AuditOutcome::Allowed,
+        );
+        append_auth_audit(&mut conn, &event).await?;
         conn.commit().await.map_err(store_error)
     }
 
@@ -436,7 +457,7 @@ mod pg_tests {
     use wyrd_spec::ids::TenantSlug;
     use wyrd_sql::queries::auth::{insert_human_refresh_token, refresh_by_hash};
 
-    use super::CliLogins;
+    use super::{CLI_LOGOUT_OPERATION, CliLogins};
     use crate::connections::HumanConnections;
     use crate::exchange_api_key::token_hash;
 
@@ -586,10 +607,12 @@ mod pg_tests {
     }
 
     /// Logout from a stale refresh token revokes its live successor, while the
-    /// same User's other login keeps renewing.
+    /// same User's other login keeps renewing, and records exactly one
+    /// logout audit event; an audit store that refuses the append rolls the
+    /// revocation back.
     ///
     /// # Panics
-    /// Panics when the wrong rows are revoked.
+    /// Panics when the wrong rows are revoked or the audit differs.
     #[tokio::test]
     async fn logout_revokes_only_its_own_chain() {
         let fixture = PgFixture::start().await.expect("fixture starts");
@@ -640,14 +663,52 @@ mod pg_tests {
         }
         conn.commit().await.expect("seed commits");
 
+        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let logouts = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM vala.audit_staging
+                  WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
+            )
+            .bind(tenant.as_uuid())
+            .bind(CLI_LOGOUT_OPERATION)
+            .bind(user)
+            .fetch_one(&admin)
+            .await
+            .expect("audit query runs")
+        };
+        sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
+            .execute(&admin)
+            .await
+            .expect("append privilege revoked");
+        let refused = logins
+            .end(&SecretBearer::new(tokens[0].clone()), "req-refused")
+            .await;
+        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
+            .execute(&admin)
+            .await
+            .expect("append privilege restored");
+        assert!(
+            matches!(refused, Err(WyrdError::AuditUnavailable { .. })),
+            "{refused:?}"
+        );
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        let unrevoked = refresh_by_hash(&mut conn, &token_hash(&tokens[0]))
+            .await
+            .expect("lookup")
+            .expect("row exists");
+        assert_eq!(unrevoked.revoked_reason, None, "the revocation rolled back");
+        drop(conn);
+        assert_eq!(logouts().await, 0);
+
         logins
-            .end(&SecretBearer::new(tokens[0].clone()))
+            .end(&SecretBearer::new(tokens[0].clone()), "req-logout")
             .await
             .expect("logout revokes");
         logins
-            .end(&SecretBearer::new("not-a-jwt".to_owned()))
+            .end(&SecretBearer::new("not-a-jwt".to_owned()), "req-noop")
             .await
             .expect("an unusable token is a no-op");
+        assert_eq!(logouts().await, 1, "exactly one logout is recorded");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let mut revoked = Vec::new();

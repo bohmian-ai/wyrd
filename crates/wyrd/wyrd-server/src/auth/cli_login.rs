@@ -175,18 +175,19 @@ pub async fn cancel_cli_handoff(
 /// RFC 7009 semantics: possession of the refresh token is the authority, and
 /// an unknown, malformed, or already revoked token also answers `204`. Only
 /// that login's refresh chain is revoked; the User's other logins continue.
+/// The revocation commits with its audit event under the request id.
 ///
 /// # Errors
-/// Returns a `503` when the store fails and a `500` when auth is not
-/// configured.
+/// Returns a `503` when the store or the audit path fails and a `500` when
+/// auth is not configured.
 #[utoipa::path(
     post,
     path = "/auth/revoke",
     request_body = RevokeRefreshToken,
     responses(
         (status = 204, description = "The token's login, if it named one, no longer renews"),
-        (status = 503, description = "The auth backend is unavailable \
-          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
+        (status = 503, description = "The auth backend or audit path is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)", body = WyrdProblem)
     ),
     security(()),
     tag = "Auth"
@@ -194,10 +195,12 @@ pub async fn cancel_cli_handoff(
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn revoke_refresh_token(
     State(state): State<AppState>,
+    request_id: Option<Extension<RequestId>>,
     Json(request): Json<RevokeRefreshToken>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
+    let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
     cli_logins(&state)?
-        .end(&request.refresh_token)
+        .end(&request.refresh_token, request_id.as_str())
         .await
         .map(|()| StatusCode::NO_CONTENT)
         .map_err(WyrdErrorResponse::from)

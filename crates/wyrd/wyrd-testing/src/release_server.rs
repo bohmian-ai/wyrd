@@ -11,6 +11,8 @@
 //! directory; a working directory so the server's `.wyrd/` state lands in a
 //! temporary root; a systemd scope that gives the process the
 //! 8-CPU/16-GiB pod envelope; and any extra environment a benchmark names.
+//! A further replica joins the same Postgres and store on its own ports, as
+//! the configuration guide's peer mode describes.
 //! The wrapper's test-fixture `WYRD_DB_MAX_CONNECTIONS` cap is removed, so
 //! the pool runs at the server's default. Every other setting is the server's
 //! default.
@@ -28,8 +30,18 @@ use secrecy::SecretString;
 /// `WYRD_SERVER_URL`.
 pub const SERVER_URL: &str = "http://127.0.0.1:8080";
 
-/// The server's default metrics listener: loopback on the HTTP port plus one.
-const METRICS_URL: &str = "http://127.0.0.1:8081/metrics";
+/// The server's default public HTTP port, which replica 0 binds.
+const HTTP_PORT: u16 = 8080;
+
+/// The server's default gRPC port, which replica 0 binds.
+const GRPC_PORT: u16 = 50051;
+
+/// The server's default Bifrost peer port, which replica 0 binds.
+const PEER_PORT: u16 = 50052;
+
+/// Port offset between consecutive replicas' listeners. The metrics
+/// listener follows the HTTP port by the server's default of one.
+const REPLICA_PORT_STRIDE: u16 = 10;
 
 /// CPUs of quota in the pod envelope.
 pub const CPUS: u64 = 8;
@@ -99,8 +111,12 @@ pub struct LocalServer {
     child: Option<Child>,
     /// The process's cgroup-v2 directory, where its envelope is enforced.
     cgroup: PathBuf,
-    /// Tenants in the order `setup` provisioned them.
+    /// Tenants in the order `setup` provisioned them; empty on a joined
+    /// replica.
     tenants: Vec<SetupTenant>,
+    /// Replica ordinal: 0 for the server [`LocalServer::start`] set up,
+    /// which binds the default ports, and its listener offset otherwise.
+    ordinal: u16,
 }
 
 impl LocalServer {
@@ -128,41 +144,12 @@ impl LocalServer {
         std::fs::create_dir_all(&storage)?;
         let storage_url = format!("file://{}", storage.display());
         let workdir = root.path().to_path_buf();
-        let operator = |program: &Path| {
-            let mut command = Command::new(program);
-            command
-                .current_dir(&workdir)
-                .env("WYRD_STORAGE_URL", &storage_url)
-                .env_remove("WYRD_DB_MAX_CONNECTIONS")
-                .envs(env.iter().copied());
-            command
-        };
-
-        run(operator(binary)
+        run(operator(binary, &workdir, &storage_url, 0, env)
             .arg("migrate")
             .env("WYRD_DATABASE_URL", owner_url))?;
+        let mut server = Self::serve(binary, root, &storage_url, 0, env).await?;
 
-        let log = File::create(root.path().join("server.log"))?;
-        let child = operator(Path::new("systemd-run"))
-            .args(["--user", "--scope", "--quiet", "--collect"])
-            .arg(format!("--property=CPUQuota={}%", CPUS * 100))
-            .arg(format!("--property=MemoryMax={MEMORY_BYTES}"))
-            .arg("--property=MemorySwapMax=0")
-            .arg("--")
-            .arg(binary)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .spawn()?;
-        let mut server = Self {
-            cgroup: PathBuf::new(),
-            child: Some(child),
-            root,
-            tenants: Vec::new(),
-        };
-        server.await_ready().await?;
-        server.cgroup = server.find_cgroup()?;
-        server.confirm_envelope()?;
+        let operator = |program: &Path| operator(program, &workdir, &storage_url, 0, env);
 
         let mut platform: Option<String> = None;
         for slug in tenants {
@@ -192,6 +179,95 @@ impl LocalServer {
             });
         }
         Ok(server)
+    }
+
+    /// Starts replica `ordinal` of this deployment: `binary` serving the same
+    /// Postgres and store from its own working directory and envelope, with
+    /// every listener offset by `ordinal` strides. Nothing is migrated or set
+    /// up; the replica serves the tenants this server provisioned.
+    ///
+    /// Several replicas need peer mode: give every replica, including this
+    /// one, `WYRD_PEER_TLS_DIR` in `env`; its peer address is derived here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process exits or never becomes ready, or its
+    /// cgroup does not enforce the envelope.
+    pub async fn start_replica(
+        &self,
+        binary: &Path,
+        ordinal: u16,
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
+        let root = tempfile::Builder::new().prefix("wyrd-bench-").tempdir()?;
+        let storage_url = format!("file://{}", self.storage_dir().display());
+        Self::serve(binary, root, &storage_url, ordinal, env).await
+    }
+
+    /// Serves `binary` as replica `ordinal` from `root` in its envelope and
+    /// waits until it is ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process cannot spawn, exits, never becomes
+    /// ready, or its cgroup does not enforce the envelope.
+    async fn serve(
+        binary: &Path,
+        root: tempfile::TempDir,
+        storage_url: &str,
+        ordinal: u16,
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
+        let log = File::create(root.path().join("server.log"))?;
+        let child = operator(
+            Path::new("systemd-run"),
+            root.path(),
+            storage_url,
+            ordinal,
+            env,
+        )
+        .args(["--user", "--scope", "--quiet", "--collect"])
+        .arg(format!("--property=CPUQuota={}%", CPUS * 100))
+        .arg(format!("--property=MemoryMax={MEMORY_BYTES}"))
+        .arg("--property=MemorySwapMax=0")
+        .arg("--")
+        .arg(binary)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()?;
+        let mut server = Self {
+            cgroup: PathBuf::new(),
+            child: Some(child),
+            root,
+            tenants: Vec::new(),
+            ordinal,
+        };
+        server.await_ready().await?;
+        server.cgroup = server.find_cgroup()?;
+        server.confirm_envelope()?;
+        Ok(server)
+    }
+
+    /// This replica's public HTTP base URL; [`SERVER_URL`] for replica 0.
+    pub fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port(HTTP_PORT))
+    }
+
+    /// This replica's ordinal.
+    pub fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+
+    /// PID of the process `systemd-run --scope` executes in place, so the
+    /// serving `wyrd-server` itself; `None` once it was stopped.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
+    /// `base` offset by this replica's ordinal.
+    fn port(&self, base: u16) -> u16 {
+        replica_port(base, self.ordinal)
     }
 
     /// The first tenant's admin credential, as the guide exports it in
@@ -224,7 +300,8 @@ impl LocalServer {
     ///
     /// Returns an error when the endpoint does not answer 200.
     pub async fn metrics(&self) -> Result<Metrics> {
-        let response = reqwest::get(METRICS_URL).await?.error_for_status()?;
+        let url = format!("http://127.0.0.1:{}/metrics", self.port(HTTP_PORT) + 1);
+        let response = reqwest::get(url).await?.error_for_status()?;
         Ok(Metrics::parse(&response.text().await?))
     }
 
@@ -313,7 +390,7 @@ impl LocalServer {
             {
                 return Err(format!("wyrd-server exited during boot with {status}").into());
             }
-            if reqwest::get(format!("{SERVER_URL}/readyz"))
+            if reqwest::get(format!("{}/readyz", self.url()))
                 .await
                 .is_ok_and(|response| response.status().is_success())
             {
@@ -459,6 +536,48 @@ impl Metrics {
         sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
         sorted
     }
+}
+
+/// `base` offset by `ordinal` replica strides.
+fn replica_port(base: u16, ordinal: u16) -> u16 {
+    base + ordinal * REPLICA_PORT_STRIDE
+}
+
+/// A command running `program` as replica `ordinal` would: in `workdir`,
+/// publishing to `storage_url`, at the server's default pool size, on the
+/// replica's listeners, with `env` added. Peer mode derives the peer
+/// listener and advertised address when `env` names `WYRD_PEER_TLS_DIR`.
+fn operator(
+    program: &Path,
+    workdir: &Path,
+    storage_url: &str,
+    ordinal: u16,
+    env: &[(&str, &str)],
+) -> Command {
+    let mut command = Command::new(program);
+    command
+        .current_dir(workdir)
+        .env("WYRD_STORAGE_URL", storage_url)
+        .env_remove("WYRD_DB_MAX_CONNECTIONS")
+        .envs(env.iter().copied());
+    if ordinal > 0 {
+        command
+            .env(
+                "WYRD_SERVER_BIND",
+                format!("127.0.0.1:{}", replica_port(HTTP_PORT, ordinal)),
+            )
+            .env(
+                "WYRD_GRPC_BIND",
+                format!("127.0.0.1:{}", replica_port(GRPC_PORT, ordinal)),
+            );
+    }
+    if env.iter().any(|(name, _)| *name == "WYRD_PEER_TLS_DIR") {
+        let peer = format!("127.0.0.1:{}", replica_port(PEER_PORT, ordinal));
+        command
+            .env("WYRD_BIFROST_PEER_BIND_ADDR", &peer)
+            .env("WYRD_PEER_ADDRESS", &peer);
+    }
+    command
 }
 
 /// Runs an operator subcommand to completion and returns its stdout.

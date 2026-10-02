@@ -717,8 +717,8 @@ WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nexte
 WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=expired_lease_is_reclaimed_and_the_stale_holder_is_fenced)'
 WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_operator_delivery -E 'test(=verifiers_progress_while_operator_deliveries_are_capped)'
 WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-server --features test-support --test pg_verification_runtime -E 'test(=lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates)'
-mise exec -- cargo nextest run --locked -p wyrd-testing --bin verification_journey -E 'test(=report::tests::reconciliation_refuses_every_mismatch)'
-mise exec -- cargo nextest run --locked -p wyrd-testing --bin verification_journey -E 'test(=report::tests::quantile_reads_bucket_deltas)'
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin verification_capacity -E 'test(=report::tests::reconciliation_refuses_every_mismatch)'
+mise exec -- cargo nextest run --locked -p wyrd-testing --bin verification_capacity -E 'test(=evidence::tests::quantile_reads_bucket_deltas)'
 ```
 
 The last two commands are current-target iteration anchors; after renaming the

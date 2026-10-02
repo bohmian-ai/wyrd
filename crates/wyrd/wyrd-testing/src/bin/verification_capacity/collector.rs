@@ -1,6 +1,6 @@
-//! The two local endpoints the server calls out to: the HTTP Operator each
-//! tenant's failed Eval verdicts dispatch to, and the OTLP/gRPC trace
-//! collector the server exports its own sampled spans to.
+//! The OTLP/gRPC trace collector the server exports its own sampled spans
+//! to, and what those spans show: correlated attempts, task-start delay, and
+//! leaked identities.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -13,9 +13,6 @@ use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServ
 use wyrd_tonic::tonic::{Request, Response, Status};
 
 use crate::Result;
-
-/// Path prefix of the Operator endpoint; the tenant slug follows.
-const OPERATOR_PATH: &str = "/operator";
 
 /// Phase spans every correlated attempt trace carries under its
 /// `verification.attempt` root.
@@ -53,10 +50,8 @@ impl TraceService for SpanSink {
     }
 }
 
-/// The running local endpoints.
+/// The running trace collector.
 pub struct Collector {
-    /// Operator endpoint recording every delivery.
-    operator: wiremock::MockServer,
     /// Spans the server exported.
     spans: SpanSink,
     /// `http://` address of the trace collector.
@@ -66,17 +61,12 @@ pub struct Collector {
 }
 
 impl Collector {
-    /// Starts both endpoints on loopback ports the OS assigns.
+    /// Starts the collector on a loopback port the OS assigns.
     ///
     /// # Errors
     ///
     /// Returns a bind failure.
     pub async fn start() -> Result<Self> {
-        let operator = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(wiremock::ResponseTemplate::new(200))
-            .mount(&operator)
-            .await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let trace_endpoint = format!("http://{}", listener.local_addr()?);
         let spans = SpanSink::default();
@@ -92,16 +82,10 @@ impl Collector {
             }
         });
         Ok(Self {
-            operator,
             spans,
             trace_endpoint,
             stop,
         })
-    }
-
-    /// The URL `slug`'s Operator Card posts to.
-    pub fn operator_url(&self, slug: &str) -> String {
-        format!("{}{OPERATOR_PATH}/{slug}", self.operator.uri())
     }
 
     /// The address the server's `WYRD_OTLP_ENDPOINT` names.
@@ -109,20 +93,30 @@ impl Collector {
         &self.trace_endpoint
     }
 
-    /// Operator deliveries received per tenant slug.
-    pub async fn operator_posts(&self) -> BTreeMap<String, u64> {
-        let mut posts = BTreeMap::new();
-        for request in self.operator.received_requests().await.unwrap_or_default() {
-            if let Some(slug) = request
-                .url
-                .path()
-                .strip_prefix(OPERATOR_PATH)
-                .and_then(|rest| rest.strip_prefix('/'))
-            {
-                *posts.entry(slug.to_owned()).or_default() += 1;
-            }
-        }
-        posts
+    /// Task-start delays, microseconds, of the sampled queued attempts of
+    /// `kind` that started within `[from, to)` Unix nanoseconds.
+    pub fn task_start_delays(&self, kind: &str, from: u64, to: u64) -> Vec<u64> {
+        let spans = self
+            .spans
+            .0
+            .lock()
+            .map(|spans| spans.clone())
+            .unwrap_or_default();
+        spans
+            .iter()
+            .filter(|span| {
+                span.name == "verification.attempt"
+                    && (from..to).contains(&span.start_time_unix_nano)
+                    && attribute(span, "kind").is_some_and(|value| match value {
+                        any_value::Value::StringValue(text) => text == kind,
+                        _ => false,
+                    })
+            })
+            .filter_map(|span| match attribute(span, "task_start_delay_us")? {
+                any_value::Value::IntValue(delay) => u64::try_from(*delay).ok(),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Stops the trace collector and summarizes what the server exported.
@@ -138,8 +132,19 @@ impl Collector {
     }
 }
 
+/// The value of `span`'s attribute `key`.
+fn attribute<'a>(span: &'a Span, key: &str) -> Option<&'a any_value::Value> {
+    span.attributes
+        .iter()
+        .find(|attribute| attribute.key == key)?
+        .value
+        .as_ref()?
+        .value
+        .as_ref()
+}
+
 /// What the sampled server traces show.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TraceSummary {
     /// Spans exported.
     pub spans: usize,

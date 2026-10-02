@@ -55,6 +55,7 @@ arrow = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+clap = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 rcgen = { workspace = true }
 futures-util = { workspace = true }
@@ -68,9 +69,14 @@ http-body-util = "0.1"
 opendal = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
+# The verification capacity benchmark serves its judge mock over trusted TLS.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 # Roots the bound server's Eval judge at the test gateway's mock upstream.
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
+# Journeys and the capacity benchmark build their native judge Prompt.
+skald-prompt = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 secrecy = { workspace = true }
@@ -115,9 +121,6 @@ wiremock = { workspace = true }
 workspace-hack.workspace = true
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.
 datafusion-proto = { workspace = true }
-# The continuous Eval journey builds its native judge Prompt and points the
-# production judge at a local OpenAI-compatible provider.
-skald-prompt = { workspace = true }
 # The analytical-layout journey maps an Eval report through the production
 # result payload builder, whose Eval input is this crate's report type.
 vala-eval = { workspace = true }
@@ -147,10 +150,10 @@ name = "bifrost_query_capacity"
 path = "src/bin/bifrost_query_capacity/main.rs"
 bench = false
 
-# The opt-in multi-tenant verification journey benchmark. Run only through
-# `mise run bench:verification:journey`; only its unit tests run in a lane,
+# The opt-in verification capacity benchmark. Run only through
+# `mise run bench:verification:capacity`; only its unit tests run in a lane,
 # with the crate's other tests.
 [[bin]]
-name = "verification_journey"
-path = "src/bin/verification_journey/main.rs"
+name = "verification_capacity"
+path = "src/bin/verification_capacity/main.rs"
 bench = false

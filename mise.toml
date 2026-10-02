@@ -508,9 +508,19 @@ run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run
 description = "Opt-in benchmark: one release wyrd-server started through the local-development journey (migrate, serve, setup) in an 8-CPU/16-GiB systemd user scope, driven through the public Rust client: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --heavy` writes 100M rows and runs the broad window and full scan. Fails on any FAIL row. Linux with a delegating systemd user manager; part of no gate or verify lane."
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo build --locked --release -p wyrd-server && cargo run --locked --release -p wyrd-testing --bin bifrost_query_capacity -- \"$@\"' _"
 
-[tasks."bench:verification:journey"]
-description = "Opt-in benchmark: one release wyrd-server started through the local-development journey for eight tenants in an 8-CPU/16-GiB systemd user scope, with two public Rust clients per tenant driving Run, Drift and Eval observations, custom rows and OTLP signals through warmup (50/s), steady (100/s), burst (150/s) and drain, beside scheduled and manual Drift and a local Operator endpoint. Reconciles offered, acknowledged, activated, settled and backlog work and fails on any mismatch. Linux with a delegating systemd user manager; part of no gate or verify lane."
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo build --locked --release -p wyrd-server && cargo run --locked --release -p wyrd-testing --bin verification_journey -- \"$@\"' _"
+[tasks."bench:verification:capacity"]
+description = "Opt-in benchmark (REQ-171, AC-040): release wyrd-server replicas in peer mode, each in an 8-CPU/16-GiB systemd user scope, started through the local-development journey. Open-loop public-client load over the PSI, SPC, Custom, assertion Eval and LLM-judge Eval reference workloads, queued, direct and combined, each kind alone and mixed, in 30 s steps of 10/25/50/100/200 per second on 1 and 2 replicas, plus a fairness step with 70 background tenants. Reconciles every request, checks overlap, cross-replica claims and fairness, and applies the direct-mode overhead objective; writes target/verification-capacity/. `-- --profile` builds a frame-pointer profiling binary into target/profiling and captures every step with perf as diagnostic evidence. Linux with a delegating systemd user manager; part of no gate or verify lane."
+run = """scripts/postgres/with-test-postgres.sh -- bash -lc '
+set -euo pipefail
+binary=()
+if [[ " $* " == *" --profile "* ]]; then
+  CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes" \
+    cargo build --locked --release -p wyrd-server --target-dir target/profiling
+  binary=(--server-binary target/profiling/release/wyrd-server)
+else
+  cargo build --locked --release -p wyrd-server
+fi
+cargo run --locked --release -p wyrd-testing --bin verification_capacity -- "${binary[@]}" "$@"' _"""
 
 [tasks."test:bifrost:journey:otlp"]
 description = "Tier-1 journeys: OTLP trace, log, metric, mixed-batch and negative protocol surfaces"

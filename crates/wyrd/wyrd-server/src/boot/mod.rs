@@ -39,6 +39,8 @@ use vala_bifrost_redux::scribe::{
 use wyrd_auth::browser_sessions::BrowserSessions;
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::TenantTokenIssuer;
+use wyrd_auth::platform_login::PlatformLogin;
+use wyrd_auth::platform_sessions::PlatformSessions;
 use wyrd_auth::sealing::SealedSecretRewrap;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::{SealingKeyring, SecretKey};
@@ -1586,6 +1588,19 @@ async fn install_auth(
         config.deployment_profile.screened_http(),
         config.auth.public_origin.as_ref(),
     );
+    // Platform federated login needs the cross-tenant boundary; one owner
+    // serves every platform login so its provider cache outlives a request.
+    let platform_login = postgres.operator_pool().map(|pool| {
+        PlatformLogin::new(
+            pool.clone(),
+            sealing_key.clone(),
+            Arc::new(PlatformSessions::new(
+                pool,
+                Arc::clone(&handles.issuing_key),
+            )),
+            config.deployment_profile.screened_http(),
+        )
+    });
     let token_exchange_settings = wyrd_auth::issuance::TokenExchangeSettings::default();
     // The BFF channel exists only when the deployment provisions its key.
     let bff = (!config.auth.bff_service_key_hashes.is_empty()).then(|| BffChannel {
@@ -1609,6 +1624,7 @@ async fn install_auth(
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
         human_connections: Some(human_connections),
+        platform_login,
         bff,
         sealing_key: sealing_key.clone(),
         token_exchange_settings,

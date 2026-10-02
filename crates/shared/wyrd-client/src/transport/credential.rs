@@ -215,22 +215,40 @@ impl CredentialChain {
         Self::from_env_with_tenant(None)
     }
 
-    /// Build a credential chain using an optional file-configured tenant.
+    /// Build a credential chain using an optional file-configured tenant:
+    /// [`Self::env_only`] followed by [`Self::credentials_file`].
     #[must_use]
     pub fn from_env_with_tenant(tenant_override: Option<&str>) -> Self {
-        let mut chain = Self::default();
-        for source in [
-            explicit_token_from_env(),
-            workload_token_from_env(tenant_override),
-            api_key_from_env(),
-            api_key_from_credentials_file(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            chain.push(source);
-        }
+        let mut chain = Self::env_only(tenant_override);
+        chain.extend(Self::credentials_file());
         chain
+    }
+
+    /// The environment tiers alone — `WYRD_ACCESS_TOKEN`, then
+    /// `WYRD_WORKLOAD_TOKEN` with its tenant, then `WYRD_API_KEY` — without
+    /// the `credentials.toml` floor, so a caller can rank a saved user login
+    /// between them.
+    #[must_use]
+    pub fn env_only(tenant_override: Option<&str>) -> Self {
+        Self {
+            sources: [
+                explicit_token_from_env(),
+                workload_token_from_env(tenant_override),
+                api_key_from_env(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        }
+    }
+
+    /// The `credentials.toml` `[default].api_key` floor alone; empty when the
+    /// file is absent, unreadable, or has no key.
+    #[must_use]
+    pub fn credentials_file() -> Self {
+        Self {
+            sources: api_key_from_credentials_file().into_iter().collect(),
+        }
     }
 
     /// Append a credential source to the chain.
@@ -289,18 +307,18 @@ fn explicit_token_from_env() -> Option<CredentialSource> {
 /// Environment-based credential sources for the ADC chain.
 /// WYRD_WORKLOAD_TOKEN + WYRD_TENANT is a workload identity token, which is the second-highest-priority source.
 /// Often used in cloud-native environments where the workload identity provider issues a JWT that can be exchanged for a Wyrd access token.
+///
+/// A configured tenant selector (`tenant_override`) routes the exchange ahead
+/// of an ambient `WYRD_TENANT`, so the tenant the caller selected is the one
+/// the server binds.
 fn workload_token_from_env(tenant_override: Option<&str>) -> Option<CredentialSource> {
     let jwt = std::env::var("WYRD_WORKLOAD_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())?;
-    let tenant = std::env::var("WYRD_TENANT")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            tenant_override
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        })?;
+    let tenant = tenant_override
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| std::env::var("WYRD_TENANT").ok().filter(|v| !v.is_empty()))?;
     Some(CredentialSource::WorkloadToken {
         jwt: SecretString::from(jwt),
         tenant,

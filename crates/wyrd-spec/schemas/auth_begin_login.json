@@ -1,30 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "BeginLogin",
-  "description": "`POST /auth/login` request: begin a tenant human SSO login.\n\nThe route key is pre-login routing context only; it never becomes tenant authority. Exactly one initiation binding is required: a browser login through the BFF sends the SHA-256 of its random flow id, and a CLI login sends its server-issued handoff id. The completed session is later redeemed only by that binding.",
+  "description": "`POST /auth/login` request: begin a tenant human SSO login.\n\nThe route key is pre-login routing context only; it never becomes tenant authority. The BFF sends the SHA-256 of its random browser flow id, and the completed session is later redeemed only by that binding.",
   "type": "object",
   "required": [
+    "browser_flow_hash",
     "tenant_route_key"
   ],
   "properties": {
     "browser_flow_hash": {
       "description": "SHA-256 of the BFF's random browser flow id.",
-      "anyOf": [
+      "allOf": [
         {
           "$ref": "#/definitions/Sha256Hex"
-        },
-        {
-          "type": "null"
         }
       ]
-    },
-    "cli_handoff_id": {
-      "description": "Server-issued CLI login handoff id.",
-      "type": [
-        "string",
-        "null"
-      ],
-      "format": "uuid"
     },
     "tenant_route_key": {
       "description": "The tenant's route key (its slug), as in `/t/{tenantKey}/login`.",

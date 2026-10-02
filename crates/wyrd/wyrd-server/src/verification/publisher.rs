@@ -144,7 +144,6 @@ impl ResultPublisher {
             credential: Some(token),
             tenant: None,
             token_cache: TokenCacheMode::InMemory,
-            token_cache_path: None,
         })?;
         let bifrost = self.connect(&client).await?;
         for batch in payload.batches() {

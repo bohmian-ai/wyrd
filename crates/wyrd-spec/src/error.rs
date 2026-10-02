@@ -569,6 +569,25 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A device-code token request (RFC 8628) issued no credential.
+    ///
+    /// `details.error` carries the RFC 8628 error: `authorization_pending`
+    /// and `slow_down` ask the client to keep polling (`slow_down` at an
+    /// interval five seconds longer); `access_denied`, `expired_token`, and
+    /// `invalid_grant` end the login.
+    #[error("[WYRD_AUTH_400_DEVICE_AUTHORIZATION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_AUTH_400_DEVICE_AUTHORIZATION",
+        status = 400,
+        title = "Device authorization did not issue a credential",
+        remediation = "Keep polling on `authorization_pending`, poll five seconds slower on `slow_down`, and start a new login on any other `details.error`."
+    )]
+    DeviceAuthorization {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload; `error` is the RFC 8628 error name.
+        details: serde_json::Value,
+    },
     /// OIDC callback state is missing, invalid, or replayed.
     #[error("[WYRD_AUTH_400_INVALID_STATE] {message}")]
     #[wyrd_error(
@@ -3559,6 +3578,22 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The saved user login selected for this server and tenant cannot be
+    /// used: the selector names no saved login, the credential file is unsafe
+    /// or corrupt, the login was removed, or the server refused its renewal.
+    #[error("[WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE",
+        status = 401,
+        title = "Saved user login cannot be used",
+        remediation = "Run `wyrd auth login --server <url> --tenant <tenant>` again, select the intended tenant with the client tenant option or WYRD_TENANT, or pass an explicit credential. The details reason names the failure."
+    )]
+    ClientSavedLoginUnusable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload (`{ reason }`).
+        details: serde_json::Value,
+    },
     /// A sealed batch, or a single row, cannot fit under the client's max_message_bytes.
     #[error("[WYRD_CLIENT_413_PAYLOAD_TOO_LARGE] {message}")]
     #[wyrd_error(
@@ -3682,6 +3717,7 @@ impl WyrdError {
             | Self::BadTokenFormat { message, details }
             | Self::UnsupportedGrantType { message, details }
             | Self::InvalidState { message, details }
+            | Self::DeviceAuthorization { message, details }
             | Self::InvalidNonce { message, details }
             | Self::RefreshReused { message, details }
             | Self::RefreshRevoked { message, details }
@@ -3890,6 +3926,7 @@ impl WyrdError {
             | Self::WorkflowUnsupportedHandoff { message, details }
             | Self::ClientConfigInvalid { message, details }
             | Self::ClientNoCredentials { message, details }
+            | Self::ClientSavedLoginUnusable { message, details }
             | Self::ClientPayloadTooLarge { message, details }
             | Self::ClientRowDeserialization { message, details }
             | Self::ClientQueueFull { message, details }
@@ -4264,6 +4301,7 @@ mod tests {
         ("WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF", 501),
         ("WYRD_CLIENT_400_CONFIG_INVALID", 400),
         ("WYRD_CLIENT_401_NO_CREDENTIALS", 401),
+        ("WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE", 401),
         ("WYRD_CLIENT_413_PAYLOAD_TOO_LARGE", 413),
         ("WYRD_CLIENT_422_ROW_DESERIALIZATION", 422),
         ("WYRD_CLIENT_429_QUEUE_FULL", 429),
@@ -4557,6 +4595,10 @@ mod tests {
             WyrdError::InvalidState {
                 message: "state was missing or replayed".to_owned(),
                 details: serde_json::json!({}),
+            },
+            WyrdError::DeviceAuthorization {
+                message: "the person has not approved this device code yet".to_owned(),
+                details: serde_json::json!({ "error": "authorization_pending" }),
             },
             WyrdError::InvalidNonce {
                 message: "id token nonce mismatch".to_owned(),

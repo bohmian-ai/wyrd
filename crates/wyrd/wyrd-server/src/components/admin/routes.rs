@@ -29,7 +29,8 @@ use axum::http::StatusCode;
 use secrecy::SecretString;
 use serde::Deserialize;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, OidcProvider, ScreenError, TrustedIssuer, WorkloadBinding,
+    ClaimMapping, ClaimPath, ClientAuth, RelyingPartyError, ScreenError, TrustedIssuer,
+    WorkloadBinding,
 };
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
@@ -734,7 +735,10 @@ async fn acquire_conn<'a>(
 /// Resolve the issuer's `jwks_uri` via OIDC discovery.
 ///
 /// The issuer URL is already validated by [`IssuerUrl`]; a discovery failure is
-/// a `503`. The fetch itself goes through the deployment's
+/// a `503`. Only the discovery document is read
+/// ([`ScreenedHttp::provider_metadata`](wyrd_auth_oidc::ScreenedHttp::provider_metadata));
+/// the key set is fetched by the verifier when a token first needs it. The
+/// read goes through the deployment's
 /// [`ScreenedHttp`](wyrd_auth_oidc::ScreenedHttp), which owns the address
 /// policy, the bounded resolution, the pinning, and the redirect refusal — the
 /// same capability the login, token-exchange, and JWKS-refresh paths use, so
@@ -744,36 +748,42 @@ async fn acquire_conn<'a>(
 ///
 /// Returns a `MissingRequiredField` rejection when the issuer resolves to a
 /// blocked address, and `DiscoveryUnavailable` when the host cannot be
-/// resolved, the client cannot be built, or discovery itself fails.
+/// resolved, the client cannot be built, or the discovery read fails or names
+/// another issuer.
 pub(crate) async fn discover_jwks_uri(
     issuer: &IssuerUrl,
     deployment_profile: DeploymentProfile,
 ) -> Result<url::Url, WyrdErrorResponse> {
-    let url = url::Url::parse(issuer.as_str()).map_err(|error| {
-        WyrdErrorResponse::from(WyrdError::MissingRequiredField {
-            message: format!("issuer is not a valid URL: {error}"),
-            details: serde_json::json!({ "field": "issuer" }),
-        })
-    })?;
-
-    let client = deployment_profile
+    let metadata = deployment_profile
         .screened_http()
-        .client_for(&url)
+        .provider_metadata(issuer)
         .await
-        .map_err(screen_error)?;
+        .map_err(|error| discovery_error(issuer, error))?;
+    Ok(metadata.jwks_uri().url().clone())
+}
 
-    let provider = OidcProvider::discover(url, client).await.map_err(|error| {
-        tracing::warn!(
-            error = %error,
-            issuer = issuer.as_str(),
-            "OIDC discovery failed for admin create"
-        );
-        WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-            message: "OIDC discovery failed for issuer".to_owned(),
-            details: serde_json::json!({ "issuer": issuer.as_str() }),
-        })
-    })?;
-    Ok(provider.metadata.jwks_uri)
+/// Project a failed discovery of `issuer` during issuer setup onto the admin
+/// error catalog.
+///
+/// A screening refusal goes through [`screen_error`]; every other failure
+/// (unreachable discovery or key set, an undecodable document, or one naming
+/// another issuer) is logged with its cause and answered as
+/// `DiscoveryUnavailable` naming only the issuer.
+pub(crate) fn discovery_error(issuer: &IssuerUrl, error: RelyingPartyError) -> WyrdErrorResponse {
+    match error {
+        RelyingPartyError::Screened(error) => screen_error(error),
+        error => {
+            tracing::warn!(
+                error = %error,
+                issuer = issuer.as_str(),
+                "OIDC discovery failed for issuer setup"
+            );
+            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
+                message: "OIDC discovery failed for issuer".to_owned(),
+                details: serde_json::json!({ "issuer": issuer.as_str() }),
+            })
+        }
+    }
 }
 
 /// Project a screening refusal onto the admin error catalog.
@@ -1067,7 +1077,9 @@ mod pg_tests {
         principal_with(tenant, PermissionSet::new())
     }
 
-    /// Start a wiremock IdP that answers OIDC discovery, returning the issuer URL.
+    /// Start a wiremock IdP that answers OIDC discovery while its key set is
+    /// unavailable, returning the issuer URL. Workload issuer creation reads
+    /// only the discovery document, so it must not need the keys.
     async fn discovery_server() -> (MockServer, IssuerUrl) {
         let server = MockServer::start().await;
         let issuer = server.uri();
@@ -1078,8 +1090,15 @@ mod pg_tests {
                 "authorization_endpoint": format!("{issuer}/authorize"),
                 "token_endpoint": format!("{issuer}/token"),
                 "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
                 "id_token_signing_alg_values_supported": ["RS256", "EdDSA"],
             })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
         let issuer_url = IssuerUrl::new(&issuer).expect("loopback http issuer is valid");
@@ -1251,7 +1270,7 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await;
-        let (_server, issuer) = discovery_server().await;
+        let (server, issuer) = discovery_server().await;
 
         let view = create_trusted_issuer(
             State(state.clone()),
@@ -1259,10 +1278,18 @@ mod pg_tests {
             Json(create_issuer_request(issuer.clone(), Some(SECRET))),
         )
         .await
-        .expect("create succeeds")
+        .expect("create succeeds while the key set is unavailable")
         .0;
         assert_eq!(view.issuer, issuer.as_str());
         assert!(view.jwks_uri.ends_with("/jwks"));
+        let key_set_requests = server
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .iter()
+            .filter(|request| request.url.path() == "/jwks")
+            .count();
+        assert_eq!(key_set_requests, 0, "creation never fetches keys");
 
         // The create response is structurally redacted: no secret field anywhere.
         let body = serde_json::to_value(&view).expect("view serializes");

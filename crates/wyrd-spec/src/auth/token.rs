@@ -42,6 +42,14 @@ pub enum TokenRequest {
         /// Tenant selector fallback when the request host does not carry tenant.
         tenant: Option<TenantSlug>,
     },
+    /// RFC 8628 device-code poll: the device code from
+    /// `POST /auth/device_authorization`, redeemed once the person approved
+    /// it.
+    #[serde(rename = "urn:ietf:params:oauth:grant-type:device_code")]
+    DeviceCode {
+        /// The device code.
+        device_code: SecretBearer,
+    },
     /// Wyrd refresh-token rotation.
     RefreshToken {
         /// Signed Wyrd refresh token.

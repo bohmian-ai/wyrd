@@ -17,28 +17,30 @@
 //! [`AuthMiddleware::on_behalf_of`], re-runs its RFC 8693 exchange through the
 //! same cache and gate, drawing the actor token from the acting middleware.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 use wyrd_spec::auth::{
-    ExchangeTokenType, PlatformTokenRequest, PlatformTokenResponse, SecretBearer, TokenAudience,
-    TokenRequest, TokenResponse,
+    DeviceAuthorization, DeviceAuthorizationRequest, ExchangeTokenType, PlatformTokenRequest,
+    PlatformTokenResponse, RevokeRefreshToken, SecretBearer, TokenAudience, TokenRequest,
+    TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::TenantSlug;
 
 use crate::config::{ClientConfig, TokenCacheMode};
+use crate::credentials_file::CredentialsFile;
 use crate::error::{WyrdClientError, from_problem_json};
+use crate::transport::HttpConfig;
 use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
 use reqwest::{Client, Response};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
@@ -101,14 +103,6 @@ impl CachedToken {
 /// A renewable mint running on Tokio's blocking pool.
 type PendingMint = JoinHandle<Result<MintedAccessToken, WyrdClientError>>;
 
-/// On-disk token record. Holds the access token and expiry only — never a
-/// refresh token. `Debug` is redacted via [`SecretBearer`].
-#[derive(Debug, Serialize, Deserialize)]
-struct DiskTokenRecord {
-    access_token: SecretBearer,
-    expires_at: DateTime<Utc>,
-}
-
 /// The unauthenticated `/auth` surface of one Wyrd deployment.
 ///
 /// Every grant that *mints* a Wyrd credential is presented without one: the API
@@ -142,20 +136,40 @@ impl Debug for TokenExchange {
 impl TokenExchange {
     /// Bind an exchange to one deployment.
     ///
-    /// Installs Wyrd's process TLS provider first, for the same reason the
+    /// Every route this type calls carries a secret — an API key, a workload
+    /// assertion, a device code, or a refresh token — so the target goes
+    /// through the same [`HttpConfig::validate`] rule as the authenticated
+    /// transport before anything is built: remote cleartext `http://` is
+    /// refused, HTTPS and loopback HTTP are accepted. This one check covers
+    /// every caller, including the CLI login, logout, and refresh commands.
+    ///
+    /// The client follows no redirect, as OAuth clients do: a `307`/`308`
+    /// would replay the secret body at the redirect target, so a redirect is
+    /// returned to the caller as an ordinary non-success response.
+    ///
+    /// Installs Wyrd's process TLS provider next, for the same reason the
     /// authenticated transport does: the provider is process-global and the
     /// first client to build must be the one that sets it.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
-    /// already owns the process or the HTTP client cannot be built.
+    /// Returns [`WyrdClientError::Config`] for an empty or remote cleartext
+    /// `base_url` or a zero timeout, and [`WyrdClientError::TransportDown`]
+    /// when another Rustls provider already owns the process or the HTTP
+    /// client cannot be built.
     pub fn new(base_url: &str, timeout_ms: u64) -> Result<Self, WyrdClientError> {
+        HttpConfig {
+            base_url: base_url.to_owned(),
+            timeout_ms,
+            compression: false,
+        }
+        .validate()?;
         wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
             transport: "http".to_owned(),
             message: error.to_string(),
         })?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| WyrdClientError::TransportDown {
                 transport: "http".to_owned(),
@@ -202,6 +216,68 @@ impl TokenExchange {
         request: &PlatformTokenRequest,
     ) -> Result<PlatformTokenResponse, AuthError> {
         self.post("/auth/platform/token", request).await
+    }
+
+    /// Begin a device login at `tenant_route_key` (RFC 8628 §3.1); poll it
+    /// with [`TokenRequest::DeviceCode`] through [`Self::exchange`].
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] when the tenant offers no SSO login or
+    /// the server refuses, and [`AuthError::Client`] for a transport or decode
+    /// failure.
+    pub async fn device_authorization(
+        &self,
+        tenant_route_key: &TenantSlug,
+    ) -> Result<DeviceAuthorization, AuthError> {
+        self.post(
+            "/auth/device_authorization",
+            &DeviceAuthorizationRequest {
+                tenant_route_key: tenant_route_key.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Ask the server to end the login `refresh_token` belongs to, so neither
+    /// it nor any successor renews again; idempotent on the server.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] when the server fails and
+    /// [`AuthError::Client`] for a transport failure.
+    pub async fn revoke_refresh_token(
+        &self,
+        refresh_token: &SecretBearer,
+    ) -> Result<(), AuthError> {
+        self.post_no_content(
+            "/auth/revoke",
+            &RevokeRefreshToken {
+                refresh_token: refresh_token.clone(),
+            },
+        )
+        .await
+    }
+
+    /// POST a JSON body to one unauthenticated `/auth` path whose success
+    /// carries no body.
+    ///
+    /// # Errors
+    /// Returns [`AuthError::Server`] for a non-success status and
+    /// [`AuthError::Client`] for a transport or decode failure.
+    async fn post_no_content<S: Serialize>(&self, path: &str, body: &S) -> Result<(), AuthError> {
+        let url = format!("{}{path}", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(transport_down)?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        Self::decode::<serde_json::Value>(response)
+            .await
+            .map(|_| ())
     }
 
     /// POST a JSON body to one unauthenticated `/auth` path and decode the reply.
@@ -260,12 +336,10 @@ pub struct AuthMiddleware {
     /// waiter, so the next caller awaits that same mint instead of starting a
     /// concurrent one.
     pending_mint: Mutex<Option<PendingMint>>,
-    cache_mode: TokenCacheMode,
-    /// Resolved on-disk token-cache path, computed once at construction in
-    /// [`TokenCacheMode::Disk`] mode (`None` otherwise). Resolving here — rather
-    /// than reading `~`/`HOME` on every persist — keeps the path stable and lets
-    /// tests inject a unique path without mutating the process environment.
-    cache_path: Option<PathBuf>,
+    /// The credential file an API key's access token is cached in, beside
+    /// that key, so every process using it reuses the token; set only in
+    /// [`TokenCacheMode::Disk`] mode.
+    credentials: Option<CredentialsFile>,
     /// Set once the first short-TTL token is observed, so the operational
     /// warning fires at most once per middleware instance (see [`Self::exchange`]).
     short_ttl_warned: AtomicBool,
@@ -276,7 +350,7 @@ impl Debug for AuthMiddleware {
         f.debug_struct("AuthMiddleware")
             .field("credential", &self.credential)
             .field("http_base_url", &self.exchange.base_url)
-            .field("cache_mode", &self.cache_mode)
+            .field("credentials", &self.credentials)
             .finish_non_exhaustive()
     }
 }
@@ -285,9 +359,9 @@ impl AuthMiddleware {
     /// Build the middleware from a [`ClientConfig`] and a resolved credential.
     ///
     /// The API key is sent only to `{config.http.base_url}/auth/token`. In
-    /// [`TokenCacheMode::Disk`] mode an existing, non-stale on-disk record is
-    /// loaded as the initial cache so an access token survives process
-    /// restarts.
+    /// [`TokenCacheMode::Disk`] mode a non-stale access token cached in
+    /// `credentials.toml` beside that same API key is loaded as the initial
+    /// cache, so the token survives process restarts.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
@@ -297,16 +371,16 @@ impl AuthMiddleware {
         config: &ClientConfig,
         credential: ResolvedCredential,
     ) -> Result<Arc<Self>, WyrdClientError> {
-        let cache_path = if config.token_cache == TokenCacheMode::Disk {
-            config.token_cache_path.clone().or_else(token_cache_path)
+        let credentials = if config.token_cache == TokenCacheMode::Disk {
+            CredentialsFile::locate()
         } else {
             None
         };
-        Self::build(config, credential, cache_path)
+        Self::build(config, credential, credentials)
     }
 
-    /// Construct from a resolved cache path. `new` resolves the production
-    /// `~/.config/wyrd/token_cache.json`; tests inject a unique path so they
+    /// Construct over a resolved credential file. `new` locates the user's
+    /// `credentials.toml`; tests inject one in a temporary directory so they
     /// never touch the process environment (and stay parallel-safe).
     ///
     /// # Errors
@@ -317,12 +391,21 @@ impl AuthMiddleware {
     fn build(
         config: &ClientConfig,
         credential: ResolvedCredential,
-        cache_path: Option<PathBuf>,
+        credentials: Option<CredentialsFile>,
     ) -> Result<Arc<Self>, WyrdClientError> {
         let exchange = TokenExchange::new(&config.http.base_url, config.http.timeout_ms)?;
         let exchange_timeout = Duration::from_millis(config.http.timeout_ms);
 
-        let initial = cache_path.as_deref().and_then(load_disk_record);
+        let initial = match (&credentials, &credential) {
+            (Some(file), ResolvedCredential::ApiKey(api_key)) => file
+                .cached_api_key_token(api_key)
+                .map(|(access_token, expires_at)| CachedToken {
+                    access_token,
+                    expires_at,
+                })
+                .filter(|entry| !entry.is_stale()),
+            _ => None,
+        };
 
         Ok(Arc::new(Self {
             credential,
@@ -330,21 +413,23 @@ impl AuthMiddleware {
             exchange_timeout,
             cache: Mutex::new(initial),
             pending_mint: Mutex::new(None),
-            cache_mode: config.token_cache.clone(),
-            cache_path,
+            credentials,
             short_ttl_warned: AtomicBool::new(false),
         }))
     }
 
-    /// Test-only constructor that injects an explicit token-cache path,
-    /// avoiding any `HOME`/`~` resolution so disk-cache tests are hermetic.
+    /// Test-only constructor that injects the credential file, avoiding any
+    /// `HOME`/`~` resolution so disk-cache tests are hermetic.
+    ///
+    /// # Errors
+    /// The errors of [`Self::new`].
     #[cfg(test)]
-    fn new_with_cache_path(
+    fn new_with_credentials(
         config: &ClientConfig,
         credential: ResolvedCredential,
-        cache_path: Option<PathBuf>,
+        credentials: Option<CredentialsFile>,
     ) -> Result<Arc<Self>, WyrdClientError> {
-        Self::build(config, credential, cache_path)
+        Self::build(config, credential, credentials)
     }
 
     /// Derive a middleware in which this one acts for the holder of
@@ -371,8 +456,7 @@ impl AuthMiddleware {
             exchange_timeout: self.exchange_timeout,
             cache: Mutex::new(None),
             pending_mint: Mutex::new(None),
-            cache_mode: TokenCacheMode::InMemory,
-            cache_path: None,
+            credentials: None,
             short_ttl_warned: AtomicBool::new(false),
         })
     }
@@ -421,7 +505,9 @@ impl AuthMiddleware {
     /// exchange. A [`ResolvedCredential::WorkloadJwt`] follows the same
     /// cache/single-flight path as the API key, exchanging the ambient OIDC
     /// assertion via the `jwt-bearer` grant. A [`ResolvedCredential::Delegated`]
-    /// follows it too, running the RFC 8693 token exchange.
+    /// follows it too, running the RFC 8693 token exchange. A
+    /// [`ResolvedCredential::Renewable`] source reuses its cached token too
+    /// until the refresh skew.
     ///
     /// # Errors
     /// Returns [`AuthError::Client`] on transport failure or an invalid tenant
@@ -519,20 +605,24 @@ impl AuthMiddleware {
         }
     }
 
-    /// Exchange the API key, persist the result, and replace the in-memory
+    /// Exchange the API key, cache the result beside that key in
+    /// `credentials.toml` ([`Self::persist`]), and replace the in-memory
     /// cache. The shared post-exchange tail of [`AuthMiddleware::bearer`] and
     /// [`AuthMiddleware::force_refresh`]; the caller holds the exchange gate.
+    ///
+    /// # Errors
+    /// The exchange's [`AuthError`]; a failed cache write is not an error.
     async fn exchange_and_store(
         &self,
         api_key: &SecretString,
         cache: &mut Option<CachedToken>,
     ) -> Result<SecretBearer, AuthError> {
         let entry = self.exchange(api_key).await?;
+        self.persist(api_key, &entry).await;
         Ok(self.store(entry, cache))
     }
 
-    /// Exchange the workload JWT, persist the result, and replace the in-memory
-    /// cache. The [`ResolvedCredential::WorkloadJwt`] analogue of
+    /// Exchange the workload JWT and replace the in-memory cache. The [`ResolvedCredential::WorkloadJwt`] analogue of
     /// [`AuthMiddleware::exchange_and_store`]; the caller holds the exchange gate
     /// and both credentials share the one cache.
     async fn exchange_workload_and_store(
@@ -594,12 +684,11 @@ impl AuthMiddleware {
         Ok(bearer)
     }
 
-    /// Persist a freshly exchanged token and replace the in-memory cache,
-    /// returning the access bearer. The shared cache-write tail of both the
-    /// API-key and workload exchange paths.
+    /// Replace the in-memory cache with a freshly exchanged token,
+    /// returning the access bearer. The shared cache-write tail of every
+    /// exchange path.
     fn store(&self, entry: CachedToken, cache: &mut Option<CachedToken>) -> SecretBearer {
         let bearer = entry.access_token.clone();
-        self.persist(&entry);
         *cache = Some(entry);
         bearer
     }
@@ -713,16 +802,26 @@ impl AuthMiddleware {
         }
     }
 
-    /// Write the access token to disk in [`TokenCacheMode::Disk`] mode.
+    /// Cache an API key's freshly exchanged access token beside that key in
+    /// `credentials.toml`, in [`TokenCacheMode::Disk`] mode.
     ///
-    /// Last-writer-wins, no file lock. Best-effort: a write failure does not
-    /// fail the exchange.
-    fn persist(&self, entry: &CachedToken) {
-        if self.cache_mode != TokenCacheMode::Disk {
+    /// The write takes the credential file's lock and may wait for another
+    /// process, so it runs on the blocking pool. Best-effort: a key that is
+    /// not `[default].api_key`, an unsafe file, or a failed write leaves the
+    /// token in memory only and never fails the exchange.
+    async fn persist(&self, api_key: &SecretString, entry: &CachedToken) {
+        let Some(file) = self.credentials.clone() else {
             return;
-        }
-        if let Some(path) = self.cache_path.as_deref() {
-            let _ = write_disk_record(path, entry);
+        };
+        let api_key = api_key.clone();
+        let access_token = entry.access_token.clone();
+        let expires_at = entry.expires_at;
+        let written = tokio::task::spawn_blocking(move || {
+            file.cache_api_key_token(&api_key, &access_token, expires_at)
+        })
+        .await;
+        if let Ok(Err(error)) = written {
+            tracing::debug!(target: "wyrd.client.auth", %error, "API key access token not cached");
         }
     }
 }
@@ -735,58 +834,10 @@ fn transport_down(err: reqwest::Error) -> AuthError {
     })
 }
 
-/// Resolve the default on-disk token-cache path from the shared config helper.
-fn token_cache_path() -> Option<PathBuf> {
-    wyrd_utils::config_dir::wyrd_config_dir().map(|path| path.join("tokens"))
-}
-
-/// Load a non-stale token record from the given path, if present. Best-effort.
-fn load_disk_record(path: &std::path::Path) -> Option<CachedToken> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let record: DiskTokenRecord = serde_json::from_str(&content).ok()?;
-    let entry = CachedToken {
-        access_token: record.access_token,
-        expires_at: record.expires_at,
-    };
-    if entry.is_stale() {
-        return None;
-    }
-    Some(entry)
-}
-
-/// Write the token record at mode `0600` (owner read/write only).
-fn write_disk_record(path: &std::path::Path, entry: &CachedToken) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let record = DiskTokenRecord {
-        access_token: entry.access_token.clone(),
-        expires_at: entry.expires_at,
-    };
-    let bytes = serde_json::to_vec(&record)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(&bytes)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -795,11 +846,14 @@ mod tests {
     use tokio::net::TcpListener;
     use uuid::Uuid;
 
-    use super::{AuthError, AuthMiddleware, CachedToken};
+    use super::{AuthError, AuthMiddleware, CachedToken, TokenExchange};
     use crate::config::{ClientConfig, TokenCacheMode};
+    use crate::credentials_file::CredentialsFile;
     use crate::error::WyrdClientError;
+    use crate::saved_login::{SavedLogin, SavedLogins};
     use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
-    use wyrd_spec::auth::SecretBearer;
+    use wyrd_spec::auth::{SecretBearer, TokenRequest};
+    use wyrd_spec::ids::TenantSlug;
 
     struct MockServer {
         base_url: String,
@@ -807,7 +861,7 @@ mod tests {
         _handle: tokio::task::JoinHandle<()>,
     }
 
-    async fn spawn_mock(status_line: &'static str, body: String) -> MockServer {
+    async fn spawn_mock(status_line: &str, body: String) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let hits = Arc::new(AtomicUsize::new(0));
@@ -966,7 +1020,7 @@ mod tests {
             "only the delegated exchange repeats"
         );
 
-        assert!(delegated.cache_path.is_none(), "never persisted to disk");
+        assert!(delegated.credentials.is_none(), "never persisted to disk");
         let debug = format!("{delegated:?}");
         assert!(!debug.contains("subject-secret"), "{debug}");
         assert!(debug.contains("Bifrost"), "{debug}");
@@ -1171,52 +1225,94 @@ mod tests {
         assert!(!debug.contains("top-secret-token"));
     }
 
-    #[tokio::test]
-    async fn disk_cache_writes_secure_record_without_refresh_token() {
-        // Inject a unique cache path instead of mutating the global HOME env
-        // var, so the test is hermetic and safe under the parallel workspace
-        // test runner (the production path resolves ~/.config/wyrd).
-        let dir = std::env::temp_dir().join(format!(
-            "wyrd_auth_disk_{}_{}",
-            std::process::id(),
-            Uuid::now_v7()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("token_cache.json");
-
-        let mock = spawn_mock("HTTP/1.1 200 OK", token_body("disk-access", 3600)).await;
-        let mw = AuthMiddleware::new_with_cache_path(
-            &config_for(mock.base_url.clone(), TokenCacheMode::Disk),
-            api_key_credential(),
-            Some(path.clone()),
+    /// Write a private `credentials.toml` holding `[default].api_key` and a
+    /// user comment into a fresh directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the temporary directory or file cannot be created.
+    fn credentials_dir() -> tempfile::TempDir {
+        let dir = crate::credentials_file::private_tempdir();
+        let path = dir.path().join("credentials.toml");
+        std::fs::write(
+            &path,
+            "# kept by the user\n[default]\napi_key = \"api-key-value\"\n",
         )
-        .expect("middleware builds");
+        .expect("write credentials");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod credentials");
+        dir
+    }
 
-        let _ = mw.bearer().await.expect("exchange ok");
+    /// An API key's exchanged token is cached in `credentials.toml` beside
+    /// that key, reused by a later middleware, and never written for another
+    /// key or into a separate file.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cache is missing, insecure, drops user content, holds
+    /// the refresh token, or is not reused.
+    #[tokio::test]
+    async fn disk_cache_writes_token_beside_its_api_key() {
+        let dir = credentials_dir();
+        let path = dir.path().join("credentials.toml");
+        let mock = spawn_mock("HTTP/1.1 200 OK", token_body("disk-access", 3600)).await;
+        let config = config_for(mock.base_url.clone(), TokenCacheMode::Disk);
+        let file = || Some(CredentialsFile::at(dir.path().to_path_buf()));
 
-        let metadata = std::fs::metadata(&path).expect("token cache file exists");
+        let mw = AuthMiddleware::new_with_credentials(&config, api_key_credential(), file())
+            .expect("middleware builds");
+        mw.bearer().await.expect("exchange ok");
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            assert_eq!(
-                metadata.permissions().mode() & 0o777,
-                0o600,
-                "token cache must be mode 0600"
-            );
+            let mode = std::fs::metadata(&path)
+                .expect("credentials")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "credentials.toml must stay 0600");
         }
-
-        let contents = std::fs::read_to_string(&path).expect("read token cache");
-        assert!(
-            contents.contains("disk-access"),
-            "access token must be persisted"
-        );
+        let contents = std::fs::read_to_string(&path).expect("read credentials");
+        assert!(contents.contains("# kept by the user"), "{contents}");
+        assert!(contents.contains("api_key = \"api-key-value\""));
+        assert!(contents.contains("access_token = \"disk-access\""));
+        assert!(contents.contains("access_expires_at"));
         assert!(
             !contents.contains("refresh-should-drop"),
-            "refresh token must never be written to disk"
+            "refresh token never written"
+        );
+        assert!(
+            !dir.path().join("tokens").exists(),
+            "no separate token cache"
         );
 
-        std::fs::remove_dir_all(&dir).ok();
+        let reused = AuthMiddleware::new_with_credentials(&config, api_key_credential(), file())
+            .expect("middleware builds");
+        reused.bearer().await.expect("cached bearer");
+        assert_eq!(
+            mock.hits.load(Ordering::SeqCst),
+            1,
+            "served from credentials.toml"
+        );
+
+        let other = AuthMiddleware::new_with_credentials(
+            &config,
+            ResolvedCredential::ApiKey("other-key".to_owned().into()),
+            file(),
+        )
+        .expect("middleware builds");
+        other.bearer().await.expect("other key exchanges");
+        assert_eq!(
+            mock.hits.load(Ordering::SeqCst),
+            2,
+            "another key never reuses it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read credentials"),
+            contents,
+            "another key never writes the cache"
+        );
     }
 
     /// Source double minting sequentially numbered tokens of a fixed lifetime.
@@ -1298,24 +1394,154 @@ mod tests {
         );
     }
 
+    /// A saved login's token is used as saved until it nears expiry, with no
+    /// server call. Renewal then happens under the file lock: a removed
+    /// login asks for `wyrd auth login`, an unreachable server leaves the
+    /// record unchanged for a later retry, and an unsafe file fails closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fresh token is not reused or a renewal failure is not
+    /// reported.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saved_login_token_is_reused_until_expiry() {
+        let dir = crate::credentials_file::private_tempdir();
+        let origin = "http://127.0.0.1:9";
+        let login = SavedLogin {
+            origin: origin.to_owned(),
+            tenant_key: "acme".parse::<TenantSlug>().expect("slug"),
+            access_token: SecretBearer::new("first".to_owned()),
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            refresh_token: SecretBearer::new("refresh".to_owned()),
+        };
+        let store = SavedLogins::at(dir.path().to_path_buf());
+        store.save(login.clone()).expect("saves");
+        let source = || {
+            let exchange = TokenExchange::new(origin, 1_000).expect("exchange builds");
+            AuthMiddleware::new(
+                &config_for(origin.to_owned(), TokenCacheMode::InMemory),
+                ResolvedCredential::Renewable(store.source(&login, exchange)),
+            )
+            .expect("middleware builds")
+        };
+        let refused = |result: Result<SecretBearer, AuthError>| match result {
+            Err(AuthError::Client(error)) => error.to_string(),
+            other => panic!("the renewal is refused, got {other:?}"),
+        };
+        assert_eq!(source().bearer().await.expect("saved").expose(), "first");
+
+        let expired = SavedLogin {
+            access_expires_at: Utc::now(),
+            ..login.clone()
+        };
+        store.save(expired.clone()).expect("saves");
+        let error = refused(source().bearer().await);
+        assert!(
+            !error.contains("saved user login"),
+            "transport error: {error}"
+        );
+        assert_eq!(store.list().expect("lists"), vec![expired]);
+
+        std::fs::set_permissions(
+            dir.path().join("credentials.toml"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod");
+        assert!(refused(source().bearer().await).contains("(unsafe_store)"));
+        std::fs::set_permissions(
+            dir.path().join("credentials.toml"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("chmod");
+        store
+            .remove(origin, &login.tenant_key)
+            .expect("removes")
+            .expect("was saved");
+        assert!(refused(source().bearer().await).contains("(logged_out)"));
+    }
+
     /// A minted token stays in memory even when the client caches on disk.
     ///
     /// # Panics
     ///
-    /// Panics when the disk-mode middleware writes the token cache file.
+    /// Panics when the disk-mode middleware changes `credentials.toml`.
     #[tokio::test]
     async fn renewable_tokens_are_never_persisted() {
-        let dir = std::env::temp_dir().join(format!("wyrd_auth_renewable_{}", Uuid::now_v7()));
-        let path = dir.join("token_cache.json");
-        let mw = AuthMiddleware::new_with_cache_path(
+        let dir = credentials_dir();
+        let before = std::fs::read_to_string(dir.path().join("credentials.toml")).expect("read");
+        let mw = AuthMiddleware::new_with_credentials(
             &config_for("http://127.0.0.1:9".to_owned(), TokenCacheMode::Disk),
             ResolvedCredential::Renewable(CountingSource::new(900)),
-            Some(path.clone()),
+            Some(CredentialsFile::at(dir.path().to_path_buf())),
         )
         .expect("middleware builds");
         mw.bearer().await.expect("mint");
-        assert!(!path.exists(), "a minted capture token must not reach disk");
+        let after = std::fs::read_to_string(dir.path().join("credentials.toml")).expect("read");
+        assert_eq!(before, after, "a minted capture token must not reach disk");
         assert!(format!("{mw:?}").contains("test-system-producer"));
+    }
+
+    /// Every secret-bearing `/auth` route refuses a remote cleartext target
+    /// at construction, before any request, while HTTPS and loopback HTTP
+    /// stay usable.
+    #[test]
+    fn token_exchange_refuses_remote_cleartext() {
+        for remote in [
+            "http://wyrd.example.com",
+            "http://10.0.0.5:8080/",
+            "HTTP://wyrd.example.com",
+            "Http://10.0.0.5:8080/",
+        ] {
+            let error = TokenExchange::new(remote, 30_000).expect_err("remote http is refused");
+            assert!(
+                matches!(&error, WyrdClientError::Config { reason, .. } if reason.contains("cleartext")),
+                "{error:?}"
+            );
+        }
+        for allowed in [
+            "https://wyrd.example.com",
+            "http://localhost:8080",
+            "http://127.0.0.1:9000/",
+            "http://[::1]:8080",
+            "HTTPS://Wyrd.Example.com",
+        ] {
+            TokenExchange::new(allowed, 30_000).expect("allowed target builds");
+        }
+    }
+
+    /// A `307` or `308` from the token or revocation route fails the call and
+    /// never replays its secret body at the redirect target.
+    #[tokio::test]
+    async fn token_exchange_never_follows_a_redirect() {
+        let target = spawn_mock("HTTP/1.1 200 OK", token_body("stolen", 3600)).await;
+        for status in ["307 Temporary Redirect", "308 Permanent Redirect"] {
+            let redirect = spawn_mock(
+                &format!(
+                    "HTTP/1.1 {status}\r\nlocation: {}/auth/token",
+                    target.base_url
+                ),
+                String::new(),
+            )
+            .await;
+            let exchange = TokenExchange::new(&redirect.base_url, 30_000).expect("builds");
+            exchange
+                .exchange(&TokenRequest::RefreshToken {
+                    refresh_token: SecretBearer::new("refresh-secret".to_owned()),
+                })
+                .await
+                .expect_err("a redirected exchange fails");
+            exchange
+                .revoke_refresh_token(&SecretBearer::new("refresh-secret".to_owned()))
+                .await
+                .expect_err("a redirected revocation fails");
+            assert_eq!(redirect.hits.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(
+            target.hits.load(Ordering::SeqCst),
+            0,
+            "no body was replayed"
+        );
     }
 
     #[test]

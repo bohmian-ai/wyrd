@@ -60,7 +60,6 @@ tenant = "acme"
 
 [client.token_cache]
 kind = "disk"
-path = "/home/alice/.config/wyrd/tokens"
 ```
 
 The supported fields are:
@@ -71,11 +70,12 @@ The supported fields are:
 | `client.http_url` | `WYRD_SERVER_URL` | `http://localhost:8080` |
 | `client.tenant` | `WYRD_TENANT` | unset |
 | `client.token_cache.kind` | `WYRD_TOKEN_CACHE` | `in_memory` |
-| `client.token_cache.path` | `WYRD_TOKEN_CACHE_PATH` | `<config-dir>/tokens` |
 
-Use `in_memory` or `disk` for the token-cache kind. The global profile may
-select an endpoint, tenant, or token-cache path, but it never carries an API
-key or access token.
+Use `in_memory` or `disk` for the token-cache kind. With `disk`, the access
+token exchanged from the `[default].api_key` in `credentials.toml` is cached in
+that same file beside the key, so later processes reuse it. Wyrd keeps no other
+token file. The global profile may select an endpoint, tenant, or token-cache
+kind, but it never carries an API key or access token.
 
 ## Constructors and lazy connection
 
@@ -111,11 +111,17 @@ order, stopping at the first available source:
 
 1. An API key supplied explicitly on `ClientConfig::api_key`.
 2. `WYRD_ACCESS_TOKEN`.
-3. `WYRD_WORKLOAD_TOKEN` with `WYRD_TENANT`, or with `client.tenant` from the
-   global profile when `WYRD_TENANT` is unset.
+3. `WYRD_WORKLOAD_TOKEN` with the selected tenant key (the client `tenant`
+   option or `client.tenant`, else `WYRD_TENANT`).
 4. `WYRD_API_KEY`.
 5. `[default].api_key` in `credentials.toml` under the selected config
    directory.
+
+The tenant selector is a tenant route key, the one `wyrd auth login --tenant`
+takes. It selects a saved user login (without it, the most recent login for
+the server is used) and names the tenant a workload token is exchanged for. An access token or API key already names its tenant, so
+selecting a tenant beside one fails with `WYRD_CLIENT_400_CONFIG_INVALID`
+instead of being ignored.
 
 For local development, the credentials file can look like this:
 
@@ -189,7 +195,7 @@ override for the one process that needs a different endpoint or API key.
 | Card space remains `default` | The process started outside the repository boundary, or `wyrd.toml` failed validation and was soft-failed by the card constructor. |
 | The client reports no credentials | Check the credential chain and the selected config directory's `credentials.toml`. |
 | Workload identity has no tenant | Set `WYRD_TENANT` or `client.tenant` alongside `WYRD_WORKLOAD_TOKEN`. |
-| Disk caching does not persist | Use `kind = "disk"` and a writable `client.token_cache.path`. |
+| Disk caching does not persist | Use `kind = "disk"`, take the key from `[default].api_key`, and keep `credentials.toml` owner-only (`0600`) in a writable config directory. |
 
 ## Related
 

@@ -97,5 +97,8 @@ pub fn map_client_error(error: WyrdClientError) -> WyrdCliError {
         WyrdClientError::TransportDown { transport, message } => WyrdCliError::ClientTransport {
             detail: format!("{transport}: {message}"),
         },
+        saved @ WyrdClientError::SavedLogin { .. } => WyrdCliError::Server {
+            source: saved.into(),
+        },
     }
 }

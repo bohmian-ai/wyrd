@@ -610,7 +610,9 @@ pub fn platform_connection_from_row(
         verification: IssuerVerification {
             issuer,
             jwks_uri,
-            expected_audience: row.expected_audience,
+            // A human ID token is addressed to the relying party's client
+            // (OpenID Connect Core 1.0 §3.1.3.7 step 3).
+            expected_audience: row.client_id.clone(),
             claim_mapping,
             // A platform connection exists to let people sign in. A workload
             // reaches the platform plane with a credential, never a federated

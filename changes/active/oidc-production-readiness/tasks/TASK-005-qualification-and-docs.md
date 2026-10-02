@@ -3,102 +3,117 @@ id: TASK-005
 kind: implementation
 status: ready
 spec: SPEC-oidc-production-readiness
-spec_revision: 5
-requirements: [REQ-001, REQ-005, REQ-018, INV-001, INV-003, INV-004, INV-005, INV-006, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009]
-depends_on: [TASK-003, TASK-004]
+spec_revision: 11
+requirements: [REQ-001, REQ-005, REQ-018, REQ-021, INV-001, INV-003, INV-004, INV-005, INV-006, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009]
+depends_on: [TASK-009, TASK-010, TASK-011, TASK-012]
 ---
 
-# Production qualification and operator guidance
+# Docs and architecture authority for the standard flows
 
 ## Outcome and Value
 
-Operators can configure and recover self-hosted or hosted OIDC accurately, and every publicly claimed provider/topology combination has redacted evidence from a controlled real account over externally trusted TLS.
+Operators and SDK users read documentation and architecture authority that
+match the shipped standard flows: OIDC relying party on `openidconnect`, Wyrd
+as the OAuth authorization server for the code, device, refresh, revocation,
+token-exchange, and jwt-bearer grants, the BFF as a confidential client with
+an encrypted cookie session, and the shared client on `oauth2`. This is report
+item T5 in
+[`research/auth-standards-recommendation.md`](../research/auth-standards-recommendation.md).
 
 ## Owners, Scope, Consumers, and Prohibited Changes
 
-Own the public self-hosted and hosted documentation, CLI help, architecture authority updates where the approved contract supersedes older prose, and the qualification record. Consume completed journeys from TASK-001–004. Do not add hosted signup, social login, a commercial extension stub, provider credentials to the repository, or a production support claim based only on mocks.
+Own public self-hosted and hosted docs, CLI help text, source documentation
+that feeds generated declarations, and architecture authority
+(`architecture/wyrd-design.md`, `architecture/wyrd-security-posture.md`,
+`architecture/wyrd-doctrine.mdx` where they conflict). Consume the completed
+journeys of TASK-001–004 and TASK-009–012. Do not add hosted signup, social
+login, a commercial stub, provider credentials, a provider-specific code path,
+or a certified-provider list. Do not document SAML or SCIM; both are deferred.
+
+Delete: every passage about the login handoff, the private BFF channel
+(`/internal/bff/v1/*`, `x-wyrd-bff-key`), server-side browser sessions, sealed
+login completion, and the keyring protecting session or login credentials.
 
 ## Approach
 
-1. Reconcile public API, generated schemas, UI, CLI help, and documentation against the approved contract.
-2. Document IdP and Wyrd operator responsibilities, setup inputs and exact callback, one-active-connection rule, role mapping, local human login, independent machine identity, the shared deployment keyring for provider secrets and recoverable login/session credentials, key rotation across replicas, missing-key failure, and recovery. State that secretless-provider human login and OIDC-off UI sessions still need the keyring; machine-only use without recoverable stored credentials does not.
-3. Run the integrated self-hosted OIDC-off and OIDC-on journeys and the hosted two-tenant journey, including negative and provider-switch flows.
-4. Qualify Okta, Keycloak, and Entra ID with controlled accounts over externally trusted TLS for every combination publicly claimed; record redacted immutable artifact, topology, origin, configuration fingerprint, time, and outcome.
-
-## Qualification contract and claim matrix
-
-The initial public support claim is the following six combinations, each
-using the production Web client flow and an externally trusted HTTPS public
-origin. `SecretBasic` is the required common Web client method. If
-`SecretPost` or `Public` is offered by TASK-001 for a provider, add a row for
-that method before claiming it; `PrivateKeyJwt` is excluded. A hosted row
-means a tenant on a two-tenant Wyrd service, never a separate dedicated
-deployment. At least one hosted run pairs different providers concurrently;
-the other hosted rows may reuse a different controlled peer tenant.
-
-| Provider | Self-hosted | Hosted two-tenant |
-|---|---|---|
-| Okta | Required | Required |
-| Keycloak | Required | Required |
-| Entra ID | Required | Required |
-
-Before execution, secure a controlled tenant/application and test user for
-each provider, with authority to register the exact callback, configure group
-claims, rotate a client secret, and revoke access. Provision an externally
-trusted TLS origin and reachable Wyrd deployment for each topology; record
-the tested public origin, TLS certificate issuer, immutable Wyrd commit/image
-digest, provider tenant/application ID hashed or redacted, client-auth method,
-issuer, discovery/JWKS fingerprint, role-map fingerprint, UTC time, operator,
-and pass/fail evidence link in the durable redacted record
-`changes/evidence/oidc-production-readiness.md`. Link that record from the
-eventual completed change record and relevant operator docs; it must survive
-deletion of `changes/active/oidc-production-readiness/`. Never store secrets,
-tokens, or raw provider assertions there.
-
-For every matrix row, use the deployed UI login/callback and authorized and
-denied call, then CLI handoff and a public SDK renewal; verify outage and
-wrong-tenant refusal. Run OIDC-off self-hosted, two simultaneous hosted
-tenants, provider replacement/recovery, API-key and workload paths at least
-once per topology. Compare the deployed API/UI/CLI behavior with generated
-contracts and docs. A row passes only with the exact live outcome and
-evidence; local Keycloak/Dex fixtures are continuous regression coverage,
-not a substitute. If accounts, TLS, or a row fail, do not claim that row or
-mark AC-008 complete. Narrow published provider/topology/method claims to
-qualified rows and return to the spec if the approved three-provider outcome
-cannot be achieved.
+1. Reconcile public API, generated schemas, UI, CLI help, and docs against
+   spec revision 11.
+2. Document operator and IdP responsibilities, setup inputs and exact
+   callback, one active connection, role mapping, CLI device login, saved-login
+   selection (newest login by default, `tenant` to select), independent
+   machine identity, and recovery. The keyring is required only when a
+   provider secret is stored (REQ-005).
+3. Document the OAuth surface: the authorize, token, platform token,
+   revocation, and device authorization endpoints, RFC 8414 metadata, the
+   `wyrd-ui` confidential and `wyrd-cli` public clients, refresh rotation for
+   public clients only, the RFC 6749 §5.2 error mapping, and the one sanctioned
+   exception to `WyrdError` problem+json for these endpoints.
+4. In the security posture, change "rotated on every successful use" for
+   access and refresh tokens to "rotated on every use for public clients".
+5. Keep the generic provider setup page plus short examples for Okta,
+   Microsoft Entra ID, Google, Auth0, and Keycloak.
 
 ## Proof Strategy
 
-This task changes documentation and records qualification of already implemented behavior. It adds no production executable logic, so a manufactured RED is inapplicable. Use static contract comparison, existing real-server journeys, live controlled-provider results, and generated-document checks. If closing a discovered behavioral gap requires executable changes, route that work to the owning preceding task and its TDD scenarios; if it changes approved behavior, return to the spec.
+This task changes documentation and verifies already implemented behavior. It
+adds no production executable logic, so a manufactured RED does not apply.
+Use static contract comparison, the existing real-server journeys, and
+generated-document checks. If closing a gap needs executable changes, route
+it to the owning task (TASK-009–012); if it changes approved behavior, return
+to the spec.
 
 ## Acceptance Criteria
 
-AC-001–009 have recorded owner evidence across self-hosted, hosted, UI, CLI, Rust/Python/TypeScript SDK, and machine paths. Okta, Keycloak, and Entra ID are each qualified for the exact publicly claimed configurations. Docs never promise instant access-token revocation or advertise production SSO before the production journey passes.
+- AC-001–009 have recorded owner evidence across self-hosted, hosted, UI, CLI,
+  Rust/Python/TypeScript SDK, and machine paths.
+- FIND-TASK-004-8: shared-client, Python, and TypeScript configuration docs,
+  test-wrapper docs, and the generated TypeScript declaration describe
+  newest-login selection, selected-tenant mismatch behavior, and RFC 8628
+  device login only. Generated output is regenerated from its source owner,
+  never hand-edited.
+- No doc, help text, or architecture passage describes the handoff, the BFF
+  channel, browser-session rows, sealed completion, or session sealing keys.
+- Docs never promise instant access-token revocation or advertise production
+  SSO before the production journey passes. No provider-specific code exists.
 
 ## Expected Write Set and Consumer Closure
 
-Likely docs/, architecture/wyrd-design.md, architecture/wyrd-security-posture.md, CLI help text, generated contract artifacts from their sources, and the durable redacted record at `changes/evidence/oidc-production-readiness.md`. Do not hand-edit generated files.
+`docs/`, `architecture/wyrd-design.md`, `architecture/wyrd-security-posture.md`,
+`architecture/wyrd-doctrine.mdx` where it conflicts, CLI help text, source
+docs in `crates/shared/wyrd-client` and `sdks/*`, and generated artifacts
+from their sources.
 
 ## Verification and Evidence
 
-Run mise run test:identity:journey, mise run test:principals:integration, mise run test:cli:journey, mise run py:test:integration, mise run ts:test:integration, mise run codegen:check, and mise run docs:check. Run mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check and test for UI documentation or presentation changes. Record externally trusted TLS provider results separately from local Keycloak/Dex mock/fixture results. If executable or Rust/Python surfaces change, run their AGENTS.md formatting and lint gates as well. A red required lane blocks completion.
+List each acceptance criterion's owning journey selection without running the
+suite:
+`mise exec -- cargo nextest list --locked -p wyrd-server --test identity_e2e --run-ignored=all`
+and the equivalent CLI, UI Vitest, Python pytest collection, and TS Vitest
+listings. Record each acceptance criterion's owner test and its result from
+the owning task's evidence; the unfiltered journeys run once at change review.
 
-The integration lane must include the exact TASK-001–004 selectors and fail
-when any is absent; verify its final selection with `mise exec -- cargo
-nextest list --locked -p wyrd-server --test identity_e2e` and the equivalent
-CLI, UI Vitest, Python pytest collection, and TS Vitest listing before running
-the aggregate. The live qualification procedure above is manual and requires
-controlled accounts; its evidence rows, not the local lane's green status,
-prove AC-008. `mise run docs:check` and `mise run codegen:check` prove static
-contract/doc closure (AC-009). An OIDC-off real UI/SDK run and a hosted
-different-provider run close AC-001/003. Record each acceptance criterion's
-test/result/evidence link in the qualification record; do not accept a
-provider claim solely because another provider's row passed.
+Then run only the lanes covering this write set: `mise run docs:check`,
+`mise run codegen:check` and `mise run ts:napi:check` (generated artifacts
+and the TypeScript declaration), `mise run fmt` and `mise run lints` (CLI help
+text and Rust source docs), `mise run py:format` and `mise run py:lints` when
+Python source docs change, and
+`mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check` for UI text
+changes.
 
 ## Material Stop Conditions
 
-Stop if a claimed provider cannot pass qualification, a public contract differs from the approved spec, hosted signup becomes required in the open-source server, or required controlled provider accounts are unavailable; report the exact blocked claim and evidence.
+Stop and report if a needed behavior has no vetted library and is not covered
+by a named RFC section; never write custom protocol logic. Also stop if a
+public contract differs from the approved spec, a standard provider would
+need a provider-specific branch, or hosted signup becomes required in the
+open-source server.
 
 ## Authority Links
 
-[Approved spec](../spec.md); [AGENTS.md](../../../../AGENTS.md); [Wyrd design](../../../../architecture/wyrd-design.md); [security posture](../../../../architecture/wyrd-security-posture.md); [testing workflow](../../../../architecture/references/languages/testing-workflows.md).
+[Approved spec](../spec.md);
+[research report](../research/auth-standards-recommendation.md);
+[routing](../review/TASK-004-r2/lead-direction-routing.md);
+[AGENTS.md](../../../../AGENTS.md);
+[Wyrd design](../../../../architecture/wyrd-design.md);
+[security posture](../../../../architecture/wyrd-security-posture.md);
+[testing workflow](../../../../architecture/references/languages/testing-workflows.md).

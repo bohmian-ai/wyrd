@@ -5,9 +5,11 @@
 //! force signing-key rotation (Keycloak only).  The harness smoke test (commit
 //! 08) verifies discovery; the journey tests (commit 09) drive the full flows.
 
+use std::sync::Arc;
+
 use url::Url;
 use wiremock::MockServer;
-use wyrd_auth_oidc::{OidcProvider, ProviderMetadata};
+use wyrd_auth_oidc::{ProviderMetadata, RelyingParty, ScreenedHttp};
 use wyrd_spec::auth::IssuerUrl;
 
 /// Keycloak-specific admin context needed for privileged operations.
@@ -43,7 +45,7 @@ pub struct LoginResult {
 pub struct OidcIssuerFixture {
     /// Normalized issuer URL (used for `TrustedIssuer.issuer`).
     pub issuer: IssuerUrl,
-    provider: OidcProvider,
+    provider: Arc<ProviderMetadata>,
     http: reqwest::Client,
     admin: Option<KeycloakAdmin>,
 }
@@ -66,17 +68,11 @@ impl OidcIssuerFixture {
             .build()
             .expect("reqwest client builds");
 
-        let provider = {
-            let discover_client = reqwest::Client::new();
-            OidcProvider::discover(
-                issuer_base.parse().expect("issuer URL parses"),
-                discover_client,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("OIDC discovery failed for {issuer_base}: {e}"))
-        };
-
         let issuer = IssuerUrl::new_for_tests(issuer_base);
+        let provider = RelyingParty::new(ScreenedHttp::allowing_internal())
+            .discover(&issuer)
+            .await
+            .unwrap_or_else(|e| panic!("OIDC discovery failed for {issuer_base}: {e}"));
 
         Self {
             issuer,
@@ -95,7 +91,7 @@ impl OidcIssuerFixture {
 
     /// Discovery metadata from the provider.
     pub fn metadata(&self) -> &ProviderMetadata {
-        &self.provider.metadata
+        &self.provider
     }
 
     /// Drive a full human login at this provider for a caller-built request.
@@ -120,7 +116,7 @@ impl OidcIssuerFixture {
         code_challenge: &str,
         nonce: &str,
     ) -> LoginResult {
-        let mut authz_url = self.provider.metadata.authorization_endpoint.clone();
+        let mut authz_url = self.provider.authorization_endpoint().url().clone();
         authz_url
             .query_pairs_mut()
             .append_pair("response_type", "code")
@@ -164,10 +160,9 @@ impl OidcIssuerFixture {
     ) -> String {
         let token_url = self
             .provider
-            .metadata
-            .token_endpoint
-            .as_ref()
-            .expect("provider exposes a token endpoint");
+            .token_endpoint()
+            .expect("provider exposes a token endpoint")
+            .url();
 
         let resp = self
             .http
@@ -471,7 +466,7 @@ pub struct DiscoveryFixture {
 }
 
 impl DiscoveryFixture {
-    /// Start an issuer serving only its discovery document.
+    /// Start an issuer serving its discovery document and an empty key set.
     pub async fn start() -> Self {
         let server = wiremock::MockServer::start().await;
         let issuer = server.uri();
@@ -485,8 +480,18 @@ impl DiscoveryFixture {
                     "authorization_endpoint": format!("{issuer}/authorize"),
                     "token_endpoint": format!("{issuer}/token"),
                     "jwks_uri": format!("{issuer}/jwks"),
+                    "response_types_supported": ["code"],
+                    "subject_types_supported": ["public"],
                     "id_token_signing_alg_values_supported": ["RS256", "EdDSA"],
                 })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/jwks"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "keys": [] })),
             )
             .mount(&server)
             .await;

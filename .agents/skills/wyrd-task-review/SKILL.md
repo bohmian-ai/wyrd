@@ -108,6 +108,13 @@ standard-library, native-platform, or installed-dependency behavior before
 accepting new code. Require the smallest safe root-cause correction without
 weakening validation, error handling, security, accessibility, or durability.
 
+Reject unearned complexity. Where a standard and conventional way exists (a
+published standard such as an RFC, or the established practice of comparable
+widely used projects), the candidate must use it. Classify any mechanism,
+state, check, file, setting, option, or error beyond that standard as `DRIFT`
+unless approved authority explicitly requires it. Never require one in a
+finding or remediation; a correction follows the standard way too.
+
 Treat each failure diagnosis in the task evidence as a claim to falsify: the
 recorded cause must explain the trace, and the fix must sit at that cause. A
 change to a test, assertion, timeout, sleep, retry, `#[ignore]`, `#[allow]`, or
@@ -138,7 +145,14 @@ Inspect specifically for:
 - **REGRESSION** — existing behavior was unintentionally changed.
 
 Do not report optional improvements, speculative hardening, preferences,
-unrelated pre-existing debt, or refactors not required by the task. Tests prove
+unrelated pre-existing debt, or refactors not required by the task.
+
+A finding blocks only when it has a behavioral, security, tenancy,
+durability, or public-contract consequence, or when it deletes unearned code.
+Placement, naming, structure, and wording findings with no such consequence
+are non-blocking even when a style rule can be cited; record them under
+non-blocking notes and never let them alone produce `FIX_REQUIRED`. Missing
+rustdoc on a changed item stays blocking per `AGENTS.md`. Tests prove
 behavior; they do not prove that the requested behavior was built. Rely on
 repository source and the diff, not agent summaries.
 
@@ -285,9 +299,10 @@ proposed remediation:
 
 1. Can it be deleted while preserving the complete task?
 2. Does existing repository behavior already solve it?
-3. Does the standard library or native platform solve it?
-4. Does an already-installed dependency solve it?
-5. Only then, what is the minimum necessary correction?
+3. Is there a standard and conventional way to do it? Use that, nothing more.
+4. Does the standard library or native platform solve it?
+5. Does an already-installed dependency solve it?
+6. Only then, what is the minimum necessary correction?
 
 Prefer a correction at the source that makes invalid state unrepresentable or
 prevents it from being produced. A guard at a consumer is appropriate when that
@@ -378,11 +393,13 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
    closes the diagnosed gap without relying on repeated downstream guards;
 5. constraints, preserved behavior, and explicit non-goals;
 6. acceptance criteria mapped to every finding; and
-7. focused proof that directly exercises the gap plus broader verification.
+7. focused proof that directly exercises the gap plus only the narrowest
+   lanes covering the remediation's write set. Never require full user-journey
+   suites or broad aggregates in a task remediation; they run once at change
+   review.
 
 Batch bounded documentation corrections with the same remediation task. Keep
-the rustdoc gate intact, but do not create a style-only round while a shared
-security, tenancy, or concurrency cause remains open. If approved spec text
+the rustdoc gate intact, but never create a style-only round. If approved spec text
 conflicts with the required correction, return `SPEC_REVISION_REQUIRED` and
 name the conflict instead of prescribing an unapproved behavior change.
 

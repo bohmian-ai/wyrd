@@ -202,16 +202,23 @@ impl HttpConfig {
     /// Validate the config. Returns `Err` if `base_url` is empty or
     /// `timeout_ms` is zero.
     ///
-    /// A plaintext `http://` URL to a non-loopback host is rejected because
+    /// `base_url` must parse as an absolute `https://` URL, or an `http://`
+    /// URL whose host is loopback (`localhost` or a loopback IP), because
     /// credentials may be sent to `{base_url}/auth/token` or in request
-    /// headers. Loopback hosts (`localhost`, `127.0.0.1`, `[::1]`) remain
-    /// available for local development.
+    /// headers. The URL parser decides scheme and host, so spellings such as
+    /// `HTTP://` are judged the same way the HTTP client will send them.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::Config`] for an empty or unparsable
+    /// `base_url`, a scheme other than `http` or `https`, remote cleartext
+    /// `http`, or a zero `timeout_ms`.
     pub fn validate(&self) -> Result<(), WyrdClientError> {
+        let invalid = |reason: &str| WyrdClientError::Config {
+            field: "http_config.base_url".to_string(),
+            reason: reason.to_string(),
+        };
         if self.base_url.is_empty() {
-            return Err(WyrdClientError::Config {
-                field: "http_config.base_url".to_string(),
-                reason: "must not be empty".to_string(),
-            });
+            return Err(invalid("must not be empty"));
         }
         if self.timeout_ms == 0 {
             return Err(WyrdClientError::Config {
@@ -219,35 +226,33 @@ impl HttpConfig {
                 reason: "must be at least 1".to_string(),
             });
         }
-        if is_cleartext_remote(&self.base_url) {
-            return Err(WyrdClientError::Config {
-                field: "http_config.base_url".to_string(),
-                reason: "remote cleartext HTTP is not allowed; use https:// or a loopback host"
-                    .to_string(),
-            });
+        let url = reqwest::Url::parse(&self.base_url)
+            .map_err(|error| invalid(&format!("not an absolute URL: {error}")))?;
+        match url.scheme() {
+            "https" => Ok(()),
+            "http" if is_loopback(&url) => Ok(()),
+            "http" => Err(invalid(
+                "remote cleartext HTTP is not allowed; use https:// or a loopback host",
+            )),
+            _ => Err(invalid(
+                "the scheme must be https, or http for a loopback host",
+            )),
         }
-        Ok(())
     }
 }
 
-/// Return `true` when `url` is a plaintext `http://` URL whose host is not a
-/// loopback address. Used to flag cleartext transmission of the durable key.
-fn is_cleartext_remote(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
+/// Whether the parsed `url` names a loopback host: `localhost` or a loopback
+/// IP address. The parser has already lowercased the host.
+fn is_loopback(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
         return false;
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    // Strip an optional `:port`, but only when the authority is not a bracketed
-    // IPv6 literal whose colons would otherwise be split.
-    let host = if authority.starts_with('[') {
-        authority
-    } else {
-        authority
-            .rsplit_once(':')
-            .map_or(authority, |(host, _)| host)
-    };
-    !matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "[::1]:" | "::1")
-        && !host.starts_with("[::1]")
+    host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Default buffer label used by [`MockConfig::default`].
@@ -347,20 +352,52 @@ impl TransportConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::is_cleartext_remote;
+    use super::HttpConfig;
 
-    #[test]
-    fn cleartext_remote_flags_plaintext_non_loopback() {
-        assert!(is_cleartext_remote("http://wyrd.example.com"));
-        assert!(is_cleartext_remote("http://wyrd.example.com:8080/api"));
-        assert!(is_cleartext_remote("http://10.0.0.5:8080"));
+    /// The base-URL decision for `base_url`, through [`HttpConfig::validate`].
+    fn accepts(base_url: &str) -> bool {
+        HttpConfig {
+            base_url: base_url.to_owned(),
+            ..HttpConfig::default()
+        }
+        .validate()
+        .is_ok()
     }
 
+    /// Remote cleartext in any scheme spelling, malformed targets, and
+    /// unsupported schemes are refused.
     #[test]
-    fn cleartext_remote_exempts_https_and_loopback() {
-        assert!(!is_cleartext_remote("https://wyrd.example.com"));
-        assert!(!is_cleartext_remote("http://localhost:8080"));
-        assert!(!is_cleartext_remote("http://127.0.0.1:8080"));
-        assert!(!is_cleartext_remote("http://[::1]:8080"));
+    fn remote_cleartext_malformed_and_unsupported_targets_are_refused() {
+        for url in [
+            "http://wyrd.example.com",
+            "http://wyrd.example.com:8080/api",
+            "http://10.0.0.5:8080",
+            "HTTP://wyrd.example.com",
+            "Http://wyrd.example.com",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "wyrd.example.com",
+            "https://",
+            "http//wyrd.example.com",
+            "ftp://wyrd.example.com",
+            "file:///etc/passwd",
+        ] {
+            assert!(!accepts(url), "{url} must be refused");
+        }
+    }
+
+    /// HTTPS in any spelling and loopback HTTP are accepted.
+    #[test]
+    fn https_and_loopback_http_are_accepted() {
+        for url in [
+            "https://wyrd.example.com",
+            "HTTPS://Wyrd.Example.com/api",
+            "http://localhost:8080",
+            "HTTP://LOCALHOST:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert!(accepts(url), "{url} must be accepted");
+        }
     }
 }

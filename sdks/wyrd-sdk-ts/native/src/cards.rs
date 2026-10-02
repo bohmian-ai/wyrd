@@ -43,14 +43,17 @@ pub struct NativeCardsConnection {
 pub fn connect_cards(
     server_url: Option<String>,
     credential: Option<String>,
+    tenant: Option<String>,
 ) -> NativeCardsConnection {
     let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         None,
+        tenant.as_deref(),
     );
     drop(server_url);
     drop(credential);
+    drop(tenant);
     match client {
         Ok(client) => NativeCardsConnection {
             cards: Some(NativeCards {
@@ -277,6 +280,7 @@ impl NativeWyrdState {
         server_url: Option<String>,
         credential: Option<String>,
         grpc_url: Option<String>,
+        tenant: Option<String>,
     ) -> Result<NativeLifecycleResult> {
         let state = match &self.state {
             Ok(state) => state,
@@ -287,6 +291,7 @@ impl NativeWyrdState {
             server_url.as_deref(),
             credential.as_deref(),
             grpc_url.as_deref(),
+            tenant.as_deref(),
         ) {
             Ok(client) => client,
             Err(error) => {

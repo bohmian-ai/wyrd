@@ -168,6 +168,7 @@ class TableConfig:
         server_url: str | None = None,
         credential: str | None = None,
         grpc_url: str | None = None,
+        tenant: str | None = None,
     ) -> TableConfig:
         """Fetch an already-registered table's config by name."""
         ...
@@ -236,11 +237,13 @@ class _BifrostBase:
         credential: str | None = None,
         grpc_url: str | None = None,
         client: WyrdClient | None = None,
+        tenant: str | None = None,
     ) -> None:
         """Connect one client; every argument resolves from the chain if omitted.
 
         ``client`` reuses an existing, possibly delegated, ``WyrdClient`` and
-        cannot be combined with ``server_url``, ``credential``, or ``grpc_url``.
+        cannot be combined with ``server_url``, ``credential``, ``grpc_url``,
+        or ``tenant``.
         """
         ...
     def use_table(self, table: TableConfig) -> TableConfig | None:

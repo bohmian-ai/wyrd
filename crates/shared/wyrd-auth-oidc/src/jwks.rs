@@ -200,31 +200,6 @@ async fn fetch_jwks(
     Ok(Arc::new(map))
 }
 
-/// Fetch `jwks_uri` once through `http` and count the keys Wyrd can verify
-/// with.
-///
-/// Connection qualification uses this to prove a provider's key set is usable
-/// before trusting it, through the same screened fetch and decoder the
-/// verification cache uses, so a key set the verifier would reject cannot
-/// qualify. Nothing is cached.
-///
-/// # Errors
-/// Returns [`OidcError::JwksUnavailable`] under the same conditions as the
-/// cache's fetch: a refused or unreachable URI, a non-success status, or a body
-/// that is not a JWKS document.
-pub async fn usable_jwks_keys(
-    issuer: &str,
-    jwks_uri: &Url,
-    http: ScreenedHttp,
-) -> Result<usize, OidcError> {
-    fetch_jwks(issuer, jwks_uri, http, PROBE_TIMEOUT)
-        .await
-        .map(|keys| keys.len())
-}
-
-/// Request timeout for a one-shot [`usable_jwks_keys`] probe.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
 // --------------------------------------------------------------------------
 // JwksCache
 // --------------------------------------------------------------------------

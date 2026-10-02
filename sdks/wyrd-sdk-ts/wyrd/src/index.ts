@@ -544,6 +544,7 @@ export class TableConfig {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
+      readonly tenant?: string;
     } = {},
   ): Promise<TableConfig> {
     const described = await describeTableConfig(
@@ -551,6 +552,7 @@ export class TableConfig {
       transport.serverUrl,
       transport.credential,
       transport.grpcUrl,
+      transport.tenant,
     );
     return new TableConfig(nativeHandle(described.config, described.error));
   }
@@ -694,7 +696,8 @@ export class Bifrost {
    * constructor. Every option is optional: `serverUrl` resolves from
    * `WYRD_SERVER_URL`, `grpcUrl` from `WYRD_GRPC_URL`, and `credential`
    * through `WYRD_ACCESS_TOKEN` → `WYRD_WORKLOAD_TOKEN` + tenant →
-   * `WYRD_API_KEY` → `~/.config/wyrd/credentials.toml`.
+   * `WYRD_API_KEY` → the saved `wyrd auth login` for this server and
+   * `tenant` (a tenant route key) → `~/.config/wyrd/credentials.toml`.
    *
    * `client` reuses an existing, possibly delegated, {@link WyrdClient} for
    * authentication and transport. It cannot be combined with `serverUrl`,
@@ -707,6 +710,7 @@ export class Bifrost {
           readonly serverUrl?: string;
           readonly credential?: string;
           readonly grpcUrl?: string;
+          readonly tenant?: string;
           readonly client?: never;
         }
       | {
@@ -715,6 +719,7 @@ export class Bifrost {
           readonly serverUrl?: never;
           readonly credential?: never;
           readonly grpcUrl?: never;
+          readonly tenant?: never;
         } = {},
   ): Promise<Bifrost> {
     const connection =
@@ -724,12 +729,14 @@ export class Bifrost {
             options.serverUrl,
             options.credential,
             options.grpcUrl,
+            options.tenant,
           )
         : await wyrdClientNative(options.client).connectBifrost(
             options.table?.native,
             options.serverUrl,
             options.credential,
             options.grpcUrl,
+            options.tenant,
           );
     return new Bifrost(nativeHandle(connection.bifrost, connection.error));
   }
@@ -1069,20 +1076,26 @@ export class WyrdClient {
   /**
    * Build a client without performing IO.
    *
-   * Omitted options resolve from the environment, then
-   * `~/.config/wyrd/credentials.toml`.
+   * Omitted options resolve from the environment, then the saved
+   * `wyrd auth login` for this server (the one for `tenant`, a tenant route
+   * key, when given, otherwise the newest), then
+   * `~/.config/wyrd/credentials.toml`. A `tenant` with no saved login for this
+   * server, or a saved login that cannot be used, raises
+   * `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE`.
    */
   static connect(
     options: {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
+      readonly tenant?: string;
     } = {},
   ): WyrdClient {
     const result = connectWyrdClient(
       options.serverUrl,
       options.credential,
       options.grpcUrl,
+      options.tenant,
     );
     return new WyrdClient(nativeHandle(result.client, result.error));
   }
@@ -1139,9 +1152,17 @@ export class Cards {
    * Omitted options resolve through the same chain as {@link Bifrost.connect}.
    */
   static connect(
-    options: { readonly serverUrl?: string; readonly credential?: string } = {},
+    options: {
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly tenant?: string;
+    } = {},
   ): Cards {
-    const connection = connectCards(options.serverUrl, options.credential);
+    const connection = connectCards(
+      options.serverUrl,
+      options.credential,
+      options.tenant,
+    );
     return new Cards(nativeHandle(connection.cards, connection.error));
   }
 
@@ -1269,11 +1290,16 @@ export class Verification {
    * Omitted options resolve through the same chain as {@link Cards.connect}.
    */
   static connect(
-    options: { readonly serverUrl?: string; readonly credential?: string } = {},
+    options: {
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly tenant?: string;
+    } = {},
   ): Verification {
     const connection = connectVerification(
       options.serverUrl,
       options.credential,
+      options.tenant,
     );
     return new Verification(
       nativeHandle(connection.verification, connection.error),
@@ -1426,11 +1452,16 @@ export class OperatorConnections {
    * Omitted options resolve through the same chain as {@link Cards.connect}.
    */
   static connect(
-    options: { readonly serverUrl?: string; readonly credential?: string } = {},
+    options: {
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly tenant?: string;
+    } = {},
   ): OperatorConnections {
     const connection = connectOperatorConnections(
       options.serverUrl,
       options.credential,
+      options.tenant,
     );
     return new OperatorConnections(
       nativeHandle(connection.connections, connection.error),
@@ -1840,6 +1871,7 @@ export class WyrdState {
       readonly serverUrl?: string;
       readonly credential?: string;
       readonly grpcUrl?: string;
+      readonly tenant?: string;
     } = {},
   ): Promise<void> {
     lifecycleValue<null>(
@@ -1848,6 +1880,7 @@ export class WyrdState {
         options.serverUrl,
         options.credential,
         options.grpcUrl,
+        options.tenant,
       ),
     );
   }
@@ -2076,9 +2109,13 @@ export class Gateway {
    * Omitted options resolve through the same chain as {@link Bifrost.connect}.
    */
   static connect(
-    options: { readonly serverUrl?: string; readonly credential?: string } = {},
+    options: {
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly tenant?: string;
+    } = {},
   ): Gateway {
-    return new Gateway(connectGateway(options.serverUrl, options.credential));
+    return new Gateway(connectGateway(options.serverUrl, options.credential, options.tenant));
   }
 
   /** Read one redacted provider credential. */

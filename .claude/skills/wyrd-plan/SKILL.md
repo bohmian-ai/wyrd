@@ -96,11 +96,12 @@ guidance, not an implementation allowlist.
 
 ## Verification and Evidence
 
-The focused and broader repository-native checks that can prove completion.
-If `mise run gate` is the final aggregate, list it once instead of also
-listing its component `mise` lanes. Keep exact named-test commands for
-Red-Green iteration and identify a separate final lane only when `mise.toml`
-shows that the gate does not cover the required proof.
+The narrowest repository-native checks that prove this task: exact
+named-test commands (including the task's own journey tests by exact
+selector) plus only the owner lanes, boundary checks, and format/lint checks
+covering the task's write set. Do not list full user-journey suites, every
+language surface, or broad aggregates such as `mise run gate` in a task; those
+run once on the integrated candidate at change review.
 
 ## Material Stop Conditions
 

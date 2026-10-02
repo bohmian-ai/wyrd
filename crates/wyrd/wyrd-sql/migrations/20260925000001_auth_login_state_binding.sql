@@ -7,12 +7,12 @@
 -- lives only in the provider authorization URL; the database never stores it.
 --
 -- A row records how the login was initiated by which one binding it carries: a
--- browser login binds the hash of the BFF's random flow id; a CLI login binds a
--- server-issued handoff id. The binding is unique, so a flow id or handoff
+-- browser login binds the hash of the BFF's random flow id; a CLI login binds its
+-- device authorization id (RFC 8628). The binding is unique, so a flow id or device
 -- can be recorded against exactly one login. The callback consumes the row (consumed_at) before any provider
 -- IO and, once it has issued a Wyrd session, stores that session sealed under
 -- the deployment keyring in completion_sealed with a fresh, short
--- expires_at. The BFF or CLI redeems the completion once by its binding; the
+-- expires_at. The BFF or the device-code poll redeems the completion once by its binding; the
 -- redemption deletes the row. Neither the provider code nor a Wyrd token ever
 -- reaches the browser.
 --
@@ -31,18 +31,18 @@ CREATE TABLE wyrd.auth_login_state (
     code_verifier       TEXT        NOT NULL,
     nonce               TEXT        NOT NULL,
     browser_flow_hash   BYTEA       CHECK (octet_length(browser_flow_hash) = 32),
-    cli_handoff_id      UUID,
+    device_id           UUID,
     consumed_at         TIMESTAMPTZ,
     completion_sealed   BYTEA,
     expires_at          TIMESTAMPTZ NOT NULL,
-    CHECK (num_nonnulls(browser_flow_hash, cli_handoff_id) = 1),
+    CHECK (num_nonnulls(browser_flow_hash, device_id) = 1),
     CHECK (completion_sealed IS NULL OR consumed_at IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX auth_login_state_browser_flow
     ON wyrd.auth_login_state (browser_flow_hash) WHERE browser_flow_hash IS NOT NULL;
-CREATE UNIQUE INDEX auth_login_state_cli_handoff
-    ON wyrd.auth_login_state (cli_handoff_id) WHERE cli_handoff_id IS NOT NULL;
+CREATE UNIQUE INDEX auth_login_state_device
+    ON wyrd.auth_login_state (device_id) WHERE device_id IS NOT NULL;
 CREATE INDEX auth_login_state_expires_at
     ON wyrd.auth_login_state (data_tenant_id, expires_at);
 

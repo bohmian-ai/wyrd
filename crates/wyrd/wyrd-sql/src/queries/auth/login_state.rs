@@ -34,14 +34,14 @@ const PURGE_EXPIRED_LOGIN_STATE_SQL: &str = r#"
 ///
 /// Forced RLS's `WITH CHECK` refuses a `data_tenant_id` other than the
 /// connection's tenant. `ON CONFLICT DO NOTHING` never overwrites: a reused
-/// state hash, browser flow hash, or CLI handoff id inserts nothing, so one
+/// state hash, browser flow hash, or device id inserts nothing, so one
 /// binding names at most one login. `PostgreSQL` derives `expires_at` from the
 /// bound lifetime in seconds.
 const INSERT_LOGIN_STATE_SQL: &str = r#"
     INSERT INTO wyrd.auth_login_state (
         state_hash, data_tenant_id, connection_id, connection_revision, issuer,
         client_id, redirect_uri, code_verifier, nonce, browser_flow_hash,
-        cli_handoff_id, tester_principal_id, tester_principal_kind, expires_at
+        device_id, tester_principal_id, tester_principal_kind, expires_at
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
               statement_timestamp() + ($14 * interval '1 second'))
     ON CONFLICT DO NOTHING
@@ -60,7 +60,7 @@ const CONSUME_LOGIN_STATE_SQL: &str = r#"
        AND consumed_at IS NULL
        AND expires_at > statement_timestamp()
     RETURNING connection_id, connection_revision, issuer, client_id, redirect_uri,
-              code_verifier, nonce, browser_flow_hash, cli_handoff_id,
+              code_verifier, nonce, browser_flow_hash, device_id,
               tester_principal_id, tester_principal_kind
 "#;
 
@@ -81,12 +81,12 @@ const COMPLETE_LOGIN_STATE_SQL: &str = r#"
 /// Redeem a completed login once by its initiation binding.
 ///
 /// Deletes the RLS tenant's completed, unexpired row bound to either the
-/// browser flow hash or the CLI handoff id and returns its sealed session and
+/// browser flow hash or the device id and returns its sealed session and
 /// the connection the login went through. Deletion is the one-use guarantee:
 /// a second redemption matches nothing.
 const REDEEM_LOGIN_COMPLETION_SQL: &str = r#"
     DELETE FROM wyrd.auth_login_state
-     WHERE (browser_flow_hash = $1 OR cli_handoff_id = $2)
+     WHERE (browser_flow_hash = $1 OR device_id = $2)
        AND completion_sealed IS NOT NULL
        AND expires_at > statement_timestamp()
     RETURNING completion_sealed, connection_id
@@ -98,8 +98,8 @@ const REDEEM_LOGIN_COMPLETION_SQL: &str = r#"
 struct InitiationColumns<'a> {
     /// Browser flow hash, for a browser login.
     browser_flow_hash: Option<&'a [u8]>,
-    /// CLI handoff id, for a CLI login.
-    cli_handoff_id: Option<Uuid>,
+    /// Device authorization id, for a device-code login.
+    device_id: Option<Uuid>,
     /// Principal that began a candidate connection test.
     tester_principal_id: Option<Uuid>,
     /// That principal's kind label.
@@ -113,8 +113,8 @@ fn initiation_columns(initiation: &LoginInitiation) -> InitiationColumns<'_> {
             browser_flow_hash: Some(hash.as_bytes().as_slice()),
             ..InitiationColumns::default()
         },
-        LoginInitiation::Cli(handoff_id) => InitiationColumns {
-            cli_handoff_id: Some(*handoff_id),
+        LoginInitiation::Device(device_id) => InitiationColumns {
+            device_id: Some(*device_id),
             ..InitiationColumns::default()
         },
         LoginInitiation::ConnectionTest(tester) => InitiationColumns {
@@ -134,17 +134,17 @@ fn initiation_columns(initiation: &LoginInitiation) -> InitiationColumns<'_> {
 /// principal kind label.
 fn initiation_from_columns(
     flow_hash: Option<Vec<u8>>,
-    handoff_id: Option<Uuid>,
+    device_id: Option<Uuid>,
     tester_id: Option<Uuid>,
     tester_kind: Option<String>,
 ) -> Result<LoginInitiation, sqlx::Error> {
     let corrupt = || sqlx::Error::Decode("login state binding is corrupt".into());
-    match (flow_hash, handoff_id, tester_id, tester_kind) {
+    match (flow_hash, device_id, tester_id, tester_kind) {
         (Some(hash), None, None, None) => {
             let bytes: [u8; 32] = hash.try_into().map_err(|_| corrupt())?;
             Ok(LoginInitiation::Browser(Sha256Hex::from(bytes)))
         }
-        (None, Some(handoff_id), None, None) => Ok(LoginInitiation::Cli(handoff_id)),
+        (None, Some(device_id), None, None) => Ok(LoginInitiation::Device(device_id)),
         (None, None, Some(principal_id), Some(kind)) => {
             let principal_kind =
                 serde_json::from_value::<PrincipalKindTag>(kind.into()).map_err(|_| corrupt())?;
@@ -208,8 +208,8 @@ struct ConsumedRow {
     nonce: String,
     /// Browser flow hash, for a browser login.
     browser_flow_hash: Option<Vec<u8>>,
-    /// CLI handoff id, for a CLI login.
-    cli_handoff_id: Option<Uuid>,
+    /// Device authorization id, for a device-code login.
+    device_id: Option<Uuid>,
     /// Test principal id, for a candidate connection test.
     tester_principal_id: Option<Uuid>,
     /// Test principal kind label, for a candidate connection test.
@@ -249,7 +249,7 @@ pub async fn insert_login_state(
         .bind(row.code_verifier.expose_secret())
         .bind(&row.nonce)
         .bind(columns.browser_flow_hash)
-        .bind(columns.cli_handoff_id)
+        .bind(columns.device_id)
         .bind(columns.tester_principal_id)
         .bind(columns.tester_principal_kind)
         .bind(ttl.as_secs_f64())
@@ -279,7 +279,7 @@ pub async fn consume_login_state(
         Ok(LoginState {
             initiation: initiation_from_columns(
                 row.browser_flow_hash,
-                row.cli_handoff_id,
+                row.device_id,
                 row.tester_principal_id,
                 row.tester_principal_kind,
             )?,
@@ -334,7 +334,7 @@ pub async fn redeem_login_completion(
     let columns = initiation_columns(initiation);
     sqlx::query_as::<_, RedeemedLogin>(REDEEM_LOGIN_COMPLETION_SQL)
         .bind(columns.browser_flow_hash)
-        .bind(columns.cli_handoff_id)
+        .bind(columns.device_id)
         .fetch_optional(&mut **conn.transaction())
         .await
 }
@@ -354,13 +354,13 @@ mod tests {
     fn round_trip(initiation: &LoginInitiation) -> Result<LoginInitiation, sqlx::Error> {
         let InitiationColumns {
             browser_flow_hash,
-            cli_handoff_id,
+            device_id,
             tester_principal_id,
             tester_principal_kind,
         } = initiation_columns(initiation);
         initiation_from_columns(
             browser_flow_hash.map(<[u8]>::to_vec),
-            cli_handoff_id,
+            device_id,
             tester_principal_id,
             tester_principal_kind.map(str::to_owned),
         )
@@ -377,7 +377,7 @@ mod tests {
         });
         for initiation in [
             LoginInitiation::Browser(Sha256Hex::digest(b"flow")),
-            LoginInitiation::Cli(Uuid::now_v7()),
+            LoginInitiation::Device(Uuid::now_v7()),
             tester,
         ] {
             assert_eq!(

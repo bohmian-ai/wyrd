@@ -40,7 +40,7 @@ pub struct AuthHandles {
     pub issuing_key: Arc<IssuingKey>,
     /// Verifies Wyrd tenant access tokens on every request, locally.
     pub token_verifier: Arc<TokenVerifier>,
-    /// Verifies foreign OIDC ID tokens and workload assertions at issuance.
+    /// Verifies workload assertions at RFC 7523 `jwt-bearer` issuance.
     pub external_verifier: Arc<ExternalVerifier<PgIssuerResolver>>,
 }
 
@@ -52,8 +52,8 @@ pub struct AuthHandles {
 /// key is sufficient. The request verifier holds only that key, the issuer,
 /// the `wyrd` audience, and clock skew; it reads no database. The external
 /// verifier resolves the requesting tenant's trusted issuers from Postgres
-/// through the supplied [`PgIssuerResolver`] and is used only where a foreign
-/// token is exchanged for a Wyrd one.
+/// through the supplied [`PgIssuerResolver`] and is used only where a workload
+/// assertion is exchanged for a Wyrd one.
 ///
 /// `http` is the deployment's outbound address screening. The JWKS cache is
 /// built with it rather than a bare client, so a refresh long after the issuer

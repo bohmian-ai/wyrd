@@ -1376,7 +1376,7 @@ dependencies = [
  "async-trait",
  "azure_core",
  "futures",
- "oauth2",
+ "oauth2 4.4.2",
  "pin-project",
  "serde",
  "time",
@@ -1464,6 +1464,12 @@ name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
+
+[[package]]
+name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
 name = "base64"
@@ -3586,6 +3592,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "hkdf 0.12.4",
  "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
@@ -4672,7 +4679,7 @@ dependencies = [
  "moka",
  "murmur3",
  "once_cell",
- "ordered-float",
+ "ordered-float 4.6.0",
  "parquet",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -5975,6 +5982,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "oauth2"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "getrandom 0.2.17",
+ "http 1.4.2",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6306,6 +6332,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "openidconnect"
+version = "4.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c6709ba2ea764bbed26bce1adf3c10517113ddea6f2d4196e4851757ef2b2"
+dependencies = [
+ "base64 0.21.7",
+ "chrono",
+ "dyn-clone",
+ "ed25519-dalek",
+ "hmac 0.12.1",
+ "http 1.4.2",
+ "itertools 0.10.5",
+ "log",
+ "oauth2 5.0.0",
+ "p256",
+ "p384",
+ "rand 0.8.7",
+ "rsa",
+ "serde",
+ "serde-value",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_plain",
+ "serde_with",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 1.0.69",
+ "url",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.81"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6447,6 +6504,15 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "ordered-float"
+version = "2.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
@@ -6475,6 +6541,18 @@ name = "p256"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
+dependencies = [
+ "ecdsa",
+ "elliptic-curve",
+ "primeorder",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "p384"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe42f1670a52a47d448f14b6a5c61dd78fce51856e68edaa38f7ae3a46b8d6b6"
 dependencies = [
  "ecdsa",
  "elliptic-curve",
@@ -8304,6 +8382,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-value"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
+dependencies = [
+ "ordered-float 2.10.1",
+ "serde",
+]
+
+[[package]]
 name = "serde_bytes"
 version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8378,6 +8466,15 @@ dependencies = [
  "itoa",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "serde_plain"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce1fc6db65a611022b23a0dec6975d63fb80a302cb3388835ff02c097258d50"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -10976,11 +11073,14 @@ dependencies = [
  "console",
  "crossbeam-epoch",
  "crossbeam-utils",
+ "crypto-bigint",
  "crypto-common 0.1.7",
  "deranged",
  "digest 0.10.7",
  "digest 0.11.3",
+ "ed25519-dalek",
  "either",
+ "elliptic-curve",
  "errno",
  "flate2",
  "foldhash 0.2.0",
@@ -11051,6 +11151,7 @@ dependencies = [
  "reqwest 0.13.4",
  "ring",
  "rmcp",
+ "rsa",
  "rustix",
  "rustls",
  "rustls-webpki",
@@ -11063,7 +11164,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sha2 0.11.0",
- "signature",
  "slab",
  "smallvec",
  "sqlx-core 0.9.0",
@@ -11079,6 +11179,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tokio-util",
+ "toml_edit",
  "tonic",
  "tower",
  "tower-http",
@@ -11135,7 +11236,6 @@ dependencies = [
  "chrono",
  "jsonwebtoken 9.3.1",
  "rand 0.9.5",
- "reqwest 0.13.4",
  "secrecy",
  "serde",
  "serde_json",
@@ -11187,9 +11287,11 @@ dependencies = [
 name = "wyrd-auth-oidc"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "flate2",
  "jsonwebtoken 9.3.1",
  "moka",
+ "openidconnect",
  "reqwest 0.13.4",
  "secrecy",
  "serde",
@@ -11331,6 +11433,7 @@ dependencies = [
  "indicatif",
  "opentelemetry",
  "reqwest 0.13.4",
+ "rustix",
  "schemars 0.8.22",
  "secrecy",
  "serde",
@@ -11347,6 +11450,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-opentelemetry",
  "urlencoding",

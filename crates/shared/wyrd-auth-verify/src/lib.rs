@@ -145,12 +145,11 @@ impl Default for WyrdAuthVerifySettings {
     }
 }
 
-/// A federated identity verified against one trusted issuer.
+/// A workload assertion verified against one trusted issuer.
 ///
 /// Deliberately tenant-free: it states what the issuer asserted, not where the
-/// identity belongs. [`VerifiedExternalIdentity`] is this plus the tenant the
-/// issuer was resolved under; the platform control plane uses this form
-/// directly because a platform principal has no tenant.
+/// identity belongs. [`ExternalVerifier::verify_external`] adds the tenant the
+/// issuer was resolved under to form a [`VerifiedExternalIdentity`].
 #[derive(Debug, Clone)]
 pub struct ExternalClaims {
     /// The trusted issuer that signed the token.
@@ -169,12 +168,12 @@ pub struct ExternalClaims {
     pub raw_claims: JsonValue,
 }
 
-/// Verified identity from an external OIDC issuer.
+/// Verified workload identity from a tenant's trusted external issuer.
 ///
-/// This is NOT a [`wyrd_runtime::Principal`] (R03). The server flow (commit 06
-/// for human users, commit 07 for workloads) owns constructing the `Principal`
-/// by upsert/lookup and RBAC resolution. The verifier is SQL-free and cannot
-/// perform those operations here.
+/// This is NOT a [`wyrd_runtime::Principal`]. The RFC 7523 `jwt-bearer`
+/// exchange owns resolving the workload binding and constructing the
+/// `Principal`; the verifier is SQL-free and cannot perform those operations
+/// here.
 #[derive(Debug)]
 pub struct VerifiedExternalIdentity {
     /// The trusted issuer that signed the token.
@@ -370,9 +369,10 @@ impl TokenVerifier {
 
 /// Issuance-side verifier for tokens minted by a trusted external OIDC issuer.
 ///
-/// Used by OIDC login, workload `jwt-bearer`, and platform federated login to
-/// validate the external assertion before a Wyrd token is issued. It never
-/// verifies a Wyrd access token. Generic over the issuer resolver `I`
+/// Used only by the workload RFC 7523 `jwt-bearer` exchange to validate the
+/// external assertion before a Wyrd token is issued. Human ID tokens are
+/// verified by the OpenID Connect relying party in `wyrd-auth-oidc`, and this
+/// never verifies a Wyrd access token. Generic over the issuer resolver `I`
 /// (an RPITIT trait, not dyn-compatible), so trust lookups happen per call
 /// against the live config store.
 pub struct ExternalVerifier<I> {
@@ -489,13 +489,8 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
     /// point that resolves the issuer from a tenant's configuration and then
     /// delegates here.
     ///
-    /// It exists because not every federated identity belongs to a tenant. The
-    /// platform control plane resolves its one deployment-owned connection from
-    /// the platform store, which has no tenant to key a resolver by, and must
-    /// not grow a parallel verification path to compensate. Taking the resolved
-    /// issuer as an argument keeps one implementation for both planes; the
-    /// caller owns *which* issuer is trusted, this owns *whether* the token is
-    /// valid under it.
+    /// The caller owns *which* issuer is trusted; this owns *whether* the
+    /// token is valid under it.
     ///
     /// # Errors
     /// - [`AuthError::BadTokenFormat`] — the token is oversized or not a JWT.
@@ -567,45 +562,6 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
             expected_audience: trusted.expected_audience.clone(),
             raw_claims,
         })
-    }
-
-    /// Verify an OIDC ID token against an issuer the caller already resolved.
-    ///
-    /// ID-token semantics layered once over [`Self::verify_external_against`]:
-    /// after that generic verification succeeds, the subject must be an OpenID
-    /// Connect Subject Identifier (nonempty ASCII, at most 255 bytes) and the
-    /// token must also carry a numeric `iat` no later than now plus the allowed
-    /// clock skew. Tenant
-    /// callback and platform login route through here; workload assertions
-    /// stay on the generic entry because they are not ID tokens and carry no
-    /// `iat` contract.
-    ///
-    /// # Errors
-    /// Every error of [`Self::verify_external_against`], plus
-    /// [`AuthError::InvalidToken`] when the subject is empty, non-ASCII, or
-    /// longer than 255 bytes, or when `iat` is missing, not a non-negative
-    /// integer, or later than now plus the allowed clock skew.
-    pub async fn verify_id_token_against(
-        &self,
-        trusted: &IssuerVerification,
-        token: &str,
-    ) -> Result<ExternalClaims, AuthError> {
-        let claims = self.verify_external_against(trusted, token).await?;
-        let subject = claims.subject.as_str();
-        if subject.is_empty() || !subject.is_ascii() || subject.len() > 255 {
-            return Err(AuthError::InvalidToken);
-        }
-        let issued_at = claims
-            .raw_claims
-            .get("iat")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or(AuthError::InvalidToken)?;
-        let latest = jsonwebtoken::get_current_timestamp()
-            .saturating_add(self.settings.allowed_clock_skew.as_secs());
-        if issued_at > latest {
-            return Err(AuthError::InvalidToken);
-        }
-        Ok(claims)
     }
 }
 
@@ -2698,12 +2654,10 @@ mod tests {
             .expect("new kid should resolve after one JWKS refetch");
     }
 
-    /// ID-token verification refuses a signed token that omits or misstates a
-    /// binding, time, or Subject Identifier claim, while a valid ID token passes and a workload
-    /// assertion without `iat` stays valid on the generic entry. The shared
-    /// workload entry still refuses a missing `iss` or `aud` or a future `nbf`.
+    /// A workload assertion needs no `iat`, while the shared workload entry
+    /// still refuses a missing `iss` or `aud` (RFC 7523 §3) or a future `nbf`.
     #[tokio::test]
-    async fn oidc_id_token_requires_binding_and_time_claims() {
+    async fn workload_assertion_requires_binding_claims() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/jwks"))
@@ -2716,7 +2670,6 @@ mod tests {
         let issuer = IssuerUrl::new(EXTERNAL_ISSUER).expect("test issuer is valid");
         let tid = tenant_id();
         let trusted = make_trusted_issuer(tid, issuer, EXTERNAL_AUDIENCE, jwks_uri);
-        let verification = trusted.verification();
         let v = with_external_issuer(trusted, make_jwks_cache());
         let valid = external_claims(EXTERNAL_ISSUER, EXTERNAL_AUDIENCE, now() + 3_600, now());
         // Re-signs the valid claims with `key` set to `value`, or removed.
@@ -2730,34 +2683,6 @@ mod tests {
             encode_external_token(&claims, EXTERNAL_KID)
         };
         let future = Some((now() + 3_000).into());
-
-        let refused = [
-            ("missing iss", variant("iss", None)),
-            ("missing aud", variant("aud", None)),
-            ("missing iat", variant("iat", None)),
-            ("string iat", variant("iat", Some("now".into()))),
-            ("future iat", variant("iat", future.clone())),
-            ("future nbf", variant("nbf", future.clone())),
-            ("missing sub", variant("sub", None)),
-            ("numeric sub", variant("sub", Some(7.into()))),
-            ("empty sub", variant("sub", Some("".into()))),
-            ("non-ASCII sub", variant("sub", Some("usér".into()))),
-            ("256-byte sub", variant("sub", Some("a".repeat(256).into()))),
-        ];
-        for (case, token) in &refused {
-            let result = v.verify_id_token_against(&verification, token).await;
-            assert!(result.is_err(), "{case} must be refused: {result:?}");
-        }
-
-        v.verify_id_token_against(&verification, &encode_external_token(&valid, EXTERNAL_KID))
-            .await
-            .expect("a correctly bound ID token passes");
-        v.verify_id_token_against(&verification, &variant("nbf", Some(now().into())))
-            .await
-            .expect("a past nbf passes");
-        v.verify_id_token_against(&verification, &variant("sub", Some("a".repeat(255).into())))
-            .await
-            .expect("a 255-byte ASCII subject passes");
 
         v.verify_external(&tid, &variant("iat", None))
             .await

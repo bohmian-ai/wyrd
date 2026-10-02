@@ -7,32 +7,28 @@
 //! only in the returned authorization URL. The common callback
 //! ([`crate::callback::AuthorizationCodeExchange`]) consumes that row, issues
 //! the session, and stores it sealed against the login's initiation binding;
-//! [`HumanConnections::redeem_completion`] hands it once to the BFF or CLI
-//! holding that binding. No request header ever selects a tenant, connection, or redirect.
-//! A candidate connection test
+//! [`HumanConnections::redeem_completion`] hands it once to the BFF holding
+//! that binding; a device-code login is redeemed by its token poll
+//! ([`crate::cli_logins::CliLogins::redeem`]). No request header ever selects
+//! a tenant, connection, or redirect. A candidate connection test
 //! ([`HumanConnections::begin_test`]) writes the same login state, bound to its
-//! tester instead of a browser flow or CLI handoff, and has no completion.
+//! tester instead of a browser flow or device authorization, and has no
+//! completion.
 
 use std::time::Duration;
 
-use base64::Engine;
-use rand::RngCore;
-use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
-use sha2::{Digest, Sha256};
-use url::Url;
-use wyrd_auth_oidc::{OidcProvider, ScreenedHttp};
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     AbsoluteUrl, BeginLogin, BeginLoginResponse, LoginInitiation, Sha256Hex, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::TenantSlug;
 use wyrd_sql::queries::auth::{LoginState, insert_login_state, redeem_login_completion};
 
-use crate::callback::discover_provider;
 use crate::connections::HumanConnections;
-use crate::error::{screen_error, store_error};
+use crate::error::{relying_party_error, store_error};
 
 /// Path of the fixed same-origin BFF route a completed browser login is
 /// redirected to: `{public_origin}/login/complete`, with no query string.
@@ -46,51 +42,66 @@ pub const LOGIN_COMPLETE_PATH: &str = "/login/complete";
 /// gone. A candidate test sign-in's state shares it.
 pub(crate) const LOGIN_STATE_TTL: Duration = Duration::from_mins(5);
 
-/// Redemption window of a completed login: the BFF or CLI must redeem the
+/// Redemption window of a completed login: the BFF or device poll must redeem the
 /// sealed session within this window after the callback issues it.
 pub(crate) const LOGIN_COMPLETION_TTL: Duration = Duration::from_mins(2);
 
 impl HumanConnections {
-    /// Begin a tenant human SSO login and return the provider authorization
-    /// URL.
-    ///
-    /// Everything that can refuse without the network runs first, before any
-    /// provider IO or state write: exactly one initiation binding
-    /// ([`BeginLogin::initiation`]), a configured public origin, a deployment
-    /// sealing keyring (completed logins are sealed at rest, so a keyless
-    /// deployment cannot offer human SSO), and a known CLI handoff
-    /// ([`known_initiation`]). The route key then resolves the tenant, and
-    /// the tenant must have an Active connection; an unknown tenant and a
-    /// tenant without one fail with the same generic refusal, so the endpoint
-    /// cannot enumerate tenants or their login configuration.
-    ///
-    /// Discovery runs through this owner's screened HTTP capability and the
-    /// discovered authorization endpoint is screened by scheme. The redirect
-    /// URI is always the deployment's configured callback. The state row binds
-    /// the exact connection revision, issuer, and client id, the PKCE verifier,
-    /// the nonce, and the initiation binding; only the SHA-256 of the random
-    /// state is stored, and the raw state is returned only inside the URL.
+    /// Begin a tenant human SSO login for the BFF's browser flow and return
+    /// the provider authorization URL.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when both or neither binding is
-    /// present, no public origin is configured, or no sealing keyring is
-    /// configured; [`WyrdError::InvalidState`] for a CLI handoff this server
-    /// does not know or a flow binding already recorded for another login;
-    /// [`WyrdError::InvalidToken`] when the route key names no active tenant
-    /// or the tenant has no Active connection;
-    /// [`WyrdError::DiscoveryUnavailable`] when the issuer is refused by
-    /// screening, discovery fails, or the authorization endpoint's scheme is
-    /// refused; and [`WyrdError::AuthVerifyUnavailable`] when a store read or
-    /// the state write fails. No URL is returned unless its state row is
-    /// durable; cancellation before the commit persists nothing.
+    /// Returns the refusals of [`Self::begin_bound`].
     pub async fn begin_login(&self, request: &BeginLogin) -> Result<BeginLoginResponse, WyrdError> {
-        let initiation = request.initiation()?;
+        self.begin_bound(
+            &request.tenant_route_key,
+            LoginInitiation::Browser(request.browser_flow_hash),
+        )
+        .await
+    }
+
+    /// Begin a tenant human SSO login bound to `initiation` and return the
+    /// provider authorization URL.
+    ///
+    /// Everything that can refuse without the network runs first, before any
+    /// provider IO or state write: a configured public origin and a deployment
+    /// sealing keyring (completed logins are sealed at rest, so a keyless
+    /// deployment cannot offer human SSO). The route key then resolves the
+    /// tenant, and the tenant must have an Active connection; an unknown
+    /// tenant and a tenant without one fail with the same generic refusal, so
+    /// the endpoint cannot enumerate tenants or their login configuration.
+    ///
+    /// The provider comes from the relying party's per-issuer cache, which
+    /// discovers through the screened HTTP capability on a miss, and the
+    /// relying party screens the authorization endpoint by scheme and
+    /// generates the state, nonce, and PKCE verifier. The redirect URI is
+    /// always the deployment's configured callback. The state row binds the
+    /// exact connection revision, issuer, and client id, the PKCE verifier,
+    /// the nonce, and the initiation binding; only the SHA-256 of the state is
+    /// stored, and the raw state is returned only inside the URL. The
+    /// unique binding index lets a browser flow or device authorization name
+    /// at most one login.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when no public origin or no sealing
+    /// keyring is configured; [`WyrdError::InvalidState`] for a binding
+    /// already recorded for another login; [`WyrdError::InvalidToken`] when
+    /// the route key names no active tenant or the tenant has no Active
+    /// connection; [`WyrdError::DiscoveryUnavailable`] when the issuer is
+    /// refused by screening, discovery fails, or the authorization endpoint's
+    /// scheme is refused; and [`WyrdError::AuthVerifyUnavailable`] when a
+    /// store read or the state write fails. No URL is returned unless its
+    /// state row is durable; cancellation before the commit persists nothing.
+    pub(crate) async fn begin_bound(
+        &self,
+        tenant_route_key: &TenantSlug,
+        initiation: LoginInitiation,
+    ) -> Result<BeginLoginResponse, WyrdError> {
         let redirect_uri = self.require_callback()?.clone();
         self.require_keyring()?;
-        let initiation = known_initiation(initiation)?;
         let tenant = self
             .postgres()
-            .resolve_tenant_slug(&request.tenant_route_key)
+            .resolve_tenant_slug(tenant_route_key)
             .await
             .map_err(store_error)?
             .ok_or_else(login_unavailable)?;
@@ -99,28 +110,24 @@ impl HumanConnections {
             .await?
             .ok_or_else(login_unavailable)?;
         let trusted = &active.trusted;
-        let provider = discover_provider(&trusted.issuer, self.http()).await?;
-        let authorization_endpoint = browser_authorization_endpoint(provider, self.http())?;
-        let state_key = auth_state_key();
-        let code_verifier = pkce_verifier();
-        let nonce = auth_nonce();
-        let authorization_url = build_authorization_url(
-            &authorization_endpoint,
-            &trusted.client_id,
-            redirect_uri.as_str(),
-            &state_key,
-            code_verifier.expose_secret(),
-            &nonce,
-        );
-        let authorization_url = AbsoluteUrl::new(authorization_url.as_str().to_owned())
+        let provider = self
+            .relying_party()
+            .cached(&trusted.issuer)
+            .await
+            .map_err(relying_party_error)?;
+        let authorization = self
+            .relying_party()
+            .authorize(&provider, &trusted.client_id, redirect_uri.as_str())
+            .map_err(relying_party_error)?;
+        let authorization_url = AbsoluteUrl::new(authorization.url.as_str().to_owned())
             .map_err(|_| invalid_token("authorization URL is invalid"))?;
         let row = LoginState {
             connection: active.binding,
             issuer: trusted.issuer.to_string(),
             client_id: trusted.client_id.clone(),
             redirect_uri: redirect_uri.to_string(),
-            code_verifier,
-            nonce,
+            code_verifier: authorization.code_verifier,
+            nonce: authorization.nonce,
             initiation,
         };
         let mut conn = self
@@ -128,7 +135,7 @@ impl HumanConnections {
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
-        let state_hash = Sha256Hex::digest(state_key.as_bytes());
+        let state_hash = Sha256Hex::digest(authorization.state.as_bytes());
         if !insert_login_state(&mut conn, &state_hash, &row, LOGIN_STATE_TTL)
             .await
             .map_err(store_error)?
@@ -148,9 +155,9 @@ impl HumanConnections {
     ///
     /// The callback stores each issued session sealed under the deployment
     /// keyring against the login's initiation binding. The BFF redeems a
-    /// browser login with the flow id hash from its `HttpOnly` cookie, and the
-    /// CLI redeems its handoff; this is the primitive the BFF completion route
-    /// and the CLI handoff claim wrap, and it has no HTTP route of its own.
+    /// browser login with the flow id hash from its `HttpOnly` cookie; this is
+    /// the primitive the BFF completion route wraps, and it has no HTTP route
+    /// of its own.
     ///
     /// One tenant transaction deletes the completed, unexpired row recorded
     /// for exactly this binding and returns its sealed session, which is then
@@ -207,35 +214,9 @@ pub(crate) fn seal_completion(
     keyring.seal(&plaintext).map_err(|_| completion_unusable())
 }
 
-/// Admit a begin request's initiation binding for storage.
-///
-/// This is the one place a CLI handoff is checked. CLI handoffs are issued by
-/// a server-owned handoff table that does not exist yet, so every handoff id
-/// is unknown and refused here — before any provider IO or state write. The
-/// handoff owner replaces the `Cli` arm with a lookup of its row, leaving the
-/// browser path and the rest of login unchanged.
-///
-/// # Errors
-/// Returns [`WyrdError::InvalidState`] with reason `unknown_cli_handoff` for
-/// every CLI handoff id, and with reason `connection_test` for a connection
-/// test binding, which only [`HumanConnections::begin_test`] writes.
-pub(crate) fn known_initiation(initiation: LoginInitiation) -> Result<LoginInitiation, WyrdError> {
-    match initiation {
-        LoginInitiation::Browser(_) => Ok(initiation),
-        LoginInitiation::ConnectionTest(_) => Err(WyrdError::InvalidState {
-            message: "a connection test is begun through the candidate test route".to_owned(),
-            details: json!({ "reason": "connection_test" }),
-        }),
-        LoginInitiation::Cli(_) => Err(WyrdError::InvalidState {
-            message: "the CLI login handoff is unknown or expired; start a new login".to_owned(),
-            details: json!({ "reason": "unknown_cli_handoff" }),
-        }),
-    }
-}
-
 /// The one refusal for a route key that names no active tenant or a tenant
 /// with no Active connection, so neither can be told apart.
-fn login_unavailable() -> WyrdError {
+pub(crate) fn login_unavailable() -> WyrdError {
     WyrdError::InvalidToken {
         message: "SSO login is not available for this tenant".to_owned(),
         details: json!({}),
@@ -248,82 +229,6 @@ fn completion_unusable() -> WyrdError {
         message: "the login completion could not be processed; start a new login".to_owned(),
         details: json!({}),
     }
-}
-
-/// Take the discovered authorization endpoint only if `http`'s policy permits
-/// sending a browser there.
-///
-/// Discovery is fresh on every login, so a provider can change this endpoint
-/// after its connection was tested. The deployment's scheme rule is reapplied
-/// before any login state exists: production refuses cleartext, so state,
-/// nonce, and PKCE challenge never travel over `http`, while a permissive
-/// deployment keeps its local `http` providers.
-///
-/// # Errors
-/// Returns [`WyrdError::DiscoveryUnavailable`] — the redacted screening
-/// refusal — when the policy refuses the endpoint's scheme.
-pub(crate) fn browser_authorization_endpoint(
-    provider: OidcProvider,
-    http: ScreenedHttp,
-) -> Result<Url, WyrdError> {
-    let endpoint = provider.metadata.authorization_endpoint;
-    http.screen_scheme(&endpoint)
-        .map_err(|error| screen_error(&error))?;
-    Ok(endpoint)
-}
-
-/// Generate an unguessable login-state key.
-pub(crate) fn auth_state_key() -> String {
-    random_b64url(32)
-}
-
-/// Generate the nonce the returned ID token must echo.
-pub(crate) fn auth_nonce() -> String {
-    random_b64url(32)
-}
-
-/// Generate a PKCE code verifier.
-pub(crate) fn pkce_verifier() -> SecretString {
-    SecretString::from(random_b64url(48))
-}
-
-fn pkce_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn random_b64url(bytes: usize) -> String {
-    let mut buf = vec![0_u8; bytes];
-    rand::rng().fill_bytes(&mut buf);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
-}
-
-/// Build the provider authorization URL for one login attempt.
-///
-/// Takes the client identifier rather than a whole trusted issuer because the
-/// platform control plane's connection is not a tenant's issuer, and the URL
-/// depends on nothing else about the issuer's trust configuration.
-pub(crate) fn build_authorization_url(
-    authorization_endpoint: &Url,
-    client_id: &str,
-    redirect_uri: &str,
-    state: &str,
-    code_verifier: &str,
-    nonce: &str,
-) -> Url {
-    let mut url = authorization_endpoint.clone();
-    let challenge = pkce_challenge(code_verifier);
-    let mut query = url.query_pairs_mut();
-    query.append_pair("response_type", "code");
-    query.append_pair("client_id", client_id);
-    query.append_pair("redirect_uri", redirect_uri);
-    query.append_pair("scope", "openid profile email");
-    query.append_pair("code_challenge", &challenge);
-    query.append_pair("code_challenge_method", "S256");
-    query.append_pair("state", state);
-    query.append_pair("nonce", nonce);
-    drop(query);
-    url
 }
 
 fn invalid_token(message: &str) -> WyrdError {
@@ -377,15 +282,14 @@ mod pg_tests {
         )
     }
 
-    /// A begin request for `slug` with the given bindings.
+    /// A begin request for `slug` bound to the browser flow `flow`.
     ///
     /// # Panics
     /// Panics when `slug` is not a valid tenant slug.
-    fn begin(slug: &str, flow: Option<&[u8]>, handoff: Option<Uuid>) -> BeginLogin {
+    fn begin(slug: &str, flow: &[u8]) -> BeginLogin {
         BeginLogin {
             tenant_route_key: TenantSlug::new(slug).expect("slug is valid"),
-            browser_flow_hash: flow.map(Sha256Hex::digest),
-            cli_handoff_id: handoff,
+            browser_flow_hash: Sha256Hex::digest(flow),
         }
     }
 
@@ -425,39 +329,12 @@ mod pg_tests {
     async fn begin_without_a_sealing_key_is_refused_before_any_state() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let error = connections(&fixture, None)
-            .begin_login(&begin(fixture.tenant_slug(), Some(b"flow"), None))
+            .begin_login(&begin(fixture.tenant_slug(), b"flow"))
             .await
             .expect_err("a keyless deployment refuses login");
 
         assert!(matches!(error, WyrdError::Validation { .. }));
         assert_eq!(reason(&error).as_deref(), Some("sealing_key_missing"));
-        assert_eq!(state_rows(&fixture).await, 0);
-    }
-
-    /// Both bindings, neither binding, and an unknown CLI handoff are refused
-    /// before any tenant resolution, provider IO, or state write.
-    ///
-    /// # Panics
-    /// Panics when any of them is accepted or refused differently.
-    #[tokio::test]
-    async fn begin_refuses_ambiguous_bindings_and_unknown_handoffs() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let owner = connections(&fixture, Some(keyring()));
-        let slug = fixture.tenant_slug();
-
-        for request in [
-            begin(slug, Some(b"flow"), Some(Uuid::now_v7())),
-            begin(slug, None, None),
-        ] {
-            let error = owner.begin_login(&request).await.expect_err("refused");
-            assert!(matches!(error, WyrdError::Validation { .. }), "{error:?}");
-        }
-        let error = owner
-            .begin_login(&begin(slug, None, Some(Uuid::now_v7())))
-            .await
-            .expect_err("an unknown handoff is refused");
-        assert!(matches!(error, WyrdError::InvalidState { .. }));
-        assert_eq!(reason(&error).as_deref(), Some("unknown_cli_handoff"));
         assert_eq!(state_rows(&fixture).await, 0);
     }
 
@@ -472,11 +349,11 @@ mod pg_tests {
         let owner = connections(&fixture, Some(keyring()));
 
         let unknown = owner
-            .begin_login(&begin("no-such-tenant", Some(b"flow-a"), None))
+            .begin_login(&begin("no-such-tenant", b"flow-a"))
             .await
             .expect_err("unknown tenant refuses");
         let unconfigured = owner
-            .begin_login(&begin(fixture.tenant_slug(), Some(b"flow-b"), None))
+            .begin_login(&begin(fixture.tenant_slug(), b"flow-b"))
             .await
             .expect_err("tenant without a connection refuses");
 
@@ -673,84 +550,5 @@ mod pg_tests {
             .await
             .expect_err("an unusable completion was still consumed");
         assert!(matches!(error, WyrdError::InvalidState { .. }), "{error:?}");
-    }
-}
-
-/// The browser destination a login returns is screened by scheme after fresh
-/// discovery, independent of the address rules server fetches use.
-#[cfg(test)]
-mod destination_tests {
-    use serde_json::json;
-    use url::Url;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wyrd_auth_oidc::{AddressPolicy, OidcProvider, ScreenedHttp};
-    use wyrd_spec::error::WyrdError;
-
-    use super::browser_authorization_endpoint;
-
-    /// Discover a loopback provider whose authorization endpoint is cleartext
-    /// `http`, as a provider could republish after its connection was tested.
-    ///
-    /// # Panics
-    /// Panics when the mock provider cannot be discovered.
-    async fn cleartext_provider() -> (MockServer, OidcProvider) {
-        let server = MockServer::start().await;
-        let issuer = server.uri();
-        Mock::given(method("GET"))
-            .and(path("/.well-known/openid-configuration"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "issuer": issuer,
-                "authorization_endpoint": format!("{issuer}/authorize"),
-                "token_endpoint": format!("{issuer}/token"),
-                "jwks_uri": format!("{issuer}/jwks"),
-                "id_token_signing_alg_values_supported": ["RS256"],
-            })))
-            .mount(&server)
-            .await;
-        let issuer_url = Url::parse(&issuer).expect("mock issuer parses");
-        let client = ScreenedHttp::allowing_internal()
-            .client_for(&issuer_url)
-            .await
-            .expect("screened client");
-        let provider = OidcProvider::discover(issuer_url, client)
-            .await
-            .expect("mock provider is discovered");
-        (server, provider)
-    }
-
-    /// Production refuses a discovered cleartext authorization endpoint with
-    /// the redacted discovery refusal, so no login state is written for it.
-    ///
-    /// # Panics
-    /// Panics when the endpoint is accepted or refused with another error.
-    #[tokio::test]
-    async fn production_refuses_a_discovered_cleartext_authorization_endpoint() {
-        let (_server, provider) = cleartext_provider().await;
-
-        let error = browser_authorization_endpoint(
-            provider,
-            ScreenedHttp::new(AddressPolicy::BlockInternal),
-        )
-        .expect_err("a cleartext browser destination is refused");
-
-        assert!(
-            matches!(error, WyrdError::DiscoveryUnavailable { .. }),
-            "{error:?}"
-        );
-    }
-
-    /// A permissive deployment keeps its local `http` provider's endpoint.
-    ///
-    /// # Panics
-    /// Panics when the local endpoint is refused.
-    #[tokio::test]
-    async fn a_permissive_deployment_keeps_a_local_http_authorization_endpoint() {
-        let (server, provider) = cleartext_provider().await;
-
-        let endpoint = browser_authorization_endpoint(provider, ScreenedHttp::allowing_internal())
-            .expect("a local provider endpoint is kept");
-
-        assert_eq!(endpoint.as_str(), format!("{}/authorize", server.uri()));
     }
 }

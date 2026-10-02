@@ -13,7 +13,6 @@ use utoipa::openapi::schema::{ObjectBuilder, Schema as OpenApiSchema, Type};
 use uuid::Uuid;
 
 use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer};
-use crate::error::WyrdError;
 use crate::ids::TenantSlug;
 
 /// Absolute URL used by auth contracts.
@@ -338,10 +337,8 @@ pub struct Sha256HexError;
 /// `POST /auth/login` request: begin a tenant human SSO login.
 ///
 /// The route key is pre-login routing context only; it never becomes tenant
-/// authority. Exactly one initiation binding is required: a browser login
-/// through the BFF sends the SHA-256 of its random flow id, and a CLI login
-/// sends its server-issued handoff id. The completed session is later redeemed
-/// only by that binding.
+/// authority. The BFF sends the SHA-256 of its random browser flow id, and the
+/// completed session is later redeemed only by that binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -349,11 +346,7 @@ pub struct BeginLogin {
     /// The tenant's route key (its slug), as in `/t/{tenantKey}/login`.
     pub tenant_route_key: TenantSlug,
     /// SHA-256 of the BFF's random browser flow id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub browser_flow_hash: Option<Sha256Hex>,
-    /// Server-issued CLI login handoff id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cli_handoff_id: Option<Uuid>,
+    pub browser_flow_hash: Sha256Hex,
 }
 
 /// How a tenant human login was initiated: the single binding its completed
@@ -362,8 +355,8 @@ pub struct BeginLogin {
 pub enum LoginInitiation {
     /// A browser login bound to the BFF's flow id hash.
     Browser(Sha256Hex),
-    /// A CLI login bound to its handoff id.
-    Cli(Uuid),
+    /// A device-code login (RFC 8628) bound to its device authorization id.
+    Device(Uuid),
     /// A candidate connection test begun by this principal. Its sign-in marks
     /// the bound candidate revision tested and issues nothing, so it has no
     /// completion to redeem.
@@ -380,25 +373,6 @@ pub struct ConnectionTester {
     pub principal_id: PrincipalId,
     /// That principal's kind, which names where its roles are stored.
     pub principal_kind: PrincipalKindTag,
-}
-
-impl BeginLogin {
-    /// The request's one initiation binding.
-    ///
-    /// # Errors
-    /// Returns [`WyrdError::Validation`] when both or neither of
-    /// `browser_flow_hash` and `cli_handoff_id` are present.
-    pub fn initiation(&self) -> Result<LoginInitiation, WyrdError> {
-        match (self.browser_flow_hash, self.cli_handoff_id) {
-            (Some(hash), None) => Ok(LoginInitiation::Browser(hash)),
-            (None, Some(handoff)) => Ok(LoginInitiation::Cli(handoff)),
-            _ => Err(WyrdError::Validation {
-                message: "exactly one of browser_flow_hash or cli_handoff_id is required"
-                    .to_owned(),
-                details: serde_json::json!({ "reason": "login_binding_required" }),
-            }),
-        }
-    }
 }
 
 /// `POST /auth/login` response.
@@ -535,8 +509,8 @@ fn openapi_url_schema(
 #[cfg(test)]
 mod tests {
     use super::{
-        AbsoluteUrl, BeginLogin, CallbackQuery, IssuerUrl, LoginInitResponse, LoginInitiation,
-        Sha256Hex, UrlParseError,
+        AbsoluteUrl, BeginLogin, CallbackQuery, IssuerUrl, LoginInitResponse, Sha256Hex,
+        UrlParseError,
     };
 
     #[test]
@@ -719,38 +693,18 @@ mod tests {
         );
     }
 
-    /// Exactly one initiation binding is required; both or neither is a
-    /// validation error, and unknown fields are refused.
+    /// The browser flow binding is required and unknown fields are refused.
     #[test]
-    fn begin_login_requires_exactly_one_binding() {
+    fn begin_login_requires_the_browser_binding() {
         let hash = Sha256Hex::digest(b"flow").to_string();
-        let handoff = uuid::Uuid::now_v7();
-        let parse = |value: serde_json::Value| {
-            serde_json::from_value::<BeginLogin>(value).expect("begin login parses")
-        };
-
-        let browser = parse(serde_json::json!({
-            "tenant_route_key": "acme", "browser_flow_hash": hash
-        }));
-        assert!(matches!(
-            browser.initiation(),
-            Ok(LoginInitiation::Browser(_))
-        ));
-        let cli = parse(serde_json::json!({
-            "tenant_route_key": "acme", "cli_handoff_id": handoff
-        }));
-        assert!(matches!(cli.initiation(), Ok(LoginInitiation::Cli(id)) if id == handoff));
-        for ambiguous in [
-            serde_json::json!({ "tenant_route_key": "acme" }),
-            serde_json::json!({
-                "tenant_route_key": "acme", "browser_flow_hash": hash, "cli_handoff_id": handoff
-            }),
-        ] {
-            let error = parse(ambiguous).initiation().expect_err("refused");
-            assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION");
-        }
+        let parse = |value: serde_json::Value| serde_json::from_value::<BeginLogin>(value);
         assert!(
-            serde_json::from_value::<BeginLogin>(serde_json::json!({
+            parse(serde_json::json!({"tenant_route_key": "acme", "browser_flow_hash": hash}))
+                .is_ok()
+        );
+        assert!(parse(serde_json::json!({ "tenant_route_key": "acme" })).is_err());
+        assert!(
+            parse(serde_json::json!({
                 "tenant_route_key": "acme", "browser_flow_hash": hash, "issuer": "x"
             }))
             .is_err()

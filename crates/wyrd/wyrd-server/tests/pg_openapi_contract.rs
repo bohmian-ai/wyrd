@@ -108,7 +108,10 @@ fn catalog_status(code: &str) -> Option<u16> {
 /// Routing and documentation come out of one `utoipa-axum` registration for
 /// every route registered through `routes!`. What is pinned here is that the
 /// composition actually ran: that the nesting prefix reached the operations and
-/// that the surfaces mounted on both planes are present.
+/// that the surfaces mounted on both planes are present. It also pins that
+/// platform connection configuration, which discovers the issuer before
+/// storing it, publishes that discovery's
+/// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` as problem+json.
 #[tokio::test]
 async fn the_served_document_describes_the_composed_surface() {
     let server = WyrdTestServer::start_in_process()
@@ -133,6 +136,9 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/bifrost/tables",
         "/v1/bifrost/tables/{namespace}/{name}",
         "/auth/token",
+        "/auth/device_authorization",
+        "/auth/device",
+        "/auth/revoke",
         "/platform/tenants",
         "/v1/admin/gateway/provider-credentials",
         "/v1/admin/gateway/provider-credentials/{name}",
@@ -156,6 +162,18 @@ async fn the_served_document_describes_the_composed_surface() {
     assert!(
         !paths.contains_key("/mcp"),
         "the MCP endpoint speaks its own protocol and is not an OpenAPI operation"
+    );
+    let configure = &document["paths"]["/platform/oidc/connection"]["put"]["responses"]["503"];
+    assert_eq!(
+        configure["content"][PROBLEM_MEDIA_TYPE]["schema"]["$ref"],
+        "#/components/schemas/WyrdProblem",
+        "platform connection configuration publishes its discovery 503 as problem+json"
+    );
+    assert!(
+        configure["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("WYRD_AUTH_503_DISCOVERY_UNAVAILABLE")),
+        "the 503 names the stable discovery code: {configure}"
     );
 
     server.shutdown().await.expect("server shuts down");

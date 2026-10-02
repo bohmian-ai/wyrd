@@ -576,7 +576,7 @@ export declare class NativeWyrdClient {
    * serialized `TableConfig`; the conflict and ingest-dial failures are
    * returned as catalog metadata.
    */
-  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeBifrostConnection>
+  connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): Promise<NativeBifrostConnection>
 }
 
 /**
@@ -640,7 +640,7 @@ export declare class NativeWyrdState {
    * a second start, a closed state, and credential, dial, and fixed-table
    * failures are returned in [`NativeLifecycleResult`].
    */
-  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeLifecycleResult>
+  startBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Opens one invocation over this state, targeting the root Service Card.
    *
@@ -686,7 +686,7 @@ export declare class NativeWyrdState {
  * serialized `TableConfig`; credential and ingest-dial failures are returned
  * as catalog metadata.
  */
-export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeBifrostConnection>
+export declare function connectBifrost(table?: NativeTableConfig | undefined | null, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): Promise<NativeBifrostConnection>
 
 /**
  * Builds one Card registry handle without performing IO.
@@ -695,7 +695,7 @@ export declare function connectBifrost(table?: NativeTableConfig | undefined | n
  * chain as `connectBifrost`, so both capabilities authenticate identically.
  * Credential and configuration failures are returned as catalog metadata.
  */
-export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeCardsConnection
+export declare function connectCards(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeCardsConnection
 
 /**
  * Builds one gateway administration handle without performing IO.
@@ -708,7 +708,7 @@ export declare function connectCards(serverUrl?: string | undefined | null, cred
  * Returns a napi error when no credential resolves or the HTTP client cannot
  * be built.
  */
-export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeGateway
+export declare function connectGateway(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeGateway
 
 /**
  * Builds one Operator connection handle without performing IO.
@@ -716,7 +716,7 @@ export declare function connectGateway(serverUrl?: string | undefined | null, cr
  * Omitted arguments resolve through the same shared client configuration
  * chain as `connectCards`.
  */
-export declare function connectOperatorConnections(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeOperatorConnectionsConnection
+export declare function connectOperatorConnections(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeOperatorConnectionsConnection
 
 /**
  * Builds one Verification handle without performing IO.
@@ -724,16 +724,17 @@ export declare function connectOperatorConnections(serverUrl?: string | undefine
  * Omitted arguments resolve through the same shared client configuration
  * chain as `connectCards`, so every capability authenticates identically.
  */
-export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null): NativeVerificationConnection
+export declare function connectVerification(serverUrl?: string | undefined | null, credential?: string | undefined | null, tenant?: string | undefined | null): NativeVerificationConnection
 
 /**
  * Builds one client without performing IO.
  *
  * Omitted arguments resolve through `client_from_options`: the environment,
- * then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
+ * then the saved user login for this server and `tenant` (a tenant route
+ * key), then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
  * metadata.
  */
-export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): NativeWyrdClientResult
+export declare function connectWyrdClient(serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): NativeWyrdClientResult
 
 /**
  * Fetches an already-registered table's config by name.
@@ -746,7 +747,7 @@ export declare function connectWyrdClient(serverUrl?: string | undefined | null,
  * Returns a napi error only when the described config cannot be encoded;
  * credential, transport, and server refusals are returned as catalog metadata.
  */
-export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeTableConfigResult>
+export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null, tenant?: string | undefined | null): Promise<NativeTableConfigResult>
 
 /** Closed result of connecting one Bifrost client: a handle or a catalog error. */
 export interface NativeBifrostConnection {

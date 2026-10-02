@@ -49,21 +49,25 @@ impl NativeWyrdClientResult {
 /// Builds one client without performing IO.
 ///
 /// Omitted arguments resolve through `client_from_options`: the environment,
-/// then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
+/// then the saved user login for this server and `tenant` (a tenant route
+/// key), then `~/.config/wyrd/credentials.toml`. Failures are returned as catalog
 /// metadata.
 #[napi]
 pub fn connect_wyrd_client(
     server_url: Option<String>,
     credential: Option<String>,
     grpc_url: Option<String>,
+    tenant: Option<String>,
 ) -> NativeWyrdClientResult {
     let client = wyrd_client::bifrost::client_from_options(
         server_url.as_deref(),
         credential.as_deref(),
         grpc_url.as_deref(),
+        tenant.as_deref(),
     );
     drop(server_url);
     drop(credential);
+    drop(tenant);
     drop(grpc_url);
     NativeWyrdClientResult::from_outcome(client.map_err(|error| WyrdError::from(&error)))
 }
@@ -132,12 +136,14 @@ impl NativeWyrdClient {
         server_url: Option<String>,
         credential: Option<String>,
         grpc_url: Option<String>,
+        tenant: Option<String>,
     ) -> napi::Result<NativeBifrostConnection> {
-        if server_url.is_some() || credential.is_some() || grpc_url.is_some() {
+        if server_url.is_some() || credential.is_some() || grpc_url.is_some() || tenant.is_some() {
             return Ok(NativeBifrostConnection {
                 bifrost: None,
                 error: Some(NativeWyrdError::from_wyrd(&WyrdError::Validation {
-                    message: "client cannot be combined with serverUrl, credential, or grpcUrl"
+                    message: "client cannot be combined with serverUrl, credential, grpcUrl, or \
+                              tenant"
                         .to_owned(),
                     details: serde_json::json!({ "field": "client" }),
                 })),

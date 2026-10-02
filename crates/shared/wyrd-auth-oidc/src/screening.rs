@@ -47,7 +47,7 @@ pub enum AddressPolicy {
 }
 
 /// Why a provider fetch could not be made.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ScreenError {
     /// The URL uses a scheme the policy refuses, has no host, or resolves to
     /// an address Wyrd must never reach.

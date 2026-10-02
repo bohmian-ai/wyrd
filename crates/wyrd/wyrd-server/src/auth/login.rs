@@ -12,10 +12,10 @@ use crate::state::AppState;
 
 /// Handler for `POST /auth/login`.
 ///
-/// Begins a tenant human SSO login for the BFF (browser flow binding) or the
-/// CLI (handoff binding) and returns only the provider authorization URL. The
-/// tenant comes from the body's route key; no header — `Host`, forwarded
-/// headers, or anything else — selects the tenant, connection, or redirect.
+/// Begins a tenant human SSO login for the BFF's browser flow and returns only
+/// the provider authorization URL. The tenant comes from the body's route key;
+/// no header — `Host`, forwarded headers, or anything else — selects the
+/// tenant, connection, or redirect.
 ///
 /// Login initiation evaluates no principal permission — it answers "who is
 /// calling?", not "may they do this?" — so it appends no canonical audit event.
@@ -31,9 +31,8 @@ use crate::state::AppState;
     responses(
         (status = 200, description = "Login begun; send the browser to the returned provider \
           authorization URL", body = BeginLoginResponse),
-        (status = 400, description = "Both or neither initiation binding was supplied, or the \
-          deployment has no public origin or sealing key (WYRD_SPEC_400_VALIDATION); or the CLI \
-          handoff is unknown or the flow binding was already used \
+        (status = 400, description = "The deployment has no public origin or sealing key \
+          (WYRD_SPEC_400_VALIDATION); or the browser flow binding was already used \
           (WYRD_AUTH_400_INVALID_STATE)", body = WyrdProblem),
         (status = 401, description = "SSO login is not available for this tenant route key \
           (WYRD_AUTH_401_INVALID_TOKEN)", body = WyrdProblem),
@@ -114,8 +113,17 @@ mod pg_tests {
                 "authorization_endpoint": format!("{issuer}/authorize"),
                 "token_endpoint": format!("{issuer}/token"),
                 "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
                 "id_token_signing_alg_values_supported": ["EdDSA"],
             })))
+            .mount(provider)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
+            )
             .mount(provider)
             .await;
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");

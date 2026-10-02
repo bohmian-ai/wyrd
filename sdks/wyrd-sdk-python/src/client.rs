@@ -36,19 +36,24 @@ impl PyWyrdClient {
     /// Build a client from optionally overridden transport values.
     ///
     /// Omitted values resolve through `client_from_options`: the environment,
-    /// then `~/.config/wyrd/credentials.toml`.
+    /// then the saved user login for this server (the one for `tenant`, a
+    /// tenant route key, when given, otherwise the newest), then
+    /// `~/.config/wyrd/credentials.toml`.
     ///
     /// # Errors
     /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when no
-    /// credential resolves, or a transport error when the client cannot be built.
+    /// credential resolves, `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when
+    /// `tenant` names no saved login for this server or the saved login
+    /// cannot be used, or a transport error when the client cannot be built.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, grpc_url=None))]
+    #[pyo3(signature = (server_url=None, credential=None, grpc_url=None, tenant=None))]
     fn __new__(
         server_url: Option<&str>,
         credential: Option<&str>,
         grpc_url: Option<&str>,
+        tenant: Option<&str>,
     ) -> WyrdPyResult<Self> {
-        client_from_options(server_url, credential, grpc_url)
+        client_from_options(server_url, credential, grpc_url, tenant)
             .map(|inner| Self { inner })
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))
     }

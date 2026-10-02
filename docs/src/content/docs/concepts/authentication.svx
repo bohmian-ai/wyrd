@@ -91,10 +91,9 @@ PKCE S256, and the login state lives server-side for at most 5 minutes.
   ]}
 />
 
-1. The web app sends `POST /auth/login` with `tenant_route_key` and exactly one
-   binding: `browser_flow_hash` (the SHA-256 of a secret the web app keeps for
-   this browser flow) or `cli_handoff_id` (reserved for the CLI handoff). An
-   unknown tenant and a tenant without an Active connection get the same
+1. The web app sends `POST /auth/login` with `tenant_route_key` and
+   `browser_flow_hash` (the SHA-256 of a secret the web app keeps for this
+   browser flow). An unknown tenant and a tenant without an Active connection get the same
    `401` refusal. The response carries only `authorization_url`.
 2. The server stores the hashed state, PKCE verifier, nonce, connection, and
    binding in Postgres with a 300 s TTL. The raw state exists only in the
@@ -119,6 +118,37 @@ Human sessions require a configured sealing key; without one, login is refused
 before any state is stored. An access token is a five-minute snapshot:
 deactivating or replacing the connection stops refresh immediately, while an
 access token already issued remains valid until it expires.
+
+## CLI login (device authorization)
+
+`wyrd auth login --server <url> --tenant <key>` uses the OAuth 2.0 device
+authorization grant (RFC 8628), with Wyrd as the authorization server:
+
+1. The CLI sends `POST /auth/device_authorization` with `tenant_route_key`. The
+   response carries a secret `device_code`, a short `user_code` such as
+   `BCDF-GHJK`, `verification_uri_complete`, `expires_in` (600 s), and
+   `interval` (5 s).
+2. The CLI prints the user code and opens `verification_uri_complete`, the
+   `GET /auth/device` page. The person checks that the page shows the code
+   from their own terminal and approves it, then signs in through the
+   tenant's normal browser login. Deny ends the login.
+3. Meanwhile the CLI polls `POST /auth/token` with
+   `grant_type=urn:ietf:params:oauth:grant-type:device_code` every `interval`
+   seconds. Until the sign-in completes, the server answers
+   `WYRD_AUTH_400_DEVICE_AUTHORIZATION` with `details.error` set to an RFC 8628
+   error: `authorization_pending`, `slow_down` (poll 5 s slower),
+   `access_denied`, `expired_token`, or `invalid_grant`.
+4. Once the sign-in completes, the next poll returns the access and refresh
+   tokens, audited as `auth.device_code.grant`. The device code is single-use
+   and bound to its tenant; the server stores only its SHA-256.
+
+The CLI saves the login in `credentials.toml` (mode `0600`) under the Wyrd
+config directory. SDK clients use the saved access token until it expires,
+then renew it with the refresh token under a file lock; a refused renewal asks
+for `wyrd auth login`. Without a tenant selector a client uses the most recent
+login for that server. `wyrd auth logout` deletes the saved login and revokes
+its refresh token through `POST /auth/revoke`, warning if the revocation
+fails.
 
 ## API-key principal flow
 

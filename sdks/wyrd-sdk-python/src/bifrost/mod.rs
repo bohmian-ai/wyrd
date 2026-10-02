@@ -182,15 +182,17 @@ impl PyTableConfig {
     /// nothing resolves a credential, and the catalog code for not-found,
     /// authorization, transport, or schema-projection failures.
     #[staticmethod]
-    #[pyo3(signature = (table, server_url=None, credential=None, grpc_url=None))]
+    #[pyo3(signature = (table, server_url=None, credential=None, grpc_url=None, tenant=None))]
     fn describe(
         py: Python<'_>,
         table: &str,
         server_url: Option<&str>,
         credential: Option<&str>,
         grpc_url: Option<&str>,
+        tenant: Option<&str>,
     ) -> WyrdPyResult<Self> {
-        let client = client_from_options(server_url, credential, grpc_url).map_err(client_error)?;
+        let client =
+            client_from_options(server_url, credential, grpc_url, tenant).map_err(client_error)?;
         let inner = py
             .detach(|| wyrd_runtime::runtime().block_on(TableConfig::describe(&client, table)))
             .map_err(client_error)?;
@@ -293,7 +295,7 @@ impl Bifrost {
     /// then the environment chain exactly as before. With `client`, the
     /// supplied Rust `WyrdClient` — plain or delegated — is used as is, so no
     /// second credential is resolved; it cannot be combined with
-    /// `server_url`, `credential`, or `grpc_url`.
+    /// `server_url`, `credential`, `grpc_url`, or `tenant`.
     ///
     /// # Errors
     ///
@@ -302,7 +304,7 @@ impl Bifrost {
     /// nothing in the chain resolves a credential, and the catalog code for a
     /// failure to dial the ingest channel.
     #[new]
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client=None))]
+    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client=None, tenant=None))]
     fn __new__(
         py: Python<'_>,
         table: Option<PyTableConfig>,
@@ -310,16 +312,23 @@ impl Bifrost {
         credential: Option<&str>,
         grpc_url: Option<&str>,
         client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
+        tenant: Option<&str>,
     ) -> WyrdPyResult<Self> {
         let client = match client {
-            Some(_) if server_url.is_some() || credential.is_some() || grpc_url.is_some() => {
+            Some(_)
+                if server_url.is_some()
+                    || credential.is_some()
+                    || grpc_url.is_some()
+                    || tenant.is_some() =>
+            {
                 return Err(invalid_argument(
                     "client",
-                    "cannot be combined with server_url, credential, or grpc_url",
+                    "cannot be combined with server_url, credential, grpc_url, or tenant",
                 ));
             }
             Some(client) => client.inner().clone(),
-            None => client_from_options(server_url, credential, grpc_url).map_err(client_error)?,
+            None => client_from_options(server_url, credential, grpc_url, tenant)
+                .map_err(client_error)?,
         };
         let table = table.map(|table| table.inner);
         let handle = py

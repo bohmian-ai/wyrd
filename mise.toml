@@ -681,18 +681,72 @@ create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="
 print("Keycloak users seeded")
 PYEOF
 
-# WYRD_IDENTITY_TARGET selects the suite: `server` (Rust identity_e2e) or
-# `ui` (the production BFF journey: identity_ui_e2e starts the real server and
-# two `node build` BFF replicas sharing its Postgres and public origin, then
-# runs the Vitest HTTP journey against them). WYRD_IDENTITY_FILTER selects one
-# exact test of that suite and must select exactly one. Unfiltered runs both
-# suites, and first proves each named journey still selects exactly one test so
-# a rename cannot silently drop it.
+# WYRD_IDENTITY_TARGET selects the suite: `server` (Rust identity_e2e), `ui`
+# (the production BFF journey: identity_ui_e2e starts the real server and two
+# `node build` BFF replicas sharing its Postgres and public origin, then runs
+# the Vitest HTTP journey against them), or one saved-login journey: `cli`
+# (`wyrd auth login`), `rust`, `python`, and `typescript` (each public SDK over
+# a CLI-established login), and `client` (concurrent saved-login renewal
+# across processes). WYRD_IDENTITY_FILTER selects one exact test of that suite
+# and must select exactly one. Unfiltered runs every suite, and first proves
+# each named journey still selects exactly one test so a rename cannot
+# silently drop it.
 target="${WYRD_IDENTITY_TARGET:-}"
 case "$target" in
-  ""|server|ui) ;;
-  *) echo "unsupported WYRD_IDENTITY_TARGET=$target (supported: server, ui)" >&2; exit 2 ;;
+  ""|server|ui|cli|rust|client|python|typescript) ;;
+  *) echo "unsupported WYRD_IDENTITY_TARGET=$target (supported: server, ui, cli, rust, client, python, typescript)" >&2; exit 2 ;;
 esac
+# One saved-login journey: its exact selector must select exactly one test,
+# and a filter, when given, must name that journey.
+saved_login_journey() {
+  case "$1" in
+    cli) name=cli_device_login_journey ;;
+    rust) name=saved_user_auth_journey ;;
+    client) name=concurrent_saved_renewal ;;
+    python) name=test_saved_user_auth_journey ;;
+    typescript) name="saved user auth journey" ;;
+  esac
+  if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ "$WYRD_IDENTITY_FILTER" != "$name" ]; then
+    echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects no $1 journey; expected '$name'" >&2
+    exit 1
+  fi
+  case "$1" in
+    cli) rust_journey wyrd-cli cli "$name" ;;
+    rust) rust_journey wyrd-sdk-rust cards_state "$name" ;;
+    client) rust_journey wyrd-client pg_auth_e2e_against_fixture "$name" ;;
+    python)
+      mise run py:setup
+      selector="tests/integration/auth/test_saved_user_auth.py::$name"
+      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m identity "$selector" | grep -c "::$name" || true)"
+      if [ "$count" != 1 ]; then
+        echo "Python journey $name selects $count tests; expected exactly 1" >&2
+        exit 1
+      fi
+      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity "$selector")
+      ;;
+    typescript)
+      mise run ts:build
+      mise run ts:build:testing
+      journey=tests/integration/saved-user-auth.test.ts
+      count="$(cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest list "$journey" -t "$name" | grep -cF "$name" || true)"
+      if [ "$count" != 1 ]; then
+        echo "TypeScript journey '$name' selects $count tests; expected exactly 1" >&2
+        exit 1
+      fi
+      (cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run "$journey" -t "$name")
+      ;;
+  esac
+}
+# One ignored Rust journey by exact name, after proving it selects one test.
+rust_journey() {
+  expr="test(=$3)"
+  count="$(cargo nextest list --locked -p "$1" --test "$2" --run-ignored=all --message-format oneline -E "$expr" | grep -c . || true)"
+  if [ "$count" != 1 ]; then
+    echo "$1 --test $2 $3 selects $count tests; expected exactly 1" >&2
+    exit 1
+  fi
+  cargo nextest run --locked -p "$1" --test "$2" --run-ignored=all -E "$expr"
+}
 if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ -z "$target" ]; then
   target=server
 fi
@@ -726,6 +780,8 @@ run_ui() {
 }
 if [ "$target" = ui ]; then
   run_ui
+elif [ -n "$target" ] && [ "$target" != server ]; then
+  saved_login_journey "$target"
 elif [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
   expr="test(=${WYRD_IDENTITY_FILTER})"
   count="$(selected_count "$expr")"
@@ -746,6 +802,11 @@ else
     run_ui
   fi
   cargo nextest run --locked -p wyrd-server --test identity_e2e --run-ignored=all --test-threads=1
+  if [ "$target" != server ]; then
+    for journey in cli rust client python typescript; do
+      saved_login_journey "$journey"
+    done
+  fi
 fi
 """
 
@@ -1155,7 +1216,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run python -m pytest -q -m integration"
+run = "uv run python -m pytest -q -m 'integration and not identity'"
 
 [tasks."py:test:cards:integration"]
 hide = true
@@ -1186,9 +1247,17 @@ hide = true
 description = "Assert the production wyrd-sdk-python wheel does not expose wyrd.testing"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
+# py:setup installs the testing-enabled development build, so the check builds
+# the default wheel itself and imports it from an isolated environment; the
+# plain `import wyrd` proves that environment loads the wheel at all.
 run = """
 set -eu
-if uv run python -c 'import wyrd.testing' 2>/dev/null; then
+out="$(mktemp -d)"
+trap 'rm -rf "$out"' EXIT
+uv run maturin build --out "$out"
+wheel="$(ls "$out"/*.whl)"
+uv run --isolated --no-project --with "$wheel" python -c 'import wyrd'
+if uv run --isolated --no-project --with "$wheel" python -c 'import wyrd.testing' 2>/dev/null; then
   echo 'FAIL: wyrd.testing leaked into the default wyrd-sdk-python wheel'
   exit 1
 fi
@@ -1537,7 +1606,9 @@ seeds a tenant, mints a key, and drives @wyrd/sdk against it, tearing down via s
 in finally — symmetric with the Python journey.
 """
 dir = "sdks/wyrd-sdk-ts/wyrd"
-run = "pnpm exec vitest run tests/integration"
+# The saved user login journey needs the identity lane's Keycloak; only
+# test:identity:journey runs it.
+run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-user-auth.test.ts"
 
 [tasks."check:single-into-response-impl"]
 hide = true

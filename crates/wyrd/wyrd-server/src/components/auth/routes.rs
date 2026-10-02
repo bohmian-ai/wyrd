@@ -39,12 +39,14 @@ use utoipa_axum::routes;
 
 /// Build the tenant-plane auth router.
 ///
-/// Mounts the four auth surfaces — human login initiation
-/// (`POST /auth/login`), the common OIDC provider callback
-/// (`GET /auth/callback`), credential exchange (`POST /auth/token`), and API
-/// key issuance (`POST /auth/issue-key`) — behind one shared per-peer-IP governor,
-/// so credential guessing and login-state churn draw on a single admission
-/// budget rather than one per route.
+/// Mounts the auth surfaces — human login initiation (`POST /auth/login`),
+/// the CLI device authorization (`POST /auth/device_authorization`) and its
+/// verification page (`GET`/`POST /auth/device`), the common OIDC provider
+/// callback (`GET /auth/callback`), credential exchange (`POST /auth/token`),
+/// refresh revocation (`POST /auth/revoke`), and API key issuance
+/// (`POST /auth/issue-key`) — behind one shared per-peer-IP governor, so
+/// credential guessing, device-code polling, and login-state churn draw on a
+/// single admission budget rather than one per route.
 ///
 /// # Panics
 /// Panics when the static governor configuration is invalid (a zero period
@@ -61,6 +63,12 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 
     OpenApiRouter::new()
         .routes(routes!(crate::auth::login::login))
+        .routes(routes!(crate::auth::cli_login::device_authorization))
+        .routes(routes!(
+            crate::auth::cli_login::device_page,
+            crate::auth::cli_login::device_decision
+        ))
+        .routes(routes!(crate::auth::cli_login::revoke_refresh_token))
         .routes(routes!(callback))
         .routes(routes!(token))
         .routes(routes!(issue_key))
@@ -70,8 +78,8 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
 /// `POST /auth/token` — exchange a credential for a short-lived access token.
 ///
 /// The one tenant-plane entry point: a Wyrd API key, an external JWT bearer
-/// bound to a workload, a refresh token, or an RFC 8693 delegation all arrive
-/// here and leave with the same [`TokenResponse`]. Tenant and principal are
+/// bound to a workload, a refresh token, an RFC 8628 device code, or an RFC
+/// 8693 delegation all arrive here and leave with the same [`TokenResponse`]. Tenant and principal are
 /// derived from the verified credential, never from a client-supplied header.
 ///
 /// Every invalid-credential condition returns one indistinguishable `401` so
@@ -94,7 +102,10 @@ pub fn auth_router() -> OpenApiRouter<AppState> {
         (status = 400, description = "The token exchange's identity input is malformed — a \
           delegated or Card-free actor token, or a party exchanging with itself \
           (WYRD_SPEC_400_VALIDATION) — or the delegation would exceed the configured chain \
-          depth (WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED)", body = WyrdProblem),
+          depth (WYRD_AUTH_400_DELEGATION_DEPTH_EXCEEDED); or a device code issued no \
+          credential, with the RFC 8628 error in `details.error`: `authorization_pending`, \
+          `slow_down`, `access_denied`, `expired_token`, or `invalid_grant` \
+          (WYRD_AUTH_400_DEVICE_AUTHORIZATION)", body = WyrdProblem),
         (status = 401, description = "The presented credential is not usable. Every \
           invalid-credential condition renders one indistinguishable refusal \
           (WYRD_AUTH_401_API_KEY_INVALID); a refresh token that was already consumed reports \
@@ -262,6 +273,11 @@ async fn token(
             conn.commit().await.map_err(sql_error)?;
             Ok(Json(exchanged.into_response()))
         }
+        TokenRequest::DeviceCode { device_code } => crate::auth::cli_login::cli_logins(&state)?
+            .redeem(&device_code, req_id)
+            .await
+            .map(Json)
+            .map_err(WyrdErrorResponse::from),
         TokenRequest::JwtBearer { assertion, tenant } => {
             let exchanged = exchange_jwt_bearer(
                 &state,
@@ -276,7 +292,7 @@ async fn token(
     }
 }
 
-/// Static page a CLI-initiated login's browser tab shows once the callback
+/// Static page a device-code login's browser tab shows once the callback
 /// has issued and stored the session. It carries no token, code, or state.
 const CLI_LOGIN_COMPLETE_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
 <title>Wyrd sign-in complete</title></head><body><p>Sign-in complete. You can return to your \
@@ -299,7 +315,7 @@ Wyrd settings to activate the connection.</p></body></html>";
 /// session is stored sealed for one-use redemption by the login's initiator,
 /// and the response carries neither a token nor the provider code: a browser
 /// login is redirected (`303`) to the fixed `{public_origin}/login/complete`
-/// route with no query string, and a CLI login receives a static page. A
+/// route with no query string, and a device-code login receives a static page. A
 /// candidate connection test marks its bound candidate revision tested,
 /// issues no session, and receives a static page.
 ///
@@ -317,8 +333,8 @@ Wyrd settings to activate the connection.</p></body></html>";
           provider's discovery advertises `authorization_response_iss_parameter_supported`")
     ),
     responses(
-        (status = 200, description = "A CLI-initiated login completed and the CLI redeems the \
-          session, or a candidate connection test sign-in marked that candidate revision tested \
+        (status = 200, description = "A device-code login completed and the CLI's token poll \
+          redeems the session, or a candidate connection test sign-in marked that candidate revision tested \
           and issued no session; the browser shows a static page", content_type = "text/html",
           body = String),
         (status = 303, description = "A browser login completed; redirect to the fixed \
@@ -379,7 +395,7 @@ async fn callback(
                 .map_err(WyrdErrorResponse::from)?;
             Ok(Redirect::to(location.as_str()).into_response())
         }
-        LoginInitiation::Cli(_) => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
+        LoginInitiation::Device(_) => Ok(Html(CLI_LOGIN_COMPLETE_PAGE).into_response()),
         LoginInitiation::ConnectionTest(_) => {
             Ok(Html(CONNECTION_TEST_COMPLETE_PAGE).into_response())
         }

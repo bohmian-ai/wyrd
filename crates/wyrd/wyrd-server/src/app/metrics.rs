@@ -61,7 +61,7 @@ pub const WYRD_STORAGE_OPERATION_DURATION_SECONDS: &str = "wyrd_storage_operatio
 
 /// Non-terminal Verifier runs and Operator dispatches, by `queue` and `status`.
 pub const VERIFICATION_QUEUE_DEPTH: &str = "wyrd_verification_queue_depth";
-/// Verifier executions currently holding a runtime permit in this process.
+/// Verifier executions currently in flight in this process.
 pub const VERIFICATION_ACTIVE_RUNS: &str = "wyrd_verification_active_runs";
 /// Verifier run attempts this process claimed, by `implementation`.
 pub const VERIFICATION_RUN_ATTEMPTS_TOTAL: &str = "wyrd_verification_run_attempts_total";

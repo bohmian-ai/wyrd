@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 49
+revision: 50
 status: approved
 ---
 
@@ -1402,8 +1402,10 @@ table on `(data_tenant_id, result_id)`.
   broker, or Alert persistence path is permitted.
 - **REQ-115**: `wyrd-server` MUST supervise one generic
   `VerificationRuntime` containing Scheduler, Verifier runner, and Operator
-  worker capabilities. All worker concurrency, queue claiming, engine calls,
-  external delivery, and shutdown drain MUST be bounded. A process restart
+  worker capabilities. Operator concurrency, queue reads, engine execution time,
+  external delivery, and shutdown drain MUST remain bounded. Verifier runs and
+  baseline fitting MUST NOT use global or per-tenant execution-count permits.
+  A process restart
   MUST reclaim expired Postgres leases and expose pending, retrying, and
   terminal failures through status and structured telemetry; it MUST NOT rely
   on process-local-only run or dispatch state. No new network-serving role or
@@ -1429,10 +1431,12 @@ table on `(data_tenant_id, result_id)`.
   executes that frozen dispatch without reevaluating an end-user permission.
   Scheduler ticks, claims, leases, retries, Scribe commits, and worker mechanics
   evaluate no principal permission and MUST NOT emit authorization audit rows.
-- **REQ-146**: The initial VerificationRuntime MUST use one scheduler task, a
-  shared Verifier/baseline execution ceiling of 16 globally and 4 per tenant,
-  and an external Operator execution ceiling of 16 globally and 4 per tenant.
-  A worker MUST acquire both applicable permits before claiming durable work.
+- **REQ-146**: The initial VerificationRuntime MUST use one scheduler task.
+  Verifier runs and baseline fitting have no global or per-tenant execution-count
+  permits; their durable PostgreSQL claims, leases, deadlines and shutdown
+  behavior remain authoritative across replicas. External Operator execution
+  retains a ceiling of 16 per process and 4 per tenant within that process;
+  the Operator worker acquires both permits before claiming a dispatch.
   An external Operator dispatch has three total attempts, a 30-second timeout
   per attempt, a five-minute deadline from dispatch creation, and retry delays
   of 30 seconds then two minutes; `Retry-After` is honored only when clipped to
@@ -2017,9 +2021,11 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   retries, Scribe commits, or worker mechanics. They MUST also prove
   `operators:read` versus `operators:write` separation for connection
   management and Gate's closed SYSTEM/result-table matrix. A multi-tenant runtime journey
-  MUST saturate one tenant at four Verifier and four Operator executions while
-  another tenant still progresses, and MUST show neither global pool exceeds
-  16. A slow local Operator endpoint MUST prove the 30-second attempt timeout,
+  MUST execute more than sixteen held Verifier runs, including more than four
+  for one tenant, while another tenant also progresses. Baseline fitting MUST
+  proceed while those runs are held. Operator delivery MUST still enforce four
+  executions per tenant and sixteen per process. A slow local Operator endpoint
+  MUST prove the 30-second attempt timeout,
   three-attempt budget, 30-second/two-minute retry schedule, five-minute
   deadline, and terminal status without rerunning the Verifier. Shutdown tests
   MUST prove claims stop immediately, work drains for at most 30 seconds, and
@@ -2128,6 +2134,12 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 50 remove Verifier execution caps (2026-10-02):** Explicit caller
+  instruction removes the 16-process/4-tenant permits from Verifier runs and
+  baseline fitting directly, without an experimental candidate or replacement
+  admission layer. Operator delivery permits, durable claim/lease fencing,
+  execution/publication deadlines and shutdown behavior remain unchanged.
 
 - **Revision 49 default workload role (2026-10-02):** A Card-bound Service or
   Agent principal now receives the new built-in `workload` role at first

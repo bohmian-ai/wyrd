@@ -31,7 +31,6 @@ use wyrd_server::verification::drift::DRIFT_INVALID;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::fitter::{BaselineFitter, FitGate};
 use wyrd_server::verification::health::RuntimeCapability;
-use wyrd_server::verification::permits::VerifierPermits;
 use wyrd_server::verification::publisher::{PublicationFault, SentBatch};
 use wyrd_server::verification::runner::{EngineScript, RESULT_PUBLICATION_FAILED};
 use wyrd_server::verification::{CapabilityCrash, RuntimeLimits, VerificationRuntime};
@@ -1125,15 +1124,13 @@ async fn cancellation_and_deadline_settle_without_a_verdict() {
     runtime.stop().await;
 }
 
-/// Permits are taken before claiming: a busy tenant stops at its own ceiling,
-/// another tenant still gets capacity, the process never exceeds the global
-/// ceiling, and every run completes once capacity frees.
+/// Verifier claims exceed the former process and tenant ceilings while held,
+/// and another tenant's work also starts before any execution is released.
 ///
 /// # Panics
-/// Panics when a ceiling is exceeded, the second tenant is starved, or a run
-/// does not complete.
+/// Panics when a former ceiling still blocks work or a run fails to complete.
 #[tokio::test]
-async fn permits_cap_each_tenant_and_share_the_process() {
+async fn verifier_runs_execute_beyond_the_former_permit_ceilings() {
     let harness = Harness::start().await;
     let other_tenant = DataTenantId::new_v7();
     harness
@@ -1145,11 +1142,11 @@ async fn permits_cap_each_tenant_and_share_the_process() {
     let (other, other_subject, other_verifier) = seed_tenant(&harness.server, other_tenant).await;
     let script = EngineScript::default();
     script.hold();
-    for _ in 0..6 {
+    for _ in 0..22 {
         script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
     }
     let mut busy = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..20 {
         busy.push(harness.enqueue().await);
     }
     let now = Utc::now();
@@ -1169,33 +1166,20 @@ async fn permits_cap_each_tenant_and_share_the_process() {
                 .expect("second tenant run enqueues"),
         );
     }
-    let runtime = harness.spawn(
-        RuntimeLimits {
-            global_permits: 3,
-            tenant_permits: 2,
-            ..Harness::limits()
-        },
-        &script,
-    );
-
-    wait_until("three executions", || script.entered() == 3).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(script.entered(), 3, "the global ceiling holds across polls");
-    let mut running_busy = 0;
+    let runtime = harness.spawn(Harness::limits(), &script);
+    wait_until("all 22 executions before release", || {
+        script.entered() == 22
+    })
+    .await;
     for run in &busy {
-        if harness.seed.run(*run).await.expect("run reads").status == "running" {
-            running_busy += 1;
-        }
+        assert_eq!(
+            harness.seed.run(*run).await.expect("run reads").status,
+            "running"
+        );
     }
-    let mut running_quiet = 0;
     for run in &quiet {
-        if other.run(*run).await.expect("run reads").status == "running" {
-            running_quiet += 1;
-        }
+        assert_eq!(other.run(*run).await.expect("run reads").status, "running");
     }
-    assert_eq!(running_busy, 2, "the busy tenant stops at its ceiling");
-    assert_eq!(running_quiet, 1, "the other tenant is not starved");
-
     script.release();
     for run in busy {
         harness.wait_run(run, status("completed")).await;
@@ -1254,19 +1238,14 @@ async fn baseline_state(
         .state
 }
 
-/// Baseline fits draw from the runner's permits: while a tenant's four
-/// Verifier runs hold its whole share, its due fit stays unclaimed and
-/// another tenant's fit proceeds; releasing the runs lets the same row be
-/// claimed.
-///
-/// Each fit here settles `failed` because the fixture's baseline Card has no
-/// Parquet artifact; leaving `pending` is the claim this test observes.
+/// Baseline fits proceed for both tenants while Verifier executions are held.
+/// Each fit fails because the fixture's Data Card has no Parquet artifact;
+/// leaving `pending` proves it was claimed without waiting for Verifier slots.
 ///
 /// # Panics
-/// Panics when the saturated tenant's fit is claimed, the other tenant's fit
-/// is starved, or the released row is never claimed.
+/// Panics when held Verifier runs prevent a baseline claim.
 #[tokio::test]
-async fn baseline_fits_share_the_verifier_permits() {
+async fn baseline_fits_do_not_wait_for_verifier_executions() {
     let harness = Harness::start().await;
     let other_tenant = DataTenantId::new_v7();
     harness
@@ -1285,7 +1264,6 @@ async fn baseline_fits_share_the_verifier_permits() {
     }
     let runtime = harness.spawn(Harness::limits(), &script);
     wait_until("four executions", || script.entered() == 4).await;
-
     pending_baseline(
         &harness.server,
         &harness.seed,
@@ -1294,35 +1272,26 @@ async fn baseline_fits_share_the_verifier_permits() {
     )
     .await;
     pending_baseline(&harness.server, &other, &other_verifier, &other_subject).await;
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while baseline_state(&harness.server, &other, &other_verifier).await
-        == DriftBaselineState::Pending
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the other tenant's fit was starved"
+    for (seed, verifier) in [
+        (&harness.seed, &harness.verifier),
+        (&other, &other_verifier),
+    ] {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while baseline_state(&harness.server, seed, verifier).await == DriftBaselineState::Pending {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "held Verifier runs blocked a baseline fit"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            baseline_state(&harness.server, seed, verifier).await,
+            DriftBaselineState::Failed
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        baseline_state(&harness.server, &harness.seed, &harness.verifier).await,
-        DriftBaselineState::Pending,
-        "a tenant at its permit ceiling leaves its fit unclaimed"
-    );
-
     script.release();
     for run in busy {
         harness.wait_run(run, status("completed")).await;
-    }
-    let deadline = tokio::time::Instant::now() + WAIT;
-    while baseline_state(&harness.server, &harness.seed, &harness.verifier).await
-        == DriftBaselineState::Pending
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the released tenant's fit was never claimed"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     runtime.stop().await;
 }
@@ -1339,16 +1308,13 @@ async fn expired_lease_is_reclaimed_and_the_stale_holder_is_fenced() {
     let stale_script = EngineScript::default();
     stale_script.hold();
     stale_script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
-    let stale = harness.spawn(
-        RuntimeLimits {
-            global_permits: 1,
-            ..Harness::limits()
-        },
-        &stale_script,
-    );
+    let stale = harness.spawn(Harness::limits(), &stale_script);
     let run = harness.enqueue().await;
     wait_until("the first claim", || stale_script.entered() == 1).await;
 
+    // Close the stale runner's claim loop while its held attempt drains, so
+    // only the fresh runner can reclaim the deliberately expired lease.
+    stale.stop.cancel();
     harness.expire(run).await;
     let fresh_script = EngineScript::default();
     fresh_script.push(EngineOutcome::Completed(VerifierReport::Drift(None)));
@@ -2200,10 +2166,6 @@ fn fitter(harness: &Harness, drain_grace: Duration, gate: &FitGate) -> Arc<Basel
                 .operator_pool()
                 .expect("server has an operator pool"),
             Arc::clone(&state.storage),
-            Arc::new(VerifierPermits::new(
-                limits.global_permits,
-                limits.tenant_permits,
-            )),
             &limits,
         )
         .with_fit_gate(gate.clone()),

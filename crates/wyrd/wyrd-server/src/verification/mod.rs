@@ -39,7 +39,6 @@ use self::drift::DriftEngine;
 use self::fitter::BaselineFitter;
 use self::health::{RuntimeCapability, VerificationHealth};
 use self::operators::{OperatorDelivery, OperatorWorker, ProviderEndpoints};
-use self::permits::VerifierPermits;
 #[cfg(feature = "test-support")]
 use self::publisher::PublicationFault;
 use self::publisher::ResultPublisher;
@@ -51,10 +50,10 @@ use self::scheduler::VerificationScheduler;
 /// Bounds every runtime loop, lease, and drain obeys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeLimits {
-    /// Process-wide ceiling of concurrent Verifier executions.
-    pub global_permits: usize,
-    /// Ceiling of concurrent executions for one tenant.
-    pub tenant_permits: usize,
+    /// Process-wide ceiling of concurrent Operator deliveries.
+    pub operator_global_permits: usize,
+    /// Ceiling of concurrent Operator deliveries for one tenant.
+    pub operator_tenant_permits: usize,
     /// How long one claim holds a run before another process may reclaim it.
     ///
     /// Must exceed `execution_timeout + publication_timeout`, so a live
@@ -98,15 +97,15 @@ pub struct RuntimeLimits {
 }
 
 impl Default for RuntimeLimits {
-    /// Production bounds: 16 global and 4 per-tenant executions, a ten-minute
+    /// Production bounds: 16 process-wide and 4 per-tenant Operator deliveries, a ten-minute
     /// lease over a five-minute execution and one-minute publication, a
     /// thirty-second drain, Eval traces polled every five seconds for up to
     /// five minutes, and a five-minute rewrap interval whose passes stop after
     /// two minutes and thirty seconds per tenant.
     fn default() -> Self {
         Self {
-            global_permits: 16,
-            tenant_permits: 4,
+            operator_global_permits: 16,
+            operator_tenant_permits: 4,
             lease: Duration::from_secs(600),
             execution_timeout: Duration::from_secs(300),
             publication_timeout: Duration::from_secs(60),
@@ -434,15 +433,10 @@ impl VerificationRuntimeBuilder<'_> {
             Some(crash) => scheduler.with_crash(crash.clone()),
             None => scheduler,
         };
-        let permits = Arc::new(VerifierPermits::new(
-            self.limits.global_permits,
-            self.limits.tenant_permits,
-        ));
         let fitter = BaselineFitter::new(
             postgres.clone(),
             operator.clone(),
             Arc::clone(&self.state.storage),
-            Arc::clone(&permits),
             &self.limits,
         );
         #[cfg(feature = "test-support")]
@@ -487,7 +481,6 @@ impl VerificationRuntimeBuilder<'_> {
                     postgres.clone(),
                     operator,
                     queue,
-                    permits,
                     publisher,
                     VerifierEngines::new(
                         drift,
@@ -560,15 +553,20 @@ mod tests {
         );
     }
 
-    /// The production defaults are REQ-146's server ceilings: 16 global and 4
-    /// per-tenant executions shared by Verifier runs and baseline fits and
-    /// again for Operator deliveries, a 30-second drain, and Operator
+    /// Production defaults retain 16 process-wide and 4 per-tenant Operator
+    /// deliveries, a 30-second drain, and Operator
     /// dispatches of three attempts, each capped at 30 seconds, retried after
     /// 30 seconds and then two minutes, inside a five-minute deadline.
     #[test]
     fn production_defaults_are_the_specified_ceilings() {
         let limits = RuntimeLimits::default();
-        assert_eq!((limits.global_permits, limits.tenant_permits), (16, 4));
+        assert_eq!(
+            (
+                limits.operator_global_permits,
+                limits.operator_tenant_permits
+            ),
+            (16, 4)
+        );
         assert_eq!(limits.drain_grace, Duration::from_secs(30));
         assert_eq!(limits.operator_attempts, 3);
         assert_eq!(limits.operator_attempt_timeout, Duration::from_secs(30));

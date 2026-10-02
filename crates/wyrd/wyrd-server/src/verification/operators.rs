@@ -50,7 +50,7 @@ use super::CapabilityCrash;
 use super::RuntimeLimits;
 use super::claims::{ClaimLoop, LeasedWork, settled};
 use super::health::RuntimeCapability;
-use super::permits::VerifierPermits;
+use super::permits::OperatorPermits;
 use crate::components::operators::keys::{KeyError, OperatorKeys};
 
 mod pager_duty;
@@ -179,9 +179,9 @@ impl OperatorWorker {
         Self {
             claims: ClaimLoop::new(
                 postgres.clone(),
-                Arc::new(VerifierPermits::new(
-                    limits.global_permits,
-                    limits.tenant_permits,
+                Some(OperatorPermits::new(
+                    limits.operator_global_permits,
+                    limits.operator_tenant_permits,
                 )),
                 &limits,
             ),

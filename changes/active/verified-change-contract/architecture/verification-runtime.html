@@ -312,7 +312,7 @@
       <div class="decision"><span class="step">AGREED DIRECTION</span><h3>Retry execution, not judgment</h3><p>Execution errors retry same durable run; completed failed verdicts dispatch the Operator once. Operator delivery retries separately.</p></div>
       <div class="decision"><span class="step">LOCKED</span><h3>Baseline pending at cron</h3><p>No PSI/SPC run starts before the exact fitted baseline is ready. Unready occurrences are skipped without catch-up; a terminal fit failure remains visible.</p></div>
       <div class="decision"><span class="step">LOCKED</span><h3>No Alert resource</h3><p>One independent Operator dispatch is the durable reaction and delivery state for each configured failed-run action.</p></div>
-      <div class="decision"><span class="step">AGREED DIRECTION</span><h3>Runtime bounds</h3><p>Verifier and Operator work each use a global ceiling of 16 and per-tenant ceiling of 4. Operator delivery uses three attempts, 30-second attempt timeouts, 30-second then 2-minute retries, and a five-minute deadline. Shutdown stops claims and drains for 30 seconds.</p></div>
+      <div class="decision"><span class="step">AGREED DIRECTION</span><h3>Runtime bounds</h3><p>Verifier execution and baseline fitting have no execution-count permits. Operator delivery retains 16 slots per process and 4 per tenant within that process. Operator delivery uses three attempts, 30-second attempt timeouts, 30-second then 2-minute retries, and a five-minute deadline. Shutdown stops claims and drains for 30 seconds.</p></div>
     </div>
   </section>
 

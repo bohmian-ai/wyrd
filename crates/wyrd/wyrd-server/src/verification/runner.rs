@@ -1,8 +1,7 @@
 //! The generic Verifier runner: claim, execute, publish, settle.
 //!
-//! [`VerifierRunner`] takes an execution permit before it claims, so a claim
-//! is never made that this process cannot start. Each claimed run loads its
-//! exact Verifier Card, goes through the one closed dispatch over
+//! [`VerifierRunner`] claims and starts runs without execution-count permits.
+//! Each claimed run loads its exact Verifier Card, goes through the one closed dispatch over
 //! [`VerifierImplementation`], and ends in exactly one fenced transition the
 //! runner applies itself: a completed report is published as the tenant's
 //! SYSTEM writer and then completed; a retryable failure is retried within
@@ -47,7 +46,6 @@ use super::drift::DriftEngine;
 use super::engines::{EngineOutcome, VerifierReport};
 use super::eval::EvalEngine;
 use super::health::RuntimeCapability;
-use super::permits::VerifierPermits;
 use super::publisher::ResultPublisher;
 use super::results::{ResultPayloadBuilder, ResultRun};
 
@@ -149,7 +147,7 @@ pub struct VerifierRunner {
     operator: OperatorPool,
     /// Queue policies and transitions.
     queue: VerifierRunQueue,
-    /// Shared claim loop owning execution capacity, admission, and drain.
+    /// Shared claim loop owning durable claims, shutdown, and drain.
     claims: ClaimLoop,
     /// Remote result publication.
     publisher: ResultPublisher,
@@ -174,13 +172,12 @@ impl VerifierRunner {
         postgres: WyrdPostgres,
         operator: OperatorPool,
         queue: VerifierRunQueue,
-        permits: Arc<VerifierPermits>,
         publisher: ResultPublisher,
         engines: VerifierEngines,
         limits: RuntimeLimits,
     ) -> Self {
         Self {
-            claims: ClaimLoop::new(postgres.clone(), permits, &limits),
+            claims: ClaimLoop::new(postgres.clone(), None, &limits),
             postgres,
             operator,
             queue,
@@ -567,7 +564,7 @@ impl LeasedWork for VerifierRunner {
 
     /// Execute one claimed run and apply its single transition.
     ///
-    /// The claim loop holds its permit until settlement. Cancellation through `abandon`
+    /// The claim loop tracks the task until settlement. Cancellation through `abandon`
     /// (shutdown past its grace) stops the execution and releases the lease;
     /// a retryable failure observed after `stop` is also released rather than
     /// charged an attempt, since the process, not the run, failed.

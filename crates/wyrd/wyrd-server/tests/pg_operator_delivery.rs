@@ -1583,16 +1583,15 @@ async fn running(pool: &PgPool, tenant: DataTenantId) -> (i64, i64) {
     .expect("running counts read")
 }
 
-/// Under the production permit defaults one tenant saturates both pools at
-/// once — four Verifier executions and four Operator deliveries — while a
-/// second tenant's Verifier runs and dispatch still progress; neither
-/// process-wide pool exceeds sixteen, and all held work completes on release.
+/// Held Verifier runs exceed the former tenant ceiling while slow Operator
+/// deliveries retain their separate limits and another tenant progresses.
+/// All held work completes after release.
 ///
 /// # Panics
-/// Panics when a tenant or global ceiling is exceeded, the quiet tenant is
-/// starved, or held work does not complete.
+/// Panics when an Operator ceiling is exceeded, Verifier runs are capped,
+/// the quiet tenant is starved, or held work does not complete.
 #[tokio::test]
-async fn verifier_and_operator_pools_saturate_one_tenant_without_starving_another() {
+async fn verifiers_progress_while_operator_deliveries_are_capped() {
     let delivery = Delivery::boot().await;
     let origin = delivery.mock.uri();
     Mock::given(method("POST"))
@@ -1627,7 +1626,10 @@ async fn verifier_and_operator_pools_saturate_one_tenant_without_starving_anothe
         ..Delivery::limits()
     };
     assert_eq!(
-        (limits.global_permits, limits.tenant_permits),
+        (
+            limits.operator_global_permits,
+            limits.operator_tenant_permits
+        ),
         (16, 4),
         "production permit defaults"
     );
@@ -1692,14 +1694,14 @@ async fn verifier_and_operator_pools_saturate_one_tenant_without_starving_anothe
         let (busy_runs, busy_dispatches) = running(&delivery.assertion, busy).await;
         let (quiet_runs, quiet_dispatches) = running(&delivery.assertion, quiet.tenant).await;
         assert!(
-            busy_runs <= 4 && busy_dispatches <= 4,
-            "the busy tenant exceeded a ceiling: {busy_runs} runs, {busy_dispatches} dispatches"
+            busy_dispatches <= 4,
+            "the busy tenant exceeded its Operator ceiling: {busy_dispatches} dispatches"
         );
         assert!(
-            busy_runs + quiet_runs <= 16 && busy_dispatches + quiet_dispatches <= 16,
-            "a process-wide ceiling was exceeded"
+            busy_dispatches + quiet_dispatches <= 16,
+            "the process-wide Operator ceiling was exceeded"
         );
-        if (busy_runs, busy_dispatches, quiet_runs) == (4, 4, 2) {
+        if (busy_runs, busy_dispatches, quiet_runs) == (6, 4, 2) {
             break;
         }
         assert!(
@@ -1718,11 +1720,10 @@ async fn verifier_and_operator_pools_saturate_one_tenant_without_starving_anothe
         quiet_delivered, "delivered",
         "the quiet tenant delivered while the busy tenant was saturated"
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         script.entered(),
-        2 + 4 + 2,
-        "the busy tenant's held runs stay at its ceiling across polls"
+        2 + 6 + 2,
+        "all Verifier runs started while Operator deliveries remained capped"
     );
 
     script.release();

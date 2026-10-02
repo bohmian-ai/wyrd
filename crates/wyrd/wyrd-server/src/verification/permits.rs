@@ -1,9 +1,9 @@
-//! Global and per-tenant Verifier execution capacity.
+//! Global and per-tenant Operator delivery capacity.
 //!
-//! The runner takes one [`VerifierPermit`] before it claims a run and holds it
-//! for the whole execution and settlement, so no more than the global ceiling
-//! runs in this process and no tenant holds more than its share. Permits count
-//! capacity only; the durable queue remains the sole record of which runs exist.
+//! The Operator worker takes one [`OperatorPermit`] before it claims a dispatch
+//! and holds it through delivery and settlement. The process-wide and tenant
+//! ceilings apply only to Operator deliveries; Verifier runs take no permits.
+//! The durable queue remains the sole record of which dispatches exist.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,20 +11,20 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wyrd_spec::DataTenantId;
 
-/// Capacity held by one in-flight Verifier execution.
+/// Capacity held by one in-flight Operator delivery.
 ///
 /// Dropping it returns both the tenant and the global slot.
 #[derive(Debug)]
-pub struct VerifierPermit {
+pub struct OperatorPermit {
     /// The tenant's slot.
     _tenant: OwnedSemaphorePermit,
     /// The process-wide slot.
     _global: OwnedSemaphorePermit,
 }
 
-/// Owner of the process-wide and per-tenant Verifier ceilings.
+/// Owner of the process-wide and per-tenant Operator ceilings.
 #[derive(Debug)]
-pub struct VerifierPermits {
+pub struct OperatorPermits {
     /// Process-wide ceiling.
     global: Arc<Semaphore>,
     /// Global capacity, kept to report active work.
@@ -35,7 +35,7 @@ pub struct VerifierPermits {
     tenants: Mutex<HashMap<DataTenantId, Arc<Semaphore>>>,
 }
 
-impl VerifierPermits {
+impl OperatorPermits {
     /// Build ceilings of `global` executions in total and `per_tenant` per tenant.
     #[must_use]
     pub fn new(global: usize, per_tenant: usize) -> Self {
@@ -57,7 +57,7 @@ impl VerifierPermits {
     /// # Panics
     /// Panics when the tenant map lock was poisoned by a panic while held,
     /// which no code path inside the lock can cause.
-    pub fn try_acquire(&self, tenant: DataTenantId) -> Option<VerifierPermit> {
+    pub fn try_acquire(&self, tenant: DataTenantId) -> Option<OperatorPermit> {
         let mut tenants = self
             .tenants
             .lock()
@@ -68,7 +68,7 @@ impl VerifierPermits {
             .or_insert_with(|| Arc::new(Semaphore::new(self.per_tenant)));
         let tenant_permit = Arc::clone(semaphore).try_acquire_owned().ok()?;
         let global = Arc::clone(&self.global).try_acquire_owned().ok()?;
-        Some(VerifierPermit {
+        Some(OperatorPermit {
             _tenant: tenant_permit,
             _global: global,
         })
@@ -98,7 +98,7 @@ mod tests {
     /// Panics when a ceiling is not enforced or a released slot is not reusable.
     #[test]
     fn tenant_and_global_ceilings_bound_acquisition() {
-        let permits = VerifierPermits::new(6, 4);
+        let permits = OperatorPermits::new(6, 4);
         let busy = DataTenantId::new_v7();
         let other = DataTenantId::new_v7();
         let mut held: Vec<_> = (0..4)

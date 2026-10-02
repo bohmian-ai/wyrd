@@ -349,3 +349,31 @@ replaced it. `tenant_mismatch` remains only as the `select` reason for an
 unmatched selector, and the three journeys still assert it there. `fmt`, `lints`,
 and `test:shared` (724 passed) exited 0. The identity lane was not rerun because
 no journey referenced the removed check.
+
+### Spec revision 8 verification
+
+Spec revision 8 supersedes the handoff and renewal text above: CLI login uses the
+RFC 8628 device grant, and RefreshPending, generation, LoggedOut,
+lock_timeout, and the per-login format_version are gone. Implementation:
+061f1906f, 9f5859303, and cf2b637d3, which removes stale handoff wording from
+`/auth/login` and `TokenExchange` docs.
+
+Audit against revision 8:
+- Device grant: `POST /auth/device_authorization`, `/auth/device`, and the
+  `urn:ietf:params:oauth:grant-type:device_code` grant at `/auth/token`.
+  Errors are `authorization_pending`, `slow_down`, `access_denied`,
+  `expired_token`, and `invalid_grant`.
+- No CLI handoff remains in code, SQL, docs, or tests.
+- The browser `BeginLogin` flow is unchanged; only the CLI branch was removed.
+- Without `tenant`, the newest login for the server is used.
+- Logout deletes the record first, then revokes best-effort and warns.
+- The 0600, symlink, and directory checks still fail closed.
+
+Lane exit codes (each lane run alone):
+
+| Lane | Exit |
+|---|---|
+| fmt, lints, py:format, py:lints | 0 |
+| codegen:check, check:client-tier, check:pyo3-scope, check:py-wheel-no-testing, check:workspace-hack, docs:check | 0 |
+| py:test:unit, py:typecheck, ts:test:unit, ts:typecheck, ts:napi:check, test:wyrd-sdk | 0 |
+| test:identity:journey (all targets and unfiltered), test:shared, test:cli:journey, test:principals:integration, py:test:integration, ts:test:integration, test:wyrd | not run: Docker daemon absent on host |

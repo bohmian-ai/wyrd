@@ -1671,6 +1671,111 @@ mod tests {
                 .insert(binding(ExternalGatewayProtocol::OpenAiChat, &with_path))
                 .is_err()
         );
+
+        // Bindings may not set transport, routing, forwarding, proxy, or
+        // Wyrd-internal names, but may set credential names a Card cannot.
+        let with_header = |header_name: &str| ExternalGatewayBinding {
+            secret_headers: [(
+                http::HeaderName::from_bytes(header_name.as_bytes()).expect("header name"),
+                SecretString::from("s3cret"),
+            )]
+            .into(),
+            ..binding(ExternalGatewayProtocol::OpenAiChat, &origin)
+        };
+        for reserved in [
+            "Host",
+            "content-length",
+            "Transfer-Encoding",
+            "connection",
+            "te",
+            "upgrade",
+            "forwarded",
+            "X-Forwarded-For",
+            "x-forwarded-host",
+            "Proxy-Authorization",
+            "x-wyrd-access-token",
+            "wyrd-request-id",
+        ] {
+            let error = ExternalGatewayBindings::new()
+                .insert(with_header(reserved))
+                .expect_err("reserved binding header is refused");
+            assert_eq!(
+                error.code(),
+                "WYRD_WORKFLOW_503_BINDING_UNAVAILABLE",
+                "{reserved}"
+            );
+            assert!(!format!("{error:?}").contains("s3cret"), "{reserved}");
+        }
+        for credential in ["Authorization", "x-api-key", "x-auth-token", "x-org-secret"] {
+            ExternalGatewayBindings::new()
+                .insert(with_header(credential))
+                .expect("credential binding header is accepted");
+        }
+
+        // A gateway reflecting the bound credential in its refusal keeps its
+        // status but never surfaces the credential.
+        let reflecting = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad credential: s3cret"))
+            .mount(&reflecting)
+            .await;
+        let reflecting_origin = url::Url::parse(&reflecting.uri()).expect("uri parses");
+        let reflecting_base = format!("{}/v1", reflecting.uri());
+        let client = skald_providers::ExternalGatewayClient::new(
+            skald_providers::EndpointPolicy::new(false),
+            url::Url::parse(&reflecting_base).expect("base parses"),
+            [(
+                http::HeaderName::from_static("x-org-secret"),
+                http::HeaderValue::from_static("s3cret"),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("client builds");
+        let error = client
+            .send(
+                "gpt-test",
+                ProviderRequest::OpenAiChatCompletion(
+                    serde_json::from_value(json!({
+                        "model": "gpt-test",
+                        "messages": [{ "role": "user", "content": "hi" }]
+                    }))
+                    .expect("chat request decodes"),
+                ),
+            )
+            .await
+            .expect_err("gateway refuses");
+        assert!(
+            matches!(
+                error,
+                skald_providers::ProviderError::Status { status: 401, .. }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), "SKALD_PROVIDERS_401_AUTH");
+        assert!(!format!("{error}").contains("s3cret"), "{error}");
+        assert!(!format!("{error:?}").contains("s3cret"), "{error:?}");
+        let run = workflow_for(
+            ExternalGatewayProtocol::OpenAiChat,
+            &reflecting_base,
+            "x-team",
+            "corp",
+        )
+        .run_with_options(
+            &deps(
+                bindings_for(ExternalGatewayProtocol::OpenAiChat, &reflecting_origin),
+                ExternalEndpointProfile::Local,
+            ),
+            serde_json::Map::new(),
+            WorkflowRunOptions::default(),
+        )
+        .await
+        .expect("bound route is available");
+        assert_eq!(run.status, WorkflowRunStatus::Failed);
+        assert_eq!(run.steps["ext"].attempts, 1, "401 stays non-retryable");
+        let projected = serde_json::to_string(&run).expect("run serializes");
+        assert!(!projected.contains("s3cret"), "{projected}");
     }
 
     /// Scenario 6: input, step-result, and run budgets use canonical sizes;

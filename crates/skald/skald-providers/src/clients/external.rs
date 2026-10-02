@@ -21,6 +21,10 @@ use crate::transport::HttpTransport;
 /// Provider label used in errors raised by external-gateway calls.
 const PROVIDER: &str = "ext_gateway";
 
+/// Fixed diagnostic replacing an external gateway's refusal body, which may
+/// reflect the bound credential the gateway received.
+const WITHHELD_REFUSAL_BODY: &str = "external gateway refusal body withheld";
+
 /// Client for one external gateway endpoint and header set.
 ///
 /// The client is immutable after construction: its base URL, headers, retry
@@ -129,9 +133,15 @@ impl ExternalGatewayClient {
 
     /// Posts one JSON body with the configured headers and retry policy.
     ///
+    /// A final non-success answer keeps its status and `Retry-After` hint, so
+    /// status-based retry classification is unchanged, but its body is
+    /// replaced by [`WITHHELD_REFUSAL_BODY`]: a gateway can echo the bound
+    /// secret headers it received, and the error is publicly inspectable.
+    ///
     /// # Errors
     ///
-    /// Returns the errors of [`super::send_json_with_retry`].
+    /// Returns the errors of [`super::send_json_with_retry`], with any
+    /// [`ProviderError::Status`] body withheld.
     async fn post<T, R>(&self, url: &str, body: &T) -> ProviderResult<R>
     where
         T: serde::Serialize + ?Sized,
@@ -146,5 +156,19 @@ impl ExternalGatewayClient {
             &self.retry,
         )
         .await
+        .map_err(|error| match error {
+            ProviderError::Status {
+                provider,
+                status,
+                retry_after_ms,
+                ..
+            } => ProviderError::Status {
+                provider,
+                status,
+                body: WITHHELD_REFUSAL_BODY.to_owned(),
+                retry_after_ms,
+            },
+            other => other,
+        })
     }
 }

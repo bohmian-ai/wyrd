@@ -2574,6 +2574,10 @@ impl PyWorkflowCards {
     /// and Prompt is read along the Workflow's locked relationships, so later
     /// versions never float in. The GIL is released while loading.
     ///
+    /// Loading only reads Cards; it registers and runs nothing. It blocks
+    /// until loading finishes, and a failure after some reads returns no
+    /// partial Workflow and writes nothing durable.
+    ///
     /// # Arguments
     /// * `uid` - Exact server-assigned Workflow UID.
     /// * `space` - Workflow space.
@@ -2584,9 +2588,13 @@ impl PyWorkflowCards {
     /// A runnable `wyrd.agent.Workflow`.
     ///
     /// # Errors
-    /// Returns a validation error for a mixed or incomplete selector, and a
-    /// Wyrd error when a Card is unreadable, inactive, not a Workflow, or
-    /// fails hydration or validation.
+    /// Returns `WYRD_DATA_400_VALIDATION` for a mixed or incomplete selector
+    /// or a malformed field, before any read. Otherwise returns the error of
+    /// the shared [`wyrd_client::WorkflowCards::load`]:
+    /// `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot read
+    /// Cards, `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no Workflow matches, and
+    /// the inactive-dependency and Workflow validation errors. Python raises
+    /// each as a `WyrdError` with that code.
     #[pyo3(signature = (*, uid=None, space=None, name=None, version=None))]
     fn load(
         &self,

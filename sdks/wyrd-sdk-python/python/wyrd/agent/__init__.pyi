@@ -672,6 +672,9 @@ class Workflow:
         configuration (`WYRD_SERVER_URL` and `WYRD_API_KEY` or
         `WYRD_ACCESS_TOKEN`).
 
+        Loading only reads files and Cards; it registers and runs nothing. A
+        failure after some reads returns no partial Workflow.
+
         Args:
             path (PathLike): Workflow entry file.
 
@@ -682,8 +685,9 @@ class Workflow:
             WyrdError: When the file fails to load or validate;
                 `WYRD_CLIENT_401_NO_CREDENTIALS` when the file references a
                 registered Card and no credential is configured;
-                `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a referenced Card does
-                not exist or was deleted.
+                `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot
+                read Cards; `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a
+                referenced Card does not exist or was deleted.
 
         Example:
             ```python

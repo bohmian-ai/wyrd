@@ -153,7 +153,16 @@ impl NativeCards {
     /// Loads one registered Workflow and its locked Agents and Prompts.
     ///
     /// `selector_json` is `{ "space", "name", "version" }` or `{ "uid" }`; any
-    /// other shape, including a mix of both, is refused before any read.
+    /// other shape, including a mix of both, is refused with
+    /// `WYRD_SPEC_400_VALIDATION` before any read. A valid selector delegates
+    /// to the shared [`wyrd_client::WorkflowCards::load`], which reads every
+    /// Card at its locked version.
+    ///
+    /// Never rejects: a failure is returned in [`NativeWorkflowLoad::error`]
+    /// with its catalog code, and the public TypeScript `cards.workflow.load`
+    /// throws it as a `WyrdError`. Loading only reads Cards. If the Node
+    /// promise is abandoned, completed reads may already have happened, but
+    /// no partial Workflow is returned and nothing durable is written.
     #[napi]
     pub async fn load_workflow(&self, selector_json: String) -> NativeWorkflowLoad {
         let outcome = match parse_workflow_selector(&selector_json) {

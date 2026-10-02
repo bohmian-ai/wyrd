@@ -477,6 +477,10 @@ impl PyWorkflow {
     /// Wyrd client configuration. The GIL is released while the shared Wyrd
     /// runtime drives loading.
     ///
+    /// Loading only reads files and Cards; it registers and runs nothing. It
+    /// blocks until loading finishes, and a failure after some reads returns
+    /// no partial Workflow and writes nothing durable.
+    ///
     /// Args:
     ///     path (str | os.PathLike[str]): Workflow entry file.
     ///
@@ -484,8 +488,18 @@ impl PyWorkflow {
     ///     Workflow: Fully hydrated and validated workflow.
     ///
     /// Raises:
-    ///     `WyrdError`: When the file fails to load or validate, credentials
-    ///         are missing, or a referenced Card cannot be read.
+    ///     `WyrdError`: `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when the file
+    ///         fails to load; `WYRD_CLIENT_401_NO_CREDENTIALS` when a
+    ///         registry ref needs a credential and none is configured;
+    ///         `WYRD_PERMISSION_403_DENIED_RBAC` when the credential cannot
+    ///         read Cards; `WYRD_REGISTRY_404_CARD_NOT_FOUND` when a referenced
+    ///         Card is missing or deleted; and the Workflow validation error
+    ///         when the loaded graph is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the shared [`wyrd_client::Workflow::from_path`],
+    /// raised in Python as the `WyrdError` with the codes listed above.
     #[staticmethod]
     fn from_path(py: Python<'_>, path: PathBuf) -> WyrdPyResult<Self> {
         let workflow =

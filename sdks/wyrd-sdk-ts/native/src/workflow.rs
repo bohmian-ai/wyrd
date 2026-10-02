@@ -4,6 +4,8 @@
 //! and returns either a Workflow handle or a catalog error, so failures keep
 //! their stable codes.
 
+use std::result::Result as StdResult;
+
 use napi::Result;
 use napi_derive::napi;
 use serde::Deserialize;
@@ -34,7 +36,7 @@ pub struct NativeWorkflowLoad {
 
 impl NativeWorkflowLoad {
     /// Project one load outcome onto the closed result.
-    pub(crate) fn from_outcome(outcome: std::result::Result<Workflow, WyrdError>) -> Self {
+    pub(crate) fn from_outcome(outcome: StdResult<Workflow, WyrdError>) -> Self {
         match outcome {
             Ok(workflow) => Self {
                 workflow: Some(NativeWorkflow { workflow }),
@@ -70,9 +72,7 @@ struct WorkflowSelectorJson {
 ///
 /// Returns `WYRD_SPEC_400_VALIDATION` when the JSON is neither `{ uid }` nor
 /// `{ space, name, version }`, including a mix of both, or a field is invalid.
-pub(crate) fn parse_workflow_selector(
-    selector_json: &str,
-) -> std::result::Result<CardSelector, WyrdError> {
+pub(crate) fn parse_workflow_selector(selector_json: &str) -> StdResult<CardSelector, WyrdError> {
     let invalid = |reason: &str| WyrdError::Validation {
         message: format!(
             "Workflow selector must be {{ uid }} or {{ space, name, version }}: {reason}"
@@ -99,8 +99,16 @@ pub(crate) fn parse_workflow_selector(
 
 /// Load an authored Workflow file and the Cards it references.
 ///
-/// Local files load without a server. Registry refs are read through the
-/// ambient client configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`).
+/// Delegates to the shared [`Workflow::from_path`]: local files load without
+/// a server, and registry refs are read through the ambient client
+/// configuration (`WYRD_SERVER_URL`, `WYRD_API_KEY`). Never rejects: a load
+/// failure is returned in [`NativeWorkflowLoad::error`] with its catalog
+/// code, and the public TypeScript `Workflow.fromPath` throws it as a
+/// `WyrdError`.
+///
+/// Loading only reads files and Cards. If the Node promise is abandoned,
+/// completed reads may already have happened, but no partial Workflow is
+/// returned and nothing durable is written.
 #[napi]
 pub async fn load_workflow_from_path(path: String) -> NativeWorkflowLoad {
     NativeWorkflowLoad::from_outcome(Workflow::from_path(path).await)

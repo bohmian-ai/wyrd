@@ -11949,6 +11949,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-bifrost-redux",
+ "vala-eval",
  "vala-sql",
  "wiremock",
  "workspace-hack",

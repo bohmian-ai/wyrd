@@ -25,7 +25,7 @@ use wyrd_auth_oidc::{
     RelyingPartyError, ScreenedHttp, VerifiedIdToken,
 };
 use wyrd_crypt::SealingKeyring;
-use wyrd_spec::auth::{IssuerUrl, LoginInitResponse};
+use wyrd_spec::auth::LoginInitResponse;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::queries::platform::identity::{
     PlatformOidcConnectionRow, insert_platform_login_state, platform_oidc_connection,
@@ -128,24 +128,16 @@ impl PlatformLogin {
         }
     }
 
-    /// Discover `issuer` now, metadata and advertised key set, and return the
-    /// key set's URL for the connection about to be stored.
+    /// The relying party, and so the provider cache, this login's begin and
+    /// callback use.
     ///
-    /// Platform connection setup calls this before persisting, so a
-    /// connection is stored only when standard discovery succeeds. The fresh
-    /// provider replaces this login's cached entry
-    /// ([`RelyingParty::discover`]), so this process's next begin and
-    /// callback use the provider as it was just discovered.
-    ///
-    /// # Errors
-    /// Returns the [`RelyingPartyError`] of the failed discovery; any cached
-    /// entry is then left as it was.
-    pub async fn discover_jwks_uri(
-        &self,
-        issuer: &IssuerUrl,
-    ) -> Result<url::Url, RelyingPartyError> {
-        let provider = self.relying_party.discover(issuer).await?;
-        Ok(provider.jwks_uri().url().clone())
+    /// Platform connection setup discovers through it
+    /// ([`RelyingParty::discover`]) so a connection is stored only when
+    /// standard discovery succeeds and this process's next begin and callback
+    /// use the provider as it was just discovered.
+    #[must_use]
+    pub fn relying_party(&self) -> &RelyingParty {
+        &self.relying_party
     }
 
     /// Load the configured connection, or report that there is none.

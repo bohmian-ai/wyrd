@@ -173,8 +173,8 @@ pub(super) async fn authorize_read(
 /// Install or replace the deployment's platform OIDC connection.
 ///
 /// Before anything is stored, the issuer is discovered in full, provider
-/// metadata and its advertised key set, through the process-owned
-/// [`PlatformLogin`]; the discovered `jwks_uri` is persisted and the fresh
+/// metadata and its advertised key set, through the process-owned platform
+/// login's relying party; the discovered `jwks_uri` is persisted and the fresh
 /// provider replaces this process's cached one.
 ///
 /// # Errors
@@ -246,10 +246,16 @@ async fn configure_connection(
             details: serde_json::json!({ "field": "issuer_url" }),
         })
     })?;
-    let jwks_uri = login_service(&state)?
-        .discover_jwks_uri(&issuer)
+    // Full discovery through the process-owned relying party: the provider
+    // and its key set must load as login will load them, and the fresh entry
+    // replaces any cached one before the new row commits, so this process's
+    // next begin and callback use it.
+    let provider = login_service(&state)?
+        .relying_party()
+        .discover(&issuer)
         .await
         .map_err(|error| crate::components::admin::routes::discovery_error(&issuer, error))?;
+    let jwks_uri = provider.jwks_uri().url().clone();
 
     let sealed = seal_platform_client_secret(&client_auth, state.auth.sealing_key.as_deref())
         .map_err(|error| {

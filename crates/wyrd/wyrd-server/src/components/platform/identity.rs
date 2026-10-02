@@ -256,7 +256,6 @@ async fn configure_connection(
         &mut decision,
         issuer.as_str(),
         jwks_uri.as_str(),
-        &request.expected_audience,
         &request.client_id,
         client_auth_label(&client_auth),
         &platform_claim_mapping(),
@@ -270,7 +269,6 @@ async fn configure_connection(
     Ok(Json(PlatformOidcConnectionView {
         issuer_url: issuer.as_str().to_owned(),
         jwks_uri: jwks_uri.to_string(),
-        expected_audience: request.expected_audience,
         client_id: request.client_id,
         client_auth: client_auth_label(&client_auth).to_owned(),
         jwks_ttl_secs: request.jwks_ttl_secs,
@@ -325,7 +323,6 @@ async fn read_connection(
     Ok(Json(PlatformOidcConnectionView {
         issuer_url: row.issuer_url,
         jwks_uri: row.jwks_uri,
-        expected_audience: row.expected_audience,
         client_id: row.client_id,
         client_auth: row.client_auth,
         jwks_ttl_secs: row.jwks_ttl_secs,
@@ -644,29 +641,18 @@ async fn set_admin_status(
     }
 }
 
-/// Build the platform login service from server state.
+/// The process-owned platform login service, built once at boot.
 ///
 /// # Errors
 /// Returns an internal error when the platform plane or the signing key is not
-/// configured.
-fn login_service(state: &AppState) -> Result<PlatformLogin, WyrdErrorResponse> {
-    let pool = operator(state)?;
-    let issuing_key = state.auth.issuing_key.clone().ok_or_else(|| {
+/// configured, so no platform login owner was built.
+fn login_service(state: &AppState) -> Result<&PlatformLogin, WyrdErrorResponse> {
+    state.auth.platform_login.as_ref().ok_or_else(|| {
         WyrdErrorResponse::from(WyrdError::Internal {
-            message: "platform session issuance is not configured".to_owned(),
+            message: "platform federated login is not configured".to_owned(),
             details: serde_json::json!({ "plane": "platform" }),
         })
-    })?;
-    let sessions = std::sync::Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
-        pool.clone(),
-        issuing_key,
-    ));
-    Ok(PlatformLogin::new(
-        pool,
-        state.auth.sealing_key.clone(),
-        sessions,
-        state.deployment_profile.screened_http(),
-    ))
+    })
 }
 
 /// Begin a platform federated login.
@@ -743,7 +729,12 @@ async fn complete_login(
         }
     };
     let token = login_service(&state)?
-        .complete(SecretString::from(request.code), &request.state, req_id)
+        .complete(
+            SecretString::from(request.code),
+            &request.state,
+            request.iss.as_deref(),
+            req_id,
+        )
         .await
         .map_err(login_error)?;
 

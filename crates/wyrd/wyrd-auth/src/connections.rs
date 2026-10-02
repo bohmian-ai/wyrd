@@ -933,9 +933,12 @@ async fn commit_refusal<T>(conn: TenantConn<'_>, refusal: WyrdError) -> Result<T
     Err(refusal)
 }
 
-/// A failed test check with a stable machine-readable reason.
-/// Require the key set discovery fetched to hold at least one key the
-/// verifier can decode.
+/// Require the key set a candidate test's fresh discovery fetched to hold at
+/// least one key, so a connection whose provider publishes no signing key is
+/// never marked tested.
+///
+/// `openidconnect` already dropped any key it could not decode while
+/// discovering, so an empty set means no key the ID-token verifier could use.
 ///
 /// # Errors
 /// Returns [`WyrdError::ConnectionNotTested`] with reason `jwks_unusable`
@@ -951,6 +954,11 @@ fn require_usable_jwks(provider: &ProviderMetadata) -> Result<(), WyrdError> {
     Ok(())
 }
 
+/// A failed connection-test check with a stable machine-readable `reason`.
+///
+/// Every candidate-test refusal and the activation guard build their
+/// [`WyrdError::ConnectionNotTested`] here, so clients branch on the stable
+/// `details.reason` code and `message` stays human-facing text.
 fn not_tested_reason(reason: &str, message: &str) -> WyrdError {
     WyrdError::ConnectionNotTested {
         message: message.to_owned(),

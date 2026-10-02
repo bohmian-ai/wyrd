@@ -4413,6 +4413,15 @@ impl WyrdTestServerBuilder {
             DeploymentProfile::Development.screened_http(),
             self.public_origin.as_ref(),
         );
+        let platform_login = wyrd_auth::platform_login::PlatformLogin::new(
+            fixture.operator_pool().clone(),
+            Some(Arc::clone(&sealing_key)),
+            Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
+                fixture.operator_pool().clone(),
+                Arc::clone(&issuing_key),
+            )),
+            DeploymentProfile::Development.screened_http(),
+        );
         let bff =
             self.bff_service_key_hash
                 .map(|hash| wyrd_server::components::auth::bff::BffChannel {
@@ -4626,6 +4635,7 @@ impl WyrdTestServerBuilder {
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
                 human_connections: Some(human_connections),
+                platform_login: Some(platform_login),
                 bff,
             })
             .with_gateway(test_gateway_config(

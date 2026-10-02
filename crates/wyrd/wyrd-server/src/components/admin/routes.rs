@@ -29,8 +29,8 @@ use axum::http::StatusCode;
 use secrecy::SecretString;
 use serde::Deserialize;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, RelyingParty, RelyingPartyError, ScreenError,
-    TrustedIssuer, WorkloadBinding,
+    ClaimMapping, ClaimPath, ClientAuth, RelyingPartyError, ScreenError, TrustedIssuer,
+    WorkloadBinding,
 };
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
@@ -735,7 +735,10 @@ async fn acquire_conn<'a>(
 /// Resolve the issuer's `jwks_uri` via OIDC discovery.
 ///
 /// The issuer URL is already validated by [`IssuerUrl`]; a discovery failure is
-/// a `503`. Discovery runs through a [`RelyingParty`] over the deployment's
+/// a `503`. Only the discovery document is read
+/// ([`ScreenedHttp::provider_metadata`](wyrd_auth_oidc::ScreenedHttp::provider_metadata));
+/// the key set is fetched by the verifier when a token first needs it. The
+/// read goes through the deployment's
 /// [`ScreenedHttp`](wyrd_auth_oidc::ScreenedHttp), which owns the address
 /// policy, the bounded resolution, the pinning, and the redirect refusal — the
 /// same capability the login, token-exchange, and JWKS-refresh paths use, so
@@ -745,14 +748,15 @@ async fn acquire_conn<'a>(
 ///
 /// Returns a `MissingRequiredField` rejection when the issuer resolves to a
 /// blocked address, and `DiscoveryUnavailable` when the host cannot be
-/// resolved, the client cannot be built, or discovery itself (including the
-/// key-set fetch) fails.
+/// resolved, the client cannot be built, or the discovery read fails or names
+/// another issuer.
 pub(crate) async fn discover_jwks_uri(
     issuer: &IssuerUrl,
     deployment_profile: DeploymentProfile,
 ) -> Result<url::Url, WyrdErrorResponse> {
-    let provider = RelyingParty::new(deployment_profile.screened_http())
-        .discover(issuer)
+    let metadata = deployment_profile
+        .screened_http()
+        .provider_metadata(issuer)
         .await
         .map_err(|error| match error {
             RelyingPartyError::Screened(error) => screen_error(error),
@@ -768,7 +772,7 @@ pub(crate) async fn discover_jwks_uri(
                 })
             }
         })?;
-    Ok(provider.jwks_uri().url().clone())
+    Ok(metadata.jwks_uri().url().clone())
 }
 
 /// Project a screening refusal onto the admin error catalog.
@@ -1062,7 +1066,9 @@ mod pg_tests {
         principal_with(tenant, PermissionSet::new())
     }
 
-    /// Start a wiremock IdP that answers OIDC discovery, returning the issuer URL.
+    /// Start a wiremock IdP that answers OIDC discovery while its key set is
+    /// unavailable, returning the issuer URL. Workload issuer creation reads
+    /// only the discovery document, so it must not need the keys.
     async fn discovery_server() -> (MockServer, IssuerUrl) {
         let server = MockServer::start().await;
         let issuer = server.uri();
@@ -1081,9 +1087,7 @@ mod pg_tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/jwks"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
-            )
+            .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
         let issuer_url = IssuerUrl::new(&issuer).expect("loopback http issuer is valid");
@@ -1255,7 +1259,7 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let state = test_state(&fixture).await;
-        let (_server, issuer) = discovery_server().await;
+        let (server, issuer) = discovery_server().await;
 
         let view = create_trusted_issuer(
             State(state.clone()),
@@ -1263,10 +1267,18 @@ mod pg_tests {
             Json(create_issuer_request(issuer.clone(), Some(SECRET))),
         )
         .await
-        .expect("create succeeds")
+        .expect("create succeeds while the key set is unavailable")
         .0;
         assert_eq!(view.issuer, issuer.as_str());
         assert!(view.jwks_uri.ends_with("/jwks"));
+        let key_set_requests = server
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .iter()
+            .filter(|request| request.url.path() == "/jwks")
+            .count();
+        assert_eq!(key_set_requests, 0, "creation never fetches keys");
 
         // The create response is structurally redacted: no secret field anywhere.
         let body = serde_json::to_value(&view).expect("view serializes");

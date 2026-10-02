@@ -187,7 +187,6 @@ impl AuthorizationCodeExchange {
         let redemption = CodeRedemption {
             client_id: &trusted.client_id,
             client_auth: &trusted.client_auth,
-            audience: &trusted.expected_audience,
             claim_mapping: &trusted.claim_mapping,
             redirect_uri: &login_state.redirect_uri,
             code_verifier: &login_state.code_verifier,

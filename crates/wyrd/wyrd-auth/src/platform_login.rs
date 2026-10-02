@@ -33,6 +33,7 @@ use wyrd_sql::queries::platform::identity::{
 };
 use wyrd_sql::{OperatorPool, SqlError};
 
+use crate::callback::verify_response_issuer;
 use crate::error::relying_party_error;
 use crate::pg_resolvers::platform_connection_from_row;
 use crate::platform_sessions::{PlatformSessionError, PlatformSessions};
@@ -85,6 +86,11 @@ pub enum PlatformLoginError {
 /// is sealed with, the relying party that runs the provider exchange and
 /// verifies its ID token, and the session minter — a login is only meaningful
 /// as the composition of all four.
+///
+/// Built once per process and shared by the begin and callback routes; clones
+/// share one relying-party cache, so a callback reuses the provider state its
+/// begin discovered.
+#[derive(Clone)]
 pub struct PlatformLogin {
     /// Cross-tenant boundary the connection and identity stores live behind.
     pool: OperatorPool,
@@ -219,19 +225,23 @@ impl PlatformLogin {
 
     /// Complete a platform login and mint a platform session.
     ///
-    /// Consumes the login state exactly once, reads the provider from the
+    /// Consumes the login state exactly once and reads the provider from the
     /// relying party's per-issuer cache (re-discovered once when the ID token
-    /// names an unknown key), and has the relying party exchange the code and verify the ID token —
-    /// its issuer, the connection's expected audience, signature, expiry,
-    /// issued-at, nonce, and authorized party. The subject then resolves to a
-    /// pre-registered principal, pinned if this is that principal's first
-    /// login.
+    /// names an unknown key). The authorization response's `iss`
+    /// (`response_issuer`) is bound to the login's issuer by
+    /// [`verify_response_issuer`] (RFC 9207) before the code reaches any token
+    /// endpoint. The relying party then exchanges the code and verifies the
+    /// ID token — its issuer, the connection's client ID as its audience,
+    /// signature, expiry, issued-at, nonce, and authorized party. The subject
+    /// then resolves to a pre-registered principal, pinned if this is that
+    /// principal's first login.
     ///
     /// # Errors
     /// Returns [`PlatformLoginError::InvalidState`] for a missing, expired, or
     /// replayed state, [`PlatformLoginError::ProviderUnavailable`] when the
     /// provider cannot be reached or refuses the code,
-    /// [`PlatformLoginError::NotAccepted`] when the ID token is rejected or its
+    /// [`PlatformLoginError::NotAccepted`] when the response issuer is
+    /// mismatched or advertised and missing, the ID token is rejected, or its
     /// subject is unregistered,
     /// [`PlatformLoginError::Store`] when the platform store fails, and
     /// [`PlatformLoginError::Session`] when the session cannot be signed.
@@ -240,6 +250,7 @@ impl PlatformLogin {
         &self,
         code: SecretString,
         state: &str,
+        response_issuer: Option<&str>,
         request_id: &str,
     ) -> Result<SecretString, PlatformLoginError> {
         let connection = self.connection().await?;
@@ -260,11 +271,21 @@ impl PlatformLogin {
             .cached(issuer)
             .await
             .map_err(provider_unavailable)?;
+        verify_response_issuer(
+            response_issuer,
+            &login_state.issuer,
+            provider
+                .additional_metadata()
+                .authorization_response_iss_parameter_supported,
+        )
+        .map_err(|error| {
+            tracing::warn!(error = %error, "platform authorization response issuer refused");
+            PlatformLoginError::NotAccepted
+        })?;
         let code_verifier = SecretString::from(login_state.code_verifier);
         let redemption = CodeRedemption {
             client_id: &connection.client_id,
             client_auth: &connection.client_auth,
-            audience: &connection.verification.expected_audience,
             claim_mapping: &connection.verification.claim_mapping,
             redirect_uri: &login_state.redirect_uri,
             code_verifier: &code_verifier,

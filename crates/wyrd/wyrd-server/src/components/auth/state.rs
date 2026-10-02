@@ -6,6 +6,7 @@ use wyrd_runtime::{PermissionCheck, RbacCheck};
 
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantTokenIssuer, TokenExchangeSettings};
+use wyrd_auth::platform_login::PlatformLogin;
 use wyrd_auth_verify::{ExternalVerifier, TokenVerifier};
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
@@ -34,6 +35,10 @@ pub struct ServerAuth {
     /// login, the callback, and connection administration all resolve human
     /// trust — and the callback URL, never request headers — through it.
     pub human_connections: Option<HumanConnections>,
+    /// The platform federated-login owner, built once at boot when the
+    /// platform plane and a signing key exist. The begin and callback routes
+    /// share it, and with it one relying-party provider cache.
+    pub platform_login: Option<PlatformLogin>,
     /// The production UI browser-session channel; `None` leaves
     /// `/internal/bff/v1/*` unmounted.
     pub bff: Option<crate::components::auth::bff::BffChannel>,

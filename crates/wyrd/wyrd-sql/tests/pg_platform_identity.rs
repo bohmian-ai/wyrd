@@ -87,7 +87,6 @@ mod pg_tests {
             issuer,
             "https://idp.example.com/jwks",
             "wyrd-platform",
-            "wyrd-platform",
             "Public",
             &serde_json::json!({"subject": "sub", "email": "email", "groups": null}),
             300,
@@ -608,7 +607,7 @@ mod pg_tests {
         let pool = fixture.operator_pool();
         let mapping = serde_json::json!({ "subject": "sub", "email": "email" });
 
-        for audience in ["first-audience", "second-audience"] {
+        for client_id in ["first-client", "second-client"] {
             let mut conn = pool
                 .begin_platform_audited()
                 .await
@@ -617,8 +616,7 @@ mod pg_tests {
                 &mut conn,
                 ISSUER,
                 "https://idp.example.com/jwks",
-                audience,
-                "wyrd-platform",
+                client_id,
                 "Public",
                 &mapping,
                 300,
@@ -634,7 +632,7 @@ mod pg_tests {
             .expect("read succeeds")
             .expect("a connection is configured");
         assert_eq!(
-            connection.expected_audience, "second-audience",
+            connection.client_id, "second-client",
             "the second configuration replaced the first rather than adding one"
         );
     }

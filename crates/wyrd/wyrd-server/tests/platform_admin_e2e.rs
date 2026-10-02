@@ -423,7 +423,6 @@ async fn an_operator_recovers_from_losing_every_platform_credential() {
             &recovered_session,
             Some(json!({
                 "issuer_url": provider.issuer(),
-                "expected_audience": "wyrd-platform",
                 "client_id": "wyrd-platform",
                 "client_auth": { "method": "secret_post", "secret": "super-secret-client-value" },
             })),
@@ -1351,6 +1350,375 @@ fn platform_request(
     }
 }
 
+/// Ed25519 key the mock platform provider signs ID tokens with.
+const PLATFORM_SIGNING_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
+/// Public half of [`PLATFORM_SIGNING_KEY`] as a JWK `x`.
+const PLATFORM_SIGNING_X: &str = "WhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ-DZ8Vw";
+/// Wyrd's client identifier at the mock platform provider, and so the only
+/// audience its ID tokens may name.
+const PLATFORM_CLIENT: &str = "wyrd-platform";
+/// Discovery path of the mock platform provider.
+const PLATFORM_DISCOVERY: &str = "/.well-known/openid-configuration";
+
+/// Reset `server` to a platform provider that advertises RFC 9207 response
+/// issuers, publishes [`PLATFORM_SIGNING_KEY`] as `mock-1`, and answers its
+/// token endpoint with `token_response`.
+async fn mount_platform_provider(
+    server: &wiremock::MockServer,
+    token_response: wiremock::ResponseTemplate,
+) {
+    server.reset().await;
+    let issuer = server.uri();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(PLATFORM_DISCOVERY))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "jwks_uri": format!("{issuer}/jwks"),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["EdDSA"],
+            "authorization_response_iss_parameter_supported": true,
+        })))
+        .mount(server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            "keys": [{ "kty": "OKP", "crv": "Ed25519", "kid": "mock-1", "x": PLATFORM_SIGNING_X }]
+        })))
+        .mount(server)
+        .await;
+    mount_platform_token(server, token_response).await;
+}
+
+/// Reset `server` to a platform provider whose discovery and key set are
+/// down, while its token endpoint still answers with `token_response`.
+async fn mount_platform_outage(
+    server: &wiremock::MockServer,
+    token_response: wiremock::ResponseTemplate,
+) {
+    server.reset().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(wiremock::ResponseTemplate::new(503))
+        .mount(server)
+        .await;
+    mount_platform_token(server, token_response).await;
+}
+
+/// Answer `server`'s token endpoint with `token_response`.
+async fn mount_platform_token(
+    server: &wiremock::MockServer,
+    token_response: wiremock::ResponseTemplate,
+) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/token"))
+        .respond_with(token_response)
+        .mount(server)
+        .await;
+}
+
+/// A token-endpoint reply carrying an ID token from `issuer` for `nonce`,
+/// addressed to `audience` and signed under `kid`, asserting the verified
+/// email the registered administrator was matched on.
+///
+/// # Panics
+/// Panics when the test key does not load or the token does not sign.
+fn platform_token_reply(
+    issuer: &str,
+    nonce: &str,
+    audience: &str,
+    kid: &str,
+) -> wiremock::ResponseTemplate {
+    let now = chrono::Utc::now().timestamp();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+    header.kid = Some(kid.to_owned());
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(PLATFORM_SIGNING_KEY.as_bytes())
+        .expect("test key loads");
+    let id_token = jsonwebtoken::encode(
+        &header,
+        &json!({
+            "iss": issuer,
+            "sub": "provider-subject-1",
+            "aud": audience,
+            "exp": now + 3600,
+            "iat": now,
+            "nonce": nonce,
+            "email": "ops@example.com",
+            "email_verified": true,
+        }),
+        &key,
+    )
+    .expect("token signs");
+    wiremock::ResponseTemplate::new(200).set_body_json(json!({
+        "access_token": "provider-access",
+        "token_type": "Bearer",
+        "id_token": id_token,
+    }))
+}
+
+/// Begin a platform login and return its state and the nonce the provider
+/// must echo.
+///
+/// # Panics
+/// Panics when begin is refused or its authorization URL carries no nonce.
+async fn begin_platform_login(srv: &WyrdTestServer) -> (String, String) {
+    let resp = srv
+        .oneshot(anonymous_post(
+            "/auth/platform/login",
+            json!({ "redirect_uri": "https://wyrd.example/callback" }),
+        ))
+        .await
+        .expect("login route responds");
+    let status = resp.status();
+    let begun = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "platform login begins: {begun}");
+    let authorization_url = url::Url::parse(
+        begun["authorization_url"]
+            .as_str()
+            .expect("authorization url"),
+    )
+    .expect("authorization url parses");
+    let nonce = authorization_url
+        .query_pairs()
+        .find(|(name, _)| name == "nonce")
+        .map(|(_, value)| value.into_owned())
+        .expect("the authorization request carries a nonce");
+    let state = begun["state"].as_str().expect("state").to_owned();
+    (state, nonce)
+}
+
+/// Present the provider's return for `state` to the served platform callback,
+/// with `iss` when the provider sent one.
+async fn platform_callback(
+    srv: &WyrdTestServer,
+    state: &str,
+    iss: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut body = json!({ "code": "provider-code", "state": state });
+    if let Some(iss) = iss {
+        body["iss"] = json!(iss);
+    }
+    let resp = srv
+        .oneshot(anonymous_post("/auth/platform/callback", body))
+        .await
+        .expect("callback route responds");
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+/// Requests `server` recorded at `route` since its last reset.
+///
+/// # Panics
+/// Panics when the mock server does not record requests.
+async fn platform_provider_hits(server: &wiremock::MockServer, route: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("requests are recorded")
+        .iter()
+        .filter(|request| request.url.path() == route)
+        .count()
+}
+
+/// Federated platform sign-in runs end to end through the served begin and
+/// `/auth/platform/callback` routes against a provider that advertises RFC
+/// 9207 response issuers:
+///   1. the connection takes no audience of its own; its client ID is the
+///      audience, and a separately supplied one is refused;
+///   2. a return without `iss`, or with another issuer's, is refused before
+///      the token endpoint sees the code;
+///   3. an ID token addressed to another client is refused;
+///   4. a return with the exact `iss` yields a session with platform
+///      authority and none inside a tenant;
+///   5. with discovery and the key set down, a callback still completes from
+///      the provider state its begin cached, and a token naming an unknown key
+///      makes exactly one forced re-discovery and fails closed.
+///
+/// # Panics
+/// Panics when any step deviates from the contract above.
+#[tokio::test]
+async fn federated_platform_sign_in_runs_through_the_served_callback() {
+    let srv = WyrdTestServer::start_in_process()
+        .await
+        .expect("server starts");
+    let root = initialize_platform_root(&srv)
+        .await
+        .expect("deployment initializes");
+    let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
+    let provider = wiremock::MockServer::start().await;
+    let issuer = provider.uri();
+    mount_platform_provider(&provider, wiremock::ResponseTemplate::new(500)).await;
+
+    // 1. The client ID is the audience; there is no second one to configure.
+    let configure = |extra: Option<(&str, &str)>| {
+        let mut body = json!({
+            "issuer_url": issuer,
+            "client_id": PLATFORM_CLIENT,
+            "client_auth": { "method": "public" },
+        });
+        if let Some((field, value)) = extra {
+            body[field] = json!(value);
+        }
+        platform_request(
+            Method::PUT,
+            "/platform/oidc/connection",
+            &session,
+            Some(body),
+        )
+    };
+    let resp = srv
+        .oneshot(configure(Some(("expected_audience", "another-client"))))
+        .await
+        .expect("configure route responds");
+    assert!(
+        resp.status().is_client_error(),
+        "a separate human audience is not an input: {}",
+        resp.status()
+    );
+    let resp = srv
+        .oneshot(configure(None))
+        .await
+        .expect("configure route responds");
+    let status = resp.status();
+    let view = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "connection configures: {view}");
+    assert!(
+        view.get("expected_audience").is_none(),
+        "the connection view carries no separate audience: {view}"
+    );
+    let resp = srv
+        .oneshot(platform_request(
+            Method::POST,
+            "/platform/admins",
+            &session,
+            Some(json!({ "name": "ops-lead", "match_claim": "ops@example.com" })),
+        ))
+        .await
+        .expect("register route responds");
+    assert_eq!(resp.status(), StatusCode::OK, "administrator registers");
+
+    // 2. RFC 9207: an advertised issuer must come back, and exactly.
+    for (label, iss) in [
+        ("missing iss", None),
+        ("another issuer's iss", Some("https://evil.example.com")),
+    ] {
+        let (state, nonce) = begin_platform_login(&srv).await;
+        mount_platform_provider(
+            &provider,
+            platform_token_reply(&issuer, &nonce, PLATFORM_CLIENT, "mock-1"),
+        )
+        .await;
+        let (status, body) = platform_callback(&srv, &state, iss).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{label}: {body}");
+        assert_eq!(
+            platform_provider_hits(&provider, "/token").await,
+            0,
+            "{label}: the code never reaches the token endpoint"
+        );
+    }
+
+    // 3. The ID token must be addressed to this client.
+    let (state, nonce) = begin_platform_login(&srv).await;
+    mount_platform_provider(
+        &provider,
+        platform_token_reply(&issuer, &nonce, "another-client", "mock-1"),
+    )
+    .await;
+    let (status, body) = platform_callback(&srv, &state, Some(&issuer)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "another client's token: {body}"
+    );
+
+    // 4. The exact issuer completes, with platform authority only.
+    let (state, nonce) = begin_platform_login(&srv).await;
+    mount_platform_provider(
+        &provider,
+        platform_token_reply(&issuer, &nonce, PLATFORM_CLIENT, "mock-1"),
+    )
+    .await;
+    let (status, body) = platform_callback(&srv, &state, Some(&issuer)).await;
+    assert_eq!(status, StatusCode::OK, "the exact issuer completes: {body}");
+    let human = body["access_token"]
+        .as_str()
+        .expect("a platform session")
+        .to_owned();
+    let resp = srv
+        .oneshot(platform_post(
+            "/platform/tenants",
+            &human,
+            json!({ "slug": "federated-provisioned", "display_name": "Federated" }),
+        ))
+        .await
+        .expect("tenant route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the signed-in administrator holds platform authority"
+    );
+    let resp = srv
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/cards")
+                .header(WYRD_ACCESS_TOKEN_HEADER, format!("Bearer {human}"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("route responds");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the federated platform session confers no access inside any tenant"
+    );
+
+    // 5. A discovery outage after begin does not break a callback whose
+    //    provider state is cached.
+    let (state, nonce) = begin_platform_login(&srv).await;
+    mount_platform_outage(
+        &provider,
+        platform_token_reply(&issuer, &nonce, PLATFORM_CLIENT, "mock-1"),
+    )
+    .await;
+    let (status, body) = platform_callback(&srv, &state, Some(&issuer)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the cached provider completes: {body}"
+    );
+    assert_eq!(
+        platform_provider_hits(&provider, PLATFORM_DISCOVERY).await
+            + platform_provider_hits(&provider, "/jwks").await,
+        0,
+        "the callback fetched no discovery or key set"
+    );
+
+    // An unknown key forces one re-discovery, which the outage refuses.
+    let (state, nonce) = begin_platform_login(&srv).await;
+    mount_platform_outage(
+        &provider,
+        platform_token_reply(&issuer, &nonce, PLATFORM_CLIENT, "rotated-away"),
+    )
+    .await;
+    let (status, body) = platform_callback(&srv, &state, Some(&issuer)).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unknown key during an outage fails closed: {body}"
+    );
+    assert_eq!(
+        platform_provider_hits(&provider, PLATFORM_DISCOVERY).await,
+        1,
+        "exactly one forced re-discovery"
+    );
+
+    srv.shutdown().await.expect("server shuts down");
+}
+
 /// An operator configures federated sign-in, registers an administrator, and
 /// can take it all away again without losing the deployment.
 ///
@@ -1410,7 +1778,6 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
             &session,
             Some(json!({
                 "issuer_url": issuer,
-                "expected_audience": "wyrd-platform",
                 "client_id": "wyrd-platform",
                 "client_auth": { "method": "secret_post", "secret": secret },
             })),
@@ -1639,7 +2006,6 @@ async fn a_tenant_administrator_cannot_configure_platform_sign_in() {
             &admin,
             Some(json!({
                 "issuer_url": "https://attacker.example.com/",
-                "expected_audience": "wyrd-platform",
                 "client_id": "wyrd-platform",
                 "client_auth": { "method": "public" },
             })),
@@ -1675,7 +2041,6 @@ async fn a_connection_cannot_name_an_unresolvable_issuer() {
             &session,
             Some(json!({
                 "issuer_url": "https://wyrd-invalid.invalid/realms/platform",
-                "expected_audience": "wyrd-platform",
                 "client_id": "wyrd-platform",
                 "client_auth": { "method": "public" },
             })),
@@ -1727,7 +2092,6 @@ async fn an_operator_lists_and_suspends_platform_administrators() {
         &session,
         Some(json!({
             "issuer_url": provider.issuer(),
-            "expected_audience": "wyrd-platform",
             "client_id": "wyrd-platform",
             "client_auth": { "method": "public" },
         })),
@@ -4384,7 +4748,6 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
         &session,
         Some(json!({
             "issuer_url": provider.issuer(),
-            "expected_audience": "wyrd-platform",
             "client_id": "wyrd-platform",
             "client_auth": { "method": "public" },
         })),
@@ -4427,8 +4790,7 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
                 &session,
                 Some(json!({
                     "issuer_url": provider.issuer(),
-                    "expected_audience": "wyrd-platform-two",
-                    "client_id": "wyrd-platform",
+                    "client_id": "wyrd-platform-two",
                     "client_auth": { "method": "public" },
                 })),
             ),
@@ -4486,13 +4848,12 @@ async fn a_failed_platform_mutation_leaves_no_allowance() {
     }
 
     // The effects never landed either.
-    let audience: String = sqlx::query_scalar(
-        "SELECT expected_audience FROM platform.oidc_connection WHERE singleton",
-    )
-    .fetch_one(&superuser)
-    .await
-    .expect("connection reads");
-    assert_eq!(audience, "wyrd-platform", "the identity write rolled back");
+    let client_id: String =
+        sqlx::query_scalar("SELECT client_id FROM platform.oidc_connection WHERE singleton")
+            .fetch_one(&superuser)
+            .await
+            .expect("connection reads");
+    assert_eq!(client_id, "wyrd-platform", "the identity write rolled back");
 
     let credentials: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM platform.credentials WHERE principal_id = $1::uuid",
@@ -4665,7 +5026,6 @@ async fn a_trailing_slash_platform_issuer_completes_first_login() {
             &session,
             Some(json!({
                 "issuer_url": typed,
-                "expected_audience": "wyrd-platform",
                 "client_id": "wyrd-platform",
                 "client_auth": { "method": "public" },
             })),

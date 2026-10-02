@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use url::Url;
 use wyrd_auth_oidc::{
-    ClaimMapping, ClaimPath, ClientAuth, RelyingParty, ScreenedHttp, TrustedIssuer, WorkloadBinding,
+    ClaimMapping, ClaimPath, ClientAuth, ScreenedHttp, TrustedIssuer, WorkloadBinding,
 };
 use wyrd_crypt::SealingKeyring;
 use wyrd_spec::auth::IssuerUrl;
@@ -128,7 +128,7 @@ pub async fn seed_trusted_issuers(
     })?;
     // Boot issuers are operator configuration, so internal addresses stay
     // reachable; requests still go through the redirect-disabled transport.
-    let discovery = RelyingParty::new(ScreenedHttp::allowing_internal());
+    let discovery = ScreenedHttp::allowing_internal();
     let mut conn = postgres.tenant_conn(tenant_id).await?;
     for entry in entries {
         seed_one_trusted_issuer(&mut conn, tenant_id, entry, sealing_key, &discovery).await?;
@@ -143,7 +143,7 @@ async fn seed_one_trusted_issuer(
     tenant_id: DataTenantId,
     entry: &IssuerEntry,
     sealing_key: Option<&SealingKeyring>,
-    discovery: &RelyingParty,
+    discovery: &ScreenedHttp,
 ) -> Result<(), ServerBootError> {
     match discover_with_retry(&entry.issuer, discovery).await {
         Ok(jwks_uri) => {
@@ -217,16 +217,20 @@ pub async fn seed_workload_bindings(
     Ok(())
 }
 
-/// Run OIDC discovery for `issuer` through `discovery`, retrying transient
-/// failures on the bounded backoff schedule, and return the key-set URI the
-/// provider published.
+/// Read `issuer`'s discovery document through `discovery`, retrying
+/// transient failures on the bounded backoff schedule, and return the key-set
+/// URI the provider published.
+///
+/// Only the document is read ([`ScreenedHttp::provider_metadata`]); the
+/// workload verifier fetches the keys when an assertion first needs them, so
+/// a key set that is briefly unavailable does not block seeding.
 ///
 /// # Errors
 /// Returns [`ServerBootError::IssuerDiscoveryUnavailable`] when `issuer` is
 /// not a valid issuer URL (without retrying) or every attempt fails.
 async fn discover_with_retry(
     issuer: &str,
-    discovery: &RelyingParty,
+    discovery: &ScreenedHttp,
 ) -> Result<Url, ServerBootError> {
     let issuer_url =
         IssuerUrl::new(issuer).map_err(|e| ServerBootError::IssuerDiscoveryUnavailable {
@@ -236,8 +240,8 @@ async fn discover_with_retry(
 
     let mut last_message = String::from("discovery did not complete");
     for attempt in 0..DISCOVERY_MAX_ATTEMPTS {
-        match discovery.discover(&issuer_url).await {
-            Ok(provider) => return Ok(provider.jwks_uri().url().clone()),
+        match discovery.provider_metadata(&issuer_url).await {
+            Ok(metadata) => return Ok(metadata.jwks_uri().url().clone()),
             Err(error) => {
                 tracing::warn!(
                     issuer,
@@ -344,20 +348,33 @@ mod pg_tests {
         })
     }
 
-    /// Serve an empty key set at `server`'s `/jwks`, which discovery fetches.
-    async fn mount_key_set(server: &MockServer) {
+    /// Make `server`'s `/jwks` unavailable: workload seeding reads only the
+    /// discovery document, so it must succeed without the key set.
+    async fn mount_unavailable_key_set(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/jwks"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
-            )
+            .respond_with(ResponseTemplate::new(503))
             .mount(server)
             .await;
     }
 
+    /// Requests `server` received for its key set.
+    ///
+    /// # Panics
+    /// Panics when the mock server does not record requests.
+    async fn key_set_requests(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("requests are recorded")
+            .iter()
+            .filter(|request| request.url.path() == "/jwks")
+            .count()
+    }
+
     /// The discovery transport the boot tests use.
-    fn discovery() -> RelyingParty {
-        RelyingParty::new(ScreenedHttp::allowing_internal())
+    fn discovery() -> ScreenedHttp {
+        ScreenedHttp::allowing_internal()
     }
 
     /// The conventional key-set URI of `issuer`.
@@ -396,13 +413,18 @@ mod pg_tests {
             .mount(&server)
             .await;
 
-        mount_key_set(&server).await;
+        mount_unavailable_key_set(&server).await;
 
         let jwks_uri = discover_with_retry(&issuer, &discovery())
             .await
-            .expect("discovery should succeed");
+            .expect("discovery should succeed while the key set is unavailable");
 
         assert!(jwks_uri.as_str().ends_with("/jwks"));
+        assert_eq!(
+            key_set_requests(&server).await,
+            0,
+            "seeding never fetches keys"
+        );
     }
 
     #[tokio::test]
@@ -451,7 +473,7 @@ mod pg_tests {
             .mount(&server)
             .await;
 
-        mount_key_set(&server).await;
+        mount_unavailable_key_set(&server).await;
 
         let jwks_uri = discover_with_retry(&issuer, &discovery())
             .await

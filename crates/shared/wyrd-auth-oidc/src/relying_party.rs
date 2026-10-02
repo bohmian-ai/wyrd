@@ -61,9 +61,6 @@ const MAX_CACHED_PROVIDERS: u64 = 256;
 /// The same thirty seconds the deployment's token verifier allows by default.
 const CLOCK_SKEW: chrono::Duration = chrono::Duration::seconds(30);
 
-/// Random bytes in each generated `state` and `nonce` value.
-const RANDOM_VALUE_BYTES: u32 = 32;
-
 /// Longest Subject Identifier OpenID Connect Core 1.0 §2 permits, in bytes.
 const MAX_SUBJECT_BYTES: usize = 255;
 
@@ -197,6 +194,59 @@ impl ScreenedHttp {
     }
 }
 
+impl ScreenedHttp {
+    /// Read `issuer`'s discovery document alone, without fetching its key set.
+    ///
+    /// For workload trusted-issuer setup, which records the advertised
+    /// `jwks_uri` and leaves key retrieval to the workload verifier when an
+    /// assertion first needs it. One `GET` of
+    /// `{issuer}/.well-known/openid-configuration` goes through [`Self::send`]
+    /// (screened, pinned, redirect-free, bounded) and decodes into the
+    /// library's typed [`ProviderMetadata`]; the document's `issuer` must equal
+    /// `issuer` exactly (OpenID Connect Discovery 1.0 §4.3). The returned
+    /// metadata carries an empty key set.
+    ///
+    /// # Errors
+    /// Returns [`RelyingPartyError::Screened`] when screening refuses the
+    /// issuer, [`RelyingPartyError::IssuerMismatch`] when the document names
+    /// another issuer, and [`RelyingPartyError::DiscoveryUnavailable`] when the
+    /// request fails, answers other than `200`, or does not decode.
+    pub async fn provider_metadata(
+        &self,
+        issuer: &IssuerUrl,
+    ) -> Result<ProviderMetadata, RelyingPartyError> {
+        let unavailable = |message: String| RelyingPartyError::DiscoveryUnavailable(message);
+        let issuer_url = openidconnect::IssuerUrl::new(issuer.as_str().to_owned())
+            .map_err(|error| unavailable(error.to_string()))?;
+        let discovery_url = issuer_url
+            .join(".well-known/openid-configuration")
+            .map_err(|error| unavailable(error.to_string()))?;
+        let request = openidconnect::http::Request::get(discovery_url.as_str())
+            .header(
+                openidconnect::http::header::ACCEPT,
+                openidconnect::http::HeaderValue::from_static("application/json"),
+            )
+            .body(Vec::new())
+            .map_err(|error| unavailable(error.to_string()))?;
+        let response = self.send(request).await.map_err(|error| match error {
+            ProviderHttpError::Screened(error) => RelyingPartyError::Screened(error),
+            error => unavailable(error.to_string()),
+        })?;
+        if response.status() != openidconnect::http::StatusCode::OK {
+            return Err(unavailable(format!(
+                "discovery answered {}",
+                response.status()
+            )));
+        }
+        let metadata: ProviderMetadata = serde_json::from_slice(response.body())
+            .map_err(|error| unavailable(error.to_string()))?;
+        if metadata.issuer() != &issuer_url {
+            return Err(RelyingPartyError::IssuerMismatch);
+        }
+        Ok(metadata)
+    }
+}
+
 impl<'c> AsyncHttpClient<'c> for ScreenedHttp {
     type Error = ProviderHttpError;
     type Future = std::pin::Pin<
@@ -210,7 +260,10 @@ impl<'c> AsyncHttpClient<'c> for ScreenedHttp {
 }
 
 /// Why a relying-party step refused or could not complete.
-#[derive(Debug, thiserror::Error)]
+///
+/// `Clone` so a failed discovery shared by coalesced cache misses can be
+/// handed to each waiting caller.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum RelyingPartyError {
     /// Screening refused a provider URL before any request was made to it.
     #[error("provider URL refused by address screening: {0}")]
@@ -263,12 +316,11 @@ pub struct Authorization {
 /// What a code exchange needs from the login state and its connection.
 #[derive(Debug)]
 pub struct CodeRedemption<'a> {
-    /// Wyrd's client identifier at the provider.
+    /// Wyrd's client identifier at the provider, and the audience the ID
+    /// token must name (OpenID Connect Core 1.0 §3.1.3.7 step 3).
     pub client_id: &'a str,
     /// How Wyrd authenticates to the token endpoint.
     pub client_auth: &'a ClientAuth,
-    /// The audience the ID token must name.
-    pub audience: &'a str,
     /// How the verified claims map to an identity.
     pub claim_mapping: &'a ClaimMapping,
     /// The redirect URI the authorization request carried.
@@ -322,30 +374,47 @@ impl RelyingParty {
         }
     }
 
-    /// The screened transport provider requests go through.
-    #[must_use]
-    pub const fn http(&self) -> ScreenedHttp {
-        self.http
-    }
-
     /// The provider at `issuer`, from the cache when it holds one.
     ///
-    /// A miss discovers through [`Self::discover`]; concurrent misses for one
-    /// issuer each discover and the last one cached wins.
+    /// A miss discovers through Moka's `try_get_with`, so overlapping misses
+    /// for one issuer in this process share one discovery and key-set fetch
+    /// and each receives its outcome. A failure is not cached.
     ///
     /// # Errors
-    /// Returns the errors of [`Self::discover`].
+    /// Returns the errors of [`Self::fetch`].
     pub async fn cached(
         &self,
         issuer: &IssuerUrl,
     ) -> Result<Arc<ProviderMetadata>, RelyingPartyError> {
-        match self.providers.get(issuer.as_str()).await {
-            Some(provider) => Ok(provider),
-            None => self.discover(issuer).await,
-        }
+        self.providers
+            .try_get_with(issuer.as_str().to_owned(), async {
+                self.fetch(issuer).await.map(Arc::new)
+            })
+            .await
+            .map_err(|error| (*error).clone())
     }
 
     /// Discover `issuer` now and replace its cached entry.
+    ///
+    /// For a caller that must see the provider as it is at this moment, such
+    /// as a candidate connection test; every login path uses
+    /// [`Self::cached`].
+    ///
+    /// # Errors
+    /// Returns the errors of [`Self::fetch`]. A failure leaves any cached
+    /// entry as it was.
+    pub async fn discover(
+        &self,
+        issuer: &IssuerUrl,
+    ) -> Result<Arc<ProviderMetadata>, RelyingPartyError> {
+        let provider = Arc::new(self.fetch(issuer).await?);
+        self.providers
+            .insert(issuer.as_str().to_owned(), Arc::clone(&provider))
+            .await;
+        Ok(provider)
+    }
+
+    /// Fetch `issuer`'s discovery document and key set, uncached.
     ///
     /// `openidconnect` fetches `{issuer}/.well-known/openid-configuration`,
     /// requires the document's `issuer` to equal `issuer` exactly, and then
@@ -357,22 +426,13 @@ impl RelyingParty {
     /// issuer or key-set URL, [`RelyingPartyError::IssuerMismatch`] when the
     /// document names another issuer, and
     /// [`RelyingPartyError::DiscoveryUnavailable`] when either request fails or
-    /// its response does not decode. A failure leaves any cached entry as it
-    /// was.
-    pub async fn discover(
-        &self,
-        issuer: &IssuerUrl,
-    ) -> Result<Arc<ProviderMetadata>, RelyingPartyError> {
+    /// its response does not decode.
+    async fn fetch(&self, issuer: &IssuerUrl) -> Result<ProviderMetadata, RelyingPartyError> {
         let issuer_url = openidconnect::IssuerUrl::new(issuer.as_str().to_owned())
             .map_err(|error| RelyingPartyError::DiscoveryUnavailable(error.to_string()))?;
-        let provider = ProviderMetadata::discover_async(issuer_url, &self.http)
+        ProviderMetadata::discover_async(issuer_url, &self.http)
             .await
-            .map_err(discovery_error)?;
-        let provider = Arc::new(provider);
-        self.providers
-            .insert(issuer.as_str().to_owned(), Arc::clone(&provider))
-            .await;
-        Ok(provider)
+            .map_err(discovery_error)
     }
 
     /// Build the authorization request for one login attempt at `provider`.
@@ -401,8 +461,8 @@ impl RelyingParty {
             .set_redirect_uri(redirect_url(redirect_uri)?)
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
-                || CsrfToken::new_random_len(RANDOM_VALUE_BYTES),
-                || Nonce::new_random_len(RANDOM_VALUE_BYTES),
+                CsrfToken::new_random,
+                Nonce::new_random,
             )
             .add_scope(Scope::new("profile".to_owned()))
             .add_scope(Scope::new("email".to_owned()))
@@ -423,8 +483,10 @@ impl RelyingParty {
     /// verifier, authenticating as the connection's client, and decodes the
     /// response. The ID token is then verified against `provider`'s key set
     /// by [`Self::verify`]. When that names a key the set does not hold, the
-    /// issuer is discovered once more and the token is verified once against
-    /// the fresh set; it is never retried again.
+    /// issuer's cache entry is invalidated and re-entered through
+    /// [`Self::cached`], so overlapping refreshes in this process share one
+    /// fetch, and the token is verified once against that set; it is never
+    /// retried again.
     ///
     /// # Errors
     /// Returns [`RelyingPartyError::DiscoveryUnavailable`] when the provider
@@ -435,7 +497,7 @@ impl RelyingParty {
     /// endpoint is refused, unreachable, or answers with a server error,
     /// [`RelyingPartyError::TokenRejected`] when it refuses the code or its
     /// response carries no decodable ID token, the errors of
-    /// [`Self::discover`] for the re-discovery, and the errors of
+    /// [`Self::cached`] for the re-discovery, and the errors of
     /// [`Self::verify`]. Cancellation can leave the remote exchange outcome
     /// unknown; nothing local is persisted.
     pub async fn redeem(
@@ -480,7 +542,8 @@ impl RelyingParty {
                     issuer = issuer.as_str(),
                     "ID token names an unknown key; rediscovering once"
                 );
-                let fresh = self.discover(issuer).await?;
+                self.providers.invalidate(issuer.as_str()).await;
+                let fresh = self.cached(issuer).await?;
                 Self::verify(&fresh, id_token, redemption)
             }
             outcome => outcome,
@@ -514,7 +577,7 @@ impl RelyingParty {
         >,
         redemption: &CodeRedemption<'_>,
     ) -> Result<VerifiedIdToken, RelyingPartyError> {
-        let verifier = id_token_verifier(provider, redemption.audience);
+        let verifier = id_token_verifier(provider, redemption.client_id);
         let nonce = Nonce::new(redemption.nonce.to_owned());
         let claims = id_token.claims(&verifier, &nonce).map_err(claims_error)?;
         verify_authorized_party(claims, redemption.client_id)?;
@@ -554,7 +617,8 @@ fn redirect_url(redirect_uri: &str) -> Result<RedirectUrl, RelyingPartyError> {
         .map_err(|error| RelyingPartyError::Configuration(error.to_string()))
 }
 
-/// The ID-token verifier for `audience` at `provider`.
+/// The ID-token verifier for `client_id`, the only audience a human ID token
+/// may be addressed to, at `provider`.
 ///
 /// A public-client verifier, so symmetric algorithms are refused even when
 /// advertised; only algorithms the provider advertised for ID tokens are
@@ -562,11 +626,11 @@ fn redirect_url(redirect_uri: &str) -> Result<RedirectUrl, RelyingPartyError> {
 /// Expiry and issued-at are checked with [`CLOCK_SKEW`].
 fn id_token_verifier<'a>(
     provider: &ProviderMetadata,
-    audience: &str,
+    client_id: &str,
 ) -> IdTokenVerifier<'a, CoreJsonWebKey> {
     let keys = JsonWebKeySet::new(provider.jwks().keys().clone());
     IdTokenVerifier::new_public_client(
-        ClientId::new(audience.to_owned()),
+        ClientId::new(client_id.to_owned()),
         provider.issuer().clone(),
         keys,
     )
@@ -806,7 +870,6 @@ mod tests {
                 &CodeRedemption {
                     client_id: CLIENT,
                     client_auth: &ClientAuth::Public,
-                    audience: CLIENT,
                     claim_mapping: &mapping,
                     redirect_uri: "https://wyrd.example.com/auth/callback",
                     code_verifier: &verifier,
@@ -1237,5 +1300,138 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(hits(&server, DISCOVERY).await, 1);
+    }
+
+    /// Start a provider whose discovery answers slowly enough that concurrent
+    /// callers overlap, serving `first_keys` once and `later_keys` after.
+    ///
+    /// # Panics
+    /// Panics when the mock URI is not a valid loopback issuer.
+    async fn slow_provider(first_keys: Value, later_keys: Value) -> (MockServer, IssuerUrl) {
+        let server = MockServer::start().await;
+        let issuer = IssuerUrl::new(server.uri()).expect("loopback issuer is valid");
+        Mock::given(method("GET"))
+            .and(path(DISCOVERY))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(discovery(
+                        issuer.as_str(),
+                        &format!("{}/jwks", issuer.as_str()),
+                    ))
+                    .set_delay(std::time::Duration::from_millis(500)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first_keys))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(later_keys))
+            .mount(&server)
+            .await;
+        (server, issuer)
+    }
+
+    /// Redeem a code for [`CLIENT`] at `issuer` through the cache, as every
+    /// login path does.
+    ///
+    /// # Errors
+    /// Returns the refusal of [`RelyingParty::cached`] or
+    /// [`RelyingParty::redeem`].
+    async fn redeem_cached(
+        party: RelyingParty,
+        issuer: IssuerUrl,
+    ) -> Result<VerifiedIdToken, RelyingPartyError> {
+        let provider = party.cached(&issuer).await?;
+        let mapping = mapping();
+        let verifier = SecretString::from("code-verifier".to_owned());
+        party
+            .redeem(
+                &issuer,
+                provider,
+                SecretString::from("code".to_owned()),
+                &CodeRedemption {
+                    client_id: CLIENT,
+                    client_auth: &ClientAuth::Public,
+                    claim_mapping: &mapping,
+                    redirect_uri: "https://wyrd.example.com/auth/callback",
+                    code_verifier: &verifier,
+                    nonce: NONCE,
+                },
+            )
+            .await
+    }
+
+    /// Overlapping cache misses for one issuer, cold and again after the
+    /// entry is invalidated, share one discovery and key-set fetch.
+    #[tokio::test]
+    async fn overlapping_cache_misses_share_one_discovery() {
+        let (server, issuer) = slow_provider(key_set("mock-1"), key_set("mock-1")).await;
+        let party = RelyingParty::new(ScreenedHttp::allowing_internal());
+        let burst = || {
+            let mut burst = tokio::task::JoinSet::new();
+            for _ in 0..8 {
+                let party = party.clone();
+                let issuer = issuer.clone();
+                burst.spawn(async move { party.cached(&issuer).await });
+            }
+            burst.join_all()
+        };
+
+        for provider in burst().await {
+            provider.expect("the cold burst discovers");
+        }
+        assert_eq!(hits(&server, DISCOVERY).await, 1, "cold misses coalesce");
+        assert_eq!(hits(&server, "/jwks").await, 1);
+
+        party.providers.invalidate(issuer.as_str()).await;
+        for provider in burst().await {
+            provider.expect("the expired burst discovers");
+        }
+        assert_eq!(hits(&server, DISCOVERY).await, 2, "expired misses coalesce");
+        assert_eq!(hits(&server, "/jwks").await, 2);
+    }
+
+    /// Concurrent redemptions of rotated-key tokens through clones of one
+    /// owner share one refresh; each retries at most once, and a key still
+    /// unknown after that refresh fails closed.
+    #[tokio::test]
+    async fn concurrent_rotated_key_redemptions_share_one_refresh() {
+        const REDEMPTIONS: usize = 6;
+        for (token_kid, verifies) in [("rotated", true), ("never", false)] {
+            let (server, issuer) = slow_provider(key_set("old"), key_set("rotated")).await;
+            token_endpoint(
+                &server,
+                token_reply(&signed(&claims(&issuer), SIGNING_KEY, token_kid)),
+            )
+            .await;
+            let party = RelyingParty::new(ScreenedHttp::allowing_internal());
+            party.cached(&issuer).await.expect("the old key set primes");
+
+            let mut redemptions = tokio::task::JoinSet::new();
+            for _ in 0..REDEMPTIONS {
+                redemptions.spawn(redeem_cached(party.clone(), issuer.clone()));
+            }
+            let outcomes = redemptions.join_all().await;
+
+            for outcome in outcomes {
+                match (verifies, outcome) {
+                    (true, Ok(_)) => {}
+                    (false, Err(RelyingPartyError::UnknownKey)) => {}
+                    (_, outcome) => panic!("{token_kid}: unexpected {outcome:?}"),
+                }
+            }
+            assert_eq!(
+                hits(&server, DISCOVERY).await,
+                2,
+                "{token_kid}: the prime plus one shared refresh"
+            );
+            assert_eq!(hits(&server, "/jwks").await, 2, "{token_kid}");
+            assert_eq!(hits(&server, "/token").await, REDEMPTIONS, "{token_kid}");
+        }
     }
 }

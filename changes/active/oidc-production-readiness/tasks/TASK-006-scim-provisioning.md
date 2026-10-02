@@ -1,9 +1,9 @@
 ---
 id: TASK-006
 kind: implementation
-status: proposed
+status: ready
 spec: SPEC-oidc-production-readiness
-spec_revision: 6
+spec_revision: 9
 requirements: [REQ-019, INV-001, INV-002, INV-003, INV-005, INV-007, AC-010]
 depends_on: [TASK-005]
 ---
@@ -26,7 +26,7 @@ When SCIM is enabled, only provisioned active users whose client-provided `exter
 2. Bind a SCIM `externalId` to one tenant User, enforce idempotent create/update semantics and explicit active/inactive state, and reject duplicate or ambiguous identities.
 3. Apply Group membership through the existing tenant role authority and use existing User suspension plus refresh-family revocation for offboarding.
 4. Make human login consult the same active provisioned identity and mapped roles when the tenant enables SCIM, without email fallback or a second role-sync path.
-5. Document the customer's provisioning setup and qualify the claimed SCIM operations against a controlled enterprise IdP before advertising support.
+5. Document the customer's provisioning setup with the generic SCIM 2.0 endpoint and token, plus short examples for common IdPs.
 
 ## Ordered Implementation Scenarios
 
@@ -52,7 +52,7 @@ When SCIM is enabled, only provisioned active users whose client-provided `exter
 
 ## Acceptance Criteria
 
-Standard SCIM User/Group and required discovery operations support the documented IdP setup; repeated operations are idempotent and tenant isolated. SCIM-managed sign-in requires a provisioned active subject. Group changes take effect on the next Wyrd issuance, and suspension prevents renewal. Every authorization and mutation decision uses canonical audit. No SCIM value grants platform authority or bypasses tenant RBAC. A controlled IdP qualification records the exact operations and configuration claimed as supported.
+Standard SCIM User/Group and required discovery operations support the documented IdP setup; repeated operations are idempotent and tenant isolated. SCIM-managed sign-in requires a provisioned active subject. Group changes take effect on the next Wyrd issuance, and suspension prevents renewal. Every authorization and mutation decision uses canonical audit. No SCIM value grants platform authority or bypasses tenant RBAC.
 
 ## Expected Write Set and Consumer Closure
 
@@ -60,12 +60,12 @@ Likely server SCIM routes and auth integration, `wyrd-spec` wire/error contracts
 
 ## Verification and Evidence
 
-Run an exact focused SCIM journey command once the owning test target and selector are added and confirmed with `mise exec -- cargo nextest list --locked -p wyrd-server --test <target>`; do not invent a selector in this proposed task. Run the relevant `mise` identity/principals integration and boundary checks, `mise run codegen:check`, `mise run fmt`, and `mise run lints`. Record one controlled-IdP provisioning/deprovisioning run before publishing a provider support claim. Include negative tenant, identity-link, replay/idempotency, audit-failure, and refresh-revocation evidence.
+Run an exact focused SCIM journey command once the owning test target and selector are added and confirmed with `mise exec -- cargo nextest list --locked -p wyrd-server --test <target>`; do not invent a selector in this proposed task. Run the relevant `mise` identity/principals integration and boundary checks, `mise run codegen:check`, `mise run fmt`, and `mise run lints`. Include negative tenant, identity-link, replay/idempotency, audit-failure, and refresh-revocation evidence.
 
 ## Material Stop Conditions
 
-Do not implement until revision 6 is approved. Return to the spec if a customer IdP cannot send a stable `externalId` equal to the verified sign-in subject, if supporting existing Users requires implicit linking, or if a new security credential/role authority would be required.
+Return to the spec if a customer IdP cannot send a stable `externalId` equal to the verified sign-in subject, if supporting existing Users requires implicit linking, or if a new security credential/role authority would be required.
 
 ## Authority Links
 
-[Draft spec](../spec.md); [AGENTS.md](../../../../AGENTS.md); [security posture](../../../../architecture/wyrd-security-posture.md); [SCIM protocol](https://www.rfc-editor.org/rfc/rfc7644.html); [SCIM schema](https://www.rfc-editor.org/rfc/rfc7643.html).
+[Approved spec](../spec.md); [AGENTS.md](../../../../AGENTS.md); [security posture](../../../../architecture/wyrd-security-posture.md); [SCIM protocol](https://www.rfc-editor.org/rfc/rfc7644.html); [SCIM schema](https://www.rfc-editor.org/rfc/rfc7643.html).

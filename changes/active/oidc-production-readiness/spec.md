@@ -1,6 +1,6 @@
 ---
 id: SPEC-oidc-production-readiness
-revision: 8
+revision: 9
 status: approved
 ---
 
@@ -21,7 +21,7 @@ commercial distribution, which builds on the open-source server.
 
 This change supersedes the unapproved
 [`SPEC-tenant-oidc-federation`](../tenant-oidc-federation/spec.md) draft. It
-retains its tenant federation and production qualification obligations and
+retains its tenant federation obligations and
 closes its connection-selection and delivery-owner decisions. The approved UI
 foundation's local mock session is development scaffolding, not production
 authentication.
@@ -318,11 +318,11 @@ The initial SCIM delivery excludes using SCIM as an authentication mechanism.
 - **AC-001**: An OIDC-off, self-hosted deployment starts and serves an actual
   UI and SDK journey with an existing Wyrd credential; no IdP, OIDC secret,
   or mock-auth flag is present.
-- **AC-002**: A deployed self-hosted journey configures a controlled real
-  provider, follows the exact shown callback, signs in through the UI, maps
+- **AC-002**: A real-server self-hosted journey configures a standard OIDC
+  provider (Keycloak or Dex), follows the exact shown callback, signs in through the UI, maps
   a role, makes an authorized Wyrd call, and proves a denied call.
-- **AC-003**: A deployed hosted journey runs two tenants with different real
-  providers concurrently. It proves separate configuration, login, roles,
+- **AC-003**: A real-server hosted journey runs two tenants with different
+  OIDC providers (Keycloak and Dex) concurrently. It proves separate configuration, login, roles,
   session use, mutation, and removal, plus wrong-tenant callback and same-
   issuer cross-tenant refusal.
 - **AC-004**: Rust, Python, and TypeScript client journeys use a credential
@@ -353,12 +353,14 @@ The initial SCIM delivery excludes using SCIM as an authentication mechanism.
   credential or browser session. An unmapped but valid provider subject
   receives a tenant `User` without privileged grants, and an old-connection
   BFF session cannot renew after replacement or removal.
-- **AC-008**: Provider qualification uses controlled Okta, Keycloak, and
-  Entra ID accounts over externally trusted TLS for each combination publicly
-  claimed as supported. Redacted results identify the immutable Wyrd artifact,
-  topology, public origin, provider configuration fingerprint, execution time,
-  and outcome. Mock providers remain useful for continuous tests but cannot
-  alone justify a production support claim.
+- **AC-008**: Wyrd is provider agnostic: it uses only standard OIDC
+  (discovery, authorization code with PKCE, `client_secret_basic` or
+  `client_secret_post`, ID-token validation against JWKS, standard claims) and
+  has no provider-specific branch. The automated journeys prove this against
+  two independent implementations, Keycloak and Dex. Documentation gives the
+  generic setup plus short examples for common providers (such as Okta,
+  Microsoft Entra ID, Google, Auth0, and Keycloak). There is no per-provider
+  live qualification record or certified-provider list.
 - **AC-009**: Public contracts, CLI help, UI, self-hosted and SaaS docs, and
   generated schemas agree on optional OIDC, setup inputs, callback, one active
   connection, credential ownership, and failure behavior.
@@ -369,7 +371,7 @@ The initial SCIM delivery excludes using SCIM as an authentication mechanism.
   after suspension. Wrong-tenant, inactive, unprovisioned, replayed, and
   email-match attempts grant no membership or role.
 - **AC-011**: A real-server SAML journey signs a tenant user in through a
-  qualified IdP and existing Wyrd browser/CLI credential path, including a
+  standard SAML 2.0 IdP (Keycloak) and existing Wyrd browser/CLI credential path, including a
   hosted two-tenant case. Invalid signature, issuer, audience, recipient,
   destination, request binding, time, replay, inactive connection, or
   transient NameID fails without issuing Wyrd authority. OIDC and machine
@@ -385,6 +387,12 @@ TASK-001–005 until this draft is approved; TASK-006/007 are proposed only.
 
 ## Revision history
 
+- **Revision 9 — 2026-10-02 — approved**: Approved by Steven Forrester:
+  follow conventional OAuth 2.0 and OIDC for UI and programmatic access, and
+  stay provider agnostic like comparable open-source servers. Replaced the
+  live Okta/Keycloak/Entra ID qualification matrix and its evidence record
+  with standards-only behavior proven by automated journeys against Keycloak
+  and Dex, plus generic and per-provider setup docs.
 - **Revision 8 — 2026-10-02 — approved**: Approved by Steven Forrester under
   his standing direction that Wyrd does what comparable CLIs and SDKs do. CLI
   login uses the RFC 8628 device-code grant (as gh and aws sso do), replacing

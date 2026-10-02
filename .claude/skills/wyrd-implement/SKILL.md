@@ -76,6 +76,15 @@ failing command, the trace, and the diff, never your hypothesis. It returns the
 cause, fix site, and affected callers. Record its report beside the diagnosis,
 then apply the Ponytail ladder to the smallest fix at that root cause.
 
+## Never invent complexity
+
+If there is already a standard and conventional way to do something (a
+published standard such as an RFC, or the established practice of comparable
+widely used projects), do it that way. Do not invent a mechanism, state,
+check, file, setting, option, or error that the standard way does not have.
+If the task text, a review finding, or a remediation asks for one, report it
+to the caller instead of building it.
+
 ## Verify and record evidence
 
 Run the smallest complete verification set required by `AGENTS.md`: focused

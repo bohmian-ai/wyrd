@@ -108,6 +108,13 @@ standard-library, native-platform, or installed-dependency behavior before
 accepting new code. Require the smallest safe root-cause correction without
 weakening validation, error handling, security, accessibility, or durability.
 
+Reject unearned complexity. Where a standard and conventional way exists (a
+published standard such as an RFC, or the established practice of comparable
+widely used projects), the candidate must use it. Classify any mechanism,
+state, check, file, setting, option, or error beyond that standard as `DRIFT`
+unless approved authority explicitly requires it. Never require one in a
+finding or remediation; a correction follows the standard way too.
+
 Treat each failure diagnosis in the task evidence as a claim to falsify: the
 recorded cause must explain the trace, and the fix must sit at that cause. A
 change to a test, assertion, timeout, sleep, retry, `#[ignore]`, `#[allow]`, or
@@ -285,9 +292,10 @@ proposed remediation:
 
 1. Can it be deleted while preserving the complete task?
 2. Does existing repository behavior already solve it?
-3. Does the standard library or native platform solve it?
-4. Does an already-installed dependency solve it?
-5. Only then, what is the minimum necessary correction?
+3. Is there a standard and conventional way to do it? Use that, nothing more.
+4. Does the standard library or native platform solve it?
+5. Does an already-installed dependency solve it?
+6. Only then, what is the minimum necessary correction?
 
 Prefer a correction at the source that makes invalid state unrepresentable or
 prevents it from being produced. A guard at a consumer is appropriate when that

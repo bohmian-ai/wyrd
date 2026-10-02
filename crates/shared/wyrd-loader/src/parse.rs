@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{CardKind, Metadata, Spec};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::refs::InlineableSlotField;
 
 use super::error::{Diagnostic, LoadError};
 use super::path::PathSandbox;
@@ -233,6 +234,23 @@ fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<Authored
     })
 }
 
+/// Normalize one raw authored document before typed envelope decoding.
+///
+/// Walks every mapping and sequence. A key that [`InlineableSlotField`]
+/// recognizes — with its mapping's `type` discriminator, and per element for
+/// list slots — is an inlineable reference slot: its value is materialized
+/// and its keyed `ref`/`path`/`inline` form collapsed by
+/// [`materialize_reference_slot`]. Any other value is walked with
+/// `inside_inline` carried down, set once an `inline` key is entered. A
+/// `!file` tag is replaced with the contained file's text only inside an
+/// inline body, resolved relative to `source_path` within `sandbox`.
+///
+/// # Errors
+/// Returns an invalid-envelope diagnostic for `!file` outside an inline body,
+/// a non-string or non-regular-file target, or a slot combining several keyed
+/// forms; a path-escape diagnostic for an absolute or parent-relative `!file`
+/// path or one leaving the sandbox; and an IO diagnostic when the target
+/// cannot be read.
 fn materialize_inline_files(
     value: &mut serde_yaml::Value,
     source_path: &Path,
@@ -246,22 +264,39 @@ fn materialize_inline_files(
             }
         }
         serde_yaml::Value::Mapping(mapping) => {
-            let agent_action = mapping
+            let mapping_type = mapping
                 .get(serde_yaml::Value::String("type".to_owned()))
                 .and_then(serde_yaml::Value::as_str)
-                .is_some_and(|kind| kind == "agent");
+                .map(str::to_owned);
             for (key, value) in mapping {
                 let slot = key
                     .as_str()
-                    .is_some_and(|key| is_inlineable_slot(key, agent_action));
-                let nested_inline = inside_inline
-                    || key.as_str().is_some_and(|key| {
-                        key.eq_ignore_ascii_case("inline")
-                            || is_inlineable_body(key, value, agent_action)
-                    });
-                materialize_inline_files(value, source_path, nested_inline, sandbox)?;
-                if slot {
-                    unwrap_reference_form(value, source_path)?;
+                    .and_then(|key| InlineableSlotField::find(key, mapping_type.as_deref()));
+                match slot {
+                    Some(InlineableSlotField { list: true, .. }) => {
+                        let serde_yaml::Value::Sequence(elements) = value else {
+                            materialize_inline_files(value, source_path, inside_inline, sandbox)?;
+                            continue;
+                        };
+                        for element in elements {
+                            materialize_reference_slot(
+                                element,
+                                source_path,
+                                inside_inline,
+                                sandbox,
+                            )?;
+                        }
+                    }
+                    Some(_) => {
+                        materialize_reference_slot(value, source_path, inside_inline, sandbox)?;
+                    }
+                    None => {
+                        let nested_inline = inside_inline
+                            || key
+                                .as_str()
+                                .is_some_and(|key| key.eq_ignore_ascii_case("inline"));
+                        materialize_inline_files(value, source_path, nested_inline, sandbox)?;
+                    }
                 }
             }
         }
@@ -313,10 +348,25 @@ fn materialize_inline_files(
     Ok(())
 }
 
-/// Return whether `key` names an `InlineableRef` slot: `prompt`,
-/// `judge_ref`, or the `target` of an agent action mapping.
-fn is_inlineable_slot(key: &str, agent_action: bool) -> bool {
-    matches!(key, "prompt" | "judge_ref") || (agent_action && key == "target")
+/// Materialize one inlineable reference slot and collapse its keyed form.
+///
+/// A slot value that is an inline body (a mapping without a Card identity)
+/// may use `!file`, so it is materialized as inline content; the authored
+/// `ref`/`path`/`inline` wrapper is then unwrapped to the wire shape that
+/// typed deserialization and the canonical reference visitor accept.
+///
+/// # Errors
+/// Returns the `!file` diagnostics of [`materialize_inline_files`] and the
+/// combined-form diagnostic of [`unwrap_reference_form`].
+fn materialize_reference_slot(
+    value: &mut serde_yaml::Value,
+    source_path: &Path,
+    inside_inline: bool,
+    sandbox: &PathSandbox,
+) -> Result<(), Diagnostic> {
+    let nested_inline = inside_inline || is_inline_body(value);
+    materialize_inline_files(value, source_path, nested_inline, sandbox)?;
+    unwrap_reference_form(value, source_path)
 }
 
 /// Collapse the authored keyed reference form at an inlineable slot.
@@ -357,10 +407,9 @@ fn unwrap_reference_form(
     }
 }
 
-fn is_inlineable_body(key: &str, value: &serde_yaml::Value, agent_action: bool) -> bool {
-    if !is_inlineable_slot(key, agent_action) {
-        return false;
-    }
+/// Return whether a reference slot value is an inline body rather than a
+/// Card reference: a mapping that lacks any of `kind`, `name`, or `version`.
+fn is_inline_body(value: &serde_yaml::Value) -> bool {
     let Some(mapping) = value.as_mapping() else {
         return false;
     };
@@ -399,9 +448,14 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+    use wyrd_spec::reference::InlineableRef;
 
     /// A slot that combines two authored reference forms is refused rather
     /// than guessed at.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be written or the parse is not refused
+    /// with the combined-form diagnostic.
     #[test]
     fn parse_rejects_combined_reference_forms() {
         let mut file = NamedTempFile::new().unwrap();
@@ -417,6 +471,60 @@ mod tests {
                 .message
                 .contains("exactly one of ref, path, or inline")
         );
+    }
+
+    /// Keyed forms at the binding slots the canonical inventory owns — a
+    /// single `runs_on` and every `on_failure` list element — collapse to the
+    /// wire shape before typed decoding, alongside the Agent `prompt` slot.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be written, fails to parse, or any slot
+    /// keeps its keyed wrapper or decodes to the wrong reference form.
+    #[test]
+    fn parse_unwraps_keyed_binding_slots() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  name: test
+  space: default
+  version: "1.0.0"
+spec:
+  prompt:
+    ref: {{kind: Prompt, name: review-prompt, version: "1.0.0"}}
+  verified_by:
+    - verifier: {{kind: Verifier, name: review-quality, version: "1.0.0"}}
+      runs_on:
+        inline:
+          kind: schedule
+          cron: "0 * * * *"
+      on_failure:
+        - ref: {{kind: Operator, name: page, version: "1.0.0"}}
+        - path: ./notify.yaml
+        - inline:
+            kind: workflow
+            workflow_ref: {{kind: Workflow, name: remediate, version: "1.0.0"}}
+"#
+        )
+        .unwrap();
+
+        let cards = parse_file(file.path()).expect("keyed binding slots parse");
+        let Spec::Agent(agent) = &cards[0].spec else {
+            panic!("fixture is an Agent");
+        };
+        assert!(
+            matches!(&agent.prompt, InlineableRef::Ref(prompt) if prompt.name.as_str() == "review-prompt")
+        );
+        let binding = &agent.verified_by[0];
+        assert!(matches!(&binding.runs_on, InlineableRef::Inline(_)));
+        let [page, notify, remediate] = binding.on_failure.as_slice() else {
+            panic!("three on_failure elements decode");
+        };
+        assert!(matches!(page, InlineableRef::Ref(page) if page.name.as_str() == "page"));
+        assert!(matches!(notify, InlineableRef::Path(path) if path == Path::new("./notify.yaml")));
+        assert!(matches!(remediate, InlineableRef::Inline(_)));
     }
 
     #[test]

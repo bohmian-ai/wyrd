@@ -273,7 +273,7 @@ async fn concurrent_saved_renewal() {
     }
 
     // A logout racing renewals leaves no record behind: it deletes under the
-    // same lock the renewals hold, and a later renewal finds no login.
+    // same lock the renewals hold.
     expire_saved_access(config.path(), &origin, FIXTURE_TENANT_SLUG);
     let tenant_key = TenantSlug::new(FIXTURE_TENANT_SLUG).expect("tenant key");
     let racers = mint_in_children(3, config.path(), &server);
@@ -294,10 +294,12 @@ async fn concurrent_saved_renewal() {
         store.list().expect("lists").is_empty(),
         "no renewal restored a logged-out login: {outcomes:?}"
     );
+    // Each racer renewed before the logout, found the login gone under the
+    // lock, or started after it and found no credential at all.
     assert!(
-        outcomes
-            .iter()
-            .all(|outcome| outcome == "ok" || outcome.contains("(logged_out)")),
+        outcomes.iter().all(|outcome| outcome == "ok"
+            || outcome.contains("(logged_out)")
+            || outcome.starts_with("no credentials available")),
         "{outcomes:?}"
     );
 

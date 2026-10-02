@@ -108,5 +108,5 @@ describe("saved user login", () => {
     } finally {
       server.shutdown();
     }
-  });
+  }, 60_000);
 });

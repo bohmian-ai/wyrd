@@ -90,7 +90,8 @@ authentication.
   generated artifacts. Wyrd stores no recoverable access token, refresh token
   or API key; it stores only one-way digests. The keyring is required only
   when a provider secret is stored. Rotation keeps existing connections
-  usable and is documented and tested.
+  usable and is documented and tested. No per-tenant OIDC secret is injected
+  into every serving replica as an environment variable.
 
 ### Browser login and session
 

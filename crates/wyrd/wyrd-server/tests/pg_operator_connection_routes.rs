@@ -18,6 +18,7 @@ use wyrd_server::config::{
     DeploymentProfile, OperatorKeySource, OperatorKeysConfig, VaultKeysConfig, WyrdServerConfig,
 };
 use wyrd_spec::ids::DataTenantId;
+use wyrd_testing::logs::LogCapture;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Plaintext secrets the journey sends; none may appear in a response or row.
@@ -174,12 +175,15 @@ fn creates() -> [Value; 3] {
 
 /// A tenant administrator creates, lists, reads, updates, rotates, disables,
 /// and re-enables connections of every provider; only redacted metadata is
-/// returned and only ciphertext is stored.
+/// returned, only ciphertext is stored, no route or query reveals a stored
+/// secret, and no plaintext secret reaches a log line.
 ///
 /// # Panics
-/// Panics when any status, shape, redaction, or storage expectation fails.
+/// Panics when any status, shape, redaction, storage, or log expectation
+/// fails.
 #[tokio::test(flavor = "current_thread")]
 async fn admin_manages_redacted_encrypted_connections() {
+    let logs = LogCapture::install();
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -348,6 +352,46 @@ async fn admin_manages_redacted_encrypted_connections() {
         (StatusCode::OK, Some("active"))
     );
 
+    let (status, view) = call(
+        &server,
+        &jwt,
+        Method::GET,
+        &format!("{slack}?include_secret=true&reveal=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        view.get("bot_token").is_none(),
+        "a reveal query still returns the redacted view: {view}"
+    );
+    for suffix in ["secret", "reveal", "credentials"] {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("{slack}/{suffix}"))
+            .body(Body::empty())
+            .expect("request builds");
+        let response = server
+            .oneshot_authenticated(&jwt, request)
+            .await
+            .expect("request responds");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("response body reads");
+        assert!(
+            matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "no secret read route exists: {suffix} -> {status}"
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        for secret in SECRETS {
+            assert!(!text.contains(secret), "{suffix} leaked a secret");
+        }
+    }
+
     let (status, problem) = call(
         &server,
         &jwt,
@@ -375,6 +419,15 @@ async fn admin_manages_redacted_encrypted_connections() {
             Some("WYRD_OPERATOR_404_CONNECTION_NOT_FOUND")
         )
     );
+
+    let logged = logs.text();
+    assert!(
+        logged.contains("operator-connections"),
+        "the capture observed the connection requests"
+    );
+    for secret in SECRETS {
+        assert!(!logged.contains(secret), "a plaintext secret was logged");
+    }
 }
 
 /// `operators:read` reads but cannot write, a role without either is denied

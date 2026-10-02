@@ -3,7 +3,7 @@ id: TASK-008
 kind: implementation
 status: proposed
 spec: SPEC-verified-change-contract
-spec_revision: 47
+spec_revision: 48
 requirements: [REQ-089, REQ-101, REQ-114, REQ-151, REQ-152, INV-015, AC-017, AC-020, AC-021, AC-022, AC-023, AC-024, AC-030, AC-032, AC-033]
 depends_on: [TASK-005, TASK-006, TASK-007, TASK-009, TASK-010]
 ---
@@ -189,6 +189,7 @@ does not justify weakening proof.
 | Multi-server result writing, SYSTEM identity/table matrix, public principal refusals, one raw observation feeding two bindings | `pg_grpc_ingest_smoke.rs::{forged_tenant_result_writes_are_refused, system_writer_matrix_spans_every_builtin_table, system_owner_token_cannot_write_a_customer_result}`; `verification_runtime.rs::two_bindings_share_one_client_observation`; `pg_verification_routes.rs::system_writer_token_is_refused_by_every_public_token_grant` | `verify:bifrost`, `test:wyrd` | PASS |
 | SYSTEM-token contract violations return client errors, not 500s | `wyrd-auth-verify/src/lib.rs` (SYSTEM_OWNER tenant -> 401); `wyrd-auth/src/exchange_api_key.rs::delegation_chain` (SYSTEM subject -> 400 `WYRD_SPEC_400_VALIDATION`, `details.reason="subject_is_system"`) (bounded corrections) | `tests::into_verified_rejects_every_system_contract_violation`; `system_writer_token_is_refused_by_every_public_token_grant` | PASS |
 | Daily partitions, result Bloom columns, partition and row-group pruning, one result event time across ACKs | `vala-bifrost-redux/src/tables/mod.rs` schema test pins the managed envelope and Bloom union; `verification_runtime.rs::result_layout_partitions_blooms_and_prunes_by_result` | `verify:bifrost` | PASS |
+| AC-012, AC-014, AC-024 results join details by `result_id` within the caller's tenant-scoped query (spec revision 48 erratum; `table_schema.md` lists only the managed columns Bifrost writes) | `vala-bifrost-redux/src/tables/mod.rs` schema test pins the managed envelope; Drift and Eval journeys read details by `result_id` through tenant-bound queries | `verify:bifrost`, `test:bifrost:journey:sdk`, `test:bifrost:journey:python`, `test:bifrost:journey:typescript` | PASS |
 | Restart, shutdown drain, lease reclaim, retry, saturation fairness, supervisor health, secret-free telemetry | `pg_operator_delivery.rs` and `pg_verification_*` tests listed in the task scope; `wyrd-testing/src/logs.rs::LogCapture` | `test:operators:integration`, `test:wyrd` | PASS |
 | PostgreSQL-owned activity, schedule, claim, lease, and dispatch deadlines | activity stamp bracketed by `statement_timestamp()` in `pg_verification_bindings.rs`; tests move DB rows (`make_binding_due`, `make_retries_due`) | `test:wyrd` | PASS |
 | Operator connection CRUD, rotation, redaction, Slack/PagerDuty/HTTP fixtures, CLI, MCP, cross-tenant | `pg_operator_connection_routes.rs`; `operator_connections.rs` (Rust SDK); `operator-connections.test.ts`; CLI `cli_manages_redacted_operator_connections`; MCP `an_agent_administers_redacted_connections` | `test:operators:integration`, `test:wyrdstate:journey`, `test:cli:journey`, `test:bifrost:journey:typescript` | PASS |
@@ -219,7 +220,7 @@ Diagnosis (`test:wyrd`):
 - **Focused check:** `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=vala::trace::attributes_tests::wyrd_keys_count_locked)'` passes.
 
 Limits recorded for change review:
-- **Join key wording.** AC-025 is proven through a stand-in stale table config, because no schema-evolution API exists. AC-012, AC-014 and AC-024 name the join key `(data_tenant_id, result_id)`. In the implementation that tenant key is the physical table tenant, not a stored column, so `architecture/logic/table_schema.md` lines 21–22 are wrong. That erratum is pending a human decision.
+- **Stale-writer fence.** AC-025 is proven through a stand-in stale table config, because no schema-evolution API exists.
 - **Card reconciler decode bug.** The nullable JSON decode bug in the card reconciler (`register.rs:36`) is out of scope and also pending a human decision.
 - **Ceilings proven only indirectly.** The 16-binding global ceiling and the real 30s Operator timeout are proven only through the existing per-tenant saturation test and the defaults unit test.
 - **Not run.** Credentialed live smokes (`test:operators:smoke:live`) and the image journeys remain release-gated and were not run here.

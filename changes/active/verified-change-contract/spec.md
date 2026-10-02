@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 47
+revision: 48
 status: approved
 ---
 
@@ -1688,8 +1688,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   Verifiers, inspect non-blocking baseline status until ready, and manually
   analyze bounded windows without an Operator dispatch. They prove
   server-side PSI bin counts and SPC aggregation, persisted
-  vala.verification.results and vala.drift.result_features rows joined by
-  (`data_tenant_id`, `result_id`), and queryable results. A Custom metric journey
+  vala.verification.results and vala.drift.result_features rows joined by `result_id` within the caller's
+  tenant-scoped query, and queryable results. A Custom metric journey
   proves ready registration without a fit job and server-side window mean.
   Empty and invalid Custom windows MUST persist `completed/inconclusive` with
   null `details` and zero feature rows; scored Drift MUST persist its existing
@@ -1735,8 +1735,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   partition pruning with those frozen values even when client `created_at`
   falls on a different day.
   Successful enqueue runs the existing Eval executor and persists
-  vala.verification.results plus vala.eval.result_items joined by
-  (`data_tenant_id`, `result_id`). A workflow that skips a task MUST persist
+  vala.verification.results plus vala.eval.result_items joined by `result_id` within the caller's
+  tenant-scoped query. A workflow that skips a task MUST persist
   its `TaskRunOutcome::Skipped` beside every `Ran` task outcome, while the
   common result's `details` serializes `EvalWorkflowSummary`. A forced
   post-commit enqueue failure MUST preserve the Bifrost observation, return
@@ -1995,8 +1995,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   resolved Bloom-column union for `vala.verification.results` and both
   result-detail tables. A real tenant-scoped query MUST retrieve results by
   Verifier `card_uid`, subject
-  Card UID, and binding ID, then retrieve matching details by
-  (`data_tenant_id`, `result_id`) across at least two time partitions.
+  Card UID, and binding ID, then retrieve matching details joined by `result_id` within the caller's
+  tenant-scoped query across at least two time partitions.
   Physical Parquet evidence MUST show the declared Bloom filters are written;
   an Oracle query plan or scan metric MUST demonstrate time-partition pruning
   and `result_id` row-group pruning where the predicate is selective. The
@@ -2122,6 +2122,15 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 48 verification table schema erratum (2026-10-02):** Removed the
+  `wyrd_row_ordinal` and `data_tenant_id` rows from the shared managed columns
+  in `architecture/logic/table_schema.md`; Bifrost writes neither column.
+  Tenant scope for the five verification tables comes from the tenant-bound
+  query and the physical tenant table, not a stored row column. AC-012, AC-014,
+  and AC-024 now join results to details by `result_id` within the caller's
+  tenant-scoped query. No behavior changes. The user explicitly approved
+  revision 48 on 2026-10-02.
 
 - **Revision 47 marker-based Run correlation registration (2026-10-02):**
   Simplified Python Run OpenTelemetry registration in REQ-151, AC-032, and

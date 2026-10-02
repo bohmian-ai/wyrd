@@ -18,11 +18,11 @@ the Arrow field is non-nullable.
 | `wyrd_event_time` | Timestamp(Microsecond, UTC) | no | Server-stamped observation receipt time, or the one server-chosen event time shared by a result and all its detail rows. |
 | `wyrd_ingested_at` | Timestamp(Microsecond, UTC) | no | Bifrost ingestion time. |
 | `wyrd_batch_id` | FixedSizeBinary(16) | no | Bifrost batch identity. |
-| `wyrd_row_ordinal` | Int32 | no | Row position within the batch. |
-| `data_tenant_id` | Utf8 | no | Physical tenant key, including for result/detail joins. |
 
 These are Bifrost's existing `CorrelationPolicy::Observation` managed fields;
-clients do not author them as table payload columns. All five tables partition
+clients do not author them as table payload columns. No row column carries
+the tenant: tenant scope comes from the tenant-bound query and the physical
+tenant table. All five tables partition
 by UTC day on `wyrd_event_time`. Bifrost's managed Bloom floor is `run_id`,
 `card_uid`, and `principal_id`. `vala.drift.observations` additionally Blooms
 `series`; `vala.verification.results` additionally Blooms `result_id`,
@@ -94,7 +94,7 @@ Eval writes the existing zero-count summary. A completed Drift execution that
 cannot score valid input writes null rather than fabricating a report. There are no
 separate Drift method, Eval count, pass-rate, duration, or pass-gate columns in
 this shared table. Managed `run_id` is the Verifier run and managed `card_uid`
-is the Verifier Card. Results join details on (`data_tenant_id`, `result_id`).
+is the Verifier Card. Results join details on `result_id` within the caller's tenant-scoped query.
 
 ## `vala.drift.result_features`
 

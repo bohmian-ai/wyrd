@@ -10,7 +10,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent,
 };
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
-use skald_workflow::Workflow;
+use skald_workflow::{Workflow, WorkflowBinding, WorkflowRunStatus};
 
 #[derive(Clone)]
 struct RecordingProvider {
@@ -186,7 +186,17 @@ fn workflow() -> Workflow {
 }
 
 fn workflow_named(name: &str) -> Workflow {
-    Workflow::sequential(name, [agent("planner"), agent("writer")]).expect("workflow is valid")
+    Workflow::sequential(name, [agent("planner"), agent("writer")])
+        .and_then(|workflow| {
+            workflow.with_outputs(
+                [(
+                    "report".to_owned(),
+                    WorkflowBinding::new("steps.writer.output.text").expect("binding is valid"),
+                )]
+                .into(),
+            )
+        })
+        .expect("workflow is valid")
 }
 
 fn openai_text_response(text: &str) -> ProviderResponse {
@@ -214,9 +224,13 @@ fn openai_text_response(text: &str) -> ProviderResponse {
 #[tokio::test(flavor = "multi_thread")]
 async fn workflow_with_no_observers_runs_cleanly() {
     let providers = registry(vec!["plan", "write"]);
-    let run = workflow().run_with(&providers, "topic").await.unwrap();
+    let run = workflow()
+        .run_with(&providers, serde_json::Map::new())
+        .await
+        .unwrap();
 
-    assert_eq!(run.tasks.len(), 2);
+    assert_eq!(run.status, WorkflowRunStatus::Succeeded);
+    assert_eq!(run.outputs["report"], "write");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -225,7 +239,9 @@ async fn workflow_with_one_observer_scopes_correctly() {
     let wf = workflow().with_observers(vec![Arc::clone(&log) as Arc<dyn Observer>]);
     let providers = registry(vec!["plan", "write"]);
 
-    wf.run_with(&providers, "topic").await.unwrap();
+    wf.run_with(&providers, serde_json::Map::new())
+        .await
+        .unwrap();
 
     let events = log.events();
     assert!(events.contains(&"workflow_start:research".to_owned()));
@@ -246,7 +262,9 @@ async fn workflow_with_multiple_observers_dispatches_in_order() {
     ]);
     let providers = registry(vec!["plan", "write"]);
 
-    wf.run_with(&providers, "topic").await.unwrap();
+    wf.run_with(&providers, serde_json::Map::new())
+        .await
+        .unwrap();
 
     assert_eq!(
         *sink.lock().expect("ordered observer lock"),
@@ -264,7 +282,9 @@ async fn workflow_observers_override_global() {
         .with_observers(vec![Arc::clone(&scoped) as Arc<dyn Observer>]);
     let providers = registry(vec!["plan", "write", "solo"]);
 
-    wf.run_with(&providers, "topic").await.unwrap();
+    wf.run_with(&providers, serde_json::Map::new())
+        .await
+        .unwrap();
     agent("solo")
         .run_with(&providers, None, "topic")
         .await

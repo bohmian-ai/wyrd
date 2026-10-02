@@ -723,11 +723,19 @@ impl AccessTokenSource for SavedLoginSource {
     /// removed or logged-out record, `refresh_pending` for a record an earlier
     /// renewal left uncertain or a renewal whose outcome is unknown,
     /// `refresh_refused` when the server refuses the refresh token,
-    /// `tenant_mismatch` when it renews into another tenant, `lock_timeout`, `unsafe_store`, or `corrupt`. A failed renewal leaves
-    /// the record `RefreshPending`, so it never retries the token.
+    /// `tenant_mismatch` when it renews into another tenant, `lock_timeout`,
+    /// `unsafe_store`, or `corrupt`. A failed renewal leaves the record
+    /// `RefreshPending`, so it never retries the token.
     fn mint(&self) -> Result<MintedAccessToken, WyrdClientError> {
         self.store
             .renew(&self.origin, self.tenant_id, &self.exchange)
+    }
+
+    /// Always: another process can rotate, mark pending, or log out the
+    /// record, so every use rereads it under the store lock through
+    /// [`Self::mint`] instead of reusing the middleware's cached token.
+    fn revalidates_cache(&self) -> bool {
+        true
     }
 }
 

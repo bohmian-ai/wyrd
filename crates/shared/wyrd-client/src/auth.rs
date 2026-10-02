@@ -528,7 +528,10 @@ impl AuthMiddleware {
     /// exchange. A [`ResolvedCredential::WorkloadJwt`] follows the same
     /// cache/single-flight path as the API key, exchanging the ambient OIDC
     /// assertion via the `jwt-bearer` grant. A [`ResolvedCredential::Delegated`]
-    /// follows it too, running the RFC 8693 token exchange.
+    /// follows it too, running the RFC 8693 token exchange. A
+    /// [`ResolvedCredential::Renewable`] source reuses its cached token too,
+    /// unless it [revalidates](AccessTokenSource::revalidates_cache) every
+    /// use against durable state other processes change.
     ///
     /// # Errors
     /// Returns [`AuthError::Client`] on transport failure or an invalid tenant
@@ -539,6 +542,7 @@ impl AuthMiddleware {
                 let mut cache = self.cache.lock().await;
                 if let Some(entry) = cache.as_ref()
                     && !entry.is_stale()
+                    && !source.revalidates_cache()
                 {
                     return Ok(entry.access_token.clone());
                 }
@@ -905,8 +909,14 @@ mod tests {
     use super::{AuthError, AuthMiddleware, CachedToken, TokenExchange};
     use crate::config::{ClientConfig, TokenCacheMode};
     use crate::error::WyrdClientError;
+    use crate::saved_login::{
+        SAVED_LOGIN_FORMAT_VERSION, SavedLogin, SavedLoginState, SavedLogins,
+    };
     use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::auth::SecretBearer;
+    use wyrd_spec::ids::TenantSlug;
 
     struct MockServer {
         base_url: String,
@@ -1403,6 +1413,87 @@ mod tests {
             "minted-2",
             "a token inside the refresh skew is replaced before use"
         );
+    }
+
+    /// A live client holding a cached saved-login token rereads the record
+    /// on every use: it picks up the token another process saved, and fails
+    /// closed once that record is left pending, logged out, removed, or made
+    /// unsafe, never returning its old bearer and never calling the server.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a use returns a superseded or withdrawn token.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saved_login_cache_revalidates_every_use() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let origin = "http://127.0.0.1:9";
+        let ready = |access: &str| SavedLoginState::Ready {
+            access_token: SecretBearer::new(access.to_owned()),
+            access_expires_at: Utc::now() + chrono::Duration::hours(1),
+            refresh_token: SecretBearer::new("refresh".to_owned()),
+        };
+        let login = SavedLogin {
+            format_version: SAVED_LOGIN_FORMAT_VERSION,
+            origin: origin.to_owned(),
+            tenant_id: DataTenantId::new_v7(),
+            tenant_key: "acme".parse::<TenantSlug>().expect("slug"),
+            principal_id: PrincipalId::new(Uuid::now_v7()),
+            generation: 1,
+            state: ready("first"),
+        };
+        let client_store = SavedLogins::at(dir.path().to_path_buf());
+        client_store.save(login.clone()).expect("saves");
+        let exchange = TokenExchange::new(origin, 1_000).expect("exchange builds");
+        let mw = AuthMiddleware::new(
+            &config_for(origin.to_owned(), TokenCacheMode::InMemory),
+            ResolvedCredential::Renewable(client_store.source(&login, exchange)),
+        )
+        .expect("middleware builds");
+        assert_eq!(mw.bearer().await.expect("cached").expose(), "first");
+
+        // Another process's store handle on the same file.
+        let other = SavedLogins::at(dir.path().to_path_buf());
+        let rewrite = |state: SavedLoginState| {
+            other
+                .save(SavedLogin {
+                    state,
+                    ..login.clone()
+                })
+                .expect("saves");
+        };
+        let refused = |result: Result<SecretBearer, AuthError>| match result {
+            Err(AuthError::Client(error)) => error.to_string(),
+            other => panic!("the withdrawn login is refused, got {other:?}"),
+        };
+        rewrite(ready("second"));
+        assert_eq!(mw.bearer().await.expect("newer").expose(), "second");
+
+        rewrite(SavedLoginState::RefreshPending {
+            started_at: Utc::now(),
+            refresh_token: SecretBearer::new("refresh".to_owned()),
+        });
+        assert!(refused(mw.bearer().await).contains("(refresh_pending)"));
+
+        rewrite(ready("third"));
+        assert_eq!(mw.bearer().await.expect("ready again").expose(), "third");
+        other
+            .begin_logout(origin, login.tenant_id)
+            .expect("tombstones");
+        assert!(refused(mw.bearer().await).contains("(logged_out)"));
+        other
+            .finish_logout(origin, login.tenant_id)
+            .expect("removes");
+        assert!(refused(mw.bearer().await).contains("(logged_out)"));
+
+        rewrite(ready("fourth"));
+        assert_eq!(mw.bearer().await.expect("logged in").expose(), "fourth");
+        std::fs::set_permissions(
+            dir.path().join("credentials.toml"),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+        )
+        .expect("chmod");
+        assert!(refused(mw.bearer().await).contains("(unsafe_store)"));
     }
 
     /// A minted token stays in memory even when the client caches on disk.

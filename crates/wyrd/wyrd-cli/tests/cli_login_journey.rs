@@ -75,8 +75,8 @@ fn refusal<T: std::fmt::Debug>(result: Result<T, wyrd_client::auth::AuthError>) 
         .to_owned()
 }
 
-/// `wyrd auth login` completes a browser sign-in into a saved login without
-/// printing a token; the handoff refuses every wrong initiator, replay, and
+/// `wyrd auth login` refuses a remote cleartext server, completes a browser
+/// sign-in into a saved login without printing a token; the handoff refuses every wrong initiator, replay, and
 /// expiry; and logout ends only its own login, locally even when the server
 /// is down.
 ///
@@ -98,6 +98,41 @@ pub(crate) async fn cli_oidc_handoff_journey() {
         .await;
     let config = tempfile::tempdir().expect("config home");
     let tenant: TenantSlug = FIXTURE_TENANT_SLUG.parse().expect("slug");
+
+    // A remote cleartext server never receives a handoff verifier or a
+    // refresh token: login and refresh refuse it before any request.
+    for arguments in [
+        &[
+            "auth",
+            "login",
+            "--server",
+            "http://wyrd.example.com",
+            "--tenant",
+            FIXTURE_TENANT_SLUG,
+            "--no-browser",
+        ][..],
+        &["auth", "refresh", "--server", "http://wyrd.example.com"][..],
+    ] {
+        let mut command = cli(config.path());
+        command
+            .args(arguments)
+            .env("WYRD_REFRESH_TOKEN", "not-a-real-token");
+        let output = tokio::task::spawn_blocking(move || command.output().expect("wyrd runs"))
+            .await
+            .expect("CLI subprocess joins");
+        assert!(!output.status.success(), "{}", transcript(&output));
+        assert!(
+            transcript(&output).contains("remote cleartext HTTP is not allowed"),
+            "{}",
+            transcript(&output)
+        );
+    }
+    assert!(
+        saved_logins(config.path())
+            .list()
+            .expect("lists")
+            .is_empty()
+    );
 
     // The shipped CLI prints the provider URL, the person signs in there, and
     // the CLI's own poll saves the credential.

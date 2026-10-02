@@ -40,6 +40,7 @@ use wyrd_spec::ids::TenantSlug;
 
 use crate::config::{ClientConfig, TokenCacheMode};
 use crate::error::{WyrdClientError, from_problem_json};
+use crate::transport::HttpConfig;
 use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
 use reqwest::{Client, Response};
 use std::fmt::{Debug, Formatter, Result as FmtResult};
@@ -143,14 +144,29 @@ impl Debug for TokenExchange {
 impl TokenExchange {
     /// Bind an exchange to one deployment.
     ///
-    /// Installs Wyrd's process TLS provider first, for the same reason the
+    /// Every route this type calls carries a secret — an API key, a workload
+    /// assertion, a handoff verifier, or a refresh token — so the target goes
+    /// through the same [`HttpConfig::validate`] rule as the authenticated
+    /// transport before anything is built: remote cleartext `http://` is
+    /// refused, HTTPS and loopback HTTP are accepted. This one check covers
+    /// every caller, including the CLI login, logout, and refresh commands.
+    ///
+    /// Installs Wyrd's process TLS provider next, for the same reason the
     /// authenticated transport does: the provider is process-global and the
     /// first client to build must be the one that sets it.
     ///
     /// # Errors
-    /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
-    /// already owns the process or the HTTP client cannot be built.
+    /// Returns [`WyrdClientError::Config`] for an empty or remote cleartext
+    /// `base_url` or a zero timeout, and [`WyrdClientError::TransportDown`]
+    /// when another Rustls provider already owns the process or the HTTP
+    /// client cannot be built.
     pub fn new(base_url: &str, timeout_ms: u64) -> Result<Self, WyrdClientError> {
+        HttpConfig {
+            base_url: base_url.to_owned(),
+            timeout_ms,
+            compression: false,
+        }
+        .validate()?;
         wyrd_tls::install_crypto_provider().map_err(|error| WyrdClientError::TransportDown {
             transport: "http".to_owned(),
             message: error.to_string(),
@@ -886,7 +902,7 @@ mod tests {
     use tokio::net::TcpListener;
     use uuid::Uuid;
 
-    use super::{AuthError, AuthMiddleware, CachedToken};
+    use super::{AuthError, AuthMiddleware, CachedToken, TokenExchange};
     use crate::config::{ClientConfig, TokenCacheMode};
     use crate::error::WyrdClientError;
     use crate::transport::credential::{AccessTokenSource, MintedAccessToken, ResolvedCredential};
@@ -1407,6 +1423,28 @@ mod tests {
         mw.bearer().await.expect("mint");
         assert!(!path.exists(), "a minted capture token must not reach disk");
         assert!(format!("{mw:?}").contains("test-system-producer"));
+    }
+
+    /// Every secret-bearing `/auth` route refuses a remote cleartext target
+    /// at construction, before any request, while HTTPS and loopback HTTP
+    /// stay usable.
+    #[test]
+    fn token_exchange_refuses_remote_cleartext() {
+        for remote in ["http://wyrd.example.com", "http://10.0.0.5:8080/"] {
+            let error = TokenExchange::new(remote, 30_000).expect_err("remote http is refused");
+            assert!(
+                matches!(&error, WyrdClientError::Config { reason, .. } if reason.contains("cleartext")),
+                "{error:?}"
+            );
+        }
+        for allowed in [
+            "https://wyrd.example.com",
+            "http://localhost:8080",
+            "http://127.0.0.1:9000/",
+            "http://[::1]:8080",
+        ] {
+            TokenExchange::new(allowed, 30_000).expect("allowed target builds");
+        }
     }
 
     #[test]

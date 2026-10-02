@@ -185,6 +185,23 @@ impl<T> InlineableRef<T> {
             Self::Ref(_) | Self::Inline(_) | Self::Path(_) => None,
         }
     }
+
+    /// Project an identity-bearing slot onto the durable [`Ref`] shape,
+    /// keeping its authored provenance: an external `Ref` stays `Ref` and a
+    /// loader `Sibling` stays `Sibling`, so consumers never infer the body's
+    /// source from identity alone.
+    ///
+    /// Returns `None` for an inline body or an unresolved path.
+    #[must_use]
+    pub fn to_durable(&self) -> Option<Ref> {
+        match self {
+            Self::Ref(card_ref) => Some(Ref::Ref(card_ref.clone())),
+            Self::Sibling { sibling } => Some(Ref::Sibling {
+                sibling: sibling.clone(),
+            }),
+            Self::Inline(_) | Self::Path(_) => None,
+        }
+    }
 }
 
 impl<T> From<CardRef> for InlineableRef<T> {

@@ -161,16 +161,21 @@ async fn check_operator(
     })
 }
 
-/// Effective spec bodies for referenced binding targets, keyed by identity.
+/// Effective spec bodies for referenced binding targets, keyed by provenance
+/// and identity.
 ///
 /// Owns the request's resolved external UIDs alongside the decoded bodies, so
 /// binding validation is one method on this handle rather than a call graph
-/// that re-threads the connection and the resolution table per lookup. Seeded
-/// with the request's own submissions, so a sibling ref never reads the
-/// registry; an external ref is loaded once by its resolved UID and cached.
+/// that re-threads the connection and the resolution table per lookup. A
+/// `Sibling` reference reads only the request's own submissions and an
+/// external `Ref` only the registry body at its resolved UID, loaded once and
+/// cached, so a submitted sibling never stands in for an external dependency
+/// with the same identity.
 struct EffectiveSpecs {
-    /// Decoded spec per exact Card identity.
-    specs: HashMap<CardRefIdentity, Spec>,
+    /// Decoded submitted spec per exact Card identity.
+    siblings: HashMap<CardRefIdentity, Spec>,
+    /// Registry spec per exact identity, loaded at its resolved external UID.
+    externals: HashMap<CardRefIdentity, Spec>,
     /// External references this request already resolved to a `CardUid`.
     resolved: ResolvedRefs,
 }
@@ -184,7 +189,7 @@ impl EffectiveSpecs {
     /// # Errors
     /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable spec.
     fn new(submissions: &[CardSubmission], resolved: ResolvedRefs) -> Result<Self, WyrdError> {
-        let mut specs = HashMap::new();
+        let mut siblings = HashMap::new();
         for submission in submissions {
             let (Some(space), Some(version)) = (
                 &submission.metadata.space,
@@ -202,9 +207,13 @@ impl EffectiveSpecs {
             .identity_key();
             let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
                 .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-            specs.insert(identity, spec);
+            siblings.insert(identity, spec);
         }
-        Ok(Self { specs, resolved })
+        Ok(Self {
+            siblings,
+            externals: HashMap::new(),
+            resolved,
+        })
     }
 
     /// Check every submitted binding against the effective specs its refs name.
@@ -260,10 +269,10 @@ impl EffectiveSpecs {
         binding: &VerificationBinding,
         field: &str,
     ) -> Result<(), WyrdError> {
-        let verifier = self.load(conn, binding.verifier.as_card_ref()).await?;
+        let verifier = self.load(conn, Some(&binding.verifier)).await?;
         let trigger = match &binding.runs_on {
             InlineableRef::Inline(trigger) => Some(Spec::Trigger((**trigger).clone())),
-            reference => self.load(conn, reference.as_card_ref()).await?,
+            reference => self.load(conn, reference.to_durable().as_ref()).await?,
         };
         if let (Some(Spec::Verifier(verifier)), Some(Spec::Trigger(trigger))) =
             (&verifier, &trigger)
@@ -284,7 +293,7 @@ impl EffectiveSpecs {
         for (index, operator) in binding.on_failure.iter().enumerate() {
             let operator = match operator {
                 InlineableRef::Inline(operator) => Some(Spec::Operator((**operator).clone())),
-                reference => self.load(conn, reference.as_card_ref()).await?,
+                reference => self.load(conn, reference.to_durable().as_ref()).await?,
             };
             let field = format!("{field}.on_failure[{index}]");
             match operator {
@@ -347,7 +356,7 @@ impl EffectiveSpecs {
             else {
                 continue;
             };
-            let Some(Spec::Data(data)) = self.load(conn, baseline_ref.as_card_ref()).await? else {
+            let Some(Spec::Data(data)) = self.load(conn, Some(baseline_ref)).await? else {
                 return Err(baseline_error(
                     "signal.baseline_ref must name a registered Data Card",
                     json!({ "field": "signal.baseline_ref" }),
@@ -389,14 +398,18 @@ impl EffectiveSpecs {
     ///
     /// Each Workflow submission seeds a [`WorkflowGraph`], which runs the pure
     /// Workflow contract. The graph then names every Agent and Prompt body it
-    /// still needs; sibling and already-resolved external bodies come from
-    /// [`load`](Self::load), while a Prompt named only inside an
-    /// already-registered Agent is resolved through the same Active,
-    /// tenant-scoped batch lookup before loading. The completed graph runs the
-    /// declarative resolved checks (bindings, outputs, Prompt coverage, route
-    /// dialect) without binding tools, so sibling and external dependencies
-    /// fail identically. This runs before the write transaction, so a refusal
-    /// persists nothing.
+    /// still needs with its authored provenance; [`load`](Self::load) supplies
+    /// a sibling from the submissions and an external ref from the registry
+    /// body at its resolved UID — the same UID registration binds — while a
+    /// Prompt named only inside an already-registered Agent is resolved
+    /// through the same Active, tenant-scoped batch lookup before loading. The
+    /// completed graph runs the declarative resolved checks (bindings,
+    /// outputs, Prompt coverage, route dialect) without binding tools, so
+    /// sibling and external dependencies fail identically.
+    ///
+    /// This runs in the preflight transaction before the write transaction:
+    /// cancellation may stop after completed registry reads but before any
+    /// Card persistence, and a refusal persists nothing.
     ///
     /// # Errors
     /// Returns the `WYRD_WORKFLOW_*` contract and graph refusals of
@@ -416,23 +429,26 @@ impl EffectiveSpecs {
                 if missing.is_empty() {
                     break;
                 }
-                for card_ref in missing {
-                    if external_uid(&card_ref, &self.resolved).is_none()
-                        && !self.specs.contains_key(&sibling_key(&card_ref))
+                for dependency in missing {
+                    if let Ref::Ref(card_ref) = &dependency
+                        && external_uid(card_ref, &self.resolved).is_none()
                     {
                         let found =
-                            select_card_uids_by_ref_batch(conn, std::slice::from_ref(&card_ref))
+                            select_card_uids_by_ref_batch(conn, std::slice::from_ref(card_ref))
                                 .await?;
                         self.resolved.extend(found);
                     }
-                    let spec = self.load(conn, Some(&card_ref)).await?.ok_or_else(|| {
-                        let identity = display_ref(&card_ref);
+                    let spec = self.load(conn, Some(&dependency)).await?.ok_or_else(|| {
+                        let identity = dependency.as_card_ref().map_or_else(
+                            || "<unresolved path>".to_owned(),
+                            display_ref,
+                        );
                         WyrdError::RegistryUnresolvedDependency {
                             message: format!("card dependency {identity} was not found"),
                             details: serde_json::json!({ "card_ref": identity }),
                         }
                     })?;
-                    graph.insert(card_ref, spec)?;
+                    graph.insert(dependency, spec)?;
                 }
             }
             graph.validate()?;
@@ -440,29 +456,38 @@ impl EffectiveSpecs {
         Ok(())
     }
 
-    /// Return the effective spec a resolved ref names, loading it once if external.
+    /// Return the effective spec a reference names from its own provenance.
     ///
-    /// Returns `None` for an absent ref; unresolved refs were already rejected.
+    /// A `Sibling` reads only the submitted body; an external `Ref` reads only
+    /// the registry body at its resolved UID, loaded once and cached. Returns
+    /// `None` for an absent ref, a path, an unsubmitted sibling, or an
+    /// unresolved external ref; those were already rejected upstream.
+    ///
+    /// Cancellation may drop the in-flight by-UID read; nothing is written.
     ///
     /// # Errors
     /// Returns the registry error from loading an external Card by UID.
     async fn load(
         &mut self,
         conn: &mut TenantConn<'_>,
-        card_ref: Option<&CardRef>,
+        reference: Option<&Ref>,
     ) -> Result<Option<Spec>, WyrdError> {
-        let Some(card_ref) = card_ref else {
-            return Ok(None);
+        let card_ref = match reference {
+            None | Some(Ref::Path(_)) => return Ok(None),
+            Some(Ref::Sibling { sibling }) => {
+                return Ok(self.siblings.get(&sibling_key(sibling)).cloned());
+            }
+            Some(Ref::Ref(card_ref)) => card_ref,
         };
-        let identity = sibling_key(card_ref);
-        if let Some(spec) = self.specs.get(&identity) {
+        let identity = card_ref.identity_key();
+        if let Some(spec) = self.externals.get(&identity) {
             return Ok(Some(spec.clone()));
         }
         let Some(uid) = external_uid(card_ref, &self.resolved) else {
             return Ok(None);
         };
         let row = get_card_by_uid(conn, &uid).await?;
-        self.specs.insert(identity, row.spec.clone());
+        self.externals.insert(identity, row.spec.clone());
         Ok(Some(row.spec))
     }
 }

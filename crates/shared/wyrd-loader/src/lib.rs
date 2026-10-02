@@ -209,10 +209,12 @@ pub fn build_registration_input(tree: LoadedTree) -> Result<RegistrationInput, L
 #[cfg(test)]
 mod tests {
     use super::{build_registration_input, load};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
-    use wyrd_spec::envelope::Spec;
-    use wyrd_spec::reference::Ref;
+    use wyrd_spec::card::workflow::WorkflowAction;
+    use wyrd_spec::envelope::{CardKind, Spec};
+    use wyrd_spec::ids::SpaceName;
+    use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 
     fn prompt(name: &str, version: &str) -> String {
         format!(
@@ -221,42 +223,62 @@ mod tests {
     }
 
     /// Return the checked-in code-review Workflow bundle entry file.
-    fn code_review_workflow() -> std::path::PathBuf {
+    fn code_review_workflow() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../examples/workflows/code-review/workflow.yaml")
     }
 
-    /// Load the checked-in code-review bundle: its sibling Agent paths load
-    /// relative to the Workflow file, inherit the containing space, and land
-    /// before the Workflow in dependency order with native Prompt bodies. A
-    /// copy with a dependency cycle is refused by the pure Workflow contract.
+    /// Load the checked-in code-review bundle: its Prompt and Agent paths load
+    /// relative to their containing files, inherit the containing space, and
+    /// land in dependency order — three exact-version Prompt Cards, then the
+    /// three Agents that name them as siblings, then the Workflow. A copy with
+    /// a dependency cycle is refused by the pure Workflow contract.
+    ///
+    /// # Panics
+    /// Panics when the checked-in bundle stops loading in that shape or the
+    /// temporary cyclic copy cannot be written.
     #[test]
     fn load_explicit_workflow_bundle() {
-        use wyrd_spec::card::workflow::WorkflowAction;
-        use wyrd_spec::reference::InlineableRef;
-
         let tree = load(&code_review_workflow()).expect("code-review bundle loads");
         let names = tree
             .cards
             .iter()
             .map(|card| card.submission.metadata.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 4);
+        assert_eq!(names.len(), 7);
         assert_eq!(names.last(), Some(&"code-review"));
-        for card in &tree.cards[..3] {
-            let Spec::Agent(agent) =
-                Spec::from_kind_and_value(&card.submission.kind, card.submission.spec.clone())
-                    .expect("agent spec decodes")
-            else {
-                panic!("bundle dependencies are Agent Cards");
-            };
-            let InlineableRef::Inline(prompt) = &agent.prompt else {
-                panic!("example Agents carry inline native Prompts");
-            };
-            assert_eq!(prompt.model, "gpt-5-5");
-            assert!(prompt.variables.contains(&"code".to_owned()));
+        let engineering = |card_ref: &CardRef| {
+            assert_eq!(
+                card_ref.space.as_ref().map(SpaceName::as_str),
+                Some("engineering")
+            );
+            assert_eq!(card_ref.version.to_string(), "1.0.0");
+        };
+        for card in &tree.cards[..6] {
+            match Spec::from_kind_and_value(&card.submission.kind, card.submission.spec.clone())
+                .expect("dependency spec decodes")
+            {
+                Spec::Prompt(prompt) => {
+                    assert_eq!(prompt.prompt.model, "gpt-5-5");
+                    assert!(prompt.prompt.variables.contains(&"code".to_owned()));
+                }
+                Spec::Agent(agent) => {
+                    let InlineableRef::Sibling { sibling } = &agent.prompt else {
+                        panic!("Agent Prompt paths become sibling projections");
+                    };
+                    assert!(names[..3].contains(&sibling.name.as_str()));
+                    engineering(sibling);
+                }
+                other => panic!("unexpected bundle dependency {}", other.kind().wire_name()),
+            }
         }
-        let workflow = &tree.cards[3].submission;
+        assert!(
+            tree.cards[..3]
+                .iter()
+                .all(|card| card.submission.kind == CardKind::Prompt),
+            "Prompts register before the Agents that name them"
+        );
+        let workflow = &tree.cards[6].submission;
         let Spec::Workflow(spec) = Spec::from_kind_and_value(&workflow.kind, workflow.spec.clone())
             .expect("workflow spec decodes")
         else {
@@ -266,25 +288,21 @@ mod tests {
             let WorkflowAction::Agent(InlineableRef::Sibling { sibling }) = &step.action else {
                 panic!("path targets become sibling projections");
             };
-            assert_eq!(
-                sibling
-                    .space
-                    .as_ref()
-                    .map(wyrd_spec::ids::SpaceName::as_str),
-                Some("engineering")
-            );
+            engineering(sibling);
         }
 
         let temp = TempDir::new().expect("temp directory creates");
-        std::fs::create_dir(temp.path().join("agents")).expect("agents directory creates");
         let bundle = code_review_workflow();
         let bundle = bundle.parent().expect("bundle directory exists");
-        for agent in ["security", "correctness", "final-reviewer"] {
-            std::fs::copy(
-                bundle.join(format!("agents/{agent}.yaml")),
-                temp.path().join(format!("agents/{agent}.yaml")),
-            )
-            .expect("agent copies");
+        for dir in ["agents", "prompts"] {
+            std::fs::create_dir(temp.path().join(dir)).expect("bundle directory creates");
+            for file in ["security", "correctness", "final-reviewer"] {
+                std::fs::copy(
+                    bundle.join(format!("{dir}/{file}.yaml")),
+                    temp.path().join(format!("{dir}/{file}.yaml")),
+                )
+                .expect("bundle file copies");
+            }
         }
         let cyclic = std::fs::read_to_string(code_review_workflow())
             .expect("workflow reads")

@@ -1064,15 +1064,11 @@ async fn write_registration(
     for event in allowed {
         audit::append_on(&mut conn, event).await?;
     }
-    // Recheck before reserving idempotency so a dependency rejection rolls back
-    // the entire attempt, including its bookkeeping row. The row locks remain
-    // held while cards and relationships are written below.
-    let external_identities = plan
-        .external_refs
-        .iter()
-        .map(|(card_ref, _)| card_ref.clone())
-        .collect::<Vec<_>>();
-    plan.external_refs = recheck_active_card_refs(&mut conn, &external_identities).await?;
+    // Recheck the exact UIDs preflight validated before reserving idempotency,
+    // so a dependency rejection — including a replacement Card at the same
+    // identity — rolls back the entire attempt, including its bookkeeping row.
+    // The row locks remain held while cards and relationships are written below.
+    plan.external_refs = recheck_active_card_refs(&mut conn, &plan.external_refs).await?;
     let inserted = insert_registration_operation(
         &mut conn,
         NewRegistrationOperation {

@@ -4,9 +4,11 @@
 //! [`WorkflowLoader`] owns the optional registry client and the caller's tool
 //! registry. It gathers the exact Agent and Prompt bodies a Workflow names —
 //! loader siblings from disk, external and registered references through exact
-//! Cards reads — into a [`WorkflowGraph`]. The graph feeds Skald's existing
-//! synchronous resolver seam and runs pure and resolved Workflow validation.
-//! Loading never registers, executes, or resolves secrets.
+//! Cards reads — into a [`WorkflowGraph`]. The graph keeps each body under its
+//! authored provenance, so a sibling body never satisfies an external `ref`
+//! with the same identity. It feeds Skald's existing synchronous resolver seam
+//! and runs pure and resolved Workflow validation. Loading never registers,
+//! executes, or resolves secrets.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,6 +17,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use skald_agent::{Agent, PromptResolver};
 use skald_prompt::Prompt;
+use skald_spec::Prompt as NativePrompt;
 use skald_tool::{ToolRegistry, ToolResolver};
 use skald_workflow::{AgentResolver, Workflow};
 use wyrd_spec::api_version::ApiVersion;
@@ -22,7 +25,7 @@ use wyrd_spec::card::workflow::{WorkflowAction, WorkflowCard};
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
-use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef};
+use wyrd_spec::reference::{CardRef, CardRefIdentity, InlineableRef, Ref};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_spec::{AgentCard, AgentSpec};
 
@@ -60,9 +63,14 @@ impl WorkflowLoader {
     /// Load the Workflow Card at `path` and its local dependency bundle.
     ///
     /// The shared loader resolves `path`, `inline`, and sibling dependencies
-    /// relative to their containing files and runs pure contract validation.
-    /// External `ref` dependencies are read exactly from the registry, which
-    /// requires [`with_client`](Self::with_client). Nothing is registered.
+    /// relative to their containing files and runs pure contract validation;
+    /// every loaded Agent and Prompt is recorded as a sibling body. External
+    /// `ref` dependencies — even ones naming the same identity as a loaded
+    /// sibling — are read exactly from the registry, which requires
+    /// [`with_client`](Self::with_client). Nothing is registered.
+    ///
+    /// Cancellation may stop after completed filesystem or registry reads; no
+    /// registration or durable Card write happens on this path.
     ///
     /// # Errors
     /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` carrying the loader
@@ -96,7 +104,8 @@ impl WorkflowLoader {
         for card in &tree.cards {
             if matches!(card.submission.kind, CardKind::Agent | CardKind::Prompt) {
                 let card = submission_card(&card.submission)?;
-                graph.insert(exact_ref(&card)?, card.spec)?;
+                let sibling = exact_ref(&card)?;
+                graph.insert(Ref::Sibling { sibling }, card.spec)?;
             }
         }
         self.fetch_missing(&mut graph).await?;
@@ -111,6 +120,9 @@ impl WorkflowLoader {
     /// read by its exact identity — the stored dependency references carry
     /// their registered UIDs — so later versions never float in. The returned
     /// Workflow keeps its registered identity for the run snapshot.
+    ///
+    /// Cancellation may stop after completed registry reads; no registration
+    /// or durable Card write happens on this path.
     ///
     /// # Errors
     /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for a non-Workflow or
@@ -131,13 +143,19 @@ impl WorkflowLoader {
         graph.hydrate(self.tools.as_ref())
     }
 
-    /// Read every dependency `graph` still lacks until it is closed.
+    /// Read every external dependency `graph` still lacks until it is closed.
     ///
     /// Each pass reads the current missing set; a fetched Agent may add its
     /// Prompt reference, and Prompts add nothing, so the loop terminates.
+    /// Only external `ref` slots are read from the registry; a sibling the
+    /// bundle did not load is refused rather than substituted.
+    ///
+    /// Cancellation may stop between reads, leaving `graph` partially filled;
+    /// nothing durable is written.
     ///
     /// # Errors
-    /// Returns the errors of [`read`](Self::read) and
+    /// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` for a missing
+    /// sibling, and the errors of [`read`](Self::read) and
     /// [`WorkflowGraph::insert`].
     async fn fetch_missing(&self, graph: &mut WorkflowGraph) -> Result<(), WyrdError> {
         loop {
@@ -145,14 +163,27 @@ impl WorkflowLoader {
             if missing.is_empty() {
                 return Ok(());
             }
-            for card_ref in missing {
-                let card = self.read(&card_ref).await?;
-                graph.insert(card_ref, card.spec)?;
+            for dependency in missing {
+                let card = match &dependency {
+                    Ref::Ref(card_ref) => self.read(card_ref).await?,
+                    Ref::Sibling { sibling } => {
+                        return Err(unresolved(sibling, "is not a loaded sibling"));
+                    }
+                    Ref::Path(path) => {
+                        return Err(WyrdError::registry_invalid_card_spec(format!(
+                            "card dependency path {} was not loaded",
+                            path.display()
+                        )));
+                    }
+                };
+                graph.insert(dependency, card.spec)?;
             }
         }
     }
 
     /// Read one active Card by its exact identity.
+    ///
+    /// Cancellation may drop the in-flight Cards read; nothing is written.
     ///
     /// # Errors
     /// Returns `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` without a client or
@@ -182,12 +213,28 @@ impl WorkflowLoader {
 /// The graph is the pure, synchronous hand-off from whichever environment
 /// fetched the bodies — local disk, the registry client, or server
 /// registration — to Skald's existing resolver traits. It performs no IO.
+/// Bodies are keyed by the authored reference form as well as identity: a
+/// `Sibling` slot consumes only a submitted or path-loaded body, and a `Ref`
+/// slot only the body its exact registry read returned, even when both name
+/// the same `(kind, space, name, version)`.
 pub struct WorkflowGraph {
     /// The Workflow Card being hydrated.
     workflow: WorkflowCard,
-    /// Referenced Agent and Prompt bodies keyed by exact identity, with the
-    /// reference that named them.
-    bodies: HashMap<CardRefIdentity, (CardRef, Spec)>,
+    /// Referenced Agent and Prompt bodies keyed by provenance and identity.
+    bodies: HashMap<BodyKey, Spec>,
+}
+
+/// Provenance-qualified body key: whether the slot is a loader sibling, and
+/// the exact identity it names.
+type BodyKey = (bool, CardRefIdentity);
+
+/// Return the body key for a durable dependency, or `None` for a path.
+fn body_key(dependency: &Ref) -> Option<BodyKey> {
+    match dependency {
+        Ref::Ref(card_ref) => Some((false, card_ref.identity_key())),
+        Ref::Sibling { sibling } => Some((true, sibling.identity_key())),
+        Ref::Path(_) => None,
+    }
 }
 
 impl WorkflowGraph {
@@ -213,36 +260,50 @@ impl WorkflowGraph {
         Self::new(WorkflowCard::from_envelope(submission_card(submission)?)?)
     }
 
-    /// Record the body of one referenced Agent or Prompt Card.
+    /// Record the body supplied for one Agent or Prompt dependency.
+    ///
+    /// `dependency` carries the authored form: pass `Ref::Sibling` for a
+    /// submitted or path-loaded body and `Ref::Ref` for the body an exact
+    /// registry read returned. Re-inserting the same key replaces the body.
     ///
     /// # Errors
-    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when `spec` is not the
-    /// kind `card_ref` names.
-    pub fn insert(&mut self, card_ref: CardRef, spec: Spec) -> Result<(), WyrdError> {
+    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an unresolved path or
+    /// when `spec` is not the kind `dependency` names.
+    pub fn insert(&mut self, dependency: Ref, spec: Spec) -> Result<(), WyrdError> {
+        let (Some(card_ref), Some(key)) = (dependency.as_card_ref(), body_key(&dependency)) else {
+            return Err(WyrdError::registry_invalid_card_spec(
+                "card dependency is an unresolved path",
+            ));
+        };
         if spec.kind() != card_ref.kind {
             return Err(WyrdError::registry_invalid_card_spec(format!(
                 "card dependency {card_ref} resolved to a {} body",
                 spec.kind().wire_name()
             )));
         }
-        self.bodies
-            .insert(card_ref.identity_key(), (card_ref, spec));
+        self.bodies.insert(key, spec);
         Ok(())
     }
 
-    /// Return the Agent and Prompt references whose bodies are still absent.
+    /// Return the Agent and Prompt dependencies whose bodies are still absent.
     ///
-    /// Prompt references of known Agents — inline step Agents and recorded
-    /// Agent bodies — are included, so repeated fetching closes the graph.
+    /// Each dependency keeps its authored `Ref` or `Sibling` form, so the
+    /// caller supplies it from the matching source. Prompt references of
+    /// known Agents — inline step Agents and recorded Agent bodies — are
+    /// included, so repeated fetching closes the graph. Paths are never
+    /// returned; they stay unresolved and fail hydration.
     #[must_use]
-    pub fn missing(&self) -> Vec<CardRef> {
-        let mut missing: Vec<CardRef> = Vec::new();
-        let mut want = |card_ref: Option<&CardRef>| {
-            if let Some(card_ref) = card_ref
-                && !self.bodies.contains_key(&card_ref.identity_key())
-                && !missing.iter().any(|known| known.same_identity(card_ref))
+    pub fn missing(&self) -> Vec<Ref> {
+        let mut missing: Vec<Ref> = Vec::new();
+        let mut want = |dependency: Option<Ref>| {
+            if let Some(dependency) = dependency
+                && let Some(key) = body_key(&dependency)
+                && !self.bodies.contains_key(&key)
+                && !missing
+                    .iter()
+                    .any(|known| body_key(known).as_ref() == Some(&key))
             {
-                missing.push(card_ref.clone());
+                missing.push(dependency);
             }
         };
         for step in &self.workflow.spec.steps {
@@ -250,14 +311,16 @@ impl WorkflowGraph {
             let agent = match agent {
                 InlineableRef::Inline(agent) => Some(agent.as_ref()),
                 reference => {
-                    want(reference.as_card_ref());
-                    reference
-                        .as_card_ref()
-                        .and_then(|card_ref| self.agent(card_ref))
+                    let dependency = reference.to_durable();
+                    let agent = dependency
+                        .as_ref()
+                        .and_then(|dependency| self.agent(dependency));
+                    want(dependency);
+                    agent
                 }
             };
             if let Some(agent) = agent {
-                want(agent.prompt.as_card_ref());
+                want(agent.prompt.to_durable());
             }
         }
         missing
@@ -315,10 +378,11 @@ impl WorkflowGraph {
         Ok(workflow)
     }
 
-    /// Return the recorded Agent body `card_ref` names.
-    fn agent(&self, card_ref: &CardRef) -> Option<&AgentSpec> {
-        match self.bodies.get(&card_ref.identity_key()) {
-            Some((_, Spec::Agent(agent))) => Some(agent),
+    /// Return the Agent body recorded for `dependency`'s provenance and
+    /// identity.
+    fn agent(&self, dependency: &Ref) -> Option<&AgentSpec> {
+        match body_key(dependency).and_then(|key| self.bodies.get(&key)) {
+            Some(Spec::Agent(agent)) => Some(agent),
             _ => None,
         }
     }
@@ -335,15 +399,27 @@ struct GraphResolver<'a> {
 }
 
 impl AgentResolver for GraphResolver<'_> {
-    /// Build the runtime Agent for a referenced step from its recorded body,
-    /// keeping the reference's exact identity.
+    /// Build the runtime Agent for a referenced step from the body recorded
+    /// under the step's authored provenance, keeping its exact identity.
+    ///
+    /// # Errors
+    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for a step that is not a
+    /// Card reference, `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when no body
+    /// was recorded for that provenance, and the Agent tool and Prompt
+    /// resolution errors of `Agent::from_card`.
     fn resolve(&self, agent_ref: &InlineableRef<AgentSpec>) -> Result<Agent, WyrdError> {
-        let card_ref = agent_ref.as_card_ref().ok_or_else(|| {
-            WyrdError::registry_invalid_card_spec("workflow step Agent is not a card reference")
-        })?;
+        let dependency = agent_ref.to_durable();
+        let (Some(dependency), Some(card_ref)) = (
+            dependency.as_ref(),
+            dependency.as_ref().and_then(Ref::as_card_ref),
+        ) else {
+            return Err(WyrdError::registry_invalid_card_spec(
+                "workflow step Agent is not a card reference",
+            ));
+        };
         let mut spec = self
             .graph
-            .agent(card_ref)
+            .agent(dependency)
             .cloned()
             .ok_or_else(|| unresolved(card_ref, "was not loaded"))?;
         if !self.bind_tools {
@@ -372,16 +448,28 @@ impl AgentResolver for GraphResolver<'_> {
 }
 
 impl PromptResolver for GraphResolver<'_> {
-    /// Return an inline native Prompt or the recorded Prompt Card body.
-    fn resolve(&self, prompt_ref: &InlineableRef<skald_spec::Prompt>) -> Result<Prompt, WyrdError> {
+    /// Return an inline native Prompt or the Prompt Card body recorded under
+    /// the slot's authored provenance.
+    ///
+    /// # Errors
+    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an unresolved path
+    /// and `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when no Prompt body was
+    /// recorded for that provenance and identity.
+    fn resolve(&self, prompt_ref: &InlineableRef<NativePrompt>) -> Result<Prompt, WyrdError> {
         if let InlineableRef::Inline(prompt) = prompt_ref {
             return Ok(Prompt::from_native((**prompt).clone()));
         }
-        let card_ref = prompt_ref.as_card_ref().ok_or_else(|| {
-            WyrdError::registry_invalid_card_spec("Agent prompt is an unresolved path")
-        })?;
-        match self.graph.bodies.get(&card_ref.identity_key()) {
-            Some((_, Spec::Prompt(prompt))) => Ok(Prompt::from_native(prompt.prompt.clone())),
+        let dependency = prompt_ref.to_durable();
+        let (Some(key), Some(card_ref)) = (
+            dependency.as_ref().and_then(body_key),
+            dependency.as_ref().and_then(Ref::as_card_ref),
+        ) else {
+            return Err(WyrdError::registry_invalid_card_spec(
+                "Agent prompt is an unresolved path",
+            ));
+        };
+        match self.graph.bodies.get(&key) {
+            Some(Spec::Prompt(prompt)) => Ok(Prompt::from_native(prompt.prompt.clone())),
             _ => Err(unresolved(card_ref, "was not loaded")),
         }
     }
@@ -448,6 +536,7 @@ mod tests {
         WorkflowExecutionDependencies, WorkflowRunOptions, WorkflowRunStatus, WyrdGatewayCall,
         WyrdGatewayCaller,
     };
+    use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -462,6 +551,9 @@ mod tests {
     #[async_trait]
     impl WyrdGatewayCaller for ReviewGateway {
         /// Answer with a fixed review per reviewer, recording the request.
+        ///
+        /// # Errors
+        /// Never returns an error; every request receives its fixed review.
         async fn call(
             &self,
             call: WyrdGatewayCall,
@@ -484,6 +576,10 @@ mod tests {
     }
 
     /// One OpenAI Chat completion carrying `text`.
+    ///
+    /// # Panics
+    /// Panics if the static completion fixture stops decoding, which is a
+    /// test-fixture invariant.
     fn chat_text(text: &str) -> ProviderResponse {
         let response: OpenAiChatResponse = serde_json::from_value(json!({
             "id": "resp",
@@ -505,17 +601,22 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../examples/workflows/code-review")
     }
 
-    /// Copy the bundle into a temp directory with `edit` applied to the
-    /// Workflow YAML.
-    fn edited_bundle(edit: impl Fn(String) -> String) -> tempfile::TempDir {
-        let temp = tempfile::TempDir::new().expect("temp directory creates");
-        std::fs::create_dir(temp.path().join("agents")).expect("agents directory creates");
-        for agent in ["security", "correctness", "final-reviewer"] {
-            std::fs::copy(
-                bundle().join(format!("agents/{agent}.yaml")),
-                temp.path().join(format!("agents/{agent}.yaml")),
-            )
-            .expect("agent copies");
+    /// Copy the bundle's Agent and Prompt Cards into a temp directory with
+    /// `edit` applied to the Workflow YAML.
+    ///
+    /// # Panics
+    /// Panics when a bundle file cannot be read, copied, or written.
+    fn edited_bundle(edit: impl Fn(String) -> String) -> TempDir {
+        let temp = TempDir::new().expect("temp directory creates");
+        for dir in ["agents", "prompts"] {
+            std::fs::create_dir(temp.path().join(dir)).expect("bundle directory creates");
+            for file in ["security", "correctness", "final-reviewer"] {
+                std::fs::copy(
+                    bundle().join(format!("{dir}/{file}.yaml")),
+                    temp.path().join(format!("{dir}/{file}.yaml")),
+                )
+                .expect("bundle file copies");
+            }
         }
         let workflow =
             std::fs::read_to_string(bundle().join("workflow.yaml")).expect("workflow reads");
@@ -523,10 +624,16 @@ mod tests {
         temp
     }
 
-    /// Hydrate and run the checked-in bundle offline: both reviewers feed the
-    /// final reviewer's declared Prompt variables through the existing
-    /// binder. External refs without a client, extra Prompt bindings, and a
-    /// route/dialect mismatch are refused at load before any call.
+    /// Hydrate and run the checked-in bundle offline: its path-loaded Prompt
+    /// Cards back each Agent, and both reviewers feed the final reviewer's
+    /// declared Prompt variables through the existing binder. External refs
+    /// without a client — including one naming the same identity as a loaded
+    /// sibling — extra Prompt bindings, and a route/dialect mismatch are
+    /// refused at load before any call.
+    ///
+    /// # Panics
+    /// Panics when the bundle stops hydrating or running as asserted, or a
+    /// refusal is missing or carries the wrong code.
     #[tokio::test]
     async fn hydrate_local_workflow_graph() {
         let loader = WorkflowLoader::new(Arc::new(ToolRegistry::new()));
@@ -575,6 +682,19 @@ mod tests {
             .load_file(&external.path().join("workflow.yaml"))
             .await
             .expect_err("a ref needs a registry client");
+        assert_eq!(error.code(), "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY");
+
+        let shadowed = edited_bundle(|yaml| {
+            yaml.replacen(
+                "    - id: correctness",
+                "    - id: registered_security\n      action:\n        type: agent\n        target:\n          ref:\n            kind: Agent\n            name: security-reviewer\n            version: \"1.0.0\"\n      inputs:\n        code: input.code\n\n    - id: correctness",
+                1,
+            )
+        });
+        let error = loader
+            .load_file(&shadowed.path().join("workflow.yaml"))
+            .await
+            .expect_err("a loaded sibling never satisfies an external ref");
         assert_eq!(error.code(), "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY");
 
         let extra = edited_bundle(|yaml| {

@@ -153,3 +153,52 @@ No historical green result substitutes for the new Native or version-intent asse
 ## Handoff
 
 Route directly to `$wyrd-implement`. After implementation, review the complete original-base-to-new-candidate range against Revision 12, original/replacement task, both review attempts and this remediation. Do not review only the latest fix diff. Any genuinely new public/authority/security/concurrency/persistence decision returns to specification approval; the selected corrections above need none.
+
+## Implementation Evidence
+
+Commits on `wyrd/skald-workflow-runtime/TASK-002` after reviewed candidate
+`e7d16b5bd`: d6e397dfd (FIND-10), b6d184c4c (FIND-8), 7d0a2078d and 05c7d4fab
+(FIND-7), a following docs commit (FIND-5/6), 32aa5cfe6 (FIND-9).
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-002-10 | `wyrd-server/src/components/cards/resolve.rs::EffectiveSpecs::validate_workflows` decodes the Workflow from `graph_ready_submissions` holders; authored submissions still drive hashing, replay, sibling cache, persistence | `pg_workflow_registration::registers_only_valid_explicit_workflow_graphs` extended: omitted → `0.1.0`, scoped `"2"` → `2.0.0`, each reloaded exactly; invalid binding under both intents refused at `steps[0].inputs.extra` with no operation/Card writes. RED before fix: `Workflow Card envelope missing resolved version pin` | PASS |
+| FIND-TASK-002-9 | `CardGraphHydrator::{resolve_graph,resolve_refs,load_root,resolve_root_selector}` (`wyrd-client/src/cards/hydrate/graph.rs`); `EffectiveSpecs::resolve` replaces free `resolve_card_references`; private `RegistrationWriter { state, caller }::write` replaces free `write_registration` (`service.rs`). Structural only | the three `pg_workflow_registration` tests, `pg_cards_register::relationship_recheck_blocks_target_lifecycle_race`, `test:cards:integration`, `test:shared`, `check:registry-tx-coupling` | PASS |
+| FIND-TASK-002-7 | `tests/fixtures/workflow-loading` now the explicit Native variant: `llm_route: native`, Prompts `provider: {custom: mock}` (default `ProviderRegistry` echo mock) with body-naming user messages; `shadowed/local-workflow.yaml` added; Rust fake gateway and its five dev-deps removed; Rust ambient loads run in a child test process (`load_in_child` / `authored_load_child`, wyrd-tls precedent) | All three journeys: local run, mixed authored run, shadowed run (local vs registered body at same identity), registered exact + UID runs after `team-v2` registers, exact outputs and `final_review` text; 401/403/404 authored refusals in Rust, Python, TS; gateway example `run` → `WYRD_WORKFLOW_503_BINDING_UNAVAILABLE` in Python/TS | PASS |
+| FIND-TASK-002-8 | `wyrd/src/index.ts`: `JsonValue`, `WorkflowStepStatus`, `WorkflowStepResult`, `WorkflowRunError`; `WorkflowRun.outputs/steps/error` typed; `run(input: Record<string, JsonValue>)` | `tests/unit/workflow-types.test.ts` (`@ts-expect-error` for undefined/function/bigint; full snapshot without casts). RED against the old build: 9 tsc errors (missing `JsonValue`, unused expect-error ×3, missing `details`/`status`/`attempts`/`error`/`remediation`). Native run returns the snapshot in the TS journey | PASS |
+| FIND-TASK-002-5 | rustdoc on `load_workflow_from_path`, `NativeCards::load_workflow` (result channel, TS throw, abandoned-promise read-only/no-partial); Python `PyWorkflow::from_path` gains `# Errors`, `PyWorkflowCards::load` codes; `stubs/agent.pyi`/`cards.pyi` aligned; declarations regenerated | `ts:napi:check`, `codegen:check`, `py:typecheck` | PASS |
+| FIND-TASK-002-6 | `native/src/workflow.rs` imports `std::result::Result as StdResult` (crate convention) for `from_outcome` and `parse_workflow_selector`; `napi::Result` kept for `run` | `lints`, `ts:napi:check` | PASS |
+
+### Observed during remediation
+
+- Python selector validation (`cards.workflow.load` mixed or versionless) raises
+  the existing Python boundary code `WYRD_DATA_400_VALIDATION`, as every Python
+  Cards selector does; the stub previously claimed `WYRD_SPEC_400_VALIDATION`.
+  The stub and journey now state the real code. TS keeps
+  `WYRD_SPEC_400_VALIDATION`; Rust has no client-side selector parse.
+- `check:workspace-hack` (not in this task's lanes) fails on an `opentelemetry`
+  `spec_unstable_logs_enabled` feature drift that is present with or without
+  this change's dev-dependency removal. Not fixed here; route to the owner of
+  the workspace-hack.
+
+### Material limits
+
+- Native execution uses the default registry's echo mock; no live provider.
+  TASK-003 gateway composition and TASK-005 CLI/all-routes proof stay excluded.
+- `authored_load_child` is `#[ignore]` and fails fast if started without
+  `load_in_child`'s environment.
+
+### Verification commands
+
+All exact focused closure commands in this task passed on the final tree
+(loader, wyrd-client unit, three `pg_workflow_registration` tests,
+`pg_cards_register` recheck test, Rust/Python/TS journeys with the corrected
+vitest filter). Lanes: `test:shared`, `test:skald`, `test:cards:integration`,
+`test:wyrd-sdk`, `py:test:unit`, `py:test:cards:integration`, `py:typecheck`,
+`ts:test:unit`, `ts:test:integration`, `ts:typecheck`, `ts:napi:check`,
+`codegen:check`, `check:client-tier`, `check:sdk-client-tier`,
+`check:pyo3-scope`, `check:registry-tx-coupling`, `fmt`, `lints`,
+`py:format`, `py:lints`, `git diff --check` — all PASS. No docs-site or skill
+files touched.
+
+Status: IMPLEMENTED.

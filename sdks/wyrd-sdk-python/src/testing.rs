@@ -134,7 +134,9 @@ impl WyrdTestServer {
     /// `provider_base_url` roots every built-in gateway adapter at one local
     /// mock upstream (`OpenAI` under `/v1`), so gateway journeys dispatch over
     /// HTTP with the harness's operator credential bindings; without it the
-    /// gateway reaches no provider. `live_providers` instead points every
+    /// gateway reaches no provider. The same `/v1` upstream also serves the
+    /// `OpenAI` LLM judge of the verification runtime, so a continuous Eval
+    /// journey's judge calls `<root>/v1/chat/completions`. `live_providers` instead points every
     /// built-in adapter at its real provider endpoint, which only the opt-in
     /// live smoke lane asks for.
     ///

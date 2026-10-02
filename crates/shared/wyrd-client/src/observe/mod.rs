@@ -148,10 +148,15 @@ impl Observe<'_> {
     /// The Python and TypeScript boundaries hold a JSON document, not a Rust
     /// type, and reach the same projection through this door.
     ///
+    /// An integer literal beyond 64-bit range is refused from the text before
+    /// parsing would round it to a float.
+    ///
     /// # Errors
     /// As [`Observe::drift`], plus an invalid-observation error when `json` is
-    /// not valid JSON.
+    /// not valid JSON or carries an integer literal beyond exact `Float64`
+    /// range.
     pub fn drift_json(&self, json: &str, session_id: Option<SessionId>) -> Result<(), WyrdError> {
+        drift::check_integer_literals(json)?;
         self.drift_value(&parse_json(json, "drift features")?, session_id)
     }
 

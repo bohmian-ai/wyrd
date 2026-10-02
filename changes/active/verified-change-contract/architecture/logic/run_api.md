@@ -1,6 +1,6 @@
 # Run API for continuous verification
 
-**Status:** Approved client interface through specification revision 34.
+**Status:** Approved client interface through specification revision 46.
 
 ## User contract
 
@@ -153,14 +153,15 @@ Entering a Python run performs three best-effort local operations:
 Setting attributes only on the span active at entry is insufficient because
 OpenTelemetry span attributes are not inherited by child spans. The processor
 is therefore required for spans created by an agent framework inside the run
-scope. It is stateless apart from provider-registration bookkeeping and wraps
-its complete `on_start` path so an import, context lookup, provider, or span
-error never escapes into application code. Registration is thread-safe,
-idempotent, and attempted at most once per provider; the outcome is cached. A
-provider whose registration fails, including one that raises after accepting
-the processor, never receives another attempt and simply gets no enrichment,
-because the foreign exception makes the side effect unknowable and a retry
-could install a duplicate processor. The scope uses a local OpenTelemetry context value,
+scope. It wraps its complete `on_start` path so an import, context lookup,
+provider, or span error never escapes into application code. Registration is
+thread-safe, idempotent, and attempted at most once per provider object; the
+outcome is weakly tracked by provider identity, never equality, so equal but
+distinct providers register independently. Each attempt owns its own
+processor, inert until `add_span_processor` returns normally. A provider whose
+registration fails, including one that raises after accepting the processor,
+never receives another attempt and gets no enrichment: the processor it may
+have retained stays inert, and a retry could install a duplicate. The scope uses a local OpenTelemetry context value,
 not baggage or resource attributes: baggage is not projected automatically and
 may cross process boundaries, while Bifrost extracts these keys from each
 record.

@@ -1,7 +1,7 @@
 ---
 id: TASK-009-R4
 kind: remediation
-status: ready
+status: superseded
 spec: SPEC-verified-change-contract
 spec_revision: 45
 requirements: [REQ-151, AC-032]

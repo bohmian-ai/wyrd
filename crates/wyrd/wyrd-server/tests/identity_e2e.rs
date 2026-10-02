@@ -1787,12 +1787,7 @@ async fn cli_login(
     password: &str,
 ) -> oauth2::basic::BasicTokenResponse {
     let http = |request| oauth_http(srv, request);
-    let device: oauth2::StandardDeviceAuthorizationResponse = cli
-        .exchange_device_code()
-        .add_extra_param("tenant", FIXTURE_TENANT_SLUG)
-        .request_async(&http)
-        .await
-        .expect("the device login begins");
+    let device = begin_device_login(srv, cli).await;
     let sign_in = approve_device(srv, device.user_code().secret()).await;
     let returned = provider_sign_in(
         &sign_in,
@@ -1815,28 +1810,13 @@ async fn cli_login(
         .expect("the device code redeems")
 }
 
-/// Approve `user_code` for the fixture tenant on the verification page,
-/// posting from the deployment's origin as the page's own form does, and
+/// Approve `user_code` for the fixture tenant on the verification page and
 /// return the provider sign-in URL it redirects to.
 ///
 /// # Panics
 /// Panics when the page refuses the approval.
 async fn approve_device(srv: &WyrdTestServer, user_code: &str) -> Url {
-    let form = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("tenant", FIXTURE_TENANT_SLUG)
-        .append_pair("user_code", user_code)
-        .append_pair("decision", "approve")
-        .finish();
-    let response = auth_call(srv, || {
-        Request::builder()
-            .method(Method::POST)
-            .uri("/auth/device")
-            .header(header::ORIGIN, PUBLIC_ORIGIN)
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(form.clone()))
-            .expect("approval request builds")
-    })
-    .await;
+    let response = decide_device(srv, user_code, "approve").await;
     assert_eq!(
         response.status(),
         StatusCode::SEE_OTHER,
@@ -1849,6 +1829,81 @@ async fn approve_device(srv: &WyrdTestServer, user_code: &str) -> Url {
         .expect("approval names the sign-in URL")
         .parse()
         .expect("sign-in URL parses")
+}
+
+/// Post `decision` (`approve` or `deny`) for `user_code` and the fixture
+/// tenant to the verification page from the deployment's origin, as the
+/// page's own form does.
+///
+/// # Panics
+/// Panics when the request cannot be built or the router fails.
+async fn decide_device(
+    srv: &WyrdTestServer,
+    user_code: &str,
+    decision: &str,
+) -> axum::http::Response<Body> {
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("tenant", FIXTURE_TENANT_SLUG)
+        .append_pair("user_code", user_code)
+        .append_pair("decision", decision)
+        .finish();
+    auth_call(srv, || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/auth/device")
+            .header(header::ORIGIN, PUBLIC_ORIGIN)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(form.clone()))
+            .expect("device decision request builds")
+    })
+    .await
+}
+
+/// Poll `POST /auth/token` once with `device_code` as the public `wyrd-cli`
+/// client (RFC 8628 §3.4) and read the status and RFC 6749 body.
+///
+/// # Panics
+/// Panics when the request cannot be built, the router fails, or the body
+/// is not JSON.
+async fn device_poll(srv: &WyrdTestServer, device_code: &str) -> (StatusCode, Value) {
+    let form = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+        .append_pair("device_code", device_code)
+        .append_pair("client_id", "wyrd-cli")
+        .finish();
+    let response = auth_call(srv, || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/auth/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(form.clone()))
+            .expect("device poll builds")
+    })
+    .await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 65_536)
+        .await
+        .expect("poll body reads");
+    (
+        status,
+        serde_json::from_slice(&body).expect("poll body is JSON"),
+    )
+}
+
+/// Begin one device login for the fixture tenant as `wyrd-cli` with the
+/// `oauth2` crate.
+///
+/// # Panics
+/// Panics when the device authorization request is refused.
+async fn begin_device_login(
+    srv: &WyrdTestServer,
+    cli: &CliClient,
+) -> oauth2::StandardDeviceAuthorizationResponse {
+    cli.exchange_device_code()
+        .add_extra_param("tenant", FIXTURE_TENANT_SLUG)
+        .request_async(&|request| oauth_http(srv, request))
+        .await
+        .expect("the device login begins")
 }
 
 /// Whether `result` is the RFC 6749 §5.2 `invalid_grant` refusal.
@@ -1956,6 +2011,130 @@ async fn human_oidc_login_journey() {
         is_invalid_grant(&after_replay),
         "the successor cannot rotate after replay: {after_replay:?}"
     );
+}
+
+/// The CLI's device grant issues nothing it should not (RFC 8628 §3.5), and
+/// the authorization server publishes the endpoints the `oauth2` crate is
+/// configured with (RFC 8414):
+///   1. the metadata names the token, device, revocation, and authorization
+///      endpoints under the public origin and S256 as the only PKCE method,
+///   2. a pending code answers `authorization_pending`, then `slow_down` when
+///      polled again within the interval; an unknown code is `invalid_grant`,
+///   3. a denied code answers `access_denied` once and `invalid_grant` after,
+///   4. an expired code answers `expired_token` once and `invalid_grant`
+///      after, and can no longer be approved,
+///   5. revoking an unknown token answers `200` (RFC 7009 §2.2).
+///
+/// No refused poll returns a token.
+///
+/// # Panics
+/// Panics when the server fails to start or any answer differs.
+#[tokio::test]
+#[ignore = "requires the Keycloak and Dex identity lane"]
+async fn device_grant_refusal_journey() {
+    let srv = human_server().await;
+    let cli = cli_client();
+
+    // Step 1: RFC 8414 metadata.
+    let response = auth_call(&srv, || {
+        Request::builder()
+            .uri("/.well-known/oauth-authorization-server")
+            .body(Body::empty())
+            .expect("metadata request builds")
+    })
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let metadata: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 65_536)
+            .await
+            .expect("metadata reads"),
+    )
+    .expect("metadata is JSON");
+    assert_eq!(metadata["issuer"], PUBLIC_ORIGIN, "{metadata}");
+    for (field, path) in [
+        ("authorization_endpoint", "/auth/authorize"),
+        ("token_endpoint", "/auth/token"),
+        (
+            "device_authorization_endpoint",
+            "/auth/device_authorization",
+        ),
+        ("revocation_endpoint", "/auth/revoke"),
+    ] {
+        assert_eq!(metadata[field], format!("{PUBLIC_ORIGIN}{path}"), "{field}");
+    }
+    assert_eq!(
+        metadata["code_challenge_methods_supported"],
+        serde_json::json!(["S256"])
+    );
+
+    // Step 2: pending, too fast, unknown.
+    let pending = begin_device_login(&srv, &cli).await;
+    let code = pending.device_code().secret();
+    for expected in ["authorization_pending", "slow_down"] {
+        let (status, body) = device_poll(&srv, code).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], expected, "{body}");
+    }
+    let (status, body) = device_poll(&srv, "not-a-device-code").await;
+    assert_eq!(
+        (status, &body["error"]),
+        (StatusCode::BAD_REQUEST, &serde_json::json!("invalid_grant"))
+    );
+
+    // Step 3: denied.
+    let denial = decide_device(&srv, pending.user_code().secret(), "deny").await;
+    assert_eq!(
+        denial.status(),
+        StatusCode::OK,
+        "the page records the denial"
+    );
+    for expected in ["access_denied", "invalid_grant"] {
+        let (status, body) = device_poll(&srv, code).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], expected, "{body}");
+        assert!(body.get("access_token").is_none(), "{body}");
+    }
+
+    // Step 4: expired.
+    let expiring = begin_device_login(&srv, &cli).await;
+    sqlx::query(
+        "UPDATE wyrd.auth_device_authorizations
+            SET created_at = statement_timestamp() - interval '11 minutes',
+                expires_at = statement_timestamp() - interval '1 minute'",
+    )
+    .execute(
+        &srv.pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens"),
+    )
+    .await
+    .expect("the device code expires");
+    let refused = decide_device(&srv, expiring.user_code().secret(), "approve").await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "an expired code is not approved"
+    );
+    for expected in ["expired_token", "invalid_grant"] {
+        let (status, body) = device_poll(&srv, expiring.device_code().secret()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], expected, "{body}");
+        assert!(body.get("access_token").is_none(), "{body}");
+    }
+
+    // Step 5: revoking an unknown token succeeds and revokes nothing.
+    let form = "token=not-a-token&client_id=wyrd-cli";
+    let revoked = auth_call(&srv, || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/auth/revoke")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(form))
+            .expect("revoke request builds")
+    })
+    .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
 }
 
 /// Present a `wyrd-ui` refresh token to `POST /auth/token` as that

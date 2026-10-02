@@ -11,8 +11,8 @@ use skald_agent::{
 use skald_prompt::Prompt;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_responses::{
-    OpenAiResponseContentPart, OpenAiResponseItem, OpenAiResponsesRequest, OpenAiResponsesResponse,
-    OpenAiResponsesSettings, OpenAiResponsesTool,
+    OpenAiReasoningSummaryPart, OpenAiResponseContentPart, OpenAiResponseItem,
+    OpenAiResponsesRequest, OpenAiResponsesResponse, OpenAiResponsesSettings, OpenAiResponsesTool,
 };
 use skald_spec::{
     MessageNum, Prompt as SpecPrompt, ProviderName, ProviderRequest, ProviderResponse, ResponseType,
@@ -99,7 +99,9 @@ fn message(role: &str, part: OpenAiResponseContentPart) -> OpenAiResponseItem {
 fn reasoning() -> OpenAiResponseItem {
     OpenAiResponseItem::Reasoning {
         id: Some("rs_1".to_owned()),
-        summary: None,
+        summary: vec![OpenAiReasoningSummaryPart::SummaryText {
+            text: "checked".to_owned(),
+        }],
         encrypted_content: Some("opaque".to_owned()),
     }
 }

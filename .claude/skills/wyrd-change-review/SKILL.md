@@ -47,6 +47,13 @@ or `REGRESSION`. Do not report optional improvements, preferences, unrelated
 debt, or speculative hardening. Each finding names the violated obligation,
 exact location, evidence, consequence, required outcome, and closure proof.
 
+Reject unearned complexity. Where a standard and conventional way exists (a
+published standard such as an RFC, or the established practice of comparable
+widely used projects), the integrated change must use it. Classify any
+mechanism, state, check, file, setting, option, or error beyond that standard
+as `DRIFT` unless approved authority explicitly requires it. Never require one
+in a finding or remediation; a correction follows the standard way too.
+
 ## Verdict and routing
 
 Return `PASS`, `FIX_REQUIRED`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`.

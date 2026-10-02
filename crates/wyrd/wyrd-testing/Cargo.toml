@@ -68,6 +68,9 @@ http-body-util = "0.1"
 opendal = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
+# Roots the bound server's Eval judge at the test gateway's mock upstream.
+skald-runtime = { workspace = true }
+skald-spec = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 secrecy = { workspace = true }
@@ -115,8 +118,6 @@ datafusion-proto = { workspace = true }
 # The continuous Eval journey builds its native judge Prompt and points the
 # production judge at a local OpenAI-compatible provider.
 skald-prompt = { workspace = true }
-skald-runtime = { workspace = true }
-skald-spec = { workspace = true }
 metrics = { workspace = true }
 # Local provider upstream of the native gateway ingress journey.
 wiremock = { workspace = true }

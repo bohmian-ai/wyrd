@@ -180,6 +180,9 @@ pub struct WyrdTestServer {
     /// binds. Off by default so ordinary journeys never race a background
     /// scheduler or runner over the queue they assert on.
     verification_runtime: bool,
+    /// `OpenAI`-compatible mock upstream the composed verification runtime's
+    /// Eval judges call; `None` keeps the environment-built default registry.
+    verification_provider: Option<Url>,
 }
 
 struct WyrdTestServerInner {
@@ -469,6 +472,9 @@ pub struct WyrdTestServerBuilder {
     /// Built-in provider base URLs of an attached HTTP gateway engine; `None`
     /// keeps the default engine that dispatches nothing.
     gateway_endpoints: Option<BuiltinEndpoints>,
+    /// `OpenAI`-compatible mock upstream the bound verification runtime's Eval
+    /// judges call, set with the gateway provider root.
+    verification_provider: Option<Url>,
     /// Address and token variable the declared test Vault backend uses.
     ///
     /// `None` keeps the unreachable default address and the default token
@@ -605,6 +611,7 @@ impl Default for WyrdTestServerBuilder {
             omit_token_verifier: false,
             limits: None,
             gateway_endpoints: None,
+            verification_provider: None,
             gateway_vault_backend: None,
             stalled_drain_for_test: None,
             shutdown_drain_for_test: None,
@@ -3529,8 +3536,18 @@ impl WyrdTestServer {
             config.shutdown.drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
         }
 
-        let bound = WyrdServer::new(config, state)
-            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?
+        let mut server = WyrdServer::new(config, state)
+            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?;
+        if let Some(provider) = &self.verification_provider {
+            let providers = skald_runtime::ProviderRegistry::for_provider(
+                &skald_spec::ProviderName::OpenAi,
+                provider.as_str(),
+                Some("wyrd-test-provider-key"),
+            )
+            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?;
+            server = server.with_verification_providers_for_test(Arc::new(providers));
+        }
+        let bound = server
             .bind(ServeMode::Both)
             .await
             .map_err(|e| WyrdTestServerError::Bind(format!("{e:?}")))?;
@@ -3707,11 +3724,15 @@ impl WyrdTestServerBuilder {
     ///
     /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini, and
     /// Vertex at `root` itself, where each provider's native paths begin.
-    /// Delegates to [`Self::with_gateway_endpoints_for_test`].
+    /// Delegates to [`Self::with_gateway_endpoints_for_test`]. The same `/v1`
+    /// upstream also serves the `OpenAI` Eval judge of a bound server's
+    /// verification runtime, so a language journey roots both model paths at
+    /// one local mock.
     #[must_use]
-    pub fn with_gateway_provider_root_for_test(self, root: Url) -> Self {
+    pub fn with_gateway_provider_root_for_test(mut self, root: Url) -> Self {
         let mut openai = root.clone();
         openai.set_path("/v1");
+        self.verification_provider = Some(openai.clone());
         self.with_gateway_endpoints_for_test(BuiltinEndpoints {
             openai: Some(openai),
             anthropic: Some(root.clone()),
@@ -4577,6 +4598,7 @@ impl WyrdTestServerBuilder {
             stalled_drain_for_test: self.stalled_drain_for_test,
             shutdown_drain_for_test: self.shutdown_drain_for_test,
             verification_runtime: self.verification_runtime,
+            verification_provider: self.verification_provider,
             serve_task_panic_for_test: self.serve_task_panic_for_test,
         })
     }

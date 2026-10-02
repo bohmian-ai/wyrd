@@ -419,7 +419,9 @@ Wyrd settings to activate the connection.</p></body></html>";
 /// `GET /auth/authorize` is redirected (`303`) back to its client's redirect
 /// URI with a single-use Wyrd authorization code and the client's `state`
 /// (RFC 6749 §4.1.2), or with an RFC 6749 §4.1.2.1 error once its state was
-/// consumed; a device-code login records its approval and receives a static
+/// consumed — including a provider's own `error`, which the client receives
+/// as `access_denied`, or as `server_error` or `temporarily_unavailable`
+/// when the provider reported one of those; a device-code login records its approval and receives a static
 /// page; a candidate connection test marks its bound candidate revision
 /// tested, issues nothing, and receives a static page.
 ///
@@ -430,7 +432,10 @@ Wyrd settings to activate the connection.</p></body></html>";
     get,
     path = "/auth/callback",
     params(
-        ("code" = String, Query, description = "Authorization code from the identity provider"),
+        ("code" = Option<String>, Query, description = "Authorization code from the identity \
+          provider; exactly one of `code` or `error` is present"),
+        ("error" = Option<String>, Query, description = "The identity provider's RFC 6749 \
+          §4.1.2.1 error code"),
         ("state" = String, Query, description = "Opaque login state Wyrd generated at initiation"),
         ("iss" = Option<String>, Query, description = "RFC 9207 authorization-response issuer; \
           when present it must equal the login's issuer, and it is required when the \
@@ -444,7 +449,8 @@ Wyrd settings to activate the connection.</p></body></html>";
         (status = 303, description = "An authorization-request login completed: redirect to \
           the client's redirect URI with `code` and `state`, or with an RFC 6749 §4.1.2.1 \
           `error`", headers(("Location" = String, description = "The client's redirect URI"))),
-        (status = 400, description = "The login state is unknown, expired, or replayed \
+        (status = 400, description = "The query carries both or neither of `code` and \
+          `error` (WYRD_SPEC_400_VALIDATION), the login state is unknown, expired, or replayed \
           (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match \
           (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no public origin \
           (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
@@ -474,7 +480,7 @@ async fn callback(
     let request_id = request_id.map_or_else(RequestId::now_v7, |Extension(id)| id);
     let completed = exchange_authorization_code(
         &state,
-        query.code.into_secret_string(),
+        query.response()?,
         &query.state,
         query.iss.as_deref(),
         request_id.as_str(),

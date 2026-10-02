@@ -1,14 +1,14 @@
 //! Human OIDC callback adapter: the common `GET /auth/callback` exchange.
 
-use secrecy::SecretString;
 use wyrd_auth::callback::LoginCompletion;
+use wyrd_spec::auth::ProviderResponse;
 
 use crate::auth::auth_not_configured;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
-/// Complete a login from the provider callback's `code`, `state`, and
-/// optional RFC 9207 `iss`.
+/// Complete a login from the provider callback's `response` (its code or
+/// error), `state`, and optional RFC 9207 `iss`.
 ///
 /// Builds the authorization-code exchange from the server's auth
 /// configuration and runs it. The tenant is recovered from the state alone;
@@ -21,7 +21,7 @@ use crate::state::AppState;
 /// refusal of [`wyrd_auth::callback::AuthorizationCodeExchange::execute`].
 pub async fn exchange_authorization_code(
     state: &AppState,
-    code: SecretString,
+    response: ProviderResponse,
     state_key: &str,
     response_issuer: Option<&str>,
     request_id: &str,
@@ -35,7 +35,7 @@ pub async fn exchange_authorization_code(
             .ok_or_else(auth_not_configured)?,
     };
     service
-        .execute(code, state_key, response_issuer, request_id)
+        .execute(response, state_key, response_issuer, request_id)
         .await
         .map_err(WyrdErrorResponse::from)
 }
@@ -69,7 +69,8 @@ mod pg_tests {
     use wyrd_spec::auth::IssuerTokenPolicy;
     use wyrd_spec::auth::{
         ClientAuthorization, ConnectionTester, IssuerUrl, LoginInitiation, OAuthClientId,
-        PrincipalId, PrincipalKindTag, SecretBearer, Sha256Hex, TokenType,
+        OAuthErrorCode, PrincipalId, PrincipalKindTag, ProviderResponse, SecretBearer, Sha256Hex,
+        TokenType,
     };
     use wyrd_sql::queries::auth::{
         HumanConnectionWrite, LoginState, consume_login_state, human_connection_in_state,
@@ -80,6 +81,7 @@ mod pg_tests {
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use super::exchange_authorization_code;
+    use crate::auth::oauth::OAuthError;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
     const PUBLIC_KEY_PEM: &[u8] = b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n";
@@ -176,7 +178,7 @@ mod pg_tests {
 
         let error = exchange_authorization_code(
             &state,
-            SecretString::from("code".to_owned()),
+            ProviderResponse::Code(SecretBearer::new("code".to_owned())),
             "missing-state",
             None,
             "req-missing-state",
@@ -209,7 +211,7 @@ mod pg_tests {
 
         let error = exchange_authorization_code(
             &state,
-            SecretString::from("code".to_owned()),
+            ProviderResponse::Code(SecretBearer::new("code".to_owned())),
             raw,
             None,
             "req-consumed",
@@ -218,6 +220,99 @@ mod pg_tests {
         .expect_err("a consumed state is refused");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_STATE");
+    }
+
+    /// A provider's `error` consumes the login state once and resolves to
+    /// the client's redirect with `access_denied` and its exact `state`,
+    /// issuing nothing; `server_error` and `temporarily_unavailable` keep
+    /// their codes, and a present `iss` must still name the login's issuer.
+    ///
+    /// # Panics
+    /// Panics when a provider error is not resolved to the client's refusal,
+    /// the state survives, or anything is issued.
+    #[tokio::test]
+    async fn a_provider_error_consumes_state_and_refuses_to_the_client() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let state = test_state_with_human_connections(&fixture).await;
+        let binding = committed_active_binding(&fixture).await;
+        let cases = [
+            ("access_denied", None, OAuthErrorCode::AccessDenied),
+            ("login_required", None, OAuthErrorCode::AccessDenied),
+            ("server_error", None, OAuthErrorCode::ServerError),
+            (
+                "temporarily_unavailable",
+                Some("https://idp.fixture.test"),
+                OAuthErrorCode::TemporarilyUnavailable,
+            ),
+            (
+                "temporarily_unavailable",
+                Some("https://other.example.com"),
+                OAuthErrorCode::AccessDenied,
+            ),
+        ];
+        for (index, (provider_error, iss, expected)) in cases.into_iter().enumerate() {
+            let raw = format!("provider-error-{index}");
+            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+            let inserted = insert_login_state(
+                &mut conn,
+                &Sha256Hex::digest(raw.as_bytes()),
+                &LoginState {
+                    connection: binding,
+                    issuer: "https://idp.fixture.test".to_owned(),
+                    client_id: "wyrd-fixture".to_owned(),
+                    redirect_uri: "https://test-tenant-1.example.com/auth/callback".to_owned(),
+                    code_verifier: SecretString::from("verifier"),
+                    nonce: "nonce".to_owned(),
+                    initiation: LoginInitiation::Authorize(ClientAuthorization {
+                        client: OAuthClientId::WyrdUi,
+                        redirect_uri: UI_REDIRECT.to_owned(),
+                        code_challenge: CODE_CHALLENGE.to_owned(),
+                        state: Some("client-state".to_owned()),
+                    }),
+                },
+                StdDuration::from_mins(5),
+            )
+            .await
+            .expect("state inserts");
+            assert!(inserted, "the state is recorded");
+            conn.commit().await.expect("state commits");
+
+            let completed = exchange_authorization_code(
+                &state,
+                ProviderResponse::Error(provider_error.to_owned()),
+                &raw,
+                iss,
+                "req-provider-error",
+            )
+            .await
+            .expect("a provider error resolves to the client");
+            let LoginCompletion::Refused {
+                authorization,
+                error,
+            } = completed
+            else {
+                panic!("{provider_error}: expected a client refusal, got {completed:?}");
+            };
+            assert_eq!(authorization.redirect_uri, UI_REDIRECT);
+            assert_eq!(authorization.state.as_deref(), Some("client-state"));
+            assert_eq!(
+                OAuthError::authorization(error),
+                expected,
+                "{provider_error} {iss:?}"
+            );
+
+            let replay = exchange_authorization_code(
+                &state,
+                ProviderResponse::Error(provider_error.to_owned()),
+                &raw,
+                iss,
+                "req-provider-error-replay",
+            )
+            .await
+            .expect_err("the state was consumed once");
+            assert_eq!(replay.0.code(), "WYRD_AUTH_400_INVALID_STATE");
+        }
+        assert_nothing_persisted(&fixture).await;
     }
 
     /// A verified token for a consumed login issues only an authorization

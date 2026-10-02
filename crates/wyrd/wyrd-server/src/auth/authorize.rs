@@ -12,7 +12,7 @@ use axum::Json;
 use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
-use url::Url;
+use url::{Url, form_urlencoded};
 use wyrd_spec::auth::{
     AbsoluteUrl, AuthorizationServerMetadata, ClientAuthorization, OAuthClientId, OAuthErrorCode,
 };
@@ -32,12 +32,13 @@ const UI_REDIRECT_PATH: &str = "/login/callback";
 /// §4.1.1, RFC 7636 §4.3).
 ///
 /// Only `wyrd-ui` uses the authorization code grant, so `client_id` must
-/// name it and `redirect_uri` must equal its registered
+/// name it once and `redirect_uri` must appear once and equal its registered
 /// `{public_origin}/login/callback` exactly (RFC 6749 §3.1.2); otherwise the
-/// browser is shown an error page and never redirected. After that, a
-/// repeated parameter, a missing `response_type`, `code_challenge`, or
+/// browser is shown an error page and never redirected. After that, any
+/// other repeated parameter, a missing `response_type`, `code_challenge`, or
 /// `tenant`, a challenge method other than `S256`, or a refused sign-in
-/// redirects back with the RFC 6749 §4.1.2.1 error. A valid request
+/// redirects back with the RFC 6749 §4.1.2.1 error, carrying `state` only
+/// when the request sent exactly one. A valid request
 /// redirects (`303`) to the tenant's provider sign-in, bound to the client,
 /// redirect URI, challenge, and `state`. No request header selects the
 /// tenant, connection, or redirect, and initiation appends no audit event:
@@ -82,23 +83,31 @@ pub async fn authorize(
         .as_ref()
         .ok_or_else(auth_not_configured)?;
     let registered = ui_redirect_uri(connections.require_callback()?);
-    let form = OAuthForm::parse(query.unwrap_or_default().as_bytes());
-    let Some(form) = form.ok().filter(|form| {
-        form.get("client_id") == Some(OAuthClientId::WyrdUi.as_str())
-            && form.get("redirect_uri") == Some(registered.as_str())
-    }) else {
+    let query = query.unwrap_or_default();
+    if unique_param(&query, "client_id").as_deref() != Some(OAuthClientId::WyrdUi.as_str())
+        || unique_param(&query, "redirect_uri").as_deref() != Some(registered.as_str())
+    {
         return Ok(page(
             StatusCode::BAD_REQUEST,
             "<h1>Sign-in request refused</h1><p>The application or its return address is not \
              registered with this Wyrd deployment.</p>",
         ));
-    };
-    let authorization = ClientAuthorization {
+    }
+    let mut authorization = ClientAuthorization {
         client: OAuthClientId::WyrdUi,
         redirect_uri: registered,
-        code_challenge: form.get("code_challenge").unwrap_or_default().to_owned(),
-        state: form.get("state").map(str::to_owned),
+        code_challenge: String::new(),
+        state: unique_param(&query, "state"),
     };
+    let Ok(form) = OAuthForm::parse(query.as_bytes()) else {
+        return Ok(client_redirect(
+            &authorization,
+            &[("error", error_name(OAuthErrorCode::InvalidRequest))],
+        ));
+    };
+    form.get("code_challenge")
+        .unwrap_or_default()
+        .clone_into(&mut authorization.code_challenge);
     let refused = |code| {
         Ok(client_redirect(
             &authorization,
@@ -177,6 +186,17 @@ pub async fn metadata(
         revocation_endpoint_auth_methods_supported: auth_methods,
         code_challenge_methods_supported: strings(&["S256"]),
     }))
+}
+
+/// The value of the parameter `name` in the form-encoded `query` when it is
+/// sent exactly once with a value; `None` when it is absent or repeated.
+/// Parameters without a value are omitted, as [`OAuthForm`] omits them.
+fn unique_param(query: &str, name: &str) -> Option<String> {
+    let mut values = form_urlencoded::parse(query.as_bytes())
+        .filter(|(key, value)| key == name && !value.is_empty())
+        .map(|(_, value)| value.into_owned());
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
 }
 
 /// `wyrd-ui`'s registered redirect URI under the origin of the deployment's
@@ -430,7 +450,45 @@ mod pg_tests {
         );
     }
 
-    /// An unregistered redirect URI or client is never redirected to.
+    /// Once the client and redirect URI are each sent once and registered, a
+    /// repeated non-binding parameter redirects back with `invalid_request`,
+    /// echoing `state` only when it is unambiguous (RFC 6749 §4.1.2.1).
+    ///
+    /// # Panics
+    /// Panics when a duplicate is not redirected back with `invalid_request`
+    /// or `state` is echoed from an ambiguous request.
+    #[tokio::test]
+    async fn duplicate_parameters_redirect_back_to_the_registered_client() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let provider = MockServer::start().await;
+        let state = authorize_state(&fixture, &provider).await;
+        let tenant = fixture.tenant_slug().to_owned();
+
+        for (query, echoed) in [
+            (request(&tenant, "&state=again"), None),
+            (request(&tenant, "&code_challenge_method=S256"), Some("xyz")),
+            (request(&tenant, &format!("&tenant={tenant}")), Some("xyz")),
+        ] {
+            let (status, location) = get_authorize(state.clone(), &query).await;
+            assert_eq!(status, StatusCode::SEE_OTHER, "{query}");
+            let location = location.expect("redirects");
+            assert!(
+                location
+                    .as_str()
+                    .starts_with("https://wyrd.example.com/login/callback?"),
+                "{query}"
+            );
+            assert_eq!(
+                param(&location, "error").as_deref(),
+                Some("invalid_request"),
+                "{query}"
+            );
+            assert_eq!(param(&location, "state").as_deref(), echoed, "{query}");
+        }
+    }
+
+    /// An unregistered, missing, or repeated redirect URI or client is never
+    /// redirected to.
     ///
     /// # Panics
     /// Panics when the request redirects.
@@ -444,7 +502,12 @@ mod pg_tests {
         for query in [
             request(&tenant, "").replace("wyrd.example.com", "evil.example.org"),
             request(&tenant, "").replace("wyrd-ui", "wyrd-cli"),
-            request(&tenant, "&state=again"),
+            request(&tenant, "&client_id=wyrd-ui"),
+            request(
+                &tenant,
+                "&redirect_uri=https%3A%2F%2Fwyrd.example.com%2Flogin%2Fcallback",
+            ),
+            request(&tenant, "").replace("&client_id=wyrd-ui", ""),
         ] {
             let (status, location) = get_authorize(state.clone(), &query).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");

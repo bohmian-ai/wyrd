@@ -1,7 +1,7 @@
 //! Domain logic for the common human OIDC callback.
 //!
-//! The callback carries the provider's `code`, `state`, and optional RFC 9207
-//! `iss`. The state's SHA-256 names one login-state row across tenants; that
+//! The callback carries the provider's `code` or `error`, its `state`, and
+//! optional RFC 9207 `iss`. The state's SHA-256 names one login-state row across tenants; that
 //! row alone decides the tenant, connection revision, issuer, client,
 //! redirect, PKCE verifier, nonce, and initiation binding. No request header
 //! takes part. A present `iss` must name that recorded issuer.
@@ -31,8 +31,8 @@ use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
-    ClientAuthorization, IssuerUrl, LoginInitiation, OAuthClientId, SecretBearer, Sha256Hex,
-    TokenResponse,
+    ClientAuthorization, IssuerUrl, LoginInitiation, OAuthClientId, ProviderResponse, SecretBearer,
+    Sha256Hex, TokenResponse,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
@@ -106,8 +106,8 @@ impl std::fmt::Debug for AuthorizationCodeExchange {
 }
 
 impl AuthorizationCodeExchange {
-    /// Complete a login from the provider callback's `code`, `state`, and
-    /// optional RFC 9207 `iss`.
+    /// Complete a login from the provider callback's `response` (its code or
+    /// error), `state`, and optional RFC 9207 `iss`.
     ///
     /// The SHA-256 of `state_key` resolves the login's tenant through the
     /// narrow definer lookup; an unknown, expired, or already consumed state
@@ -121,7 +121,10 @@ impl AuthorizationCodeExchange {
     /// the recorded issuer before any token-endpoint request; the relying
     /// party exchanges the code with the recorded redirect URI and PKCE
     /// verifier and verifies the ID token, its nonce, and its authorized
-    /// party; and [`Self::finish_id_token_exchange`] records the outcome.
+    /// party; and [`Self::finish_id_token_exchange`] records the outcome. A
+    /// provider error consumes the state the same way and, once a present
+    /// `iss` names the recorded issuer, refuses the login without any
+    /// provider request ([`provider_refusal`]).
     /// Returns what the callback recorded, which decides its response: an
     /// authorization-request login is redirected back to its client with a
     /// code, or with an error when it is refused after its state was
@@ -151,7 +154,7 @@ impl AuthorizationCodeExchange {
     /// the person starts a new login.
     pub async fn execute(
         &self,
-        code: SecretString,
+        response: ProviderResponse,
         state_key: &str,
         response_issuer: Option<&str>,
         request_id: &str,
@@ -169,7 +172,13 @@ impl AuthorizationCodeExchange {
             ));
         };
         let result = self
-            .complete(tenant_id, &state_hash, code, response_issuer, request_id)
+            .complete(
+                tenant_id,
+                &state_hash,
+                response,
+                response_issuer,
+                request_id,
+            )
             .await;
         // A refusal rolls back any user it resolved, so the denied event
         // names no principal.
@@ -193,7 +202,7 @@ impl AuthorizationCodeExchange {
         &self,
         tenant_id: DataTenantId,
         state_hash: &Sha256Hex,
-        code: SecretString,
+        response: ProviderResponse,
         response_issuer: Option<&str>,
         request_id: &str,
     ) -> Result<LoginCompletion, WyrdError> {
@@ -205,16 +214,23 @@ impl AuthorizationCodeExchange {
         conn.commit().await.map_err(store_error)?;
         let login_state = login_state
             .ok_or_else(|| invalid_state("login state is missing, expired, or already consumed"))?;
-        let result = self
-            .verify_and_finish(
-                tenant_id,
-                state_hash,
-                &login_state,
-                code,
-                response_issuer,
-                request_id,
-            )
-            .await;
+        let result = match response {
+            ProviderResponse::Code(code) => {
+                self.verify_and_finish(
+                    tenant_id,
+                    state_hash,
+                    &login_state,
+                    code.into_secret_string(),
+                    response_issuer,
+                    request_id,
+                )
+                .await
+            }
+            ProviderResponse::Error(error) => {
+                verify_response_issuer(response_issuer, &login_state.issuer, false)
+                    .and_then(|()| Err(provider_refusal(&error)))
+            }
+        };
         match (result, login_state.initiation) {
             (Err(error), LoginInitiation::Authorize(authorization)) => {
                 Ok(LoginCompletion::Refused {
@@ -662,6 +678,23 @@ pub fn verify_response_issuer(
             "authorization response is missing the issuer the provider advertises",
         )),
         None => Ok(()),
+    }
+}
+
+/// The refusal a provider's RFC 6749 §4.1.2.1 `error` resolves the login to.
+///
+/// `temporarily_unavailable` and `server_error` keep their meaning, so the
+/// client is redirected back with the same code; every other provider error
+/// is a refused sign-in, which the client sees as `access_denied`. Neither
+/// the provider's code nor its `error_description` is copied into the
+/// refusal, so none of its text is reflected or logged.
+fn provider_refusal(error: &str) -> WyrdError {
+    let message = "the identity provider refused the sign-in".to_owned();
+    let details = serde_json::json!({});
+    match error {
+        "temporarily_unavailable" => WyrdError::DiscoveryUnavailable { message, details },
+        "server_error" => WyrdError::Internal { message, details },
+        _ => WyrdError::InvalidToken { message, details },
     }
 }
 

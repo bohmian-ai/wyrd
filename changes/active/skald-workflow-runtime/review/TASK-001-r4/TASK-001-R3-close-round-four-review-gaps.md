@@ -174,3 +174,34 @@ git diff --check
 A red required lane blocks completion. Route this task directly to
 `$wyrd-implement`; a later task review must reassess the complete cumulative
 base-to-candidate range.
+
+## Implementation evidence
+
+Commits: `f116b1676` (FIND-27), `6d9cabbdd` (FIND-29), `c08ddd236` (FIND-28),
+plus this evidence record.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-001-27` | `docs/architecture/skald.md` overview, Dependency Direction prose, and diagram now name the `skald-workflow -> wyrd-spec` contract edge, list the other live `wyrd-spec` consumers (`skald-agent`, `skald-tool`, `skald-prompt`) and `skald-providers -> wyrd-tls`, and keep the no-`wyrd-server`/no-`vala-*` boundary. Whole page re-read against every `crates/skald/*/Cargo.toml` and `architecture/wyrd-doctrine.mdx` service boundaries. | `mise run docs:check` exit 0 | PASS |
+| `FIND-TASK-001-28` | `crates/wyrd/wyrd-testing/src/server.rs`: one `WyrdTestServer::settle_lifecycle` used by `shutdown`, `shutdown_and_inspect`, startup rollback, `terminate_abruptly_for_test`, `await_terminal_failure_for_test`, and `Drop`. It cancels both tokens, waits up to the existing 2 s budget for the serve task and then aborts **and joins** it (never detaches), and, unless a bound serve task returned its production drain report, runs the existing `Bifrost::shutdown` and falls back to `Bifrost::abort`. `Drop` runs it on a joined scoped thread over the shared Wyrd runtime before field drop releases runtime owners and the fixture; on an active runtime the budget is zero (abort directly). The stalled-drain seam now serves and drains normally, then never completes. | `server::teardown_tests::shutdown_aborts_and_joins_a_serve_task_that_outlives_its_drain` and `server::teardown_tests::dropping_an_in_process_server_settles_bifrost_before_fixture_release`: both FAIL on the pre-fix teardown (flag unset; storage owner not settled), both PASS after (2 selected, 2 passed) | PASS |
+| `FIND-TASK-001-29` | `crates/skald/skald-agent/src/loop_runtime.rs` `chat_span` records `request_model(request)` of the dispatched (post-`before_model`) request, falling back to the resolved Prompt model only for model-less wire shapes (Gemini/Vertex). | `agent_run_chat_span_records_callback_replaced_model` (new): FAIL before (`gpt-4o` != `gpt-4o-mini`), PASS after; asserts dispatch and span both carry the replacement, `chat` operation, `openai` provider, no finish-reasons field, no payload marker. `agent_run_genai_google_provider_and_model` keeps the Gemini/Vertex fallback green. | PASS |
+
+Focused commands (each exit 0 after the fix):
+
+```bash
+mise exec -- cargo nextest run --locked -p skald-agent --test agent_timeout \
+  -E 'test(=agent_run_chat_span_records_callback_replaced_model)'   # 1 selected, 1 passed
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-testing --lib \
+  -E 'test(=server::teardown_tests::shutdown_aborts_and_joins_a_serve_task_that_outlives_its_drain) | test(=server::teardown_tests::dropping_an_in_process_server_settles_bifrost_before_fixture_release)'"
+  # 2 selected, 2 passed
+```
+
+Broader verification: `mise run fmt` 0, `mise run lints` 0, `mise run test:skald`
+0 (337 passed), `mise run test:wyrd` 0 (2284 passed, 161 skipped), `mise run docs:check` 0,
+`mise run check:client-tier` 0, `git diff --check a51af030b..HEAD` 0.
+
+Non-goals held: no production lifecycle API, crate, dependency, feature, sleep,
+retry, larger timeout, telemetry abstraction, or Observer surface was added;
+production shutdown semantics are unchanged. No file outside the three findings'
+owners and this record changed.

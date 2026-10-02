@@ -127,13 +127,14 @@ model across synchronous and asynchronous use.
 **Behavior.** Missing OpenTelemetry packages, an API-only or unsupported
 provider, registration failure, span enrichment failure, and exit
 context-update failure do not escape or block explicit Wyrd observations. A
-user exception propagates unchanged. Unknown Card aliases still fail. Global
-and explicitly supplied private providers receive at most one Wyrd processor
-each, and registration is attempted at most once per provider.
+user exception propagates unchanged. Unknown Card aliases still fail. Run
+entry marks the global provider, and `install_run_correlation` marks an
+explicitly supplied private provider, so repeated entry registers once; a
+duplicate from a concurrent first entry is harmless.
 
 **RED.** Add failure-injection cases beside the Python Run surface cases. They
-fail until optional integration failures are contained and provider
-registration is idempotent. Use the same focused Python command from Scenario
+fail until optional integration failures are contained and repeated entry
+skips a marked provider. Use the same focused Python command from Scenario
 2.
 
 **GREEN.** Contain only the optional telemetry integration failures while

@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 46
+revision: 47
 status: approved
 ---
 
@@ -317,8 +317,8 @@ flows are listed in its "Input and queue boundary" section.
   execution-local OpenTelemetry context under the exact Bifrost attributes
   `wyrd.card_ref` and `wyrd.run_id`, set both attributes on an already-active
   recording span only when that span does not already carry `wyrd.card_ref`,
-  and ensure one idempotently registered span processor copies the innermost
-  scope's pair from the parent context to every span started inside the scope.
+  and ensure a Wyrd span processor copies the innermost scope's pair from the
+  parent context to every span started inside the scope.
   The Wyrd scope stack lives inside the OpenTelemetry context value itself: a
   tuple of `(card_ref, run_id)` pairs, innermost last, under one private
   context key created at module import when OpenTelemetry is present. Entry
@@ -332,14 +332,25 @@ flows are listed in its "Input and queue boundary" section.
   A framework using the global provider MUST need no setup beyond
   `with state.run(...)`; the Python SDK MUST expose an idempotent
   `wyrd.otel.install_run_correlation(provider)` escape hatch for a
-  framework-owned private provider. Registration is idempotent and attempted
-  at most once per provider; its outcome is cached, and a provider whose
-  registration fails, including one that raises after accepting the processor,
-  never receives another attempt and simply gets no enrichment. Missing
-  OpenTelemetry packages, an unsupported or absent provider, no active
-  recording span, invalid runtime context, processor failure, and
-  context-update failure MUST all fail open as no enrichment: they MUST NOT fail Run construction or entry/exit, application
-  execution, or explicit Wyrd observation emission. Unknown Card aliases,
+  framework-owned private provider. Registration carries exactly three
+  guarantees. (1) No processor pile-up: Run entry automatically registers the
+  Wyrd processor on the global tracer provider (and
+  `install_run_correlation(provider)` on an explicit private provider) and
+  marks that provider object with a private attribute so later entries skip
+  it. Registration is best effort; a duplicate processor (for example from a
+  concurrent first entry) is harmless because the processor is stateless and
+  enrichment is idempotent. (2) Never break the app: every optional-telemetry
+  failure, including absent OpenTelemetry packages, an unsupported or absent
+  provider, a provider without `add_span_processor`, an unmarkable provider,
+  a registration error, no active recording span, invalid runtime context,
+  processor failure, and context-update failure, is swallowed as no
+  enrichment: it MUST NOT fail Run construction or entry/exit, application
+  execution, Card errors, user exceptions, or explicit Wyrd observation
+  emission. (3) Correct stamping: the scope stack lives in the OpenTelemetry
+  context value as specified above; spans started inside the block receive the
+  innermost `(card_ref, run_id)`; nested, async, and same-Run concurrent tasks
+  stamp correctly; exit pops only that view's pair; and entry does not
+  overwrite an existing `wyrd.card_ref` on the already-active span. Unknown Card aliases,
   authorization, validation, and Wyrd writes remain fail-closed. The client
   MUST inject only CardRef and run ID; tenant, principal, Card UID, and request
   identity remain server-derived. The context manager MUST NOT start or end a
@@ -1838,9 +1849,11 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   processor registration failure, span enrichment failure, and exit
   context-update failure do not escape or block explicit observations; a user
   exception from the block MUST propagate unchanged. Unknown aliases MUST
-  still fail before entry. Provider registration MUST be idempotent and
-  attempted at most once per provider, including a provider that raises after
-  accepting the processor. A nested scope MUST NOT overwrite `wyrd.card_ref`
+  still fail before entry. Repeated entry MUST register the processor once on
+  a normal provider by way of the provider marker, and every optional
+  registration failure MUST leave explicit observations working; duplicate
+  registration under a concurrent first entry is permitted. A nested scope
+  MUST NOT overwrite `wyrd.card_ref`
   on an already-active span that carries one, and an explicitly installed
   private provider MUST receive the same attributes. Context exit MUST NOT be
   treated as a telemetry or Bifrost durability barrier. No test may infer
@@ -2109,6 +2122,20 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 47 marker-based Run correlation registration (2026-10-02):**
+  Simplified Python Run OpenTelemetry registration in REQ-151, AC-032, and
+  `architecture/logic/run_api.md` to three guarantees: no processor pile-up
+  (a private marker attribute on the provider object makes later entries skip
+  it; a duplicate from a concurrent first entry is harmless because the
+  processor is stateless and enrichment idempotent), never break the app
+  (every optional-telemetry failure is swallowed), and correct stamping from
+  the context-held scope stack. Removed the at-most-once-per-provider attempt,
+  cached outcomes, the no-enrichment rule for accept-then-raise providers, the
+  strict single-processor guarantee, identity-versus-equality caching, and the
+  registration lock with inert processors. This supersedes
+  `TASK-009-R6-reentrant-provider-registration`. The user explicitly approved
+  revision 47 on 2026-10-02 and waived further review.
 
 - **Revision 46 token-free Python Run correlation (2026-10-01):** Resolved
   `FIND-TASK-009-8` by keeping the Python Wyrd scope stack inside the

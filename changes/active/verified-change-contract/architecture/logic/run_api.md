@@ -62,8 +62,8 @@ Rust
 ```
 
 Python's `__exit__` always returns false so a user exception continues out of
-the block. `install_run_correlation` returns true only when the supplied or
-global provider accepts the processor; false means optional enrichment is not
+the block. `install_run_correlation` returns true when the supplied or
+global provider accepts the processor or is already marked; false means optional enrichment is not
 available. Callers never need to branch on that result to use a Run.
 
 ### Python
@@ -154,14 +154,29 @@ Setting attributes only on the span active at entry is insufficient because
 OpenTelemetry span attributes are not inherited by child spans. The processor
 is therefore required for spans created by an agent framework inside the run
 scope. It wraps its complete `on_start` path so an import, context lookup,
-provider, or span error never escapes into application code. Registration is
-thread-safe, idempotent, and attempted at most once per provider object; the
-outcome is weakly tracked by provider identity, never equality, so equal but
-distinct providers register independently. Each attempt owns its own
-processor, inert until `add_span_processor` returns normally. A provider whose
-registration fails, including one that raises after accepting the processor,
-never receives another attempt and gets no enrichment: the processor it may
-have retained stays inert, and a retry could install a duplicate. The scope uses a local OpenTelemetry context value,
+provider, or span error never escapes into application code.
+
+Registration carries exactly three guarantees:
+
+1. **No processor pile-up.** Run entry automatically registers the Wyrd
+   processor on the global tracer provider (and
+   `install_run_correlation(provider)` on an explicit private provider) and
+   marks that provider object with a private attribute so later entries skip
+   it. Registration is best effort. A duplicate processor, for example from a
+   concurrent first entry, is harmless because the processor is stateless and
+   enrichment is idempotent, so no lock exists.
+2. **Never break the app.** Every optional-telemetry failure (absent
+   OpenTelemetry, a provider without `add_span_processor`, an unmarkable
+   provider, a registration error, a context-update failure) is swallowed.
+   Runs, explicit observations, Card errors, and user exceptions behave
+   unchanged.
+3. **Correct stamping.** The scope stack lives in the OpenTelemetry context
+   value. Spans started inside the block get the innermost
+   `(card_ref, run_id)`; nested, async, and same-Run concurrent tasks stamp
+   correctly; exit pops only this view's pair; and entry does not overwrite an
+   existing `wyrd.card_ref` on the already-active span.
+
+The scope uses a local OpenTelemetry context value,
 not baggage or resource attributes: baggage is not projected automatically and
 may cross process boundaries, while Bifrost extracts these keys from each
 record.
@@ -225,8 +240,8 @@ it after the creating block exits. Raw threads or framework-private execution
 contexts are not implicitly covered. A framework that uses the global tracer
 provider needs no setup beyond the context manager. A framework using a
 private provider must pass it once to
-`wyrd.otel.install_run_correlation(provider)`; registration is idempotent,
-attempted at most once per provider, and fail-open. No OpenTelemetry SDK dependency becomes mandatory: the helper uses
+`wyrd.otel.install_run_correlation(provider)`; registration is marked on the
+provider so repeated calls skip it, and it is fail-open. No OpenTelemetry SDK dependency becomes mandatory: the helper uses
 the optional API when present and duck-types provider registration. The
 existing `otel` extra remains optional.
 

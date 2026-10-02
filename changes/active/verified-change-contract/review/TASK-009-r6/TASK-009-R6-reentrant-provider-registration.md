@@ -1,7 +1,7 @@
 ---
 id: TASK-009-R6
 kind: remediation
-status: ready
+status: superseded
 spec: SPEC-verified-change-contract
 spec_revision: 46
 requirements: [REQ-151, AC-032]
@@ -9,6 +9,8 @@ depends_on: [TASK-009, TASK-009-R1, TASK-009-R2, TASK-009-R3, TASK-009-R4E, TASK
 parent_task: TASK-009
 remediates: [FIND-TASK-009-14]
 ---
+
+Superseded by spec revision 47 (human-approved simplification; registration lock removed).
 
 # Keep provider registration reentrant and fail-open
 

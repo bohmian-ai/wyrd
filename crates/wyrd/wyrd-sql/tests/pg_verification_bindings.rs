@@ -693,10 +693,11 @@ async fn insert_raw_binding(conn: &mut TenantConn<'_>, binding: Uuid, owner: Uui
 /// an unarmed schedule is armed from, so a caller's wall clock never decides
 /// any of them.
 ///
-/// The exchange is driven from a caller instant more than a year in the
-/// future: the stored stamp still lands at database statement time, the cursor
-/// is the next boundary after that database time, and the gate flips only when
-/// the stored value itself is moved across the window in the database.
+/// The exchange is bracketed by two `statement_timestamp()` reads in its own
+/// transaction: the stored stamp lands inside that database-time bracket, the
+/// cursor is the next boundary after that database time, and the gate flips
+/// only when the stored value itself is moved across the window in the
+/// database.
 ///
 /// # Panics
 /// Panics when the stored stamp, the armed cursor, or the gate follows the
@@ -725,16 +726,17 @@ async fn database_clock_owns_machine_activity_and_schedule_arming() {
         .tenant_conn()
         .await
         .expect("tenant connection opens");
-    let database_now = database_now(&mut conn).await;
+    let before = database_now(&mut conn).await;
     record_machine_authentication(&mut conn, principal)
         .await
         .expect("activation records");
+    let after = database_now(&mut conn).await;
     let stamped = cursor_of_stamp(&mut conn, principal)
         .await
         .expect("a qualifying exchange stamps activity");
     assert!(
-        (stamped - database_now).num_seconds().abs() < 60,
-        "the stamp is database statement time, not a caller instant: {stamped} vs {database_now}"
+        before <= stamped && stamped <= after,
+        "the stamp is the recording statement's database time: {before} <= {stamped} <= {after}"
     );
     let armed = cursor(&mut conn, binding.as_uuid()).await.expect("armed");
     assert!(

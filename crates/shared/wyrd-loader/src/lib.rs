@@ -257,9 +257,8 @@ mod tests {
             assert!(prompt.variables.contains(&"code".to_owned()));
         }
         let workflow = &tree.cards[3].submission;
-        let Spec::Workflow(spec) =
-            Spec::from_kind_and_value(&workflow.kind, workflow.spec.clone())
-                .expect("workflow spec decodes")
+        let Spec::Workflow(spec) = Spec::from_kind_and_value(&workflow.kind, workflow.spec.clone())
+            .expect("workflow spec decodes")
         else {
             panic!("entry is the Workflow Card");
         };

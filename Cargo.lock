@@ -11694,6 +11694,8 @@ dependencies = [
  "skald-providers",
  "skald-runtime",
  "skald-spec",
+ "skald-tool",
+ "skald-workflow",
  "sqlx 0.9.0",
  "subtle",
  "temp-env",

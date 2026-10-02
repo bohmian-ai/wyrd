@@ -3,12 +3,13 @@
 use std::collections::{BTreeSet, HashMap};
 
 use serde_json::json;
+use wyrd_client::WorkflowGraph;
 use wyrd_spec::card::data::{ArrowFormat, DataInterface};
 use wyrd_spec::card::drift::DriftSignal;
 use wyrd_spec::card::operator::{OperatorAction, OperatorSpec};
 use wyrd_spec::card::trigger::{TriggerActivation, TriggerSpec};
 use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
-use wyrd_spec::envelope::Spec;
+use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::operator_connection::OperatorConnectionStatus;
@@ -38,8 +39,10 @@ pub type ResolvedRefs = Vec<(CardRef, CardUid)>;
 /// Returns `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` or
 /// `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY` when a reference is a loader-only
 /// path, names an unsubmitted sibling, or has no Card in this tenant; the
-/// binding refusals listed on [`EffectiveSpecs::validate_bindings`]; and the
-/// underlying registry error when the batch read or a by-UID read fails.
+/// binding refusals listed on [`EffectiveSpecs::validate_bindings`]; the
+/// Workflow graph refusals listed on [`EffectiveSpecs::validate_workflows`];
+/// and the underlying registry error when the batch read or a by-UID read
+/// fails.
 pub async fn resolve_card_references(
     conn: &mut TenantConn<'_>,
     submissions: &[CardSubmission],
@@ -75,6 +78,7 @@ pub async fn resolve_card_references(
     let mut effective = EffectiveSpecs::new(submissions, resolved_refs)?;
     effective.validate_bindings(conn, submissions).await?;
     effective.validate_baselines(conn, submissions).await?;
+    effective.validate_workflows(conn, submissions).await?;
     Ok(effective.resolved)
 }
 
@@ -377,6 +381,61 @@ impl EffectiveSpecs {
                     json!({ "field": "signal.features", "feature": missing.as_str() }),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Validate every submitted Workflow against its effective resolved graph.
+    ///
+    /// Each Workflow submission seeds a [`WorkflowGraph`], which runs the pure
+    /// Workflow contract. The graph then names every Agent and Prompt body it
+    /// still needs; sibling and already-resolved external bodies come from
+    /// [`load`](Self::load), while a Prompt named only inside an
+    /// already-registered Agent is resolved through the same Active,
+    /// tenant-scoped batch lookup before loading. The completed graph runs the
+    /// declarative resolved checks (bindings, outputs, Prompt coverage, route
+    /// dialect) without binding tools, so sibling and external dependencies
+    /// fail identically. This runs before the write transaction, so a refusal
+    /// persists nothing.
+    ///
+    /// # Errors
+    /// Returns the `WYRD_WORKFLOW_*` contract and graph refusals of
+    /// [`WorkflowGraph::validate`], `WYRD_REGISTRY_*_UNRESOLVED_DEPENDENCY`
+    /// when a needed body has no Active Card in this tenant,
+    /// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for an undecodable submission or
+    /// a body of the wrong kind, and registry read failures unchanged.
+    async fn validate_workflows(
+        &mut self,
+        conn: &mut TenantConn<'_>,
+        submissions: &[CardSubmission],
+    ) -> Result<(), WyrdError> {
+        for submission in submissions.iter().filter(|s| s.kind == CardKind::Workflow) {
+            let mut graph = WorkflowGraph::from_submission(submission)?;
+            loop {
+                let missing = graph.missing();
+                if missing.is_empty() {
+                    break;
+                }
+                for card_ref in missing {
+                    if external_uid(&card_ref, &self.resolved).is_none()
+                        && !self.specs.contains_key(&sibling_key(&card_ref))
+                    {
+                        let found =
+                            select_card_uids_by_ref_batch(conn, std::slice::from_ref(&card_ref))
+                                .await?;
+                        self.resolved.extend(found);
+                    }
+                    let spec = self.load(conn, Some(&card_ref)).await?.ok_or_else(|| {
+                        let identity = display_ref(&card_ref);
+                        WyrdError::RegistryUnresolvedDependency {
+                            message: format!("card dependency {identity} was not found"),
+                            details: serde_json::json!({ "card_ref": identity }),
+                        }
+                    })?;
+                    graph.insert(card_ref, spec)?;
+                }
+            }
+            graph.validate()?;
         }
         Ok(())
     }

@@ -82,9 +82,10 @@ impl WorkflowLoader {
                 path.display()
             ))
         })?;
-        let mut workflows = tree.cards.iter().filter(|card| {
-            card.submission.kind == CardKind::Workflow && card.source_path == entry
-        });
+        let mut workflows = tree
+            .cards
+            .iter()
+            .filter(|card| card.submission.kind == CardKind::Workflow && card.source_path == entry);
         let (Some(workflow), None) = (workflows.next(), workflows.next()) else {
             return Err(WyrdError::registry_invalid_card_spec(format!(
                 "{} must contain exactly one Workflow Card",
@@ -105,24 +106,23 @@ impl WorkflowLoader {
     /// Fetch a registered Workflow and its locked dependencies for local
     /// execution.
     ///
-    /// `workflow` must name an exact Workflow version and space. Every Card is
+    /// `workflow` must name a Workflow in an explicit space; its version is
+    /// always an exact pin, which the exact read validates. Every Card is
     /// read by its exact identity — the stored dependency references carry
     /// their registered UIDs — so later versions never float in. The returned
     /// Workflow keeps its registered identity for the run snapshot.
     ///
     /// # Errors
-    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` without a client or for a
-    /// reference that is not an exact Workflow identity;
+    /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for a non-Workflow or
+    /// spaceless reference or an invalid version, and
+    /// `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` without a client;
     /// `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` for a Card that is not
     /// active; the Cards read error for a missing, foreign, or mismatched
     /// Card; and the errors of [`WorkflowGraph::hydrate`].
     pub async fn load_registered(&self, workflow: &CardRef) -> Result<Workflow, WyrdError> {
-        if workflow.kind != CardKind::Workflow
-            || workflow.space.is_none()
-            || !workflow.version.is_pin()
-        {
+        if workflow.kind != CardKind::Workflow || workflow.space.is_none() {
             return Err(WyrdError::registry_invalid_card_spec(
-                "registered Workflow loading requires an exact Workflow space, name, and version",
+                "registered Workflow loading requires a Workflow reference with a space",
             ));
         }
         let card = self.read(workflow).await?;
@@ -225,7 +225,8 @@ impl WorkflowGraph {
                 spec.kind().wire_name()
             )));
         }
-        self.bodies.insert(card_ref.identity_key(), (card_ref, spec));
+        self.bodies
+            .insert(card_ref.identity_key(), (card_ref, spec));
         Ok(())
     }
 
@@ -250,7 +251,9 @@ impl WorkflowGraph {
                 InlineableRef::Inline(agent) => Some(agent.as_ref()),
                 reference => {
                     want(reference.as_card_ref());
-                    reference.as_card_ref().and_then(|card_ref| self.agent(card_ref))
+                    reference
+                        .as_card_ref()
+                        .and_then(|card_ref| self.agent(card_ref))
                 }
             };
             if let Some(agent) = agent {
@@ -439,8 +442,8 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use skald_providers::ProviderError;
-    use skald_spec::wire::openai_chat::OpenAiChatResponse;
     use skald_spec::ProviderResponse;
+    use skald_spec::wire::openai_chat::OpenAiChatResponse;
     use skald_workflow::{
         WorkflowExecutionDependencies, WorkflowRunOptions, WorkflowRunStatus, WyrdGatewayCall,
         WyrdGatewayCaller,
@@ -516,8 +519,7 @@ mod tests {
         }
         let workflow =
             std::fs::read_to_string(bundle().join("workflow.yaml")).expect("workflow reads");
-        std::fs::write(temp.path().join("workflow.yaml"), edit(workflow))
-            .expect("workflow writes");
+        std::fs::write(temp.path().join("workflow.yaml"), edit(workflow)).expect("workflow writes");
         temp
     }
 

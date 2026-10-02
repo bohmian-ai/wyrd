@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use skald_observer::{Observer, current};
 use skald_runtime::ProviderRegistry;
-use tokio::task::{Id, JoinSet};
+use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::card::workflow::WorkflowRun;
@@ -27,6 +27,7 @@ use wyrd_spec::reference::CardRef;
 
 use crate::attempt::AttemptOutcome;
 use crate::error::WorkflowResult;
+use crate::observe::{RunEvents, StepResultCeiling, sleep_until};
 use crate::plan::ExecutionPlan;
 use crate::route::{AttemptRouteContext, WorkflowGatewayCorrelation};
 use crate::run::{RunEnding, RunLedger};
@@ -95,6 +96,8 @@ pub(crate) struct WorkflowExecutor {
     ready: BTreeSet<usize>,
     /// Step limits and run cancellation.
     options: WorkflowRunOptions,
+    /// Absolute total run deadline, fixed when the run is prepared.
+    deadline: Option<Instant>,
 }
 
 /// What a finished step task reports.
@@ -125,17 +128,20 @@ struct StepTask {
     attempts: Arc<[AtomicU32]>,
     /// Step result size limit.
     max_step_result_bytes: Option<usize>,
-    /// Observer active for the run.
-    observer: Arc<dyn Observer>,
+    /// Best-effort Workflow event delivery for the run.
+    events: RunEvents,
 }
 
 impl WorkflowExecutor {
-    /// Prepare the executor and its queued snapshot.
+    /// Prepare the executor and its queued snapshot, fixing the absolute run
+    /// deadline from now.
     ///
     /// # Errors
     ///
-    /// Returns `WYRD_WORKFLOW_413_GRAPH_TOO_LARGE` when the terminal reserve
-    /// cannot fit the run size limit.
+    /// Returns `WYRD_WORKFLOW_422_RUN_REQUEST` (field `deadline`) when the run
+    /// deadline is not representable as an instant, and
+    /// `WYRD_WORKFLOW_413_GRAPH_TOO_LARGE` when the terminal reserve cannot fit
+    /// the run size limit.
     pub(crate) fn new(
         workflow_id: String,
         workflow: Option<CardRef>,
@@ -143,6 +149,18 @@ impl WorkflowExecutor {
         native: &ProviderRegistry,
         options: WorkflowRunOptions,
     ) -> WorkflowResult<Self> {
+        let deadline = options
+            .limits
+            .deadline
+            .map(|limit| {
+                Instant::now()
+                    .checked_add(limit)
+                    .ok_or_else(|| WyrdError::WorkflowRunRequest {
+                        message: "the run deadline is not representable".to_owned(),
+                        details: serde_json::json!({ "field": "deadline" }),
+                    })
+            })
+            .transpose()?;
         let ledger = RunLedger::new(
             WorkflowRunId::new_v7(),
             workflow,
@@ -170,23 +188,30 @@ impl WorkflowExecutor {
             waiting,
             ready,
             options,
+            deadline,
         })
     }
 
     /// Execute the run to a terminal snapshot.
     ///
     /// Never fails after preparation: step, cancellation, deadline, and size
-    /// outcomes are all recorded in the returned snapshot.
+    /// outcomes are all recorded in the returned snapshot. Workflow events go
+    /// through [`RunEvents`], so observers cannot fail or stall the run past
+    /// its cancellation or deadline.
     pub(crate) async fn execute(mut self) -> WorkflowRun {
         let observer = current();
         let run_id = self.ledger.run_id().to_string();
         let started = Instant::now();
-        observer
-            .on_workflow_start(&run_id, &self.workflow_id, self.plan.steps.len())
-            .await;
-        self.ledger.start();
-        let deadline = self.options.limits.deadline.map(|limit| started + limit);
+        let deadline = self.deadline;
         let cancellation = self.options.cancellation.clone();
+        let events = RunEvents::new(
+            Arc::clone(&observer),
+            &run_id,
+            cancellation.clone(),
+            deadline,
+        );
+        events.start(&self.workflow_id, self.plan.steps.len()).await;
+        self.ledger.start();
         let mut tasks: JoinSet<StepReport> = JoinSet::new();
         let mut running: HashMap<Id, usize> = HashMap::new();
         let mut stopping = false;
@@ -210,6 +235,15 @@ impl WorkflowExecutor {
                 match self.bind(index) {
                     Ok(pairs) => {
                         self.ledger.step_started(index);
+                        let max_step_result_bytes = self.options.limits.max_step_result_bytes;
+                        let step_observer: Arc<dyn Observer> = match max_step_result_bytes {
+                            Some(limit) => Arc::new(StepResultCeiling::new(
+                                Arc::clone(&observer),
+                                limit,
+                                self.plan.steps[index].validator.is_some(),
+                            )),
+                            None => Arc::clone(&observer),
+                        };
                         let task = StepTask {
                             plan: Arc::clone(&self.plan),
                             index,
@@ -219,21 +253,18 @@ impl WorkflowExecutor {
                             deadline,
                             cancellation: cancellation.clone(),
                             attempts: Arc::clone(&self.attempts),
-                            max_step_result_bytes: self.options.limits.max_step_result_bytes,
-                            observer: Arc::clone(&observer),
+                            max_step_result_bytes,
+                            events: events.clone(),
                         };
-                        let scoped =
-                            skald_observer::with_observer(Arc::clone(&observer), task.run());
+                        let scoped = skald_observer::with_observer(step_observer, task.run());
                         let handle = tasks.spawn(scoped);
                         running.insert(handle.id(), index);
                     }
                     Err(error) => {
                         let step_id = &self.plan.steps[index].id;
                         self.attempts[index].store(1, Ordering::Release);
-                        observer.on_workflow_step_attempt(&run_id, step_id, 1).await;
-                        observer
-                            .on_workflow_step_result(&run_id, step_id, 1, Some(error.code()))
-                            .await;
+                        events.attempt(step_id, 1, None).await;
+                        events.result(step_id, 1, Some(error.code())).await;
                         self.ledger.step_failed(
                             index,
                             wyrd_spec::card::workflow::WorkflowRunError::from_wyrd(&error),
@@ -253,7 +284,7 @@ impl WorkflowExecutor {
                     tasks.abort_all();
                     continue;
                 }
-                () = sleep_until_deadline(deadline), if ending == RunEnding::Settled && deadline.is_some() => {
+                () = sleep_until(deadline), if ending == RunEnding::Settled && deadline.is_some() => {
                     ending = RunEnding::TimedOut;
                     tasks.abort_all();
                     continue;
@@ -268,40 +299,61 @@ impl WorkflowExecutor {
             let Some(index) = running.remove(&id) else {
                 continue;
             };
-            let attempts = self.attempts[index].load(Ordering::Acquire);
-            match report {
-                Ok(StepReport::Finished(AttemptOutcome::Succeeded(payload))) => {
-                    if self.ledger.step_succeeded(index, payload, attempts) {
-                        self.release_dependents(index);
-                    } else {
-                        stopping = true;
-                    }
-                }
-                Ok(StepReport::Finished(AttemptOutcome::Failed { error, .. })) => {
-                    self.ledger.step_failed(index, error, attempts);
-                    stopping = true;
-                }
-                Ok(StepReport::Interrupted) => self.ledger.step_cancelled(index, attempts),
-                Err(error) if error.is_cancelled() => self.ledger.step_cancelled(index, attempts),
-                Err(_panic) => {
-                    let error = WyrdError::WorkflowInternal {
-                        message: format!("step '{}' task panicked", self.plan.steps[index].id),
-                        details: serde_json::json!({ "step": self.plan.steps[index].id }),
-                    };
-                    self.ledger.step_failed(
-                        index,
-                        wyrd_spec::card::workflow::WorkflowRunError::from_wyrd(&error),
-                        attempts,
-                    );
-                    stopping = true;
-                }
-            }
+            stopping |= self.settle(index, report);
         }
         let run = self.ledger.finish(ending, &self.plan);
-        observer
-            .on_workflow_finish(&run_id, &self.workflow_id, started.elapsed())
-            .await;
+        events.finish(&self.workflow_id, started.elapsed()).await;
         run
+    }
+
+    /// Record one joined step task in the ledger; returns whether new
+    /// scheduling must stop.
+    ///
+    /// Success releases dependents unless its payload overflows the run
+    /// budget; failure and panic stop scheduling. An interrupted or aborted
+    /// task is `cancelled` only once an attempt began; a task stopped before
+    /// its first attempt stays active so [`RunLedger::finish`] records it as
+    /// `unstarted` with no attempts or timestamps.
+    fn settle(&mut self, index: usize, report: Result<StepReport, JoinError>) -> bool {
+        let attempts = self.attempts[index].load(Ordering::Acquire);
+        match report {
+            Ok(StepReport::Finished(AttemptOutcome::Succeeded(payload))) => {
+                if self.ledger.step_succeeded(index, payload, attempts) {
+                    self.release_dependents(index);
+                    false
+                } else {
+                    true
+                }
+            }
+            Ok(StepReport::Finished(AttemptOutcome::Failed { error, .. })) => {
+                self.ledger.step_failed(index, error, attempts);
+                true
+            }
+            Ok(StepReport::Interrupted) => {
+                if attempts > 0 {
+                    self.ledger.step_cancelled(index, attempts);
+                }
+                false
+            }
+            Err(error) if error.is_cancelled() => {
+                if attempts > 0 {
+                    self.ledger.step_cancelled(index, attempts);
+                }
+                false
+            }
+            Err(_panic) => {
+                let error = WyrdError::WorkflowInternal {
+                    message: format!("step '{}' task panicked", self.plan.steps[index].id),
+                    details: serde_json::json!({ "step": self.plan.steps[index].id }),
+                };
+                self.ledger.step_failed(
+                    index,
+                    wyrd_spec::card::workflow::WorkflowRunError::from_wyrd(&error),
+                    attempts,
+                );
+                true
+            }
+        }
     }
 
     /// Resolve the Prompt variable values for the step at `index`.
@@ -358,13 +410,13 @@ impl StepTask {
     /// Run attempts until success, a terminal failure, retry exhaustion, or
     /// interruption.
     ///
-    /// Each attempt races, in order, cancellation, the total deadline, the
+    /// Each attempt fixes its own and the Agent's deadlines before reporting
+    /// its start, then races, in order, cancellation, the total deadline, the
     /// step attempt timeout, and the attempt itself. Retryable failures wait
     /// the deterministic backoff, which also races cancellation and the total
     /// deadline. No attempt begins after either fires.
     async fn run(self) -> StepReport {
         let step = &self.plan.steps[self.index];
-        let run_id = self.run_id.to_string();
         let mut attempt: u32 = 0;
         loop {
             if self.cancellation.is_cancelled()
@@ -376,17 +428,28 @@ impl StepTask {
             }
             attempt += 1;
             self.attempts[self.index].store(attempt, Ordering::Release);
-            self.observer
-                .on_workflow_step_attempt(&run_id, &step.id, attempt)
+            let deadlines = deadline_after(step.timeout)
+                .and_then(|attempt| Ok((attempt, deadline_after(step.agent.run_config.timeout)?)));
+            let Ok((attempt_deadline, agent_deadline)) = deadlines else {
+                let error = WyrdError::WorkflowInternal {
+                    message: format!("step '{}' timeout is not representable", step.id),
+                    details: serde_json::json!({ "step": step.id }),
+                };
+                self.events
+                    .result(&step.id, attempt, Some(error.code()))
+                    .await;
+                return StepReport::Finished(AttemptOutcome::failed(&error, false));
+            };
+            self.events
+                .attempt(&step.id, attempt, attempt_deadline)
                 .await;
-            let attempt_deadline = step.timeout.map(|timeout| Instant::now() + timeout);
             let outcome = tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => return StepReport::Interrupted,
-                () = sleep_until_deadline(self.deadline), if self.deadline.is_some() => {
+                () = sleep_until(self.deadline), if self.deadline.is_some() => {
                     return StepReport::Interrupted;
                 }
-                () = sleep_until_deadline(attempt_deadline), if attempt_deadline.is_some() => {
+                () = sleep_until(attempt_deadline), if attempt_deadline.is_some() => {
                     AttemptOutcome::failed(
                         &WyrdError::WorkflowStepTimeout {
                             message: format!("step '{}' attempt exceeded its timeout", step.id),
@@ -395,31 +458,27 @@ impl StepTask {
                         true,
                     )
                 }
-                outcome = self.attempt(attempt, attempt_deadline) => outcome,
+                outcome = self.attempt(attempt, attempt_deadline, agent_deadline) => outcome,
             };
             let (error, retryable) = match outcome {
                 AttemptOutcome::Succeeded(payload) => {
-                    self.observer
-                        .on_workflow_step_result(&run_id, &step.id, attempt, None)
-                        .await;
+                    self.events.result(&step.id, attempt, None).await;
                     return StepReport::Finished(AttemptOutcome::Succeeded(payload));
                 }
                 AttemptOutcome::Failed { error, retryable } => (error, retryable),
             };
-            self.observer
-                .on_workflow_step_result(&run_id, &step.id, attempt, Some(&error.code))
+            self.events
+                .result(&step.id, attempt, Some(&error.code))
                 .await;
             if !retryable || attempt > step.max_retries {
                 return StepReport::Finished(AttemptOutcome::Failed { error, retryable });
             }
             let delay = backoff(step.initial_backoff_ms, attempt);
-            self.observer
-                .on_workflow_step_backoff(&run_id, &step.id, attempt + 1, delay)
-                .await;
+            self.events.backoff(&step.id, attempt + 1, delay).await;
             tokio::select! {
                 biased;
                 () = self.cancellation.cancelled() => return StepReport::Interrupted,
-                () = sleep_until_deadline(self.deadline), if self.deadline.is_some() => {
+                () = sleep_until(self.deadline), if self.deadline.is_some() => {
                     return StepReport::Interrupted;
                 }
                 () = tokio::time::sleep(delay) => {}
@@ -431,13 +490,13 @@ impl StepTask {
     ///
     /// Gateway routes run a copy of the Agent whose provider registry holds
     /// only this attempt's route adapter; native routes use the Agent as is.
-    async fn attempt(&self, attempt: u32, attempt_deadline: Option<Instant>) -> AttemptOutcome {
+    async fn attempt(
+        &self,
+        attempt: u32,
+        attempt_deadline: Option<Instant>,
+        agent_deadline: Option<Instant>,
+    ) -> AttemptOutcome {
         let step = &self.plan.steps[self.index];
-        let agent_deadline = step
-            .agent
-            .run_config
-            .timeout
-            .map(|timeout| Instant::now() + timeout);
         let deadline = [attempt_deadline, agent_deadline, self.deadline]
             .into_iter()
             .flatten()
@@ -488,12 +547,16 @@ pub(crate) fn backoff(initial_ms: u64, retry: u32) -> Duration {
     Duration::from_millis(initial_ms.saturating_mul(factor).min(MAX_BACKOFF_MS))
 }
 
-/// Sleep until `deadline`, or forever when there is none.
-async fn sleep_until_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
-    }
+/// Absolute deadline `timeout` from now, or `Err` with the timeout when the
+/// instant is not representable.
+///
+/// # Errors
+///
+/// Returns the timeout when `now + timeout` overflows the clock.
+fn deadline_after(timeout: Option<Duration>) -> Result<Option<Instant>, Duration> {
+    timeout
+        .map(|timeout| Instant::now().checked_add(timeout).ok_or(timeout))
+        .transpose()
 }
 
 #[cfg(test)]

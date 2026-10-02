@@ -75,8 +75,9 @@ impl WorkflowSpec {
     /// invalid input and output names; step bindings that reference an
     /// undeclared input, the step itself, or a step outside its declared
     /// transitive dependencies; an empty output map or an output bound to an
-    /// undeclared input or step; malformed external-gateway routes; and a step
-    /// fallback whose resolved route is not [`LlmRoute::WyrdGateway`].
+    /// undeclared input or step; malformed external-gateway routes; a
+    /// `max_retries` of `u32::MAX`; and a step fallback whose resolved route
+    /// is not [`LlmRoute::WyrdGateway`].
     /// Cross-Card checks that need the resolved Agent Prompt (variable
     /// coverage and route dialect) belong to the runtime that resolved it.
     ///
@@ -215,12 +216,13 @@ impl WorkflowSpec {
         false
     }
 
-    /// Validate one step's input bindings, route, and fallback.
+    /// Validate one step's input bindings, route, retry bound, and fallback.
     ///
     /// # Errors
     /// Returns a validation error for an invalid binding name, a binding that
     /// references an undeclared input or an invisible step, an invalid route,
-    /// or a fallback on a non-WyrdGateway route.
+    /// a `max_retries` of `u32::MAX` (its final attempt count cannot fit the
+    /// `u32` attempts field), or a fallback on a non-WyrdGateway route.
     fn validate_step(
         &self,
         index: &BTreeMap<&str, usize>,
@@ -245,6 +247,16 @@ impl WorkflowSpec {
         }
         if let Some(route) = &step.llm_route {
             route.validate(&format!("steps[{position}].llm_route"))?;
+        }
+        if step
+            .retry
+            .as_ref()
+            .is_some_and(|retry| retry.max_retries == u32::MAX)
+        {
+            return Err(WorkflowValidationError::invalid(
+                &format!("steps[{position}].retry.max_retries"),
+                "must be below 4294967295 so every attempt count fits a u32",
+            ));
         }
         if let Some(fallback) = &step.fallback {
             let field = format!("steps[{position}].fallback");

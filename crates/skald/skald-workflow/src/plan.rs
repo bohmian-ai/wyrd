@@ -59,7 +59,8 @@ impl ResolvedGraph {
     /// [`WorkflowError::AgentNotFound`] for an unresolved step; a
     /// field-specific `WYRD_WORKFLOW_422_VALIDATION` error for a Prompt that
     /// cannot drive the Agent loop, an unbound or extra Prompt variable, or a
-    /// binding that selects a payload its target step does not produce;
+    /// binding that selects a payload its target step does not produce, or a
+    /// step or Agent timeout whose deadline is not representable;
     /// `WYRD_WORKFLOW_422_OUTPUT_SCHEMA` for an output schema that does not
     /// compile; and `WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED` for an external
     /// route whose protocol differs from the Prompt's request dialect.
@@ -107,6 +108,15 @@ impl ResolvedGraph {
                     )
                     .into());
                 }
+            }
+            if let Some(seconds) = step.timeout_seconds {
+                require_representable(
+                    &format!("steps[{position}].timeout_seconds"),
+                    Duration::from_secs(seconds),
+                )?;
+            }
+            if let Some(timeout) = agent.run_config.timeout {
+                require_representable(&format!("steps[{position}].action"), timeout)?;
             }
             response_types.insert(step.id.as_str(), &prompt.response_type);
             steps.push(ResolvedStep {
@@ -292,6 +302,22 @@ impl ExecutionPlan {
             input,
             outputs: spec.outputs.clone(),
         })
+    }
+}
+
+/// Require that a deadline `timeout` from now is a representable instant.
+///
+/// # Errors
+///
+/// Returns a field-specific validation error when `now + timeout` overflows
+/// the clock, so the bound is refused rather than clamped or dropped.
+fn require_representable(field: &str, timeout: Duration) -> Result<(), WorkflowValidationError> {
+    match tokio::time::Instant::now().checked_add(timeout) {
+        Some(_) => Ok(()),
+        None => Err(WorkflowValidationError::invalid(
+            field,
+            "timeout is too large to represent as a deadline",
+        )),
     }
 }
 

@@ -32,6 +32,7 @@
 
 mod attempt;
 pub mod error;
+mod observe;
 mod output;
 mod plan;
 #[cfg(feature = "python")]

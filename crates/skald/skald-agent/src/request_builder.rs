@@ -27,6 +27,16 @@ pub enum PromptLoopSupport {
 }
 
 /// Decide whether a rendered provider request can drive the agent tool loop.
+///
+/// Classifies the request into the closed [`PromptLoopSupport`] set that the
+/// loop knows how to seed, extend with conversation history, and replay. The
+/// check is pure; `agent` only names the Agent in the error.
+///
+/// # Errors
+///
+/// Returns [`AgentError::Prompt`] for embedding, Vertex prediction, raw
+/// passthrough, and any other request shape that has no conversation to
+/// drive.
 pub fn validate_prompt_loop_request(
     agent: &str,
     request: &ProviderRequest,
@@ -112,6 +122,18 @@ pub fn extract_messages(agent: &str, request: &ProviderRequest) -> AgentResult<V
 }
 
 /// Build a provider-native request from rendered prompt seed messages and conversation turns.
+///
+/// Starts from `seed_messages`, appends each conversation turn in the
+/// request's own dialect (OpenAI Responses turns as native `input` items,
+/// including replayed reasoning and function-call items), and replaces the
+/// `template` messages with the result. The template's model, settings, and
+/// tools are kept unchanged.
+///
+/// # Errors
+///
+/// Returns [`AgentError::Prompt`] when the template cannot drive the loop,
+/// and [`AgentError::LoopMessageType`] when a turn or seed message does not
+/// match the template's dialect.
 pub fn request_from_conversation(
     agent: &str,
     template: ProviderRequest,
@@ -127,6 +149,18 @@ pub fn request_from_conversation(
 }
 
 /// Extract the provider-native assistant message from one model response.
+///
+/// OpenAI Chat keeps the first choice's message, Anthropic its role and
+/// content blocks, Gemini and Vertex the first candidate's content, and
+/// OpenAI Responses every output item in provider order, so reasoning
+/// identity, summaries, encrypted state, and function calls are replayed on
+/// the next stateless request.
+///
+/// # Errors
+///
+/// Returns [`AgentError::LoopMessageType`] when an OpenAI Chat response has
+/// no choices, a Google response has no candidates, or the response shape
+/// has no conversation message.
 pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResult<MessageNum> {
     match response {
         ProviderResponse::OpenAiChatCompletion(response) => {

@@ -7,7 +7,6 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use skald_prompt::Prompt;
-use skald_runtime::ProviderRegistry;
 use skald_spec::Prompt as PromptSpec;
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
@@ -25,7 +24,7 @@ use crate::card_error::AgentCardError;
 use crate::error::AgentResult;
 use crate::journal::{Journal, NoopJournal};
 use crate::run::{AgentRun, RunConfig};
-use crate::session::{NoSession, SessionId, SessionMemory};
+use crate::session::{NoSession, SessionMemory};
 
 /// Wire form for a durable Agent Card.
 pub type AgentWire = AgentCard;
@@ -661,38 +660,14 @@ impl Agent {
 
     /// Run the bounded tool loop using the stored or default provider registry.
     ///
+    /// Equivalent to [`Self::run_with`] with the process default registry and
+    /// no session.
+    ///
     /// # Errors
-    /// Returns Skald agent runtime errors.
+    /// Returns the errors of [`Self::run_with`].
     pub async fn run(&self, input: &str) -> AgentResult<AgentRun> {
         let providers = skald_runtime::default_registry();
-        crate::loop_runtime::run(self, providers.as_ref(), None, input).await
-    }
-
-    /// Run the bounded tool loop against a live provider registry.
-    ///
-    /// # Errors
-    /// Returns Skald agent runtime errors.
-    pub async fn run_with(
-        &self,
-        providers: &ProviderRegistry,
-        session_id: Option<SessionId>,
-        input: &str,
-    ) -> AgentResult<AgentRun> {
-        crate::loop_runtime::run(self, providers, session_id, input).await
-    }
-
-    /// Run the bounded tool loop driven by a rendered prompt with variable
-    /// substitution.
-    ///
-    /// # Errors
-    /// Returns Skald agent runtime errors.
-    pub async fn run_prompt(
-        &self,
-        providers: &ProviderRegistry,
-        prompt: &Prompt,
-        vars: &[(&str, &str)],
-    ) -> AgentResult<AgentRun> {
-        crate::loop_runtime::run_prompt(self, providers, prompt, vars).await
+        self.run_with(providers.as_ref(), None, input).await
     }
 
     fn from_resolved_parts(

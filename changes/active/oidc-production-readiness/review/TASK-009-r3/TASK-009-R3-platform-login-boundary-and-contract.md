@@ -139,3 +139,25 @@ remediation. Those run once at final change review under the standing rule from
 commit `518026d54`.
 
 Route this task directly to `$wyrd-implement`.
+
+## Remediation Evidence
+
+Base `35a53faa2`. `FIND-TASK-009-5` and `-14` are not touched.
+
+| Finding | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-TASK-009-15` | `PlatformLogin::relying_party` deleted. New inherent `PlatformLogin::discover_jwks_uri` delegates to the owned `RelyingParty::discover` (which replaces the same cache entry) and returns the advertised JWKS URL. `configure_connection` calls it | `rg 'relying_party\(\)' crates` shows only the tenant `HumanConnections` callers in `wyrd-auth/src/{login,callback}.rs`, with no `PlatformLogin` accessor. The served journey's same-issuer reconfiguration step still verifies a newly published key with 0 discovery requests | PASS |
+| `FIND-TASK-009-16` | `configure_connection` rustdoc (`# Errors`), discovery comment and `utoipa` responses now declare `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` for unreachable, unavailable, undecodable or mismatched discovery/JWKS. `400` covers a malformed URL, a blocked address or an unsealable secret | `federated_platform_sign_in_runs_through_the_served_callback` asserts `503` and `WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` for unavailable and undecodable key sets, with the row unchanged. RED: `the_served_document_describes_the_composed_surface` failed (PUT `/platform/oidc/connection` 503 was `Null`). GREEN after the declaration | PASS |
+
+Exact named tests (Postgres wrapper), each with exit 0:
+
+```
+mise exec -- cargo nextest run --locked -p wyrd-server --test platform_admin_e2e -E 'test(=federated_platform_sign_in_runs_through_the_served_callback)' => 1 test run: 1 passed, 38 skipped
+mise exec -- cargo nextest run --locked -p wyrd-server --test pg_openapi_contract -E 'test(=the_served_document_describes_the_composed_surface)' => 1 test run: 1 passed, 20 skipped
+```
+
+Lanes (one at a time, foreground): `mise run fmt` 0, `mise run lints` 0,
+`mise run test:principals:integration` 0, and `mise run test:wyrd` 0 (2344 passed;
+covers `wyrd-auth` and `wyrd-server`). The identity journey and the language
+lanes are not run here; under the narrowest-verification rule (`518026d54`)
+they run once at final change review.

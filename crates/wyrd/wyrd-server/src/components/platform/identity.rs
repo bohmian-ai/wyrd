@@ -172,9 +172,18 @@ pub(super) async fn authorize_read(
 
 /// Install or replace the deployment's platform OIDC connection.
 ///
+/// Before anything is stored, the issuer is discovered in full, provider
+/// metadata and its advertised key set, through the process-owned
+/// [`PlatformLogin`]; the discovered `jwks_uri` is persisted and the fresh
+/// provider replaces this process's cached one.
+///
 /// # Errors
-/// Returns a stable Wyrd error when the caller is unauthorized, the client
-/// secret cannot be sealed, or the write fails.
+/// Returns a `400` when the issuer URL is malformed, resolves to a blocked
+/// address, or the client secret cannot be sealed;
+/// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` when the issuer cannot be
+/// reached, its discovery document or key set is unavailable or undecodable,
+/// or the document names another issuer; and a stable Wyrd error when the
+/// caller is unauthorized or the write fails.
 #[utoipa::path(
     put,
     path = "/platform/oidc/connection",
@@ -182,13 +191,17 @@ pub(super) async fn authorize_read(
     responses(
         (status = 200, description = "Connection installed; the JWKS endpoint comes from discovery",
          body = PlatformOidcConnectionView),
-        (status = 400, description = "Issuer invalid, unreachable, resolving to a blocked address, \
-          or a client secret that cannot be sealed (WYRD_SPEC_400_VALIDATION)", body = WyrdProblem),
+        (status = 400, description = "Issuer URL malformed or resolving to a blocked address, or a \
+          client secret that cannot be sealed (WYRD_SPEC_400_VALIDATION, \
+          WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD)", body = WyrdProblem),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
+        (status = 503, description = "The issuer could not be reached, or its discovery document \
+          or key set is unavailable, undecodable, or names another issuer \
+          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -218,9 +231,10 @@ async fn configure_connection(
         }
         PlatformClientAuth::Public => ClientAuth::Public,
     };
-    // Discovery is the only network call on this path, and it is screened
-    // against the deployment's blocked address ranges and pinned against DNS
-    // rebinding by the same owner the tenant issuer path uses. Taking a
+    // Discovery (metadata, then the advertised key set) is the only network
+    // traffic on this path, and it is screened against the deployment's
+    // blocked address ranges and pinned against DNS rebinding by the same
+    // transport the tenant login path uses. Taking a
     // caller-supplied JWKS URL instead would make this route an SSRF primitive:
     // the anonymous login route drives outbound fetches to whatever is stored.
     // The parser's message names the URL library, so the caller is told which
@@ -232,16 +246,10 @@ async fn configure_connection(
             details: serde_json::json!({ "field": "issuer_url" }),
         })
     })?;
-    // Full discovery through the process-owned relying party: the provider
-    // and its key set must load as login will load them, and the fresh entry
-    // replaces any cached one before the new row commits, so this process's
-    // next begin and callback use it.
-    let provider = login_service(&state)?
-        .relying_party()
-        .discover(&issuer)
+    let jwks_uri = login_service(&state)?
+        .discover_jwks_uri(&issuer)
         .await
         .map_err(|error| crate::components::admin::routes::discovery_error(&issuer, error))?;
-    let jwks_uri = provider.jwks_uri().url().clone();
 
     let sealed = seal_platform_client_secret(&client_auth, state.auth.sealing_key.as_deref())
         .map_err(|error| {

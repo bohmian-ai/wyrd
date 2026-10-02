@@ -1630,7 +1630,15 @@ async fn federated_platform_sign_in_runs_through_the_served_callback() {
             .expect("configure route responds");
         let status = resp.status();
         let body = body_json(resp).await;
-        assert!(!status.is_success(), "{label} is refused: {status} {body}");
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{label} is refused: {body}"
+        );
+        assert_eq!(
+            body["code"], "WYRD_AUTH_503_DISCOVERY_UNAVAILABLE",
+            "{label} carries the stable discovery code: {body}"
+        );
         let resp = srv
             .oneshot(platform_request(
                 Method::GET,

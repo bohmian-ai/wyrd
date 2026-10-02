@@ -271,4 +271,16 @@ Verification (all exit 0): focused Rust `cargo nextest run --locked -p wyrd-clie
 `cargo nextest run --locked -p wyrd-sdk-rust --test observe_run -P journey --run-ignored=all -E 'test(=scoped_run_emits_drift_eval_and_generic_rows)'` under the Postgres wrapper;
 `mise run test:shared`, `test:wyrd-sdk`, `py:test:unit`, `py:test:integration`, `py:typecheck`, `ts:test:unit`, `ts:test:integration`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:client-tier`, `check:pyo3-scope`, `fmt`, `py:format`, `lints`, `py:lints`, `git diff --check`.
 
+Exact named Rust proof (TASK-009-R5, all exit 0):
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-client --lib \
+  -E 'test(=observe::tests::run_for_card_selects_the_initial_view_and_shares_its_invocation)'
+mise exec -- cargo nextest run --locked -p wyrd-client --lib \
+  -E 'test(=observe::tests::run_for_card_refuses_an_unknown_alias_without_network_io)'
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test observe_run \
+  -P journey --run-ignored=all -E 'test(=scoped_run_emits_drift_eval_and_generic_rows)'"
+```
+
 Notes: `vala.traces.spans` persists no `card_ref` column; Scribe resolves the asserted ref to `card_uid`, so the journey reads the asserted CardRef back from the span's lossless `attributes` payload. The journey uses a private provider with `install_run_correlation(provider)` because OpenTelemetry's global provider is set-once per process; unit tests cover the global-provider path. Non-goals (server Run resource, second exporter/queue, wrapper span, global Card scope, log/metric enrichment, client-authored identity) remain excluded.

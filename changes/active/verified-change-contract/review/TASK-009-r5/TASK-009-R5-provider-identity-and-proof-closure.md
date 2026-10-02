@@ -232,3 +232,43 @@ cannot avoid retaining providers strongly; failed retained processors cannot
 be kept inert without changing the public installation contract; a required
 join needs a Gate, Scribe, Bifrost, shared Rust, generated-contract, or schema
 change; or any correction conflicts with specification revision 46.
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| 1. `FIND-TASK-009-9` distinct equal providers | `python/wyrd/otel.py` `_outcomes` is a list of `[weakref, outcome]` pairs; `_outcome_entry` prunes dead refs and matches with `is` | `test_equal_providers_register_independently_by_identity` (red on prior code, green now) | PASS |
+| 2. `FIND-TASK-009-10` retained processor inert | per-attempt `_RunCorrelationProcessor` with `active=False`, set `True` only after `add_span_processor` returns; shared `_PROCESSOR` removed | `test_a_processor_retained_by_a_failed_registration_never_enriches` (red on prior code, green now); existing healthy global/private and accept-then-raise tests still pass | PASS |
+| 3. `FIND-TASK-009-11` Run authority revision | `architecture/logic/run_api.md` status now says revision 46; "stateless" allowance replaced with identity-keyed, per-attempt inert processor text | review | PASS |
+| 4. `FIND-TASK-009-12` R4 superseded | `review/TASK-009-r4/TASK-009-R4-stabilize-provider-registration-idempotency.md` frontmatter `status: superseded`; body and R4E link unchanged | review | PASS |
+| 5. `FIND-TASK-009-13` exact Rust proof | original task evidence records the three exact commands | all three exit 0 (journey: 1 passed under `with-test-postgres.sh` + `db:migrate:all:inner`) | PASS |
+
+Verification (all exit 0):
+
+```bash
+(cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q \
+  tests/unit/state/test_observe_surface.py::test_equal_providers_register_independently_by_identity)
+(cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q \
+  tests/unit/state/test_observe_surface.py::test_a_processor_retained_by_a_failed_registration_never_enriches)
+(cd sdks/wyrd-sdk-python && mise exec -- uv run python -m pytest -q tests/unit/state/test_observe_surface.py)  # 39 passed
+mise exec -- cargo nextest run --locked -p wyrd-client --lib \
+  -E 'test(=observe::tests::run_for_card_selects_the_initial_view_and_shares_its_invocation)'
+mise exec -- cargo nextest run --locked -p wyrd-client --lib \
+  -E 'test(=observe::tests::run_for_card_refuses_an_unknown_alias_without_network_io)'
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test observe_run \
+  -P journey --run-ignored=all -E 'test(=scoped_run_emits_drift_eval_and_generic_rows)'"
+mise run py:setup
+mise run py:test:unit
+mise run py:test:integration   # 72 passed
+mise run py:typecheck
+mise run codegen:check
+mise run check:pyo3-scope
+mise run fmt
+mise run lints
+mise run py:format
+mise run py:lints
+git diff --check
+```
+
+Non-goals stayed out: no provider wrapper, retry, warning, new dependency, shared Rust, generated declaration, schema, or journey change. Changed files: `otel.py`, `test_observe_surface.py`, `run_api.md`, the R4 frontmatter, the original task's evidence, and this file.

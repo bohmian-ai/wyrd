@@ -420,6 +420,11 @@ pub trait ShardItem {
     fn table(&self) -> &TableRef;
     /// In-flight bytes charged to the item.
     fn bytes(&self) -> usize;
+    /// Client batch identity the item carries.
+    ///
+    /// A client retry reuses the ID, so the scheduler uses it with the tenant
+    /// and table to keep two copies of one batch out of the same group.
+    fn batch_id(&self) -> [u8; 16];
 }
 
 /// One fixed shard mailbox.
@@ -534,6 +539,17 @@ struct TenantTableQueues<T> {
     active_tables: VecDeque<TableRef>,
 }
 
+impl<T> TenantTableQueues<T> {
+    /// Returns the request the tenant's next turn would take, without taking it.
+    ///
+    /// Reads the front of the next table's queue, which is the item
+    /// [`TenantTableRoundRobin::pop_next_table_item`] pops while the rotation
+    /// and queues stay in step.
+    fn peek_next_table_item(&self) -> Option<&T> {
+        self.by_table.get(self.active_tables.front()?)?.front()
+    }
+}
+
 impl<T> Default for TenantTableQueues<T> {
     fn default() -> Self {
         Self {
@@ -580,8 +596,15 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
     /// requeues both levels behind their peers when either still has work.
     /// Tenants and tables whose queues emptied are dropped from the rotation
     /// entirely rather than left as empty entries a later turn would waste.
+    ///
+    /// The group never holds two copies of one tenant/table/batch identity:
+    /// the owner's duplicate checks see a batch only after its group commits,
+    /// so a second in-group copy would write its WAL slices twice. When the
+    /// next request is such a copy, its tenant goes back to the front of the
+    /// rotation, keeping its turn for the next group, and this group ends.
     pub fn pop_group(&mut self) -> Vec<T> {
         let mut result = Vec::new();
+        let mut batches = HashSet::new();
         while result.len() < MAX_GROUP_ITEMS {
             let Some(tenant) = self.active_tenants.pop_front() else {
                 break;
@@ -589,10 +612,19 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
             let Some(queues) = self.pending_by_tenant.get_mut(&tenant) else {
                 continue;
             };
+            // ponytail: a resent copy closes the group; the next group's
+            // existing memtable and durable fence checks absorb it.
+            if let Some(next) = queues.peek_next_table_item()
+                && batches.contains(&(tenant, next.table().clone(), next.batch_id()))
+            {
+                self.active_tenants.push_front(tenant);
+                break;
+            }
             let Some(item) = Self::pop_next_table_item(queues) else {
                 self.pending_by_tenant.remove(&tenant);
                 continue;
             };
+            batches.insert((tenant, item.table().clone(), item.batch_id()));
             result.push(item);
             if queues.active_tables.is_empty() {
                 self.pending_by_tenant.remove(&tenant);
@@ -644,6 +676,10 @@ impl ShardItem for PreparedAppend {
 
     fn bytes(&self) -> usize {
         self.prepared_bytes
+    }
+
+    fn batch_id(&self) -> [u8; 16] {
+        *self.batch_id.as_bytes()
     }
 }
 
@@ -3103,18 +3139,15 @@ impl ShardOwner {
     ///
     /// Each ACK carries the rows its batch accounted for and whether this group
     /// inserted that batch; a replay suppressed by the fence or the memtable
-    /// identity reports no first commit. When one batch was resent within the
-    /// group, only its first copy in group order reports the first commit.
-    /// Reservations drop with each append.
-    fn acknowledge_visible(mut state: GroupWalState) {
+    /// identity reports no first commit. Reservations drop with each append.
+    fn acknowledge_visible(state: GroupWalState) {
         for append in state.prepared {
-            let batch_id = append.batch_id.as_bytes();
-            let first_commit = state.inserted_batch_ids.remove(batch_id);
             if let Some(sender) = append.durable_ack {
+                let batch_id = append.batch_id.as_bytes();
                 let rows = state.rows_by_append.get(batch_id).copied().unwrap_or(0);
                 let _ = sender.send(Ok(crate::scribe::preprocess::DurableCompletion {
                     rows,
-                    first_commit,
+                    first_commit: state.inserted_batch_ids.contains(batch_id),
                 }));
             }
             drop(append.reservation);
@@ -3663,18 +3696,10 @@ impl ShardOwner {
 
     /// Prepares one group for WAL synchronization without acknowledging it.
     ///
-    /// A client that resends a batch while its original is still queued can
-    /// put both copies of one tenant/table/batch identity in the same group.
-    /// Neither the memtable nor `synced_not_inserted` sees the first copy until
-    /// after the group commits, so only the first copy writes WAL slices; a
-    /// later copy whose slice identities match is dropped here and shares the
-    /// first copy's row count and outcome when the group acknowledges.
-    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when duplicate detection, WAL append, memory
-    /// reservation, or retry bookkeeping fails, or when an in-group copy reuses
-    /// a batch identity with contradictory slices.
+    /// reservation, or retry bookkeeping fails.
     async fn write_group(
         &mut self,
         mut prepared: Vec<PreparedAppend>,
@@ -3690,33 +3715,16 @@ impl ShardOwner {
         let fixed_durable_capacity = durable.capacity();
         let mut touched = HashMap::<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>::new();
         let mut rows_by_append = HashMap::<[u8; 16], u64>::new();
-        let mut group_batches = HashMap::<
-            (DataTenantId, TableRef, [u8; 16]),
-            Vec<crate::scribe::wal::ScribeAppendPayloadIdentity>,
-        >::new();
         for append in &mut prepared {
             if let Some(memory) = append.memory.as_mut() {
                 memory.transfer_category(MemoryCategory::Prepared)?;
             }
             let batch_id = *append.batch_id.as_bytes();
-            let group_key = (append.tenant, append.table.clone(), batch_id);
-            if let Some(first) = group_batches.get(&group_key) {
-                let Err(error) = Self::drop_resent_copy(append, first) else {
-                    continue;
-                };
-                if let Err(cleanup_error) = self.release_active_reservations(&durable) {
-                    tracing::error!(error = %cleanup_error, "active cleanup failed after in-group duplicate error");
-                }
-                Self::notify_prepared_error(&mut prepared, &error);
-                return Err(error);
-            }
-            let first = group_batches.entry(group_key).or_default();
             loop {
                 let Some(slice) = Self::next_prepared_slice(append) else {
                     break;
                 };
                 let identity = slice.wal_append.payload_identity()?;
-                first.push(identity);
                 match self.memtable.retained_batch_rows(&slice.seal_key, identity) {
                     Ok(Some(rows)) => {
                         let entry = rows_by_append.entry(batch_id).or_default();
@@ -3772,33 +3780,6 @@ impl ShardOwner {
             spent_batch_ids: HashSet::new(),
             inserted_batch_ids: HashSet::new(),
         })
-    }
-
-    /// Drops the slices of a batch copy resent within one group.
-    ///
-    /// The first copy of the batch already wrote its WAL slices in this group;
-    /// this copy writes none and is acknowledged with the first copy's outcome.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when a slice lacks its retry identity
-    /// or the copy's slice identities differ from `first`.
-    fn drop_resent_copy(
-        append: &mut PreparedAppend,
-        first: &[crate::scribe::wal::ScribeAppendPayloadIdentity],
-    ) -> Result<(), ScribeError> {
-        let PreparedSliceSet::Materialized(slices) = &mut append.slices;
-        let resent = slices
-            .drain(..)
-            .map(|slice| slice.wal_append.payload_identity())
-            .collect::<Result<Vec<_>, _>>()?;
-        if resent != first {
-            return Err(ScribeError::Internal {
-                detail: "in-group Scribe batch ID was reused with contradictory payload identity"
-                    .to_owned(),
-            });
-        }
-        Ok(())
     }
 
     /// Takes the next prepared slice of one append, in order.
@@ -5867,6 +5848,14 @@ mod tests {
         fn bytes(&self) -> usize {
             self.bytes
         }
+
+        /// Derives the batch identity from the arrival sequence, so items that
+        /// share a sequence model one batch and its resent copy.
+        fn batch_id(&self) -> [u8; 16] {
+            let mut id = [0; 16];
+            id[..size_of::<usize>()].copy_from_slice(&self.sequence.to_le_bytes());
+            id
+        }
     }
 
     /// Proves an ample shutdown budget flushes every owner before draining tasks.
@@ -6927,20 +6916,22 @@ mod tests {
         assert_eq!(owner.wal_io.sync_submissions_for_test(), 2);
     }
 
-    /// A batch resent while its original is still queued commits once in one group.
+    /// A batch resent while its original is still queued commits once.
     ///
-    /// A client retry reuses the batch ID, and both copies can land in the same
-    /// shard group before either is visible. The group must commit the batch's
-    /// rows once, acknowledge both copies with the same row count, and report a
-    /// first commit to exactly one, without failing the unrelated batch beside
-    /// them.
+    /// A client retry reuses the batch ID, so both copies can be queued before
+    /// either is visible. The scheduler closes the group at the resent copy,
+    /// and the owner's next group absorbs it through the memtable identity: the
+    /// rows are visible once, both copies acknowledge with the same row count,
+    /// only the original reports a first commit, and the unrelated batch in the
+    /// first group commits beside it.
     ///
     /// # Panics
     ///
-    /// Panics if the isolated owner cannot be built, the group fails, an ACK is
-    /// missing, or the visible rows or first-commit reports diverge.
+    /// Panics if the isolated owner cannot be built, a group fails, an ACK is
+    /// missing, the copies share a group, or the visible rows or first-commit
+    /// reports diverge.
     #[tokio::test]
-    async fn same_batch_resent_within_one_group_commits_once() {
+    async fn same_batch_resent_before_commit_lands_in_a_later_group_and_commits_once() {
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
         let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
@@ -6958,21 +6949,40 @@ mod tests {
             owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
         let key = owner_key();
         let resent = uuid::Uuid::now_v7();
-        let (group, acks) =
+        let (appends, acks) =
             acked_group_for_key(&budget, &key, &[resent, uuid::Uuid::now_v7(), resent]);
+        for append in appends {
+            assert!(
+                !owner
+                    .handle_command(ShardCommand::Append(Box::new(append)))
+                    .await
+            );
+        }
 
-        owner.process_group(group).await.expect("group commits");
+        let mut group_sizes = Vec::new();
+        while !owner.scheduler.is_empty() {
+            let group = owner.scheduler.pop_group();
+            group_sizes.push(group.len());
+            owner.process_group(group).await.expect("group commits");
+        }
+        assert_eq!(
+            group_sizes,
+            [2, 1],
+            "the resent copy closes the first group"
+        );
 
         let mut completions = Vec::new();
         for ack in acks {
             completions.push(ack.await.expect("ACK delivered").expect("batch commits"));
         }
         assert_eq!(completions[0].rows, completions[2].rows);
-        assert!(completions[1].first_commit);
         assert_eq!(
-            [completions[0].first_commit, completions[2].first_commit],
-            [true, false],
-            "only the first copy of a resent batch is its first commit"
+            completions
+                .iter()
+                .map(|c| c.first_commit)
+                .collect::<Vec<_>>(),
+            [true, true, false],
+            "only the original copy of a resent batch is its first commit"
         );
         let visible = owner.memtable.stats().expect("query-visible rows");
         assert_eq!(
@@ -7688,6 +7698,31 @@ mod tests {
             vec![true, false, true, false, true, false],
             "request size buys no extra tenant-level turns"
         );
+    }
+
+    /// A resent copy of a queued batch starts the next group.
+    ///
+    /// Pushing `[A, B, A']` for one tenant and table, where `A'` reuses `A`'s
+    /// batch identity, must drain as `[A, B]` then `[A']`, so the owner never
+    /// sees both copies in one group.
+    ///
+    /// # Panics
+    ///
+    /// Panics when both copies share a group or arrival order changes.
+    #[test]
+    fn scheduler_ends_group_before_a_resent_batch() {
+        let tenant = DataTenantId::new_v7();
+        let mut scheduler = TenantTableRoundRobin::default();
+        for sequence in [1, 2, 1] {
+            scheduler.push(scheduled(tenant, "hot", sequence));
+        }
+
+        let sequences = |group: Vec<Item>| group.into_iter().map(|item| item.sequence).collect();
+        let first: Vec<usize> = sequences(scheduler.pop_group());
+        let second: Vec<usize> = sequences(scheduler.pop_group());
+        assert_eq!(first, [1, 2]);
+        assert_eq!(second, [1]);
+        assert!(scheduler.is_empty());
     }
 
     /// Verify that shard lookup is bounded within the fixed topology for any batch.

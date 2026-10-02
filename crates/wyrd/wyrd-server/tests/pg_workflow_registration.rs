@@ -733,7 +733,13 @@ async fn fetches_and_executes_locked_workflow_graph() {
     assert_eq!(gateway.requests().len(), 6);
 
     let shadowed = edited_bundle(
-        |card| card.replacen("You are a security reviewer.", "You are a local auditor.", 1),
+        |card| {
+            card.replacen(
+                "You are a security reviewer.",
+                "You are a local auditor.",
+                1,
+            )
+        },
         |yaml| add_registered_step(&yaml, "registered_security", "security-reviewer"),
     );
     let shadowed = loader
@@ -956,13 +962,12 @@ async fn refuses_stale_preflight_after_dependency_replacement() {
     );
     assert_eq!(operation_count(&server).await, operations);
     assert_eq!(card_count(&server, "stale-plan").await, 0);
-    let inbound: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.card_relationships WHERE target_uid = $1",
-    )
-    .bind(replacement_uid)
-    .fetch_one(&pool)
-    .await
-    .expect("replacement relationships read");
+    let inbound: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM wyrd.card_relationships WHERE target_uid = $1")
+            .bind(replacement_uid)
+            .fetch_one(&pool)
+            .await
+            .expect("replacement relationships read");
     assert_eq!(inbound, 0);
 
     let error = cards

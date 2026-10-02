@@ -522,6 +522,8 @@ fn unresolved(card_ref: &CardRef, reason: &str) -> WyrdError {
     }
 }
 
+/// Loader composition, provenance, and hydration tests over the checked-in
+/// code-review bundle and a real client/server boundary.
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

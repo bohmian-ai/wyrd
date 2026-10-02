@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
+use serde_yaml::Value as YamlValue;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{CardKind, Metadata, Spec};
 use wyrd_spec::reference::CardRef;
@@ -88,7 +89,7 @@ pub(crate) fn parse_file_with_sandbox(
     let mut diagnostics = Vec::new();
 
     for raw_doc in serde_yaml::Deserializer::from_str(content) {
-        match serde_yaml::Value::deserialize(raw_doc) {
+        match YamlValue::deserialize(raw_doc) {
             Ok(mut value) => {
                 if let Err(diagnostic) =
                     materialize_inline_files(&mut value, &source_path, false, sandbox)
@@ -194,7 +195,7 @@ fn collect_yaml_files(
     Ok(())
 }
 
-fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<AuthoredCard, Diagnostic> {
+fn parse_single_envelope(path: &Path, raw: YamlValue) -> Result<AuthoredCard, Diagnostic> {
     let envelope = serde_yaml::from_value::<RawCardEnvelope>(raw).map_err(|e| {
         // Check for missing required envelope fields
         let error_msg = e.to_string();
@@ -252,21 +253,21 @@ fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<Authored
 /// path or one leaving the sandbox; and an IO diagnostic when the target
 /// cannot be read.
 fn materialize_inline_files(
-    value: &mut serde_yaml::Value,
+    value: &mut YamlValue,
     source_path: &Path,
     inside_inline: bool,
     sandbox: &PathSandbox,
 ) -> Result<(), Diagnostic> {
     match value {
-        serde_yaml::Value::Sequence(values) => {
+        YamlValue::Sequence(values) => {
             for value in values {
                 materialize_inline_files(value, source_path, inside_inline, sandbox)?;
             }
         }
-        serde_yaml::Value::Mapping(mapping) => {
+        YamlValue::Mapping(mapping) => {
             let mapping_type = mapping
-                .get(serde_yaml::Value::String("type".to_owned()))
-                .and_then(serde_yaml::Value::as_str)
+                .get(YamlValue::String("type".to_owned()))
+                .and_then(YamlValue::as_str)
                 .map(str::to_owned);
             for (key, value) in mapping {
                 let slot = key
@@ -274,7 +275,7 @@ fn materialize_inline_files(
                     .and_then(|key| InlineableSlotField::find(key, mapping_type.as_deref()));
                 match slot {
                     Some(InlineableSlotField { list: true, .. }) => {
-                        let serde_yaml::Value::Sequence(elements) = value else {
+                        let YamlValue::Sequence(elements) = value else {
                             materialize_inline_files(value, source_path, inside_inline, sandbox)?;
                             continue;
                         };
@@ -300,7 +301,7 @@ fn materialize_inline_files(
                 }
             }
         }
-        serde_yaml::Value::Tagged(tagged) if tagged.tag == "!file" => {
+        YamlValue::Tagged(tagged) if tagged.tag == "!file" => {
             if !inside_inline {
                 return Err(Diagnostic::invalid_envelope(
                     source_path.to_path_buf(),
@@ -335,15 +336,12 @@ fn materialize_inline_files(
             }
             let content = std::fs::read_to_string(&resolved)
                 .map_err(|error| Diagnostic::io(source_path.to_path_buf(), &error))?;
-            *value = serde_yaml::Value::String(content);
+            *value = YamlValue::String(content);
         }
-        serde_yaml::Value::Tagged(tagged) => {
+        YamlValue::Tagged(tagged) => {
             materialize_inline_files(&mut tagged.value, source_path, inside_inline, sandbox)?;
         }
-        serde_yaml::Value::Null
-        | serde_yaml::Value::Bool(_)
-        | serde_yaml::Value::Number(_)
-        | serde_yaml::Value::String(_) => {}
+        YamlValue::Null | YamlValue::Bool(_) | YamlValue::Number(_) | YamlValue::String(_) => {}
     }
     Ok(())
 }
@@ -359,7 +357,7 @@ fn materialize_inline_files(
 /// Returns the `!file` diagnostics of [`materialize_inline_files`] and the
 /// combined-form diagnostic of [`unwrap_reference_form`].
 fn materialize_reference_slot(
-    value: &mut serde_yaml::Value,
+    value: &mut YamlValue,
     source_path: &Path,
     inside_inline: bool,
     sandbox: &PathSandbox,
@@ -381,10 +379,7 @@ fn materialize_reference_slot(
 /// # Errors
 /// Returns an invalid-envelope diagnostic when one slot combines more than
 /// one of `ref`, `path`, and `inline`.
-fn unwrap_reference_form(
-    value: &mut serde_yaml::Value,
-    source_path: &Path,
-) -> Result<(), Diagnostic> {
+fn unwrap_reference_form(value: &mut YamlValue, source_path: &Path) -> Result<(), Diagnostic> {
     let Some(mapping) = value.as_mapping_mut() else {
         return Ok(());
     };
@@ -409,13 +404,13 @@ fn unwrap_reference_form(
 
 /// Return whether a reference slot value is an inline body rather than a
 /// Card reference: a mapping that lacks any of `kind`, `name`, or `version`.
-fn is_inline_body(value: &serde_yaml::Value) -> bool {
+fn is_inline_body(value: &YamlValue) -> bool {
     let Some(mapping) = value.as_mapping() else {
         return false;
     };
     let has_identity_field = ["kind", "name", "version"]
         .iter()
-        .all(|field| mapping.contains_key(serde_yaml::Value::String((*field).to_owned())));
+        .all(|field| mapping.contains_key(YamlValue::String((*field).to_owned())));
     !has_identity_field
 }
 

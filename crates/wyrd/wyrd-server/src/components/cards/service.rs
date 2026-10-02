@@ -1043,11 +1043,15 @@ fn plan_registration(
 /// registration. The returned flag is `true` only when that transaction
 /// committed; a lost idempotency race rolls it back and returns the winner's
 /// replay with `false`, leaving the caller to record the verdicts standalone.
+/// Each external dependency must still be the exact Active UID preflight
+/// validated; a replacement at the same identity is refused, not bound.
+/// Cancellation before commit rolls the whole transaction back.
 ///
 /// # Errors
-/// Returns [`WyrdError::AuditUnavailable`] when the append fails, and the
-/// dependency, idempotency, validation, or registry failure otherwise; nothing
-/// commits on any error.
+/// Returns [`WyrdError::AuditUnavailable`] when the append fails,
+/// `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when a preflight-validated UID is
+/// no longer Active, and the idempotency, validation, or registry failure
+/// otherwise; nothing commits on any error.
 #[tracing::instrument(
     skip(state, caller, plan, allowed),
     fields(operation = "card.registration.write")

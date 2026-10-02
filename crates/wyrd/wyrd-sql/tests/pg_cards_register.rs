@@ -589,6 +589,13 @@ async fn relationship_rows_preserve_exact_target_identity() {
 }
 
 /// Hold the target lifecycle row lock until the relationship transaction commits.
+///
+/// The recheck receives the preflight `(CardRef, CardUid)` pair and locks only
+/// that exact Active row, so a concurrent lifecycle update must wait.
+///
+/// # Panics
+/// Panics when fixture setup fails, the expected Active target is not
+/// rechecked, or the lifecycle update does not block behind the row lock.
 #[tokio::test]
 async fn relationship_recheck_blocks_target_lifecycle_race() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -671,9 +678,10 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
         .tenant_conn()
         .await
         .expect("registration connection opens");
-    let resolved = recheck_active_card_refs(&mut registration_conn, &[(target_ref, target_uid.clone())])
-        .await
-        .expect("active target rechecks");
+    let resolved =
+        recheck_active_card_refs(&mut registration_conn, &[(target_ref, target_uid.clone())])
+            .await
+            .expect("active target rechecks");
     assert_eq!(resolved[0].1, target_uid);
     let resolved_refs = resolved
         .iter()

@@ -25,6 +25,9 @@ const RELATION_OUTBOUND: &str = "outbound";
 /// unvalidated. `FOR SHARE` then prevents a concurrent lifecycle update or
 /// delete from invalidating the dependency before the relationship insert.
 ///
+/// Cancellation drops the caller's uncommitted transaction, releasing every
+/// lock taken here and persisting nothing.
+///
 /// # Errors
 /// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` for a reference without a
 /// space, `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY` when the expected UID is

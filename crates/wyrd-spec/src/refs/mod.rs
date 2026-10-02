@@ -593,7 +593,7 @@ where
 mod completeness_tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use serde_json::json;
+    use serde_json::{Value, json};
     use skald_spec::Prompt;
 
     use super::{InlineableSlotField, ReferenceSlotVisitor, SlotValue};
@@ -823,10 +823,10 @@ mod completeness_tests {
 
     /// Count the slots [`InlineableSlotField`] recognizes in a serialized spec,
     /// walking every mapping with its own `type` discriminator.
-    fn raw_slot_count(value: &serde_json::Value) -> usize {
+    fn raw_slot_count(value: &Value) -> usize {
         match value {
-            serde_json::Value::Object(mapping) => {
-                let mapping_type = mapping.get("type").and_then(serde_json::Value::as_str);
+            Value::Object(mapping) => {
+                let mapping_type = mapping.get("type").and_then(Value::as_str);
                 mapping
                     .iter()
                     .map(|(key, value)| {
@@ -839,7 +839,7 @@ mod completeness_tests {
                     })
                     .sum()
             }
-            serde_json::Value::Array(values) => values.iter().map(raw_slot_count).sum(),
+            Value::Array(values) => values.iter().map(raw_slot_count).sum(),
             _ => 0,
         }
     }

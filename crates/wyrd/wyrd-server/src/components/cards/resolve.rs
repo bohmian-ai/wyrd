@@ -33,7 +33,8 @@ pub type ResolvedRefs = Vec<(CardRef, CardUid)>;
 /// the remaining identities into one RLS-scoped registry read, and then checks
 /// every verification binding against the effective specs those refs name. All
 /// of it runs before the caller opens its write transaction, so any refusal
-/// here persists nothing.
+/// here persists nothing. Cancellation may stop after completed registry reads
+/// but always before Card persistence.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_*_UNRESOLVED_PATH_REF` or
@@ -439,10 +440,9 @@ impl EffectiveSpecs {
                         self.resolved.extend(found);
                     }
                     let spec = self.load(conn, Some(&dependency)).await?.ok_or_else(|| {
-                        let identity = dependency.as_card_ref().map_or_else(
-                            || "<unresolved path>".to_owned(),
-                            display_ref,
-                        );
+                        let identity = dependency
+                            .as_card_ref()
+                            .map_or_else(|| "<unresolved path>".to_owned(), display_ref);
                         WyrdError::RegistryUnresolvedDependency {
                             message: format!("card dependency {identity} was not found"),
                             details: serde_json::json!({ "card_ref": identity }),

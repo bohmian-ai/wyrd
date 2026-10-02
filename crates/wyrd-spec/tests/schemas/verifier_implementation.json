@@ -4506,6 +4506,13 @@
                 "null"
               ]
             },
+            "id": {
+              "description": "Provider item identity, required to replay the item statelessly.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "summary": {
               "default": null,
               "type": [

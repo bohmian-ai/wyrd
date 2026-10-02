@@ -95,6 +95,15 @@ fn message(role: &str, part: OpenAiResponseContentPart) -> OpenAiResponseItem {
     }
 }
 
+/// The scripted reasoning item, carrying its replay identity and state.
+fn reasoning() -> OpenAiResponseItem {
+    OpenAiResponseItem::Reasoning {
+        id: Some("rs_1".to_owned()),
+        summary: None,
+        encrypted_content: Some("opaque".to_owned()),
+    }
+}
+
 /// The scripted function call.
 fn lookup_call() -> OpenAiResponseItem {
     OpenAiResponseItem::FunctionCall {
@@ -105,8 +114,8 @@ fn lookup_call() -> OpenAiResponseItem {
 }
 
 /// A Responses Agent calls a tool and the next request replays the user
-/// input, the function call, and its output as native input items; reasoning
-/// items are not replayed.
+/// input, the returned reasoning item, the function call, and its output as
+/// native input items in provider order.
 #[tokio::test]
 async fn agent_run_executes_openai_responses_tool_loop() {
     let user = message(
@@ -117,16 +126,11 @@ async fn agent_run_executes_openai_responses_tool_loop() {
     );
     let mock = MockProvider::new(ProviderName::OpenAi)
         .expect_request(responses_request(vec![user.clone()], true))
-        .respond_with(responses_answer(vec![
-            OpenAiResponseItem::Reasoning {
-                summary: None,
-                encrypted_content: None,
-            },
-            lookup_call(),
-        ]))
+        .respond_with(responses_answer(vec![reasoning(), lookup_call()]))
         .expect_request(responses_request(
             vec![
                 user,
+                reasoning(),
                 lookup_call(),
                 OpenAiResponseItem::FunctionCallOutput {
                     call_id: "c1".to_owned(),

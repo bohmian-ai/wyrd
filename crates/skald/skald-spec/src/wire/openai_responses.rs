@@ -351,6 +351,9 @@ pub enum OpenAiResponseItem {
         output: String,
     },
     Reasoning {
+        /// Provider item identity, required to replay the item statelessly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         summary: Option<String>,
         #[serde(default)]

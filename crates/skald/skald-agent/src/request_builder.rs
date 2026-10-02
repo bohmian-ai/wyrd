@@ -159,17 +159,11 @@ pub fn assistant_message(agent: &str, response: &ProviderResponse) -> AgentResul
                     })?;
             Ok(MessageNum::Gemini(candidate.content.clone().into()))
         }
-        // ponytail: reasoning items are not replayed because the wire type
-        // drops their item id; replay them (or chain `previous_response_id`)
-        // if reasoning-model tool loops need it.
-        ProviderResponse::OpenAiResponses(response) => Ok(MessageNum::OpenAiResponses(
-            response
-                .output
-                .iter()
-                .filter(|item| !matches!(item, OpenAiResponseItem::Reasoning { .. }))
-                .cloned()
-                .collect(),
-        )),
+        // Every output item, reasoning included, is replayed in provider order
+        // so a stateless next request carries native continuation state.
+        ProviderResponse::OpenAiResponses(response) => {
+            Ok(MessageNum::OpenAiResponses(response.output.clone()))
+        }
         ProviderResponse::OpenAiEmbeddings(_)
         | ProviderResponse::GoogleBatchEmbed(_)
         | ProviderResponse::VertexPredict(_)

@@ -32,8 +32,8 @@ pub struct CardRegistrationOperationRow {
     pub idempotency_key: String,
     /// BLAKE3/JCS request hash.
     pub request_hash: String,
-    /// Stored composite response for exact replay.
-    #[sqlx(json)]
+    /// Stored composite response for exact replay; NULL while the operation is
+    /// pending, so it decodes as plain nullable JSONB.
     pub stored_response: Option<JsonValue>,
     /// Operation status literal.
     pub status: String,

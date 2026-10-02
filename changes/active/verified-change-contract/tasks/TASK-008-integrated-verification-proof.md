@@ -188,6 +188,7 @@ does not justify weakening proof.
 | HTTP/MCP manual and direct runs: requester identity, null direct owner/binding, idempotency, unauthorized and cross-tenant refusals, Bifrost result query | `pg_verification_routes.rs`; MCP `an_agent_runs_a_verifier_directly_and_reads_its_result`; `verification_run.rs::assert_verifier_kind_contract` | `test:wyrd`, `test:bifrost:journey:mcp`, `test:bifrost:journey:sdk` | PASS |
 | Multi-server result writing, SYSTEM identity/table matrix, public principal refusals, one raw observation feeding two bindings | `pg_grpc_ingest_smoke.rs::{forged_tenant_result_writes_are_refused, system_writer_matrix_spans_every_builtin_table, system_owner_token_cannot_write_a_customer_result}`; `verification_runtime.rs::two_bindings_share_one_client_observation`; `pg_verification_routes.rs::system_writer_token_is_refused_by_every_public_token_grant` | `verify:bifrost`, `test:wyrd` | PASS |
 | SYSTEM-token contract violations return client errors, not 500s | `wyrd-auth-verify/src/lib.rs` (SYSTEM_OWNER tenant -> 401); `wyrd-auth/src/exchange_api_key.rs::delegation_chain` (SYSTEM subject -> 400 `WYRD_SPEC_400_VALIDATION`, `details.reason="subject_is_system"`) (bounded corrections) | `tests::into_verified_rejects_every_system_contract_violation`; `system_writer_token_is_refused_by_every_public_token_grant` | PASS |
+| A pending registration operation with NULL `stored_response` decodes, so the card reconciler no longer fails with `WYRD_REGISTRY_503` | `wyrd-sql/src/queries/cards/register.rs` drops `#[sqlx(json)]` from `stored_response` (bounded correction) | `pg_cards_register::pending_operation_with_null_stored_response_decodes`; `WYRD_LOG=info mise run test:cards:integration` logs no `WYRD_REGISTRY_503`; `test:sql` | PASS |
 | Daily partitions, result Bloom columns, partition and row-group pruning, one result event time across ACKs | `vala-bifrost-redux/src/tables/mod.rs` schema test pins the managed envelope and Bloom union; `verification_runtime.rs::result_layout_partitions_blooms_and_prunes_by_result` | `verify:bifrost` | PASS |
 | AC-012, AC-014, AC-024 results join details by `result_id` within the caller's tenant-scoped query (spec revision 48 erratum; `table_schema.md` lists only the managed columns Bifrost writes) | `vala-bifrost-redux/src/tables/mod.rs` schema test pins the managed envelope; Drift and Eval journeys read details by `result_id` through tenant-bound queries | `verify:bifrost`, `test:bifrost:journey:sdk`, `test:bifrost:journey:python`, `test:bifrost:journey:typescript` | PASS |
 | Restart, shutdown drain, lease reclaim, retry, saturation fairness, supervisor health, secret-free telemetry | `pg_operator_delivery.rs` and `pg_verification_*` tests listed in the task scope; `wyrd-testing/src/logs.rs::LogCapture` | `test:operators:integration`, `test:wyrd` | PASS |
@@ -210,7 +211,7 @@ Lanes run sequentially in this session, all exit 0: `fmt`, `py:format`,
 `test:bifrost:journey:python`, `test:bifrost:journey:typescript`,
 `test:operators:integration`, `py:test:unit`, `py:test:integration`,
 `ts:test:unit`, `ts:test:integration`, `docs:check`, `check:skills-sync`,
-`git diff --check`. Closeout: `mise run gate` exit 0 (run with `CARGO_BUILD_JOBS=8` after a host low-memory kill of the first attempt).
+`git diff --check`. Closeout: `mise run gate` exit 0 before the decode fix; after it `test:sql`, `test:cards:integration`, `fmt`, and `lints` exit 0, and focused `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-sql --test pg_cards_register -E 'test(=pending_operation_with_null_stored_response_decodes)'` passes (run with `CARGO_BUILD_JOBS=8` after a host low-memory kill of the first attempt).
 
 Diagnosis (`test:wyrd`):
 - **Symptom:** `wyrd-spec vala::trace::attributes_tests::wyrd_keys_count_locked` failed with `left: 8, right: 9`.
@@ -221,6 +222,5 @@ Diagnosis (`test:wyrd`):
 
 Limits recorded for change review:
 - **Stale-writer fence.** AC-025 is proven through a stand-in stale table config, because no schema-evolution API exists.
-- **Card reconciler decode bug.** The nullable JSON decode bug in the card reconciler (`register.rs:36`) is out of scope and also pending a human decision.
 - **Ceilings proven only indirectly.** The 16-binding global ceiling and the real 30s Operator timeout are proven only through the existing per-tenant saturation test and the defaults unit test.
 - **Not run.** Credentialed live smokes (`test:operators:smoke:live`) and the image journeys remain release-gated and were not run here.

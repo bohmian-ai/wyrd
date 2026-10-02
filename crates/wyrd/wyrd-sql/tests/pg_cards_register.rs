@@ -12,8 +12,9 @@ use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, RECONCILE_KIND_REGISTRATION, claim_card_reconciliation,
     insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
-    manifest_completion_rows, persist_outbound_relationships, recheck_active_card_refs,
-    record_card_reconciliation_failure, soft_delete_card_by_ref, soft_delete_card_with_state,
+    lookup_existing_operation, lookup_operation_by_id, manifest_completion_rows,
+    persist_outbound_relationships, recheck_active_card_refs, record_card_reconciliation_failure,
+    soft_delete_card_by_ref, soft_delete_card_with_state,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -177,6 +178,48 @@ async fn pending_card_and_manifest_share_registration_transaction() {
     assert_eq!(manifest_state.1, None);
     assert_eq!(manifest_state.2, None);
     conn.commit().await.expect("assertion transaction commits");
+}
+
+/// A reserved operation has no stored response until it commits; reading it
+/// back must decode the NULL `stored_response` rather than fail, because the
+/// registration replay and the startup reconciler both read pending rows.
+#[tokio::test]
+async fn pending_operation_with_null_stored_response_decodes() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let principal_id = PrincipalId::new(Uuid::now_v7());
+    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    assert!(
+        insert_registration_operation(
+            &mut conn,
+            NewRegistrationOperation {
+                operation_id,
+                principal_id,
+                idempotency_key: "sql-pending-null-response",
+                request_hash: "request-hash",
+            },
+        )
+        .await
+        .expect("operation inserts")
+    );
+
+    let by_id = lookup_operation_by_id(&mut conn, operation_id)
+        .await
+        .expect("pending operation decodes by id")
+        .expect("pending operation exists");
+    let by_key = lookup_existing_operation(&mut conn, principal_id, "sql-pending-null-response")
+        .await
+        .expect("pending operation decodes by idempotency key")
+        .expect("pending operation exists");
+
+    for row in [by_id, by_key] {
+        assert_eq!(row.operation_id, operation_id.as_uuid());
+        assert_eq!(row.status, "pending");
+        assert!(row.stored_response.is_none());
+    }
 }
 
 /// Claims are serialized by `SKIP LOCKED`, recover after lease expiry, and stop

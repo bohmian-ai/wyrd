@@ -183,7 +183,7 @@ pub struct WyrdTestServer {
     /// Whether this server's Bifrost owner has been drained or aborted.
     ///
     /// Set when a bound production serve task returns its drain report, or
-    /// when [`Self::settle_lifecycle`] runs the Bifrost shutdown or abort
+    /// when [`Self::settle_lifecycle`] completes a clean Bifrost drain or abort
     /// itself, so teardown never releases the fixture under live role work and
     /// never drains the same owner twice.
     bifrost_settled: bool,
@@ -788,7 +788,12 @@ impl WyrdTestServer {
     /// `budget` deadline, whose failure path aborts every selected role, and
     /// falls back to [`Bifrost::abort`] when that shutdown does not finish in
     /// time. A zero `budget` skips the graceful Bifrost drain and aborts
-    /// directly. Repeated calls are no-ops once both owners have settled.
+    /// directly. The abort is awaited to completion without a deadline: it is
+    /// the fence that guarantees no governed storage request or retained
+    /// loader is still live, so the owner is marked settled only after a clean
+    /// drain or a completed abort. Repeated calls are no-ops once both owners
+    /// have settled, and a call cancelled mid-abort leaves the owner unsettled
+    /// so the next call repeats the idempotent abort.
     ///
     /// [`Bifrost::shutdown`]: wyrd_server::state::Bifrost::shutdown
     /// [`Bifrost::abort`]: wyrd_server::state::Bifrost::abort
@@ -829,7 +834,6 @@ impl WyrdTestServer {
             }
         }
         if !self.bifrost_settled {
-            self.bifrost_settled = true;
             let bifrost = &self.inner.state.bifrost;
             let deadline = tokio::time::Instant::now() + budget;
             let drained = !budget.is_zero()
@@ -837,13 +841,11 @@ impl WyrdTestServer {
                     tokio::time::timeout_at(deadline, bifrost.shutdown(deadline.into_std())).await,
                     Ok(Ok(_))
                 );
-            if !drained
-                && tokio::time::timeout_at(deadline, bifrost.abort())
-                    .await
-                    .is_err()
-            {
-                tracing::warn!("Bifrost storage did not settle within the teardown budget");
+            if !drained {
+                tracing::warn!("Bifrost did not drain within the teardown budget; awaiting abort");
+                bifrost.abort().await;
             }
+            self.bifrost_settled = true;
         }
         outcome
     }
@@ -5451,6 +5453,10 @@ mod teardown_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use vala_bifrost_redux::storage::{
+        BifrostStorageError, StorageOperation, StorageOperationBarrier,
+    };
+
     use super::WyrdTestServer;
 
     /// A bound serve task that outlives the graceful drain budget is aborted
@@ -5501,6 +5507,57 @@ mod teardown_tests {
         assert!(
             storage.inspect().is_settled(),
             "Bifrost-owned work must be drained or aborted before the fixture drops"
+        );
+    }
+
+    /// Implicitly dropping an in-process server on an active Tokio runtime,
+    /// while a real governed storage request is admitted and parked at the
+    /// production barrier, awaits the Bifrost abort to completion before the
+    /// fixture is released: once the drop returns the fixture is gone, so the
+    /// request must already have terminated and the storage owner settled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_an_in_process_server_with_live_storage_work_awaits_abort_before_fixture_release()
+     {
+        let server = WyrdTestServer::start_in_process()
+            .await
+            .expect("in-process test server starts");
+        let storage = Arc::clone(
+            server
+                .inner
+                .state
+                .bifrost_storage()
+                .expect("the default server owns Bifrost storage"),
+        );
+        let fixture = Arc::downgrade(&server.inner.fixture);
+        let barrier = StorageOperationBarrier::new(StorageOperation::Exists);
+        storage.install_operation_barrier_for_test(Arc::clone(&barrier));
+        let request = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            async move { storage.exists("teardown-probe").await }
+        });
+        barrier.wait_until_reached().await;
+        assert_eq!(storage.inspect().active_requests, 1);
+
+        drop(server);
+
+        let inspection = storage.inspect();
+        assert_eq!(
+            fixture.strong_count(),
+            0,
+            "the drop must release the fixture"
+        );
+        assert_eq!(
+            inspection.active_requests, 0,
+            "the fixture was released while a governed storage request was still admitted"
+        );
+        assert!(inspection.is_settled());
+        barrier.release();
+        assert_eq!(
+            request
+                .await
+                .expect("the parked request joins")
+                .expect_err("the abort terminates the parked request"),
+            BifrostStorageError::Closed
         );
     }
 }

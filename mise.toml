@@ -545,7 +545,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py tests/integration/test_drift_journey.py tests/integration/test_verification_journey.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_bifrost_query.py tests/integration/state/test_observe_journey.py tests/integration/test_drift_journey.py tests/integration/test_verification_journey.py tests/integration/test_verification_execute_journey.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -556,7 +556,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/drift-verification.test.ts tests/integration/operator-connections.test.ts"
+run = "pnpm exec vitest run tests/integration/oracle-query.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/observe-run.test.ts tests/integration/verification-run.test.ts tests/integration/verification-execute.test.ts tests/integration/drift-verification.test.ts tests/integration/operator-connections.test.ts"
 
 [tasks."check:bifrost-resource-governance"]
 description = "Reject obsolete Bifrost resource ownership"

@@ -5,7 +5,7 @@ status: ready
 spec: SPEC-oidc-production-readiness
 spec_revision: 9
 requirements: [REQ-001, REQ-005, REQ-018, INV-001, INV-003, INV-004, INV-005, INV-006, AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009]
-depends_on: [TASK-003, TASK-004]
+depends_on: [TASK-003, TASK-004, TASK-008]
 ---
 
 # Provider-agnostic verification and operator guidance

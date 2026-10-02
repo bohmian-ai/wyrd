@@ -1,6 +1,6 @@
 ---
 id: SPEC-oidc-production-readiness
-revision: 9
+revision: 10
 status: approved
 ---
 
@@ -165,6 +165,18 @@ authentication.
   the local save replays the old token on retry, which the server's reuse
   detection treats as theft. Logout deletes the saved login locally, then
   revokes it on the server best-effort and warns if revocation fails.
+- **REQ-021**: Wyrd's OAuth endpoints follow the OAuth wire format, so a
+  standard OAuth client works unchanged. The token, platform token,
+  revocation, and device authorization endpoints accept
+  `application/x-www-form-urlencoded` request bodies (RFC 6749 §3.2,
+  RFC 7009 §2.1, RFC 8628 §3.1). Token success responses use the RFC 6749 §5.1
+  JSON body. Errors use the RFC 6749 §5.2 JSON body (`error`,
+  `error_description`) with the registered error codes from RFC 6749,
+  RFC 8628, RFC 8693, and RFC 7523, and the status codes RFC 6749 requires.
+  Wyrd's own SDKs use the same wire format; no JSON alternative remains.
+  These OAuth endpoints are the one exception to Wyrd's rule that public
+  errors use the `WyrdError` problem+json catalog; every other endpoint keeps
+  it.
 - **REQ-013**: A deployed Service or Agent uses its own scoped Wyrd API key by
   default. Where the deployment chooses workload federation, Wyrd accepts a
   verified, audience-bound platform assertion only through the existing
@@ -387,6 +399,11 @@ TASK-001–005 until this draft is approved; TASK-006/007 are proposed only.
 
 ## Revision history
 
+- **Revision 10 — 2026-10-02 — approved**: Approved by Steven Forrester:
+  follow the OAuth standard on the wire. Added REQ-021: the token, platform
+  token, revocation, and device authorization endpoints take form-encoded
+  requests and return RFC 6749 success and error bodies, replacing the JSON
+  request bodies and problem+json error envelope those endpoints used.
 - **Revision 9 — 2026-10-02 — approved**: Approved by Steven Forrester:
   follow conventional OAuth 2.0 and OIDC for UI and programmatic access, and
   stay provider agnostic like comparable open-source servers. Replaced the

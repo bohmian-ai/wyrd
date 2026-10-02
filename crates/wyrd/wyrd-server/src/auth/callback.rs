@@ -45,7 +45,6 @@ mod pg_tests {
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
 
-    use crate::auth::pg_resolvers::PgIssuerResolver;
     use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
     use secrecy::SecretString;
@@ -59,11 +58,9 @@ mod pg_tests {
     use wyrd_auth::connections::HumanConnections;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_oidc::{
-        ClaimMapping, ClaimPath, ClientAuth, JwksCache, MappedClaims, ScreenedHttp, TrustedIssuer,
+        ClaimMapping, ClaimPath, ClientAuth, MappedClaims, ScreenedHttp, TrustedIssuer,
     };
-    use wyrd_auth_verify::{
-        ExternalVerifier, Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
-    };
+    use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_crypt::{SealingKeyring, SecretKey};
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::Permission;
@@ -168,7 +165,7 @@ mod pg_tests {
     #[tokio::test]
     async fn unknown_state_is_refused_without_a_tenant_audit() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
 
         let error = exchange_authorization_code(
             &state,
@@ -192,7 +189,7 @@ mod pg_tests {
     #[tokio::test]
     async fn a_consumed_state_is_refused() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let binding = committed_active_binding(&fixture).await;
         let raw = "consumed-state";
         pending_login(
@@ -227,7 +224,7 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let trusted =
             trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
         let binding = committed_active_binding(&fixture).await;
@@ -279,7 +276,7 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let trusted =
             trusted_issuer_with_jwks(tenant, jwks_uri(&server), HashMap::new(), Vec::new());
         let mut binding = committed_active_binding(&fixture).await;
@@ -371,7 +368,7 @@ mod pg_tests {
     async fn same_email_different_subjects_are_distinct_users() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
         let service = authorization_exchange_service(&state);
@@ -409,7 +406,7 @@ mod pg_tests {
     async fn changed_roles_are_audited_once_and_unchanged_roles_never() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
         let service = authorization_exchange_service(&state);
@@ -460,7 +457,7 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         seed_role(&fixture, ALPHA).await;
         seed_role(&fixture, BETA).await;
         let trusted = trusted_issuer_with_jwks(
@@ -571,7 +568,7 @@ mod pg_tests {
     async fn a_failed_role_sync_audit_rolls_back_the_whole_login() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
         let (hash, login) = pending_login(&fixture, state_hash(10), binding, "nonce").await;
@@ -637,7 +634,7 @@ mod pg_tests {
     async fn a_test_sign_in_marks_only_its_candidate_tested_and_issues_nothing() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let tester = seed_tester(&fixture, true).await;
         let binding = committed_candidate_binding(&fixture).await;
@@ -691,7 +688,7 @@ mod pg_tests {
     async fn an_unauthorized_tester_leaves_the_candidate_untested() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let tester = seed_tester(&fixture, false).await;
         let binding = committed_candidate_binding(&fixture).await;
@@ -738,7 +735,7 @@ mod pg_tests {
     async fn a_failed_tested_audit_leaves_the_candidate_untested() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
-        let state = test_state_with_external(&fixture).await;
+        let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let tester = seed_tester(&fixture, true).await;
         let binding = committed_candidate_binding(&fixture).await;
@@ -1228,18 +1225,14 @@ mod pg_tests {
         )
     }
 
-    /// Build callback test state with a real issuing key, external verifier,
-    /// and human-connection owner.
+    /// Build callback test state with a real issuing key, the matching
+    /// access-token verifier, and the human-connection owner.
     ///
     /// Human trust is passed to `finish_id_token_exchange` explicitly; a test
     /// that reaches issuance seeds the Active connection its login state is
-    /// bound to. The Pg issuer resolver backs the verifier's workload path.
-    async fn test_state_with_external(fixture: &PgFixture) -> AppState {
+    /// bound to.
+    async fn test_state_with_human_connections(fixture: &PgFixture) -> AppState {
         let sealing_key = Arc::new(SealingKeyring::new(SecretKey::from_bytes([7_u8; 32])));
-        let issuer_resolver = Arc::new(PgIssuerResolver::new(
-            fixture.wyrd_postgres().clone(),
-            Some(Arc::clone(&sealing_key)),
-        ));
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -1255,22 +1248,11 @@ mod pg_tests {
             Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key parses")),
         );
         let verifier = TokenVerifier::new(local_keys, "wyrd", WyrdAuthVerifySettings::default());
-        let external_verifier = ExternalVerifier::new(
-            Arc::new(JwksCache::new(
-                ScreenedHttp::allowing_internal(),
-                StdDuration::from_secs(300),
-                StdDuration::from_secs(5),
-            )),
-            Arc::clone(&issuer_resolver),
-            WyrdAuthVerifySettings::default(),
-        );
         test_state(fixture)
             .await
             .with_auth(crate::components::auth::ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(Arc::new(verifier)),
-                external_verifier: Some(Arc::new(external_verifier)),
-                trusted_issuer_resolver: Some(issuer_resolver),
                 human_connections: Some(HumanConnections::new(
                     fixture.wyrd_postgres().clone(),
                     Some(Arc::clone(&sealing_key)),

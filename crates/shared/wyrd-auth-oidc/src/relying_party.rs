@@ -556,8 +556,8 @@ impl RelyingParty {
     /// algorithm the provider advertised that is not symmetric, the signature
     /// against the provider's key set, the expiry, and the nonce. This adds
     /// what the library leaves to its caller: the authorized-party rules of
-    /// OpenID Connect Core 1.0 §3.1.3.7 steps 4 and 5 (several audiences need
-    /// an `azp` naming the client, and a present `azp` must name it), an
+    /// OpenID Connect Core 1.0 §3.1.3.7 steps 4 and 5 (the library refuses any
+    /// audience beside the client, and a present `azp` must name it), an
     /// issued-at no later than now plus [`CLOCK_SKEW`] (step 10), and a
     /// Subject Identifier of at most 255 ASCII bytes (§2). The verified claims
     /// are mapped through the connection's claim mapping.
@@ -622,7 +622,9 @@ fn redirect_url(redirect_uri: &str) -> Result<RedirectUrl, RelyingPartyError> {
 ///
 /// A public-client verifier, so symmetric algorithms are refused even when
 /// advertised; only algorithms the provider advertised for ID tokens are
-/// accepted. Additional audiences are left to [`verify_authorized_party`].
+/// accepted. The library's default refuses any audience beside `client_id`,
+/// because Wyrd trusts no other audience; [`verify_authorized_party`] then
+/// checks a present `azp`.
 /// Expiry and issued-at are checked with [`CLOCK_SKEW`].
 fn id_token_verifier<'a>(
     provider: &ProviderMetadata,
@@ -635,7 +637,6 @@ fn id_token_verifier<'a>(
         keys,
     )
     .set_allowed_algs(provider.id_token_signing_alg_values_supported().clone())
-    .set_other_audience_verifier_fn(|_| true)
     .set_time_fn(|| Utc::now() - CLOCK_SKEW)
     .set_issue_time_verifier_fn(|issued_at| {
         if issued_at > Utc::now() + CLOCK_SKEW {
@@ -967,8 +968,9 @@ mod tests {
     }
 
     /// Nonce, issuer, audience, algorithm, signature, expiry, issued-at,
-    /// authorized-party, and subject refusals all fail closed; several
-    /// audiences with an `azp` naming the client verify.
+    /// authorized-party, and subject refusals all fail closed, including an
+    /// additional untrusted audience beside the client even when `azp` names
+    /// the client; a single audience with an `azp` naming the client verifies.
     #[tokio::test]
     async fn id_token_refusals_fail_closed() {
         let (server, issuer) = provider().await;
@@ -1007,6 +1009,11 @@ mod tests {
                 "azp naming another client",
                 ed(&with("azp", json!("other"))),
             ),
+            ("untrusted additional audience", {
+                let mut extra = with("aud", json!([CLIENT, "other"]));
+                extra["azp"] = json!(CLIENT);
+                ed(&extra)
+            }),
             ("subject too long", ed(&with("sub", json!("s".repeat(256))))),
         ];
         for (label, id_token) in cases {
@@ -1035,12 +1042,10 @@ mod tests {
             "{error:?}"
         );
 
-        let mut with_azp = with("aud", json!([CLIENT, "other"]));
-        with_azp["azp"] = json!(CLIENT);
-        serve_token(&server, &issuer, &ed(&with_azp)).await;
+        serve_token(&server, &issuer, &ed(&with("azp", json!(CLIENT)))).await;
         redeem(&party, &issuer)
             .await
-            .expect("several audiences with azp naming the client verify");
+            .expect("a single audience with an azp naming the client verifies");
     }
 
     /// A validly signed token whose asymmetric algorithm the provider did not

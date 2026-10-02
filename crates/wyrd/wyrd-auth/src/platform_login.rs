@@ -128,6 +128,18 @@ impl PlatformLogin {
         }
     }
 
+    /// The relying party, and so the provider cache, this login's begin and
+    /// callback use.
+    ///
+    /// Platform connection setup discovers through it
+    /// ([`RelyingParty::discover`]) so a connection is stored only when
+    /// standard discovery succeeds and this process's next begin and callback
+    /// use the provider as it was just discovered.
+    #[must_use]
+    pub fn relying_party(&self) -> &RelyingParty {
+        &self.relying_party
+    }
+
     /// Load the configured connection, or report that there is none.
     ///
     /// # Errors

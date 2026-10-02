@@ -758,21 +758,32 @@ pub(crate) async fn discover_jwks_uri(
         .screened_http()
         .provider_metadata(issuer)
         .await
-        .map_err(|error| match error {
-            RelyingPartyError::Screened(error) => screen_error(error),
-            error => {
-                tracing::warn!(
-                    error = %error,
-                    issuer = issuer.as_str(),
-                    "OIDC discovery failed for admin create"
-                );
-                WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
-                    message: "OIDC discovery failed for issuer".to_owned(),
-                    details: serde_json::json!({ "issuer": issuer.as_str() }),
-                })
-            }
-        })?;
+        .map_err(|error| discovery_error(issuer, error))?;
     Ok(metadata.jwks_uri().url().clone())
+}
+
+/// Project a failed discovery of `issuer` during issuer setup onto the admin
+/// error catalog.
+///
+/// A screening refusal goes through [`screen_error`]; every other failure
+/// (unreachable discovery or key set, an undecodable document, or one naming
+/// another issuer) is logged with its cause and answered as
+/// `DiscoveryUnavailable` naming only the issuer.
+pub(crate) fn discovery_error(issuer: &IssuerUrl, error: RelyingPartyError) -> WyrdErrorResponse {
+    match error {
+        RelyingPartyError::Screened(error) => screen_error(error),
+        error => {
+            tracing::warn!(
+                error = %error,
+                issuer = issuer.as_str(),
+                "OIDC discovery failed for issuer setup"
+            );
+            WyrdErrorResponse::from(WyrdError::DiscoveryUnavailable {
+                message: "OIDC discovery failed for issuer".to_owned(),
+                details: serde_json::json!({ "issuer": issuer.as_str() }),
+            })
+        }
+    }
 }
 
 /// Project a screening refusal onto the admin error catalog.

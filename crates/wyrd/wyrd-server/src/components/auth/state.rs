@@ -19,10 +19,11 @@ pub struct ServerAuth {
     /// Verifies bearer tokens on every authenticated request. Required in production
     /// (enforced by `AppState::production_validate`).
     pub token_verifier: Option<Arc<TokenVerifier>>,
-    /// Verifies foreign OIDC ID tokens and workload assertions at issuance
-    /// (login callback, platform login, `jwt-bearer`); never used per request.
+    /// Verifies workload assertions at RFC 7523 `jwt-bearer` issuance; never
+    /// used per request. Human ID tokens verify through the relying party
+    /// owned by [`Self::human_connections`] and [`Self::platform_login`].
     pub external_verifier: Option<Arc<ExternalVerifier<PgIssuerResolver>>>,
-    /// Resolves trusted OIDC issuers from Postgres for foreign-OIDC verification paths.
+    /// Resolves a tenant's trusted workload issuers from Postgres for `jwt-bearer`.
     pub trusted_issuer_resolver: Option<Arc<PgIssuerResolver>>,
     /// Resolves workload-to-principal bindings from Postgres for the JWT-bearer exchange path.
     pub workload_binding_resolver: Option<Arc<PgWorkloadBindingResolver>>,

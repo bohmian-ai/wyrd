@@ -1361,10 +1361,11 @@ const PLATFORM_CLIENT: &str = "wyrd-platform";
 const PLATFORM_DISCOVERY: &str = "/.well-known/openid-configuration";
 
 /// Reset `server` to a platform provider that advertises RFC 9207 response
-/// issuers, publishes [`PLATFORM_SIGNING_KEY`] as `mock-1`, and answers its
-/// token endpoint with `token_response`.
+/// issuers, answers its key set with `key_set`, and answers its token
+/// endpoint with `token_response`.
 async fn mount_platform_provider(
     server: &wiremock::MockServer,
+    key_set: wiremock::ResponseTemplate,
     token_response: wiremock::ResponseTemplate,
 ) {
     server.reset().await;
@@ -1385,12 +1386,17 @@ async fn mount_platform_provider(
         .await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/jwks"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
-            "keys": [{ "kty": "OKP", "crv": "Ed25519", "kid": "mock-1", "x": PLATFORM_SIGNING_X }]
-        })))
+        .respond_with(key_set)
         .mount(server)
         .await;
     mount_platform_token(server, token_response).await;
+}
+
+/// A key set publishing [`PLATFORM_SIGNING_KEY`] under `kid`.
+fn platform_key_set(kid: &str) -> wiremock::ResponseTemplate {
+    wiremock::ResponseTemplate::new(200).set_body_json(json!({
+        "keys": [{ "kty": "OKP", "crv": "Ed25519", "kid": kid, "x": PLATFORM_SIGNING_X }]
+    }))
 }
 
 /// Reset `server` to a platform provider whose discovery and key set are
@@ -1534,7 +1540,11 @@ async fn platform_provider_hits(server: &wiremock::MockServer, route: &str) -> u
 ///      authority and none inside a tenant;
 ///   5. with discovery and the key set down, a callback still completes from
 ///      the provider state its begin cached, and a token naming an unknown key
-///      makes exactly one forced re-discovery and fails closed.
+///      makes exactly one forced re-discovery and fails closed;
+///   6. configuration discovers through the same relying party: a key set
+///      that is unavailable or undecodable is refused without replacing the
+///      stored connection, and a same-issuer reconfiguration refreshes the
+///      provider the next begin and callback use.
 ///
 /// # Panics
 /// Panics when any step deviates from the contract above.
@@ -1549,7 +1559,12 @@ async fn federated_platform_sign_in_runs_through_the_served_callback() {
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
     let provider = wiremock::MockServer::start().await;
     let issuer = provider.uri();
-    mount_platform_provider(&provider, wiremock::ResponseTemplate::new(500)).await;
+    mount_platform_provider(
+        &provider,
+        platform_key_set("mock-1"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
 
     // 1. The client ID is the audience; there is no second one to configure.
     let configure = |extra: Option<(&str, &str)>| {
@@ -1588,6 +1603,55 @@ async fn federated_platform_sign_in_runs_through_the_served_callback() {
         view.get("expected_audience").is_none(),
         "the connection view carries no separate audience: {view}"
     );
+
+    // A provider whose key set cannot be loaded is refused, and the stored
+    // connection is left as it was.
+    let reconfigure = json!({
+        "issuer_url": issuer,
+        "client_id": "wyrd-platform-two",
+        "client_auth": { "method": "public" },
+    });
+    for (label, key_set) in [
+        ("unavailable key set", wiremock::ResponseTemplate::new(503)),
+        (
+            "undecodable key set",
+            wiremock::ResponseTemplate::new(200).set_body_string("not a key set"),
+        ),
+    ] {
+        mount_platform_provider(&provider, key_set, wiremock::ResponseTemplate::new(500)).await;
+        let resp = srv
+            .oneshot(platform_request(
+                Method::PUT,
+                "/platform/oidc/connection",
+                &session,
+                Some(reconfigure.clone()),
+            ))
+            .await
+            .expect("configure route responds");
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert!(!status.is_success(), "{label} is refused: {status} {body}");
+        let resp = srv
+            .oneshot(platform_request(
+                Method::GET,
+                "/platform/oidc/connection",
+                &session,
+                None,
+            ))
+            .await
+            .expect("connection route responds");
+        let stored = body_json(resp).await;
+        assert_eq!(
+            stored["client_id"], PLATFORM_CLIENT,
+            "{label}: the stored connection is unchanged: {stored}"
+        );
+    }
+    mount_platform_provider(
+        &provider,
+        platform_key_set("mock-1"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
     let resp = srv
         .oneshot(platform_request(
             Method::POST,
@@ -1607,6 +1671,7 @@ async fn federated_platform_sign_in_runs_through_the_served_callback() {
         let (state, nonce) = begin_platform_login(&srv).await;
         mount_platform_provider(
             &provider,
+            platform_key_set("mock-1"),
             platform_token_reply(&issuer, &nonce, PLATFORM_CLIENT, "mock-1"),
         )
         .await;
@@ -1623,6 +1688,7 @@ async fn federated_platform_sign_in_runs_through_the_served_callback() {
     let (state, nonce) = begin_platform_login(&srv).await;
     mount_platform_provider(
         &provider,
+        platform_key_set("mock-1"),
         platform_token_reply(&issuer, &nonce, "another-client", "mock-1"),
     )
     .await;
@@ -1637,6 +1703,7 @@ async fn federated_platform_sign_in_runs_through_the_served_callback() {
     let (state, nonce) = begin_platform_login(&srv).await;
     mount_platform_provider(
         &provider,
+        platform_key_set("mock-1"),
         platform_token_reply(&issuer, &nonce, PLATFORM_CLIENT, "mock-1"),
     )
     .await;
@@ -1714,6 +1781,38 @@ async fn federated_platform_sign_in_runs_through_the_served_callback() {
         platform_provider_hits(&provider, PLATFORM_DISCOVERY).await,
         1,
         "exactly one forced re-discovery"
+    );
+
+    // 6. Reconfiguring the same issuer refreshes this process's provider: a
+    //    key published only since the last discovery verifies afterwards
+    //    without another discovery.
+    mount_platform_provider(
+        &provider,
+        platform_key_set("mock-2"),
+        wiremock::ResponseTemplate::new(500),
+    )
+    .await;
+    let resp = srv
+        .oneshot(configure(None))
+        .await
+        .expect("configure route responds");
+    assert_eq!(resp.status(), StatusCode::OK, "same-issuer reconfiguration");
+    let (state, nonce) = begin_platform_login(&srv).await;
+    mount_platform_outage(
+        &provider,
+        platform_token_reply(&issuer, &nonce, PLATFORM_CLIENT, "mock-2"),
+    )
+    .await;
+    let (status, body) = platform_callback(&srv, &state, Some(&issuer)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the reconfigured provider's key verifies: {body}"
+    );
+    assert_eq!(
+        platform_provider_hits(&provider, PLATFORM_DISCOVERY).await,
+        0,
+        "the callback used the provider reconfiguration discovered"
     );
 
     srv.shutdown().await.expect("server shuts down");

@@ -145,12 +145,11 @@ impl Default for WyrdAuthVerifySettings {
     }
 }
 
-/// A federated identity verified against one trusted issuer.
+/// A workload assertion verified against one trusted issuer.
 ///
 /// Deliberately tenant-free: it states what the issuer asserted, not where the
-/// identity belongs. [`VerifiedExternalIdentity`] is this plus the tenant the
-/// issuer was resolved under; the platform control plane uses this form
-/// directly because a platform principal has no tenant.
+/// identity belongs. [`ExternalVerifier::verify_external`] adds the tenant the
+/// issuer was resolved under to form a [`VerifiedExternalIdentity`].
 #[derive(Debug, Clone)]
 pub struct ExternalClaims {
     /// The trusted issuer that signed the token.
@@ -169,12 +168,12 @@ pub struct ExternalClaims {
     pub raw_claims: JsonValue,
 }
 
-/// Verified identity from an external OIDC issuer.
+/// Verified workload identity from a tenant's trusted external issuer.
 ///
-/// This is NOT a [`wyrd_runtime::Principal`] (R03). The server flow (commit 06
-/// for human users, commit 07 for workloads) owns constructing the `Principal`
-/// by upsert/lookup and RBAC resolution. The verifier is SQL-free and cannot
-/// perform those operations here.
+/// This is NOT a [`wyrd_runtime::Principal`]. The RFC 7523 `jwt-bearer`
+/// exchange owns resolving the workload binding and constructing the
+/// `Principal`; the verifier is SQL-free and cannot perform those operations
+/// here.
 #[derive(Debug)]
 pub struct VerifiedExternalIdentity {
     /// The trusted issuer that signed the token.
@@ -370,9 +369,10 @@ impl TokenVerifier {
 
 /// Issuance-side verifier for tokens minted by a trusted external OIDC issuer.
 ///
-/// Used by OIDC login, workload `jwt-bearer`, and platform federated login to
-/// validate the external assertion before a Wyrd token is issued. It never
-/// verifies a Wyrd access token. Generic over the issuer resolver `I`
+/// Used only by the workload RFC 7523 `jwt-bearer` exchange to validate the
+/// external assertion before a Wyrd token is issued. Human ID tokens are
+/// verified by the OpenID Connect relying party in `wyrd-auth-oidc`, and this
+/// never verifies a Wyrd access token. Generic over the issuer resolver `I`
 /// (an RPITIT trait, not dyn-compatible), so trust lookups happen per call
 /// against the live config store.
 pub struct ExternalVerifier<I> {
@@ -489,13 +489,8 @@ impl<I: IssuerConfigResolver> ExternalVerifier<I> {
     /// point that resolves the issuer from a tenant's configuration and then
     /// delegates here.
     ///
-    /// It exists because not every federated identity belongs to a tenant. The
-    /// platform control plane resolves its one deployment-owned connection from
-    /// the platform store, which has no tenant to key a resolver by, and must
-    /// not grow a parallel verification path to compensate. Taking the resolved
-    /// issuer as an argument keeps one implementation for both planes; the
-    /// caller owns *which* issuer is trusted, this owns *whether* the token is
-    /// valid under it.
+    /// The caller owns *which* issuer is trusted; this owns *whether* the
+    /// token is valid under it.
     ///
     /// # Errors
     /// - [`AuthError::BadTokenFormat`] — the token is oversized or not a JWT.

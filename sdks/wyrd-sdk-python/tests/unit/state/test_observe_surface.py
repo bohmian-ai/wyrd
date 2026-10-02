@@ -389,10 +389,10 @@ async def _span_later(tracer: Any, name: str) -> None:
     tracer.start_span(name).end()
 
 
-def test_global_and_private_providers_receive_one_processor_each(
+def test_repeated_entry_registers_once_on_a_marked_provider(
     tmp_path: Path, spans: tuple[TracerProvider, InMemorySpanExporter]
 ) -> None:
-    """Registration is idempotent per provider, through entry or the explicit hook."""
+    """The provider marker skips re-registration, through entry or the explicit hook."""
     provider, exporter = spans
     run = _state(tmp_path).run()
     with run, run:
@@ -411,116 +411,29 @@ def test_global_and_private_providers_receive_one_processor_each(
     assert _correlation(private_exporter) == {"private": (run.card_ref, run.run_id)}
 
 
-def test_a_provider_that_raises_after_accepting_is_never_asked_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A provider that keeps the processor and then raises holds exactly one."""
+class _Raising:
+    """A provider whose processor registration raises."""
 
-    class Retaining:
-        """A provider that retains the supplied processor, then raises."""
-
-        def __init__(self) -> None:
-            self.processors: list[object] = []
-
-        def add_span_processor(self, processor: object) -> None:
-            self.processors.append(processor)
-            raise RuntimeError("accepted, then failed")
-
-    retaining = Retaining()
-    assert install_run_correlation(retaining) is False
-    assert install_run_correlation(retaining) is False
-    monkeypatch.setattr(trace, "get_tracer_provider", lambda: retaining)
-    with _state(tmp_path).run() as entered:
-        _drift_reaches_the_ordinary_boundary(entered)
-    assert install_run_correlation() is False
-    assert len(retaining.processors) == 1
+    def add_span_processor(self, processor: object) -> None:
+        raise RuntimeError("registration failed")
 
 
-def test_a_processor_retained_by_a_failed_registration_never_enriches(tmp_path: Path) -> None:
-    """The processor kept by an accept-then-raise provider stays inert in scope."""
+class _Unmarkable:
+    """A provider that accepts processors but cannot carry the Wyrd marker."""
 
-    class Retaining:
-        """A provider that retains the supplied processor, then raises."""
+    __slots__ = ()
 
-        def __init__(self) -> None:
-            self.processors: list[Any] = []
-
-        def add_span_processor(self, processor: Any) -> None:
-            self.processors.append(processor)
-            raise RuntimeError("accepted, then failed")
-
-    class Span:
-        """A span recording every attribute written to it."""
-
-        def __init__(self) -> None:
-            self.attributes: dict[str, Any] = {}
-
-        def set_attribute(self, key: str, value: Any) -> None:
-            self.attributes[key] = value
-
-    retaining = Retaining()
-    assert install_run_correlation(retaining) is False
-    assert install_run_correlation(retaining) is False
-    (processor,) = retaining.processors
-    span = Span()
-    with _state(tmp_path).run(card="model"):
-        processor.on_start(span)
-    assert span.attributes == {}
-
-
-def test_equal_providers_register_independently_by_identity(tmp_path: Path) -> None:
-    """A failed provider never suppresses a distinct healthy provider that equals it."""
-
-    class Equal(TracerProvider):
-        """A provider equal to every other ``Equal``; optionally failing."""
-
-        def __init__(self, fail: bool) -> None:
-            super().__init__()
-            self.fail = fail
-
-        def __eq__(self, other: object) -> bool:
-            return isinstance(other, Equal)
-
-        def __hash__(self) -> int:
-            return 0
-
-        def add_span_processor(self, span_processor: Any) -> None:
-            if self.fail:
-                raise RuntimeError("registration failed")
-            super().add_span_processor(span_processor)
-
-    failing, healthy = Equal(fail=True), Equal(fail=False)
-    exporter = InMemorySpanExporter()
-    healthy.add_span_processor(SimpleSpanProcessor(exporter))
-    assert failing == healthy and failing is not healthy
-    assert install_run_correlation(failing) is False
-    assert install_run_correlation(healthy) is True
-    assert install_run_correlation(healthy) is True
-    assert _wyrd_processors(healthy) == 1
-    run = _state(tmp_path).run(card="model")
-    with run:
-        healthy.get_tracer("framework").start_span("healthy").end()
-    assert _correlation(exporter) == {"healthy": (run.card_ref, run.run_id)}
+    def add_span_processor(self, processor: object) -> None:
+        raise AssertionError("an unmarkable provider is never registered")
 
 
 def test_unsupported_providers_are_refused_without_raising() -> None:
-    """API-only, proxy, and failing providers report False instead of raising."""
-
-    attempts: list[object] = []
-
-    class Failing:
-        """A provider whose registration raises before retaining anything."""
-
-        def add_span_processor(self, processor: object) -> None:
-            attempts.append(processor)
-            raise RuntimeError("registration failed")
-
+    """API-only, proxy, unmarkable, and failing providers report False instead of raising."""
     assert install_run_correlation(object()) is False
     assert install_run_correlation(trace.ProxyTracerProvider()) is False
-    failing = Failing()
-    assert install_run_correlation(failing) is False
-    assert install_run_correlation(failing) is False
-    assert len(attempts) == 1
+    assert install_run_correlation(trace.ProxyTracerProvider()) is False
+    assert install_run_correlation(_Unmarkable()) is False
+    assert install_run_correlation(_Raising()) is False
 
 
 def test_run_exit_accepts_conventional_keywords_and_omitted_arguments(tmp_path: Path) -> None:
@@ -572,28 +485,14 @@ def _broken(*_args: object, **_kwargs: object) -> None:
 def test_registration_and_attach_failures_never_block_observations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """API-only, raising-registration, and failing-attach providers leave emits untouched."""
+    """API-only, unmarkable, raising, and failing-attach paths leave emits untouched."""
     run = _state(tmp_path).run(card="model")
-    monkeypatch.setattr(trace, "get_tracer_provider", lambda: object())
-    with run as entered:
-        _drift_reaches_the_ordinary_boundary(entered)
-
-    attempts: list[object] = []
-
-    class Raising:
-        """A global provider whose processor registration raises."""
-
-        def add_span_processor(self, processor: object) -> None:
-            attempts.append(processor)
-            raise RuntimeError("registration failed")
-
-    monkeypatch.setattr(trace, "get_tracer_provider", Raising)
-    with run as entered:
-        _drift_reaches_the_ordinary_boundary(entered)
-    assert len(attempts) == 1
-    with pytest.raises(ValueError, match="app"), run:
-        raise ValueError("app")
-    assert len(attempts) == 2
+    for provider in (object(), _Unmarkable(), _Raising()):
+        monkeypatch.setattr(trace, "get_tracer_provider", lambda provider=provider: provider)
+        with run as entered:
+            _drift_reaches_the_ordinary_boundary(entered)
+        with pytest.raises(ValueError, match="app"), run:
+            raise ValueError("app")
 
     monkeypatch.setattr(otel_context, "attach", _broken)
     with run as entered:

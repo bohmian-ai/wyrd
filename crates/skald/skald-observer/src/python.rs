@@ -277,6 +277,9 @@ impl Observer for PythonObserver {
         .ok();
     }
 
+    /// Call the Python `on_workflow_step_attempt(run_id, step_id, attempt)`
+    /// hook on a blocking thread holding the GIL; `attempt` counts from 1. A
+    /// raised Python exception is swallowed so observation stays best-effort.
     async fn on_workflow_step_attempt(&self, run_id: &str, step_id: &str, attempt: u32) {
         let run_id = run_id.to_owned();
         let step_id = step_id.to_owned();
@@ -291,6 +294,10 @@ impl Observer for PythonObserver {
         .ok();
     }
 
+    /// Call the Python `on_workflow_step_result(run_id, step_id, attempt,
+    /// error_code)` hook on a blocking thread holding the GIL. `error_code` is
+    /// the stable Wyrd code of a failed attempt and `None` for success; no
+    /// payload crosses the bridge. A raised Python exception is swallowed.
     async fn on_workflow_step_result(
         &self,
         run_id: &str,
@@ -315,6 +322,10 @@ impl Observer for PythonObserver {
         .ok();
     }
 
+    /// Call the Python `on_workflow_step_backoff(run_id, step_id,
+    /// next_attempt, delay_ms)` hook on a blocking thread holding the GIL.
+    /// `delay` crosses as whole milliseconds, saturating at `u64::MAX`. A
+    /// raised Python exception is swallowed.
     async fn on_workflow_step_backoff(
         &self,
         run_id: &str,

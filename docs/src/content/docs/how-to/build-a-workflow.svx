@@ -16,7 +16,7 @@ Dependencies only order steps. Data moves through explicit declarations:
 - `with_step_inputs(step_id, ...)` binds each unresolved Prompt variable of a step to `input.<name>`, a dependency's `steps.<id>.output.text`, or `steps.<id>.output.structured[.<field>...]`.
 - `with_outputs` names the values the run returns.
 
-Step ids are the Agent names. A step whose Prompt variable has no binding, or a binding that names a step the step does not depend on, fails validation before any model call.
+Step ids are derived deterministically from Agent names: characters outside `[A-Za-z0-9_]` become `_`, a name that does not start with a letter or `_` gains a leading `_`, an unnamed Agent becomes `step_<n>` for its position, and a repeated id gains a `_2`, `_3`, ... suffix. When an Agent name is not already a unique valid identifier, read the assigned ids from `Workflow.steps` before binding step inputs. A step whose Prompt variable has no binding, or a binding that names a step the step does not depend on, fails validation before any model call.
 
 ## Author
 

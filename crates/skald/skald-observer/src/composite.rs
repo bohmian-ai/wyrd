@@ -141,12 +141,17 @@ impl Observer for CompositeObserver {
         }
     }
 
+    /// Forward attempt start (`attempt` counts from 1) to every observer in
+    /// registration order, awaiting each before the next.
     async fn on_workflow_step_attempt(&self, run_id: &str, step_id: &str, attempt: u32) {
         for obs in &self.0 {
             obs.on_workflow_step_attempt(run_id, step_id, attempt).await;
         }
     }
 
+    /// Forward an attempt result to every observer in registration order,
+    /// awaiting each before the next. `error_code` is the stable Wyrd code of
+    /// a failed attempt and `None` for success; no payload is forwarded.
     async fn on_workflow_step_result(
         &self,
         run_id: &str,
@@ -160,6 +165,8 @@ impl Observer for CompositeObserver {
         }
     }
 
+    /// Forward a scheduled backoff of `delay` before `next_attempt` to every
+    /// observer in registration order, awaiting each before the next.
     async fn on_workflow_step_backoff(
         &self,
         run_id: &str,

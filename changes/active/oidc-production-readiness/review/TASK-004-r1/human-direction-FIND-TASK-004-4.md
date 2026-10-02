@@ -31,3 +31,15 @@ REQ-012's "user-protected credential store" is satisfied as below.
   refresh token, store what the server returns, use it. The client does not
   decode the renewed access token to compare its tenant; the server already
   binds a refresh token to its login. Delete that check and its test.
+
+## Addendum: standard practice (spec revision 8, same date)
+
+Spec revision 8 supersedes the "Renewal and logout keep their required
+semantics" bullet above. Drop `RefreshPending`, the durable generation and
+per-request revalidation, the `LoggedOut` tombstone, the custom lock deadline
+and `lock_timeout` error, and the per-login `format_version`. Keep the plain
+blocking lock, atomic replace, 0600 fail-closed file checks, and preservation
+of the user's other content. Default to the most recent login for a server
+when no `tenant` is given. Replace the custom CLI handoff (TASK-002 server
+handoff rows and claim polling included) with the RFC 8628 device-code grant;
+the browser handoff is unchanged.

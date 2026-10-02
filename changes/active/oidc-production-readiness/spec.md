@@ -1,6 +1,6 @@
 ---
 id: SPEC-oidc-production-readiness
-revision: 7
+revision: 8
 status: approved
 ---
 
@@ -143,23 +143,28 @@ authentication.
 
 - **REQ-011**: `wyrd auth login` for a human opens the system browser and
   completes the tenant's SSO flow without pasting a callback URL or printing
-  access or refresh tokens. The CLI obtains the Wyrd user credential through
-  a short-lived, one-time handoff bound to the initiated login and a
-  CLI-held secret; an absent, wrong, expired, or replayed claim returns no
-  credential. Neither the provider authorization code nor a Wyrd token is
-  put in a redirect URL. A second IdP application registration is not
-  required solely for CLI use.
+  access or refresh tokens. The CLI uses the OAuth 2.0 Device Authorization
+  Grant (RFC 8628) with Wyrd as the authorization server: it shows a user
+  code and opens the verification URL, the person signs in through the
+  tenant's normal browser login and approves that code, and the CLI polls
+  Wyrd's token endpoint for the Wyrd user credential. A wrong, expired,
+  denied, or already-redeemed device code returns no credential. Neither the
+  provider authorization code nor a Wyrd token is put in a redirect URL. A
+  second IdP application registration is not required solely for CLI use.
 - **REQ-012**: The CLI stores the renewable Wyrd user credential in a
   user-protected credential store with tenant and server identity. Rust,
   Python, and TypeScript clients resolve it through the shared client and
   renew short-lived Wyrd access tokens automatically without contacting the
   IdP on routine API calls. An explicitly supplied credential overrides the
-  saved user credential. With multiple saved logins, a client uses only the
-  login selected for its intended server and tenant; ambiguous selection
-  fails rather than choosing another tenant. Concurrent local clients sharing
-  a saved login must not replay a rotated refresh token or overwrite newer
-  renewal state. If renewal cannot be completed safely, access fails and the
-  user can log in again. A user can log out or revoke the saved session.
+  saved user credential. With multiple saved logins for one server, the
+  `tenant` key selects one; without it, the most recent login for that server
+  is used. Local clients sharing a saved login refresh under an exclusive file
+  lock and reread the file first, so they reuse a token another client just
+  saved instead of replaying its predecessor. A refused refresh asks the user
+  to log in again; a client that crashes between the server's rotation and
+  the local save replays the old token on retry, which the server's reuse
+  detection treats as theft. Logout deletes the saved login locally, then
+  revokes it on the server best-effort and warns if revocation fails.
 - **REQ-013**: A deployed Service or Agent uses its own scoped Wyrd API key by
   default. Where the deployment chooses workload federation, Wyrd accepts a
   verified, audience-bound platform assertion only through the existing
@@ -292,7 +297,8 @@ The initial SCIM delivery excludes using SCIM as an authentication mechanism.
    authority for one server and tenant. The browser session and provider
    tokens are not SDK credentials; deployed workloads use their own identity.
 7. A completed OIDC callback hands Wyrd credentials to its initiating browser
-   or CLI through one server-owned, encrypted, expiring, single-use handoff.
+   through one server-owned, encrypted, expiring, single-use handoff. The CLI
+   receives its credential only through the RFC 8628 device-code grant.
    The deployment keyring protects recoverable provider and Wyrd session
    credentials in both self-hosted and hosted deployments; the number of
    tenants does not select a different secret-storage or login path.
@@ -322,9 +328,9 @@ The initial SCIM delivery excludes using SCIM as an authentication mechanism.
 - **AC-004**: Rust, Python, and TypeScript client journeys use a credential
   established by the interactive CLI path without manual token paste, renew
   it without a repeat IdP visit, and reject an expired or revoked credential.
-  Journeys prove explicit credential precedence, unambiguous selection among
-  saved logins for different tenants on one server, and safe renewal when
-  concurrent local clients share one login. The browser receives no provider
+  Journeys prove explicit credential precedence, `tenant` selection and the
+  most-recent-login default among saved logins on one server, and that
+  concurrent local clients sharing one login do not replay a rotated token. The browser receives no provider
   secret or Wyrd token in page data or redirect URLs.
 - **AC-005**: Machine journeys prove an API-key Service or Agent continues
   operating with human SSO enabled and that an opted-in workload assertion
@@ -343,8 +349,8 @@ The initial SCIM delivery excludes using SCIM as an authentication mechanism.
   failure, mapping changes, provider key and secret rotation, absent or
   rotated sealing keys, and BFF session behavior across two serving replicas.
   A missing or wrong browser-flow binding, unauthorized BFF caller, missing or
-  wrong CLI handoff secret, expired handoff, or second redemption yields no
-  Wyrd credential or browser session. An unmapped but valid provider subject
+  wrong, expired, denied, or already-redeemed device code yields no Wyrd
+  credential or browser session. An unmapped but valid provider subject
   receives a tenant `User` without privileged grants, and an old-connection
   BFF session cannot renew after replacement or removal.
 - **AC-008**: Provider qualification uses controlled Okta, Keycloak, and
@@ -379,6 +385,17 @@ TASK-001–005 until this draft is approved; TASK-006/007 are proposed only.
 
 ## Revision history
 
+- **Revision 8 — 2026-10-02 — approved**: Approved by Steven Forrester under
+  his standing direction that Wyrd does what comparable CLIs and SDKs do. CLI
+  login uses the RFC 8628 device-code grant (as gh and aws sso do), replacing
+  the custom polled browser/CLI handoff. Saved-login renewal and logout match
+  gh, gcloud, and aws: refresh under a file lock and save the result, ask for
+  a new login on refusal, use the most recent login when no `tenant` is
+  given, and on logout delete locally then revoke best-effort. Removed the
+  refresh-pending marker, per-request generation revalidation, logged-out
+  tombstone, custom lock deadline, and per-login format version. Accepted
+  consequence: a crash between rotation and save makes the retry look like
+  refresh-token reuse, which revokes that User's refresh tokens.
 - **Revision 7 — 2026-10-01 — approved**: Approved by Steven Forrester.
   Connection testing completes one real interactive sign-in and never infers
   provider health from side-effect probes (`prompt=none` redirect or

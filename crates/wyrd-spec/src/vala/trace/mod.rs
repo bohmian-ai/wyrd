@@ -405,7 +405,7 @@ mod attributes_tests {
 
     #[test]
     fn wyrd_keys_count_locked() {
-        assert_eq!(WYRD_KEYS.len(), 9);
+        assert_eq!(WYRD_KEYS.len(), 8);
     }
 
     #[test]

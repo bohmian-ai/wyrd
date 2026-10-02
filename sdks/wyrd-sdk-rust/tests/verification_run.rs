@@ -4,7 +4,10 @@
 //! served binding ID through Cards, then acts as the Service itself: reads the
 //! binding status, starts a keyed manual run, replays it, and reads the run
 //! back. Negative flows cover a reused key with a different body, an invalid
-//! window, and a credential without `evals:run`.
+//! window, and a credential without `evals:run`. Registration accepts
+//! `kind: Verifier` with `implementation.kind: drift` and `eval`, and refuses
+//! the retired `kind: Drift` and `kind: Eval` Cards before they reach the
+//! server.
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +39,62 @@ fn write_bound_service(root: &Path) -> (PathBuf, PathBuf) {
     )
     .expect("service card writes");
     (verifier, service)
+}
+
+/// Prove `Cards::register_from_path` accepts an Eval `kind: Verifier` and
+/// refuses the retired `kind: Drift` and `kind: Eval` Cards.
+///
+/// Each retired Card fails with the registry's stable invalid-spec code
+/// carrying the loader's envelope diagnostic, and no Card of that name is
+/// readable afterwards.
+///
+/// # Panics
+/// Panics when a fixture cannot be written, the Eval Verifier does not
+/// register, or a retired Card registers, refuses with another code, or is
+/// readable.
+async fn assert_verifier_kind_contract(cards: &Cards, root: &Path) {
+    let eval = root.join("eval-verifier.yaml");
+    std::fs::write(
+        &eval,
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: rust-run-eval\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: eval\n    spec:\n      tasks: {}\n",
+    )
+    .expect("eval verifier card writes");
+    Box::pin(cards.register_from_path(&eval))
+        .await
+        .expect("an Eval kind: Verifier registers");
+    for kind in ["Drift", "Eval"] {
+        let name = format!("rust-retired-{}", kind.to_lowercase());
+        let path = root.join(format!("{name}.yaml"));
+        std::fs::write(
+            &path,
+            format!(
+                "apiVersion: wyrd/v1\nkind: {kind}\nmetadata:\n  name: {name}\n  version: 1.0.0\n  space: default\nspec: {{}}\n"
+            ),
+        )
+        .expect("retired card writes");
+        let refused = Box::pin(cards.register_from_path(&path))
+            .await
+            .expect_err("a retired Card kind is refused");
+        assert_eq!(
+            refused.code(),
+            "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+            "{kind}: {refused:?}"
+        );
+        assert!(
+            format!("{refused:?}").contains("WYRD_LOADER_400_INVALID_ENVELOPE"),
+            "{kind}: the loader diagnostic travels with the refusal: {refused:?}"
+        );
+        let selector = CardSelector::exact(
+            serde_json::from_value(json!({
+                "kind": "Verifier", "name": name, "version": "1.0.0", "space": "default"
+            }))
+            .expect("reference matches the wire contract"),
+        );
+        cards
+            .get(selector)
+            .await
+            .expect_err("no Card of the retired kind's name was registered");
+    }
 }
 
 /// Unwrap a machine bootstrap into its raw API key.
@@ -93,6 +152,7 @@ async fn starts_a_keyed_manual_run_and_reads_its_status() {
     let receipt = Box::pin(cards.register_from_path(&service))
         .await
         .expect("service registers");
+    assert_verifier_kind_contract(&cards, root.path()).await;
     let binding_id = cards
         .get(CardSelector::exact(receipt.root.clone()))
         .await

@@ -294,16 +294,25 @@ impl DelegateToken {
 /// Validate the exchange identity and build its actor chain, earliest first.
 ///
 /// The actor must present a direct token for a Card-bound Service or Agent,
-/// and must not be the subject itself; the subject's earlier actors precede
-/// the new actor in the chain.
+/// and must not be the subject itself; the subject must not be the internal
+/// SYSTEM writer, which takes part in no delegation or impersonation flow and
+/// can never hold a delegated tenant token. The subject's earlier actors
+/// precede the new actor in the chain.
 ///
 /// # Errors
-/// Returns [`DelegateError::MalformedIdentity`] for a delegated actor token,
-/// an actor without a Service or Agent Card, or a self-exchange.
+/// Returns [`DelegateError::MalformedIdentity`] for a SYSTEM subject, a
+/// delegated actor token, an actor without a Service or Agent Card, or a
+/// self-exchange.
 fn delegation_chain(
     subject: &VerifiedToken,
     actor: &VerifiedToken,
 ) -> Result<Vec<DelegationStep>, DelegateError> {
+    if matches!(
+        subject.principal.kind,
+        wyrd_runtime::PrincipalKind::System { .. }
+    ) {
+        return Err(DelegateError::MalformedIdentity("subject_is_system"));
+    }
     if !actor.delegation_chain.is_empty() {
         return Err(DelegateError::MalformedIdentity("actor_token_is_delegated"));
     }

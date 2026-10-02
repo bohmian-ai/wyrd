@@ -802,7 +802,9 @@ impl AccessTokenClaims {
     /// delegation chain; the permissions are exactly one fixed purpose —
     /// `bifrost_record:write` for result publication, or one
     /// [`Permission::drift_table_read`] for the Drift observation read, never
-    /// both; and the scope is exactly one UID-bearing Verifier Card.
+    /// both; the scope is exactly one UID-bearing Verifier Card; and the
+    /// tenant is a customer tenant, never `SYSTEM_OWNER`, because each SYSTEM
+    /// principal is provisioned inside the one tenant whose results it writes.
     ///
     /// # Errors
     /// Returns [`AuthError::InvalidToken`] when any of those conditions fails.
@@ -810,6 +812,7 @@ impl AccessTokenClaims {
         let principal = &self.principal;
         let scope = principal.card_ref_scope.as_slice();
         let conforms = principal.id.as_uuid().get_version_num() == 7
+            && principal.tenant_id != DataTenantId::SYSTEM_OWNER
             && self.sub == principal.id.to_string()
             && principal.card_ref.is_none()
             && self.roles.is_empty()
@@ -2035,6 +2038,16 @@ mod tests {
                 "delegation chain",
                 AccessTokenClaims {
                     act: Some(Box::new(act_chain(1))),
+                    ..base.clone()
+                },
+            ),
+            (
+                "system-owner tenant",
+                AccessTokenClaims {
+                    principal: TokenPrincipalRef {
+                        tenant_id: DataTenantId::SYSTEM_OWNER,
+                        ..base.principal.clone()
+                    },
                     ..base.clone()
                 },
             ),

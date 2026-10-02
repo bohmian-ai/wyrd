@@ -1,11 +1,12 @@
 //! Verification control-plane routes through the authenticated HTTP surface.
 //!
 //! Drives `GET /v1/verification/bindings/{id}`, `POST /v1/verification/runs`,
-//! and `GET /v1/verification/runs/{id}` against the in-process server and the
+//! `GET /v1/verification/runs/{id}`, and `POST /v1/verification/execute` against the in-process server and the
 //! repository-managed Postgres: durable enqueue with requester identity,
 //! Idempotency-Key replay and conflict, every refusal before enqueue, the
 //! audited allow and deny decisions, and tenant isolation. No runtime executes
-//! the runs, so every enqueued run stays `pending`. It also proves the
+//! the runs, so every enqueued run stays `pending`; direct executions judge
+//! inline and never enqueue. It also proves the
 //! tenant's internal SYSTEM result writer is unreachable through the public
 //! principal and credential routes.
 
@@ -935,5 +936,574 @@ async fn system_writer_token_is_refused_by_every_public_token_grant() {
         before,
         "no token grant changed or credentialed the SYSTEM writer"
     );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A PSI Drift Verifier spec over the numeric feature `score`.
+fn psi_spec() -> Value {
+    json!({ "implementation": { "kind": "drift", "spec": {
+        "method": "Psi",
+        "signal": { "kind": "Distribution",
+                    "baseline_ref": { "kind": "Data", "name": "vx-psi-baseline", "version": "1.0.0" },
+                    "features": ["score"] },
+        "condition": { "kind": "Statistical" },
+        "profile": { "kind": "Psi",
+                     "binning_strategy": { "kind": "EqualWidth", "n_bins": 10 },
+                     "threshold": { "kind": "Fixed", "value": 0.25 } }
+    } } })
+}
+
+/// The serialized PSI fit of `score` uniformly spread over `0..1000`.
+///
+/// # Panics
+/// Panics when the spec does not decode or the fit fails.
+fn psi_fitted() -> Value {
+    let spec: wyrd_spec::card::drift::DriftSpec =
+        serde_json::from_value(psi_spec()["implementation"]["spec"].clone())
+            .expect("PSI spec decodes");
+    let values: Vec<f64> = (0..1000).map(f64::from).collect();
+    let batch = arrow::record_batch::RecordBatch::try_from_iter([(
+        "score",
+        std::sync::Arc::new(arrow::array::Float64Array::from(values)) as arrow::array::ArrayRef,
+    )])
+    .expect("fit batch builds");
+    serde_json::to_value(vala_drift::fit_baseline(&batch, &spec).expect("PSI fits"))
+        .expect("fit serializes")
+}
+
+/// An Eval Verifier spec with one gated `is_not_null` assertion on `$.x`.
+fn eval_assertion_spec() -> Value {
+    json!({ "implementation": { "kind": "eval", "spec": {
+        "pass_gate": { "kind": "all_pass" },
+        "tasks": { "a": { "kind": "assertion", "id": "a", "context_path": "$.x",
+                          "operator": "is_not_null", "expected": null } }
+    } } })
+}
+
+/// A direct execution body judging `subject` with `verifier` over `input`.
+fn execute_body(verifier: &CardUid, subject: &CardUid, input: Value) -> Value {
+    json!({ "verifier_uid": verifier, "subject_card_uid": subject, "input": input })
+}
+
+/// `drift_samples` input of one numeric column.
+fn samples(column: &str, values: &[f64]) -> Value {
+    json!({ "kind": "drift_samples", "columns": { column: values } })
+}
+
+/// POST one raw direct execution body as `jwt`.
+///
+/// # Panics
+/// Panics when the request cannot be built or the route fails to respond.
+async fn post_execute(server: &WyrdTestServer, jwt: &str, body: String) -> (StatusCode, Value) {
+    let response = server
+        .oneshot_authenticated(
+            jwt,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/verification/execute")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("execute request builds"),
+        )
+        .await
+        .expect("execute request responds");
+    decoded(response).await
+}
+
+/// The direct execution targets of one tenant.
+struct Direct {
+    /// Subject Service every execution judges.
+    service: CardUid,
+    /// Custom Drift Verifier on `latency` with baseline 100 and threshold 10.
+    custom: CardUid,
+    /// PSI Verifier with a ready current-format baseline.
+    psi: CardUid,
+    /// PSI Verifier whose baseline was fitted before the format field.
+    legacy: CardUid,
+    /// PSI Verifier with no fitted baseline.
+    unfitted: CardUid,
+    /// Eval Verifier with one context assertion.
+    eval: CardUid,
+    /// Eval Verifier with a trace assertion direct execution cannot run.
+    traced: CardUid,
+}
+
+impl Direct {
+    /// Seed every direct target in the server's tenant.
+    ///
+    /// # Panics
+    /// Panics when any fixture write fails.
+    async fn seed(server: &WyrdTestServer) -> Self {
+        let tenant = server.data_tenant_id();
+        let fixture = server
+            .verification_fixture()
+            .await
+            .expect("verification fixture provisions");
+        let mut legacy_fit = psi_fitted();
+        legacy_fit["Psi"]
+            .as_object_mut()
+            .expect("PSI fit is an object")
+            .remove("format");
+        Self {
+            service: seed_card(server, tenant, "Service", "vx-service", json!({})).await,
+            custom: fixture
+                .custom_drift_verifier("vx-custom", "latency", 100.0, 10.0)
+                .await
+                .expect("Custom Verifier registers"),
+            psi: fixture
+                .fitted_verifier("vx-psi", &psi_spec(), &psi_fitted())
+                .await
+                .expect("fitted PSI Verifier registers"),
+            legacy: fixture
+                .fitted_verifier("vx-legacy", &psi_spec(), &legacy_fit)
+                .await
+                .expect("legacy PSI Verifier registers"),
+            unfitted: fixture
+                .verifier("vx-unfitted", &psi_spec())
+                .await
+                .expect("unfitted PSI Verifier registers"),
+            eval: fixture
+                .verifier("vx-eval", &eval_assertion_spec())
+                .await
+                .expect("Eval Verifier registers"),
+            traced: fixture
+                .verifier(
+                    "vx-traced",
+                    &json!({ "implementation": { "kind": "eval", "spec": { "tasks": {
+                        "t": { "kind": "trace_assertion", "id": "t", "span_selector": "$.spans[0].name",
+                               "operator": "equals", "expected": "x" } } } } }),
+                )
+                .await
+                .expect("traced Eval Verifier registers"),
+        }
+    }
+}
+
+/// Direct execution judges Custom and PSI Drift samples and an Eval record
+/// inline, returning the exact identities, verdict, counts, and detail;
+/// unscoreable (null) samples are `inconclusive`. Nothing is enqueued and each
+/// request audits exactly one allowed `evals:run` decision.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any verdict, identity, run count, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_judges_inline_without_runs() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let direct = Direct::seed(&server).await;
+    let (caller, jwt) = user(&server, "vx-writer", &["writer"]).await;
+
+    let spread: Vec<f64> = (0..1000).map(f64::from).collect();
+    let skewed = vec![990.0; 500];
+    let cases = [
+        (
+            direct.custom.clone(),
+            samples("latency", &[101.0, 99.0]),
+            "passed",
+            "drift",
+        ),
+        (
+            direct.custom.clone(),
+            samples("latency", &[150.0]),
+            "failed",
+            "drift",
+        ),
+        (
+            direct.psi.clone(),
+            samples("score", &spread),
+            "passed",
+            "drift",
+        ),
+        (
+            direct.psi.clone(),
+            samples("score", &skewed),
+            "failed",
+            "drift",
+        ),
+        (
+            direct.psi.clone(),
+            json!({ "kind": "drift_samples", "columns": { "score": [1.0, null] } }),
+            "inconclusive",
+            "drift",
+        ),
+        (
+            direct.eval.clone(),
+            json!({ "kind": "eval_record", "context": { "x": 1 } }),
+            "passed",
+            "eval",
+        ),
+        (
+            direct.eval.clone(),
+            json!({ "kind": "eval_record", "context": { "x": null } }),
+            "failed",
+            "eval",
+        ),
+    ];
+    let requests = cases.len();
+    for (verifier, input, verdict, kind) in cases {
+        let body = execute_body(&verifier, &direct.service, input);
+        let (status, response) = post_execute(&server, &jwt, body.to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{body} -> {response}");
+        assert_eq!(response["verdict"], verdict, "{body} -> {response}");
+        assert_eq!(response["verifier"]["uid"], verifier.to_string());
+        assert_eq!(response["subject"]["uid"], direct.service.to_string());
+        assert_eq!(
+            response["detail"].as_object().map(|d| d.contains_key(kind)),
+            Some(true)
+        );
+        assert!(response["execution_id"].is_string());
+        assert!(response["summary"].is_string());
+    }
+    assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
+    let decisions = decisions(&server, "verification.execute", caller).await;
+    assert_eq!(decisions.len(), requests, "one decision per request");
+    assert!(
+        decisions
+            .iter()
+            .all(|decision| decision == &("evals:run".to_owned(), "allowed".to_owned()))
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Malformed, oversized, unknown, unready, legacy, incompatible, and
+/// unsupported executions are refused with stable codes, and a caller without
+/// `evals:run` or without scope over the subject is refused with one audited
+/// denial; nothing is ever enqueued.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, a route fails
+/// to respond, or any status, code, run count, or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_refusals_are_stable() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let direct = Direct::seed(&server).await;
+    let (_, jwt) = user(&server, "vx-refused-writer", &["writer"]).await;
+    let service = &direct.service;
+    let record = json!({ "kind": "eval_record", "context": { "x": 1 } });
+    let wide: serde_json::Map<String, Value> =
+        (0..65).map(|i| (format!("c{i}"), json!([1.0]))).collect();
+
+    let cases = [
+        (
+            "{".to_owned(),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            json!({ "verifier_uid": direct.custom, "subject_card_uid": service,
+                    "input": samples("latency", &[1.0]), "x": 1 })
+            .to_string(),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            execute_body(
+                &direct.custom,
+                service,
+                json!({ "kind": "drift_samples", "columns": { "latency": [1.0, "a"] } }),
+            )
+            .to_string(),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VERIFICATION_400_INPUT_INVALID",
+        ),
+        (
+            " ".repeat(1024 * 1024 + 1),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+        (
+            execute_body(
+                &direct.eval,
+                service,
+                json!({ "kind": "eval_record",
+                "context": { "x": "a".repeat(256 * 1024) } }),
+            )
+            .to_string(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+        (
+            execute_body(
+                &direct.custom,
+                service,
+                json!({ "kind": "drift_samples", "columns": wide }),
+            )
+            .to_string(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        ),
+        (
+            execute_body(
+                &CardUid::from_uuid(Uuid::now_v7()).expect("UID is valid"),
+                service,
+                record.clone(),
+            )
+            .to_string(),
+            StatusCode::NOT_FOUND,
+            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+        ),
+        (
+            execute_body(service, service, record.clone()).to_string(),
+            StatusCode::NOT_FOUND,
+            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+        ),
+        (
+            execute_body(&direct.unfitted, service, samples("score", &[1.0])).to_string(),
+            StatusCode::CONFLICT,
+            "WYRD_VERIFICATION_409_BASELINE_NOT_READY",
+        ),
+        (
+            execute_body(&direct.legacy, service, samples("score", &[1.0])).to_string(),
+            StatusCode::CONFLICT,
+            "WYRD_VERIFICATION_409_BASELINE_LEGACY",
+        ),
+        (
+            execute_body(&direct.custom, service, record.clone()).to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
+        ),
+        (
+            execute_body(&direct.psi, service, samples("other", &[1.0])).to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
+        ),
+        (
+            execute_body(
+                &direct.eval,
+                service,
+                json!({ "kind": "eval_record", "context": { "y": 1 } }),
+            )
+            .to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
+        ),
+        (
+            execute_body(&direct.traced, service, record.clone()).to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
+        ),
+    ];
+    for (body, status, code) in cases {
+        let (actual, problem) = post_execute(&server, &jwt, body.clone()).await;
+        assert_eq!(
+            (actual, problem["code"].as_str()),
+            (status, Some(code)),
+            "{} -> {problem}",
+            &body[..body.len().min(200)]
+        );
+    }
+
+    let allowed = execute_body(&direct.eval, service, record).to_string();
+    let (reader, reader_jwt) = user(&server, "vx-reader", &["reader"]).await;
+    let (status, problem) = post_execute(&server, &reader_jwt, allowed.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(
+        decisions(&server, "verification.execute", reader).await,
+        vec![("evals:run".to_owned(), "denied".to_owned())]
+    );
+    let machine = server
+        .bootstrap_service("vx-foreign-service", &["writer"])
+        .await
+        .expect("card-bound service bootstraps");
+    let machine_token = machine_jwt(&server, &machine).await;
+    let (status, problem) = post_execute(&server, &machine_token, allowed).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(
+        decisions(&server, "verification.execute", machine.id().as_uuid()).await,
+        vec![("evals:run".to_owned(), "denied".to_owned())]
+    );
+    assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A direct execution whose decision cannot be audited is refused with the
+/// stable audit code before any engine work, on both the allowed and the
+/// Card-scope denied path, and leaves no decision row behind.
+///
+/// # Panics
+/// Panics when the server fails to start, a fixture write fails, the failure
+/// trigger cannot be installed, a route fails to respond, or any status, code,
+/// or audit expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_fails_closed_when_audit_fails() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let direct = Direct::seed(&server).await;
+    let (caller, jwt) = user(&server, "vx-audit-writer", &["writer"]).await;
+    let machine = server
+        .bootstrap_service("vx-audit-foreign-service", &["writer"])
+        .await
+        .expect("card-bound service bootstraps");
+    let machine_token = machine_jwt(&server, &machine).await;
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    // Every decision of the user fails, but only denials of the machine: a
+    // failed scope denial must never fall back to recording an allowance.
+    let function = format!(
+        r#"CREATE OR REPLACE FUNCTION vala.test_fail_execute_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'verification.execute'
+                AND (NEW.outcome = 'denied' OR NEW.principal_id = '{caller}') THEN
+               RAISE EXCEPTION 'injected execute audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;"#
+    );
+    for statement in [
+        function,
+        r#"CREATE TRIGGER test_fail_execute_audit
+           BEFORE INSERT ON vala.audit_staging
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_execute_audit()"#
+            .to_owned(),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&superuser)
+            .await
+            .expect("failure trigger installs");
+    }
+
+    let body = execute_body(
+        &direct.eval,
+        &direct.service,
+        json!({ "kind": "eval_record", "context": { "x": 1 } }),
+    )
+    .to_string();
+    for (principal, token) in [(caller, &jwt), (machine.id().as_uuid(), &machine_token)] {
+        let (status, problem) = post_execute(&server, token, body.clone()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{problem}");
+        assert_eq!(problem["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
+        assert!(
+            decisions(&server, "verification.execute", principal)
+                .await
+                .is_empty()
+        );
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// An Eval Verifier whose one gated task asks an inline OpenAI judge to grade
+/// `$.answer`, with no task-level retries.
+///
+/// # Panics
+/// Panics when the judge prompt cannot be built.
+fn judge_spec() -> Value {
+    let prompt = skald_prompt::openai_chat(
+        "gpt-test",
+        skald_prompt::OpenAiChatOptions {
+            messages: vec!["Grade the answer ${answer}.".to_owned()],
+            variables: vec!["answer".to_owned()],
+            output: Some(
+                skald_prompt::ResponseFormat::json_schema(
+                    "judge_result",
+                    json!({
+                        "type": "object",
+                        "properties": { "passed": { "type": "boolean" } },
+                        "required": ["passed"],
+                        "additionalProperties": false
+                    }),
+                )
+                .expect("the judge response format builds"),
+            ),
+            ..skald_prompt::OpenAiChatOptions::default()
+        },
+    )
+    .expect("the judge prompt builds");
+    json!({ "implementation": { "kind": "eval", "spec": {
+        "pass_gate": { "kind": "all_pass" },
+        "tasks": { "judge": {
+            "kind": "llm_judge", "id": "judge",
+            "judge_ref": { "prompt": prompt.into_native(), "tool_names": [],
+                           "run_config": { "max_iterations": 1 } },
+            "context_path": "$.answer", "operator": "equals",
+            "expected": { "passed": true }, "max_retries": 0
+        } }
+    } } })
+}
+
+/// A direct Eval execution calls the configured judge provider and returns
+/// its graded verdict; when the provider fails, the execution is refused with
+/// the stable dependency code and no provider detail.
+///
+/// # Panics
+/// Panics when the mock provider or server fails to start, a fixture write
+/// fails, a route fails to respond, or any status, verdict, or code
+/// expectation fails.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_execution_calls_the_judge_provider() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let provider = MockServer::start().await;
+    let server = WyrdTestServer::builder()
+        .with_gateway_provider_root_for_test(
+            url::Url::parse(&provider.uri()).expect("mock URL parses"),
+        )
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let service = seed_card(
+        &server,
+        server.data_tenant_id(),
+        "Service",
+        "vx-judged",
+        json!({}),
+    )
+    .await;
+    let judge = server
+        .verification_fixture()
+        .await
+        .expect("verification fixture provisions")
+        .verifier("vx-judge", &judge_spec())
+        .await
+        .expect("judge Verifier registers");
+    let (_, jwt) = user(&server, "vx-judge-writer", &["writer"]).await;
+    let body = execute_body(
+        &judge,
+        &service,
+        json!({ "kind": "eval_record", "context": { "answer": "yes" } }),
+    )
+    .to_string();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl_direct", "object": "chat.completion", "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{ "index": 0, "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
+        })))
+        .expect(1)
+        .mount(&provider)
+        .await;
+    let (status, response) = post_execute(&server, &jwt, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["verdict"], "passed", "{response}");
+    provider.verify().await;
+
+    provider.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": { "message": "provider-secret-detail", "type": "server_error" }
+        })))
+        .mount(&provider)
+        .await;
+    let (status, problem) = post_execute(&server, &jwt, body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{problem}");
+    assert_eq!(problem["code"], "WYRD_VERIFICATION_502_DEPENDENCY_FAILED");
+    assert!(!problem.to_string().contains("provider-secret-detail"));
     server.shutdown().await.expect("test server shuts down");
 }

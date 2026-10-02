@@ -25,10 +25,13 @@ use tracing::Instrument as _;
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 
 use vala_eval::orchestrator::{
-    AgentCardResolver, MediaResolver, PromptCardResolver, ScenarioScoring, SkaldJudgeInvoker,
+    AgentCardResolver, MediaResolver, OrchestratorError, PromptCardResolver, ScenarioScoring,
+    SkaldJudgeInvoker,
 };
 use vala_eval::sampling::RecordSample;
-use vala_eval::{EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings};
+use vala_eval::{
+    EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
+};
 use vala_sql::queries::olap_catalog::get_by_fqn;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
@@ -232,9 +235,7 @@ impl EvalEngine {
     /// Score `record` through the one Eval execution path and map its report.
     ///
     /// A trace that is still missing when a task needs it waits; every other
-    /// execution error retries and never becomes a failed assertion. Plan
-    /// construction is the `prepare` phase and every judge invocation is a
-    /// wait on `telemetry`.
+    /// execution error retries and never becomes a failed assertion.
     async fn score(
         &self,
         tenant: DataTenantId,
@@ -244,6 +245,60 @@ impl EvalEngine {
         traces: InMemoryTraceSource,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
+        let run_id = run.lease.run_id;
+        let eval_run = RunId::from_string(run_id.to_string());
+        match self
+            .judge_record(tenant, eval_run, spec, record, traces, telemetry)
+            .await
+        {
+            Ok(report) => EngineOutcome::Completed(report),
+            Err(ScoreFailure::Plan(error)) => terminal(failed(
+                run_id,
+                SPEC_INVALID,
+                "the Eval spec cannot be planned",
+                &error,
+            )),
+            Err(ScoreFailure::Execute(error)) if error.awaits_trace() => {
+                EngineOutcome::AwaitingTrace(failure(
+                    AWAITING_TRACE,
+                    "the record's trace has not landed",
+                ))
+            }
+            Err(ScoreFailure::Execute(error)) => EngineOutcome::Retry(failed(
+                run_id,
+                EXECUTION_FAILED,
+                "the Eval tasks cannot be executed",
+                &error,
+            )),
+            Err(ScoreFailure::Capture(error)) => EngineOutcome::Retry(failed(
+                run_id,
+                EXECUTION_FAILED,
+                "the Eval report cannot be captured",
+                &error,
+            )),
+        }
+    }
+
+    /// Score one `record` of `tenant` under `spec` and map its report.
+    ///
+    /// The one Eval execution path of queued runs and direct execution: it
+    /// judges through the production Skald invoker over the tenant's registry
+    /// and media, with `traces` as the only trace source. Plan construction
+    /// is the `prepare` phase and every judge invocation is a wait on
+    /// `telemetry`.
+    ///
+    /// # Errors
+    /// Returns [`ScoreFailure`] naming whether planning, task execution, or
+    /// context capture failed.
+    pub async fn judge_record(
+        &self,
+        tenant: DataTenantId,
+        eval_run: RunId,
+        spec: &EvalSpec,
+        record: &EvalRecordObservation,
+        traces: InMemoryTraceSource,
+        telemetry: &ExecutionTelemetry,
+    ) -> Result<VerifierReport, ScoreFailure> {
         let registry = Arc::new(TenantRegistry {
             state: self.state.clone(),
             tenant,
@@ -262,7 +317,7 @@ impl EvalEngine {
             inner: judge,
             waits: telemetry.waits(),
         };
-        let planned = telemetry
+        let scoring = telemetry
             .prepare(async {
                 ScenarioScoring::new(
                     Arc::new(spec.clone()),
@@ -271,45 +326,26 @@ impl EvalEngine {
                     Duration::from_millis(READ_DEADLINE_MS),
                 )
             })
-            .await;
-        let scoring = match planned {
-            Ok(scoring) => scoring,
-            Err(error) => {
-                return terminal(failed(
-                    run.lease.run_id,
-                    SPEC_INVALID,
-                    "the Eval spec cannot be planned",
-                    &error,
-                ));
-            }
-        };
-        let eval_run = RunId::from_string(run.lease.run_id.to_string());
-        match scoring
+            .await
+            .map_err(ScoreFailure::Plan)?;
+        let report = scoring
             .score_record(eval_run, None, record)
             .instrument(tracing::info_span!("verification.score"))
             .await
-        {
-            Ok(report) => match VerifierReport::eval(report, spec) {
-                Ok(report) => EngineOutcome::Completed(report),
-                Err(error) => EngineOutcome::Retry(failed(
-                    run.lease.run_id,
-                    EXECUTION_FAILED,
-                    "the Eval report cannot be captured",
-                    &error,
-                )),
-            },
-            Err(error) if error.awaits_trace() => EngineOutcome::AwaitingTrace(failure(
-                AWAITING_TRACE,
-                "the record's trace has not landed",
-            )),
-            Err(error) => EngineOutcome::Retry(failed(
-                run.lease.run_id,
-                EXECUTION_FAILED,
-                "the Eval tasks cannot be executed",
-                &error,
-            )),
-        }
+            .map_err(ScoreFailure::Execute)?;
+        VerifierReport::eval(report, spec).map_err(ScoreFailure::Capture)
     }
+}
+
+/// Why scoring one Eval record produced no report.
+#[derive(Debug)]
+pub enum ScoreFailure {
+    /// The spec cannot be planned into stages.
+    Plan(OrchestratorError),
+    /// A task could not be executed, such as a judge that exhausted its retries.
+    Execute(EvalExecError),
+    /// An observed value could not be captured into the report.
+    Capture(EvalExecError),
 }
 
 /// Whether any task of `spec` asserts over the record's trace.

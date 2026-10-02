@@ -226,7 +226,6 @@ mod tests {
                     value: Some(AnyValue {
                         value: Some(any_value::Value::StringValue((*value).to_owned())),
                     }),
-                    ..KeyValue::default()
                 })
                 .collect(),
             ..Span::default()

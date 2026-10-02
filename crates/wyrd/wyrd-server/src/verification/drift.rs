@@ -652,7 +652,7 @@ pub struct DriftEngine {
     /// The one tenant token issuer the SYSTEM Drift reader is minted through.
     issuer: TenantTokenIssuer,
     /// Fitted baseline reads.
-    baselines: DriftBaselineQueue,
+    baselines: FittedBaselines,
     /// Deadline of one aggregate query.
     query_timeout: Duration,
 }
@@ -662,9 +662,9 @@ impl DriftEngine {
     #[must_use]
     pub fn new(state: AppState, issuer: TenantTokenIssuer, query_timeout: Duration) -> Self {
         Self {
+            baselines: FittedBaselines::new(state.clone()),
             state,
             issuer,
-            baselines: DriftBaselineQueue::default(),
             query_timeout,
         }
     }
@@ -742,8 +742,10 @@ impl DriftEngine {
             Some(DriftProfile::Psi(profile)) => {
                 let (baseline, sql) = telemetry
                     .prepare(async {
-                        let FittedBaseline::Psi(baseline) =
-                            self.fitted(tenant, &run.verifier_uid, telemetry).await?
+                        let FittedBaseline::Psi(baseline) = self
+                            .baselines
+                            .load(tenant, &run.verifier_uid, telemetry)
+                            .await?
                         else {
                             return Err(invalid(
                                 "the fitted baseline is not a PSI baseline".to_owned(),
@@ -761,8 +763,10 @@ impl DriftEngine {
             Some(DriftProfile::Spc(_)) => {
                 let (baseline, sql) = telemetry
                     .prepare(async {
-                        let FittedBaseline::Spc(baseline) =
-                            self.fitted(tenant, &run.verifier_uid, telemetry).await?
+                        let FittedBaseline::Spc(baseline) = self
+                            .baselines
+                            .load(tenant, &run.verifier_uid, telemetry)
+                            .await?
                         else {
                             return Err(invalid(
                                 "the fitted baseline is not an SPC baseline".to_owned(),
@@ -780,6 +784,29 @@ impl DriftEngine {
             None => Err(invalid("the Drift Verifier has no profile".to_owned())),
         }
     }
+}
+
+/// Loader of ready fitted Drift baselines.
+///
+/// Queued Drift runs and direct executions share it, so both refuse a missing
+/// or legacy baseline identically.
+#[derive(Clone)]
+pub struct FittedBaselines {
+    /// Server state owning the Wyrd Postgres registry.
+    state: AppState,
+    /// Fitted baseline reads.
+    queue: DriftBaselineQueue,
+}
+
+impl FittedBaselines {
+    /// Build a loader reading through `state`.
+    #[must_use]
+    pub fn new(state: AppState) -> Self {
+        Self {
+            state,
+            queue: DriftBaselineQueue::default(),
+        }
+    }
 
     /// Load the ready fitted baseline of `verifier_uid`.
     ///
@@ -792,7 +819,7 @@ impl DriftEngine {
     /// Retries a registry failure; terminates with [`BASELINE_NOT_READY`] when
     /// no baseline is ready, [`BASELINE_LEGACY`] for an earlier format, and
     /// [`DRIFT_INVALID`] when the stored profile does not decode.
-    async fn fitted(
+    pub async fn load(
         &self,
         tenant: DataTenantId,
         verifier_uid: &CardUid,
@@ -809,7 +836,7 @@ impl DriftEngine {
                     .tenant_conn(tenant)
                     .await
                     .map_err(|error| unavailable(&error))?;
-                self.baselines
+                self.queue
                     .fitted(&mut conn, verifier_uid)
                     .await
                     .map_err(|error| unavailable(&error))

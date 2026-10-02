@@ -31,7 +31,7 @@ use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::verification::{VerificationError, VerificationVerdict};
+use wyrd_spec::verification::{VerificationError, VerificationVerdict, VerifierKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verifier_runs::{
     ClaimedRun, RetryOutcome, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
@@ -48,7 +48,7 @@ use super::eval::EvalEngine;
 use super::health::RuntimeCapability;
 use super::publisher::ResultPublisher;
 use super::results::{ResultPayloadBuilder, ResultRun};
-use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase, VerifierKind};
+use super::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
 /// Stable error code when the exact Verifier Card cannot be loaded or is not
 /// a Verifier.

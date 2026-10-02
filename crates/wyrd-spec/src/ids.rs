@@ -369,6 +369,15 @@ uuid7_id_type!(
 );
 
 uuid7_id_type!(
+    /// Transient identity of one direct Verifier execution.
+    ///
+    /// `POST /v1/verification/execute` mints it per request. It appears only
+    /// in that response, the request's audit decision, and its trace; it is
+    /// never persisted and addresses nothing afterwards.
+    VerificationExecutionId
+);
+
+uuid7_id_type!(
     /// Durable identity of one Operator dispatch in `wyrd.operator_dispatches`.
     ///
     /// Settlement of a failed binding-created run mints one per distinct

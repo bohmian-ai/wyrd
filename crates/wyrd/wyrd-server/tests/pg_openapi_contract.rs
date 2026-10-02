@@ -891,18 +891,19 @@ async fn card_contract_publishes_typed_lifecycle_and_problem_shapes() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// The Verification surface is exactly three typed operations.
+/// The Verification surface is exactly four typed operations.
 ///
-/// Binding status, manual run request, and run status publish their typed
-/// request and response schemas, the manual request answers `202 Accepted`,
-/// and no result or other Verification operation is routed: verdicts are
-/// read from Bifrost by `result_id`.
+/// Binding status, manual run request, run status, and direct execution
+/// publish their typed request and response schemas, the manual request
+/// answers `202 Accepted`, direct execution answers `200` with its judgment
+/// and documents its stable refusals, and no result or other Verification
+/// operation is routed: queued verdicts are read from Bifrost by `result_id`.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop, or when a Verification path,
 /// method, status, or schema reference differs.
 #[tokio::test]
-async fn verification_contract_publishes_exactly_three_typed_operations() {
+async fn verification_contract_publishes_exactly_four_typed_operations() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -924,6 +925,7 @@ async fn verification_contract_publishes_exactly_three_typed_operations() {
         verification,
         BTreeSet::from([
             ("/v1/verification/bindings/{binding_id}", "get"),
+            ("/v1/verification/execute", "post"),
             ("/v1/verification/runs", "post"),
             ("/v1/verification/runs/{run_id}", "get"),
         ])
@@ -954,6 +956,27 @@ async fn verification_contract_publishes_exactly_three_typed_operations() {
     assert_eq!(
         schema_ref(&paths["/v1/verification/runs/{run_id}"]["get"], "200").as_deref(),
         Some("#/components/schemas/VerificationRunStatus")
+    );
+    let execute = &paths["/v1/verification/execute"]["post"];
+    assert_eq!(
+        execute["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ExecuteVerificationRequest"
+    );
+    assert_eq!(
+        schema_ref(execute, "200").as_deref(),
+        Some("#/components/schemas/ExecuteVerificationResponse")
+    );
+    let documented: BTreeSet<&str> = execute["responses"]
+        .as_object()
+        .expect("execute responses object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        ["400", "403", "404", "409", "413", "422", "502", "504"]
+            .iter()
+            .all(|status| documented.contains(status)),
+        "{documented:?}"
     );
 
     server.shutdown().await.expect("server shuts down");

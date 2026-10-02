@@ -17,9 +17,7 @@ use std::time::{Duration, Instant};
 
 use tracing::Instrument as _;
 
-use wyrd_spec::card::drift::DriftProfile;
-use wyrd_spec::card::verifier::VerifierImplementation;
-use wyrd_spec::vala::eval::EvalTask;
+use wyrd_spec::verification::VerifierKind;
 
 use crate::app::metrics::{
     VERIFICATION_ACTIVE_RUNS, VERIFICATION_ENGINE_OVERHEAD_SECONDS,
@@ -29,73 +27,6 @@ use crate::app::metrics::{
 
 /// One measured `[start, end)` interval on the process-monotonic clock.
 type Interval = (Instant, Instant);
-
-/// The closed `kind` dimension of every verification execution family.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerifierKind {
-    /// Drift with a PSI profile.
-    DriftPsi,
-    /// Drift with an SPC profile.
-    DriftSpc,
-    /// Drift with a Custom profile.
-    DriftCustom,
-    /// Eval whose every task is a record assertion.
-    EvalAssertion,
-    /// Eval with at least one LLM judge; judge presence wins over every other task.
-    EvalLlmJudge,
-    /// A supported non-judge Eval graph with trace or agent assertions.
-    EvalOther,
-    /// An execution whose exact spec could not be resolved or classified.
-    Unknown,
-}
-
-impl VerifierKind {
-    /// Classify `implementation` by its Drift profile or its Eval task graph.
-    ///
-    /// A Drift spec without a profile cannot be classified and is
-    /// [`Unknown`](Self::Unknown); an empty Eval graph is
-    /// [`EvalOther`](Self::EvalOther), never a claimed assertion workload.
-    #[must_use]
-    pub fn of(implementation: &VerifierImplementation) -> Self {
-        match implementation {
-            VerifierImplementation::Drift(spec) => match &spec.profile {
-                Some(DriftProfile::Psi(_)) => Self::DriftPsi,
-                Some(DriftProfile::Spc(_)) => Self::DriftSpc,
-                Some(DriftProfile::Custom(_)) => Self::DriftCustom,
-                None => Self::Unknown,
-            },
-            VerifierImplementation::Eval(spec) => {
-                let mut tasks = spec.tasks.values();
-                if tasks
-                    .clone()
-                    .any(|task| matches!(task, EvalTask::LlmJudge(_)))
-                {
-                    Self::EvalLlmJudge
-                } else if !spec.tasks.is_empty()
-                    && tasks.all(|task| matches!(task, EvalTask::Assertion(_)))
-                {
-                    Self::EvalAssertion
-                } else {
-                    Self::EvalOther
-                }
-            }
-        }
-    }
-
-    /// The stable metric and span label.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::DriftPsi => "drift_psi",
-            Self::DriftSpc => "drift_spc",
-            Self::DriftCustom => "drift_custom",
-            Self::EvalAssertion => "eval_assertion",
-            Self::EvalLlmJudge => "eval_llm_judge",
-            Self::EvalOther => "eval_other",
-            Self::Unknown => "unknown",
-        }
-    }
-}
 
 /// The closed `mode` dimension: how the execution was admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +141,9 @@ impl WaitSink {
 ///
 /// Created when a queued attempt is claimed or a direct request enters the
 /// runtime; it raises the active gauge at once and lowers it exactly once on
-/// drop, under whatever kind the execution then carries.
+/// drop, under whatever kind the execution then carries. A direct execution
+/// dropped before [`finish`](Self::finish) — a client disconnect — finishes
+/// as `cancelled`.
 #[derive(Debug)]
 pub struct ExecutionTelemetry {
     /// How the execution was admitted.
@@ -221,6 +154,8 @@ pub struct ExecutionTelemetry {
     ledger: Mutex<Ledger>,
     /// Waits measured inside the engine.
     waits: WaitSink,
+    /// Whether the execution's outcome was emitted.
+    finished: bool,
 }
 
 impl ExecutionTelemetry {
@@ -242,6 +177,7 @@ impl ExecutionTelemetry {
                 phases: Default::default(),
             }),
             waits: WaitSink::default(),
+            finished: false,
         }
     }
 
@@ -317,7 +253,13 @@ impl ExecutionTelemetry {
     /// `failed` marks an unsuccessful execution outcome; a completed failed
     /// judgment is not one. Phases with no interval emit no sample. The
     /// active gauge is lowered when `self` drops at the end of this call.
-    pub fn finish(self, outcome: &'static str, failed: bool) {
+    pub fn finish(mut self, outcome: &'static str, failed: bool) {
+        self.emit(outcome, failed);
+        self.finished = true;
+    }
+
+    /// Emit the outcome families of [`finish`](Self::finish).
+    fn emit(&self, outcome: &'static str, failed: bool) {
         let ledger = self.lock();
         let (kind, mode) = (ledger.kind.as_str(), self.mode.as_str());
         for (phase, intervals) in Phase::ALL.iter().zip(&ledger.phases) {
@@ -390,9 +332,13 @@ impl ExecutionTelemetry {
 }
 
 impl Drop for ExecutionTelemetry {
-    /// Lower the active gauge exactly once and count an execution that was
-    /// never classified as `unknown`.
+    /// Finish an abandoned direct execution as `cancelled`, then lower the
+    /// active gauge exactly once and count an execution that was never
+    /// classified as `unknown`.
     fn drop(&mut self) {
+        if !self.finished && self.mode == ExecutionMode::Direct {
+            self.emit("cancelled", true);
+        }
         let ledger = self
             .ledger
             .get_mut()
@@ -491,7 +437,6 @@ mod tests {
     //! Proof of classification and the wait-union arithmetic.
 
     use super::*;
-    use serde_json::json;
 
     /// Offset `ms` milliseconds from `base`.
     fn at(base: Instant, ms: u64) -> Instant {
@@ -531,41 +476,30 @@ mod tests {
         assert!(local >= Duration::from_millis(20), "{local:?}");
     }
 
-    /// Judge presence wins, an all-assertion graph is an assertion Eval, any
-    /// other graph is `eval_other`, and a profile-less Drift is `unknown`.
+    /// A direct execution dropped before finishing — a client disconnect —
+    /// records one `cancelled` failure; an abandoned queued attempt does not.
+    ///
+    /// # Panics
+    /// Panics when the rendered exposition lacks the direct cancellation or
+    /// carries a queued one.
     #[test]
-    fn kind_classification_follows_the_closed_precedence() {
-        let assertion = json!({
-            "kind": "assertion", "id": "a", "context_path": "$.x",
-            "operator": "is_not_null", "expected": null
+    fn abandoned_direct_execution_finishes_cancelled() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            drop(ExecutionTelemetry::start(ExecutionMode::Direct));
+            drop(ExecutionTelemetry::start(ExecutionMode::Queued));
         });
-        let judge = json!({
-            "kind": "llm_judge", "id": "j",
-            "judge_ref": {"prompt": {
-                "kind": "Prompt", "name": "judge", "version": "1.0.0", "space": "default"
-            }},
-            "operator": "greater_than_or_equals", "expected": 0.5
-        });
-        let trace = json!({
-            "kind": "trace_assertion", "id": "t", "span_selector": "$.spans",
-            "operator": "is_non_empty", "expected": null
-        });
-        let eval = |tasks: serde_json::Value| -> VerifierImplementation {
-            serde_json::from_value(json!({"kind": "eval", "spec": {"tasks": tasks}}))
-                .expect("eval implementation decodes")
-        };
-        assert_eq!(
-            VerifierKind::of(&eval(json!({"a": assertion}))),
-            VerifierKind::EvalAssertion
+        let text = handle.render();
+        assert!(
+            text.contains(
+                r#"wyrd_verification_run_failures_total{kind="unknown",mode="direct",outcome="cancelled"} 1"#
+            ),
+            "{text}"
         );
-        assert_eq!(
-            VerifierKind::of(&eval(json!({"a": assertion, "j": judge, "t": trace}))),
-            VerifierKind::EvalLlmJudge
+        assert!(
+            !text.contains(r#"mode="queued",outcome="cancelled""#),
+            "{text}"
         );
-        assert_eq!(
-            VerifierKind::of(&eval(json!({"a": assertion, "t": trace}))),
-            VerifierKind::EvalOther
-        );
-        assert_eq!(VerifierKind::of(&eval(json!({}))), VerifierKind::EvalOther);
     }
 }

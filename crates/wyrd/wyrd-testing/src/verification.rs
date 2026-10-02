@@ -21,6 +21,7 @@ use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, insert_card_row, insert_registration_operation,
     upsert_service_account_from_card,
 };
+use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::verification::{
     BindingActivation, FrozenTarget, NewBinding, project_bindings, record_machine_authentication,
 };
@@ -236,6 +237,68 @@ impl VerificationFixture {
         let uid = self.insert(&mut conn, &card).await?;
         conn.commit().await?;
         Ok(uid)
+    }
+
+    /// Register one active Verifier Card named `name` with `spec`.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError`] when `spec` is not a Verifier spec
+    /// or a write fails.
+    pub async fn verifier(
+        &self,
+        name: &str,
+        spec: &Value,
+    ) -> Result<CardUid, VerificationFixtureError> {
+        let card = card("Verifier", name, spec)?;
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let uid = self.insert(&mut conn, &card).await?;
+        conn.commit().await?;
+        Ok(uid)
+    }
+
+    /// Register one PSI or SPC Verifier named `name` with `spec` whose
+    /// baseline is already `ready` with the serialized `fitted` profile.
+    ///
+    /// Registers a stand-in baseline Data Card, then drives the baseline row
+    /// through its real pending, claim, and complete transitions, so readiness
+    /// is exactly what a fitter would leave without running one.
+    ///
+    /// # Errors
+    /// Returns [`VerificationFixtureError::Card`] when another baseline is
+    /// claimed first or the completion is stale, or a write error.
+    pub async fn fitted_verifier(
+        &self,
+        name: &str,
+        spec: &Value,
+        fitted: &Value,
+    ) -> Result<CardUid, VerificationFixtureError> {
+        let verifier = self.verifier(name, spec).await?;
+        let data = card(
+            "Data",
+            &format!("{name}-baseline"),
+            &serde_json::json!({
+                "interface": { "kind": "Pandas",
+                               "meta": { "framework_version": "2.2.2", "compression": "Snappy" } },
+                "schema": { "columns": [{ "name": "value", "dtype": "float64" }] },
+                "stats": { "byte_count": 1, "sha256": "0".repeat(64) }
+            }),
+        )?;
+        let queue = DriftBaselineQueue::default();
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let data = self.insert(&mut conn, &data).await?;
+        queue.insert_pending(&mut conn, &verifier, &data).await?;
+        conn.commit().await?;
+        let mut conn = self.postgres.tenant_conn(self.tenant).await?;
+        let claimed = queue
+            .claim(&mut conn, chrono::Duration::minutes(1))
+            .await?
+            .filter(|claimed| claimed.lease.verifier_uid == verifier)
+            .ok_or_else(|| {
+                VerificationFixtureError::Card(format!("baseline of {verifier} was not claimed"))
+            })?;
+        queue.complete(&mut conn, &claimed.lease, fitted).await?;
+        conn.commit().await?;
+        Ok(verifier)
     }
 
     /// Register one Operator Card named `name` with `spec` directly, skipping

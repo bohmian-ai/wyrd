@@ -74,10 +74,6 @@ pub struct WyrdServer {
     extra_workers: Vec<(&'static str, BoxWorker)>,
     #[cfg(feature = "test-support")]
     shutdown_probe: Option<ShutdownTestProbe>,
-    /// Test-only model providers the composed verification runtime's Eval
-    /// judges call instead of the environment-built process default.
-    #[cfg(feature = "test-support")]
-    verification_providers: Option<Arc<skald_runtime::ProviderRegistry>>,
 }
 
 impl WyrdServer {
@@ -141,8 +137,6 @@ impl WyrdServer {
             extra_workers: Vec::new(),
             #[cfg(feature = "test-support")]
             shutdown_probe: None,
-            #[cfg(feature = "test-support")]
-            verification_providers: None,
         })
     }
 
@@ -209,19 +203,6 @@ impl WyrdServer {
     #[must_use]
     fn with_shutdown_probe(mut self, probe: ShutdownTestProbe) -> Self {
         self.shutdown_probe = Some(probe);
-        self
-    }
-
-    /// Judge Eval runs in the composed verification runtime through
-    /// `providers`, a local mock upstream, instead of the process default
-    /// registry built from the environment.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn with_verification_providers_for_test(
-        mut self,
-        providers: Arc<skald_runtime::ProviderRegistry>,
-    ) -> Self {
-        self.verification_providers = Some(providers);
         self
     }
 
@@ -358,8 +339,6 @@ impl WyrdServer {
             extra_workers: self.extra_workers,
             #[cfg(feature = "test-support")]
             shutdown_probe: self.shutdown_probe,
-            #[cfg(feature = "test-support")]
-            verification_providers: self.verification_providers,
             http_listener,
             grpc_listener,
             metrics_listener,
@@ -398,10 +377,6 @@ pub struct BoundServer {
     metrics_addr: Option<SocketAddr>,
     #[cfg(feature = "test-support")]
     shutdown_probe: Option<ShutdownTestProbe>,
-    /// Test-only model providers the composed verification runtime's Eval
-    /// judges call instead of the environment-built process default.
-    #[cfg(feature = "test-support")]
-    verification_providers: Option<Arc<skald_runtime::ProviderRegistry>>,
 }
 
 /// Test-only shutdown boundaries exercised through [`BoundServer::run`].
@@ -474,10 +449,6 @@ impl BoundServer {
         let mut builder = VerificationRuntime::builder(&self.state).limits(limits);
         if let Some(endpoint) = &self.config.verification.ingest_endpoint {
             builder = builder.ingest_endpoint(endpoint.clone());
-        }
-        #[cfg(feature = "test-support")]
-        if let Some(providers) = &self.verification_providers {
-            builder = builder.providers(Arc::clone(providers));
         }
         builder.local_ingest(self.grpc_addr).build()
     }

@@ -10,6 +10,7 @@
 //! another reclaims its leases.
 
 mod claims;
+pub mod direct;
 pub mod drift;
 pub mod engines;
 pub mod eval;
@@ -308,7 +309,7 @@ pub struct VerificationRuntimeBuilder<'a> {
     state: &'a AppState,
     /// Runtime bounds.
     limits: RuntimeLimits,
-    /// Model providers Eval judges call; the process default when `None`.
+    /// Model providers Eval judges call; the state's judge providers when `None`.
     providers: Option<Arc<skald_runtime::ProviderRegistry>>,
     /// Scribe-bearing gRPC endpoint results are published through.
     ingest_endpoint: Option<String>,
@@ -333,8 +334,8 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
-    /// Judge Eval runs through `providers` instead of the process default
-    /// registry built from the environment.
+    /// Judge Eval runs through `providers` instead of the state's
+    /// [`judge_providers`](AppState::judge_providers).
     #[must_use]
     pub fn providers(mut self, providers: Arc<skald_runtime::ProviderRegistry>) -> Self {
         self.providers = Some(providers);
@@ -488,7 +489,7 @@ impl VerificationRuntimeBuilder<'_> {
                         self::eval::EvalEngine::new(
                             self.state.clone(),
                             self.providers
-                                .unwrap_or_else(skald_runtime::default_registry),
+                                .unwrap_or_else(|| Arc::clone(&self.state.judge_providers)),
                             self.limits.trace_deadline,
                         ),
                     ),
